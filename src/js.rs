@@ -8884,7 +8884,7 @@ impl PageCmd {
     /// Commands originating in native user input. HTML §8.1.7.4 assigns these
     /// to the user-interaction task source, independently of networking,
     /// timers, rendering, and page-owned messaging.
-    fn is_user_interaction(&self) -> bool {
+    pub(crate) fn is_user_interaction(&self) -> bool {
         matches!(
             self,
             Self::Click(_)
@@ -8922,10 +8922,10 @@ impl PageCmd {
 /// A watch channel keeps exactly one pending value, so it is bounded while the
 /// actor still observes the final target required by Pointer Events.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct PageHover {
-    node: Option<usize>,
-    x: f64,
-    y: f64,
+pub(crate) struct PageHover {
+    pub(crate) node: Option<usize>,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
 }
 
 /// Which kind of retained boundary a patch targets. Paint patches preserve all
@@ -9052,10 +9052,62 @@ struct PageHandleState {
     interaction_running: std::sync::Arc<std::sync::Mutex<bool>>,
     hover: Option<tokio::sync::watch::Sender<PageHover>>,
     cache: std::sync::Arc<crate::http::PageCache>,
-    runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
+    runtime_interrupt: PageRuntimeInterrupt,
+}
+
+#[derive(Debug, Clone)]
+enum PageRuntimeInterrupt {
+    Boa(std::sync::Arc<boa_engine::vm::RuntimeInterrupt>),
+    #[cfg(feature = "lumen-desktop")]
+    Lumen(std::sync::Arc<lumen::RuntimeInterrupt>),
+}
+
+impl Default for PageRuntimeInterrupt {
+    fn default() -> Self {
+        Self::Boa(Default::default())
+    }
+}
+
+impl PageRuntimeInterrupt {
+    fn request_user_navigation(&self) {
+        match self {
+            Self::Boa(interrupt) => interrupt.request_user_navigation(),
+            #[cfg(feature = "lumen-desktop")]
+            Self::Lumen(interrupt) => interrupt.request_user_navigation(),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Boa(interrupt) => interrupt.cancel(),
+            #[cfg(feature = "lumen-desktop")]
+            Self::Lumen(interrupt) => interrupt.cancel(),
+        }
+    }
 }
 
 impl PageHandle {
+    #[cfg(feature = "lumen-desktop")]
+    pub(crate) fn from_lumen_parts(
+        cmds: tokio::sync::mpsc::Sender<PageCmd>,
+        interactions: tokio::sync::mpsc::Sender<PageCmd>,
+        interaction_running: std::sync::Arc<std::sync::Mutex<bool>>,
+        hover: tokio::sync::watch::Sender<PageHover>,
+        cache: std::sync::Arc<crate::http::PageCache>,
+        runtime_interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
+    ) -> Self {
+        Self {
+            cmds,
+            state: Box::new(PageHandleState {
+                interactions: Some(interactions),
+                interaction_running,
+                hover: Some(hover),
+                cache,
+                runtime_interrupt: PageRuntimeInterrupt::Lumen(runtime_interrupt),
+            }),
+        }
+    }
+
     /// Queue native input on HTML's user-interaction task source.
     ///
     /// Input uses a dedicated priority lane, but does not abort author script.
@@ -9286,6 +9338,10 @@ pub fn spawn_page(
     html: String,
     env: PageEnv,
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
+    #[cfg(feature = "lumen-desktop")]
+    if LUMEN_BACKEND_SELECTED.load(std::sync::atomic::Ordering::Acquire) {
+        return crate::lumen_spike::spawn_page(html, env);
+    }
     let cache = env.cache.clone();
     let runtime_interrupt = std::sync::Arc::new(boa_engine::vm::RuntimeInterrupt::default());
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
@@ -9343,11 +9399,23 @@ pub fn spawn_page(
                 interaction_running,
                 hover: Some(hover_tx),
                 cache,
-                runtime_interrupt,
+                runtime_interrupt: PageRuntimeInterrupt::Boa(runtime_interrupt),
             }),
         },
         evt_rx,
     )
+}
+
+#[cfg(feature = "lumen-desktop")]
+static LUMEN_BACKEND_SELECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the experimental Lumen page actor for subsequently created pages in
+/// this process. The separately named desktop entry point calls this before it
+/// creates the browser controller; production entry points never call it.
+#[cfg(feature = "lumen-desktop")]
+pub fn select_lumen_backend() {
+    LUMEN_BACKEND_SELECTED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The full worker-scope JS: the shared structured-clone codec (extracted from
@@ -12380,12 +12448,21 @@ fn listener_ids(page: &mut LoadedPage, src: &[u8]) -> std::collections::HashSet<
 }
 
 fn clickable_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) {
-    use std::collections::HashSet;
-
     // Listener-bearing nodes, straight from the registry we own.
     let listeners = listener_ids(page, b"__trust.clickables().join(\",\")");
-
     let dom = page.dom.borrow();
+    clickable_set_for_dom(&dom, &listeners)
+}
+
+/// Engine-neutral half of live click-target extraction. The JavaScript engine
+/// supplies the listener registry; canonical DOM semantics and hit metadata
+/// remain shared by every backend.
+pub(crate) fn clickable_set_for_dom(
+    dom: &Dom,
+    listeners: &std::collections::HashSet<usize>,
+) -> (std::collections::HashSet<usize>, bool) {
+    use std::collections::HashSet;
+
     // The COMPOSED tree: shadow content is where component UIs live.
     let everyone = dom.composed_descendants(crate::dom::DOCUMENT);
     let inherent: Vec<usize> = everyone
@@ -12493,8 +12570,18 @@ const HOVER_ATTRS: &[&str] = &[
 /// selector with no safe narrow probe (for example `:is(:hover)`) marks every
 /// possible designated element. No cursor heuristics are involved.
 fn hover_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) {
-    let mut hosts = listener_ids(page, b"__trust.hoverables().join(\",\")");
+    let hosts = listener_ids(page, b"__trust.hoverables().join(\",\")");
     let dom = page.dom.borrow();
+    hover_set_for_dom(&dom, &hosts)
+}
+
+/// Engine-neutral half of Pointer Events/UI Events target marking. Listener
+/// discovery is backend-specific; composed-tree targeting is not.
+pub(crate) fn hover_set_for_dom(
+    dom: &Dom,
+    listener_hosts: &std::collections::HashSet<usize>,
+) -> (std::collections::HashSet<usize>, bool) {
+    let mut hosts = listener_hosts.clone();
     for d in dom.composed_descendants(crate::dom::DOCUMENT) {
         if HOVER_ATTRS.iter().any(|a| dom.attr(d, a).is_some()) {
             hosts.insert(d);
@@ -23727,7 +23814,7 @@ mod tests {
         // armed across the bundle's compile+execute so we can size the never-
         // called share — done in a SEPARATE pass so the census hooks don't
         // perturb the timing medians.
-        let run_once = |do_census: bool| -> (
+        type EngineProfileRun = (
             Duration,
             Duration,
             Duration,
@@ -23735,7 +23822,8 @@ mod tests {
             &'static str,
             boa_engine::vm::fn_census::FnCensus,
             Option<f64>,
-        ) {
+        );
+        let run_once = |do_census: bool| -> EngineProfileRun {
             let html = r#"<html><head></head><body><div id="content"></div></body></html>"#;
             let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
             let mut ctx = page_context_with(None).0;

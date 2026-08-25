@@ -18,6 +18,11 @@ name = "trust-desktop"
 path = "src/bin/trust-desktop.rs"
 
 [[bin]]
+name = "trust-desktop-lumen"
+path = "src/bin/trust-desktop-lumen.rs"
+required-features = ["lumen-desktop"]
+
+[[bin]]
 name = "trust-lumen-spike"
 path = "src/bin/trust-lumen-spike.rs"
 required-features = ["lumen-spike"]
@@ -38,6 +43,9 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Experimental sibling-engine integration. Boa remains the production engine;
 # this only builds the isolated TRust-prelude/benchmark probe.
 lumen-spike = ["dep:lumen"]
+# Experimental native browser artifact. This adds a separately named binary;
+# the normal `trust` and `trust-desktop` entry points continue selecting Boa.
+lumen-desktop = ["lumen-spike"]
 
 [dependencies]
 accesskit = "0.24.1"

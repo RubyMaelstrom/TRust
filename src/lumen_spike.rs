@@ -403,6 +403,1359 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     })
 }
 
+#[cfg(feature = "lumen-desktop")]
+mod desktop {
+    use super::*;
+    use crate::js::{FormSubmission, Outcome, PageCmd, PageEnv, PageEvt, PageHandle, PageHover};
+    use std::collections::HashSet;
+
+    const PAGE_STACK: usize = 64 * 1024 * 1024;
+    const WAKE_FLOOR: Duration = Duration::from_millis(16);
+    const USER_TASK_BUDGET: Duration = Duration::from_secs(1);
+
+    struct LumenPage {
+        engine: lumen::Engine,
+        dom: Rc<RefCell<Dom>>,
+        base: url::Url,
+        outcome: Outcome,
+        started: Instant,
+        last_render: Option<crate::http::RenderedPage>,
+    }
+
+    enum Wake {
+        Interaction(Option<PageCmd>),
+        Cmd(Option<PageCmd>),
+        Hover(Option<PageHover>),
+        Host(Option<LumenHostTask>),
+        Platform,
+        Timer,
+        Lifecycle,
+    }
+
+    struct InteractionTurn {
+        running: Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl InteractionTurn {
+        fn begin(
+            running: &Arc<std::sync::Mutex<bool>>,
+            interrupt: &Arc<lumen::RuntimeInterrupt>,
+        ) -> Self {
+            *running.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            interrupt.begin_user_interaction();
+            Self {
+                running: running.clone(),
+            }
+        }
+    }
+
+    impl Drop for InteractionTurn {
+        fn drop(&mut self) {
+            *self
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = false;
+        }
+    }
+
+    /// Spawn the experimental Lumen resident realm behind the same actor
+    /// contract used by both frontends. The separately named desktop binary is
+    /// the only production-shaped entry point which selects this function.
+    pub(crate) fn spawn_page(
+        html: String,
+        env: PageEnv,
+    ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
+        let cache = env.cache.clone();
+        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(16);
+        let interaction_running = Arc::new(std::sync::Mutex::new(false));
+        let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
+            node: None,
+            x: 0.0,
+            y: 0.0,
+        });
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let actor_interrupt = interrupt.clone();
+        let actor_running = interaction_running.clone();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("trust-page-lumen"))
+            .stack_size(PAGE_STACK)
+            .spawn(move || {
+                page_actor(
+                    html,
+                    env,
+                    cmd_rx,
+                    interaction_rx,
+                    hover_rx,
+                    event_tx,
+                    actor_running,
+                    actor_interrupt,
+                );
+                crate::release_allocator_memory();
+            });
+        if spawned.is_err() {
+            // Dropping the event sender in the failed closure tells the caller
+            // to take its existing CSS-only fallback.
+        }
+        (
+            PageHandle::from_lumen_parts(
+                cmd_tx,
+                interaction_tx,
+                interaction_running,
+                hover_tx,
+                cache,
+                interrupt,
+            ),
+            event_rx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn page_actor(
+        html: String,
+        env: PageEnv,
+        mut cmds: tokio::sync::mpsc::Receiver<PageCmd>,
+        mut interactions: tokio::sync::mpsc::Receiver<PageCmd>,
+        mut hover: tokio::sync::watch::Receiver<PageHover>,
+        events: tokio::sync::mpsc::Sender<PageEvt>,
+        interaction_running: Arc<std::sync::Mutex<bool>>,
+        interrupt: Arc<lumen::RuntimeInterrupt>,
+    ) {
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        // A no-network realm does not retain the sender in HostState. Keep the
+        // lane open anyway: a closed `recv()` is immediately ready and would
+        // otherwise win the actor select before lifecycle/timer/input work.
+        let _host_keepalive = host_tx.clone();
+        let mut page = match load_page(&html, env, host_tx, interrupt.clone()) {
+            Ok(page) => page,
+            Err(outcome) => {
+                let _ = events.blocking_send(PageEvt::Static { html, outcome });
+                return;
+            }
+        };
+
+        // HTML's parser task has completed through DOMContentLoaded. Expose a
+        // rendering opportunity before the separately queued load task; slow
+        // dynamically prepared resources can therefore delay load without
+        // hiding the interactive document shell.
+        let (shell, rendered, _) = extract_live(&mut page);
+        page.last_render = Some(rendered.clone());
+        let mut outcome = std::mem::take(&mut page.outcome);
+        outcome.elapsed = page.started.elapsed();
+        outcome.rendered = Some(Box::new(rendered));
+        if events
+            .blocking_send(PageEvt::Updated {
+                html: shell,
+                outcome,
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("trust Lumen page actor runtime");
+        let wall_origin = Instant::now();
+        let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
+        let mut lifecycle_complete = false;
+        let mut prefer_timer = false;
+        let mut last_timer = None;
+        let mut deferred_host_task = None;
+
+        'event_loop: loop {
+            if matches!(
+                interrupt.current_reason(),
+                Some(lumen::InterruptReason::Cancelled)
+            ) {
+                break;
+            }
+            let elapsed = wall_origin.elapsed().as_secs_f64() * 1000.0;
+            let observed_now = trust_number(&mut page, "now").unwrap_or(virtual_origin + elapsed);
+            let now = observed_now.max(virtual_origin + elapsed);
+            virtual_origin = now - elapsed;
+            let deadline = trust_number(&mut page, "nextDeadline");
+            let timer_due = deadline.is_some_and(|deadline| deadline <= now)
+                && last_timer.is_none_or(|last: Instant| last.elapsed() >= WAKE_FLOOR);
+            let platform_ready = trust_bool(&mut page, "hasPlatformTask");
+            let load_ready = !lifecycle_complete && pending_resources(&mut page) == 0;
+
+            let mut immediate = None;
+            if let Ok(command) = interactions.try_recv() {
+                immediate = Some(Wake::Interaction(Some(command)));
+            } else if hover.has_changed().unwrap_or(false) {
+                immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
+            } else if let Some(task) = deferred_host_task
+                .take()
+                .or_else(|| host_rx.try_recv().ok())
+            {
+                if timer_due && prefer_timer {
+                    deferred_host_task = Some(task);
+                    immediate = Some(Wake::Timer);
+                } else {
+                    immediate = Some(Wake::Host(Some(task)));
+                }
+            } else if load_ready {
+                immediate = Some(Wake::Lifecycle);
+            } else if platform_ready && (!timer_due || !prefer_timer) {
+                immediate = Some(Wake::Platform);
+            } else if timer_due {
+                immediate = Some(Wake::Timer);
+            } else if let Ok(command) = cmds.try_recv() {
+                immediate = Some(Wake::Cmd(Some(command)));
+            }
+
+            let wait = deadline.map(|deadline| {
+                Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0).max(WAKE_FLOOR)
+            });
+            let wake = immediate.unwrap_or_else(|| {
+                interrupt.set_deadline(None);
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        command = interactions.recv() => Wake::Interaction(command),
+                        changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
+                        task = host_rx.recv() => Wake::Host(task),
+                        command = cmds.recv() => Wake::Cmd(command),
+                        () = sleep_or_pending(wait) => Wake::Timer,
+                    }
+                })
+            });
+
+            let _interaction = match &wake {
+                Wake::Interaction(Some(_)) | Wake::Hover(Some(_)) => {
+                    Some(InteractionTurn::begin(&interaction_running, &interrupt))
+                }
+                Wake::Cmd(Some(command)) if command.is_user_interaction() => {
+                    Some(InteractionTurn::begin(&interaction_running, &interrupt))
+                }
+                _ => None,
+            };
+
+            match wake {
+                Wake::Interaction(Some(command)) | Wake::Cmd(Some(command)) => {
+                    if !dispatch_command(&mut page, command, &events, &interrupt) {
+                        break;
+                    }
+                    prefer_timer = true;
+                }
+                Wake::Hover(Some(hover)) => {
+                    if !dispatch_command(
+                        &mut page,
+                        PageCmd::Hover {
+                            node: hover.node,
+                            x: hover.x,
+                            y: hover.y,
+                        },
+                        &events,
+                        &interrupt,
+                    ) {
+                        break;
+                    }
+                    prefer_timer = true;
+                }
+                Wake::Interaction(None) | Wake::Cmd(None) | Wake::Hover(None) => break,
+                Wake::Host(Some(task)) => {
+                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                    if let Err(error) = dispatch_host_task(&mut page.engine, task) {
+                        page.outcome.errors.push(error);
+                    }
+                    checkpoint(&mut page, "host task");
+                    if !finish_task(&mut page, &events) {
+                        break;
+                    }
+                    prefer_timer = true;
+                }
+                Wake::Host(None) => break,
+                Wake::Platform => {
+                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                    let _ = call_trust(&mut page, "runPlatformTask", &[], "platform task");
+                    checkpoint(&mut page, "platform task");
+                    if !finish_task(&mut page, &events) {
+                        break;
+                    }
+                    prefer_timer = true;
+                }
+                Wake::Timer => {
+                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                    let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
+                    let _ = call_trust(&mut page, "tickTo", &[Value::Num(real_now)], "timer task");
+                    checkpoint(&mut page, "timer task");
+                    if !finish_task(&mut page, &events) {
+                        break;
+                    }
+                    last_timer = Some(Instant::now());
+                    prefer_timer = false;
+                }
+                Wake::Lifecycle => {
+                    lifecycle_complete = true;
+                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                    let _ = evaluate_task(
+                        &mut page,
+                        "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
+                        "load event",
+                    );
+                    checkpoint(&mut page, "load event");
+                    if !finish_task(&mut page, &events) {
+                        break 'event_loop;
+                    }
+                    prefer_timer = true;
+                }
+            }
+            page.engine.collect_garbage_at_idle();
+            // Deadlines bound author execution, not the host's idle scheduling
+            // queries. Navigation/cancellation flags remain independently set.
+            interrupt.set_deadline(None);
+        }
+    }
+
+    async fn sleep_or_pending(wait: Option<Duration>) {
+        match wait {
+            Some(wait) => tokio::time::sleep(wait).await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    fn load_page(
+        html: &str,
+        env: PageEnv,
+        host_tasks: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        interrupt: Arc<lumen::RuntimeInterrupt>,
+    ) -> Result<LumenPage, Outcome> {
+        let mut outcome = Outcome::default();
+        let viewport = crate::layout2::Viewport::new(
+            f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
+            f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
+        );
+        let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+        {
+            let mut dom = dom.borrow_mut();
+            dom.set_viewport_px(viewport.width, viewport.height);
+            dom.set_device_pixel_ratio(env.device_pixel_ratio);
+            dom.set_doc_url(url::Url::parse(&env.url).ok());
+            if !env.sheets.is_empty() {
+                dom.attach_external_sheets(&env.sheets);
+            }
+        }
+        let scripts: Vec<_> = {
+            let dom = dom.borrow();
+            dom.scripts()
+                .into_iter()
+                .filter(|(_, _, ty, node)| {
+                    !(is_classic(ty) && dom.attr(*node, "nomodule").is_some())
+                })
+                .collect()
+        };
+        if scripts.is_empty() && !dom.borrow().hover_css_affects_rendering() {
+            return Err(outcome);
+        }
+
+        let response_url = url::Url::parse(&env.url)
+            .unwrap_or_else(|_| url::Url::parse(DEFAULT_URL).expect("default URL parses"));
+        let base = {
+            let dom = dom.borrow();
+            dom.descendants(DOCUMENT)
+                .into_iter()
+                .find_map(|node| {
+                    (dom.tag_name(node) == Some("base"))
+                        .then(|| dom.attr(node, "href"))
+                        .flatten()
+                        .and_then(|href| response_url.join(href.trim()).ok())
+                })
+                .unwrap_or_else(|| response_url.clone())
+        };
+        dom.borrow_mut().set_doc_url(Some(base.clone()));
+
+        interrupt.set_deadline(Some(Instant::now() + crate::js::WALL_BUDGET));
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(dom.clone(), clock.clone());
+        state.base = base.clone();
+        state.storage = env.storage.clone().unwrap_or_default();
+        state.blobs = env.blobs.clone();
+        state.viewport.set(viewport);
+        state.device_pixel_ratio.set(env.device_pixel_ratio);
+        if let Some(handle) = env.net.clone() {
+            state.enable_network(response_url, handle, env.cache.clone(), host_tasks);
+            state.base = base.clone();
+        }
+
+        let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        let engine_clock = clock.clone();
+        engine.set_wall_clock(move || engine_clock.now_ms());
+        state.configure_module_loading(&mut engine);
+        engine.ctx().op_state().put(state);
+        install_host_boundary(&mut engine);
+
+        let config = format!(
+            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1 Lumen', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
+            json_string(base.as_str()),
+            json_string(crate::locale::LANGUAGE),
+            json_string(crate::locale::LANGUAGES[0]),
+            json_string(crate::locale::LANGUAGES[1]),
+            viewport.width,
+            viewport.height,
+            env.device_pixel_ratio,
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(8),
+            crate::http::GLOBAL_PRIVACY_CONTROL,
+            lumen_potentially_trustworthy(&base),
+        );
+        if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
+            outcome.errors.push(error);
+            return Err(outcome);
+        }
+        if let Err(error) = eval(&mut engine, crate::js::PRELUDE, "TRust platform prelude") {
+            outcome.errors.push(error);
+            return Err(outcome);
+        }
+
+        let started = Instant::now();
+        for (index, (src, inline, ty, node)) in scripts.into_iter().enumerate() {
+            if is_classic(&ty) {
+                let source = initial_classic_source(src.as_deref(), &inline, &env);
+                let Some((name, source, external)) = source else {
+                    outcome
+                        .errors
+                        .push(format!("classic script #{} failed to load", index + 1));
+                    fire_engine_script_event(&mut engine, node, "error");
+                    continue;
+                };
+                if let Err(error) = run_injected_classic_task(&mut engine, node, &name, &source) {
+                    outcome.errors.push(error);
+                } else if external {
+                    fire_engine_script_event(&mut engine, node, "load");
+                }
+            } else if ty.as_deref().is_some_and(|ty| ty.trim() == "module") {
+                let external = src.is_some();
+                let source = initial_module_source(src.as_deref(), &inline, &env, &base);
+                let Some((mut name, source)) = source else {
+                    outcome.modules_skipped += 1;
+                    fire_engine_script_event(&mut engine, node, "error");
+                    continue;
+                };
+                if !external {
+                    name = format!("inline-module#{}", index + 1);
+                }
+                if let Err(error) = run_injected_module_task(&mut engine, node, &name, &source) {
+                    outcome.errors.push(error);
+                }
+            }
+        }
+
+        let mut page = LumenPage {
+            engine,
+            dom,
+            base,
+            outcome,
+            started,
+            last_render: None,
+        };
+        let _ = evaluate_task(
+            &mut page,
+            "__trust.readyState = 'interactive'; __trust.hydrateFrames(); __trust.fire(document, 'DOMContentLoaded', true);",
+            "DOMContentLoaded",
+        );
+        checkpoint(&mut page, "DOMContentLoaded");
+        Ok(page)
+    }
+
+    fn is_classic(type_attr: &Option<String>) -> bool {
+        match type_attr {
+            None => true,
+            Some(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "text/javascript" | "application/javascript" | "text/ecmascript"
+            ),
+        }
+    }
+
+    fn initial_classic_source(
+        src: Option<&str>,
+        inline: &str,
+        env: &PageEnv,
+    ) -> Option<(String, String, bool)> {
+        let Some(src) = src else {
+            return Some((String::from("inline script"), inline.to_string(), false));
+        };
+        if src.starts_with("data:") {
+            let body = crate::img::decode_data_url(src)?;
+            return Some((
+                src.to_string(),
+                String::from_utf8_lossy(&body).into_owned(),
+                true,
+            ));
+        }
+        let body = env
+            .externals
+            .iter()
+            .find(|(name, _)| name == src)?
+            .1
+            .as_ref()?;
+        Some((
+            src.to_string(),
+            String::from_utf8_lossy(body).into_owned(),
+            true,
+        ))
+    }
+
+    fn initial_module_source(
+        src: Option<&str>,
+        inline: &str,
+        env: &PageEnv,
+        base: &url::Url,
+    ) -> Option<(String, String)> {
+        let Some(src) = src else {
+            return Some((base.to_string(), inline.to_string()));
+        };
+        let resolved = base.join(src).ok()?;
+        if resolved.scheme() == "data" {
+            let content_type = data_url_content_type(resolved.as_str());
+            let body = crate::img::decode_data_url(resolved.as_str())?;
+            return crate::http::module_script_response_allowed(200, &content_type).then(|| {
+                (
+                    resolved.to_string(),
+                    crate::http::decode_body(&content_type, &body),
+                )
+            });
+        }
+        let handle = env.net.as_ref()?;
+        let fetch = env
+            .cache
+            .peek(&resolved)
+            .unwrap_or_else(|| env.cache.fetch(handle, resolved.clone()));
+        let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
+        crate::http::module_script_response_allowed(response.status, &response.content_type).then(
+            || {
+                (
+                    resolved.to_string(),
+                    crate::http::decode_body(&response.content_type, &response.body),
+                )
+            },
+        )
+    }
+
+    fn json_string(value: &str) -> String {
+        serde_json::to_string(value).unwrap_or_else(|_| String::from("\"\""))
+    }
+
+    fn pending_resources(page: &mut LumenPage) -> usize {
+        page.engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map_or(0, |state| state.pending_resources)
+    }
+
+    fn prepare_task(interrupt: &Arc<lumen::RuntimeInterrupt>, budget: Duration) {
+        interrupt.set_deadline(Some(Instant::now() + budget));
+    }
+
+    fn evaluate_task(page: &mut LumenPage, source: &str, label: &str) -> Option<Value> {
+        let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            page.engine.eval_value_interruptible(source)
+        }));
+        match evaluated {
+            Ok(Ok(Ok(value))) => Some(value),
+            Ok(Ok(Err(error))) => {
+                record_eval_error(page, error, label);
+                None
+            }
+            Ok(Err(error)) => {
+                page.outcome.errors.push(format!(
+                    "{label} parse error at line {}: {}",
+                    error.line, error.message
+                ));
+                None
+            }
+            Err(_) => {
+                page.outcome
+                    .errors
+                    .push(format!("{label}: Lumen engine panic — page JS halted"));
+                page.outcome.panicked = true;
+                None
+            }
+        }
+    }
+
+    fn engine_call_trust(
+        engine: &mut lumen::Engine,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, EvalError> {
+        let global = engine.global_this();
+        let trust = engine
+            .ctx()
+            .member_get(&global, "__trust")
+            .map_err(EvalError::Throw)?;
+        let function = engine
+            .ctx()
+            .member_get(&trust, name)
+            .map_err(EvalError::Throw)?;
+        engine.call_function_interruptible(&function, trust, args)
+    }
+
+    fn call_trust(page: &mut LumenPage, name: &str, args: &[Value], label: &str) -> Option<Value> {
+        let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine_call_trust(&mut page.engine, name, args)
+        }));
+        match called {
+            Ok(Ok(value)) => Some(value),
+            Ok(Err(error)) => {
+                record_eval_error(page, error, label);
+                None
+            }
+            Err(_) => {
+                page.outcome
+                    .errors
+                    .push(format!("{label}: Lumen engine panic — page JS halted"));
+                page.outcome.panicked = true;
+                None
+            }
+        }
+    }
+
+    fn record_eval_error(page: &mut LumenPage, error: EvalError, label: &str) {
+        match error {
+            EvalError::Interrupted(lumen::InterruptReason::UserNavigation) => {}
+            EvalError::Interrupted(lumen::InterruptReason::Cancelled) => {}
+            EvalError::Interrupted(reason) => page
+                .outcome
+                .errors
+                .push(format!("{label} interrupted: {}", reason.message())),
+            EvalError::Throw(error) => {
+                let message = describe_throw(&mut page.engine, error, label);
+                page.outcome.errors.push(message);
+            }
+        }
+    }
+
+    fn checkpoint(page: &mut LumenPage, label: &str) {
+        if let Err(reason) = page.engine.run_microtasks_interruptible()
+            && !matches!(
+                reason,
+                lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled
+            )
+        {
+            page.outcome.errors.push(format!(
+                "{label} microtasks interrupted: {}",
+                reason.message()
+            ));
+        }
+        drain_diagnostics(page);
+    }
+
+    fn drain_diagnostics(page: &mut LumenPage) {
+        for (source, errors) in [
+            ("__trust.errors.splice(0).join('\\u0000')", true),
+            ("__trust.logs.splice(0).join('\\u0000')", false),
+        ] {
+            let Ok(Ok(value)) = page.engine.eval_value_interruptible(source) else {
+                continue;
+            };
+            let joined = value_string(&mut page.engine, &value);
+            let destination = if errors {
+                &mut page.outcome.errors
+            } else {
+                &mut page.outcome.console
+            };
+            destination.extend(
+                joined
+                    .split('\0')
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from),
+            );
+        }
+        let rejections = page.engine.take_unhandled_rejections();
+        for rejection in rejections {
+            let message = value_string(&mut page.engine, &rejection);
+            page.outcome
+                .console
+                .push(format!("unhandled rejection: {message}"));
+        }
+        page.outcome.fetches = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .and_then(|state| state.network.as_ref())
+            .map_or(0, |network| {
+                network.fetched.load(std::sync::atomic::Ordering::Relaxed)
+            });
+    }
+
+    fn trust_number(page: &mut LumenPage, name: &str) -> Option<f64> {
+        call_trust(page, name, &[], name).and_then(|value| value.as_num_opt())
+    }
+
+    fn trust_bool(page: &mut LumenPage, name: &str) -> bool {
+        call_trust(page, name, &[], name).is_some_and(|value| page.engine.ctx().to_boolean(&value))
+    }
+
+    fn listener_ids(page: &mut LumenPage, name: &str) -> HashSet<usize> {
+        let Some(value) = call_trust(page, name, &[], name) else {
+            return HashSet::new();
+        };
+        let Ok(joined) = page.engine.ctx().coerce_string(&value) else {
+            return HashSet::new();
+        };
+        joined
+            .split(',')
+            .filter_map(|part| part.parse().ok())
+            .collect()
+    }
+
+    fn extract_live(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        let clickable_listeners = listener_ids(page, "clickables");
+        let hover_listeners = listener_ids(page, "hoverables");
+        let (clickable, has_interaction) = {
+            let dom = page.dom.borrow();
+            crate::js::clickable_set_for_dom(&dom, &clickable_listeners)
+        };
+        let (hover, complete_hover_hits) = {
+            let dom = page.dom.borrow();
+            crate::js::hover_set_for_dom(&dom, &hover_listeners)
+        };
+        let paint = page
+            .dom
+            .borrow()
+            .hover_paint_subject_candidates_in(&[DOCUMENT]);
+        {
+            let mut dom = page.dom.borrow_mut();
+            dom.set_hover_hosts(hover, complete_hover_hits);
+            dom.set_paint_patch_hosts(paint.into_iter().collect());
+            dom.set_render_clickables(clickable.clone(), true);
+        }
+        let (viewport, ratio, images) = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| {
+                (
+                    state.viewport.get(),
+                    state.device_pixel_ratio.get(),
+                    state.images.borrow().clone(),
+                )
+            })
+            .unwrap_or((DEFAULT_VIEWPORT, 1.0, Default::default()));
+        let rendered = {
+            let dom = page.dom.borrow();
+            crate::http::render_arena(&dom, &page.base, viewport, ratio, None, &images)
+        };
+        let html = if cfg!(test) || std::env::var_os("TRUST_DUMP_RAW").is_some() {
+            page.dom.borrow().serialize_live(DOCUMENT, &clickable)
+        } else {
+            String::new()
+        };
+        {
+            let mut dom = page.dom.borrow_mut();
+            let _ = dom.take_dirty();
+            let _ = dom.take_dirty_targets();
+        }
+        (html, rendered, has_interaction)
+    }
+
+    fn value_is_nullish(value: &Value) -> bool {
+        matches!(value, Value::Null | Value::Undefined | Value::Empty)
+    }
+
+    fn value_to_string(page: &mut LumenPage, value: &Value) -> Option<String> {
+        page.engine
+            .ctx()
+            .coerce_string(value)
+            .ok()
+            .map(|value| value.to_string())
+    }
+
+    // Command dispatch and event-tail handling are kept below the shared
+    // extraction helpers so every task follows the same task → checkpoint →
+    // rendering-update sequence from HTML §8.1.7.3.
+
+    fn dispatch_command(
+        page: &mut LumenPage,
+        command: PageCmd,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        interrupt: &Arc<lumen::RuntimeInterrupt>,
+    ) -> bool {
+        match command {
+            PageCmd::Click(node) => {
+                prepare_interaction(page, interrupt);
+                let prevented = call_trust(page, "click", &[Value::Num(node as f64)], "click")
+                    .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                let anchor = if prevented {
+                    None
+                } else {
+                    call_trust(
+                        page,
+                        "followAnchorDefault",
+                        &[Value::Num(node as f64)],
+                        "hyperlink navigation",
+                    )
+                    .filter(|value| !value_is_nullish(value))
+                    .and_then(|value| value_to_string(page, &value))
+                    .filter(|value| !value.trim().is_empty())
+                };
+                checkpoint(page, "click");
+                if let Some((url, replace)) =
+                    take_navigation(page).or_else(|| anchor.map(|url| (url, false)))
+                {
+                    return send_navigation(events, url, replace);
+                }
+                let click_submit = take_click_submit(page);
+                if !finish_task(page, events) {
+                    return false;
+                }
+                if let Some((form, submitter, submission)) = click_submit {
+                    return events
+                        .blocking_send(PageEvt::SubmitForm {
+                            form,
+                            submitter: Some(submitter),
+                            submission,
+                        })
+                        .is_ok();
+                }
+                true
+            }
+            PageCmd::Key { node, input } => {
+                prepare_interaction(page, interrupt);
+                let (key, code) = key_and_code(&input.key);
+                let prevented = call_trust(
+                    page,
+                    "key",
+                    &[
+                        Value::Num(node as f64),
+                        Value::from_string(key),
+                        Value::from_string(code),
+                        Value::Bool(input.repeat),
+                        Value::Bool(input.composing),
+                        Value::Bool(input.modifiers.shift),
+                        Value::Bool(input.modifiers.control),
+                        Value::Bool(input.modifiers.alt),
+                        Value::Bool(input.modifiers.meta),
+                    ],
+                    "keydown",
+                )
+                .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                checkpoint(page, "keydown");
+                if let Some((url, replace)) = take_navigation(page) {
+                    return send_navigation(events, url, replace);
+                }
+                let click_submit = take_click_submit(page);
+                if !finish_task(page, events) {
+                    return false;
+                }
+                if let Some((form, submitter, submission)) = click_submit {
+                    return events
+                        .blocking_send(PageEvt::SubmitForm {
+                            form,
+                            submitter: Some(submitter),
+                            submission,
+                        })
+                        .is_ok();
+                }
+                events
+                    .blocking_send(PageEvt::KeyDefault { prevented })
+                    .is_ok()
+            }
+            PageCmd::SetValue {
+                node,
+                value,
+                checked,
+            } => {
+                prepare_interaction(page, interrupt);
+                let checked = checked.map_or(Value::Null, Value::Bool);
+                let _ = call_trust(
+                    page,
+                    "formSet",
+                    &[Value::Num(node as f64), Value::from_string(value), checked],
+                    "form input",
+                );
+                checkpoint(page, "form input");
+                finish_task(page, events)
+            }
+            PageCmd::Submit { form, submitter } => {
+                prepare_interaction(page, interrupt);
+                let prevented = call_trust(
+                    page,
+                    "formSubmit",
+                    &[
+                        Value::Num(form as f64),
+                        submitter.map_or(Value::Null, |node| Value::Num(node as f64)),
+                    ],
+                    "form submit",
+                )
+                .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                checkpoint(page, "form submit");
+                if let Some((url, replace)) = take_navigation(page) {
+                    return send_navigation(events, url, replace);
+                }
+                if !prevented {
+                    return events.blocking_send(PageEvt::SubmitDefault).is_ok();
+                }
+                finish_task(page, events)
+            }
+            PageCmd::Ws { id, event } => {
+                prepare_task(interrupt, crate::js::WALL_BUDGET);
+                let can_render = !matches!(&event, crate::ws::WsIn::Sent(_));
+                if let Err(error) =
+                    dispatch_host_task(&mut page.engine, LumenHostTask::WebSocket { id, event })
+                {
+                    page.outcome.errors.push(error);
+                }
+                checkpoint(page, "WebSocket task");
+                !can_render || finish_task(page, events)
+            }
+            PageCmd::Worker { id, event } => {
+                prepare_task(interrupt, crate::js::WALL_BUDGET);
+                if let Err(error) =
+                    dispatch_host_task(&mut page.engine, LumenHostTask::Worker { id, event })
+                {
+                    page.outcome.errors.push(error);
+                }
+                checkpoint(page, "Worker task");
+                finish_task(page, events)
+            }
+            PageCmd::Scroll { x, y } => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "setScroll",
+                    &[Value::Num(finite_or_zero(x)), Value::Num(finite_or_zero(y))],
+                    "scroll",
+                );
+                checkpoint(page, "scroll");
+                finish_task(page, events)
+            }
+            PageCmd::Hover { node, x, y } => {
+                prepare_interaction(page, interrupt);
+                let node = node
+                    .filter(|node| page.dom.borrow().is_valid(*node))
+                    .map_or(Value::Null, |node| Value::Num(node as f64));
+                let _ = call_trust(
+                    page,
+                    "hover",
+                    &[
+                        node,
+                        Value::Num(finite_or_zero(x)),
+                        Value::Num(finite_or_zero(y)),
+                    ],
+                    "hover",
+                );
+                checkpoint(page, "hover");
+                finish_task(page, events)
+            }
+            PageCmd::RegionGeom { items } => {
+                let mut dom = page.dom.borrow_mut();
+                for (node, client_height, client_width) in items {
+                    if dom.is_valid(node) {
+                        dom.set_scroll_geom(node, client_height, client_width);
+                    }
+                }
+                true
+            }
+            PageCmd::SetScroll { node, top, left } => {
+                prepare_interaction(page, interrupt);
+                if page.dom.borrow().is_valid(node) {
+                    page.dom.borrow_mut().set_scroll_pos(
+                        node,
+                        finite_or_zero(top),
+                        finite_or_zero(left),
+                        false,
+                    );
+                    let _ = call_trust(
+                        page,
+                        "fireElementScroll",
+                        &[Value::Num(node as f64)],
+                        "element scroll",
+                    );
+                    checkpoint(page, "element scroll");
+                    finish_task(page, events)
+                } else {
+                    events.blocking_send(PageEvt::Settled).is_ok()
+                }
+            }
+            PageCmd::Resync => {
+                let (html, rendered, _) = extract_live(page);
+                page.last_render = Some(rendered.clone());
+                let mut outcome = std::mem::take(&mut page.outcome);
+                outcome.elapsed = page.started.elapsed();
+                outcome.rendered = Some(Box::new(rendered));
+                events
+                    .blocking_send(PageEvt::Updated { html, outcome })
+                    .is_ok()
+            }
+            PageCmd::LiveRegions(_) | PageCmd::LiveBoundaries(_) => true,
+            PageCmd::ImageSizes(sizes) => {
+                let mut changed = false;
+                if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                    let mut images = state.images.borrow_mut();
+                    for (url, dimensions) in sizes {
+                        if images.get(&url) != Some(&dimensions) {
+                            images.insert(url, dimensions);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        state.geom_cache.borrow_mut().0 = u64::MAX;
+                    }
+                }
+                if changed {
+                    prepare_task(interrupt, crate::js::WALL_BUDGET);
+                    let _ = call_trust(page, "updateIntersections", &[], "image geometry");
+                    checkpoint(page, "image geometry");
+                    finish_task(page, events)
+                } else {
+                    true
+                }
+            }
+            PageCmd::Viewport(viewport) => {
+                let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
+                let changed = page
+                    .engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .is_some_and(|state| {
+                        if state.viewport.get() == viewport {
+                            return false;
+                        }
+                        state.viewport.set(viewport);
+                        state.geom_cache.borrow_mut().0 = u64::MAX;
+                        true
+                    });
+                page.dom
+                    .borrow_mut()
+                    .set_viewport_px(viewport.width, viewport.height);
+                if changed {
+                    prepare_task(interrupt, crate::js::WALL_BUDGET);
+                    let _ = call_trust(
+                        page,
+                        "setViewport",
+                        &[
+                            Value::Num(f64::from(viewport.width)),
+                            Value::Num(f64::from(viewport.height)),
+                        ],
+                        "resize",
+                    );
+                    checkpoint(page, "resize");
+                    finish_task(page, events)
+                } else {
+                    true
+                }
+            }
+            PageCmd::DevicePixelRatio(ratio) => {
+                let ratio = if ratio.is_finite() && ratio > 0.0 {
+                    ratio
+                } else {
+                    1.0
+                };
+                let changed = page
+                    .engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .is_some_and(|state| {
+                        if state.device_pixel_ratio.get() == ratio {
+                            return false;
+                        }
+                        state.device_pixel_ratio.set(ratio);
+                        state.geom_cache.borrow_mut().0 = u64::MAX;
+                        true
+                    });
+                page.dom.borrow_mut().set_device_pixel_ratio(ratio);
+                if changed {
+                    prepare_task(interrupt, crate::js::WALL_BUDGET);
+                    let _ = evaluate_task(
+                        page,
+                        &format!("globalThis.devicePixelRatio={ratio}"),
+                        "devicePixelRatio",
+                    );
+                    checkpoint(page, "devicePixelRatio");
+                    finish_task(page, events)
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    fn prepare_interaction(page: &mut LumenPage, interrupt: &Arc<lumen::RuntimeInterrupt>) {
+        prepare_task(interrupt, USER_TASK_BUDGET);
+        let _ = call_trust(page, "moResetGuard", &[], "mutation observer guard");
+        let _ = page.dom.borrow_mut().take_dirty();
+    }
+
+    fn finite_or_zero(value: f64) -> f64 {
+        if value.is_finite() { value } else { 0.0 }
+    }
+
+    fn key_and_code(key: &crate::core::Key) -> (String, String) {
+        use crate::core::Key;
+        let key_name = match key {
+            Key::Character(value) | Key::Other(value) => value.clone(),
+            Key::Enter => String::from("Enter"),
+            Key::Escape => String::from("Escape"),
+            Key::Backspace => String::from("Backspace"),
+            Key::Delete => String::from("Delete"),
+            Key::Tab => String::from("Tab"),
+            Key::ArrowLeft => String::from("ArrowLeft"),
+            Key::ArrowRight => String::from("ArrowRight"),
+            Key::ArrowUp => String::from("ArrowUp"),
+            Key::ArrowDown => String::from("ArrowDown"),
+            Key::Home => String::from("Home"),
+            Key::End => String::from("End"),
+            Key::PageUp => String::from("PageUp"),
+            Key::PageDown => String::from("PageDown"),
+        };
+        let code = match key {
+            Key::Character(value) if value.len() == 1 => {
+                format!("Key{}", value.to_ascii_uppercase())
+            }
+            Key::Character(_) => String::new(),
+            _ => key_name.clone(),
+        };
+        (key_name, code)
+    }
+
+    fn finish_task(page: &mut LumenPage, events: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+        if page.outcome.panicked {
+            let errors = std::mem::take(&mut page.outcome.errors);
+            let _ = events.blocking_send(PageEvt::Trouble(errors));
+            return false;
+        }
+        if let Some((url, replace)) = take_navigation(page) {
+            return send_navigation(events, url, replace);
+        }
+        let fragment = take_scroll_fragment(page);
+        let submission = take_form_submit(page);
+        let scrolls = page.dom.borrow_mut().take_scroll_changes();
+        let (html, rendered, _) = extract_live(page);
+        let changed = page
+            .last_render
+            .as_ref()
+            .is_none_or(|previous| !previous.visually_eq(&rendered));
+        let mut sent_primary = false;
+        if changed {
+            page.last_render = Some(rendered.clone());
+            let mut outcome = std::mem::take(&mut page.outcome);
+            outcome.elapsed = page.started.elapsed();
+            outcome.rendered = Some(Box::new(rendered));
+            if events
+                .blocking_send(PageEvt::Updated { html, outcome })
+                .is_err()
+            {
+                return false;
+            }
+            sent_primary = true;
+        } else if !page.outcome.errors.is_empty() {
+            let errors = std::mem::take(&mut page.outcome.errors);
+            if events.blocking_send(PageEvt::Trouble(errors)).is_err() {
+                return false;
+            }
+            sent_primary = true;
+        }
+        for (node, top, left) in scrolls {
+            if events
+                .blocking_send(PageEvt::Scrolled { node, top, left })
+                .is_err()
+            {
+                return false;
+            }
+            sent_primary = true;
+        }
+        if let Some(fragment) = fragment {
+            if events
+                .blocking_send(PageEvt::ScrollToFragment(fragment))
+                .is_err()
+            {
+                return false;
+            }
+            sent_primary = true;
+        }
+        if let Some((form, submitter, submission)) = submission {
+            return events
+                .blocking_send(PageEvt::SubmitForm {
+                    form,
+                    submitter,
+                    submission,
+                })
+                .is_ok();
+        }
+        sent_primary || events.blocking_send(PageEvt::Settled).is_ok()
+    }
+
+    fn take_navigation(page: &mut LumenPage) -> Option<(String, bool)> {
+        let replace = call_trust(page, "navigationReplaces", &[], "navigation")
+            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        let value = call_trust(page, "takeNavigation", &[], "navigation")?;
+        if value_is_nullish(&value) {
+            return None;
+        }
+        let url = value_to_string(page, &value)?;
+        (!url.trim().is_empty()).then(|| (url.trim().to_string(), replace))
+    }
+
+    fn send_navigation(
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        url: String,
+        replace: bool,
+    ) -> bool {
+        let event = if replace {
+            PageEvt::Replace(url)
+        } else {
+            PageEvt::Navigate(url)
+        };
+        events.blocking_send(event).is_ok()
+    }
+
+    fn take_scroll_fragment(page: &mut LumenPage) -> Option<String> {
+        let value = call_trust(page, "takeScrollFragment", &[], "fragment navigation")?;
+        (!value_is_nullish(&value))
+            .then(|| value_to_string(page, &value))
+            .flatten()
+    }
+
+    fn take_click_submit(page: &mut LumenPage) -> Option<(usize, usize, Option<FormSubmission>)> {
+        let value = evaluate_task(
+            page,
+            "(function(){var s=__trust.lastClickSubmit;__trust.lastClickSubmit=null;return (s && !s.prevented) ? (s.form + ',' + s.submitter) : '';})()",
+            "click submission",
+        )?;
+        let value = value_to_string(page, &value)?;
+        let (form, submitter) = value.split_once(',')?;
+        let form = form.trim().parse().ok()?;
+        let submitter = submitter.trim().parse().ok()?;
+        if form_method_is_dialog(page, form, submitter) {
+            return None;
+        }
+        let submission = form_submission(page, form, Some(submitter));
+        Some((form, submitter, submission))
+    }
+
+    fn take_form_submit(
+        page: &mut LumenPage,
+    ) -> Option<(usize, Option<usize>, Option<FormSubmission>)> {
+        let value = call_trust(page, "takeFormSubmit", &[], "form submission")?;
+        let value = value_to_string(page, &value)?;
+        let (form, submitter) = value.split_once(',')?;
+        let form = form.trim().parse().ok()?;
+        let submitter = (!submitter.trim().is_empty())
+            .then(|| submitter.trim().parse().ok())
+            .flatten();
+        let submission = form_submission(page, form, submitter);
+        Some((form, submitter, submission))
+    }
+
+    fn form_submission(
+        page: &mut LumenPage,
+        form: usize,
+        submitter: Option<usize>,
+    ) -> Option<FormSubmission> {
+        let value = call_trust(
+            page,
+            "formSubmission",
+            &[
+                Value::Num(form as f64),
+                submitter.map_or(Value::Null, |node| Value::Num(node as f64)),
+            ],
+            "form entry list",
+        )?;
+        let json = value_to_string(page, &value)?;
+        let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+        Some(FormSubmission {
+            action: value.get("action")?.as_str()?.to_string(),
+            method: value.get("method")?.as_str()?.to_string(),
+            body: value.get("body")?.as_str()?.to_string(),
+        })
+    }
+
+    fn form_method_is_dialog(page: &LumenPage, form: usize, submitter: usize) -> bool {
+        let dom = page.dom.borrow();
+        dom.attr(submitter, "formmethod")
+            .or_else(|| dom.attr(form, "method"))
+            .unwrap_or("get")
+            .trim()
+            .eq_ignore_ascii_case("dialog")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn actor_separates_lifecycle_tasks_and_checkpoints_click_microtasks() {
+            let html = r#"<!doctype html><html><body>
+                <span id="phase">parser</span>
+                <button id="target">before</button>
+                <script>
+                    document.addEventListener("DOMContentLoaded", function () {
+                        document.getElementById("phase").textContent = "dom";
+                    });
+                    window.addEventListener("load", function () {
+                        document.getElementById("phase").textContent = "load";
+                    });
+                    document.getElementById("target").addEventListener("click", function () {
+                        this.textContent = "clicked";
+                        Promise.resolve().then(() => this.setAttribute("data-checkpoint", "done"));
+                    });
+                </script>
+            </body></html>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let first = tokio::time::timeout(Duration::from_secs(30), events.recv())
+                .await
+                .expect("initial Lumen render timed out")
+                .expect("Lumen actor closed before initial render");
+            let PageEvt::Updated { html, .. } = first else {
+                panic!("expected an interactive shell, got {first:?}");
+            };
+            assert!(html.contains("<span id=\"phase\">dom</span>"));
+            assert!(!html.contains("<span id=\"phase\">load</span>"));
+
+            let loaded = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. })
+                            if html.contains("<span id=\"phase\">load</span>") =>
+                        {
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before load"),
+                    }
+                }
+            })
+            .await;
+            assert!(loaded.is_ok(), "load remained blocked without resources");
+
+            handle.try_send_user(PageCmd::Click(target)).unwrap();
+            let clicked = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. })
+                            if html.contains("data-checkpoint=\"done\"") =>
+                        {
+                            assert!(html.contains("clicked"));
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before click render"),
+                    }
+                }
+            })
+            .await;
+            assert!(
+                clicked.is_ok(),
+                "click render preceded its mandatory microtask checkpoint"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "lumen-desktop")]
+pub(crate) use desktop::spawn_page;
+
 /// Lumen's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
 /// compare every entry with `js::HOST_FUNCTIONS`, while the table itself remains the single source
 /// used to install functions into each new realm.
