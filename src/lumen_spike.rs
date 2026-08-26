@@ -1821,21 +1821,23 @@ mod desktop {
         }
 
         #[tokio::test]
-        async fn actor_paints_parent_before_initial_frame_navigation_and_delays_load() {
+        async fn actor_paints_parent_before_inserted_frame_navigation_and_delays_load() {
             // HTML "navigate" runs cross-document navigation in parallel; the
             // iframe and parent load events are later DOM-manipulation tasks.
             // In particular, a slow nested document must not hide the parsed,
             // DOMContentLoaded parent shell.
             let html = r#"<!doctype html><html><body>
                 <span id="phase">parser</span>
-                <iframe srcdoc="<p id='child'>child</p>"></iframe>
                 <script>
                     const phase = document.getElementById("phase");
+                    const frame = document.createElement("iframe");
+                    frame.srcdoc = "<p id='child'>child</p>";
+                    frame.addEventListener("load", function () {
+                        phase.textContent += "|frame";
+                    });
+                    document.body.appendChild(frame);
                     document.addEventListener("DOMContentLoaded", function () {
                         phase.textContent = "dom";
-                    });
-                    document.querySelector("iframe").addEventListener("load", function () {
-                        phase.textContent += "|frame";
                     });
                     window.addEventListener("load", function () {
                         phase.textContent += "|load";

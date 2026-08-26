@@ -13650,21 +13650,14 @@ pub(crate) const PRELUDE: &str = r##"
     }
 
     // A freshly inserted <iframe>/<frame> connected to the document begins
-    // loading (HTML "process the iframe attributes" runs on insertion). A frame
+    // navigation (HTML "process the iframe attributes" runs on insertion). A frame
     // built up inside a detached fragment waits until its root is connected —
     // the next load/settle sweep (or a contentDocument read) realizes it then.
-    // (Forward-referenced by the Node insert methods; `processIframeAttributes`
+    // (Forward-referenced by the Node insert methods; `queueFrameNavigation`
     // is hoisted alongside the other iframe helpers below.)
     function maybeProcessInsertedFrame(frame, parent) {
         if (!parent.isConnected) return;
-        try {
-            processIframeAttributes(frame);
-            // The insertion path may have realized the child document through
-            // a parser/framework adapter before the normal frame load task.
-            // Re-run the stylesheet link processing after navigation; the
-            // per-link started flag makes this idempotent.
-            loadFrameStyles(frame);
-        } catch (e) {}
+        queueFrameNavigation(frame);
     }
 
     // The document base URL: <base href> when present (archive.org sets
@@ -14405,7 +14398,7 @@ pub(crate) const PRELUDE: &str = r##"
         // optional resource task keeps a stylesheet failure from aborting the
         // content navigable before its required script runs.
         loadFrameStyles(frame);
-        hydrateFramesIn(frame);
+        queueFrameNavigationsIn(frame);
     }
     // "Process the iframe attributes". The initialInsertion / re-process cases
     // collapse into one idempotent function: the __loaded* de-dup makes a
@@ -14466,6 +14459,44 @@ pub(crate) const PRELUDE: &str = r##"
         }
         return frames.length;
     }
+    // Queue nested-navigation work instead of fetching and executing the
+    // child document on the DOM-mutating script's stack. The counter remains
+    // nonzero until the frame's queued load event has run; nested frames add
+    // their own entries before their parent entry retires.
+    trust.pendingFrameNavigationTasks = 0;
+    trust.hasInitialFramesPending = function () {
+        return trust.pendingFrameNavigationTasks > 0;
+    };
+    function queueFrameNavigation(frame) {
+        if (!frame || !frame.isConnected || frame.__trustNavigationQueued) return false;
+        if (frame.getAttribute("src") === null && frame.getAttribute("srcdoc") === null)
+            return false;
+        frame.__trustNavigationQueued = true;
+        trust.pendingFrameNavigationTasks++;
+        __queue_dom_task(function () {
+            frame.__trustNavigationQueued = false;
+            try {
+                processIframeAttributes(frame);
+                loadFrameStyles(frame);
+            } catch (e) {}
+            // processIframeAttributes queues this frame's load event while
+            // it is running. Append retirement afterward so parent load is
+            // still delayed through that observable event.
+            __queue_dom_task(function () {
+                trust.pendingFrameNavigationTasks = Math.max(
+                    0, trust.pendingFrameNavigationTasks - 1);
+            });
+        });
+        return true;
+    }
+    function queueFrameNavigationsIn(root) {
+        let frames;
+        try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
+        for (let i = 0; i < frames.length; i++) {
+            queueFrameNavigation(frames[i]);
+        }
+        return frames.length;
+    }
     // Parser-created nested navigables start navigation as parsing encounters
     // them, but the navigation itself proceeds in parallel and completion is
     // delivered through later navigation/DOM-manipulation tasks (HTML
@@ -14474,22 +14505,12 @@ pub(crate) const PRELUDE: &str = r##"
     // a captcha or other cross-origin child would then hide the interactive
     // parent until every descendant script had completed.
     //
-    // The trailing sentinel is queued *after* hydration has enqueued every
-    // iframe load event. Resident actors use it as the parent document's load
-    // delay condition. One-shot transforms continue to call hydrateFrames()
-    // synchronously and settle all queued tasks before serializing.
-    trust.initialFramesPending = false;
-    trust.hasInitialFramesPending = function () { return trust.initialFramesPending; };
+    // Resident actors use the pending-navigation counter as the parent
+    // document's load-delay condition. One-shot transforms continue to call
+    // hydrateFrames() synchronously and settle all queued tasks before
+    // serializing.
     trust.queueInitialFrameNavigations = function () {
-        if (trust.initialFramesPending) return;
-        let frames;
-        try { frames = g.document.querySelectorAll("iframe, frame"); } catch (e) { return; }
-        if (!frames.length) return;
-        trust.initialFramesPending = true;
-        __queue_dom_task(function () {
-            hydrateFramesIn(g.document);
-            __queue_dom_task(function () { trust.initialFramesPending = false; });
-        });
+        queueFrameNavigationsIn(g.document);
     };
     // Lazy realization when a script reads a frame's contentDocument before the
     // load sweep (or for a frame inserted after load). The de-dup guards keep a
@@ -15867,7 +15888,7 @@ pub(crate) const PRELUDE: &str = r##"
             // affected slots at the next microtask checkpoint.
             if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
             // Changing src/srcdoc re-runs "process the iframe attributes".
-            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") processIframeAttributes(this); }
+            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
         }
         setAttributeNS(_, n, v) { this.setAttribute(n, v); }
         removeAttribute(n) {
@@ -15887,7 +15908,7 @@ pub(crate) const PRELUDE: &str = r##"
             if (MO.length) moAttr(this, n, old);
             if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
             // Removing src/srcdoc re-runs "process the iframe attributes".
-            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") processIframeAttributes(this); }
+            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
         }
         hasAttribute(n) { return this.getAttribute(n) !== null; }
         getAttributeNames() { return __dom_attr_names(this.__id); }
@@ -16015,7 +16036,7 @@ pub(crate) const PRELUDE: &str = r##"
                 // HTML §4.8.6: innerHTML insertion still processes iframe
                 // attributes and starts each newly inserted nested navigable.
                 // Script elements remain inert under the fragment parser.
-                hydrateFramesIn(this);
+                queueFrameNavigationsIn(this);
                 return;
             }
             const removed = this.childNodes;
@@ -16023,7 +16044,7 @@ pub(crate) const PRELUDE: &str = r##"
             moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
             slotQueueCheck(this);
-            hydrateFramesIn(this);
+            queueFrameNavigationsIn(this);
         }
         // `content` (<template>/<meta>) and `contentDocument`/`contentWindow`
         // (<iframe>/<frame>) moved to their owning interfaces below. A generic
@@ -16067,7 +16088,7 @@ pub(crate) const PRELUDE: &str = r##"
             if (!MO.length || !container) {
                 __dom_insert_adjacent(this.__id, p, String(h));
                 if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
-                hydrateFramesIn(container || this);
+                queueFrameNavigationsIn(container || this);
                 return;
             }
             const before = new Set(container.childNodes.map((k) => k.__id));
@@ -16075,7 +16096,7 @@ pub(crate) const PRELUDE: &str = r##"
             const added = container.childNodes.filter((k) => !before.has(k.__id));
             moChildBulk(container, [], added);
             if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
-            hydrateFramesIn(container);
+            queueFrameNavigationsIn(container);
         }
         insertAdjacentElement(p, el) {
             const pos = String(p).toLowerCase();
@@ -17058,8 +17079,8 @@ pub(crate) const PRELUDE: &str = r##"
                             return {
                                 href: href,
                                 origin: parsed ? parsed[8] : "null",
-                                replace(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
-                                assign(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
+                                replace(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
+                                assign(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
                             };
                         },
                         parent: g, top: g, frames: g, frameElement: this,
@@ -17589,7 +17610,6 @@ pub(crate) const PRELUDE: &str = r##"
         try {
             destination.removeAttribute("srcdoc");
             destination.setAttribute("src", url);
-            processIframeAttributes(destination);
             return null;
         } catch (e) {
             trust.errors.push("hyperlink navigation: " + ((e && e.message) || e));
@@ -17611,9 +17631,9 @@ pub(crate) const PRELUDE: &str = r##"
             get pathname() { return state[5]; }, get search() { return state[6]; },
             get hash() { return state[7]; },
             get origin() { return inherited ? parentLocation.origin : state[8]; },
-            assign(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
-            replace(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
-            reload() { try { frame.__loadedSrc = undefined; processIframeAttributes(frame); } catch (e) {} },
+            assign(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
+            replace(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
+            reload() { try { frame.__loadedSrc = undefined; queueFrameNavigation(frame); } catch (e) {} },
             toString() { return state[0]; },
         };
     }
@@ -18759,6 +18779,7 @@ pub(crate) const PRELUDE: &str = r##"
     reflectOn(["HTMLImageElement", "HTMLScriptElement", "HTMLIFrameElement",
         "HTMLEmbedElement", "HTMLSourceElement", "HTMLTrackElement",
         "HTMLInputElement", "HTMLFrameElement"], "src", reflectUrlDesc);
+    reflectOn(["HTMLIFrameElement"], "srcdoc", reflectStrDesc);
     reflectOn(["HTMLImageElement", "HTMLSourceElement"], "srcset", reflectStrDesc);
     reflectOn(["HTMLImageElement", "HTMLSourceElement"], "sizes", reflectStrDesc);
     reflectOn(["HTMLSourceElement"], "media", reflectStrDesc);
