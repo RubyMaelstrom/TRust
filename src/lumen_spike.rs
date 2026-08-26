@@ -795,8 +795,11 @@ mod desktop {
         engine.ctx().op_state().put(state);
         install_host_boundary(&mut engine);
 
+        // HTML NavigatorID: navigator.userAgent exposes the environment settings object's default
+        // User-Agent value. Keep that identical to the HTTP client and Boa realm; the selected JS
+        // implementation is not a distinct user agent or an observable browser capability.
         let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1 Lumen', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
+            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
             json_string(base.as_str()),
             json_string(crate::locale::LANGUAGE),
             json_string(crate::locale::LANGUAGES[0]),
