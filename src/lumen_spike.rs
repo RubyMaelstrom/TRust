@@ -57,6 +57,10 @@ enum LumenHostTask {
         result: LumenResourceResult,
         external: bool,
     },
+    DynamicModule {
+        request_id: u64,
+        result: Option<(String, String)>,
+    },
     WebSocket {
         id: usize,
         event: crate::ws::WsIn,
@@ -76,6 +80,20 @@ struct LumenNetwork {
     fetched: Arc<std::sync::atomic::AtomicUsize>,
     next_fetch_id: usize,
     pending_fetches: HashMap<usize, Value>,
+}
+
+#[derive(Clone)]
+struct LumenDynamicModuleNetwork {
+    handle: tokio::runtime::Handle,
+    cache: Arc<crate::http::PageCache>,
+    fetched: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct LumenDynamicModuleLoader {
+    page: url::Url,
+    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    network: Option<LumenDynamicModuleNetwork>,
 }
 
 struct LumenWebSockets {
@@ -148,6 +166,7 @@ struct HostState {
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
     pending_resources: usize,
+    pending_dynamic_modules: Arc<std::sync::atomic::AtomicUsize>,
     network: Option<LumenNetwork>,
     websockets: Option<LumenWebSockets>,
     workers: Option<LumenPageWorkers>,
@@ -179,6 +198,7 @@ impl HostState {
             images: Default::default(),
             task_events: None,
             pending_resources: 0,
+            pending_dynamic_modules: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             network: None,
             websockets: None,
             workers: None,
@@ -236,16 +256,42 @@ impl HostState {
 
     fn configure_module_loading(&self, engine: &mut lumen::Engine) {
         engine.set_import_base(self.base.as_str());
-        let Some(network) = self.network.as_ref() else {
+        if let Some(network) = self.network.as_ref() {
+            let page = self.base.clone();
+            let handle = network.handle.clone();
+            let cache = network.cache.clone();
+            let fetched = network.fetched.clone();
+            engine.set_module_loader(move |specifier, referrer| {
+                module_dependency_loader(&page, &handle, &cache, &fetched, specifier, referrer)
+            });
+        }
+
+        // ECMA-262 HostLoadImportedModule/FinishLoadingImportedModule: dynamic import starts a
+        // host load and returns its promise without waiting for I/O. Static graph loading retains
+        // the synchronous fallback above until Lumen exposes an asynchronous graph-loader API.
+        let Some(events) = self.task_events.clone() else {
             return;
         };
-        let page = self.base.clone();
-        let handle = network.handle.clone();
-        let cache = network.cache.clone();
-        let fetched = network.fetched.clone();
-        engine.set_module_loader(move |specifier, referrer| {
-            module_dependency_loader(&page, &handle, &cache, &fetched, specifier, referrer)
-        });
+        let pending_dynamic_modules = self.pending_dynamic_modules.clone();
+        let loader = LumenDynamicModuleLoader {
+            page: self.base.clone(),
+            events,
+            network: self
+                .network
+                .as_ref()
+                .map(|network| LumenDynamicModuleNetwork {
+                    handle: network.handle.clone(),
+                    cache: network.cache.clone(),
+                    fetched: network.fetched.clone(),
+                }),
+        };
+        engine.set_async_dynamic_module_loader(
+            move |request_id, specifier, referrer, _attribute_type| {
+                pending_dynamic_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                queue_dynamic_module_load(&loader, request_id, specifier, referrer);
+                true
+            },
+        );
     }
 }
 
@@ -412,6 +458,7 @@ mod desktop {
     const PAGE_STACK: usize = 64 * 1024 * 1024;
     const WAKE_FLOOR: Duration = Duration::from_millis(16);
     const USER_TASK_BUDGET: Duration = Duration::from_secs(1);
+    const HOST_TASK_RENDER_BURST: usize = 64;
 
     struct LumenPage {
         engine: lumen::Engine,
@@ -420,6 +467,11 @@ mod desktop {
         outcome: Outcome,
         started: Instant,
         last_render: Option<crate::http::RenderedPage>,
+        #[cfg(test)]
+        last_diagnostic_render: Option<String>,
+        live_regions: HashSet<usize>,
+        live_boundaries: HashSet<usize>,
+        boundary_render: HashMap<usize, String>,
         /// Viewport, density, and decoded intrinsic-size changes can require layout even when no
         /// DOM mutation occurred during the host task.
         render_environment_dirty: bool,
@@ -542,8 +594,52 @@ mod desktop {
         // rendering opportunity before the separately queued load task; slow
         // dynamically prepared resources can therefore delay load without
         // hiding the interactive document shell.
-        let (shell, rendered, _) = extract_live(&mut page);
+        let (mut shell, mut rendered, mut has_interaction) = render_with_observers(&mut page);
         page.last_render = Some(rendered.clone());
+        #[cfg(test)]
+        {
+            page.last_diagnostic_render = Some(crate::js::render_canonical(&shell));
+        }
+        let mut lifecycle_complete = false;
+        let mut lifecycle_submission = None;
+
+        // A truly inert document does not need a resident realm. Complete its load task first so
+        // a load handler can still create controls, timers, workers, observers, or navigation;
+        // only then classify the final state as Static. Interactive or pending-work pages retain
+        // the ordinary shell-before-load rendering opportunity below.
+        if !has_resident_work(&mut page, has_interaction) {
+            prepare_task(&interrupt, crate::js::WALL_BUDGET);
+            let _ = evaluate_task(
+                &mut page,
+                "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
+                "load event",
+            );
+            checkpoint(&mut page, "load event");
+            lifecycle_complete = true;
+            if let Some((url, replace)) = take_navigation(&mut page) {
+                let _ = send_navigation(&events, url, replace);
+                return;
+            }
+            lifecycle_submission = take_form_submit(&mut page);
+            (shell, rendered, has_interaction) = render_with_observers(&mut page);
+            page.last_render = Some(rendered.clone());
+            #[cfg(test)]
+            {
+                page.last_diagnostic_render = Some(crate::js::render_canonical(&shell));
+            }
+            if !has_resident_work(&mut page, has_interaction) && lifecycle_submission.is_none() {
+                rendered.direct_actor_nodes = false;
+                let mut outcome = std::mem::take(&mut page.outcome);
+                outcome.elapsed = page.started.elapsed();
+                outcome.rendered = Some(Box::new(rendered));
+                let _ = events.blocking_send(PageEvt::Static {
+                    html: shell,
+                    outcome,
+                });
+                return;
+            }
+        }
+
         let mut outcome = std::mem::take(&mut page.outcome);
         outcome.elapsed = page.started.elapsed();
         outcome.rendered = Some(Box::new(rendered));
@@ -556,6 +652,14 @@ mod desktop {
         {
             return;
         }
+        if let Some((form, submitter, submission)) = lifecycle_submission {
+            let _ = events.blocking_send(PageEvt::SubmitForm {
+                form,
+                submitter,
+                submission,
+            });
+            return;
+        }
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -563,7 +667,6 @@ mod desktop {
             .expect("trust Lumen page actor runtime");
         let wall_origin = Instant::now();
         let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
-        let mut lifecycle_complete = false;
         let mut prefer_timer = false;
         let mut last_timer = None;
         let mut deferred_host_task = None;
@@ -663,12 +766,26 @@ mod desktop {
                 }
                 Wake::Interaction(None) | Wake::Cmd(None) | Wake::Hover(None) => break,
                 Wake::Host(Some(task)) => {
-                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
-                    if let Err(error) = dispatch_host_task(&mut page.engine, task) {
-                        page.outcome.errors.push(error);
+                    // HTML permits one rendering opportunity after several selected tasks. Keep
+                    // each host completion's mandatory microtask checkpoint, but coalesce a
+                    // bounded burst of already-ready resource/network tasks into one paint. This
+                    // prevents a ready module/style batch from exposing every intermediate
+                    // script-removal frame while retaining timer/input fairness.
+                    let mut next = Some(task);
+                    for _ in 0..HOST_TASK_RENDER_BURST {
+                        let Some(task) = next.take() else { break };
+                        prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                        if let Err(error) = dispatch_host_task(&mut page.engine, task) {
+                            page.outcome.errors.push(error);
+                        }
+                        checkpoint(&mut page, "host task");
+                        next = host_rx.try_recv().ok();
                     }
-                    checkpoint(&mut page, "host task");
-                    if !finish_task(&mut page, &events) {
+                    // The bounded burst may have already removed one more task from the
+                    // channel. Preserve it for the next event-loop turn instead of dropping
+                    // the completion at the fairness boundary.
+                    deferred_host_task = next;
+                    if !finish_task_with_ack(&mut page, &events, false) {
                         break;
                     }
                     prefer_timer = true;
@@ -678,7 +795,7 @@ mod desktop {
                     prepare_task(&interrupt, crate::js::WALL_BUDGET);
                     let _ = call_trust(&mut page, "runPlatformTask", &[], "platform task");
                     checkpoint(&mut page, "platform task");
-                    if !finish_task(&mut page, &events) {
+                    if !finish_task_with_ack(&mut page, &events, false) {
                         break;
                     }
                     prefer_timer = true;
@@ -688,7 +805,7 @@ mod desktop {
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let _ = call_trust(&mut page, "tickTo", &[Value::Num(real_now)], "timer task");
                     checkpoint(&mut page, "timer task");
-                    if !finish_task(&mut page, &events) {
+                    if !finish_task_with_ack(&mut page, &events, false) {
                         break;
                     }
                     last_timer = Some(Instant::now());
@@ -703,7 +820,12 @@ mod desktop {
                         "load event",
                     );
                     checkpoint(&mut page, "load event");
-                    if !finish_task(&mut page, &events) {
+                    // HTML §13.2.7 runs the readiness/load steps as their own task. It can
+                    // produce a render, navigation, submission, or error, but `Settled` is
+                    // TRust's acknowledgement for a frontend command. Exposing one for this
+                    // internal lifecycle task can overtake the next click already queued by
+                    // the frontend and make that click appear to have done nothing.
+                    if !finish_task_with_ack(&mut page, &events, false) {
                         break 'event_loop;
                     }
                     prefer_timer = true;
@@ -781,8 +903,11 @@ mod desktop {
         state.blobs = env.blobs.clone();
         state.viewport.set(viewport);
         state.device_pixel_ratio.set(env.device_pixel_ratio);
+        // Inline and data-backed module scripts use the HTML task queue even when this document
+        // has no network runtime. Keep that local task source independent of `enable_network`.
+        state.task_events = Some(host_tasks.clone());
         if let Some(handle) = env.net.clone() {
-            state.enable_network(response_url, handle, env.cache.clone(), host_tasks);
+            state.enable_network(response_url, handle, env.cache.clone(), host_tasks.clone());
             state.base = base.clone();
         }
 
@@ -831,9 +956,9 @@ mod desktop {
             if is_classic(&ty) {
                 let source = initial_classic_source(src.as_deref(), &inline, &env);
                 let Some((name, source, external)) = source else {
-                    outcome
-                        .errors
-                        .push(format!("classic script #{} failed to load", index + 1));
+                    // HTML §4.12.1.1 executes a null script result by firing `error` at the
+                    // element and returning. A fetch/MIME/status rejection is not an uncaught
+                    // JavaScript exception and therefore does not belong in the page error tally.
                     fire_engine_script_event(&mut engine, node, "error");
                     continue;
                 };
@@ -862,6 +987,8 @@ mod desktop {
                 if !external {
                     name = format!("inline-module#{}", index + 1);
                 }
+                let import_base = url::Url::parse(&name).unwrap_or_else(|_| base.clone());
+                speculate_engine_imports(&mut engine, &import_base, source.as_bytes());
                 if trace {
                     eprintln!("lumen: script[{index}] start module {name}");
                 }
@@ -883,6 +1010,11 @@ mod desktop {
             outcome,
             started,
             last_render: None,
+            #[cfg(test)]
+            last_diagnostic_render: None,
+            live_regions: HashSet::new(),
+            live_boundaries: HashSet::new(),
+            boundary_render: HashMap::new(),
             render_environment_dirty: false,
         };
         let _ = evaluate_task(
@@ -978,6 +1110,43 @@ mod desktop {
             .ctx()
             .host_mut::<HostState>()
             .map_or(0, |state| state.pending_resources)
+    }
+
+    fn has_resident_work(page: &mut LumenPage, has_interaction: bool) -> bool {
+        if has_interaction
+            || page.dom.borrow().hover_css_affects_rendering()
+            || !page.dom.borrow().hover_hosts_is_empty()
+        {
+            return true;
+        }
+        let host_work = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .is_some_and(|state| {
+                state.pending_resources > 0
+                    || state
+                        .pending_dynamic_modules
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                    || state
+                        .network
+                        .as_ref()
+                        .is_some_and(|network| !network.pending_fetches.is_empty())
+                    || state
+                        .websockets
+                        .as_ref()
+                        .is_some_and(|sockets| !sockets.sockets.is_empty())
+                    || state
+                        .workers
+                        .as_ref()
+                        .is_some_and(|workers| !workers.workers.is_empty())
+            });
+        host_work
+            || trust_number(page, "nextDeadline").is_some()
+            || trust_bool(page, "hasPlatformTask")
+            || trust_bool(page, "hasScrollWork")
+            || trust_bool(page, "hasInitialFramesPending")
     }
 
     fn prepare_task(interrupt: &Arc<lumen::RuntimeInterrupt>, budget: Duration) {
@@ -1168,6 +1337,7 @@ mod desktop {
     }
 
     fn extract_live(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        prime_page_svg_sprites(page);
         let clickable_listeners = listener_ids(page, "clickables");
         let hover_listeners = listener_ids(page, "hoverables");
         let (clickable, has_interaction) = {
@@ -1217,6 +1387,71 @@ mod desktop {
         (html, rendered, has_interaction)
     }
 
+    /// Run the observer portions of HTML's "update the rendering" algorithm around layout.
+    /// ResizeObserver callbacks precede IntersectionObserver callbacks, and either callback may
+    /// alter geometry that requires another bounded style/layout/observer pass before painting.
+    fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        let mut rendered = extract_live(page);
+        for _ in 0..6 {
+            let resized = trust_number(page, "updateResizes").unwrap_or(0.0);
+            let intersected = trust_number(page, "updateIntersections").unwrap_or(0.0);
+            checkpoint(page, "rendering observers");
+            if resized + intersected <= 0.0 || page.outcome.panicked {
+                break;
+            }
+            rendered = extract_live(page);
+        }
+        rendered
+    }
+
+    /// SVG 2 §5.6: a same-origin external `<use href="sheet.svg#symbol">` obtains the external
+    /// resource document before the use-element shadow tree can be rendered. Keep the resource
+    /// cache and request cap identical to the other Lumen subresource paths.
+    fn prime_page_svg_sprites(page: &mut LumenPage) {
+        let urls = page.dom.borrow().external_svg_use_sheets(&page.base);
+        for url in urls {
+            if crate::dom::sprite_sheet_cached(url.as_str()) {
+                continue;
+            }
+            let prepared = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                let network = state.network.as_ref()?;
+                if !matches!(url.scheme(), "http" | "https")
+                    || !crate::http::subresource_allowed(&state.base, &url)
+                {
+                    return None;
+                }
+                let shared = if let Some(shared) = network.cache.peek(&url) {
+                    shared
+                } else {
+                    if network
+                        .fetched
+                        .fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
+                        )
+                        .is_err()
+                    {
+                        return None;
+                    }
+                    network.cache.fetch(&network.handle, url.clone())
+                };
+                Some((network.handle.clone(), shared))
+            });
+            let Some((handle, shared)) = prepared else {
+                continue;
+            };
+            let Some(response) = crate::http::PageCache::block_on_fetch(Some(&handle), shared)
+            else {
+                continue;
+            };
+            if (200..300).contains(&response.status) {
+                let text = crate::http::decode_body(&response.content_type, &response.body);
+                crate::dom::prime_sprite_sheet(url.as_str(), &text);
+            }
+        }
+    }
+
     fn value_is_nullish(value: &Value) -> bool {
         matches!(value, Value::Null | Value::Undefined | Value::Empty)
     }
@@ -1264,7 +1499,7 @@ mod desktop {
                     return send_navigation(events, url, replace);
                 }
                 let click_submit = take_click_submit(page);
-                if !finish_task(page, events) {
+                if !finish_task_with_ack(page, events, click_submit.is_none()) {
                     return false;
                 }
                 if let Some((form, submitter, submission)) = click_submit {
@@ -1303,7 +1538,7 @@ mod desktop {
                     return send_navigation(events, url, replace);
                 }
                 let click_submit = take_click_submit(page);
-                if !finish_task(page, events) {
+                if !finish_task_with_ack(page, events, click_submit.is_none()) {
                     return false;
                 }
                 if let Some((form, submitter, submission)) = click_submit {
@@ -1440,6 +1675,11 @@ mod desktop {
                 let (html, rendered, _) = extract_live(page);
                 page.render_environment_dirty = false;
                 page.last_render = Some(rendered.clone());
+                #[cfg(test)]
+                {
+                    page.last_diagnostic_render = Some(crate::js::render_canonical(&html));
+                }
+                page.boundary_render.clear();
                 let mut outcome = std::mem::take(&mut page.outcome);
                 outcome.elapsed = page.started.elapsed();
                 outcome.rendered = Some(Box::new(rendered));
@@ -1447,7 +1687,14 @@ mod desktop {
                     .blocking_send(PageEvt::Updated { html, outcome })
                     .is_ok()
             }
-            PageCmd::LiveRegions(_) | PageCmd::LiveBoundaries(_) => true,
+            PageCmd::LiveRegions(nodes) => {
+                page.live_regions = nodes.into_iter().collect();
+                true
+            }
+            PageCmd::LiveBoundaries(nodes) => {
+                page.live_boundaries = nodes.into_iter().collect();
+                true
+            }
             PageCmd::ImageSizes(sizes) => {
                 let mut changed = false;
                 if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
@@ -1581,7 +1828,110 @@ mod desktop {
         (key_name, code)
     }
 
+    #[cfg(test)]
+    enum BoundaryPatchResult {
+        FullRender,
+        Unchanged,
+        Sent(bool),
+    }
+
+    /// Preserve the actor's retained-boundary protocol while the production frontends consume
+    /// complete typed layouts. This follows the same conservative rule as the Boa actor: every
+    /// concrete dirty target must fit a confirmed patchable boundary, otherwise full rendering is
+    /// the always-correct fallback.
+    #[cfg(test)]
+    fn emit_boundary_patch(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+    ) -> BoundaryPatchResult {
+        let Some(mut targets) = page.dom.borrow_mut().take_dirty_targets() else {
+            return BoundaryPatchResult::FullRender;
+        };
+        {
+            let dom = page.dom.borrow();
+            targets.retain(|(node, kind)| {
+                dom.is_connected(*node)
+                    && dom.dirty_target_can_render(*node, *kind)
+                    && (*kind != crate::dom::DirtyKind::Attr || !dom.inert_positioned_attr(*node))
+            });
+        }
+        if targets.is_empty() {
+            return BoundaryPatchResult::Unchanged;
+        }
+        let Some(boundaries) = ({
+            let dom = page.dom.borrow();
+            crate::js::confined_boundaries(
+                &dom,
+                &page.live_regions,
+                &page.live_boundaries,
+                Some(&targets),
+            )
+        }) else {
+            return BoundaryPatchResult::FullRender;
+        };
+
+        let clickable_listeners = listener_ids(page, "clickables");
+        let hover_listeners = listener_ids(page, "hoverables");
+        let boundary_nodes: Vec<usize> = boundaries.iter().map(|(node, _)| *node).collect();
+        let clickable = {
+            let dom = page.dom.borrow();
+            crate::js::clickable_set_for_dom(&dom, &clickable_listeners).0
+        };
+        let (hover, complete_hover_hits) = {
+            let dom = page.dom.borrow();
+            crate::js::hover_set_for_dom(&dom, &hover_listeners)
+        };
+        let paint = page
+            .dom
+            .borrow()
+            .hover_paint_subject_candidates_in(&boundary_nodes);
+        {
+            let mut dom = page.dom.borrow_mut();
+            dom.set_hover_hosts(hover, complete_hover_hits);
+            dom.extend_paint_patch_hosts(paint);
+            dom.set_render_clickables(clickable.clone(), true);
+        }
+
+        let mut patches = Vec::new();
+        {
+            let dom = page.dom.borrow();
+            for (node, tier) in boundaries {
+                let html = dom.serialize_patch(node, &clickable);
+                let canonical = crate::js::render_canonical(&html);
+                if page.boundary_render.get(&node).map(String::as_str) == Some(canonical.as_str()) {
+                    continue;
+                }
+                page.boundary_render.insert(node, canonical);
+                patches.push(crate::js::SubtreePatch { node, html, tier });
+            }
+            page.boundary_render
+                .retain(|node, _| dom.is_connected(*node));
+        }
+        if patches.is_empty() {
+            return BoundaryPatchResult::Unchanged;
+        }
+
+        let (_, rendered, _) = extract_live(page);
+        page.last_render = Some(rendered.clone());
+        let mut outcome = std::mem::take(&mut page.outcome);
+        outcome.elapsed = page.started.elapsed();
+        outcome.rendered = Some(Box::new(rendered));
+        BoundaryPatchResult::Sent(
+            events
+                .blocking_send(PageEvt::Patched { patches, outcome })
+                .is_ok(),
+        )
+    }
+
     fn finish_task(page: &mut LumenPage, events: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+        finish_task_with_ack(page, events, true)
+    }
+
+    fn finish_task_with_ack(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        acknowledge_settle: bool,
+    ) -> bool {
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
             let _ = events.blocking_send(PageEvt::Trouble(errors));
@@ -1596,14 +1946,45 @@ mod desktop {
         let mut sent_primary = false;
         let dom_dirty = page.dom.borrow_mut().take_dirty();
         let environment_dirty = std::mem::take(&mut page.render_environment_dirty);
-        if dom_dirty || environment_dirty {
-            let (html, rendered, _) = extract_live(page);
-            let changed = page
+        #[cfg(test)]
+        let mut render_handled = false;
+        #[cfg(not(test))]
+        let render_handled = false;
+        #[cfg(test)]
+        if dom_dirty && !environment_dirty {
+            match emit_boundary_patch(page, events) {
+                BoundaryPatchResult::FullRender => {}
+                BoundaryPatchResult::Unchanged => render_handled = true,
+                BoundaryPatchResult::Sent(ok) => {
+                    if !ok {
+                        return false;
+                    }
+                    sent_primary = true;
+                    render_handled = true;
+                }
+            }
+        }
+        if (dom_dirty || environment_dirty) && !render_handled {
+            let (html, rendered, _) = render_with_observers(page);
+            let presentation_changed = page
                 .last_render
                 .as_ref()
                 .is_none_or(|previous| !previous.visually_eq(&rendered));
+            #[cfg(test)]
+            let diagnostic_changed = page
+                .last_diagnostic_render
+                .as_deref()
+                .is_none_or(|previous| previous != crate::js::render_canonical(&html));
+            #[cfg(not(test))]
+            let diagnostic_changed = false;
+            let changed = presentation_changed || diagnostic_changed;
             if changed {
                 page.last_render = Some(rendered.clone());
+                #[cfg(test)]
+                {
+                    page.last_diagnostic_render = Some(crate::js::render_canonical(&html));
+                }
+                page.boundary_render.clear();
                 let mut outcome = std::mem::take(&mut page.outcome);
                 outcome.elapsed = page.started.elapsed();
                 outcome.rendered = Some(Box::new(rendered));
@@ -1650,7 +2031,7 @@ mod desktop {
                 })
                 .is_ok();
         }
-        sent_primary || events.blocking_send(PageEvt::Settled).is_ok()
+        sent_primary || !acknowledge_settle || events.blocking_send(PageEvt::Settled).is_ok()
     }
 
     fn take_navigation(page: &mut LumenPage) -> Option<(String, bool)> {
@@ -3378,8 +3759,7 @@ fn module_dependency_loader(
     specifier: &str,
     referrer: &str,
 ) -> Option<(String, String)> {
-    let base = url::Url::parse(referrer).unwrap_or_else(|_| page.clone());
-    let resolved = base.join(specifier).ok()?;
+    let resolved = resolve_module_specifier(page, specifier, referrer)?;
     if resolved.scheme() == "data" {
         let content_type = data_url_content_type(resolved.as_str());
         if !crate::http::module_script_response_allowed(200, &content_type) {
@@ -3414,6 +3794,7 @@ fn module_dependency_loader(
     };
     crate::http::module_script_response_allowed(response.status, &response.content_type).then(
         || {
+            speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
             (
                 resolved.to_string(),
                 crate::http::decode_body(&response.content_type, &response.body),
@@ -3422,12 +3803,229 @@ fn module_dependency_loader(
     )
 }
 
+/// Resolve a module specifier without an import map. HTML's resolve-a-module-specifier algorithm
+/// accepts URL-like specifiers here; a bare specifier is a failure rather than a path relative to
+/// the referrer. Import-map support can replace this boundary without changing either loader.
+fn resolve_module_specifier(page: &url::Url, specifier: &str, referrer: &str) -> Option<url::Url> {
+    if !(specifier.starts_with('/')
+        || specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || url::Url::parse(specifier).is_ok())
+    {
+        return None;
+    }
+    let base = url::Url::parse(referrer).unwrap_or_else(|_| page.clone());
+    base.join(specifier).ok()
+}
+
+fn data_dynamic_module_result(resolved: &url::Url) -> Option<(String, String)> {
+    let content_type = data_url_content_type(resolved.as_str());
+    crate::http::module_script_response_allowed(200, &content_type)
+        .then(|| crate::img::decode_data_url(resolved.as_str()))
+        .flatten()
+        .map(|body| {
+            (
+                resolved.to_string(),
+                crate::http::decode_body(&content_type, &body),
+            )
+        })
+}
+
+/// Start one dynamic module fetch and report only Send data back to the owning page thread. Fetch
+/// and HTML module-script MIME checks happen off-thread; parsing, linking, evaluation, promise
+/// settlement, and the following microtask checkpoint remain serialized in the JS realm.
+fn queue_dynamic_module_load(
+    loader: &LumenDynamicModuleLoader,
+    request_id: u64,
+    specifier: &str,
+    referrer: &str,
+) {
+    let Some(resolved) = resolve_module_specifier(&loader.page, specifier, referrer) else {
+        let _ = loader.events.send(LumenHostTask::DynamicModule {
+            request_id,
+            result: None,
+        });
+        return;
+    };
+    if resolved.scheme() == "data" {
+        let result = data_dynamic_module_result(&resolved);
+        let _ = loader
+            .events
+            .send(LumenHostTask::DynamicModule { request_id, result });
+        return;
+    }
+    let Some(network) = loader.network.as_ref() else {
+        let _ = loader.events.send(LumenHostTask::DynamicModule {
+            request_id,
+            result: None,
+        });
+        return;
+    };
+    if !matches!(resolved.scheme(), "http" | "https")
+        || !crate::http::subresource_allowed(&loader.page, &resolved)
+    {
+        let _ = loader.events.send(LumenHostTask::DynamicModule {
+            request_id,
+            result: None,
+        });
+        return;
+    }
+
+    let shared = if let Some(shared) = network.cache.peek(&resolved) {
+        shared
+    } else {
+        if network
+            .fetched
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
+            )
+            .is_err()
+        {
+            let _ = loader.events.send(LumenHostTask::DynamicModule {
+                request_id,
+                result: None,
+            });
+            return;
+        }
+        network.cache.fetch(&network.handle, resolved.clone())
+    };
+    let events = loader.events.clone();
+    network.cache.spawn(&network.handle, async move {
+        let result = shared.await.ok().and_then(|response| {
+            crate::http::module_script_response_allowed(response.status, &response.content_type)
+                .then(|| {
+                    (
+                        resolved.to_string(),
+                        crate::http::decode_body(&response.content_type, &response.body),
+                    )
+                })
+        });
+        let _ = events.send(LumenHostTask::DynamicModule { request_id, result });
+    });
+}
+
+fn speculate_engine_imports(engine: &mut lumen::Engine, base: &url::Url, body: &[u8]) {
+    let Some((page, handle, cache, fetched)) =
+        engine.ctx().host_mut::<HostState>().and_then(|state| {
+            let network = state.network.as_ref()?;
+            Some((
+                state.base.clone(),
+                network.handle.clone(),
+                network.cache.clone(),
+                network.fetched.clone(),
+            ))
+        })
+    else {
+        return;
+    };
+    speculate_module_imports(&page, &handle, &cache, &fetched, base, body);
+}
+
+/// HTML §4.12.1 fetches a module script and its dependencies in parallel. Lumen's graph loader
+/// intentionally stays synchronous and atomic, so warm every statically named dependency in the
+/// shared page cache before that loader asks for them in source order.
+fn speculate_module_imports(
+    page: &url::Url,
+    handle: &tokio::runtime::Handle,
+    cache: &Arc<crate::http::PageCache>,
+    fetched: &std::sync::atomic::AtomicUsize,
+    base: &url::Url,
+    body: &[u8],
+) {
+    for specifier in crate::js::scan_module_imports(body)
+        .into_iter()
+        .take(crate::js::MAX_SPECULATIVE_IMPORTS)
+    {
+        let Some(resolved) = base
+            .join(&specifier)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+        else {
+            continue;
+        };
+        if cache.peek(&resolved).is_some() {
+            continue;
+        }
+        if !crate::http::subresource_allowed(page, &resolved)
+            || fetched
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
+                )
+                .is_err()
+        {
+            continue;
+        }
+        if std::env::var_os("TRUST_NET_TRACE").is_some() {
+            eprintln!("lumen: module prefetch {resolved}");
+        }
+        cache.prefetch(handle, resolved);
+    }
+}
+
 fn push_engine_error(engine: &mut lumen::Engine, message: String) {
     host_push_injected_error(engine.ctx(), message);
 }
 
 fn fire_engine_script_event(engine: &mut lumen::Engine, node_id: usize, event_type: &str) {
     host_fire_script_event(engine.ctx(), node_id, event_type);
+}
+
+/// HTML's run-a-module-script completion steps wait for the module's evaluation promise, including
+/// top-level await. Retaining this as a pending resource also keeps the document load event behind
+/// parser-inserted module evaluation. Each reaction runs during the owning realm's microtask
+/// checkpoint and performs the element's success/failure steps exactly once.
+fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &str) -> bool {
+    let Some(promise) = engine.module_evaluation_promise(name) else {
+        return false;
+    };
+    if let Some(state) = engine.ctx().host_mut::<HostState>() {
+        state.pending_resources += 1;
+    } else {
+        return false;
+    }
+
+    let fulfilled = engine.ctx().new_native_fn(
+        "",
+        0,
+        Rc::new(move |ctx, _this, _args| {
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                state.pending_resources = state.pending_resources.saturating_sub(1);
+            }
+            host_fire_script_event(ctx, node_id, "load");
+            Ok(Value::Undefined)
+        }),
+    );
+    let failed_name = name.to_string();
+    let rejected = engine.ctx().new_native_fn(
+        "",
+        1,
+        Rc::new(move |ctx, _this, args| {
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                state.pending_resources = state.pending_resources.saturating_sub(1);
+            }
+            let reason = args
+                .first()
+                .and_then(|value| ctx.coerce_string(value).ok())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("module evaluation failed"));
+            host_push_injected_error(ctx, format!("module {failed_name}: {reason}"));
+            host_fire_script_event(ctx, node_id, "error");
+            Ok(Value::Undefined)
+        }),
+    );
+    let attached = engine
+        .ctx()
+        .member_get(&promise, "then")
+        .and_then(|then| engine.ctx().invoke(then, promise, &[fulfilled, rejected]))
+        .is_ok();
+    if !attached && let Some(state) = engine.ctx().host_mut::<HostState>() {
+        state.pending_resources = state.pending_resources.saturating_sub(1);
+    }
+    attached
 }
 
 fn run_injected_classic_task(
@@ -3523,8 +4121,12 @@ fn run_injected_module_task(
     }));
     match evaluated {
         Ok(Ok(lumen::ExecutionOutcome::Value(_))) => {
-            // HTML fires load after successful evaluation for both external and inline modules.
-            fire_engine_script_event(engine, node_id, "load");
+            if !track_module_evaluation(engine, node_id, name) {
+                fire_engine_script_event(engine, node_id, "load");
+            }
+            engine.run_microtasks_interruptible().map_err(|reason| {
+                format!("module {name} microtasks interrupted: {}", reason.message())
+            })?;
         }
         Ok(Ok(lumen::ExecutionOutcome::Throw { name: ty, message })) => {
             push_engine_error(engine, format!("module {name}: {ty}: {message}"));
@@ -3700,6 +4302,21 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 state.pending_resources = state.pending_resources.saturating_sub(1);
             }
             run_resource_task(engine, node_id, name, kind, result, external)?;
+        }
+        LumenHostTask::DynamicModule { request_id, result } => {
+            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                let _ = state.pending_dynamic_modules.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |count| Some(count.saturating_sub(1)),
+                );
+            }
+            if let Some((name, source)) = result.as_ref()
+                && let Ok(base) = url::Url::parse(name)
+            {
+                speculate_engine_imports(engine, &base, source.as_bytes());
+            }
+            let _ = engine.finish_dynamic_module_load(request_id, result);
         }
         LumenHostTask::WebSocket { id, event } => {
             dispatch_websocket_task(engine, id, event)?;
@@ -5862,7 +6479,19 @@ mod tests {
             Some(4)
         );
 
-        for _ in 0..4 {
+        // Four inserted resources plus the classic script's asynchronous dynamic-import fetch.
+        // The latter does not delay the classic script element's load event, but its promise must
+        // still settle in a later networking task.
+        for _ in 0..8 {
+            let resources_done = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .is_some_and(|state| state.pending_resources == 0);
+            if resources_done
+                && string_value(&mut engine, "String(globalThis.classicImport)") == "17"
+            {
+                break;
+            }
             let task = runtime
                 .block_on(async {
                     tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await
@@ -5892,8 +6521,8 @@ mod tests {
             "classic script cleanup/load ordering: {order}"
         );
         assert!(
-            order.find("classic-import:17") < order.find("classic-load"),
-            "classic-script dynamic import must settle during cleanup: {order}"
+            order.find("classic-load") < order.find("classic-import:17"),
+            "dynamic import must not delay classic-script load completion: {order}"
         );
         assert_eq!(string_value(&mut engine, "String(classicCurrent)"), "true");
         assert_eq!(string_value(&mut engine, "String(classicImport)"), "17");
@@ -5901,6 +6530,86 @@ mod tests {
             string_value(&mut engine, "String(classicMicroCurrent)"),
             "true"
         );
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| state.pending_resources),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn top_level_await_delays_module_load_completion() {
+        // HTML §4.12.1: running a module script waits for its evaluation promise. In particular,
+        // top-level await must delay both the script element's load event and the document's load
+        // event until the awaited dynamic-import graph finishes evaluating.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        cache.seed(
+            page.join("dep.js").unwrap().to_string(),
+            200,
+            String::from("text/javascript"),
+            b"globalThis.awaitedModuleBody = 'done'; export default 1;".to_vec(),
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, DEFAULT_URL);
+        eval(
+            &mut engine,
+            r#"
+                const html = document.createElement('html');
+                const body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const script = document.createElement('script');
+                script.id = 'entry';
+                globalThis.awaitedModuleEvent = 'pending';
+                script.onload = () => awaitedModuleEvent = 'load';
+                script.onerror = () => awaitedModuleEvent = 'error';
+                body.appendChild(script);
+            "#,
+            "module event target",
+        )
+        .unwrap();
+        let node_id = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .and_then(|state| state.dom.borrow().get_by_id("entry"))
+            .expect("module event target exists");
+
+        run_injected_module_task(
+            &mut engine,
+            node_id,
+            DEFAULT_URL,
+            "await import('./dep.js'); globalThis.awaitedEntryBody = 'done';",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "awaitedModuleEvent"), "pending");
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| state.pending_resources),
+            Some(1)
+        );
+
+        let task = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await })
+            .expect("dynamic module task completes")
+            .expect("dynamic module channel remains open");
+        dispatch_host_task(&mut engine, task).unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(string_value(&mut engine, "awaitedModuleBody"), "done");
+        assert_eq!(string_value(&mut engine, "awaitedEntryBody"), "done");
+        assert_eq!(string_value(&mut engine, "awaitedModuleEvent"), "load");
         assert_eq!(
             engine
                 .ctx()

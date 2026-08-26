@@ -5527,8 +5527,29 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        // Cross-document navigation runs in parallel and completes as a later task. An actor may
+        // expose the parsed parent as its first rendering opportunity, so wait for the canonical
+        // frame projection instead of assuming it must be folded into that first paint.
+        if !body.contains("data-trust-frame") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("initial frame navigation keeps the page live");
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !body.contains("data-trust-frame") && std::time::Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        body = html;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
         assert!(
             body.contains("data-trust-frame"),
             "frame wrapper missing: {body}"
@@ -6902,10 +6923,34 @@ mod tests {
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
         let started = std::time::Instant::now();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
         let peak = peak.load(Relaxed);
-        let body = String::from_utf8_lossy(&response.body);
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        // A rendering opportunity may expose the interactive shell while the entry module is
+        // suspended at top-level await. The module script still delays `load`; observe the actor's
+        // later rendering update rather than requiring all frontends to suppress that valid paint.
+        if !body.contains(&format!("got {N}")) {
+            let live = response
+                .live
+                .as_mut()
+                .expect("pending module evaluation keeps the page actor live");
+            body = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match live.events.recv().await {
+                        Some(crate::js::PageEvt::Updated { html, .. })
+                            if html.contains(&format!("got {N}")) =>
+                        {
+                            break html;
+                        }
+                        Some(_) => {}
+                        None => panic!("page actor closed before module evaluation completed"),
+                    }
+                }
+            })
+            .await
+            .expect("module evaluation render timed out");
+        }
         eprintln!(
             "static_module_graph_prefetches_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
         );
@@ -7011,10 +7056,34 @@ mod tests {
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
         let started = std::time::Instant::now();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
         let peak = peak.load(Relaxed);
-        let body = String::from_utf8_lossy(&response.body);
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        // A rendering opportunity may expose the interactive shell while the entry module is
+        // suspended at top-level await. The module script still delays `load`; observe the actor's
+        // later rendering update rather than requiring all frontends to suppress that valid paint.
+        if !body.contains(&format!("got {N}")) {
+            let live = response
+                .live
+                .as_mut()
+                .expect("pending module evaluation keeps the page actor live");
+            body = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match live.events.recv().await {
+                        Some(crate::js::PageEvt::Updated { html, .. })
+                            if html.contains(&format!("got {N}")) =>
+                        {
+                            break html;
+                        }
+                        Some(_) => {}
+                        None => panic!("page actor closed before module evaluation completed"),
+                    }
+                }
+            })
+            .await
+            .expect("module evaluation render timed out");
+        }
         eprintln!(
             "dynamic_sibling_imports_load_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
         );
@@ -8939,8 +9008,29 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("modules drive TRust — dynamically") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("top-level await keeps the module page live");
+            body = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match live.events.recv().await {
+                        Some(crate::js::PageEvt::Updated { html, .. })
+                            if html.contains("modules drive TRust — dynamically") =>
+                        {
+                            break html;
+                        }
+                        Some(_) => {}
+                        None => panic!("module page actor closed before evaluation completed"),
+                    }
+                }
+            })
+            .await
+            .expect("module graph render timed out");
+        }
         let outcome = response.js.as_ref().expect("js ran");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(outcome.modules_skipped, 0);
