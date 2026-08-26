@@ -1114,6 +1114,26 @@ mod desktop {
                 eprintln!("lumen: console: {message}");
             }
         }
+        if let Ok(source) = std::env::var("TRUST_LUMEN_PROBE") {
+            match page.engine.eval_value_interruptible(&source) {
+                Ok(Ok(value)) => {
+                    eprintln!("lumen: probe: {}", value_string(&mut page.engine, &value))
+                }
+                Ok(Err(EvalError::Throw(error))) => {
+                    eprintln!(
+                        "lumen: probe threw: {}",
+                        describe_throw(&mut page.engine, error, "probe")
+                    );
+                }
+                Ok(Err(EvalError::Interrupted(reason))) => {
+                    eprintln!("lumen: probe interrupted: {}", reason.message());
+                }
+                Err(error) => eprintln!(
+                    "lumen: probe parse error at line {}: {}",
+                    error.line, error.message
+                ),
+            }
+        }
         page.outcome.fetches = page
             .engine
             .ctx()
