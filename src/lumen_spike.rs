@@ -823,7 +823,9 @@ mod desktop {
         }
 
         let started = Instant::now();
+        let trace = std::env::var_os("TRUST_LUMEN_TRACE").is_some();
         for (index, (src, inline, ty, node)) in scripts.into_iter().enumerate() {
+            let script_started = Instant::now();
             if is_classic(&ty) {
                 let source = initial_classic_source(src.as_deref(), &inline, &env);
                 let Some((name, source, external)) = source else {
@@ -833,10 +835,19 @@ mod desktop {
                     fire_engine_script_event(&mut engine, node, "error");
                     continue;
                 };
+                if trace {
+                    eprintln!("lumen: script[{index}] start classic {name}");
+                }
                 if let Err(error) = run_injected_classic_task(&mut engine, node, &name, &source) {
                     outcome.errors.push(error);
                 } else if external {
                     fire_engine_script_event(&mut engine, node, "load");
+                }
+                if trace {
+                    eprintln!(
+                        "lumen: script[{index}] done +{}ms",
+                        script_started.elapsed().as_millis()
+                    );
                 }
             } else if ty.as_deref().is_some_and(|ty| ty.trim() == "module") {
                 let external = src.is_some();
@@ -849,12 +860,20 @@ mod desktop {
                 if !external {
                     name = format!("inline-module#{}", index + 1);
                 }
+                if trace {
+                    eprintln!("lumen: script[{index}] start module {name}");
+                }
                 if let Err(error) = run_injected_module_task(&mut engine, node, &name, &source) {
                     outcome.errors.push(error);
                 }
+                if trace {
+                    eprintln!(
+                        "lumen: script[{index}] done +{}ms",
+                        script_started.elapsed().as_millis()
+                    );
+                }
             }
         }
-
         let mut page = LumenPage {
             engine,
             dom,
@@ -1058,6 +1077,8 @@ mod desktop {
     }
 
     fn drain_diagnostics(page: &mut LumenPage) {
+        let error_start = page.outcome.errors.len();
+        let console_start = page.outcome.console.len();
         for (source, errors) in [
             ("__trust.errors.splice(0).join('\\u0000')", true),
             ("__trust.logs.splice(0).join('\\u0000')", false),
@@ -1084,6 +1105,14 @@ mod desktop {
             page.outcome
                 .console
                 .push(format!("unhandled rejection: {message}"));
+        }
+        if std::env::var_os("TRUST_LUMEN_TRACE").is_some() {
+            for error in &page.outcome.errors[error_start..] {
+                eprintln!("lumen: {error}");
+            }
+            for message in &page.outcome.console[console_start..] {
+                eprintln!("lumen: console: {message}");
+            }
         }
         page.outcome.fetches = page
             .engine
