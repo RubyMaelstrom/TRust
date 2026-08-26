@@ -5725,10 +5725,6 @@ fn parse_desktop_args(args: impl IntoIterator<Item = String>) -> Result<DesktopO
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    #[cfg(feature = "lumen-desktop")]
-    if env!("CARGO_BIN_NAME") == "trust-desktop-lumen" {
-        trust::js::select_lumen_backend();
-    }
     let options = parse_desktop_args(std::env::args().skip(1))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.help {

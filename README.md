@@ -2,7 +2,7 @@
 
 A terminal-based browser written in Rust, that's why it's called TRust.
 Oh wait, did you know it also supports telnet, gopher, gemini, finger, and whois?
-Oh, and HTTP. With a full rusty JS engine forked from Boa and customized.
+Oh, and HTTP. With the pure-Rust Lumen JavaScript engine integrated directly.
 Image support? We got it. Live JS rendering? Yup. Full CSS? Yeah.
 
 Browse the web, connect to MUDs, check out your favorite gopher holes and
@@ -14,7 +14,25 @@ search, channel, and other browsing pages remain in TRust.
 
 ## Installation
 
-Just `git clone` this repo and then `cargo build --release`.
+TRust currently expects its maintained Lumen checkout as a sibling directory:
+
+```text
+Code/
+├── Lumen/   # TRust integration branch, currently 384e7f4
+└── TRust/
+```
+
+From `TRust`, `cargo build --release` builds the Lumen-only `trust` and
+`trust-desktop` release binaries. Lumen is selected at compile time, so neither
+artifact contains the legacy Boa engine.
+
+The vendored Boa backend remains available for regression comparisons, but is
+not built normally:
+
+```sh
+cargo build --release --no-default-features --features mimalloc,boa-backend \
+  --bin trust-boa --bin trust-desktop-boa
+```
 
 The native desktop architecture is also available as `trust-desktop`. It uses
 winit and the same CSS-pixel layout engine as the terminal browser. HTML boxes,

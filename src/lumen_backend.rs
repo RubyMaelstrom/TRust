@@ -1,9 +1,8 @@
-//! Opt-in Lumen backend under construction.
+//! Production Lumen JavaScript backend and its synthetic benchmark harness.
 //!
-//! This shares TRust's real platform prelude, DOM arena, and integer-handle host boundary while
-//! leaving the production Boa page actor untouched. Host operations are being moved across in
-//! standards-oriented slices and are checked against Boa's canonical registry so names and
-//! JavaScript-visible function lengths cannot drift silently.
+//! The resident actor shares TRust's platform prelude, DOM arena, and integer-handle host boundary
+//! with the legacy Boa implementation. Both engine adapters are checked against the same
+//! engine-neutral registry so host names and JavaScript-visible function lengths cannot drift.
 
 use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
@@ -44,7 +43,7 @@ enum LumenResourceKind {
 /// Send-only work returned by background platform operations. Engine values never enter this
 /// channel: the page thread retains Promise resolvers in [`LumenNetwork`] and settles them after
 /// selecting the corresponding HTML task.
-#[allow(dead_code)] // Read by the resident Lumen actor once the backend cutover reaches src/js.rs.
+#[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
     FetchDone {
         id: usize,
@@ -449,16 +448,148 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     })
 }
 
-#[cfg(feature = "lumen-desktop")]
+#[cfg(feature = "lumen-backend")]
 mod desktop {
     use super::*;
     use crate::js::{FormSubmission, Outcome, PageCmd, PageEnv, PageEvt, PageHandle, PageHover};
     use std::collections::HashSet;
 
     const PAGE_STACK: usize = 64 * 1024 * 1024;
-    const WAKE_FLOOR: Duration = Duration::from_millis(16);
-    const USER_TASK_BUDGET: Duration = Duration::from_secs(1);
     const HOST_TASK_RENDER_BURST: usize = 64;
+
+    /// Run the Lumen page pipeline as a one-shot transformation.
+    ///
+    /// This path exists for diagnostics and the non-resident HTTP helpers. It
+    /// uses the same parser task, microtask checkpoints, platform task source,
+    /// timer ordering, and host-completion dispatch as the resident actor; the
+    /// only difference is that virtual time advances to the next timer because
+    /// there is no displayed document which could observe real time passing.
+    pub(crate) fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
+        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let env = PageEnv {
+            url: env.url.clone(),
+            viewport: env.viewport,
+            cell_px: env.cell_px,
+            device_pixel_ratio: env.device_pixel_ratio,
+            externals: env.externals.clone(),
+            sheets: env.sheets.clone(),
+            cache: env.cache.clone(),
+            net: env.net.clone(),
+            storage: env.storage.clone(),
+            blobs: env.blobs.clone(),
+        };
+        let mut page = match load_page(html, env, host_tx, interrupt.clone()) {
+            Ok(page) => page,
+            Err(mut outcome) => {
+                outcome.elapsed = Duration::ZERO;
+                return (html.to_string(), outcome);
+            }
+        };
+        let _ = evaluate_task(&mut page, "__trust.oneShot = true;", "one-shot setup");
+        let _ = evaluate_task(
+            &mut page,
+            "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
+            "load event",
+        );
+        checkpoint(&mut page, "load event");
+
+        // A one-shot document has no future rendering opportunity, so advance
+        // its task sources until they are quiescent. The cap is a diagnostic
+        // resource envelope, not a browsing deadline or replacement for the
+        // resident event loop.
+        for _ in 0..100_000 {
+            if let Ok(task) = host_rx.try_recv() {
+                if let Err(error) = dispatch_host_task(&mut page.engine, task) {
+                    page.outcome.errors.push(error);
+                }
+                checkpoint(&mut page, "host task");
+                continue;
+            }
+            if trust_bool(&mut page, "hasPlatformTask") {
+                let ran = call_trust(&mut page, "runPlatformTask", &[], "platform task")
+                    .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                checkpoint(&mut page, "platform task");
+                if ran {
+                    continue;
+                }
+            }
+            let Some(deadline) = trust_number(&mut page, "nextDeadline") else {
+                break;
+            };
+            let ran = call_trust(&mut page, "tickTo", &[Value::Num(deadline)], "timer task")
+                .and_then(|value| value.as_num_opt())
+                .unwrap_or(0.0);
+            checkpoint(&mut page, "timer task");
+            if ran <= 0.0 {
+                break;
+            }
+        }
+        page.outcome.elapsed = page.started.elapsed();
+        let output = page.dom.borrow().serialize(DOCUMENT);
+        (output, std::mem::take(&mut page.outcome))
+    }
+
+    struct ActorTaskTrace {
+        interval_started: Instant,
+        turns: u64,
+        interactions: u64,
+        commands: u64,
+        hovers: u64,
+        host_tasks: u64,
+        platform_turns: u64,
+        platform_tasks: u64,
+        idle_turns: u64,
+        timer_turns: u64,
+        timer_tasks: u64,
+        lifecycle_turns: u64,
+        finishes: u64,
+        dirty_finishes: u64,
+        render_passes: u64,
+        visual_updates: u64,
+    }
+
+    impl ActorTaskTrace {
+        fn enabled() -> Option<Self> {
+            std::env::var_os("TRUST_LUMEN_TASK_TRACE").map(|_| Self {
+                interval_started: Instant::now(),
+                turns: 0,
+                interactions: 0,
+                commands: 0,
+                hovers: 0,
+                host_tasks: 0,
+                platform_turns: 0,
+                platform_tasks: 0,
+                idle_turns: 0,
+                timer_turns: 0,
+                timer_tasks: 0,
+                lifecycle_turns: 0,
+                finishes: 0,
+                dirty_finishes: 0,
+                render_passes: 0,
+                visual_updates: 0,
+            })
+        }
+
+        fn reset(&mut self) {
+            self.interval_started = Instant::now();
+            self.turns = 0;
+            self.interactions = 0;
+            self.commands = 0;
+            self.hovers = 0;
+            self.host_tasks = 0;
+            self.platform_turns = 0;
+            self.platform_tasks = 0;
+            self.idle_turns = 0;
+            self.timer_turns = 0;
+            self.timer_tasks = 0;
+            self.lifecycle_turns = 0;
+            self.finishes = 0;
+            self.dirty_finishes = 0;
+            self.render_passes = 0;
+            self.visual_updates = 0;
+        }
+    }
 
     struct LumenPage {
         engine: lumen::Engine,
@@ -475,6 +606,7 @@ mod desktop {
         /// Viewport, density, and decoded intrinsic-size changes can require layout even when no
         /// DOM mutation occurred during the host task.
         render_environment_dirty: bool,
+        task_trace: Option<ActorTaskTrace>,
     }
 
     enum Wake {
@@ -483,6 +615,7 @@ mod desktop {
         Hover(Option<PageHover>),
         Host(Option<LumenHostTask>),
         Platform,
+        Idle(f64),
         Timer,
         Lifecycle,
     }
@@ -513,9 +646,8 @@ mod desktop {
         }
     }
 
-    /// Spawn the experimental Lumen resident realm behind the same actor
-    /// contract used by both frontends. The separately named desktop binary is
-    /// the only production-shaped entry point which selects this function.
+    /// Spawn the production Lumen resident realm behind the actor contract
+    /// shared by the terminal and desktop frontends.
     pub(crate) fn spawn_page(
         html: String,
         env: PageEnv,
@@ -608,7 +740,7 @@ mod desktop {
         // only then classify the final state as Static. Interactive or pending-work pages retain
         // the ordinary shell-before-load rendering opportunity below.
         if !has_resident_work(&mut page, has_interaction) {
-            prepare_task(&interrupt, crate::js::WALL_BUDGET);
+            prepare_unbounded_task(&interrupt);
             let _ = evaluate_task(
                 &mut page,
                 "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
@@ -668,7 +800,6 @@ mod desktop {
         let wall_origin = Instant::now();
         let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
         let mut prefer_timer = false;
-        let mut last_timer = None;
         let mut deferred_host_task = None;
 
         'event_loop: loop {
@@ -683,9 +814,14 @@ mod desktop {
             let now = observed_now.max(virtual_origin + elapsed);
             virtual_origin = now - elapsed;
             let deadline = trust_number(&mut page, "nextDeadline");
-            let timer_due = deadline.is_some_and(|deadline| deadline <= now)
-                && last_timer.is_none_or(|last: Instant| last.elapsed() >= WAKE_FLOOR);
+            let timer_due = deadline.is_some_and(|deadline| deadline <= now);
             let platform_ready = trust_bool(&mut page, "hasPlatformTask");
+            let idle_deadline = if !platform_ready && trust_bool(&mut page, "hasIdleRequest") {
+                let end = deadline.map_or(now + 50.0, |deadline| deadline.min(now + 50.0));
+                (end > now).then_some(end)
+            } else {
+                None
+            };
             let load_ready = !lifecycle_complete
                 && pending_resources(&mut page) == 0
                 && !trust_bool(&mut page, "hasInitialFramesPending");
@@ -713,12 +849,23 @@ mod desktop {
                 immediate = Some(Wake::Timer);
             } else if let Ok(command) = cmds.try_recv() {
                 immediate = Some(Wake::Cmd(Some(command)));
+            } else if let Some(deadline) = idle_deadline {
+                immediate = Some(Wake::Idle(deadline));
             }
 
-            let wait = deadline.map(|deadline| {
-                Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0).max(WAKE_FLOOR)
-            });
+            let wait = deadline
+                .map(|deadline| Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0));
             let wake = immediate.unwrap_or_else(|| {
+                // Lumen's forced host collection is an idle hook, not a task-
+                // boundary hook. A future timer/animation-frame deadline means
+                // the realm still has active work; allocation-triggered task
+                // checks retain responsibility there. Forcing a full tracing
+                // collection before every 16 ms animation sleep made a large
+                // YouTube heap consume a core while callbacks made no DOM
+                // changes. Collect only before a genuinely indefinite park.
+                if wait.is_none() {
+                    page.engine.collect_garbage_at_idle();
+                }
                 interrupt.set_deadline(None);
                 runtime.block_on(async {
                     tokio::select! {
@@ -741,6 +888,20 @@ mod desktop {
                 }
                 _ => None,
             };
+
+            if let Some(trace) = page.task_trace.as_mut() {
+                trace.turns += 1;
+                match &wake {
+                    Wake::Interaction(_) => trace.interactions += 1,
+                    Wake::Cmd(_) => trace.commands += 1,
+                    Wake::Hover(_) => trace.hovers += 1,
+                    Wake::Host(_) => {}
+                    Wake::Platform => trace.platform_turns += 1,
+                    Wake::Idle(_) => trace.idle_turns += 1,
+                    Wake::Timer => trace.timer_turns += 1,
+                    Wake::Lifecycle => trace.lifecycle_turns += 1,
+                }
+            }
 
             match wake {
                 Wake::Interaction(Some(command)) | Wake::Cmd(Some(command)) => {
@@ -774,7 +935,10 @@ mod desktop {
                     let mut next = Some(task);
                     for _ in 0..HOST_TASK_RENDER_BURST {
                         let Some(task) = next.take() else { break };
-                        prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                        if let Some(trace) = page.task_trace.as_mut() {
+                            trace.host_tasks += 1;
+                        }
+                        prepare_unbounded_task(&interrupt);
                         if let Err(error) = dispatch_host_task(&mut page.engine, task) {
                             page.outcome.errors.push(error);
                         }
@@ -792,28 +956,58 @@ mod desktop {
                 }
                 Wake::Host(None) => break,
                 Wake::Platform => {
-                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
-                    let _ = call_trust(&mut page, "runPlatformTask", &[], "platform task");
+                    prepare_unbounded_task(&interrupt);
+                    let ran = call_trust(&mut page, "runPlatformTask", &[], "platform task")
+                        .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                    if ran && let Some(trace) = page.task_trace.as_mut() {
+                        trace.platform_tasks += 1;
+                    }
                     checkpoint(&mut page, "platform task");
                     if !finish_task_with_ack(&mut page, &events, false) {
                         break;
                     }
                     prefer_timer = true;
                 }
+                Wake::Idle(deadline) => {
+                    prepare_unbounded_task(&interrupt);
+                    let _ = call_trust(
+                        &mut page,
+                        "startIdlePeriod",
+                        &[Value::Num(deadline)],
+                        "start idle period",
+                    );
+                    let ran = call_trust(&mut page, "runPlatformTask", &[], "idle task")
+                        .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                    if ran && let Some(trace) = page.task_trace.as_mut() {
+                        trace.platform_tasks += 1;
+                    }
+                    checkpoint(&mut page, "idle task");
+                    if !finish_task_with_ack(&mut page, &events, false) {
+                        break;
+                    }
+                    prefer_timer = true;
+                }
                 Wake::Timer => {
-                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                    prepare_unbounded_task(&interrupt);
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
-                    let _ = call_trust(&mut page, "tickTo", &[Value::Num(real_now)], "timer task");
+                    let ran =
+                        call_trust(&mut page, "tickTo", &[Value::Num(real_now)], "timer task")
+                            .and_then(|value| value.as_num_opt())
+                            .unwrap_or(0.0);
+                    if ran > 0.0
+                        && let Some(trace) = page.task_trace.as_mut()
+                    {
+                        trace.timer_tasks += ran as u64;
+                    }
                     checkpoint(&mut page, "timer task");
                     if !finish_task_with_ack(&mut page, &events, false) {
                         break;
                     }
-                    last_timer = Some(Instant::now());
                     prefer_timer = false;
                 }
                 Wake::Lifecycle => {
                     lifecycle_complete = true;
-                    prepare_task(&interrupt, crate::js::WALL_BUDGET);
+                    prepare_unbounded_task(&interrupt);
                     let _ = evaluate_task(
                         &mut page,
                         "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
@@ -831,9 +1025,10 @@ mod desktop {
                     prefer_timer = true;
                 }
             }
-            page.engine.collect_garbage_at_idle();
-            // Deadlines bound author execution, not the host's idle scheduling
-            // queries. Navigation/cancellation flags remain independently set.
+            report_task_trace(&mut page);
+            // Ordinary tasks have no wall-clock deadline. Clear an explicit
+            // diagnostic deadline before the host returns to scheduling;
+            // navigation and cancellation use separate interrupt state.
             interrupt.set_deadline(None);
         }
     }
@@ -895,7 +1090,7 @@ mod desktop {
         };
         dom.borrow_mut().set_doc_url(Some(base.clone()));
 
-        interrupt.set_deadline(Some(Instant::now() + crate::js::WALL_BUDGET));
+        interrupt.set_deadline(None);
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(dom.clone(), clock.clone());
         state.base = base.clone();
@@ -954,7 +1149,7 @@ mod desktop {
         for (index, (src, inline, ty, node)) in scripts.into_iter().enumerate() {
             let script_started = Instant::now();
             if is_classic(&ty) {
-                let source = initial_classic_source(src.as_deref(), &inline, &env);
+                let source = initial_classic_source(src.as_deref(), &inline, &env, &base);
                 let Some((name, source, external)) = source else {
                     // HTML §4.12.1.1 executes a null script result by firing `error` at the
                     // element and returning. A fetch/MIME/status rejection is not an uncaught
@@ -1016,6 +1211,7 @@ mod desktop {
             live_boundaries: HashSet::new(),
             boundary_render: HashMap::new(),
             render_environment_dirty: false,
+            task_trace: ActorTaskTrace::enabled(),
         };
         let _ = evaluate_task(
             &mut page,
@@ -1040,6 +1236,7 @@ mod desktop {
         src: Option<&str>,
         inline: &str,
         env: &PageEnv,
+        base: &url::Url,
     ) -> Option<(String, String, bool)> {
         let Some(src) = src else {
             return Some((String::from("inline script"), inline.to_string(), false));
@@ -1052,17 +1249,42 @@ mod desktop {
                 true,
             ));
         }
-        let body = env
+        if let Some(body) = env
             .externals
             .iter()
-            .find(|(name, _)| name == src)?
-            .1
-            .as_ref()?;
-        Some((
-            src.to_string(),
-            String::from_utf8_lossy(body).into_owned(),
-            true,
-        ))
+            .find(|(name, _)| name == src)
+            .and_then(|(_, body)| body.as_ref())
+        {
+            return Some((
+                src.to_string(),
+                String::from_utf8_lossy(body).into_owned(),
+                true,
+            ));
+        }
+
+        // HTML §4.12.1.1, "prepare the script element": prefetching is an
+        // optional optimization. Once a connected classic script with `src`
+        // is prepared, fetching that classic script is mandatory even when a
+        // preload scanner did not announce it.
+        let resolved = base.join(src).ok()?;
+        let handle = env.net.as_ref()?;
+        let fetch = env
+            .cache
+            .peek(&resolved)
+            .unwrap_or_else(|| env.cache.fetch(handle, resolved.clone()));
+        let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
+        crate::http::classic_script_response_allowed(
+            response.status,
+            &response.content_type,
+            &response.headers,
+        )
+        .then(|| {
+            (
+                resolved.to_string(),
+                crate::http::decode_body(&response.content_type, &response.body),
+                true,
+            )
+        })
     }
 
     fn initial_module_source(
@@ -1145,12 +1367,17 @@ mod desktop {
         host_work
             || trust_number(page, "nextDeadline").is_some()
             || trust_bool(page, "hasPlatformTask")
+            || trust_bool(page, "hasIdleRequest")
             || trust_bool(page, "hasScrollWork")
             || trust_bool(page, "hasInitialFramesPending")
     }
 
-    fn prepare_task(interrupt: &Arc<lumen::RuntimeInterrupt>, budget: Duration) {
-        interrupt.set_deadline(Some(Instant::now() + budget));
+    /// HTML §8.1.7.3 runs an ordinary selected task to completion before the
+    /// microtask checkpoint. Ordinary page tasks do not have a host-imposed
+    /// wall-clock deadline; navigation and document teardown use their own
+    /// explicit interrupt paths.
+    fn prepare_unbounded_task(interrupt: &Arc<lumen::RuntimeInterrupt>) {
+        interrupt.set_deadline(None);
     }
 
     fn evaluate_task(page: &mut LumenPage, source: &str, label: &str) -> Option<Value> {
@@ -1313,6 +1540,43 @@ mod desktop {
             .map_or(0, |network| {
                 network.fetched.load(std::sync::atomic::Ordering::Relaxed)
             });
+    }
+
+    fn report_task_trace(page: &mut LumenPage) {
+        let due = page
+            .task_trace
+            .as_ref()
+            .is_some_and(|trace| trace.interval_started.elapsed() >= Duration::from_secs(1));
+        if !due {
+            return;
+        }
+        let queues = call_trust(page, "taskQueueState", &[], "task trace")
+            .map(|value| value_string(&mut page.engine, &value))
+            .unwrap_or_else(|| String::from("unavailable"));
+        let Some(trace) = page.task_trace.as_mut() else {
+            return;
+        };
+        eprintln!(
+            "lumen: tasks {:.3}s turns={} interaction={} cmd={} hover={} host={} platform={}/{} idle={} timer={}/{} lifecycle={} finish={} dirty={} render={} updated={} queues={}",
+            trace.interval_started.elapsed().as_secs_f64(),
+            trace.turns,
+            trace.interactions,
+            trace.commands,
+            trace.hovers,
+            trace.host_tasks,
+            trace.platform_tasks,
+            trace.platform_turns,
+            trace.idle_turns,
+            trace.timer_tasks,
+            trace.timer_turns,
+            trace.lifecycle_turns,
+            trace.finishes,
+            trace.dirty_finishes,
+            trace.render_passes,
+            trace.visual_updates,
+            queues,
+        );
+        trace.reset();
     }
 
     fn trust_number(page: &mut LumenPage, name: &str) -> Option<f64> {
@@ -1592,7 +1856,7 @@ mod desktop {
                 finish_task(page, events)
             }
             PageCmd::Ws { id, event } => {
-                prepare_task(interrupt, crate::js::WALL_BUDGET);
+                prepare_unbounded_task(interrupt);
                 let can_render = !matches!(&event, crate::ws::WsIn::Sent(_));
                 if let Err(error) =
                     dispatch_host_task(&mut page.engine, LumenHostTask::WebSocket { id, event })
@@ -1603,7 +1867,7 @@ mod desktop {
                 !can_render || finish_task(page, events)
             }
             PageCmd::Worker { id, event } => {
-                prepare_task(interrupt, crate::js::WALL_BUDGET);
+                prepare_unbounded_task(interrupt);
                 if let Err(error) =
                     dispatch_host_task(&mut page.engine, LumenHostTask::Worker { id, event })
                 {
@@ -1711,7 +1975,7 @@ mod desktop {
                 }
                 if changed {
                     page.render_environment_dirty = true;
-                    prepare_task(interrupt, crate::js::WALL_BUDGET);
+                    prepare_unbounded_task(interrupt);
                     let _ = call_trust(page, "updateIntersections", &[], "image geometry");
                     checkpoint(page, "image geometry");
                     finish_task(page, events)
@@ -1738,7 +2002,7 @@ mod desktop {
                     .set_viewport_px(viewport.width, viewport.height);
                 if changed {
                     page.render_environment_dirty = true;
-                    prepare_task(interrupt, crate::js::WALL_BUDGET);
+                    prepare_unbounded_task(interrupt);
                     let _ = call_trust(
                         page,
                         "setViewport",
@@ -1775,7 +2039,7 @@ mod desktop {
                 page.dom.borrow_mut().set_device_pixel_ratio(ratio);
                 if changed {
                     page.render_environment_dirty = true;
-                    prepare_task(interrupt, crate::js::WALL_BUDGET);
+                    prepare_unbounded_task(interrupt);
                     let _ = evaluate_task(
                         page,
                         &format!("globalThis.devicePixelRatio={ratio}"),
@@ -1791,7 +2055,7 @@ mod desktop {
     }
 
     fn prepare_interaction(page: &mut LumenPage, interrupt: &Arc<lumen::RuntimeInterrupt>) {
-        prepare_task(interrupt, USER_TASK_BUDGET);
+        prepare_unbounded_task(interrupt);
         let _ = call_trust(page, "moResetGuard", &[], "mutation observer guard");
         let _ = page.dom.borrow_mut().take_dirty();
     }
@@ -1937,6 +2201,14 @@ mod desktop {
             let _ = events.blocking_send(PageEvt::Trouble(errors));
             return false;
         }
+        for (url, replace) in take_history_updates(page) {
+            if events
+                .blocking_send(PageEvt::HistoryUpdate { url, replace })
+                .is_err()
+            {
+                return false;
+            }
+        }
         if let Some((url, replace)) = take_navigation(page) {
             return send_navigation(events, url, replace);
         }
@@ -1946,6 +2218,12 @@ mod desktop {
         let mut sent_primary = false;
         let dom_dirty = page.dom.borrow_mut().take_dirty();
         let environment_dirty = std::mem::take(&mut page.render_environment_dirty);
+        if let Some(trace) = page.task_trace.as_mut() {
+            trace.finishes += 1;
+            if dom_dirty || environment_dirty {
+                trace.dirty_finishes += 1;
+            }
+        }
         #[cfg(test)]
         let mut render_handled = false;
         #[cfg(not(test))]
@@ -1965,6 +2243,9 @@ mod desktop {
             }
         }
         if (dom_dirty || environment_dirty) && !render_handled {
+            if let Some(trace) = page.task_trace.as_mut() {
+                trace.render_passes += 1;
+            }
             let (html, rendered, _) = render_with_observers(page);
             let presentation_changed = page
                 .last_render
@@ -1979,6 +2260,9 @@ mod desktop {
             let diagnostic_changed = false;
             let changed = presentation_changed || diagnostic_changed;
             if changed {
+                if let Some(trace) = page.task_trace.as_mut() {
+                    trace.visual_updates += 1;
+                }
                 page.last_render = Some(rendered.clone());
                 #[cfg(test)]
                 {
@@ -2043,6 +2327,16 @@ mod desktop {
         }
         let url = value_to_string(page, &value)?;
         (!url.trim().is_empty()).then(|| (url.trim().to_string(), replace))
+    }
+
+    fn take_history_updates(page: &mut LumenPage) -> Vec<(String, bool)> {
+        let Some(value) = call_trust(page, "takeHistoryUpdates", &[], "history update") else {
+            return Vec::new();
+        };
+        let Some(json) = value_to_string(page, &value) else {
+            return Vec::new();
+        };
+        crate::js::decode_history_updates(&json)
     }
 
     fn send_navigation(
@@ -2202,6 +2496,136 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn actor_does_not_abort_a_long_running_click_task_by_wall_clock() {
+            // HTML §8.1.7.3 runs the selected user-interaction task to
+            // completion. A user agent can expose an explicit "stop script"
+            // intervention, but an arbitrary one-second host deadline must not
+            // silently interrupt a valid handler. YouTube's SPA click handler
+            // exceeds one second under the interpreter before it publishes its
+            // /watch navigation.
+            let html = r#"<!doctype html><html><body>
+                <a id="target" href="https://www.youtube.com/watch?v=standard">watch</a>
+                <script>
+                    document.getElementById("target").addEventListener("click", function (event) {
+                        event.preventDefault();
+                        const started = performance.now();
+                        while (performance.now() - started < 1200) {}
+                        location.href = this.href;
+                    });
+                </script>
+            </body></html>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if matches!(events.recv().await, Some(PageEvt::Updated { .. })) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("initial Lumen render timed out");
+
+            handle.try_send_user(PageCmd::Click(target)).unwrap();
+            let navigated = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Navigate(url)) => break url,
+                        Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed during click task"),
+                    }
+                }
+            })
+            .await
+            .expect("long-running click task was wall-clock interrupted");
+            assert_eq!(
+                navigated, "https://www.youtube.com/watch?v=standard",
+                "click handler must publish its navigation after completing"
+            );
+            drop(handle);
+        }
+
+        #[tokio::test]
+        async fn actor_reports_spa_history_urls_without_cross_document_navigation() {
+            // YouTube's anchor handler cancels the default navigation and then
+            // commits /watch with history.pushState(). HTML makes this a
+            // same-document URL/history update: the host must observe it, but
+            // must not fetch or discard the resident realm.
+            let html = r#"<!doctype html><html><body>
+                <a id="target" href="https://www.youtube.com/watch?v=spa">watch</a>
+                <script>
+                    document.getElementById("target").addEventListener("click", function (event) {
+                        event.preventDefault();
+                        history.pushState({ video: "spa" }, "", this.href);
+                    });
+                </script>
+            </body></html>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) = spawn_page(
+                html.to_string(),
+                PageEnv::bare("https://www.youtube.com/results?search_query=spa"),
+            );
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if matches!(events.recv().await, Some(PageEvt::Updated { .. })) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("initial Lumen render timed out");
+
+            handle.try_send_user(PageCmd::Click(target)).unwrap();
+            let (url, replace) = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::HistoryUpdate { url, replace }) => break (url, replace),
+                        Some(PageEvt::Navigate(url) | PageEvt::Replace(url)) => {
+                            panic!("pushState became a document navigation: {url}")
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed during SPA click"),
+                    }
+                }
+            })
+            .await
+            .expect("same-document history update timed out");
+            assert_eq!(url, "https://www.youtube.com/watch?v=spa");
+            assert!(!replace);
+            assert!(handle.try_send_user(PageCmd::Click(target)).is_ok());
+        }
+
+        #[tokio::test]
+        async fn actor_starts_idle_period_only_after_ordinary_tasks_quiesce() {
+            let html = r#"<!doctype html><html><body>
+                <output id="result">waiting</output>
+                <script>
+                    requestIdleCallback(function (deadline) {
+                        document.getElementById("result").textContent =
+                            "idle:" + deadline.didTimeout + ":" + (deadline.timeRemaining() > 0);
+                    });
+                </script>
+            </body></html>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            let rendered = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("idle:false:true") => {
+                            break html;
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before its idle period"),
+                    }
+                }
+            })
+            .await
+            .expect("idle callback did not receive an actor-selected idle period");
+            assert!(rendered.contains("<output id=\"result\">idle:false:true</output>"));
+        }
+
+        #[tokio::test]
         async fn actor_paints_parent_before_inserted_frame_navigation_and_delays_load() {
             // HTML "navigate" runs cross-document navigation in parallel; the
             // iframe and parent load events are later DOM-manipulation tasks.
@@ -2263,8 +2687,10 @@ mod desktop {
     }
 }
 
-#[cfg(feature = "lumen-desktop")]
+#[cfg(feature = "lumen-backend")]
 pub(crate) use desktop::spawn_page;
+#[cfg(feature = "lumen-backend")]
+pub(crate) use desktop::transform;
 
 /// Lumen's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
 /// compare every entry with `js::HOST_FUNCTIONS`, while the table itself remains the single source
@@ -3706,18 +4132,34 @@ fn run_lumen_worker(
         let base_ms = lumen_worker_now(&mut engine);
         let wall = Instant::now();
         let deadline = lumen_worker_deadline(&mut engine);
-        let command = match deadline {
-            Some(deadline) => {
-                let wait = Duration::from_secs_f64(((deadline - base_ms).max(0.0)) / 1000.0);
-                match ctl_rx.recv_timeout(wait) {
-                    Ok(command) => Some(command),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        let queued_command = match ctl_rx.try_recv() {
+            Ok(command) => Some(command),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        };
+        // This is a forced full host collection, so use it only as the idle
+        // hook it is: after proving no message is runnable and immediately
+        // before an indefinite park. A worker with a future timer remains
+        // active and uses Lumen's allocation/task-boundary collection instead
+        // of tracing its entire heap after every message or timer task.
+        if queued_command.is_none() && deadline.is_none() {
+            engine.collect_garbage_at_idle();
+        }
+        let command = match queued_command {
+            Some(command) => Some(command),
+            None => match deadline {
+                Some(deadline) => {
+                    let wait = Duration::from_secs_f64(((deadline - base_ms).max(0.0)) / 1000.0);
+                    match ctl_rx.recv_timeout(wait) {
+                        Ok(command) => Some(command),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
-            }
-            None => match ctl_rx.recv() {
-                Ok(command) => Some(command),
-                Err(_) => break,
+                None => match ctl_rx.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => break,
+                },
             },
         };
 
@@ -3747,7 +4189,6 @@ fn run_lumen_worker(
         {
             break;
         }
-        engine.collect_garbage_at_idle();
     }
 }
 
@@ -5124,7 +5565,7 @@ fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 }
 
 /// HTML §4.8.4 `complete`: omitted/empty sources are complete. Until the frontend's resource
-/// availability state is injected into this spike, synchronously available data URLs are the
+/// availability state is injected into this backend, synchronously available data URLs are the
 /// selected requests that can be proven completely available.
 fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (base, viewport, density) = host_layout_environment(ctx);
@@ -6977,6 +7418,224 @@ mod tests {
             call_trust_method(&mut engine, "tick", &[]),
             Value::Bool(false)
         ));
+    }
+
+    #[test]
+    fn html_timer_initialization_applies_the_nested_four_millisecond_clamp() {
+        // HTML §8.7 "timer initialization steps" is shared by Window and
+        // workers. Levels 1–6 preserve a requested zero delay; a timer created
+        // from level 6 or later is clamped to 4 ms. Window callbacks receive
+        // the Window global as their callback `this` value.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.timerResult = { nesting: [], waits: [], thisValues: [] };
+            function chain() {
+                timerResult.thisValues.push(this === window);
+                if (timerResult.nesting.length < 7) {
+                    setTimeout(chain, 0);
+                    const info = __trust.nextTimerInfo();
+                    timerResult.nesting.push(info.nesting);
+                    timerResult.waits.push(info.wait);
+                }
+            }
+            setTimeout(chain, Infinity);
+            timerResult.initialWait = __trust.nextTimerInfo().wait;
+            "#,
+            "timer nesting setup",
+        )
+        .unwrap();
+        for _ in 0..8 {
+            let deadline = eval_value(&mut engine, "__trust.nextDeadline()", "timer deadline")
+                .unwrap()
+                .as_num_opt()
+                .unwrap();
+            eval(
+                &mut engine,
+                &format!("__trust.tickTo({deadline})"),
+                "timer task",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "String(timerResult.initialWait)"),
+            "0"
+        );
+        assert_eq!(
+            string_value(&mut engine, "timerResult.nesting.join(',')"),
+            "2,3,4,5,6,7,8"
+        );
+        assert_eq!(
+            string_value(&mut engine, "timerResult.waits.join(',')"),
+            "0,0,0,0,0,4,4"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(timerResult.thisValues.every(Boolean))"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn animation_frame_callbacks_share_one_rendering_opportunity() {
+        // HTML §8.10 snapshots the animation-frame callback map for a rendering
+        // opportunity. Cancellation from an earlier callback affects that
+        // snapshot; callbacks requested while it runs wait for the next frame.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.frameResult = { order: [], timestamps: [] };
+            let third;
+            requestAnimationFrame((timestamp) => {
+                frameResult.order.push("first");
+                frameResult.timestamps.push(timestamp);
+                cancelAnimationFrame(third);
+                requestAnimationFrame((nextTimestamp) => {
+                    frameResult.order.push("nested");
+                    frameResult.timestamps.push(nextTimestamp);
+                });
+            });
+            requestAnimationFrame((timestamp) => {
+                frameResult.order.push("second");
+                frameResult.timestamps.push(timestamp);
+            });
+            third = requestAnimationFrame(() => frameResult.order.push("cancelled"));
+            try { requestAnimationFrame(null); }
+            catch (error) { frameResult.typeError = error.name; }
+
+            frameResult.firstCount = __trust.tickTo(__trust.nextDeadline());
+            frameResult.afterFirst = frameResult.order.join(",");
+            frameResult.sameTimestamp = frameResult.timestamps[0] === frameResult.timestamps[1];
+            frameResult.secondCount = __trust.tickTo(__trust.nextDeadline());
+            frameResult.afterSecond = frameResult.order.join(",");
+            frameResult.timestampAdvanced = frameResult.timestamps[2] > frameResult.timestamps[1];
+            "#,
+            "animation frame callback map",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "String(frameResult.firstCount)"),
+            "2"
+        );
+        assert_eq!(
+            string_value(&mut engine, "frameResult.afterFirst"),
+            "first,second"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(frameResult.sameTimestamp)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(frameResult.secondCount)"),
+            "1"
+        );
+        assert_eq!(
+            string_value(&mut engine, "frameResult.afterSecond"),
+            "first,second,nested"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(frameResult.timestampAdvanced)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "frameResult.typeError"),
+            "TypeError"
+        );
+    }
+
+    #[test]
+    fn idle_callback_lists_deadlines_and_timeout_tasks_follow_the_spec() {
+        // W3C requestIdleCallback §§4–5: pending callbacks become runnable only
+        // when the host starts an idle period; reposted callbacks wait for the
+        // next period, and an options.timeout expiry races through the idle
+        // task source with didTimeout=true.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.idleResult = { order: [] };
+            const cancelled = requestIdleCallback(() => idleResult.order.push("cancelled"));
+            cancelIdleCallback(cancelled);
+            requestIdleCallback((deadline) => {
+                idleResult.order.push("first");
+                idleResult.didTimeout = deadline.didTimeout;
+                idleResult.before = deadline.timeRemaining();
+                const started = performance.now();
+                while (performance.now() - started < 2) {}
+                idleResult.after = deadline.timeRemaining();
+                idleResult.tag = Object.prototype.toString.call(deadline);
+                requestIdleCallback(() => idleResult.order.push("nested"));
+            });
+            idleResult.timerBeforePeriod = __trust.nextDeadline();
+            __trust.startIdlePeriod(__trust.now() + 50);
+            idleResult.firstTask = __trust.runPlatformTask();
+            idleResult.afterFirst = idleResult.order.join(",");
+            idleResult.samePeriodHasTask = __trust.hasPlatformTask();
+            __trust.startIdlePeriod(__trust.now() + 50);
+            idleResult.secondTask = __trust.runPlatformTask();
+
+            requestIdleCallback((deadline) => {
+                idleResult.order.push("timeout");
+                idleResult.timeoutDidTimeout = deadline.didTimeout;
+                idleResult.timeoutRemaining = deadline.timeRemaining();
+            }, { timeout: 5 });
+            __trust.tickTo(__trust.now() + 10);
+            idleResult.timeoutQueued = __trust.hasPlatformTask();
+            __trust.runPlatformTask();
+            idleResult.finalOrder = idleResult.order.join(",");
+            "#,
+            "idle callback processing model",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.timerBeforePeriod)"),
+            "null"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.firstTask)"),
+            "true"
+        );
+        assert_eq!(string_value(&mut engine, "idleResult.afterFirst"), "first");
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.samePeriodHasTask)"),
+            "false"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.secondTask)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.didTimeout)"),
+            "false"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.before > idleResult.after)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "idleResult.tag"),
+            "[object IdleDeadline]"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.timeoutQueued)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.timeoutDidTimeout)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(idleResult.timeoutRemaining)"),
+            "0"
+        );
+        assert_eq!(
+            string_value(&mut engine, "idleResult.finalOrder"),
+            "first,nested,timeout"
+        );
     }
 
     #[test]

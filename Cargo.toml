@@ -12,15 +12,22 @@ path = "src/lib.rs"
 [[bin]]
 name = "trust"
 path = "src/main.rs"
+required-features = ["lumen-backend"]
 
 [[bin]]
 name = "trust-desktop"
 path = "src/bin/trust-desktop.rs"
+required-features = ["lumen-backend"]
 
 [[bin]]
-name = "trust-desktop-lumen"
-path = "src/bin/trust-desktop-lumen.rs"
-required-features = ["lumen-desktop"]
+name = "trust-boa"
+path = "src/bin/trust-boa.rs"
+required-features = ["boa-backend"]
+
+[[bin]]
+name = "trust-desktop-boa"
+path = "src/bin/trust-desktop-boa.rs"
+required-features = ["boa-backend"]
 
 [[bin]]
 name = "trust-lumen-spike"
@@ -32,29 +39,32 @@ required-features = ["lumen-spike"]
 # bytecode-compile of large JS bundles are dominated by millions of small
 # allocations (AST nodes, CodeBlocks); mimalloc is ~17% faster there than
 # glibc malloc, end to end, behaviour-identically. It is the one C dependency
-# (libmimalloc-sys) — the pure-Rust ethos is about the *engine* (Boa, not v8),
-# not the allocator, and rustls already links C crypto — but it's isolated
-# behind this feature: `--no-default-features` keeps the build pure-Rust.
-default = ["mimalloc"]
+# (libmimalloc-sys) — the pure-Rust ethos is about the JS engine rather than
+# the allocator, and rustls already links C crypto — but it's isolated
+# behind this feature. A system-allocator Lumen build uses
+# `--no-default-features --features lumen-backend`.
+default = ["mimalloc", "lumen-backend"]
 # `libmimalloc-sys` (the same C lib mimalloc already pulls — no new build dep)
 # exposes `mi_collect`, which we call at navigation boundaries to return a heavy
 # page's freed high-water to the OS (see `release_allocator_memory`).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
-# Experimental sibling-engine integration. Boa remains the production engine;
-# this only builds the isolated TRust-prelude/benchmark probe.
-lumen-spike = ["dep:lumen"]
-# Experimental native browser artifact. This adds a separately named binary;
-# the normal `trust` and `trust-desktop` entry points continue selecting Boa.
-lumen-desktop = ["lumen-spike"]
+# Exactly one JavaScript backend is compiled into a browser artifact. Lumen is
+# the normal backend; Boa is retained as an explicit legacy comparison build.
+lumen-backend = ["dep:lumen"]
+boa-backend = ["dep:boa_engine", "dep:boa_parser", "dep:boa_ast", "dep:boa_interner"]
+# Synthetic engine benchmark harness; omitted from ordinary browser builds.
+lumen-spike = ["lumen-backend"]
 
 [dependencies]
 accesskit = "0.24.1"
 accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
-boa_engine = { version = "0.21", features = ["annex-b"] }
+boa_engine = { version = "0.21", features = ["annex-b"], optional = true }
 # Direct dep for the lazy-parse control surface (`boa_parser::lazy`); the
 # vendored crate is shared with boa_engine via `[patch]` below.
-boa_parser = "0.21"
+boa_parser = { version = "0.21", optional = true }
+boa_ast = { version = "0.21", optional = true }
+boa_interner = { version = "0.21", optional = true }
 bytes = "1.11.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Default features = the pure-Rust `miniz_oxide` backend. NEVER enable the
@@ -74,8 +84,8 @@ mimalloc = { version = "0.1", optional = true }
 # metrics for the canonical CSS-pixel inline formatting context. TRust owns the
 # surrounding CSS and retained-paint contracts; Parley is the font machinery.
 # Keep the shaping/editor boundary current. Parley 0.11 requires ICU4X 2.1+;
-# TRust's customized Boa 0.21 fork follows upstream Boa's current ICU4X 2.2
-# pins so Cargo resolves one compiled-data provider across both engines.
+# The optional legacy Boa 0.21 fork follows upstream Boa's current ICU4X 2.2
+# pins so a Boa comparison build resolves one compiled-data provider.
 # Linux/FreeBSD discovery is owned by `font_system`, so do not activate
 # Fontique's native-system feature there. Other targets retain their native
 # platform catalog until their equivalent configuration policy is owned here.
@@ -95,7 +105,7 @@ glifo = "0.3.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 # FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner
-# maps). Pure Rust, already in the tree via Boa; SipHash's HashDoS
+# maps). Pure Rust; SipHash's HashDoS
 # resistance buys nothing for arena-internal keys.
 rustc-hash = "2"
 serde_json = "1"
@@ -133,7 +143,7 @@ wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl"
 vt100 = "0.16.2"
 winit = "0.30.13"
 softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
-# WebAssembly engine. wasmi is a pure-Rust interpreter (the Boa-analog — no
+# WebAssembly engine. wasmi is a pure-Rust interpreter (no
 # v8/C++), so it preserves the pure-Rust-engine ethos. Runtime parses BINARY
 # wasm only (the web ships binary), so the default `wat` feature is dropped;
 # `simd` is enabled because the SIMD proposal is finalized and the crate is
@@ -155,13 +165,6 @@ parley = { version = "0.11.0", default-features = false, features = ["system"] }
 # fixtures. Pure-Rust (wasmi ecosystem); NEVER a runtime dependency — the
 # runtime accepts only binary wasm from the web.
 wat = "1"
-# Test-only access to the vendored AST/interner for the lazy-parse (`lazy_scan`)
-# fuzz harness: it walks the real parser's function-body spans and checks the
-# fallible body-skip against them. Redirected to the vendored forks by
-# `[patch.crates-io]` below. (`boa_parser` is a runtime dep above for the
-# `boa_parser::lazy` control surface.)
-boa_ast = "0.21"
-boa_interner = "0.21"
 
 [patch.crates-io]
 fontique = { path = "vendor/fontique-0.11.0" }
@@ -175,9 +178,8 @@ image-webp = { path = "vendor/image-webp-0.2.4" }
 # wgpu 30's panic-safe SurfaceTexture teardown (gfx-rs/wgpu#9678). Keep the
 # renderer changes confined to the fork and drop the patch when Vello updates.
 vello_hybrid = { path = "vendor/vello_hybrid-0.2.0" }
-# TRust's Boa fork. Boa is the only viable pure-Rust JS engine, but it's
-# half-finished and we keep hitting its edges; we vendor it so we can fix
-# the engine itself instead of working around it from js.rs. First fix:
+# TRust's legacy Boa fork. We retain it for regression comparisons and vendor
+# it so engine fixes remain in the engine instead of becoming js.rs shims. First fix:
 # the cyclic-module `Debug` recursion that turned a recoverable module
 # assert into an uncatchable stack-overflow abort (see src/module/*).
 boa_engine = { path = "vendor/boa_engine-0.21.1" }
@@ -207,8 +209,8 @@ boa_gc = { path = "vendor/boa_gc-0.21.1" }
 # cross threads.
 boa_parser = { path = "vendor/boa_parser-0.21.1" }
 # TRust's vendored WebAssembly engine. wasmi is a pure-Rust interpreter (the
-# Boa-analog); we vendor the wasmi-labs crates so we OWN the engine and can
-# fork/patch it the way we do Boa, if a WASM showstopper ever needs it. No
+# interpreter); we vendor the wasmi-labs crates so we own the engine and can
+# fork/patch it if a WebAssembly showstopper ever needs it. No
 # patches yet — wasmi is complete — so these are byte-for-byte the 1.1.0 crates.
 # (`wasmparser`/`spin`/`libm` are third-party deps left on crates.io.)
 wasmi = { path = "vendor/wasmi-1.1.0" }

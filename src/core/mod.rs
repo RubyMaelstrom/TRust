@@ -1012,6 +1012,10 @@ impl BrowserController {
             Link::Http(url) => Some(url.clone()),
             _ => None,
         });
+        self.queue_external_media_with_referrer(url, referrer);
+    }
+
+    fn queue_external_media_with_referrer(&mut self, url: url::Url, referrer: Option<url::Url>) {
         self.status = format!("Opening in mpv: {url}");
         self.external_media.push_back((url, referrer));
         self.invalidation.request_redraw();
@@ -1298,6 +1302,9 @@ impl BrowserController {
             }
             PageEvt::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
             PageEvt::Replace(address) => self.begin_address(&address, NavigationIntent::Replace),
+            PageEvt::HistoryUpdate { url, replace } => {
+                self.apply_same_document_history_update(&url, replace)
+            }
             PageEvt::ScrollToFragment(fragment) => {
                 self.pending_fragment = Some(fragment);
                 true
@@ -1349,6 +1356,38 @@ impl BrowserController {
                 }
                 true
             }
+        }
+    }
+
+    /// Apply HTML's URL and history update steps without starting a fetch or
+    /// replacing the resident Document. The JS realm owns classic-history
+    /// state; this controller owns browser chrome and product-level navigation
+    /// policy, including the existing YouTube → mpv delegation.
+    fn apply_same_document_history_update(&mut self, address: &str, _replace: bool) -> bool {
+        let Ok(url) = url::Url::parse(address) else {
+            self.status = String::from("Page supplied an invalid same-document URL.");
+            return true;
+        };
+        let Some(page) = self.current.as_mut() else {
+            return false;
+        };
+        let old_url = match &page.target {
+            Link::Http(url) => Some(url.clone()),
+            _ => None,
+        };
+        let address_changed = old_url.as_ref() != Some(&url);
+        page.target = Link::Http(url.clone());
+        if let FetchedDocument::Http(response) = &mut page.document {
+            // `Response::url` is also the base used by any later static
+            // presentation rebuild. After pushState/replaceState, HTML's
+            // active Document URL—not the original request URL—is the base.
+            response.url = url.clone();
+        }
+        if crate::media::is_youtube_video_url(&url) {
+            self.queue_external_media_with_referrer(url, old_url);
+            true
+        } else {
+            address_changed
         }
     }
 
@@ -1968,6 +2007,52 @@ mod tests {
         )));
         assert!(browser.snapshot().loading);
         assert!(browser.take_external_media().is_none());
+    }
+
+    #[test]
+    fn spa_history_watch_update_preserves_page_and_delegates_to_mpv() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let source =
+            url::Url::parse("https://www.youtube.com/results?search_query=squirrels").unwrap();
+        browser.current = Some(BrowserPage {
+            target: Link::Http(source.clone()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+
+        assert!(
+            browser.handle_page_event(crate::js::PageEvt::HistoryUpdate {
+                url: String::from("https://www.youtube.com/watch?v=spa123"),
+                replace: false,
+            })
+        );
+
+        assert!(
+            browser.page_is_live(),
+            "pushState must retain the Document realm"
+        );
+        assert!(
+            !browser.snapshot().loading,
+            "pushState must not start a fetch"
+        );
+        assert_eq!(
+            browser.snapshot().address,
+            "https://www.youtube.com/watch?v=spa123"
+        );
+        let (video, referrer) = browser.take_external_media().unwrap();
+        assert_eq!(video.as_str(), "https://www.youtube.com/watch?v=spa123");
+        assert_eq!(referrer.as_ref(), Some(&source));
     }
 
     #[test]

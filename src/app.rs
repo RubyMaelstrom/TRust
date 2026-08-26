@@ -4430,6 +4430,9 @@ impl App {
         )> = None;
         let mut trouble: Vec<String> = Vec::new();
         let mut navigate: Option<(String, bool)> = None;
+        // History API URL writes are same-document updates, not fetch
+        // navigations. Preserve their task order while coalescing renders.
+        let mut history_updates: Vec<(String, bool)> = Vec::new();
         // A same-document fragment scroll the page requested; applied AFTER the
         // render below so it targets the freshly-rendered doc's `anchor_rows`.
         // Newest wins.
@@ -4485,6 +4488,9 @@ impl App {
                 }
                 Some(PageEvt::Navigate(url)) => navigate = Some((url, false)),
                 Some(PageEvt::Replace(url)) => navigate = Some((url, true)),
+                Some(PageEvt::HistoryUpdate { url, replace }) => {
+                    history_updates.push((url, replace));
+                }
                 Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
                 None => break,
             }
@@ -4523,6 +4529,9 @@ impl App {
         if let Some(frag) = scroll_fragment {
             self.scroll_to_fragment(&frag);
         }
+        for (url, replace) in history_updates {
+            self.apply_same_document_history_update(&url, replace);
+        }
         if !trouble.is_empty() {
             self.page_js_errors.extend(trouble.iter().cloned());
             self.status = format!(
@@ -4559,6 +4568,26 @@ impl App {
             self.navigate_from_page(&url);
         }
         (full_replace, drains)
+    }
+
+    /// Mirror WHATWG HTML's URL and history update steps in terminal chrome.
+    /// The resident realm has already synchronously changed `Document.URL`;
+    /// this must neither fetch nor replace that realm. It does, however, pass
+    /// the new active URL through the same external-media policy as every
+    /// other browser navigation surface.
+    fn apply_same_document_history_update(&mut self, address: &str, _replace: bool) {
+        let Ok(url) = url::Url::parse(address) else {
+            self.status = String::from("page supplied an invalid same-document URL");
+            self.notice = true;
+            return;
+        };
+        let referrer = self.http_referrer();
+        if let Some(g) = &mut self.browser {
+            g.doc.url = Link::Http(url.clone());
+        }
+        if crate::media::is_youtube_video_url(&url) {
+            self.launch_mpv_with_referrer(url.to_string(), referrer.as_ref());
+        }
     }
 
     /// Swap the living page's fresh render into the browser doc:
