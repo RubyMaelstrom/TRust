@@ -420,6 +420,9 @@ mod desktop {
         outcome: Outcome,
         started: Instant,
         last_render: Option<crate::http::RenderedPage>,
+        /// Viewport, density, and decoded intrinsic-size changes can require layout even when no
+        /// DOM mutation occurred during the host task.
+        render_environment_dirty: bool,
     }
 
     enum Wake {
@@ -781,9 +784,11 @@ mod desktop {
             state.base = base.clone();
         }
 
+        // Keep Lumen's release tiering policy for browser workloads. In particular, compiling
+        // every function on its first call is useful for a hot synthetic loop but makes framework
+        // startup pay native-code generation for large numbers of one-shot functions. Lumen's
+        // LUMEN_TIER and LUMEN_TIER_THRESHOLD diagnostics remain available through Engine::new.
         let mut engine = lumen::Engine::new_with_interrupt(interrupt);
-        engine.set_tier(Tier::Jit);
-        engine.set_tier_threshold(0);
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
@@ -854,6 +859,7 @@ mod desktop {
             outcome,
             started,
             last_render: None,
+            render_environment_dirty: false,
         };
         let _ = evaluate_task(
             &mut page,
@@ -1378,6 +1384,7 @@ mod desktop {
             }
             PageCmd::Resync => {
                 let (html, rendered, _) = extract_live(page);
+                page.render_environment_dirty = false;
                 page.last_render = Some(rendered.clone());
                 let mut outcome = std::mem::take(&mut page.outcome);
                 outcome.elapsed = page.started.elapsed();
@@ -1402,6 +1409,7 @@ mod desktop {
                     }
                 }
                 if changed {
+                    page.render_environment_dirty = true;
                     prepare_task(interrupt, crate::js::WALL_BUDGET);
                     let _ = call_trust(page, "updateIntersections", &[], "image geometry");
                     checkpoint(page, "image geometry");
@@ -1428,6 +1436,7 @@ mod desktop {
                     .borrow_mut()
                     .set_viewport_px(viewport.width, viewport.height);
                 if changed {
+                    page.render_environment_dirty = true;
                     prepare_task(interrupt, crate::js::WALL_BUDGET);
                     let _ = call_trust(
                         page,
@@ -1464,6 +1473,7 @@ mod desktop {
                     });
                 page.dom.borrow_mut().set_device_pixel_ratio(ratio);
                 if changed {
+                    page.render_environment_dirty = true;
                     prepare_task(interrupt, crate::js::WALL_BUDGET);
                     let _ = evaluate_task(
                         page,
@@ -1529,25 +1539,30 @@ mod desktop {
         let fragment = take_scroll_fragment(page);
         let submission = take_form_submit(page);
         let scrolls = page.dom.borrow_mut().take_scroll_changes();
-        let (html, rendered, _) = extract_live(page);
-        let changed = page
-            .last_render
-            .as_ref()
-            .is_none_or(|previous| !previous.visually_eq(&rendered));
         let mut sent_primary = false;
-        if changed {
-            page.last_render = Some(rendered.clone());
-            let mut outcome = std::mem::take(&mut page.outcome);
-            outcome.elapsed = page.started.elapsed();
-            outcome.rendered = Some(Box::new(rendered));
-            if events
-                .blocking_send(PageEvt::Updated { html, outcome })
-                .is_err()
-            {
-                return false;
+        let dom_dirty = page.dom.borrow_mut().take_dirty();
+        let environment_dirty = std::mem::take(&mut page.render_environment_dirty);
+        if dom_dirty || environment_dirty {
+            let (html, rendered, _) = extract_live(page);
+            let changed = page
+                .last_render
+                .as_ref()
+                .is_none_or(|previous| !previous.visually_eq(&rendered));
+            if changed {
+                page.last_render = Some(rendered.clone());
+                let mut outcome = std::mem::take(&mut page.outcome);
+                outcome.elapsed = page.started.elapsed();
+                outcome.rendered = Some(Box::new(rendered));
+                if events
+                    .blocking_send(PageEvt::Updated { html, outcome })
+                    .is_err()
+                {
+                    return false;
+                }
+                sent_primary = true;
             }
-            sent_primary = true;
-        } else if !page.outcome.errors.is_empty() {
+        }
+        if !sent_primary && !page.outcome.errors.is_empty() {
             let errors = std::mem::take(&mut page.outcome.errors);
             if events.blocking_send(PageEvt::Trouble(errors)).is_err() {
                 return false;
