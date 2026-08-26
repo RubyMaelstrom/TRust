@@ -583,7 +583,9 @@ mod desktop {
             let timer_due = deadline.is_some_and(|deadline| deadline <= now)
                 && last_timer.is_none_or(|last: Instant| last.elapsed() >= WAKE_FLOOR);
             let platform_ready = trust_bool(&mut page, "hasPlatformTask");
-            let load_ready = !lifecycle_complete && pending_resources(&mut page) == 0;
+            let load_ready = !lifecycle_complete
+                && pending_resources(&mut page) == 0
+                && !trust_bool(&mut page, "hasInitialFramesPending");
 
             let mut immediate = None;
             if let Ok(command) = interactions.try_recv() {
@@ -885,7 +887,7 @@ mod desktop {
         };
         let _ = evaluate_task(
             &mut page,
-            "__trust.readyState = 'interactive'; __trust.hydrateFrames(); __trust.fire(document, 'DOMContentLoaded', true);",
+            "__trust.readyState = 'interactive'; __trust.queueInitialFrameNavigations(); __trust.fire(document, 'DOMContentLoaded', true);",
             "DOMContentLoaded",
         );
         checkpoint(&mut page, "DOMContentLoaded");
@@ -1815,6 +1817,64 @@ mod desktop {
             assert!(
                 clicked.is_ok(),
                 "click render preceded its mandatory microtask checkpoint"
+            );
+        }
+
+        #[tokio::test]
+        async fn actor_paints_parent_before_initial_frame_navigation_and_delays_load() {
+            // HTML "navigate" runs cross-document navigation in parallel; the
+            // iframe and parent load events are later DOM-manipulation tasks.
+            // In particular, a slow nested document must not hide the parsed,
+            // DOMContentLoaded parent shell.
+            let html = r#"<!doctype html><html><body>
+                <span id="phase">parser</span>
+                <iframe srcdoc="<p id='child'>child</p>"></iframe>
+                <script>
+                    const phase = document.getElementById("phase");
+                    document.addEventListener("DOMContentLoaded", function () {
+                        phase.textContent = "dom";
+                    });
+                    document.querySelector("iframe").addEventListener("load", function () {
+                        phase.textContent += "|frame";
+                    });
+                    window.addEventListener("load", function () {
+                        phase.textContent += "|load";
+                    });
+                </script>
+            </body></html>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let first = tokio::time::timeout(Duration::from_secs(30), events.recv())
+                .await
+                .expect("initial Lumen render timed out")
+                .expect("Lumen actor closed before initial render");
+            let PageEvt::Updated { html, .. } = first else {
+                panic!("expected an interactive shell, got {first:?}");
+            };
+            assert!(html.contains("<span id=\"phase\">dom</span>"), "{html}");
+            assert!(
+                !html.contains("child"),
+                "frame navigated before shell paint: {html}"
+            );
+
+            let loaded = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. })
+                            if html.contains("<span id=\"phase\">dom|frame|load</span>") =>
+                        {
+                            assert!(html.contains("child"));
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before frame/parent load"),
+                    }
+                }
+            })
+            .await;
+            assert!(
+                loaded.is_ok(),
+                "parent load did not follow initial iframe load task"
             );
         }
     }

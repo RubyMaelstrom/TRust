@@ -14200,6 +14200,16 @@ pub(crate) const PRELUDE: &str = r##"
     // inside a component, seen from outside), and propagation ends at the tree
     // where a hop makes them collapse mid-walk.
     function dispatch(target, ev, forceBubble) {
+        // Each browsing context owns a distinct Window/EventTarget. TRust
+        // currently multiplexes those Window objects through one engine global,
+        // so retain the active nested navigable as part of the logical target.
+        // Without this filter a child `load` also invoked the parent window's
+        // listeners (and the eventual parent `load` invoked every child
+        // listener), violating DOM's per-EventTarget listener-list rule.
+        if (target === g && !ev.__windowTargetSet) {
+            ev.__windowTargetSet = true;
+            ev.__frameTarget = trust.__activeFrame || null;
+        }
         ev.target = target;
         const origRelated = ev.relatedTarget;
         const hasRelated = origRelated !== null && origRelated !== undefined;
@@ -14456,6 +14466,31 @@ pub(crate) const PRELUDE: &str = r##"
         }
         return frames.length;
     }
+    // Parser-created nested navigables start navigation as parsing encounters
+    // them, but the navigation itself proceeds in parallel and completion is
+    // delivered through later navigation/DOM-manipulation tasks (HTML
+    // "navigate" and "iframe load event steps"). A host whose DOM is already
+    // parsed must not collapse that entire tree into the DOMContentLoaded task:
+    // a captcha or other cross-origin child would then hide the interactive
+    // parent until every descendant script had completed.
+    //
+    // The trailing sentinel is queued *after* hydration has enqueued every
+    // iframe load event. Resident actors use it as the parent document's load
+    // delay condition. One-shot transforms continue to call hydrateFrames()
+    // synchronously and settle all queued tasks before serializing.
+    trust.initialFramesPending = false;
+    trust.hasInitialFramesPending = function () { return trust.initialFramesPending; };
+    trust.queueInitialFrameNavigations = function () {
+        if (trust.initialFramesPending) return;
+        let frames;
+        try { frames = g.document.querySelectorAll("iframe, frame"); } catch (e) { return; }
+        if (!frames.length) return;
+        trust.initialFramesPending = true;
+        __queue_dom_task(function () {
+            hydrateFramesIn(g.document);
+            __queue_dom_task(function () { trust.initialFramesPending = false; });
+        });
+    };
     // Lazy realization when a script reads a frame's contentDocument before the
     // load sweep (or for a frame inserted after load). The de-dup guards keep a
     // repeat call cheap; a frame with neither src nor srcdoc stays about:blank.
