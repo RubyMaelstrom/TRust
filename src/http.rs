@@ -31,9 +31,9 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 // A single request's wall cap. Generous because a streamed LLM chat completion
 // (Open WebUI → llama.cpp) holds the connection open for the WHOLE generation —
 // a reasoning model can think for a minute or more before the body closes. The
-// real per-context bound is the JS budget (a page LOAD is still capped by
-// `WALL_BUDGET`; an interactive dispatch extends only while a fetch is in
-// flight), so this only needs to be long enough not to sever a working stream.
+// Request I/O retains a network timeout independent of JavaScript task
+// execution. A stalled connection fails as a resource operation; it does not
+// impose a wall-clock deadline on the event-loop task that initiated it.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 10;
 pub(crate) const USER_AGENT: &str = "TRust/0.1";
@@ -1438,7 +1438,7 @@ async fn read_response<R: AsyncRead + Unpin>(
     // the body a GET would return. Reading one here would block forever on
     // bytes that never arrive; a single HEAD to any keep-alive server (an
     // ad framework's latency probe, a preflight resource check) hung the
-    // whole page load until `WALL_BUDGET` killed it. The socket is at a
+    // whole page load until the former page wall deadline killed it. The socket is at a
     // clean message boundary, so it stays poolable.
     if is_head {
         return Ok((status, headers, Vec::new(), reusable, set_cookies));
@@ -6570,12 +6570,11 @@ mod tests {
     }
 
     // A dynamically inserted classic script is its own HTML networking task:
-    // it fetches in parallel and executes when ready, rather than borrowing a
-    // one-second user-dispatch deadline. This mirrors HTML §4.12.1.1's
-    // force-async path and protects real SPA bundles whose CDN response takes
-    // longer than an interaction turn.
+    // it fetches in parallel and executes when ready, rather than borrowing
+    // an earlier event-loop task. This mirrors HTML §4.12.1.1's force-async
+    // path and protects real SPA bundles whose CDN response takes time.
     #[tokio::test]
-    async fn a_slow_dom_ready_injected_script_survives_the_dispatch_budget() {
+    async fn a_slow_dom_ready_injected_script_runs_as_its_own_networking_task() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6596,8 +6595,8 @@ mod tests {
                     }
                     let text = String::from_utf8_lossy(&req).into_owned();
                     if text.starts_with("GET /sdk.js ") {
-                        // Deliberately exceed DISPATCH_BUDGET (1s), but stay
-                        // well inside the page-wide resource-task wall bound.
+                        // Deliberately take longer than the historical
+                        // one-second dispatch bound.
                         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
                     }
                     let reply: &[u8] = if text.starts_with("GET /page ") {
@@ -7352,9 +7351,9 @@ mod tests {
     /// Phase 2 (background fetch): a `fetch()` fired from a CLICK runs OFF the
     /// dispatch — the dispatch returns IMMEDIATELY with the loading state and the
     /// actor stays responsive, then the result lands as a SEPARATE render when
-    /// the wire completes. Before this the dispatch BLOCKED on the fetch (up to
-    /// `DISPATCH_NET_GRACE` = 300s), freezing the live engine. We prove the
-    /// no-block contract by delaying `/data` so a "loading" render is forced out
+    /// the wire completes. Before this the dispatch BLOCKED on the fetch,
+    /// freezing the live engine. We prove the no-block contract by delaying
+    /// `/data` so a "loading" render is forced out
     /// strictly before the "DATA-OK" render.
     #[tokio::test]
     async fn a_click_fetch_runs_in_the_background_not_blocking_the_dispatch() {

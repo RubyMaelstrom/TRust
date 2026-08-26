@@ -19,7 +19,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--tier" => {
                 let value = args.next().ok_or("--tier requires a value")?;
-                tier = trust::lumen_spike::parse_tier(&value)?;
+                tier = trust::lumen_backend::parse_tier(&value)?;
             }
             "--threshold" => {
                 let value = args.next().ok_or("--threshold requires a value")?;
@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let report = trust::lumen_spike::run_benchmark(&benchmark, tier, threshold)?;
+    let report = trust::lumen_backend::run_benchmark(&benchmark, tier, threshold)?;
     println!("{}", report.logs);
     println!("---- TRust/Lumen integration ----");
     println!("tier: {:?} (threshold {threshold})", report.tier);
