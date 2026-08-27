@@ -80,6 +80,11 @@ struct Builder<'a, 't> {
     scroll_containers: Vec<ScrollContainer>,
     sticky_constraints: Vec<StickyConstraint>,
     marquee_scopes: HashMap<NodeId, MarqueeScope>,
+    /// CSS 2.2 `clip:rect()` regions keyed by the positioned element that
+    /// establishes them. Unlike overflow clips these are not represented in
+    /// the fragment geometry, so the paint adapter carries them down the flat
+    /// ancestor chain for every descendant command.
+    legacy_clips: HashMap<NodeId, CssRect>,
     patch_boundaries: Vec<super::GraphicalPatchBoundary>,
     boundaries: Vec<super::GraphicalBoundary>,
     /// Absolute overflow clips already active in the display list. A clip
@@ -120,10 +125,12 @@ impl<'a, 't> Builder<'a, 't> {
             scroll_containers: Vec::new(),
             sticky_constraints: Vec::new(),
             marquee_scopes: HashMap::new(),
+            legacy_clips: HashMap::new(),
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
             hard_clips: Vec::new(),
         };
+        this.collect_legacy_clips(root);
         this.collect_scroll_containers(root);
         this.collect_patch_boundaries(root);
         this.collect_sticky(root);
@@ -134,12 +141,14 @@ impl<'a, 't> Builder<'a, 't> {
         // establish ordinary CSS Overflow scroll containers and interaction
         // boundaries.
         for fixed in fixed {
+            this.collect_legacy_clips(fixed);
             this.collect_scroll_containers(fixed);
             this.collect_patch_boundaries(fixed);
             this.collect_sticky(fixed);
             this.collect_marquees(fixed);
         }
         for top in top_layer {
+            this.collect_legacy_clips(&top.fragment);
             this.collect_scroll_containers(&top.fragment);
             this.collect_patch_boundaries(&top.fragment);
             this.collect_sticky(&top.fragment);
@@ -198,13 +207,39 @@ impl<'a, 't> Builder<'a, 't> {
     }
 
     fn effective_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
-        let _ = node;
-        hard.map(|clip| self.clip_rect(clip))
+        self.clip_chain(node, hard)
     }
 
     fn ancestor_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
-        let _ = node;
-        hard.map(|clip| self.clip_rect(clip))
+        self.clip_chain(node, hard)
+    }
+
+    fn clip_chain(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
+        let mut clip = hard.map(|clip| self.clip_rect(clip));
+        let mut current = (node != NO_NODE).then_some(node);
+        while let Some(id) = current {
+            if let Some(rect) = self.legacy_clips.get(&id) {
+                clip = intersect_css_rects(clip, *rect);
+            }
+            current = self.dom.parent_flat(id);
+        }
+        clip
+    }
+
+    fn collect_legacy_clips(&mut self, fragment: &Frag<'_>) {
+        if fragment.node != NO_NODE
+            && matches!(fragment.kind, FragKind::Block)
+            && let Some(rect) = legacy_clip_rect(
+                self.dom,
+                fragment.node,
+                CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
+            )
+        {
+            self.legacy_clips.insert(fragment.node, rect);
+        }
+        for child in &fragment.children {
+            self.collect_legacy_clips(child);
+        }
     }
 
     fn clip_rect(&self, clip: Clip) -> CssRect {
@@ -1278,6 +1313,50 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     builder.pop_scroll_ancestors(scroll_depth);
 }
 
+/// CSS 2.2 §11.1.2 legacy clipping rectangle. The four offsets are from the
+/// positioned element's border box; `auto` leaves that edge at the border
+/// edge. Percentages are not part of the legacy grammar.
+fn legacy_clip_rect(dom: &Dom, node: NodeId, border_box: CssRect) -> Option<CssRect> {
+    if !matches!(
+        dom.computed_value_resolved(node, "position")
+            .as_deref()
+            .map(str::trim),
+        Some("absolute" | "fixed")
+    ) {
+        return None;
+    }
+    let value = dom.computed_value_resolved(node, "clip")?;
+    let value = value.trim();
+    let inner = value.get(5..value.len().checked_sub(1)?).filter(|_| {
+        value
+            .get(..5)
+            .is_some_and(|head| head.eq_ignore_ascii_case("rect("))
+    })?;
+    let normalized = inner.replace(',', " ");
+    let parts: Vec<&str> = normalized.split_whitespace().collect();
+    let [top, right, bottom, left] = parts.as_slice() else {
+        return None;
+    };
+    let units = Units::of(dom, node);
+    let edge = |value: &str, auto: f32| {
+        value
+            .trim()
+            .eq_ignore_ascii_case("auto")
+            .then_some(auto)
+            .or_else(|| crate::layout2::css_length_px(value, units))
+    };
+    let top = edge(top, 0.0)?;
+    let right = edge(right, border_box.width)?;
+    let bottom = edge(bottom, border_box.height)?;
+    let left = edge(left, 0.0)?;
+    Some(CssRect::new(
+        border_box.x + left,
+        border_box.y + top,
+        (right - left).max(0.0),
+        (bottom - top).max(0.0),
+    ))
+}
+
 fn intersect_css_rects(existing: Option<CssRect>, rect: CssRect) -> Option<CssRect> {
     let Some(existing) = existing else {
         return Some(rect);
@@ -1286,7 +1365,10 @@ fn intersect_css_rects(existing: Option<CssRect>, rect: CssRect) -> Option<CssRe
     let y0 = existing.y.max(rect.y);
     let x1 = (existing.x + existing.width).min(rect.x + rect.width);
     let y1 = (existing.y + existing.height).min(rect.y + rect.height);
-    (x1 > x0 && y1 > y0).then(|| CssRect::new(x0, y0, x1 - x0, y1 - y0))
+    // An empty intersection remains an active zero-area clip. Returning None
+    // would mean "unclipped" to every caller and leak exactly the content the
+    // two disjoint clips are required to suppress.
+    Some(CssRect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)))
 }
 
 /// Direct `<input>` controls are atomic pieces inside an anonymous line box,
@@ -1304,6 +1386,8 @@ fn paint_atomic_control_box(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
+    let clip = builder.effective_clip(node, parent.clip);
+    let pushed_clip = clip.is_some_and(|clip| builder.push_hard_clip(clip));
     let style = super::style::BoxStyle::of(
         builder.dom,
         node,
@@ -1353,6 +1437,9 @@ fn paint_atomic_control_box(
         rect,
         outline_of(builder.dom, node, Units::of(builder.dom, node)),
     );
+    if pushed_clip {
+        builder.pop_hard_clip();
+    }
 }
 
 /// HTML Rendering §15.5 permits a user agent to supply a native appearance for
@@ -1367,6 +1454,15 @@ fn paint_native_control_surface(
     builder: &mut Builder<'_, '_>,
 ) {
     let node = fragment.node;
+    // WHATWG HTML Rendering §15.5.10 defines checkbox/radio inputs as one
+    // inline-block containing a *single* native control. Their atomic glyph
+    // is that complete appearance; painting the generic text-control surface
+    // behind it creates a second square/rectangle around the widget.
+    let is_checkable = builder.dom.tag_name(node) == Some("input")
+        && builder
+            .dom
+            .attr(node, "type")
+            .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "checkbox" | "radio"));
     let is_control = matches!(builder.dom.tag_name(node), Some("button" | "textarea"))
         || (builder.dom.tag_name(node) == Some("input")
             && !builder
@@ -1375,6 +1471,7 @@ fn paint_native_control_surface(
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
         || builder.dom.is_contenteditable_host(node);
     if !is_control
+        || is_checkable
         || builder
             .dom
             .computed_value_resolved(node, "appearance")

@@ -857,7 +857,11 @@ impl Dom {
         false
     }
 
-    fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
+    /// DOM Standard §4.2.2.3 "finding a slot": return the first slot in
+    /// the light parent's shadow tree whose name matches this slottable.  The
+    /// event dispatcher uses this as Node's `get the parent` algorithm; the
+    /// public `assignedSlot` IDL getter additionally hides closed-tree slots.
+    pub fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
         let host = self.nodes[id].parent?;
         let shadow = self.shadow_root(host)?;
         let wanted = self.attr(id, "slot").unwrap_or("").trim();
@@ -2926,6 +2930,19 @@ impl Dom {
                 _ => "decimal",
             },
             "display" => ua_display(tag),
+            // WHATWG HTML Rendering §15.3.10: these widgets use border-box
+            // sizing in the UA origin. An authored 30px button therefore
+            // remains 30px including its padding and border.
+            "box-sizing" if tag == "button" || tag == "select" => "border-box",
+            "box-sizing"
+                if tag == "input"
+                    && matches!(
+                        self.input_type(id).as_str(),
+                        "radio" | "checkbox" | "reset" | "button" | "submit" | "color" | "search"
+                    ) =>
+            {
+                "border-box"
+            }
             _ => return None,
         };
         Some(v.to_string())
@@ -4817,11 +4834,25 @@ impl Dom {
                     return;
                 }
                 let color = self.svg_used_color(id);
+                // SVG 2 §6.6 maps presentation attributes into the author
+                // cascade at specificity zero, while ordinary author rules
+                // (including shadow-scoped component rules) can override
+                // them. The standalone raster resource has no document CSS,
+                // so materialize each direct cascade winner as inline style.
+                let paint = self.svg_resource_style(id);
                 let mut serialized_attrs = String::new();
-                self.write_attrs(
+                self.write_attrs_with_extra_style(
                     id,
                     attrs,
-                    &mut |_, value| Some(replace_css_current_color(value, &color)),
+                    &mut |name, value| {
+                        let value = if SVG_PRESENTATION_PROPERTIES.contains(&name) {
+                            self.resolve_vars(id, value)
+                        } else {
+                            value.to_string()
+                        };
+                        Some(replace_css_current_color(&value, &color))
+                    },
+                    &paint,
                     &mut serialized_attrs,
                 );
                 out.push('<');
@@ -4838,6 +4869,27 @@ impl Dom {
                 }
             }
         }
+    }
+
+    /// Direct SVG presentation-property winners to carry into an isolated
+    /// image resource. Inherited winners are emitted on the ancestor where
+    /// they were declared, so the SVG renderer reconstructs inheritance.
+    fn svg_resource_style(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        for &property in SVG_PRESENTATION_PROPERTIES {
+            let Some(raw) = self.cascaded(id, property) else {
+                continue;
+            };
+            let value = self.resolve_vars(id, &raw);
+            if value.trim().is_empty() {
+                continue;
+            }
+            out.push_str(property);
+            out.push(':');
+            out.push_str(&value);
+            out.push(';');
+        }
+        out
     }
 
     /// The first resolvable same-tree fragment referenced by a descendant
@@ -5559,12 +5611,28 @@ impl Dom {
         rewrite: &mut dyn FnMut(&str, &str) -> Option<String>,
         out: &mut String,
     ) {
+        self.write_attrs_with_extra_style(id, attrs, rewrite, "", out);
+    }
+
+    /// `write_attrs` with additional declarations that must share its one
+    /// serialized `style` attribute. XML forbids duplicate attributes, so an
+    /// isolated SVG cannot append a second attribute after the ordinary baked
+    /// layout declarations have already synthesized the first one.
+    fn write_attrs_with_extra_style(
+        &self,
+        id: NodeId,
+        attrs: &[Attribute],
+        rewrite: &mut dyn FnMut(&str, &str) -> Option<String>,
+        extra_style: &str,
+        out: &mut String,
+    ) {
         // Bake the cascaded box/layout properties (the engine has the
         // sheets; the re-parsed layout arena doesn't) into the element's
         // inline style. `display:none` is dropped outright (never baked, see the
         // skip below); `visibility:hidden` IS kept + baked now (paint
         // suppression, Phase 2) so the re-parse paints it blank.
-        let bake = self.baked_element_style(id, false);
+        let mut bake = self.baked_element_style(id, false);
+        append_style(&mut bake, extra_style);
         let mut style_done = false;
         for a in attrs {
             let name: &str = &a.name.local;
@@ -5799,15 +5867,15 @@ impl Dom {
         }
         match comb {
             Combinator::Child => self
-                .style_parent(id)
+                .selector_parent(id)
                 .is_some_and(|p| self.matches_complex(p, rest, scope)),
             Combinator::Descendant | Combinator::None => {
-                let mut up = self.style_parent(id);
+                let mut up = self.selector_parent(id);
                 while let Some(a) = up {
                     if self.matches_complex(a, rest, scope) {
                         return true;
                     }
-                    up = self.style_parent(a);
+                    up = self.selector_parent(a);
                 }
                 false
             }
@@ -5825,6 +5893,22 @@ impl Dom {
                 false
             }
         }
+    }
+
+    /// Parent used by Selectors matching. CSS Shadow 1 §3.2/§4.1 draws an
+    /// important boundary here: selectors operate on the DOM/light tree,
+    /// while inheritance and box construction operate on the flat tree. A
+    /// slotted light-DOM child therefore remains a child of its shadow host
+    /// for `>`/descendant selectors even though [`style_parent`] correctly
+    /// returns the slot for inheritance.
+    fn selector_parent(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes[id].parent?;
+        if matches!(self.tag_name(parent), Some("iframe" | "frame"))
+            && self.frame_body(parent).is_some()
+        {
+            return None;
+        }
+        self.tag_name(parent).is_some().then_some(parent)
     }
 
     /// The nearest preceding sibling that is an element (skips text/comments).
@@ -6334,6 +6418,30 @@ fn append_style(style: &mut String, declarations: &str) {
     }
     style.push_str(declarations);
 }
+
+/// SVG 2 presentation properties retained in an isolated inline-SVG image.
+/// Keeping one list for attribute var() substitution and stylesheet winner
+/// materialization prevents the two standards-defined cascade inputs from
+/// diverging.
+const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-opacity",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "clip-rule",
+    "paint-order",
+    "vector-effect",
+    "shape-rendering",
+    "stop-color",
+    "stop-opacity",
+];
 
 fn escape_attr(s: &str) -> Cow<'_, str> {
     if !s.contains(['&', '<', '>', '"']) {
@@ -7670,6 +7778,26 @@ const PROPS: &[PropDef] = &[
     // borders and text decorations. Graphical paint must retain it instead of
     // falling back to the terminal theme at the end of layout.
     prop("color", true, true),
+    // SVG 2 §6.6 presentation attributes participate in the CSS cascade.
+    // These paint properties are consumed when an inline SVG is serialized
+    // into the desktop image pipeline; they are not layout snapshot fields.
+    prop("fill", true, false),
+    prop("fill-opacity", true, false),
+    prop("fill-rule", true, false),
+    prop("stroke", true, false),
+    prop("stroke-opacity", true, false),
+    prop("stroke-width", true, false),
+    prop("stroke-linecap", true, false),
+    prop("stroke-linejoin", true, false),
+    prop("stroke-miterlimit", true, false),
+    prop("stroke-dasharray", true, false),
+    prop("stroke-dashoffset", true, false),
+    prop("clip-rule", true, false),
+    prop("paint-order", true, false),
+    prop("vector-effect", false, false),
+    prop("shape-rendering", true, false),
+    prop("stop-color", false, false),
+    prop("stop-opacity", false, false),
     // CSS UI 4 §6.2/§6.3: both inherit and affect hit testing without
     // changing box generation. Bake them into live snapshots so the layout
     // arena sees the same interaction eligibility as the resident page DOM.
@@ -7763,6 +7891,9 @@ const PROPS: &[PropDef] = &[
     prop("overflow", false, true),
     prop("overflow-x", false, true),
     prop("overflow-y", false, true),
+    // CSS 2.2 §11.1.2 legacy clipping. It applies only to absolutely
+    // positioned boxes and clips the complete border box and descendants.
+    prop("clip", false, true),
     // CSS Scroll Snap 1: a scroll container only card-SNAPS when it declares
     // `scroll-snap-type` (mandatory/proximity); otherwise it scrolls freely.
     // `scroll-snap-align` (on the items) is the snap-position alignment.
@@ -11534,6 +11665,26 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_selectors_keep_slotted_elements_in_the_light_tree() {
+        // CSS Shadow 1 §3.2.1/§4.1: selectors precede flattening. The direct
+        // child remains matchable through its light-DOM parent after a slot
+        // acquires it; only inheritance changes to use the slot as parent.
+        let mut dom = Dom::parse_document(
+            "<head><style>x-search > input { width:300px; --bar:100%; }</style></head>\
+             <body><x-search id=host><input id=query></x-search></body>",
+        );
+        let host = dom.get_by_id("host").unwrap();
+        let query = dom.get_by_id("query").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let slot = dom.create_element("slot");
+        dom.append(shadow, slot);
+
+        assert_eq!(dom.parent_flat(query), Some(slot));
+        assert_eq!(dom.computed_value(query, "width").as_deref(), Some("300px"));
+        assert_eq!(dom.custom_prop(query, "--bar").as_deref(), Some("100%"));
+    }
+
+    #[test]
     fn parses_and_serializes_a_document() {
         let dom = Dom::parse_document(
             "<html><head><title>T</title></head><body><p id=a>hi <b>there</b></p></body></html>",
@@ -11743,6 +11894,47 @@ mod tests {
                 .to_rgba8()
                 .pixels()
                 .any(|pixel| { pixel[0] >= 200 && pixel[1] < 80 && pixel[2] < 80 && pixel[3] > 0 })
+        );
+    }
+
+    #[test]
+    fn inline_svg_materializes_stylesheet_paint_and_presentation_vars() {
+        // SVG 2 §6.6: a presentation attribute is an author declaration at
+        // specificity zero, and a matching stylesheet declaration overrides
+        // it. CSS Variables §3 substitution occurs before the isolated image
+        // parser consumes either form.
+        let dom = Dom::parse_document(
+            r#"<head><style>
+                 svg { --selected:#dbe0ff; color:#999 }
+                 .icon { fill:currentColor; width:10px }
+                 .override { fill:#123456 }
+               </style></head><body>
+               <svg id="paint" viewBox="0 0 20 10">
+                 <rect class="icon" width="10" height="10"/>
+                 <rect class="override" x="10" width="10" height="10"
+                       style="opacity:1"
+                       fill="var(--selected, #f00)"/>
+               </svg></body>"#,
+        );
+        let svg = dom.get_by_id("paint").unwrap();
+        let (source, _) = dom.svg_image_data(svg, None).expect("paintable SVG");
+        let markup = String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap();
+        assert!(markup.contains("fill:#999999"), "{markup}");
+        assert!(markup.contains("fill:#123456"), "{markup}");
+        assert!(
+            !markup.contains("var("),
+            "unresolved presentation var: {markup}"
+        );
+        let (image, _) = crate::img::decode(&crate::img::decode_data_url(&source).unwrap())
+            .expect("materialized stylesheet paint rasterizes");
+        let rgba = image.to_rgba8();
+        assert!(
+            rgba.pixels()
+                .any(|p| p[0] == 0x99 && p[1] == 0x99 && p[2] == 0x99)
+        );
+        assert!(
+            rgba.pixels()
+                .any(|p| p[0] == 0x12 && p[1] == 0x34 && p[2] == 0x56)
         );
     }
 
