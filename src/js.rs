@@ -2816,6 +2816,7 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__dom_set_hover", 1, sys_set_hover),
     ("__dom_children", 1, sys_children),
     ("__dom_slot_assigned", 1, sys_slot_assigned),
+    ("__dom_assigned_slot", 1, sys_assigned_slot),
     ("__dom_next", 1, sys_next),
     ("__dom_prev", 1, sys_prev),
     ("__dom_node_type", 1, sys_node_type),
@@ -3133,6 +3134,17 @@ fn sys_slot_assigned(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
             .unwrap_or_default()
     };
     Ok(ids_array(ids, ctx))
+}
+
+/// DOM Standard §4.2.2.3 assigned-slot lookup for the internal event-parent
+/// algorithm. Closed-root filtering belongs to the public IDL getter, not this
+/// primitive, because composed events still traverse closed shadow trees.
+fn sys_assigned_slot(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    Ok(id_value(
+        arg_node(&d, args, 0).and_then(|id| d.assigned_slot(id)),
+    ))
 }
 
 fn sys_next(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -10897,12 +10909,12 @@ fn dispatch_set_scroll_in(
 /// Edge-triggered + geometry-cached: a no-op (no settle) unless it delivered
 /// entries, so a page with no observers / no geometry change pays one cheap eval.
 /// The browser's "update the rendering" observer step: deliver ResizeObserver
-/// then IntersectionObserver notifications against the CURRENT layout, and run
-/// the microtasks their callbacks schedule. Both are edge-triggered (a no-op unless a
-/// target's size / intersection state actually changed), so a page with no
-/// observers pays one cheap eval each.
+/// against the current layout until its synchronous broadcast loop converges,
+/// then record IntersectionObserver threshold crossings. Intersection Observer
+/// §3.2.4 queues callbacks on its own platform task source; they do not join
+/// ResizeObserver's rendering-update loop.
 ///
-/// It LOOPS because a callback can change geometry that the next pass must
+/// ResizeObserver LOOPS because a callback can change geometry that the next pass must
 /// observe — a responsive grid (Twitch's shelves) re-renders more cards once its
 /// container's REAL width is finally delivered, which resizes both the container
 /// and the cards, which the next ResizeObserver pass sees. The old single-shot
@@ -10928,19 +10940,7 @@ fn run_intersections(page: &mut LoadedPage) {
         if page.outcome.panicked {
             return;
         }
-        let intersected = guarded_call_trust(
-            &mut page.ctx,
-            "updateIntersections",
-            &[],
-            "intersection observer",
-            &mut page.outcome,
-        )
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0);
-        if page.outcome.panicked {
-            return;
-        }
-        if resized + intersected <= 0.0 {
+        if resized <= 0.0 {
             break;
         }
         // Observer callbacks run in the rendering update. Their promise jobs
@@ -10948,6 +10948,13 @@ fn run_intersections(page: &mut LoadedPage) {
         // remains a later event-loop task.
         run_microtasks_into(&mut page.ctx, &mut page.outcome);
     }
+    let _ = guarded_call_trust(
+        &mut page.ctx,
+        "updateIntersections",
+        &[],
+        "intersection observer update",
+        &mut page.outcome,
+    );
 }
 
 fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {

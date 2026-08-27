@@ -4391,6 +4391,12 @@ impl DesktopApp {
                         .as_ref()
                         .and_then(|scene| scene.page_hit_at(self.pointer))
                         .filter(|hit| hit.link.is_some() || hit.actor.is_some());
+                    if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
+                        eprintln!(
+                            "desktop: primary release pressed={:?} released={released:?}",
+                            self.pressed_hit
+                        );
+                    }
                     let click_target =
                         self.pressed_hit
                             .take()
@@ -4399,6 +4405,9 @@ impl DesktopApp {
                                 let parents = &self.page_layout.as_ref()?.document.parents;
                                 click_target_for_hits(&pressed, &released, parents)
                             });
+                    if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
+                        eprintln!("desktop: primary click target={click_target:?}");
+                    }
                     if let Some(target) = click_target {
                         self.activate_page_hit(target);
                     }

@@ -1664,19 +1664,21 @@ mod desktop {
     }
 
     /// Run the observer portions of HTML's "update the rendering" algorithm around layout.
-    /// ResizeObserver callbacks precede IntersectionObserver callbacks, and either callback may
-    /// alter geometry that requires another bounded style/layout/observer pass before painting.
+    /// HTML's rendering loop synchronously repeats style/layout only for active
+    /// ResizeObserver broadcasts. Intersection Observer §3.2.4 instead queues
+    /// notification on its own task source after recording intersections; its
+    /// callbacks cannot force another layout inside this rendering opportunity.
     fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
         let mut rendered = extract_live(page);
         for _ in 0..6 {
             let resized = trust_number(page, "updateResizes").unwrap_or(0.0);
-            let intersected = trust_number(page, "updateIntersections").unwrap_or(0.0);
             checkpoint(page, "rendering observers");
-            if resized + intersected <= 0.0 || page.outcome.panicked {
+            if resized <= 0.0 || page.outcome.panicked {
                 break;
             }
             rendered = extract_live(page);
         }
+        let _ = trust_number(page, "updateIntersections");
         rendered
     }
 
@@ -2508,6 +2510,57 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn actor_navigates_slotted_link_descendant_activation() {
+            // DOM §2.9 + HTML links: the painted image is the click target,
+            // while the enclosing anchor in a closed shadow tree is the
+            // activation target selected from its composed event path. This is
+            // the structure used by archive.org's collection item tiles.
+            let html = r#"<!doctype html><html><body>
+                <x-tile id="tile"><img id="target" alt="item"></x-tile>
+                <script>
+                    const root = document.getElementById("tile")
+                        .attachShadow({ mode: "closed" });
+                    root.innerHTML = '<a href="/details/vhskids"><slot></slot></a>';
+                    document.getElementById("target").addEventListener("click", () => {});
+                </script>
+            </body></html>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) = spawn_page(
+                html.to_string(),
+                PageEnv::bare("https://archive.org/details/vhsvault"),
+            );
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { .. }) => break,
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("initial page task failed: {errors:?}")
+                        }
+                        Some(other) => panic!("expected live page update, got {other:?}"),
+                        None => panic!("Lumen actor closed before initial render"),
+                    }
+                }
+            })
+            .await
+            .expect("initial Lumen render timed out");
+
+            handle.try_send_navigation_click(target).unwrap();
+            let navigated = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Navigate(url)) => break url,
+                        Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed during slotted link click"),
+                    }
+                }
+            })
+            .await
+            .expect("slotted hyperlink navigation timed out");
+            assert_eq!(navigated, "https://archive.org/details/vhskids");
+        }
+
+        #[tokio::test]
         async fn parser_document_write_uses_the_current_script_insertion_point() {
             // WHATWG HTML §8.4.3 inserts each document.write string immediately
             // before the active parser insertion point. The source is already a
@@ -2895,6 +2948,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_set_hover", 1, host_set_hover),
     ("__dom_children", 1, host_children),
     ("__dom_slot_assigned", 1, host_slot_assigned),
+    ("__dom_assigned_slot", 1, host_assigned_slot),
     ("__dom_next", 1, host_next),
     ("__dom_prev", 1, host_prev),
     ("__dom_node_type", 1, host_node_type),
@@ -5156,6 +5210,17 @@ fn host_slot_assigned(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     Ok(host_ids_array(ctx, ids))
 }
 
+/// DOM Standard §4.2.2.3 assigned-slot lookup. Unlike the public
+/// `assignedSlot` getter, this internal primitive intentionally returns slots
+/// in closed roots: Node's event-parent algorithm must traverse them.
+fn host_assigned_slot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(host_id_value(
+        host_arg_node(&dom, args, 0).and_then(|id| dom.assigned_slot(id)),
+    ))
+}
+
 fn host_next(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -6239,7 +6304,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 101, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 102, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -6250,7 +6315,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 101);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 102);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -7456,6 +7521,165 @@ mod tests {
     }
 
     #[test]
+    fn slotted_events_follow_the_assigned_slot_through_shadow_buttons() {
+        // DOM §§2.2, 2.9, 4.2.2.3, and 4.4: a slottable's event parent is
+        // its assigned slot rather than its light-tree parent. This is what
+        // lets a click targeting a component's projected label reach the
+        // shadow button that contains <slot>. Closed roots remain in the
+        // internal path but are hidden by assignedSlot/composedPath outside.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html);
+            html.appendChild(body);
+            const names = (path) => path.map((node) => node === window ? "window"
+                : node.localName || (node.nodeType === 9 ? "#document" : "#fragment")).join(",");
+
+            const openHost = document.createElement("x-open");
+            body.appendChild(openHost);
+            const openRoot = openHost.attachShadow({ mode: "open" });
+            openRoot.innerHTML = '<button><slot name="label"></slot></button>';
+            const openButton = openRoot.querySelector("button");
+            const openSlot = openRoot.querySelector("slot");
+            const openLabel = document.createElement("span");
+            openLabel.setAttribute("slot", "label");
+            openLabel.textContent = "Weekly views";
+            openHost.appendChild(openLabel);
+            let openReached = false, openTarget = "", openPath = "", documentTarget = "";
+            openButton.addEventListener("click", (event) => {
+                openReached = true;
+                openTarget = event.target.localName;
+                openPath = names(event.composedPath());
+            });
+            document.addEventListener("click", (event) => { documentTarget = event.target.localName; });
+            openLabel.dispatchEvent(new MouseEvent("click", { bubbles: true, composed: true }));
+
+            const closedHost = document.createElement("x-closed-slot");
+            body.appendChild(closedHost);
+            const closedRoot = closedHost.attachShadow({ mode: "closed" });
+            closedRoot.innerHTML = '<button><slot name="label"></slot></button>';
+            const closedButton = closedRoot.querySelector("button");
+            const closedLabel = document.createElement("span");
+            closedLabel.setAttribute("slot", "label");
+            closedHost.appendChild(closedLabel);
+            let closedReached = false, closedInsidePath = "", closedOutsidePath = "";
+            closedButton.addEventListener("click", (event) => {
+                closedReached = true;
+                closedInsidePath = names(event.composedPath());
+            });
+            closedHost.addEventListener("click", (event) => {
+                closedOutsidePath = names(event.composedPath());
+            });
+            closedLabel.dispatchEvent(new MouseEvent("click", { bubbles: true, composed: true }));
+
+            const textHost = document.createElement("x-text-slot");
+            body.appendChild(textHost);
+            const textRoot = textHost.attachShadow({ mode: "open" });
+            textRoot.innerHTML = "<slot></slot>";
+            const projectedText = document.createTextNode("projected");
+            textHost.appendChild(projectedText);
+
+            globalThis.slottedEventResult = [
+                openLabel.parentNode === openHost,
+                openLabel.assignedSlot === openSlot,
+                openReached,
+                openTarget,
+                documentTarget,
+                openPath,
+                closedLabel.assignedSlot === null,
+                closedReached,
+                closedInsidePath,
+                closedOutsidePath,
+                projectedText.assignedSlot === textRoot.querySelector("slot")
+            ].join("|");
+            "##,
+            "assigned-slot event parent",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "slottedEventResult"),
+            "true|true|true|span|span|span,slot,button,#fragment,x-open,body,html,#document,window|true|true|span,slot,button,#fragment,x-closed-slot,body,html,#document,window|span,x-closed-slot,body,html,#document,window|true"
+        );
+    }
+
+    #[test]
+    fn hyperlink_activation_uses_the_click_event_path() {
+        // DOM §2.9 chooses the first activation-behavior object while building
+        // the click event path. It can therefore be an ancestor of a Text or
+        // Element target, can be reached through an assigned slot, and remains
+        // the activation target even if a listener removes it before the
+        // default action runs. HTML links with an empty href are hyperlinks too.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html);
+            html.appendChild(body);
+
+            const direct = document.createElement("a");
+            direct.href = "/details/direct";
+            const label = document.createElement("span");
+            label.textContent = "direct";
+            direct.appendChild(label);
+            body.appendChild(direct);
+            const text = label.firstChild;
+
+            const host = document.createElement("x-link");
+            const root = host.attachShadow({ mode: "closed" });
+            root.innerHTML = '<a href="/details/slotted"><slot></slot></a>';
+            const slotted = document.createElement("img");
+            host.appendChild(slotted);
+            body.appendChild(host);
+
+            const removed = document.createElement("a");
+            removed.href = "/details/removed";
+            const removedLabel = document.createElement("span");
+            removed.appendChild(removedLabel);
+            body.appendChild(removed);
+            removed.addEventListener("click", () => {
+                removedLabel.remove();
+                removed.remove();
+            });
+            const removedPrevented = __trust.click(removedLabel.__id);
+            const removedDefault = __trust.followAnchorDefault(removedLabel.__id);
+
+            const canceled = document.createElement("a");
+            canceled.href = "/details/canceled";
+            const canceledImage = document.createElement("img");
+            canceled.appendChild(canceledImage);
+            body.appendChild(canceled);
+            canceled.addEventListener("click", event => event.preventDefault());
+
+            const empty = document.createElement("a");
+            empty.setAttribute("href", "");
+            body.appendChild(empty);
+
+            globalThis.hyperlinkActivationResult = [
+                __trust.followAnchorDefault(text.__id),
+                __trust.followAnchorDefault(slotted.__id),
+                removedPrevented,
+                removedDefault,
+                __trust.click(canceledImage.__id),
+                __trust.followAnchorDefault(empty.__id)
+            ].join("|");
+            "##,
+            "hyperlink activation target",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "hyperlinkActivationResult"),
+            "https://example.com/details/direct|https://example.com/details/slotted|false|https://example.com/details/removed|true|https://example.com/"
+        );
+    }
+
+    #[test]
     fn css_style_declaration_rejects_unitless_nonzero_lengths() {
         // CSSOM §6.7.1 + CSS Values 4 §6: assigning a JS number to a length
         // property stringifies it, but the resulting nonzero <number> is not a
@@ -7985,6 +8209,81 @@ mod tests {
             call_trust_method(&mut engine, "tick", &[]),
             Value::Bool(false)
         ));
+    }
+
+    #[test]
+    fn intersection_observer_records_then_notifies_on_its_task_source() {
+        // Intersection Observer §§3.2.4–3.2.6: the rendering update queues
+        // entries and one IntersectionObserver task; it does not synchronously
+        // invoke callbacks. `takeRecords()` drains queued entries before that
+        // task, and repeated geometry updates with no threshold crossing do not
+        // duplicate a record.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.ioResult = { callbacks: 0, entries: 0 };
+            const target = document.createElement('div');
+            const observer = new IntersectionObserver(function (entries) {
+                ioResult.callbacks++;
+                ioResult.entries += entries.length;
+            });
+            observer.observe(target);
+            ioResult.firstQueued = __trust.updateIntersections();
+            ioResult.callbackWasSync = ioResult.callbacks !== 0;
+            ioResult.hadTask = __trust.hasPlatformTask();
+            ioResult.taken = observer.takeRecords().length;
+
+            observer.unobserve(target);
+            observer.observe(target);
+            ioResult.secondQueued = __trust.updateIntersections();
+            ioResult.duplicateQueued = __trust.updateIntersections();
+            ioResult.ranTask = __trust.runPlatformTask();
+            "#,
+            "IntersectionObserver task source",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[ioResult.firstQueued, ioResult.callbackWasSync, ioResult.hadTask, ioResult.taken, ioResult.secondQueued, ioResult.duplicateQueued, ioResult.ranTask, ioResult.callbacks, ioResult.entries].join(',')"
+            ),
+            "1,false,true,1,1,0,true,1,1"
+        );
+    }
+
+    #[test]
+    fn observer_initial_update_fallbacks_are_coalesced_per_api() {
+        // Pending initial observations request a rendering opportunity, not
+        // one timer task per target. The resident actor retains a timer as a
+        // fallback for a late observe() that otherwise dirtied no rendering,
+        // but a large registry must still create only one IO and one RO timer.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const io = new IntersectionObserver(function () {});
+            const ro = new ResizeObserver(function () {});
+            for (let i = 0; i < 128; i++) {
+                const target = document.createElement('div');
+                io.observe(target);
+                ro.observe(target);
+            }
+            globalThis.observerQueuesBefore = __trust.taskQueueState();
+            __trust.updateResizes();
+            __trust.updateIntersections();
+            globalThis.observerQueuesAfter = __trust.taskQueueState();
+            "#,
+            "observer initial update coalescing",
+        )
+        .unwrap();
+
+        let before = string_value(&mut engine, "observerQueuesBefore");
+        assert!(before.contains("timers=2(once=2,interval=0)"), "{before}");
+        let after = string_value(&mut engine, "observerQueuesAfter");
+        assert!(after.contains("timers=0(once=0,interval=0)"), "{after}");
+        assert!(after.contains("intersection=1"), "{after}");
     }
 
     #[test]
