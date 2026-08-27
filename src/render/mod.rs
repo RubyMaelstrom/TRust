@@ -233,13 +233,16 @@ impl ImageHandle {
 }
 
 impl PagePaint {
-    /// Whether scene composition must advance the CSS Animations document
-    /// timeline even when no DOM/layout mutation occurred.
+    /// Whether scene composition must advance a document paint timeline even
+    /// when no DOM/layout mutation occurred (CSS Animations or `<marquee>`).
     pub fn has_css_animations(&self) -> bool {
         let has = |commands: &[Primitive]| {
-            commands
-                .iter()
-                .any(|command| matches!(command, Primitive::BeginCssAnimation(_)))
+            commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Primitive::BeginCssAnimation(_) | Primitive::BeginMarquee(_)
+                )
+            })
         };
         has(&self.primitives)
             || has(&self.fixed_under_primitives)
@@ -415,6 +418,18 @@ pub struct TextDecorationPaint {
     pub style: DecorationStyle,
 }
 
+/// One computed `text-shadow` layer retained with a shaped glyph run. Text
+/// shadows are ink only: they share the glyph geometry and never participate
+/// in layout, selection, or hit testing (CSS Text Decoration 4 §4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextShadowPaint {
+    pub color: PaintColor,
+    pub offset: CssPoint,
+    pub blur_radius: f32,
+    pub spread: f32,
+    pub inset: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HitRegion {
     pub rect: CssRect,
@@ -490,6 +505,11 @@ pub enum DisplayCommand {
     /// document clock and emits an ordinary transform before rasterization.
     BeginCssAnimation(CssAnimationScope),
     EndCssAnimation,
+    /// HTML marquee content animation. Layout leaves the element's border,
+    /// background, and clipping viewport fixed; only descendant paint enters
+    /// this sampled translation scope (HTML Rendering §15.5.13).
+    BeginMarquee(MarqueeScope),
+    EndMarquee,
     /// A renderer may use a native blur/filter, or fall back to an expanded
     /// translucent shape. The geometry and CSS semantics remain TRust-owned.
     Shadow {
@@ -516,6 +536,9 @@ pub enum DisplayCommand {
         shaped: crate::text::ShapedText,
         color: PaintColor,
         decoration: TextDecorationPaint,
+        /// Author order, frontmost first. Backends paint this list in reverse
+        /// below the decorations/text, as required by CSS Text Decoration 4.
+        shadows: Vec<TextShadowPaint>,
         clip: Option<CssRect>,
         /// DOM/layout identity retained for selection, hit testing, and links.
         node: usize,
@@ -564,6 +587,38 @@ pub struct CssPaintAnimation {
 pub struct CssAnimationPoint {
     pub offset: f32,
     pub value: CssPoint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarqueeScope {
+    pub viewport: CssRect,
+    pub content: CssRect,
+    pub behavior: MarqueeBehavior,
+    pub direction: MarqueeDirection,
+    pub scroll_interval_seconds: f32,
+    pub scroll_distance: f32,
+    /// `None` is HTML's infinite (`-1`) loop count.
+    pub loop_count: Option<u32>,
+    pub running: bool,
+    pub paused_at_seconds: Option<f32>,
+    pub paused_total_seconds: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarqueeBehavior {
+    #[default]
+    Scroll,
+    Slide,
+    Alternate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarqueeDirection {
+    #[default]
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// One entry in the document's ordered top layer. Entries cannot be flattened
@@ -825,6 +880,8 @@ fn command_changes_paint_state(command: &DisplayCommand) -> bool {
             | DisplayCommand::EndFixed
             | DisplayCommand::BeginCssAnimation(_)
             | DisplayCommand::EndCssAnimation
+            | DisplayCommand::BeginMarquee(_)
+            | DisplayCommand::EndMarquee
     )
 }
 
@@ -937,7 +994,9 @@ fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
         | DisplayCommand::BeginFixed
         | DisplayCommand::EndFixed
         | DisplayCommand::BeginCssAnimation(_)
-        | DisplayCommand::EndCssAnimation => None,
+        | DisplayCommand::EndCssAnimation
+        | DisplayCommand::BeginMarquee(_)
+        | DisplayCommand::EndMarquee => None,
     }
 }
 
@@ -1441,9 +1500,124 @@ impl Scene {
                         )));
                 }
                 Primitive::EndCssAnimation => self.primitives.push(Primitive::PopTransform),
+                Primitive::BeginMarquee(scope) => {
+                    let translation = sample_marquee_scope(scope, elapsed_seconds);
+                    self.primitives
+                        .push(Primitive::PushTransform(Affine2d::translate(
+                            translation.x,
+                            translation.y,
+                        )));
+                }
+                Primitive::EndMarquee => self.primitives.push(Primitive::PopTransform),
                 other => self.primitives.push(other.clone()),
             }
         }
+    }
+}
+
+/// Sample HTML's discrete marquee motion. The scroll interval and distance
+/// define a maximum movement per frame (HTML §16.3.1); quantizing the elapsed
+/// document timeline to that interval preserves the legacy stepped cadence
+/// without timers or DOM relayout.
+fn sample_marquee_scope(scope: &MarqueeScope, elapsed_seconds: f32) -> CssPoint {
+    if scope.scroll_distance <= 0.0 || scope.scroll_interval_seconds <= 0.0 {
+        return CssPoint::default();
+    }
+    let sampled_at = if scope.running {
+        elapsed_seconds
+    } else {
+        scope.paused_at_seconds.unwrap_or(0.0)
+    };
+    let elapsed_seconds = (sampled_at.max(0.0) - scope.paused_total_seconds.max(0.0)).max(0.0);
+    let horizontal = matches!(
+        scope.direction,
+        MarqueeDirection::Left | MarqueeDirection::Right
+    );
+    let (viewport_start, viewport_end, content_start, content_end) = if horizontal {
+        (
+            scope.viewport.x,
+            scope.viewport.x + scope.viewport.width,
+            scope.content.x,
+            scope.content.x + scope.content.width,
+        )
+    } else {
+        (
+            scope.viewport.y,
+            scope.viewport.y + scope.viewport.height,
+            scope.content.y,
+            scope.content.y + scope.content.height,
+        )
+    };
+    let forward = matches!(
+        scope.direction,
+        MarqueeDirection::Left | MarqueeDirection::Up
+    );
+    let (mut start, mut end) = match scope.behavior {
+        MarqueeBehavior::Scroll => {
+            if forward {
+                (viewport_end - content_start, viewport_start - content_end)
+            } else {
+                (viewport_start - content_end, viewport_end - content_start)
+            }
+        }
+        MarqueeBehavior::Slide => {
+            if forward {
+                (viewport_end - content_start, viewport_start - content_start)
+            } else {
+                (viewport_start - content_end, viewport_end - content_end)
+            }
+        }
+        MarqueeBehavior::Alternate => {
+            if forward {
+                (viewport_end - content_end, viewport_start - content_start)
+            } else {
+                (viewport_start - content_start, viewport_end - content_end)
+            }
+        }
+    };
+    let distance = (end - start).abs();
+    if distance <= f32::EPSILON {
+        return CssPoint::default();
+    }
+    let steps = (distance / scope.scroll_distance).ceil().max(1.0) as u64;
+    let frame = (elapsed_seconds.max(0.0) / scope.scroll_interval_seconds).floor() as u64;
+    // A resetting traversal needs a distinct terminal sample. Otherwise the
+    // modulo wraps on the very tick that reaches the far edge, so up to one
+    // whole scroll-distance of content remains visible forever. Alternate
+    // motion can share that boundary sample with the next, reversed leg.
+    let frames_per_loop = if scope.behavior == MarqueeBehavior::Alternate {
+        steps
+    } else {
+        steps.saturating_add(1)
+    };
+    let loop_index = frame / frames_per_loop;
+    if let Some(count) = scope.loop_count
+        && loop_index >= u64::from(count)
+    {
+        // HTML Rendering §15.5.13 turns a finite marquee off only after the
+        // current traversal has ended. Its contents therefore remain at that
+        // traversal's end edge; snapping a scroll marquee back to its start
+        // edge made the last frame visibly jump.
+        let value = if scope.behavior == MarqueeBehavior::Alternate && count % 2 == 0 {
+            start
+        } else {
+            end
+        };
+        return if horizontal {
+            CssPoint::new(value, 0.0)
+        } else {
+            CssPoint::new(0.0, value)
+        };
+    }
+    if scope.behavior == MarqueeBehavior::Alternate && loop_index % 2 == 1 {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let progress = ((frame % frames_per_loop) as f32 * scope.scroll_distance / distance).min(1.0);
+    let value = start + (end - start) * progress;
+    if horizontal {
+        CssPoint::new(value, 0.0)
+    } else {
+        CssPoint::new(0.0, value)
     }
 }
 
@@ -2365,6 +2539,7 @@ fn paint_chrome_text(
             color,
             style: DecorationStyle::Solid,
         },
+        shadows: Vec::new(),
         clip: None,
         node: 0,
         link: None,
@@ -2400,6 +2575,7 @@ fn paint_ui_text(
             color,
             style: DecorationStyle::Solid,
         },
+        shadows: Vec::new(),
         clip: None,
         node: 0,
         link: None,
@@ -2600,6 +2776,76 @@ mod tests {
         assert_eq!(
             sample_css_animation_scope(&scope, 5.0),
             CssPoint::new(60.0, 330.0)
+        );
+    }
+
+    #[test]
+    fn marquee_sampling_obeys_interval_distance_direction_and_pause() {
+        let mut scope = MarqueeScope {
+            viewport: CssRect::new(0.0, 0.0, 100.0, 20.0),
+            content: CssRect::new(0.0, 0.0, 20.0, 20.0),
+            behavior: MarqueeBehavior::Scroll,
+            direction: MarqueeDirection::Left,
+            scroll_interval_seconds: 0.1,
+            scroll_distance: 6.0,
+            loop_count: None,
+            running: true,
+            paused_at_seconds: None,
+            paused_total_seconds: 0.0,
+        };
+        assert_eq!(sample_marquee_scope(&scope, 0.0), CssPoint::new(100.0, 0.0));
+        assert_eq!(
+            sample_marquee_scope(&scope, 0.09),
+            CssPoint::new(100.0, 0.0)
+        );
+        assert_eq!(sample_marquee_scope(&scope, 0.1), CssPoint::new(94.0, 0.0));
+        assert_eq!(
+            sample_marquee_scope(&scope, 1.9),
+            CssPoint::new(-14.0, 0.0),
+            "the last stepped sample may still expose at most scrollAmount pixels"
+        );
+        assert_eq!(
+            sample_marquee_scope(&scope, 2.0),
+            CssPoint::new(-20.0, 0.0),
+            "scroll paints a fully exited terminal frame before repeating"
+        );
+        assert_eq!(
+            sample_marquee_scope(&scope, 2.11),
+            CssPoint::new(100.0, 0.0),
+            "the next interval starts the following traversal"
+        );
+        scope.running = false;
+        scope.paused_at_seconds = Some(0.2);
+        assert_eq!(sample_marquee_scope(&scope, 10.0), CssPoint::new(88.0, 0.0));
+        scope.running = true;
+        scope.paused_total_seconds = 0.8;
+        assert_eq!(
+            sample_marquee_scope(&scope, 1.0),
+            CssPoint::new(94.0, 0.0),
+            "resuming subtracts the accumulated pause"
+        );
+
+        scope.loop_count = Some(1);
+        scope.paused_total_seconds = 0.0;
+        assert_eq!(
+            sample_marquee_scope(&scope, 100.0),
+            CssPoint::new(-20.0, 0.0),
+            "a finite scroll marquee remains at the completed traversal's end"
+        );
+
+        scope.behavior = MarqueeBehavior::Slide;
+        assert_eq!(
+            sample_marquee_scope(&scope, 100.0),
+            CssPoint::new(0.0, 0.0),
+            "slide leaves the contents flush with the destination edge"
+        );
+
+        scope.behavior = MarqueeBehavior::Alternate;
+        scope.loop_count = Some(2);
+        assert_eq!(
+            sample_marquee_scope(&scope, 100.0),
+            CssPoint::new(80.0, 0.0),
+            "an even number of alternate traversals finishes back at its start"
         );
     }
 
@@ -2920,6 +3166,7 @@ mod tests {
                 color: PaintColor::Foreground,
                 style: DecorationStyle::Solid,
             },
+            shadows: Vec::new(),
             clip: None,
             node: 1,
             link: None,

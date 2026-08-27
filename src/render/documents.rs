@@ -163,6 +163,7 @@ pub fn paint_doc_selected(
                     color,
                     style: DecorationStyle::Solid,
                 },
+                shadows: Vec::new(),
                 clip: None,
                 node: line_index + 1,
                 link: line.link.clone(),

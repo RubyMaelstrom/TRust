@@ -29,7 +29,10 @@ use super::flex::{
 use super::float::{FloatBox, FloatCtx, Side};
 use super::inline::{AtomBoxSize, FloatEnv, Ifc, InlineItem, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
-use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Outline, Pos, RIGHT, TOP, block_align};
+use super::style::{
+    BOTTOM, BoxStyle, InlineStyle, LEFT, Outline, Pos, RIGHT, TOP, block_align,
+    legacy_descendant_align,
+};
 use super::tree::{Atom, AtomKind, BoxNode, Content, Inline};
 use super::value::{Len, Vp};
 
@@ -1629,6 +1632,14 @@ impl Flow<'_> {
             Len::None => f32::INFINITY,
             l => spec(l).unwrap_or(f32::INFINITY),
         };
+        // WHATWG HTML Rendering §15.2/15.3.3: `<center>` and legacy
+        // `align` hints additionally align qualifying over-constrained
+        // descendant blocks by changing the margin that CSS 2.1 §10.3.3
+        // would otherwise force. Floats and out-of-flow boxes do not use that
+        // normal-flow block equation.
+        let legacy_align = (s.float.is_none() && !s.position.out_of_flow())
+            .then(|| legacy_descendant_align(self.dom, b.node))
+            .flatten();
         // §10.3.3 for one candidate width; returns (ml, content_w).
         let solve = |w: Option<f32>| -> (f32, f32) {
             let ml = s.margin[LEFT].resolve(Some(cb_w));
@@ -1644,13 +1655,27 @@ impl Flow<'_> {
                     let free = cb_w - w - bp;
                     let ml_auto = s.margin[LEFT].is_auto();
                     let mr_auto = s.margin[RIGHT].is_auto();
-                    let ml = match (ml_auto, mr_auto) {
+                    let mut ml = match (ml_auto, mr_auto) {
                         // Both auto: center (negative free → treated 0/ltr).
                         (true, true) => (free / 2.0).max(0.0),
                         (true, false) => free - mr.unwrap_or(0.0),
                         // ml known (or over-constrained: mr gives way, ltr).
                         _ => ml.unwrap_or(0.0),
                     };
+                    if !ml_auto && !mr_auto {
+                        // A positive remainder is the case where the normal
+                        // ltr block equation forces margin-right to a greater
+                        // used value. Split or transfer only that remainder;
+                        // authored non-auto margins remain intact.
+                        let remainder = free - ml - mr.unwrap_or(0.0);
+                        if remainder > 0.0 {
+                            ml += match legacy_align {
+                                Some(super::style::Align2::Center) => remainder / 2.0,
+                                Some(super::style::Align2::Right) => remainder,
+                                _ => 0.0,
+                            };
+                        }
+                    }
                     (ml, w)
                 }
             }
@@ -3628,7 +3653,21 @@ impl Flow<'_> {
             }
         };
         let def_h = self.height_px(&s.height, s, bt, bb, cb_h);
-        let (frag, anchors) = self.item_frag(fb, content_w, cb_w, def_h, parent_inl);
+        let (mut frag, mut anchors) = self.item_frag(fb, content_w, cb_w, def_h, parent_inl);
+        // CSS Positioned Layout 3 §2/§3.3: `position:relative` lays the
+        // box out in its ordinary formatting context first, then shifts it as
+        // a purely visual effect. A float therefore keeps its unshifted margin
+        // box in FloatCtx (so following floats and lines exclude the original
+        // position), while its fragment, descendants, and anchors receive the
+        // same paint offset as an ordinary block. `item_frag` intentionally
+        // returns unshifted geometry for its other flex/grid/oof callers.
+        let (dx, dy) = self.paint_offset(s, cb_w, cb_h, frag.w, frag.h);
+        if dx != 0.0 || dy != 0.0 {
+            Self::offset_frag(&mut frag, dx, dy);
+            for anchor in &mut anchors {
+                anchor.1 += dy;
+            }
+        }
         PrelaidFloat {
             side,
             mw: m[LEFT] + frag.w + m[RIGHT],
@@ -3678,8 +3717,19 @@ impl Flow<'_> {
             Some(w) => w.clamp(min_w, max_w),
             None => {
                 let avail = (cb_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
-                self.shrink_to_fit(ab, avail, parent_inl)
-                    .clamp(min_w, max_w)
+                // HTML Rendering §15.5.13 gives MARQUEE an inline-block
+                // principal box, but interoperable marquee widgets use the
+                // available inline size for an authored auto width and
+                // separately measure their contents at max-content. Treating
+                // it as an ordinary shrink-to-fit inline-block collapsed the
+                // viewport to the moving text, so a loop restarted partway
+                // across the containing block instead of at its start edge.
+                if self.dom.tag_name(ab.node) == Some("marquee") {
+                    avail.clamp(min_w, max_w)
+                } else {
+                    self.shrink_to_fit(ab, avail, parent_inl)
+                        .clamp(min_w, max_w)
+                }
             }
         };
         let def_h = self.height_px(&s.height, s, bt, bb, cb_h);

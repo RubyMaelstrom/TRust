@@ -21,7 +21,7 @@ use super::{
     ImageSampling, LineCap, PaintBrush, PaintColor, PaintShape, PathElement, Primitive,
     RasterBackend, RasterFrame, Scene, StrokeStyle, is_desktop_heart_image_handle,
 };
-use crate::core::PhysicalSize;
+use crate::core::{CssPoint, PhysicalSize};
 
 pub(super) const MAX_REGISTERED_IMAGES: usize = 256;
 
@@ -207,7 +207,9 @@ impl VelloCpuRenderer {
                 | DisplayCommand::BeginFixed
                 | DisplayCommand::EndFixed
                 | DisplayCommand::BeginCssAnimation(_)
-                | DisplayCommand::EndCssAnimation => {
+                | DisplayCommand::EndCssAnimation
+                | DisplayCommand::BeginMarquee(_)
+                | DisplayCommand::EndMarquee => {
                     // Scene composition resolves these to Push/PopTransform.
                 }
                 DisplayCommand::Shadow {
@@ -286,6 +288,7 @@ impl VelloCpuRenderer {
                     shaped,
                     color,
                     decoration,
+                    shadows,
                     clip,
                     ..
                 } => {
@@ -304,36 +307,30 @@ impl VelloCpuRenderer {
                     if let Some(clip) = clip {
                         self.context.push_clip_path(&rect_path(*clip));
                     }
-                    self.context.set_paint(vello_color(*color));
-                    for run in &shaped.runs {
-                        let glyphs: Vec<vello_cpu::Glyph> = run
-                            .glyphs
-                            .iter()
-                            .map(|glyph| vello_cpu::Glyph {
-                                id: glyph.id,
-                                x: origin.x + glyph.x,
-                                y: origin.y + glyph.y,
-                            })
-                            .collect();
-                        let mut glyphs_builder = self
-                            .context
-                            .glyph_run(&mut self.resources, run.font.data())
-                            .font_size(run.font_size)
-                            .normalized_coords(&run.normalized_coords);
-                        if run.synth_bold {
-                            let amount = f64::from(run.font_size) * 0.025;
-                            glyphs_builder = glyphs_builder.font_embolden(
-                                glifo::FontEmbolden::new(Diagonal2::new(amount, amount)),
-                            );
-                        }
-                        if let Some(degrees) = run.synth_skew_degrees {
-                            glyphs_builder = glyphs_builder.glyph_transform(Affine::skew(
-                                f64::from(degrees).to_radians().tan(),
-                                0.0,
-                            ));
-                        }
-                        glyphs_builder.fill_glyphs(glyphs.into_iter());
+                    // CSS Text Decoration 4 §4 paints shadow layers below the
+                    // decorated text, with the first authored shadow on top.
+                    // Vello CPU currently exposes arbitrary-path blur only for
+                    // rounded rectangles; glyph shadows retain blur/spread in
+                    // the display list and use the exact zero-blur path here.
+                    for shadow in shadows.iter().rev() {
+                        let shadow_origin =
+                            CssPoint::new(origin.x + shadow.offset.x, origin.y + shadow.offset.y);
+                        self.context.set_paint(vello_color(shadow.color));
+                        paint_glyphs(
+                            &mut self.context,
+                            &mut self.resources,
+                            shadow_origin,
+                            shaped,
+                        );
+                        paint_decorations(
+                            &mut self.context,
+                            shadow_origin,
+                            shaped,
+                            decoration.style,
+                        );
                     }
+                    self.context.set_paint(vello_color(*color));
+                    paint_glyphs(&mut self.context, &mut self.resources, *origin, shaped);
                     self.context.set_paint(vello_color(decoration.color));
                     paint_decorations(&mut self.context, *origin, shaped, decoration.style);
                     if clip.is_some() {
@@ -586,6 +583,39 @@ impl RasterBackend for VelloCpuRenderer {
             size: self.size,
             pixels: &self.presented,
         })
+    }
+}
+
+fn paint_glyphs(
+    context: &mut RenderContext,
+    resources: &mut Resources,
+    origin: crate::core::CssPoint,
+    shaped: &crate::text::ShapedText,
+) {
+    for run in &shaped.runs {
+        let glyphs: Vec<vello_cpu::Glyph> = run
+            .glyphs
+            .iter()
+            .map(|glyph| vello_cpu::Glyph {
+                id: glyph.id,
+                x: origin.x + glyph.x,
+                y: origin.y + glyph.y,
+            })
+            .collect();
+        let mut glyphs_builder = context
+            .glyph_run(resources, run.font.data())
+            .font_size(run.font_size)
+            .normalized_coords(&run.normalized_coords);
+        if run.synth_bold {
+            let amount = f64::from(run.font_size) * 0.025;
+            glyphs_builder = glyphs_builder
+                .font_embolden(glifo::FontEmbolden::new(Diagonal2::new(amount, amount)));
+        }
+        if let Some(degrees) = run.synth_skew_degrees {
+            glyphs_builder = glyphs_builder
+                .glyph_transform(Affine::skew(f64::from(degrees).to_radians().tan(), 0.0));
+        }
+        glyphs_builder.fill_glyphs(glyphs.into_iter());
     }
 }
 
@@ -1070,6 +1100,60 @@ mod tests {
         assert_eq!(
             renderer.images[&handle].revision,
             scene.image_store.revision(handle).unwrap()
+        );
+    }
+
+    #[test]
+    fn cpu_raster_paints_retained_text_shadow_ink() {
+        let snapshot = BrowserSnapshot {
+            address: String::new(),
+            status: String::new(),
+            loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            focused: false,
+            viewport: CssSize::new(120.0, 80.0),
+            page_revision: 0,
+        };
+        let mut scene = desktop_shell(
+            ViewportMetrics::from_physical(PhysicalSize::new(120, 80), ScaleFactor::new(1.0)),
+            &snapshot,
+        );
+        let mut style = crate::text::TextStyle::default();
+        style.size = 28.0;
+        scene.primitives.push(DisplayCommand::GlyphRun {
+            origin: CssPoint::new(12.0, 38.0),
+            shaped: crate::text::shape("M", &style),
+            color: PaintColor::Rgba(0, 0, 0, 255),
+            decoration: crate::render::TextDecorationPaint {
+                color: PaintColor::Rgba(0, 0, 0, 255),
+                style: DecorationStyle::Solid,
+            },
+            shadows: Vec::new(),
+            clip: None,
+            node: 1,
+            link: None,
+        });
+
+        let mut renderer = VelloCpuRenderer::new();
+        let without_shadow = renderer.render(&scene).unwrap().pixels.to_vec();
+        let Some(DisplayCommand::GlyphRun { shadows, .. }) = scene.primitives.last_mut() else {
+            unreachable!()
+        };
+        shadows.push(crate::render::TextShadowPaint {
+            color: PaintColor::Rgba(255, 0, 255, 255),
+            offset: CssPoint::new(24.0, 0.0),
+            blur_radius: 0.0,
+            spread: 0.0,
+            inset: false,
+        });
+        let with_shadow = renderer.render(&scene).unwrap().pixels.to_vec();
+        assert!(
+            without_shadow
+                .iter()
+                .zip(&with_shadow)
+                .any(|(before, after)| before != after),
+            "a retained text-shadow layer must reach the raster output"
         );
     }
 

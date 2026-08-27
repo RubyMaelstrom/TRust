@@ -578,13 +578,41 @@ impl Builder<'_> {
         if matches!(style.height, super::value::Len::Auto) {
             style.height = super::value::Len::px(dimension("height", 150.0));
         }
+        // HTML Rendering §15.3.2 sizes the child document to the iframe's
+        // content box. The BODY remains that document's formatting box: CSS
+        // Display 3 §2 requires its authored inner display type to select the
+        // descendants' block/flex/grid/table formatting context. Hard-coding
+        // block here made the canonical desktop path disagree with the
+        // serialized terminal adapter for flex-centered iframe documents.
+        let body = body.and_then(|body| match display_of(self.dom, body) {
+            Disp::Table => Some(self.table(body)),
+            display @ (Disp::Flex | Disp::Grid | Disp::Block | Disp::ListItem) => {
+                Some(self.container(body, display))
+            }
+            // BODY's HTML UA display is block. If an author explicitly picks
+            // an inline-level value, blockify it because it is the root
+            // formatting box of the child document viewport.
+            Disp::Inline => Some(self.container(body, Disp::Block)),
+            // `display:contents` removes BODY's principal box; preserving its
+            // child flow in an anonymous block is the closest tree-level
+            // representation supported by this iframe viewport container.
+            Disp::Contents => {
+                let children = self.children(body);
+                Some(self.assemble(
+                    crate::layout2::NO_NODE,
+                    BoxStyle::anonymous(),
+                    children,
+                    None,
+                    None,
+                    false,
+                ))
+            }
+            Disp::None => None,
+        });
         let frame = BoxNode {
             node: id,
             style,
-            content: Content::Blocks(
-                body.map(|body| vec![self.container(body, Disp::Block)])
-                    .unwrap_or_default(),
-            ),
+            content: Content::Blocks(body.into_iter().collect()),
             marker: None,
             marker_image: None,
             marker_inside: false,

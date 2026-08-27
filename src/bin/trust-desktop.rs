@@ -4856,6 +4856,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                         self.image_sizes.insert(source, (image.width, image.height));
                         let evicted = self.image_store.insert(handle, image);
                         self.handle_decoded_image_evictions(evicted);
+                        let mut animation_registered = false;
                         if let Some(animation) = animation
                             && self.image_store.contains(handle)
                         {
@@ -4875,7 +4876,17 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                                     handle,
                                     worker_source,
                                 );
+                                animation_registered = true;
                             }
+                        }
+                        if animation_registered {
+                            // The visibility schedule may already have been
+                            // cached while this handle was still a pending
+                            // static image. Recompute it immediately so a
+                            // visible animation becomes active without waiting
+                            // for the gallery relayout timer or another scroll.
+                            self.image_schedule_key = None;
+                            self.request_redraw();
                         }
                         self.decoded_images_pending_layout = true;
                     }
