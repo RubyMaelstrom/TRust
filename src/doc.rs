@@ -378,7 +378,7 @@ pub struct Doc {
     pub scroll_clips: Vec<(usize, u16, u16)>,
     /// Independent-formatting-context boundaries that lay their content INLINE in
     /// `rows` (NOT in a region/carousel buffer) — the cache for incremental
-    /// layout's general subtree splice (INCREMENTAL_LAYOUT_PLAN.md §14). A live
+    /// layout's general subtree splice (incremental-layout contract §14). A live
     /// `Patched{node}` whose boundary is here re-lays ONLY that subtree and
     /// splices it back into `rows` (Tier 1 in-place / Tier 2 shift), leaving the
     /// rest of the document untouched. Captured on every full HTTP render of a
@@ -397,7 +397,7 @@ pub struct Doc {
     /// `#fragment` link / URL / live hash-change targets that anchor — HTML's
     /// "scroll to the fragment". Empty for line-model docs (gopher/gemini/text).
     pub anchor_rows: std::collections::HashMap<String, usize>,
-    /// Alpha-composited image overlap groups (LAYOUT_OVERHAUL_PLAN.md P8): a
+    /// Alpha-composited image overlap groups (layout2 architecture P8): a
     /// synthetic `x-trust-composite:` image URL → the ordered layers the app's
     /// encode pass alpha-composites into that box's single protocol. A composite
     /// `Item` in `rows`/region buffers carries the synthetic URL as its `image`;

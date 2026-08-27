@@ -782,7 +782,7 @@ fn paint_carousel(
 pub(crate) type RegionBuffer = (Vec<Row>, Vec<Carousel>, Vec<(usize, u16, u16)>);
 
 /// Lay one scroll region's subtree into its scrollable buffer for an
-/// incremental region PATCH (INCREMENTAL_LAYOUT_PLAN.md). `root` is the region
+/// incremental region PATCH (incremental-layout contract). `root` is the region
 /// node laid AS a fragment root (`lay_region_fragment`); this composites its
 /// content exactly as the full-render extraction does (`paint_region` — same
 /// scrollport origin, nested-scroller extraction, snap stops), so the patched

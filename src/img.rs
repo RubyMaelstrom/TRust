@@ -37,7 +37,7 @@ pub struct ImageInfo {
     pub mime: &'static str,
     /// Whether the decoded raster carries any non-opaque pixel (a real
     /// transparency, not merely an alpha channel that is fully 255). Layout's
-    /// overlap compositor (LAYOUT_OVERHAUL_PLAN.md P8) reads this to decide
+    /// overlap compositor (layout2 architecture P8) reads this to decide
     /// whether an image painted OVER another must be alpha-composited into one
     /// emission (transparent → the lower image shows through its holes) or can
     /// stay a separate, cheap opaque overwrite. SVG is silhouette-tinted to a
@@ -1265,7 +1265,7 @@ pub fn encode_sliced(
     }
 }
 
-/// One layer of an alpha-composite overlap group (LAYOUT_OVERHAUL_PLAN.md P8):
+/// One layer of an alpha-composite overlap group (layout2 architecture P8):
 /// its source bytes, used cell box, cell offset within the union, and its
 /// `object-fit`/`image-rendering`. `encode_composite` decodes+fits each and
 /// alpha-blends them in order.

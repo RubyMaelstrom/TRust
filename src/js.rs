@@ -1,6 +1,6 @@
-//! The JS engine seam: the ONLY module allowed to import `boa_engine` (Boa IS
-//! the engine — a showstopper means fixing the vendored fork, never swapping;
-//! see CLAUDE.md). Owns the budgeted page context, the `__dom_*`/`__http_*`
+//! Legacy Boa JavaScript engine seam: the only module allowed to import
+//! `boa_engine` in the explicit Boa backend. A showstopper means fixing the
+//! vendored fork, never swapping. Owns the page context, the `__dom_*`/`__http_*`
 //! integer-syscall boundary over the Rust arena, the PRELUDE (the web platform,
 //! self-hosted in JS on those syscalls), the compiled-code caches (prelude
 //! image + cross-page CDN image), parallel/lazy parse, and the living-page
@@ -125,7 +125,7 @@ fn apply_gc_policy() {
 /// `retenure_permanent` tenures it so it stops being re-ref-counted in the
 /// `trace_non_roots` pass of every later collection during the page's life —
 /// a ~2x cut to that phase on allocation-heavy pages (the phase is ~28% of GC
-/// time; see JS_ENGINE_REVIEW.md / GC_PLAN.md). The first no-write-barrier
+/// time). The first no-write-barrier
 /// brick of the generational GC track. Safe by construction: tenuring only
 /// ever *retains* (it can never free a live object), and the retenure is
 /// self-cleaning across navigations on the reused page thread.
@@ -749,9 +749,9 @@ mod runtime_limit_in_async {
 // the settle-time execution where a real SPA spends its seconds (Steam's
 // ~15s tail), which only exists in the full page context. This thread-local
 // accumulator runs across the whole live load instead — the tool the JS
-// engine performance plan's Step 1 gate needs to decide whether parse+compile
+// JS profiling gate needs to decide whether parse+compile
 // or execution dominates a real rendered page (and thus whether lazy compile
-// is the prize or execution work must be reopened).
+// is the prize or execution throughput remains the next target).
 //
 // Thread-local because all of a page's JS runs on its own `trust-page` thread
 // (or the calling thread for the one-shot `transform`). Reset at `load_page`
@@ -880,7 +880,7 @@ fn phases_arm(on: bool) {
 /// reading: parse+compile is the ceiling lazy compilation can remove; if it is
 /// a small share of the measured JS CPU (cross-check against `/usr/bin/time -v`
 /// User CPU, which should be ≈ the CPU line here), execution dominates and the
-/// plan's execution-throughput removal must be reopened.
+/// execution throughput remains the next optimization target.
 fn report_phases(wall: Duration) {
     if !phases_on() {
         return;
@@ -1109,7 +1109,7 @@ fn run_script_task(
 }
 
 /// Process-global detached image of the compiled PRELUDE — the in-memory
-/// compiled-code cache's first consumer (JS-engine performance plan, Step 4,
+/// compiled-code cache's first consumer (the cross-page cache work,
 /// built on the K1/K2 keystone `CodeBlockImage`).
 ///
 /// The prelude is the same ~65 KB of JS on every page, and its parse+compile is
@@ -1132,8 +1132,7 @@ static PRELUDE_IMAGE: std::sync::OnceLock<boa_engine::vm::CodeBlockImage> =
 /// Run a rehydrated [`CodeBlockImage`] as a script in `ctx`'s realm: install it
 /// into an empty carrier script (`Script::parse("")`, ~free, which binds the
 /// carrier to this realm) and evaluate. The shared execution seam behind both
-/// the prelude cache (Step 4) and the cross-page CDN cache (Phase 2) — see the
-/// JS-engine performance plan.
+/// the prelude cache and the cross-page CDN cache.
 ///
 /// Sound ONLY for a realm-portable image: one whose source declared no globals,
 /// so its compiled `<main>` block references no realm global-binding slots and
@@ -1254,8 +1253,8 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
     outcome.elapsed += started.elapsed();
 }
 
-/// Max parse workers in the parallel-parse pool (Step 5a of the JS-engine
-/// performance plan). Bounded like `PREFETCH_CONCURRENCY` so a page with
+/// Max parse workers in the parallel-parse pool. Bounded like
+/// `PREFETCH_CONCURRENCY` so a page with
 /// hundreds of `<script>`s can't spawn a thread storm; clamped to core count
 /// and job count below.
 const PARSE_CONCURRENCY: usize = 8;
@@ -1421,8 +1420,8 @@ fn dispatch_parallel_parse(
     })
 }
 
-/// The cross-page CDN compiled-code cache (JS-engine performance plan, Phase 2)
-/// — the keystone `CodeBlockImage`'s second consumer, after the prelude cache.
+/// The cross-page CDN compiled-code cache — the keystone `CodeBlockImage`'s
+/// second consumer, after the prelude cache.
 ///
 /// External classic scripts (jQuery, D3, Vue, Lit, React … served from a CDN)
 /// are byte-identical across the pages of a session, yet Boa re-parses and
@@ -1489,7 +1488,7 @@ fn cdn_cacheable(body_len: usize) -> bool {
 /// the same source to an incompatible image, so its hash space must not overlap.
 /// The cache never persists across processes, so within one run this is
 /// constant; folding it into the key is defensive and documents the keying rule
-/// the plan calls for (source hash + engine build + flags).
+/// (source hash + engine build + flags).
 const CDN_CACHE_BUILD_TAG: &str = concat!("trust-cdn-cache-v1/", env!("CARGO_PKG_VERSION"));
 
 struct CdnCache {
@@ -1822,8 +1821,8 @@ fn microtask_checkpoint(ctx: &mut Context) -> JsResult<()> {
 // timers) is built *in JavaScript* by PRELUDE on top of them. The win is
 // keeping the arena out of Boa's GC (nodes never become GC objects) and
 // writing the platform concisely in the language it's specced in — NOT
-// engine portability (Boa is the engine; a showstopper means forking it,
-// see CLAUDE.md).
+// engine portability (Boa is the engine for this legacy backend; a showstopper
+// means forking it).
 
 /// The page's arena, shared with syscalls through the context's
 /// host-defined storage.
@@ -2778,7 +2777,7 @@ fn ids_array(ids: Vec<usize>, ctx: &mut Context) -> JsValue {
 /// `source-url :: function`. The profiler samples the synchronous and async
 /// instruction loops; it's zero-cost when the env var is unset. Invaluable for
 /// engine-perf dives because hardware perf counters are locked on this host
-/// (see CLAUDE.md) — and it disambiguates "stuck in JS" from "stuck in Rust"
+/// — and it disambiguates "stuck in JS" from "stuck in Rust"
 /// (a phase with elapsed wall time but no samples is Rust-side, e.g. layout or
 /// the cascade, not the engine).
 fn dump_vm_profile(tag: &str) {
@@ -3380,7 +3379,7 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
     if c.0 != epoch {
         let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
         // JS geometry reads the same engine that laid the page out
-        // (LAYOUT_OVERHAUL_PLAN.md P7): the boxes come straight off the fragment
+        // (layout2 architecture P7): the boxes come straight off the fragment
         // tree AND one pass yields the used grid track sizes.
         let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
             &d,
@@ -7585,15 +7584,15 @@ struct LoadedPage {
     last_diagnostic_render: Option<String>,
     /// The clipped scroll-region nodes the app confirmed it laid out
     /// (`PageCmd::LiveRegions`). A mutation is patched only when confined to one
-    /// of these (INCREMENTAL_LAYOUT_PLAN.md §4b) — everything else takes the full
+    /// of these (incremental-layout contract §4b) — everything else takes the full
     /// path, so a non-region scroll box can't trigger a failed-patch→resync.
     live_regions: std::collections::HashSet<usize>,
     /// The cached inline IFC-boundary nodes the app can splice (`Doc.boundaries`,
     /// via `PageCmd::LiveBoundaries`). A mutation whose nearest IFC boundary is
     /// here is patched as a general inline `Patched` (Tier 2); everything else
-    /// takes the full path (INCREMENTAL_LAYOUT_PLAN.md §14).
+    /// takes the full path (incremental-layout contract §14).
     live_boundaries: std::collections::HashSet<usize>,
-    /// Per-boundary render-dedup baselines (INCREMENTAL_LAYOUT_PLAN.md §12c, W1):
+    /// Per-boundary render-dedup baselines (incremental-layout contract §12c, W1):
     /// the `render_canonical` form of the last patch we emitted for each relayout
     /// boundary, keyed by its `data-trust-node`. The patch path serializes ONLY a
     /// dirty boundary's subtree (never the whole document) and drops the patch
@@ -8837,12 +8836,12 @@ pub enum PageCmd {
     Resync,
     /// The current set of CLIPPED scroll-region nodes (by `data-trust-node`) the
     /// app has laid out. The actor patches a mutation ONLY when it's confined to
-    /// one of these (INCREMENTAL_LAYOUT_PLAN.md §4b) — a non-region scroll box
+    /// one of these (incremental-layout contract §4b) — a non-region scroll box
     /// (content fits / height-elastic) takes the full path instead of a failed
     /// patch. The app sends the full set whenever it changes (deduped).
     LiveRegions(Vec<usize>),
     /// The current set of cached INLINE IFC-boundary nodes (the `Doc.boundaries`
-    /// node set) the app can splice into `Doc.rows` (INCREMENTAL_LAYOUT_PLAN.md
+    /// node set) the app can splice into `Doc.rows` (incremental-layout contract
     /// §14). The actor proposes a general inline `Patched` ONLY for a boundary in
     /// this set; one the app hasn't cached takes the full path (no failed-patch
     /// resync). Sent whenever it changes (deduped).
@@ -9202,7 +9201,7 @@ const OBSERVER_DELIVERY_PASSES: usize = 6;
 /// display-frame delay to every timer task.
 const REST_TICKS: usize = 1;
 /// The page thread owns all parsing/execution: same wide stack as the
-/// one-shot path (Boa's parser recursion, see CLAUDE.md).
+/// one-shot path (Boa's parser recursion).
 const PAGE_STACK: usize = 64 * 1024 * 1024;
 
 /// What unblocked the at-rest event loop: an app command (`None` = the app
@@ -12027,7 +12026,7 @@ fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usiz
 /// live anchors included. Returns the set + whether the page has ANY interaction
 /// (clickables or forms) — the Static-vs-live signal. This is the part of
 /// `extract_live` that does NOT serialize the whole document, so the incremental
-/// patch path (INCREMENTAL_LAYOUT_PLAN.md §12c W1) can mark clickables for a
+/// patch path (incremental-layout contract §12c W1) can mark clickables for a
 /// per-boundary serialize without paying the whole-doc serialize.
 /// Evaluate a prelude id-list entry point (`__trust.clickables()` /
 /// `hoverables()`) into a set — the listener-registry half of the marker sets.
@@ -12209,7 +12208,7 @@ pub(crate) fn hover_set_for_dom(
 /// their nodes need click markers; the whole-document walk (every composed
 /// node × a `cursor` cascade probe × an ancestor scan) was the last per-patch
 /// whole-doc cost after the serialize itself was scoped
-/// (INCREMENTAL_LAYOUT_PLAN.md §12c). Same semantics as the full set for every
+/// (incremental-layout contract §12c). Same semantics as the full set for every
 /// in-scope node: ancestor `listens()` walks still climb past the boundary
 /// (a delegated row inside a listening container stays live), and a container
 /// holding an interactive is still demoted — an out-of-scope interactive can't
@@ -12516,7 +12515,7 @@ fn extract_changed(
 /// full `Updated` (the always-correct fallback). Returns `Some(send_ok)` when an
 /// event was sent, `None` when nothing visible changed (the caller continues to
 /// its scroll/trouble/settled tail). Drains the dirty-target set regardless.
-/// (INCREMENTAL_LAYOUT_PLAN.md — Tier 1.)
+/// (incremental-layout contract — Tier 1.)
 fn emit_dirty_render(
     page: &mut LoadedPage,
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
@@ -12556,7 +12555,7 @@ fn emit_dirty_render(
             return None;
         }
     }
-    // Paint-relevance filter (INCREMENTAL_LAYOUT_PLAN.md): drop ATTR mutations
+    // Paint-relevance filter (incremental-layout contract): drop ATTR mutations
     // that cannot change a single painted cell — an out-of-flow subtree that
     // paints nothing (Twitch's decorative `highlight__progress-bar` animates its
     // width EVERY frame, repainting nothing, and was ~88% of the whole-doc
@@ -12582,7 +12581,7 @@ fn emit_dirty_render(
     }
     let n_targets = targets.as_ref().map(|t| t.len());
     // Decide patch-vs-full from the dirty TARGETS — BEFORE any serialize
-    // (INCREMENTAL_LAYOUT_PLAN.md §12c W1). When every mutation this cycle is
+    // (incremental-layout contract §12c W1). When every mutation this cycle is
     // confined to a patchable boundary, the patch path serializes ONLY those
     // subtrees; the whole document is never serialized. The old order did a
     // whole-doc serialize (~13.7ms on a 462KB chat, growing) on EVERY dirty
@@ -12641,7 +12640,7 @@ fn retain_connected_dirty_targets(
     !targets.is_empty()
 }
 
-/// The patch path (INCREMENTAL_LAYOUT_PLAN.md §12c W1): serialize ONLY each dirty
+/// The patch path (incremental-layout contract §12c W1): serialize ONLY each dirty
 /// boundary's subtree (never the whole document), canonical-dedup against the
 /// per-boundary baseline (`boundary_render`), and emit a `Patched` for the
 /// boundaries that actually changed. A cycle whose every boundary is canonically
@@ -12899,7 +12898,7 @@ fn patchable_boundary(dom: &crate::dom::Dom, b: crate::dom::NodeId) -> bool {
     })
 }
 
-/// The incremental-layout kill switch (INCREMENTAL_LAYOUT_PLAN.md §9):
+/// The incremental-layout kill switch (incremental-layout contract §9):
 /// `TRUST_NO_INCREMENTAL_LAYOUT` forces the full path (A/B + escape hatch).
 #[cfg(test)]
 fn no_incremental() -> bool {
@@ -13460,7 +13459,7 @@ mod tests {
     /// samples are independent. NB: this measures ONE bundle in isolation — it
     /// CANNOT see a live SPA's settle-time execution; for that, load the real
     /// page under `TRUST_JS_PHASE=1` (the whole-load phase report). See the JS
-    /// engine performance plan, Step 0/1.
+    /// whole-load phase report above.
     ///   TRUST_JS_BENCH=/tmp/kevlar.js [TRUST_JS_BENCH_RUNS=5] \
     ///     cargo test --release engine_profile -- --ignored --nocapture
     /// (run under `/usr/bin/time -v` for User CPU / max RSS too).
@@ -14676,7 +14675,7 @@ mod tests {
 
     /// Process peak resident set size (MiB) from `/proc/self/status` VmHWM —
     /// Linux only; `None` elsewhere. Cheaper and dependency-free vs getrusage
-    /// (the host's `perf` counters are locked; see CLAUDE.md).
+    /// (the host's `perf` counters are locked).
     fn proc_peak_rss_mib() -> Option<u64> {
         std::fs::read_to_string("/proc/self/status")
             .ok()?
@@ -14785,7 +14784,7 @@ mod tests {
     // `CodeBlockImage`; `CodeBlock::from_image` rehydrates one on ANY thread.
     // These three tests are the feasibility proof for the cache /
     // compile-on-arrival / parallel-compile cluster (see
-    // JS_ENGINE_PERFORMANCE_PLAN.md). The fixture exercises every coupled
+    // performance concern). The fixture exercises every coupled
     // payload: a nested function (recursive `Gc<CodeBlock>`), a closure over a
     // captured local (`Scope`), a `BigInt` constant, string constants, and
     // property inline caches.
@@ -18937,7 +18936,7 @@ mod tests {
     /// Run `transform` on a dedicated 64MB-stack thread, exactly as production
     /// does (`spawn_page`). The plain `transform` runs on the caller's thread;
     /// for big real-world bundles the parser/scope-analyzer recursion needs the
-    /// big stack (CLAUDE.md), and lazy compilation moves that deep recursion into
+    /// big stack, and lazy compilation moves that deep recursion into
     /// EXECUTION (re-analysis at delazify), so a test driving a big bundle with
     /// `TRUST_LAZY_PARSE=1` must use the same big stack the live page actor does.
     /// Takes ownership (the engine env is `Send`, as `spawn_page` relies on).
@@ -20539,7 +20538,7 @@ mod tests {
 
     #[test]
     fn confined_boundaries_walks_up_to_the_nearest_cached_boundary() {
-        // INCREMENTAL_LAYOUT_PLAN.md §14 (the walk-up): a deep mutation whose
+        // incremental-layout contract §14 (the walk-up): a deep mutation whose
         // NEAREST IFC boundary (a row-sharing flex item — the viewer counter
         // pattern) the app couldn't cache routes to its enclosing CACHED section
         // and patches it, instead of forcing a whole-document render.
@@ -20573,7 +20572,7 @@ mod tests {
 
     #[test]
     fn confined_boundaries_routes_a_cached_inline_boundary_to_a_width_stable_patch() {
-        // INCREMENTAL_LAYOUT_PLAN.md §14: a content mutation inside a block-filling
+        // incremental-layout contract §14: a content mutation inside a block-filling
         // IFC boundary the app has CACHED is proposed as a `WidthStable` patch (the
         // Doc.rows splice); the SAME boundary uncached takes the full path.
         use crate::dom::DirtyKind;
@@ -20605,7 +20604,7 @@ mod tests {
 
     #[test]
     fn a_chat_append_emits_a_targeted_patch_not_a_full_render() {
-        // INCREMENTAL_LAYOUT_PLAN.md Tier 1 — the headline behaviour: a click that
+        // incremental-layout contract Tier 1 — the headline behaviour: a click that
         // appends a message INTO a scroll region emits a TARGETED `Patched` for
         // that region (so the app re-lays only it), NOT a whole-document
         // `Updated`. The build-then-append (`createElement`+`textContent`+
@@ -20773,7 +20772,7 @@ mod tests {
 
     #[test]
     fn an_invisible_in_region_mutation_dedups_and_the_full_path_carries_prior_patches() {
-        // INCREMENTAL_LAYOUT_PLAN.md §12c W1 (scoped change-detection). Three
+        // incremental-layout contract §12c W1 (scoped change-detection). Three
         // properties in one flow:
         //  (a) a VISIBLE append inside a live region emits a targeted `Patched`
         //      (the patch path — no whole-document serialize);
@@ -25791,7 +25790,7 @@ mod tests {
 
     #[test]
     fn intl_shim_formats_honestly_and_passes_feature_detection() {
-        // The en-only prelude shim (CLAUDE.md: measured against Boa's
+        // The en-only prelude shim (measured against Boa's
         // half-built intl_bundled and chosen over it). Output is honest
         // English, and the detection surface (resolvedOptions,
         // supportedLocalesOf) exists so i18n libraries take their
@@ -26084,7 +26083,7 @@ mod tests {
 
     #[test]
     fn opacity_zero_placeholder_reports_its_real_clipped_height() {
-        // Phase 1 (VIRTUALIZED_LIST_LAYOUT_PLAN.md): a React virtualized-list
+        // React virtualized-list
         // placeholder is `opacity:0` + a cached height + `overflow:hidden`
         // (Mastodon's off-screen articles). `opacity:0` suppresses PAINT not box
         // generation, so getBoundingClientRect must report the real 128px box —

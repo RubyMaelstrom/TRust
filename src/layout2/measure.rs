@@ -1,4 +1,4 @@
-//! JS geometry from fragments (LAYOUT_OVERHAUL_PLAN.md, P7).
+//! JS geometry from fragments (layout2 architecture, P7).
 //!
 //! `getBoundingClientRect`, `offset*`/`client*`, and the observer machinery
 //! read a `NodeId → PxRect` border-box map in CSS px. `scrollHeight` and
@@ -7,7 +7,7 @@
 //! from *painted cells* plus a stack of heuristics (`element_tops` for empty
 //! sentinels, `declared_boxes` floors, `clip_heights` caps). layout2 has REAL
 //! stored geometry, so the map falls out of the fragment tree directly — the
-//! plan's promise that "JS geometry reads the fragment tree, *more* accurate
+//! design goal that "JS geometry reads the fragment tree, *more* accurate
 //! than today".
 //!
 //! A composed-tree ancestor union supplies each scrolling area's content extent

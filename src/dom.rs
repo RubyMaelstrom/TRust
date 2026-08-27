@@ -1,12 +1,11 @@
 //! The live, scriptable document: an arena DOM built straight from
-//! html5ever, mutated by page JavaScript (through js.rs), then either
-//! laid out into rows directly (layout.rs) or serialized back to HTML
-//! for the app to re-parse and lay out.
+//! html5ever, mutated by the selected JavaScript backend, then either laid
+//! out by `layout2` or serialized back to HTML for the app to re-parse.
 //!
 //! Deliberately NOT rcdom: a mutable DOM can't live with rcdom's
-//! Node::drop force-clearing children (see CLAUDE.md), and an arena of
-//! indices gives JS a flat, GC-free handle type — wrappers hold a
-//! `NodeId`, the whole arena drops with the page.
+//! Node::drop force-clearing children, and an arena of indices gives JS a flat,
+//! GC-free handle type — wrappers hold a `NodeId`, and the whole arena drops
+//! with the page.
 
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
@@ -228,7 +227,7 @@ pub struct Dom {
     /// the layout side, so the `SPRITE_SHEETS` key matches). `None` = unknown
     /// (sprite refs then count as unrenderable, the conservative answer).
     doc_url: Option<url::Url>,
-    /// Incremental layout (INCREMENTAL_LAYOUT_PLAN.md): the element nodes mutated
+    /// Incremental layout (incremental-layout contract): the element nodes mutated
     /// since the last `take_dirty_targets`, with the kind of change. A mutation
     /// confined to a relayout boundary's subtree lets the app re-lay ONLY that
     /// boundary instead of the whole document. Content = childList/text (the
@@ -896,8 +895,8 @@ impl Dom {
     }
 
     /// The monotonic mutation counter. Anything memoized against the DOM's
-    /// current shape (the geometry box map in `js.rs`, like the cascade
-    /// caches here) keys on this and rebuilds when it advances.
+    /// current shape (the geometry box map in the active JavaScript backend,
+    /// like the cascade caches here) keys on this and rebuilds when it advances.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -1042,7 +1041,7 @@ impl Dom {
     }
 
     /// The nearest LIVE scroll-region ancestor (the Tier-1 relayout boundary,
-    /// INCREMENTAL_LAYOUT_PLAN.md §4b) a mutation at `node` is confined to —
+    /// incremental-layout contract §4b) a mutation at `node` is confined to —
     /// `None` when none encloses it (the change reaches non-region content ⇒ full
     /// relayout, OR Tier 2). `live_regions` is the set the APP confirmed are
     /// currently CLIPPED scroll viewports (a fixed band → content changes can't
@@ -1076,7 +1075,7 @@ impl Dom {
     /// whose inside cannot change the layout of anything outside it (and into
     /// which outside floats cannot intrude). This is the spec-exact form of "the
     /// mutation can't affect anything outside its container"
-    /// (INCREMENTAL_LAYOUT_PLAN.md §13a): CSS2 §9.4.1 block-formatting-context
+    /// (incremental-layout contract §13a): CSS2 §9.4.1 block-formatting-context
     /// triggers (`overflow ≠ visible`, `float`, out-of-flow, `display:flow-root`/
     /// table-cell/inline-block), CSS Flexbox/Grid §3 (a flex/grid container AND a
     /// flex/grid item each establish one for their contents), and CSS Containment
@@ -1167,11 +1166,11 @@ impl Dom {
 
     /// The nearest ancestor (or `self`, for a `Content` change) of a mutation at
     /// `node` that establishes an independent formatting context — the GENERAL
-    /// relayout boundary (INCREMENTAL_LAYOUT_PLAN.md §13a). Unlike
+    /// relayout boundary (incremental-layout contract §13a). Unlike
     /// `relayout_boundary` (which only finds an app-confirmed live scroll
     /// region), this returns ANY independent-formatting-context ancestor, the
     /// boundary whose interior the app will re-lay and splice once the general
-    /// `Doc.rows` splice lands (plan §13c step 4). Until then it drives only the
+    /// `Doc.rows` splice lands (incremental-layout design §13c step 4). Until then it drives only the
     /// diagnostic (`confined_boundaries`) so a live page reveals which boundaries
     /// the splice must handle. An `Attr` change may move the node's OWN box, so we
     /// start the walk at its parent; a `Content` change is contained, so `node`
@@ -1193,7 +1192,7 @@ impl Dom {
     /// The nearest independent-formatting-context ancestor (or `self`, for a
     /// `Content` change) that the app has CACHED as a splice-able boundary —
     /// walking UP past any IFC boundary the app couldn't cache
-    /// (INCREMENTAL_LAYOUT_PLAN.md §14). A mutation is contained by EVERY IFC
+    /// (incremental-layout contract §14). A mutation is contained by EVERY IFC
     /// ancestor, so the nearest cached one is a valid (if larger) patch target.
     /// This is what lets a deep mutation — an animated viewer counter that's a
     /// flex-ROW item sharing its row (so its own box can't be a `Doc.rows`
@@ -1222,7 +1221,7 @@ impl Dom {
     }
 
     /// Serialize a relayout boundary's subtree as a self-contained fragment for
-    /// an incremental patch (INCREMENTAL_LAYOUT_PLAN.md §4a). The boundary is
+    /// an incremental patch (incremental-layout contract §4a). The boundary is
     /// wrapped in a context `<div>` carrying the inherited computed values from
     /// ABOVE it, so the app's `computed_value`/`text_decoration` over the
     /// re-parsed fragment — which has no real ancestors — resolve EXACTLY as in
@@ -3843,7 +3842,7 @@ impl Dom {
     /// Whether `id` is connected to the document (a render-affecting node). A
     /// mutation on a DETACHED subtree — the `createElement` + set-content that
     /// precedes `appendChild` — is invisible until the node is inserted, so
-    /// incremental layout IGNORES it (INCREMENTAL_LAYOUT_PLAN.md): the insertion
+    /// incremental layout IGNORES it (incremental-layout contract): the insertion
     /// records the container, whose patch re-serializes the now-attached content.
     pub fn is_connected(&self, id: NodeId) -> bool {
         let mut cur = Some(id);
@@ -5398,7 +5397,7 @@ impl Dom {
         // Bake the actor node id on every element the app re-correlates after a
         // re-parse: form controls + vertical scroll containers (values / region
         // scroll round-trip by it) AND every independent-formatting-context
-        // boundary (INCREMENTAL_LAYOUT_PLAN.md §14 step 3). An IFC boundary is a
+        // boundary (incremental-layout contract §14 step 3). An IFC boundary is a
         // box whose interior can't reflow anything outside it, so the app can
         // re-lay ONLY that subtree and splice it back — but only if it can map the
         // patched fragment to the cached box by this id. IFC roots are SPARSE (not
@@ -5670,7 +5669,8 @@ impl Dom {
     }
 
     /// All `<script>` elements in document order, as (src-attr, inline
-    /// source, type-attr) — the execution schedule for js.rs.
+    /// source, type-attr) — the execution schedule for the active JavaScript
+    /// backend.
     /// Every `<script>` in document order: `(src, inline text, type, node)`.
     /// The node id lets the runner expose `document.currentScript` while a
     /// classic script executes.
@@ -7550,7 +7550,7 @@ fn prop_index(name: &str) -> Option<usize> {
 /// The inherited layout properties (the `inherited=true` rows of `PROPS`) — the
 /// styling context that flows INTO a relayout boundary. `serialize_patch`
 /// materializes these onto the fragment wrapper so an ancestor-less re-parse
-/// resolves them identically (INCREMENTAL_LAYOUT_PLAN.md §4a). Keep in sync with
+/// resolves them identically (incremental-layout contract §4a). Keep in sync with
 /// the `inherited=true` rows below. (`visibility` is inherited but a rendered
 /// boundary is by definition visible, so it's a near-no-op; included for rigor.)
 const INHERITED_LAYOUT_PROPS: &[&str] = &[
@@ -10777,7 +10777,7 @@ fn take_block(input: &str) -> (&str, &str) {
 // for raw fidelity (`selectorText`, every declaration, at-rule structure),
 // e.g. feature-detection libraries and css3test's `Supports.atrule`. So
 // this is a separate, lossless-ish parser whose output (compact JSON) the
-// js.rs prelude wraps as CSSStyleRule/CSSMediaRule/etc. Unknown at-rules
+// JavaScript prelude wraps as CSSStyleRule/CSSMediaRule/etc. Unknown at-rules
 // are DROPPED — a real browser omits unrecognized at-rules from cssRules,
 // which is exactly what at-rule feature detection relies on.
 
@@ -11253,7 +11253,7 @@ mod tests {
         // UTF-8 byte ranges. The old URL look-ahead could end inside a
         // multi-byte code point and panic while a live page was measuring a
         // resized element; the resulting panic was misreported as a
-        // ResizeObserver/Boa failure.
+        // ResizeObserver failure.
         let (name, value, important) =
             parse_decl("background: hello xyz” URL(Icon.PNG) !important").unwrap();
         assert_eq!(name, "background");
@@ -12379,7 +12379,7 @@ mod tests {
 
     #[test]
     fn relayout_boundary_finds_the_enclosing_scroll_container() {
-        // INCREMENTAL_LAYOUT_PLAN.md §4b: a mutation maps to the nearest scroll
+        // incremental-layout contract §4b: a mutation maps to the nearest scroll
         // container (the size-contained relayout boundary).
         let dom = Dom::parse_document(
             r#"<body><div id=chrome>x</div>
@@ -12416,7 +12416,7 @@ mod tests {
 
     #[test]
     fn independent_formatting_context_matches_the_spec_triggers() {
-        // INCREMENTAL_LAYOUT_PLAN.md §13a: the boundary set is exactly the boxes
+        // incremental-layout contract §13a: the boundary set is exactly the boxes
         // that establish an independent formatting context (CSS2 §9.4.1 BFC + CSS
         // Display + Flexbox/Grid §3 + Containment L2). A plain in-flow block is
         // NOT one (its inside can affect its outside), so it is never a boundary.
@@ -12457,7 +12457,7 @@ mod tests {
 
     #[test]
     fn general_boundary_walks_to_the_nearest_formatting_context_root() {
-        // The general relayout boundary (plan §13c step 4 target) is the nearest
+        // The general relayout boundary (incremental-layout design §13c step 4 target) is the nearest
         // independent-formatting-context ancestor — NOT keyed on an app-confirmed
         // region. Here a mutation deep inside a plain wrapper resolves up to the
         // enclosing `overflow:auto` card, skipping the in-flow `<p>` wrapper.

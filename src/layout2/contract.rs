@@ -410,7 +410,7 @@ pub struct Carousel {
     pub hide_scrollbar: bool,
 }
 
-/// One image layer of an alpha-composited overlap group (LAYOUT_OVERHAUL_PLAN.md
+/// One image layer of an alpha-composited overlap group (layout2 architecture
 /// P8). When image fragments overlap and an upper one has real transparency,
 /// the paint compositor emits a SINGLE synthetic `x-trust-composite:` image item
 /// over the union box and records the group's layers here (in `Doc.composites`,
@@ -570,7 +570,7 @@ pub struct Region {
     /// be ROUTED: a URL here means the image's box is contained by this scroll
     /// region's independent formatting context, so its intrinsic-size reflow
     /// re-lays only this region — never the whole document (the inner-scroll
-    /// de-lag, INCREMENTAL_LAYOUT_PLAN.md §14). Populated on every full render; a
+    /// de-lag, incremental-layout contract §14). Populated on every full render; a
     /// region patch refreshes it from the patch fragment, so it survives the
     /// per-message re-parse and stays current as chat grows.
     pub image_urls: Vec<String>,
@@ -610,7 +610,7 @@ impl Region {
 
 /// An independent-formatting-context boundary that lays its content INLINE in
 /// `Doc.rows` — the cache entry for incremental layout's general subtree splice
-/// (INCREMENTAL_LAYOUT_PLAN.md §14). Captured during a full render so a live
+/// (incremental-layout contract §14). Captured during a full render so a live
 /// `Patched{node}` whose boundary matches can re-lay ONLY that subtree and
 /// splice it back in place (Tier 1) or splice+shift+scroll-anchor (Tier 2),
 /// leaving the rest of the document identity. Two kinds qualify: BLOCK-FILLING
@@ -1004,7 +1004,7 @@ pub fn render_row(row: &Row) -> String {
 
 /// The result of laying one INLINE relayout-boundary fragment (a block-filling
 /// IFC box, NOT a scroll region) for the general incremental splice
-/// (INCREMENTAL_LAYOUT_PLAN.md §14). `rows` are in the fragment's own coordinate
+/// (incremental-layout contract §14). `rows` are in the fragment's own coordinate
 /// space (cols from 0); the app shifts them by the cached `origin_col` and
 /// splices them into `Doc.rows`. `regions`/`carousels` non-empty means the box
 /// now contains content outside pure `Doc.rows` (it grew a scroll viewport /

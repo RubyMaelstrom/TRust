@@ -14,7 +14,8 @@ search, channel, and other browsing pages remain in TRust.
 
 ## Installation
 
-TRust currently expects its maintained Lumen checkout as a sibling directory:
+The normal TRust binaries use Lumen, a pure-Rust JavaScript engine maintained
+in a sibling checkout. The current integration checkout is laid out as:
 
 ```text
 Code/
@@ -22,19 +23,15 @@ Code/
 └── TRust/
 ```
 
+The path dependency is intentional: TRust and Lumen are being developed
+together while the host-boundary work is upstreamed. Keep the sibling Lumen
+checkout at the integration revision recorded above before building.
+
 From `TRust`, `cargo build --release` builds the Lumen-only `trust` and
 `trust-desktop` release binaries. Lumen is selected at compile time, so neither
-artifact contains the legacy Boa engine.
+normal artifact contains the legacy Boa engine.
 
-The vendored Boa backend remains available for regression comparisons, but is
-not built normally:
-
-```sh
-cargo build --release --no-default-features --features mimalloc,boa-backend \
-  --bin trust-boa --bin trust-desktop-boa
-```
-
-The native desktop architecture is also available as `trust-desktop`. It uses
+The native desktop binary, `trust-desktop`, uses
 winit and the same CSS-pixel layout engine as the terminal browser. HTML boxes,
 author colors, borders, gradients, images and Parley-shaped text paint through
 a renderer-neutral TRust display list. Vello CPU is the correctness/reference
@@ -43,6 +40,25 @@ list directly through wgpu. The established `trust` terminal frontend remains
 fully supported through a CSS-pixel-to-cell adapter. Tests and developer tools
 can render the identical page pipeline without a window through
 `trust::render::headless`.
+
+## JavaScript engine
+
+Lumen is the production JavaScript engine for both the terminal and desktop
+frontends. The browser-facing contract lives in TRust; engine-specific host
+bindings and the resident page actor live in `src/lumen_backend.rs` and the
+sibling Lumen checkout. This keeps DOM, networking, storage, workers, and
+rendering behavior shared by both frontends.
+
+Boa is retained only as an explicitly selected legacy/regression backend. It is
+not linked into normal release binaries:
+
+```sh
+cargo build --release --no-default-features --features mimalloc,boa-backend \
+  --bin trust-boa --bin trust-desktop-boa
+```
+
+The opt-in `trust-lumen-spike` binary is a synthetic Lumen benchmark harness;
+it is not a separate browser backend and is omitted from ordinary builds.
 
 ## Launching it
 
