@@ -71,6 +71,12 @@ impl Config {
         features.set(WasmFeatures::FLOATS, true);
         features.set(WasmFeatures::CUSTOM_PAGE_SIZES, false);
         features.set(WasmFeatures::MEMORY64, true);
+        // The legacy exception proposal is still emitted by browser-targeted
+        // toolchains (including the .NET runtime used by some Blazor apps).
+        // Keep both the tag section and the legacy try/catch instruction set
+        // enabled; wasmparser gates the former on EXCEPTIONS.
+        features.set(WasmFeatures::EXCEPTIONS, true);
+        features.set(WasmFeatures::LEGACY_EXCEPTIONS, true);
         features.set(WasmFeatures::WIDE_ARITHMETIC, false);
         features.set(WasmFeatures::SIMD, cfg!(feature = "simd"));
         features.set(WasmFeatures::RELAXED_SIMD, cfg!(feature = "simd"));

@@ -19,6 +19,12 @@ pub enum Label {
 pub struct LabelRef(u32);
 
 impl LabelRef {
+    /// Returns the stable numeric identity of this label.
+    #[inline]
+    pub fn into_u32(self) -> u32 {
+        self.0
+    }
+
     /// Returns the `usize` value of the [`LabelRef`].
     #[inline]
     fn into_usize(self) -> usize {

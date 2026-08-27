@@ -129,6 +129,47 @@ macro_rules! for_each_op_grouped {
                     offset: BranchOffset,
                 },
 
+                /// Installs a legacy WebAssembly exception handler.
+                ///
+                /// The handler target points at the first `catch` clause. The
+                /// executor keeps the handler live until `ExceptionEnd` or
+                /// until an exception selects one of its clauses.
+                #[snake_name(exception_try)]
+                ExceptionTry {
+                    handler: BranchOffset,
+                    try_id: AnyConst32
+                },
+                /// Tests the pending legacy exception against a tag and, when
+                /// it matches, writes the tag fields to the result registers.
+                #[snake_name(exception_catch)]
+                ExceptionCatch {
+                    @ results: BoundedSlotSpan,
+                    tag: AnyConst32,
+                    next: BranchOffset
+                },
+                /// Catches any pending legacy exception.
+                #[snake_name(exception_catch_all)]
+                ExceptionCatchAll {
+                    try_id: AnyConst32
+                },
+                /// Raises a legacy exception from tag fields in registers.
+                #[snake_name(exception_throw)]
+                ExceptionThrow {
+                    tag: AnyConst32,
+                    values: BoundedSlotSpan
+                },
+                /// Rethrows the exception caught by a legacy catch clause, or
+                /// continues an uncaught exception search.
+                #[snake_name(exception_rethrow)]
+                ExceptionRethrow {
+                    try_id: AnyConst32
+                },
+                /// Closes a legacy exception handler and its catch context.
+                #[snake_name(exception_end)]
+                ExceptionEnd {
+                    try_id: AnyConst32
+                },
+
                 /// A fallback instruction for cmp+branch instructions with branch offsets that cannot be 16-bit encoded.
                 ///
                 /// # Note

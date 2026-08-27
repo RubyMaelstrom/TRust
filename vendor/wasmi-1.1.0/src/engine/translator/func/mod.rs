@@ -29,6 +29,7 @@ use self::{
         Stack,
         StackAllocations,
         TempOperand,
+        TryControlFrame,
     },
     utils::{Input, Input16, Input32, Reset, ReusableAllocations},
 };
@@ -346,6 +347,13 @@ impl FuncTranslator {
     fn resolve_type(&self, type_index: u32) -> FuncType {
         let func_type_idx = FuncTypeIdx::from(type_index);
         let dedup_func_type = self.module.get_func_type(func_type_idx);
+        self.engine()
+            .resolve_func_type(dedup_func_type, Clone::clone)
+    }
+
+    /// Resolves the function type carried by a legacy exception tag.
+    fn resolve_tag_type(&self, tag_index: u32) -> FuncType {
+        let dedup_func_type = self.module.get_type_of_tag(tag_index);
         self.engine()
             .resolve_func_type(dedup_func_type, Clone::clone)
     }
@@ -1327,6 +1335,140 @@ impl FuncTranslator {
         }
         if frame.is_branched_to() {
             // No need to reset `last_instr` if there was no branch to the end of a Wasm `block`.
+            self.instrs.reset_last_instr();
+        }
+        Ok(())
+    }
+
+    /// Translates one legacy typed `catch` or `catch_all` clause.
+    fn translate_catch(&mut self, tag_index: u32, catch_all: bool) -> Result<(), Error> {
+        let mut frame = match self.stack.pop_control() {
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame,
+            ControlFrame::Unreachable(ControlFrameKind::Try)
+            | ControlFrame::Unreachable(ControlFrameKind::Catch)
+            | ControlFrame::Unreachable(ControlFrameKind::CatchAll) => {
+                debug_assert!(!self.reachable);
+                self.stack.push_unreachable(if catch_all {
+                    ControlFrameKind::CatchAll
+                } else {
+                    ControlFrameKind::Catch
+                })?;
+                return Ok(());
+            }
+            unexpected => panic!(
+                "expected a legacy exception control frame but found: {unexpected:?}"
+            ),
+        };
+
+        // Normal fallthrough from the preceding try/catch body skips the
+        // remaining clauses and reaches the common end label.
+        if self.reachable {
+            let consume_fuel_instr = frame.consume_fuel_instr();
+            self.copy_branch_params(&frame, consume_fuel_instr)?;
+            frame.branch_to();
+            self.encode_br(frame.label())?;
+        }
+        self.stack.trunc(frame.height());
+
+        let catch_label = if frame.handler() == frame.next_catch() {
+            frame.handler()
+        } else {
+            frame.next_catch()
+        };
+        self.labels
+            .pin_label(catch_label, self.instrs.next_instr())
+            .unwrap();
+
+        let catch_instr = self.instrs.next_instr();
+        // `catch_all` is terminal in the legacy grammar. Do not manufacture a
+        // deferred next-catch label for it: unlike a typed catch, it has no
+        // unmatched-exception path to rethrow through.
+        let (next_catch, next) = if catch_all {
+            (catch_label, BranchOffset::uninit())
+        } else {
+            let next_catch = self.labels.new_label();
+            let next = self
+                .labels
+                .try_resolve_label(next_catch, catch_instr)?;
+            (next_catch, next)
+        };
+        let (results, tag) = if catch_all {
+            (
+                BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), 0),
+                0,
+            )
+        } else {
+            let tag_type = self.resolve_tag_type(tag_index);
+            let len = u16::try_from(tag_type.params().len())
+                .expect("validated exception tag has too many fields");
+            let span = self
+                .push_results(catch_instr, tag_type.params())?
+                .unwrap_or_else(|| SlotSpan::new(Slot::from(0)));
+            (BoundedSlotSpan::new(span, len), tag_index)
+        };
+        if catch_all {
+            self.push_instr(
+                Op::exception_catch_all(frame.try_id()),
+                FuelCostsProvider::base,
+            )?;
+        } else {
+            self.push_instr(
+                Op::exception_catch(results, tag, next),
+                FuelCostsProvider::base,
+            )?;
+        }
+        self.reachable = true;
+        self.stack.push_catch(frame, catch_all, next_catch)?;
+        self.instrs.reset_last_instr();
+        Ok(())
+    }
+
+    /// Translates the end of a legacy Wasm `try` and its catch clauses.
+    ///
+    /// The legacy exception proposal represents an uncaught exception by
+    /// falling through a chain of catch tests into a rethrow. Normal control
+    /// flow branches over that chain and reaches `ExceptionEnd`, which removes
+    /// the active handler before the construct's result values are exposed.
+    fn translate_end_try(&mut self, mut frame: TryControlFrame) -> Result<(), Error> {
+        let consume_fuel_instr = frame.consume_fuel_instr();
+        let is_end_of_body_reachable = self.reachable;
+        if is_end_of_body_reachable {
+            self.copy_branch_params(&frame, consume_fuel_instr)?;
+            frame.branch_to();
+            self.encode_br(frame.label())?;
+        }
+
+        let fallback_label = if frame.is_catch_all() {
+            None
+        } else if frame.handler() == frame.next_catch() {
+            // A `try` without catches still needs a handler target so that an
+            // exception is propagated to an enclosing construct.
+            Some(frame.handler())
+        } else {
+            // The last typed catch uses its deferred next-catch label as the
+            // unmatched-exception target.
+            Some(frame.next_catch())
+        };
+        if let Some(fallback_label) = fallback_label {
+            self.labels
+                .pin_label(fallback_label, self.instrs.next_instr())
+                .unwrap();
+            self.push_instr(Op::exception_rethrow(frame.try_id()), FuelCostsProvider::base)?;
+        }
+
+        self.push_instr(Op::exception_end(frame.try_id()), FuelCostsProvider::base)?;
+        self.labels
+            .pin_label(frame.label(), self.instrs.next_instr())
+            .unwrap();
+        let is_end_reachable = is_end_of_body_reachable || frame.is_branched_to();
+        if frame.is_branched_to() {
+            self.push_frame_results(&frame)?;
+        }
+        self.reachable = is_end_reachable;
+        if self.reachable && self.stack.is_control_empty() {
+            self.encode_return(consume_fuel_instr)?;
+        }
+        if frame.is_branched_to() {
             self.instrs.reset_last_instr();
         }
         Ok(())

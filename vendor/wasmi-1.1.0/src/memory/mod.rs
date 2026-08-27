@@ -6,6 +6,7 @@ pub use self::{
     ty::{MemoryType, MemoryTypeBuilder},
 };
 use super::{AsContext, AsContextMut, StoreContext, StoreContextMut, Stored};
+use alloc::vec::Vec;
 use crate::{collections::arena::ArenaIndex, core::CoreMemory, errors::MemoryError, Error};
 
 /// A raw index to a linear memory entity.
@@ -192,6 +193,24 @@ impl Memory {
             .inner
             .resolve_memory(self)
             .data_size()
+    }
+
+    /// Returns the mutation generation of this linear memory for embedder mirror invalidation.
+    pub fn data_version(&self, ctx: impl AsContext) -> u64 {
+        ctx.as_context()
+            .store
+            .inner
+            .resolve_memory(self)
+            .data_version()
+    }
+
+    /// Takes the page-aligned ranges written since the previous call.
+    pub fn take_dirty_ranges(&self, mut ctx: impl AsContextMut) -> Vec<core::ops::Range<usize>> {
+        ctx.as_context_mut()
+            .store
+            .inner
+            .resolve_memory_mut(self)
+            .take_dirty_ranges()
     }
 
     /// Reads `n` bytes from `memory[offset..offset+n]` into `buffer`

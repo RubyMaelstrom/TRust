@@ -19,6 +19,7 @@ impl Executor<'_> {
             .pop()
             .expect("the executing call frame is always on the stack");
         self.stack.values.truncate(returned.frame_offset());
+        self.exceptions.prune(self.stack.calls.len());
         let new_instance = popped_instance.and_then(|_| self.stack.calls.instance());
         if let Some(new_instance) = new_instance {
             self.cache.update(store, new_instance);

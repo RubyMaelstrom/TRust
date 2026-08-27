@@ -148,12 +148,13 @@ impl Executor<'_> {
             .and_then(|memory| memory.get(..len))
             .ok_or(TrapCode::MemoryOutOfBounds)?;
         let dst_bytes = dst_memory
-            .data_mut()
+            .data_mut_untracked()
             .get_mut(dst_index..)
             .and_then(|memory| memory.get_mut(..len))
             .ok_or(TrapCode::MemoryOutOfBounds)?;
         fuel.consume_fuel_if(|costs| costs.fuel_for_copying_bytes(len as u64))?;
         dst_bytes.copy_from_slice(src_bytes);
+        dst_memory.mark_dirty_range(dst_index, len);
         self.try_next_instr_at(3)
     }
 
@@ -168,7 +169,7 @@ impl Executor<'_> {
     ) -> Result<(), Error> {
         let memory = self.get_memory(memory);
         let (memory, fuel) = store.resolve_memory_and_fuel_mut(&memory);
-        let bytes = memory.data_mut();
+        let bytes = memory.data_mut_untracked();
         // These accesses just perform the bounds checks required by the Wasm spec.
         bytes
             .get(src_index..)
@@ -180,6 +181,7 @@ impl Executor<'_> {
             .ok_or(TrapCode::MemoryOutOfBounds)?;
         fuel.consume_fuel_if(|costs| costs.fuel_for_copying_bytes(len as u64))?;
         bytes.copy_within(src_index..src_index.wrapping_add(len), dst_index);
+        memory.mark_dirty_range(dst_index, len);
         self.try_next_instr_at(3)
     }
 
@@ -229,12 +231,13 @@ impl Executor<'_> {
         let memory = self.get_memory(memory);
         let (memory, fuel) = store.resolve_memory_and_fuel_mut(&memory);
         let slice = memory
-            .data_mut()
+            .data_mut_untracked()
             .get_mut(dst..)
             .and_then(|memory| memory.get_mut(..len))
             .ok_or(TrapCode::MemoryOutOfBounds)?;
         fuel.consume_fuel_if(|costs| costs.fuel_for_copying_bytes(len as u64))?;
         slice.fill(value);
+        memory.mark_dirty_range(dst, len);
         self.try_next_instr_at(2)
     }
 
@@ -264,8 +267,9 @@ impl Executor<'_> {
             &self.get_memory(memory_index),
             &self.get_data_segment(data_index),
         );
-        let memory = memory
-            .data_mut()
+        let memory_entity = memory;
+        let memory = memory_entity
+            .data_mut_untracked()
             .get_mut(dst_index..)
             .and_then(|memory| memory.get_mut(..len))
             .ok_or(TrapCode::MemoryOutOfBounds)?;
@@ -276,6 +280,7 @@ impl Executor<'_> {
             .ok_or(TrapCode::MemoryOutOfBounds)?;
         fuel.consume_fuel_if(|costs| costs.fuel_for_copying_bytes(len as u64))?;
         memory.copy_from_slice(data);
+        memory_entity.mark_dirty_range(dst_index, len);
         self.try_next_instr_at(3)
     }
 }

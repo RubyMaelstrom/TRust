@@ -103,6 +103,7 @@ impl ModuleParser {
                 } => self.process_version(num, encoding, range),
                 Payload::TypeSection(section) => self.process_types(section, module),
                 Payload::ImportSection(section) => self.process_imports(section, module),
+                Payload::TagSection(section) => self.process_tags(section, module),
                 Payload::FunctionSection(section) => self.process_functions(section, module),
                 Payload::TableSection(section) => self.process_tables(section, module),
                 Payload::MemorySection(section) => self.process_memories(section, module),

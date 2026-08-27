@@ -11,7 +11,7 @@ use crate::{
         },
         BlockType,
     },
-    ir::{self, Const16, Op},
+    ir::{self, BoundedSlotSpan, Const16, Op, Slot, SlotSpan},
     module::{self, FuncIdx, MemoryIdx, TableIdx, WasmiValueType},
     Error,
     ExternRef,
@@ -47,6 +47,12 @@ macro_rules! impl_visit_operator {
         impl_visit_operator!(@@skipped $($rest)*);
     };
     ( @wide_arithmetic $($rest:tt)* ) => {
+        impl_visit_operator!(@@skipped $($rest)*);
+    };
+    ( @exceptions $($rest:tt)* ) => {
+        impl_visit_operator!(@@skipped $($rest)*);
+    };
+    ( @legacy_exceptions $($rest:tt)* ) => {
         impl_visit_operator!(@@skipped $($rest)*);
     };
     ( @@skipped $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident $_ann:tt $($rest:tt)* ) => {
@@ -172,6 +178,103 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
     }
 
     #[inline(never)]
+    fn visit_try(&mut self, block_ty: wasmparser::BlockType) -> Self::Output {
+        if !self.reachable {
+            self.stack.push_unreachable(ControlFrameKind::Try)?;
+            return Ok(());
+        }
+        self.preserve_all_locals()?;
+        let block_ty = BlockType::new(block_ty, &self.module);
+        let handler_label = self.labels.new_label();
+        let end_label = self.labels.new_label();
+        let try_id = handler_label.into_u32();
+        let try_instr = self.instrs.next_instr();
+        let handler = self
+            .labels
+            .try_resolve_label(handler_label, try_instr)?;
+        self.push_instr(
+            Op::exception_try(handler, try_id),
+            FuelCostsProvider::base,
+        )?;
+        self.stack
+            .push_try(block_ty, handler_label, end_label, try_id)?;
+        self.instrs.reset_last_instr();
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn visit_catch(&mut self, tag_index: u32) -> Self::Output {
+        self.translate_catch(tag_index, false)
+    }
+
+    #[inline(never)]
+    fn visit_catch_all(&mut self) -> Self::Output {
+        self.translate_catch(0, true)
+    }
+
+    #[inline(never)]
+    fn visit_throw(&mut self, tag_index: u32) -> Self::Output {
+        bail_unreachable!(self);
+        let tag_type = self.resolve_tag_type(tag_index);
+        let len_values = tag_type.params().len();
+        let values = if len_values == 0 {
+            SlotSpan::new(Slot::from(0))
+        } else {
+            self.try_form_regspan_or_move(len_values, self.stack.consume_fuel_instr())?
+        };
+        self.push_instr(
+            Op::exception_throw(
+                tag_index,
+                BoundedSlotSpan::new(
+                    values,
+                    u16::try_from(len_values).expect("validated exception tag has too many fields"),
+                ),
+            ),
+            FuelCostsProvider::base,
+        )?;
+        self.stack.pop_n(len_values, &mut self.operands);
+        self.reachable = false;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn visit_throw_ref(&mut self) -> Self::Output {
+        self.translate_unsupported_operator("throw_ref")
+    }
+
+    #[inline(never)]
+    fn visit_try_table(&mut self, _try_table: wasmparser::TryTable) -> Self::Output {
+        self.translate_unsupported_operator("try_table")
+    }
+
+    #[inline(never)]
+    fn visit_rethrow(&mut self, relative_depth: u32) -> Self::Output {
+        bail_unreachable!(self);
+        let depth = usize::try_from(relative_depth)
+            .expect("legacy exception rethrow depth does not fit in usize");
+        let try_id = match self.stack.peek_control(depth) {
+            ControlFrame::Catch(frame) => frame.try_id(),
+            unexpected => panic!(
+                "legacy `rethrow` target must be a catch frame, found: {unexpected:?}"
+            ),
+        };
+        self.push_instr(
+            Op::exception_rethrow(try_id),
+            FuelCostsProvider::base,
+        )?;
+        self.reachable = false;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn visit_delegate(&mut self, _relative_depth: u32) -> Self::Output {
+        // The legacy delegate form is not emitted by the .NET runtime used by
+        // TRust. Keep validation authoritative and fail clearly if another
+        // module requires this less common forwarding form.
+        self.translate_unsupported_operator("delegate")
+    }
+
+    #[inline(never)]
     fn visit_else(&mut self) -> Self::Output {
         let mut frame = match self.stack.pop_control() {
             ControlFrame::If(frame) => frame,
@@ -213,6 +316,9 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
             ControlFrame::Loop(frame) => self.translate_end_loop(frame),
             ControlFrame::If(frame) => self.translate_end_if(frame),
             ControlFrame::Else(frame) => self.translate_end_else(frame),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => {
+                self.translate_end_try(frame)
+            }
             ControlFrame::Unreachable(frame) => self.translate_end_unreachable(frame),
         }
     }
