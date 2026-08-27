@@ -4,7 +4,7 @@
 //! traversal into a stateful TRust display list; it does not contain Vello,
 //! framebuffer, DPI, winit, Ratatui, or terminal-cell types.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::str::FromStr as _;
 
@@ -15,9 +15,10 @@ use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::render::{
     Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
     CssPaintAnimation, CssRect, DecorationStyle, DisplayCommand, GradientStop, HitRegion, ImageFit,
-    ImageHandle, ImageRequest, ImageSampling, LineCap, PagePaint, PaintBrush, PaintColor,
-    PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle,
-    TextDecorationPaint, TopLayerEntry,
+    ImageHandle, ImageRequest, ImageSampling, LineCap, MarqueeBehavior, MarqueeDirection,
+    MarqueeScope, PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement,
+    ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint, TextShadowPaint,
+    TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -78,6 +79,7 @@ struct Builder<'a, 't> {
     image_handles: HashSet<ImageHandle>,
     scroll_containers: Vec<ScrollContainer>,
     sticky_constraints: Vec<StickyConstraint>,
+    marquee_scopes: HashMap<NodeId, MarqueeScope>,
     patch_boundaries: Vec<super::GraphicalPatchBoundary>,
     boundaries: Vec<super::GraphicalBoundary>,
     /// Absolute overflow clips already active in the display list. A clip
@@ -117,6 +119,7 @@ impl<'a, 't> Builder<'a, 't> {
             image_handles: HashSet::new(),
             scroll_containers: Vec::new(),
             sticky_constraints: Vec::new(),
+            marquee_scopes: HashMap::new(),
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
             hard_clips: Vec::new(),
@@ -124,6 +127,7 @@ impl<'a, 't> Builder<'a, 't> {
         this.collect_scroll_containers(root);
         this.collect_patch_boundaries(root);
         this.collect_sticky(root);
+        this.collect_marquees(root);
         // Fixed-positioned fragments are retained outside the normal-flow
         // fragment tree for compositing. CSS Position 3 changes their
         // containing block and viewport attachment, but descendants still
@@ -133,13 +137,56 @@ impl<'a, 't> Builder<'a, 't> {
             this.collect_scroll_containers(fixed);
             this.collect_patch_boundaries(fixed);
             this.collect_sticky(fixed);
+            this.collect_marquees(fixed);
         }
         for top in top_layer {
             this.collect_scroll_containers(&top.fragment);
             this.collect_patch_boundaries(&top.fragment);
             this.collect_sticky(&top.fragment);
+            this.collect_marquees(&top.fragment);
         }
         this
+    }
+
+    /// Emit one descendant paint command inside its nearest marquee's fixed
+    /// clip and sampled translation. The marquee element's own box paint uses
+    /// the ordinary command path, so borders/backgrounds never move.
+    fn push_marquee_content(&mut self, node: NodeId, command: DisplayCommand) {
+        let Some(scope) = self.marquee_scope(node, true) else {
+            self.commands.push(command);
+            return;
+        };
+        self.push_marquee_scope(scope);
+        self.commands.push(command);
+        self.pop_marquee_scope();
+    }
+
+    fn marquee_scope(&self, node: NodeId, include_node: bool) -> Option<MarqueeScope> {
+        let mut current = if node == NO_NODE {
+            None
+        } else if include_node {
+            Some(node)
+        } else {
+            self.dom.parent_flat(node)
+        };
+        while let Some(id) = current {
+            if let Some(scope) = self.marquee_scopes.get(&id) {
+                return Some(scope.clone());
+            }
+            current = self.dom.parent_flat(id);
+        }
+        None
+    }
+
+    fn push_marquee_scope(&mut self, scope: MarqueeScope) {
+        self.commands
+            .push(DisplayCommand::PushClip(PaintShape::Rect(scope.viewport)));
+        self.commands.push(DisplayCommand::BeginMarquee(scope));
+    }
+
+    fn pop_marquee_scope(&mut self) {
+        self.commands.push(DisplayCommand::EndMarquee);
+        self.commands.push(DisplayCommand::PopClip);
     }
 
     fn image(&mut self, source: String) -> ImageHandle {
@@ -202,6 +249,14 @@ impl<'a, 't> Builder<'a, 't> {
     }
 
     fn push_scroll_ancestors(&mut self, node: NodeId) -> usize {
+        self.push_scroll_chain(node, false)
+    }
+
+    fn push_scroll_content_chain(&mut self, node: NodeId) -> usize {
+        self.push_scroll_chain(node, true)
+    }
+
+    fn push_scroll_chain(&mut self, node: NodeId, include_node: bool) -> usize {
         if node == NO_NODE {
             return 0;
         }
@@ -211,7 +266,11 @@ impl<'a, 't> Builder<'a, 't> {
         // its host (DOM §4.2.2), so paint ancestry must cross that boundary:
         // otherwise a custom element's host box is clipped but the image/text
         // painted by its shadow tree escapes the same scrollport.
-        let mut current = self.dom.parent_flat(node);
+        let mut current = if include_node {
+            Some(node)
+        } else {
+            self.dom.parent_flat(node)
+        };
         while let Some(id) = current {
             if !matches!(self.dom.tag_name(id), Some("html" | "body"))
                 && let Some(container) = self
@@ -337,6 +396,112 @@ impl<'a, 't> Builder<'a, 't> {
             self.collect_sticky(child);
         }
     }
+
+    fn collect_marquees(&mut self, fragment: &Frag<'_>) {
+        if fragment.node != NO_NODE && self.dom.tag_name(fragment.node) == Some("marquee") {
+            let viewport = padding_box(fragment);
+            let content = marquee_content_bounds(fragment).unwrap_or(viewport);
+            let behavior = match self
+                .dom
+                .attr(fragment.node, "behavior")
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("slide") => MarqueeBehavior::Slide,
+                Some("alternate") => MarqueeBehavior::Alternate,
+                _ => MarqueeBehavior::Scroll,
+            };
+            let direction = match self
+                .dom
+                .attr(fragment.node, "direction")
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("right") => MarqueeDirection::Right,
+                Some("up") => MarqueeDirection::Up,
+                Some("down") => MarqueeDirection::Down,
+                _ => MarqueeDirection::Left,
+            };
+            let mut delay_ms = self
+                .dom
+                .attr(fragment.node, "scrolldelay")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or(85);
+            if self.dom.attr(fragment.node, "truespeed").is_none() && delay_ms < 60 {
+                delay_ms = 60;
+            }
+            let scroll_distance = self
+                .dom
+                .attr(fragment.node, "scrollamount")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or(6) as f32;
+            let loop_count = self
+                .dom
+                .attr(fragment.node, "loop")
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .filter(|count| *count >= 1)
+                .and_then(|count| u32::try_from(count).ok());
+            self.marquee_scopes.insert(
+                fragment.node,
+                MarqueeScope {
+                    viewport,
+                    content,
+                    behavior,
+                    direction,
+                    scroll_interval_seconds: delay_ms as f32 / 1_000.0,
+                    scroll_distance,
+                    loop_count,
+                    running: self
+                        .dom
+                        .attr(fragment.node, "data-trust-marquee-stopped")
+                        .is_none(),
+                    paused_at_seconds: self
+                        .dom
+                        .attr(fragment.node, "data-trust-marquee-stopped")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0),
+                    paused_total_seconds: self
+                        .dom
+                        .attr(fragment.node, "data-trust-marquee-paused-total")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .unwrap_or(0.0),
+                },
+            );
+        }
+        for child in &fragment.children {
+            self.collect_marquees(child);
+        }
+    }
+}
+
+fn marquee_content_bounds(fragment: &Frag<'_>) -> Option<CssRect> {
+    fn union(a: CssRect, b: CssRect) -> CssRect {
+        let left = a.x.min(b.x);
+        let top = a.y.min(b.y);
+        let right = (a.x + a.width).max(b.x + b.width);
+        let bottom = (a.y + a.height).max(b.y + b.height);
+        CssRect::new(left, top, right - left, bottom - top)
+    }
+    fn collect(fragment: &Frag<'_>, bounds: &mut Option<CssRect>) {
+        let rect = CssRect::new(
+            fragment.x,
+            fragment.y,
+            fragment.w.max(0.0),
+            fragment.h.max(0.0),
+        );
+        *bounds = Some(bounds.map_or(rect, |old| union(old, rect)));
+        for child in &fragment.children {
+            collect(child, bounds);
+        }
+    }
+    let mut bounds = None;
+    for child in &fragment.children {
+        collect(child, &mut bounds);
+    }
+    bounds
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -862,6 +1027,16 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     let scroll_depth = builder.push_scroll_ancestors(style_node);
     let fragment_clip = builder.ancestor_clip(style_node, fragment.clip);
     let pushed_fragment_clip = fragment_clip.is_some_and(|clip| builder.push_hard_clip(clip));
+    // A descendant block's background, border, outline, and hit region are
+    // part of the marquee contents just as its text and replaced images are.
+    // Wrap the complete fragment paint while excluding the marquee's own
+    // principal box, whose viewport border/background stays stationary.
+    let marquee_scope = matches!(fragment.kind, FragKind::Block)
+        .then(|| builder.marquee_scope(fragment.node, false))
+        .flatten();
+    if let Some(scope) = marquee_scope.clone() {
+        builder.push_marquee_scope(scope);
+    }
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     if let Some(style) = style.filter(|_| fragment.w > 0.0 && fragment.h > 0.0) {
         let radii = border_radii(builder.dom, style, rect);
@@ -939,7 +1114,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             // so inline text/replaced content inside a shadow tree receives
             // the same clip and scroll transform as element fragments.
             let piece_scroll_depth = if fragment.node == NO_NODE {
-                builder.push_scroll_ancestors(node)
+                builder.push_scroll_content_chain(node)
             } else {
                 0
             };
@@ -994,23 +1169,36 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     color: decoration_color(builder.dom, style_node).unwrap_or(color),
                     style: decoration_style(builder.dom, style_node),
                 };
-                builder.commands.push(DisplayCommand::GlyphRun {
-                    origin,
-                    shaped: shaped.clone(),
-                    color,
-                    decoration,
-                    clip,
+                let shadows = text_shadows(builder.dom, style_node, color);
+                builder.push_marquee_content(
                     node,
-                    link: piece.item.link.clone(),
-                });
-                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
-                    builder.commands.push(DisplayCommand::HitRegion(HitRegion {
-                        rect: CssRect::new(origin.x, origin.y, shaped.advance, shaped.line_height),
+                    DisplayCommand::GlyphRun {
+                        origin,
+                        shaped: shaped.clone(),
+                        color,
+                        decoration,
+                        shadows,
+                        clip,
                         node,
-                        actor: interaction_actor(builder.dom, node),
                         link: piece.item.link.clone(),
-                        cursor: cursor_value(builder.dom, style_node),
-                    }));
+                    },
+                );
+                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    builder.push_marquee_content(
+                        node,
+                        DisplayCommand::HitRegion(HitRegion {
+                            rect: CssRect::new(
+                                origin.x,
+                                origin.y,
+                                shaped.advance,
+                                shaped.line_height,
+                            ),
+                            node,
+                            actor: interaction_actor(builder.dom, node),
+                            link: piece.item.link.clone(),
+                            cursor: cursor_value(builder.dom, style_node),
+                        }),
+                    );
                 }
             } else if let Some(source) = piece
                 .item
@@ -1026,47 +1214,53 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     piece.paint_width,
                     piece.paint_height,
                 );
-                builder.commands.push(DisplayCommand::Image {
-                    rect,
-                    handle,
-                    source_rect: None,
-                    fit: if piece.item.crop {
-                        ImageFit::Cover
-                    } else {
-                        ImageFit::Contain
-                    },
-                    sampling: if if style_node == NO_NODE {
-                        piece.item.pixelated
-                    } else {
-                        matches!(
-                            builder
-                                .dom
-                                .computed_value_resolved(style_node, "image-rendering")
-                                .as_deref(),
-                            Some(
-                                "pixelated"
-                                    | "crisp-edges"
-                                    | "-moz-crisp-edges"
-                                    | "-webkit-optimize-contrast"
-                            )
-                        )
-                    } {
-                        ImageSampling::Nearest
-                    } else {
-                        ImageSampling::Smooth
-                    },
-                    clip,
+                builder.push_marquee_content(
                     node,
-                    link: piece.item.link.clone(),
-                });
-                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
-                    builder.commands.push(DisplayCommand::HitRegion(HitRegion {
+                    DisplayCommand::Image {
                         rect,
+                        handle,
+                        source_rect: None,
+                        fit: if piece.item.crop {
+                            ImageFit::Cover
+                        } else {
+                            ImageFit::Contain
+                        },
+                        sampling: if if style_node == NO_NODE {
+                            piece.item.pixelated
+                        } else {
+                            matches!(
+                                builder
+                                    .dom
+                                    .computed_value_resolved(style_node, "image-rendering")
+                                    .as_deref(),
+                                Some(
+                                    "pixelated"
+                                        | "crisp-edges"
+                                        | "-moz-crisp-edges"
+                                        | "-webkit-optimize-contrast"
+                                )
+                            )
+                        } {
+                            ImageSampling::Nearest
+                        } else {
+                            ImageSampling::Smooth
+                        },
+                        clip,
                         node,
-                        actor: interaction_actor(builder.dom, node),
                         link: piece.item.link.clone(),
-                        cursor: cursor_value(builder.dom, style_node),
-                    }));
+                    },
+                );
+                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    builder.push_marquee_content(
+                        node,
+                        DisplayCommand::HitRegion(HitRegion {
+                            rect,
+                            node,
+                            actor: interaction_actor(builder.dom, node),
+                            link: piece.item.link.clone(),
+                            cursor: cursor_value(builder.dom, style_node),
+                        }),
+                    );
                 }
             }
             builder.pop_scroll_ancestors(piece_scroll_depth);
@@ -1074,6 +1268,9 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
     if style.is_some() && fragment.w > 0.0 && fragment.h > 0.0 {
         paint_outline(fragment, builder);
+    }
+    if marquee_scope.is_some() {
+        builder.pop_marquee_scope();
     }
     if pushed_fragment_clip {
         builder.pop_hard_clip();
@@ -2023,6 +2220,58 @@ fn paint_box_shadows(
             inset,
         });
     }
+}
+
+/// CSS Text Decoration 4 §4: parse each comma-separated shadow independently;
+/// its first two lengths are offsets, followed by optional non-negative blur
+/// and spread distances. The first authored layer is frontmost, so retain
+/// author order and let the renderer paint the vector back-to-front.
+fn text_shadows(dom: &Dom, node: NodeId, current_color: PaintColor) -> Vec<TextShadowPaint> {
+    if node == NO_NODE {
+        return Vec::new();
+    }
+    let Some(value) = dom.computed_value_resolved(node, "text-shadow") else {
+        return Vec::new();
+    };
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let units = Units::of(dom, node);
+    // Resource-bound hostile declarations while keeping substantially more
+    // layers than ordinary outline recipes (Burgeritchi uses 26).
+    split_top_level(&value, ',')
+        .into_iter()
+        .take(128)
+        .filter_map(|shadow| {
+            let tokens = split_ws(shadow);
+            let inset = tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("inset"));
+            let color = tokens
+                .iter()
+                .find_map(|token| resolve_color(dom, node, token))
+                .unwrap_or(current_color);
+            let lengths = tokens
+                .iter()
+                .filter_map(|token| super::css_length_px(token, units))
+                .collect::<Vec<_>>();
+            if lengths.len() < 2 || lengths.len() > 4 {
+                return None;
+            }
+            let blur_radius = lengths.get(2).copied().unwrap_or(0.0);
+            let spread = lengths.get(3).copied().unwrap_or(0.0);
+            if blur_radius < 0.0 || spread < 0.0 {
+                return None;
+            }
+            Some(TextShadowPaint {
+                color,
+                offset: CssPoint::new(lengths[0], lengths[1]),
+                blur_radius,
+                spread,
+                inset,
+            })
+        })
+        .collect()
 }
 
 fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {

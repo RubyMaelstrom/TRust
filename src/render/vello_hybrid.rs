@@ -811,7 +811,9 @@ impl VelloHybridRenderer {
                 | DisplayCommand::BeginFixed
                 | DisplayCommand::EndFixed
                 | DisplayCommand::BeginCssAnimation(_)
-                | DisplayCommand::EndCssAnimation => {}
+                | DisplayCommand::EndCssAnimation
+                | DisplayCommand::BeginMarquee(_)
+                | DisplayCommand::EndMarquee => {}
                 DisplayCommand::Shadow {
                     shape,
                     color,
@@ -888,6 +890,7 @@ impl VelloHybridRenderer {
                     shaped,
                     color,
                     decoration,
+                    shadows,
                     clip,
                     ..
                 } => {
@@ -906,31 +909,15 @@ impl VelloHybridRenderer {
                     if let Some(clip) = clip {
                         target.push_clip_path(&rect_path(*clip));
                     }
-                    target.set_paint(vello_color(*color));
-                    for run in &shaped.runs {
-                        let glyphs = run.glyphs.iter().map(|glyph| glifo::Glyph {
-                            id: glyph.id,
-                            x: origin.x + glyph.x,
-                            y: origin.y + glyph.y,
-                        });
-                        let mut builder = target
-                            .glyph_run(&mut self.resources, run.font.data())
-                            .font_size(run.font_size)
-                            .normalized_coords(&run.normalized_coords);
-                        if run.synth_bold {
-                            let amount = f64::from(run.font_size) * 0.025;
-                            builder = builder.font_embolden(glifo::FontEmbolden::new(
-                                Diagonal2::new(amount, amount),
-                            ));
-                        }
-                        if let Some(degrees) = run.synth_skew_degrees {
-                            builder = builder.glyph_transform(Affine::skew(
-                                f64::from(degrees).to_radians().tan(),
-                                0.0,
-                            ));
-                        }
-                        builder.fill_glyphs(glyphs);
+                    for shadow in shadows.iter().rev() {
+                        let shadow_origin =
+                            CssPoint::new(origin.x + shadow.offset.x, origin.y + shadow.offset.y);
+                        target.set_paint(vello_color(shadow.color));
+                        paint_glyphs(&mut target, &mut self.resources, shadow_origin, shaped);
+                        paint_decorations(&mut target, shadow_origin, shaped, decoration.style);
                     }
+                    target.set_paint(vello_color(*color));
+                    paint_glyphs(&mut target, &mut self.resources, *origin, shaped);
                     target.set_paint(vello_color(decoration.color));
                     paint_decorations(&mut target, *origin, shaped, decoration.style);
                     if clip.is_some() {
@@ -1363,6 +1350,35 @@ fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
                 .with_stops(stops.as_slice()),
             );
         }
+    }
+}
+
+fn paint_glyphs(
+    target: &mut vello_hybrid::Scene,
+    resources: &mut Resources,
+    origin: CssPoint,
+    shaped: &crate::text::ShapedText,
+) {
+    for run in &shaped.runs {
+        let glyphs = run.glyphs.iter().map(|glyph| glifo::Glyph {
+            id: glyph.id,
+            x: origin.x + glyph.x,
+            y: origin.y + glyph.y,
+        });
+        let mut builder = target
+            .glyph_run(resources, run.font.data())
+            .font_size(run.font_size)
+            .normalized_coords(&run.normalized_coords);
+        if run.synth_bold {
+            let amount = f64::from(run.font_size) * 0.025;
+            builder =
+                builder.font_embolden(glifo::FontEmbolden::new(Diagonal2::new(amount, amount)));
+        }
+        if let Some(degrees) = run.synth_skew_degrees {
+            builder =
+                builder.glyph_transform(Affine::skew(f64::from(degrees).to_radians().tan(), 0.0));
+        }
+        builder.fill_glyphs(glyphs);
     }
 }
 

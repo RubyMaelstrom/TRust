@@ -781,7 +781,19 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
     let em = fs;
     let block = |v: f32| [v, 0.0, v, 0.0];
     match tag {
+        // The live presentation serializer cannot place a second <body>
+        // inside the parent document, so it emits this marker div for an
+        // iframe's child BODY formatting box. HTML Rendering §15.3.2 gives
+        // both the real BODY and that equivalent box the 8px UA margins.
         "body" => ([8.0; 4], p0),
+        _ if dom.attr(id, "data-trust-frame-body").is_some()
+            && dom
+                .node(id)
+                .parent
+                .is_some_and(|parent| dom.attr(parent, "data-trust-frame").is_some()) =>
+        {
+            ([8.0; 4], p0)
+        }
         "p" | "dl" | "pre" | "listing" | "plaintext" | "xmp" => (block(em), p0),
         "blockquote" | "figure" => ([em, 40.0, em, 40.0], p0),
         "ul" | "ol" | "menu" | "dir" => {
@@ -853,6 +865,48 @@ pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
         cur = dom.node(n).parent;
     }
     Align2::Left
+}
+
+/// The legacy HTML rendering alignment inherited by an over-constrained
+/// descendant block.  This is deliberately separate from [`block_align`]:
+/// ordinary CSS `text-align` positions inline content, while WHATWG HTML
+/// Rendering §15.2 and §15.3.3 also require `<center>` and the applicable
+/// `align` presentational hints to alter the *used inline margins* of certain
+/// descendant boxes.  The nearest such ancestor wins.
+pub(crate) fn legacy_descendant_align(dom: &Dom, id: NodeId) -> Option<Align2> {
+    if id == NO_NODE {
+        return None;
+    }
+
+    // HTML Rendering §15.2 excludes a descendant that itself has an
+    // applicable `align` attribute.  Its attribute governs its descendants,
+    // not the position of its own box within an outer alignment context.
+    if dom.attr(id, "align").and_then(align_from_css).is_some() {
+        return None;
+    }
+
+    let mut cur = dom.node(id).parent;
+    while let Some(n) = cur {
+        let tag = dom.tag_name(n).unwrap_or("");
+        if tag == "center" {
+            return Some(Align2::Center);
+        }
+        if matches!(
+            tag,
+            "div" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+        ) && let Some(value) = dom.attr(n, "align")
+        {
+            return match value.trim().to_ascii_lowercase().as_str() {
+                "center" | "middle" => Some(Align2::Center),
+                "right" => Some(Align2::Right),
+                // HTML maps `justify` descendant alignment to line-left.
+                "left" | "justify" => Some(Align2::Left),
+                _ => None,
+            };
+        }
+        cur = dom.node(n).parent;
+    }
+    None
 }
 
 fn align_from_css(value: &str) -> Option<Align2> {

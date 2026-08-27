@@ -2328,6 +2328,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_center_aligns_overconstrained_descendant_blocks() {
+        // WHATWG HTML Rendering §15.2/15.3.3: this is not merely inherited
+        // text-align. A qualifying fixed-width descendant has its forced used
+        // margin divided according to the nearest legacy alignment context.
+        let html = r#"<body style="margin:0">
+            <center><div id="centered" style="position:relative;left:-10px;width:100px;height:1px;margin:0"></div></center>
+            <div style="text-align:center"><div id="css-only" style="width:100px;height:1px;margin:0"></div></div>
+            <div align="right"><div id="right" style="width:100px;height:1px;margin:0"></div></div>
+            <center><div id="excluded" align="left" style="width:100px;height:1px;margin:0"></div></center>
+        </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 300.0, &HashMap::new());
+        let x = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].left;
+        assert!((x("centered") - 90.0).abs() < 0.01);
+        assert!((x("css-only") - 0.0).abs() < 0.01);
+        assert!((x("right") - 200.0).abs() < 0.01);
+        assert!((x("excluded") - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn relative_positioning_visually_offsets_a_float_without_moving_its_shelf() {
+        // CSS Positioned Layout 3 §2/§3.3: relative positioning moves the
+        // rendered float, but does not change where later floats see its
+        // original margin box. The second float is too wide to sit beside the
+        // first, so its shelf remains y=40 rather than following the -10px
+        // visual shift to y=30.
+        let html = r#"<body style="margin:0"><div style="width:200px">
+            <div id="first" style="float:left;position:relative;left:5px;top:-10px;width:100px;height:40px"></div>
+            <div id="second" style="float:left;width:150px;height:10px"></div>
+        </div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 200.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!((rect("first").left - 5.0).abs() < 0.01);
+        assert!((rect("first").top + 10.0).abs() < 0.01);
+        assert!((rect("second").left - 0.0).abs() < 0.01);
+        assert!((rect("second").top - 40.0).abs() < 0.01);
+    }
+
+    #[test]
     fn text_indent_and_justification_use_fractional_css_geometry() {
         let indent = lay_graphical(
             r#"<body style="margin:0"><p style="margin:0;text-indent:20.5px">indented</p></body>"#,
@@ -2924,6 +2964,82 @@ mod tests {
         let clip = clip.expect("nested document viewport clip");
         assert!((clip.width - 200.0).abs() < 0.1, "{clip:?}");
         assert!((clip.height - 74.0).abs() < 0.1, "{clip:?}");
+    }
+
+    #[test]
+    fn serialized_frame_keeps_fixed_viewport_and_flex_body_alignment() {
+        // The resident page actor serializes its live DOM before the native
+        // frontend reparses and lays it out. That adapter must preserve the
+        // same two-box model as `Tree::frame`: a positioned replaced viewport
+        // containing the child document's BODY formatting context.
+        let mut resident = Dom::parse_document(
+            r#"<body style="margin:0"><iframe id=f
+               style="position:fixed;inset:0;width:100%;height:100%;border:0"></iframe>
+               <p id=after style="margin:0">after</p></body>"#,
+        );
+        let frame = resident.get_by_id("f").unwrap();
+        resident
+            .install_frame_document(
+                frame,
+                r#"<body style="display:flex;flex-direction:column;align-items:center;
+                   min-height:100vh;margin:0"><main id=shell style="width:400px">
+                   centered shell</main></body>"#,
+                "https://frame.test/",
+            )
+            .unwrap();
+
+        let html = resident.serialize_live(crate::dom::DOCUMENT, &std::collections::HashSet::new());
+        let snapshot = Dom::parse_document(&html);
+        let shell = snapshot.get_by_id("shell").unwrap();
+        let after = snapshot.get_by_id("after").unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &snapshot,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let shell = layout.boxes.get(&shell).expect("centered child shell");
+        assert!((shell.left - 200.0).abs() < 0.1, "{shell:?}\n{html}");
+        let after = layout.boxes.get(&after).expect("parent flow sibling");
+        assert!(
+            after.top < 1.0,
+            "a fixed iframe must not consume space in parent flow: {after:?}\n{html}"
+        );
+    }
+
+    #[test]
+    fn canonical_frame_keeps_child_body_flex_formatting_context() {
+        // This exercises Tree::frame directly, before the resident DOM is
+        // serialized for another presentation arena. CSS Display 3 §2 makes
+        // BODY's inner display type authoritative for its children in either
+        // frontend path.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><iframe id=f
+               style="width:800px;height:300px;border:0"></iframe></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<body style="display:flex;flex-direction:column;align-items:center;margin:0">
+               <main id=shell style="width:400px">centered shell</main></body>"#,
+            "https://frame.test/",
+        )
+        .unwrap();
+        let shell = dom.get_by_id("shell").unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let shell = layout.boxes.get(&shell).expect("centered child shell");
+        assert!((shell.left - 200.0).abs() < 0.1, "{shell:?}");
     }
 
     #[test]
@@ -6696,6 +6812,182 @@ mod tests {
     }
 
     #[test]
+    fn graphical_text_shadow_retains_front_to_back_layers_without_reflow() {
+        let html = r#"<body style="margin:0"><span style="color:rgb(1,2,3);
+            text-shadow:rgb(255,255,255) 3px 0 0,
+                        rgb(4,5,6) -2px 1px 0">outlined</span></body>"#;
+        let layout = lay_graphical(html, 320.0, &HashMap::new());
+        let (shaped, shadows) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun {
+                    shaped, shadows, ..
+                } if shaped.text == "outlined" => Some((shaped, shadows)),
+                _ => None,
+            })
+            .expect("outlined glyph run");
+        assert_eq!(shadows.len(), 2);
+        assert_eq!(
+            shadows[0].color,
+            crate::render::PaintColor::Rgba(255, 255, 255, 255)
+        );
+        assert_eq!(shadows[0].offset, crate::core::CssPoint::new(3.0, 0.0));
+        assert_eq!(
+            shadows[1].color,
+            crate::render::PaintColor::Rgba(4, 5, 6, 255)
+        );
+        assert_eq!(shadows[1].offset, crate::core::CssPoint::new(-2.0, 1.0));
+        assert_eq!(
+            shaped.advance,
+            crate::text::shape("outlined", &crate::text::TextStyle::default()).advance,
+            "text-shadow is ink overflow and must not alter layout"
+        );
+    }
+
+    #[test]
+    fn graphical_marquee_uses_html_ua_viewport_and_wraps_descendant_paint() {
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><marquee id=m direction=right scrollamount=9
+               scrolldelay=20 style="width:200px;overflow:visible"><span id=tile
+               style="display:inline-block;background:#123456">moving</span></marquee><div
+               id=after style="width:40px;height:20px;background:#654321"></div></body>"#,
+        );
+        let marquee = node_by_id(&dom, "m");
+        assert_eq!(
+            dom.effective_display(marquee).as_deref(),
+            Some("inline-block")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(marquee, "overflow").as_deref(),
+            Some("hidden"),
+            "HTML's UA-important marquee clip beats author overflow"
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let scope = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::BeginMarquee(scope) => Some(scope),
+                _ => None,
+            })
+            .expect("marquee translation scope");
+        assert_eq!(scope.direction, crate::render::MarqueeDirection::Right);
+        assert_eq!(scope.scroll_distance, 9.0);
+        assert_eq!(
+            scope.scroll_interval_seconds, 0.06,
+            "sub-60ms delay is clamped without truespeed"
+        );
+        assert!((scope.viewport.width - 200.0).abs() < 0.1, "{scope:?}");
+
+        let fill = layout
+            .paint
+            .primitives
+            .iter()
+            .position(|command| {
+                matches!(
+                    command,
+                    crate::render::DisplayCommand::Fill {
+                        brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                            0x12, 0x34, 0x56, 0xff
+                        )),
+                        ..
+                    }
+                )
+            })
+            .expect("descendant box background");
+        assert!(
+            layout.paint.primitives[..fill]
+                .iter()
+                .rposition(|command| matches!(
+                    command,
+                    crate::render::DisplayCommand::BeginMarquee(_)
+                ))
+                .is_some()
+                && layout.paint.primitives[fill + 1..]
+                    .iter()
+                    .position(|command| matches!(
+                        command,
+                        crate::render::DisplayCommand::EndMarquee
+                    ))
+                    .is_some(),
+            "the marquee must translate complete descendant box paint"
+        );
+
+        let after = node_by_id(&dom, "after");
+        let mut marquee_depth = 0usize;
+        let mut found_after = false;
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::BeginMarquee(_) => marquee_depth += 1,
+                crate::render::DisplayCommand::EndMarquee => marquee_depth -= 1,
+                crate::render::DisplayCommand::HitRegion(region) if region.node == after => {
+                    assert_eq!(
+                        marquee_depth, 0,
+                        "a following sibling must not inherit the marquee transform or clip"
+                    );
+                    found_after = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            found_after,
+            "following sibling must remain in the display list"
+        );
+
+        let direct = Dom::parse_document(
+            r#"<body style="margin:0"><div style="width:200px"><marquee>short text</marquee><br><marquee style="width:80px">fixed</marquee></div></body>"#,
+        );
+        let direct_layout = lay_out_graphical(
+            &direct,
+            &base,
+            Viewport::new(320.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let direct_scope = direct_layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::BeginMarquee(scope) => Some(scope),
+                _ => None,
+            })
+            .expect("direct-text marquee translation scope");
+        assert!(
+            (direct_scope.viewport.width - 200.0).abs() < 0.1,
+            "{direct_scope:?}"
+        );
+        assert!(
+            direct_scope.content.width < direct_scope.viewport.width / 2.0,
+            "marquee travel uses the direct text's content extent, not the full line box: {direct_scope:?}"
+        );
+        let authored_scope = direct_layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::BeginMarquee(scope) => Some(scope),
+                _ => None,
+            })
+            .find(|scope| (scope.viewport.width - 80.0).abs() < 0.1)
+            .expect("an authored marquee width must still win over the auto-width behavior");
+        assert!(authored_scope.content.width < authored_scope.viewport.width);
+    }
+
+    #[test]
     fn graphical_background_images_use_intrinsic_size_and_repeat() {
         let dom = Dom::parse_document(
             r#"<html style="margin:0;background-image:url('/tile.webp');background-repeat:repeat"><body style="margin:0;background:transparent"><div style="height:36px"></div></body></html>"#,
@@ -7193,6 +7485,62 @@ mod tests {
                         if (rect.height - 32.0).abs() < 0.01
                 ))
         );
+    }
+
+    #[test]
+    fn graphical_scrollport_clips_direct_anonymous_line_content() {
+        // CSS Overflow 3 §§2.3 and 3.1: direct text is still content of the
+        // scroll container and is viewed through its padding-box scrollport.
+        // Anonymous line fragments retain the container as their generating
+        // style node, so paint must include that node itself in the content
+        // scroll chain rather than beginning with its DOM parent.
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><div style="height:32px;overflow:auto">first<br>second<br>third</div></body>"#,
+            320.0,
+            &HashMap::new(),
+        );
+        let container = layout
+            .paint
+            .scroll_containers
+            .first()
+            .expect("overflow:auto must establish a graphical scroll container");
+        assert_eq!(container.viewport.height, 32.0);
+
+        let mut active_clips = Vec::new();
+        let mut active_scrolls = Vec::new();
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::PushClip(shape) => {
+                    active_clips.push(shape.clone());
+                }
+                crate::render::DisplayCommand::PopClip => {
+                    active_clips.pop();
+                }
+                crate::render::DisplayCommand::BeginScroll(node) => active_scrolls.push(*node),
+                crate::render::DisplayCommand::EndScroll => {
+                    active_scrolls.pop();
+                }
+                crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                    if shaped.text.contains("third") =>
+                {
+                    assert!(
+                        active_scrolls.contains(&container.node),
+                        "direct line content must receive its own container's scroll transform"
+                    );
+                    assert!(
+                        active_clips.iter().any(|shape| matches!(
+                            shape,
+                            crate::render::PaintShape::Rect(rect)
+                                if (rect.height - 32.0).abs() < 0.01
+                        )),
+                        "direct line content must be clipped by the 32px scrollport: {active_clips:?}"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("expected overflowing direct text in the retained display list");
     }
 
     #[test]

@@ -160,6 +160,7 @@ impl TerminalView {
                         color: foreground,
                         style: DecorationStyle::Solid,
                     },
+                    shadows: Vec::new(),
                     clip: None,
                     node: usize::from(row) * usize::from(cols) + usize::from(col),
                     link: None,
