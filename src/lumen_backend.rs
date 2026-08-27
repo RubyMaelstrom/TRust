@@ -2497,6 +2497,60 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn parser_document_write_uses_the_current_script_insertion_point() {
+            // WHATWG HTML §8.4.3 inserts each document.write string immediately
+            // before the active parser insertion point. The source is already a
+            // DOM when TRust executes parser scripts, so the equivalent cursor is
+            // after the script and before its original following sibling.
+            let html = r#"<!doctype html><html><body>
+                <div id="contentW"><span id="before">before</span><script>
+                    document.write('written-text<i id="first">first</i>');
+                    document.write('<b id="second">second</b>');
+                </script><em id="after">after</em></div>
+                <div id="body-tail">tail</div>
+            </body></html>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            let rendered = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. } | PageEvt::Static { html, .. })
+                            if html.contains("id=\"second\"") =>
+                        {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("document.write failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before document.write rendered"),
+                    }
+                }
+            })
+            .await
+            .expect("parser document.write render timed out");
+
+            let content = rendered
+                .split_once("<div id=\"contentW\">")
+                .and_then(|(_, rest)| rest.split_once("</div>"))
+                .map(|(content, _)| content)
+                .expect("serialized contentW");
+            let before = content.find("id=\"before\"").expect("source predecessor");
+            let text = content.find("written-text").expect("written text");
+            let first = content.find("id=\"first\"").expect("first write");
+            let second = content.find("id=\"second\"").expect("second write");
+            let after = content.find("id=\"after\"").expect("source successor");
+            assert!(
+                before < text && text < first && first < second && second < after,
+                "{content}"
+            );
+            assert!(
+                rendered.find("id=\"second\"").unwrap()
+                    < rendered.find("id=\"body-tail\"").unwrap(),
+                "written nodes escaped their parser parent: {rendered}"
+            );
+        }
+
+        #[tokio::test]
         async fn actor_does_not_abort_a_long_running_click_task_by_wall_clock() {
             // HTML §8.1.7.3 runs the selected user-interaction task to
             // completion. A user agent can expose an explicit "stop script"
@@ -2624,6 +2678,76 @@ mod desktop {
             .await
             .expect("idle callback did not receive an actor-selected idle period");
             assert!(rendered.contains("<output id=\"result\">idle:false:true</output>"));
+        }
+
+        #[tokio::test]
+        async fn viewport_push_fires_resize_in_each_changed_frame_window() {
+            // CSSOM View §13.1 runs resize steps for every Document whose
+            // viewport changed, including an iframe resized because the top
+            // viewport grew. The callback must execute with that frame's
+            // document and inner size, not the top-level Window state shared
+            // by the single-realm implementation.
+            let html = r#"<!doctype html><html><body style="margin:0">
+                <button onclick="void 0">keep</button><script>
+                const frame = document.createElement('iframe');
+                frame.id = 'frame';
+                frame.style.cssText =
+                    'position:fixed;inset:0;width:100%;height:100%;border:0';
+                frame.srcdoc = '<body><output id="child">initial</output><scr' + 'ipt>' +
+                    'window.addEventListener("resize", function () {' +
+                    'document.getElementById("child").textContent = ' +
+                    '"child " + innerWidth + "x" + innerHeight;' +
+                    '});</scr' + 'ipt></body>';
+                document.body.appendChild(frame);
+                </script>
+            </body></html>"#;
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. } | PageEvt::Static { html, .. })
+                            if html.contains("id=\"child\"") =>
+                        {
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("frame load failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the frame loaded"),
+                    }
+                }
+            })
+            .await
+            .expect("initial frame render timed out");
+
+            handle
+                .cmds
+                .send(PageCmd::Viewport(crate::layout2::Viewport::new(
+                    400.0, 320.0,
+                )))
+                .await
+                .unwrap();
+            let resized = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome })
+                            if html.contains("child 400x320") =>
+                        {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break true;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("frame resize failed: {errors:?}"),
+                        Some(_) => {}
+                        None => break false,
+                    }
+                }
+            })
+            .await
+            .expect("nested frame resize timed out");
+            assert!(
+                resized,
+                "the changed child viewport must resize its own Window in frame scope"
+            );
         }
 
         #[tokio::test]
@@ -2970,10 +3094,12 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
     } else {
         Value::from_string(String::from_utf8_lossy(&body).into_owned())
     };
-    // Fetch Body is a byte sequence. Uint8Array is accepted by the prelude's BufferSource path;
-    // retain the legacy one-code-point-per-byte string only as an allocation-failure fallback.
+    // Fetch Body is a byte sequence. An ordinary ArrayBuffer crosses the host boundary without
+    // depending on the realm's typed-array view bookkeeping; the prelude turns it into a view at
+    // the point where the Fetch Body algorithms need one. Retain the legacy one-code-point-per-
+    // byte string only as an allocation-failure fallback.
     let bytes = ctx
-        .make_uint8array(&body)
+        .make_array_buffer(&body)
         .unwrap_or_else(|_| Value::from_string(body.iter().copied().map(char::from).collect()));
     ctx.make_array(vec![
         Value::Num(f64::from(status)),
@@ -6082,7 +6208,7 @@ mod tests {
         // the previous fixed buffer, and i64 crosses the JS boundary as BigInt.
         let mut engine = platform_engine();
         let mut module = wat::parse_str(
-            r#"
+            r##"
             (module
               (import "env" "observe" (func $observe (result i32)))
               (import "env" "boom" (func $boom))
@@ -6107,7 +6233,7 @@ mod tests {
                 i32.const 1 memory.grow)
               (func (export "callBoom") call $boom)
               (global (export "big") (mut i64) (i64.const -2)))
-            "#,
+            "##,
         )
         .unwrap();
         // A custom section named "note" with payload [1, 2, 3].
@@ -6292,6 +6418,56 @@ mod tests {
     }
 
     #[test]
+    fn webassembly_legacy_tagged_exceptions_unwind_to_the_matching_catch() {
+        // Legacy WebAssembly exception handling: a throw transfers control to the nearest
+        // enclosing matching catch and preserves the tag payload on the Wasm operand stack.
+        let mut engine = platform_engine();
+        let module = wat::parse_str(
+            r#"
+            (module
+              (tag $tag (param i32))
+              (func (export "caught") (result i32)
+                try (result i32)
+                  i32.const 7
+                  throw $tag
+                catch $tag
+                  drop
+                  i32.const 42
+                end)
+              (func (export "uncaught")
+                i32.const 9
+                throw $tag))
+            "#,
+        )
+        .unwrap();
+        let bytes = engine
+            .ctx()
+            .make_uint8array(&module)
+            .unwrap_or_else(|_| panic!("make exception fixture"));
+        let global = engine.global_this();
+        engine
+            .ctx()
+            .member_set(&global, "exceptionFixture", bytes)
+            .unwrap_or_else(|_| panic!("install exception fixture"));
+        eval(
+            &mut engine,
+            r#"
+            const exceptionInstance = new WebAssembly.Instance(
+                new WebAssembly.Module(exceptionFixture));
+            let uncaught = false;
+            try { exceptionInstance.exports.uncaught(); }
+            catch (error) { uncaught = !!error; }
+            globalThis.exceptionResult = [
+                exceptionInstance.exports.caught(), uncaught
+            ].join('|');
+            "#,
+            "WebAssembly legacy exceptions",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "exceptionResult"), "42|true");
+    }
+
+    #[test]
     fn fetch_completion_is_a_networking_task_with_byte_exact_body() {
         // Fetch §5.6 creates the promise before fetching in parallel; Fetch §2 queues response
         // processing on the networking task source; HTML §8.1.7.3 then performs one microtask
@@ -6462,7 +6638,7 @@ mod tests {
                 globalThis.syncFetchResult = [
                     syncResponse[0], syncResponse[1],
                     syncResponse[4].indexOf('x-answer\nexact') >= 0,
-                    Array.from(syncResponse[3]).join(',')
+                    Array.from(new Uint8Array(syncResponse[3])).join(',')
                 ].join('|');
             "#,
             "synchronous fetch",
@@ -7222,6 +7398,89 @@ mod tests {
     }
 
     #[test]
+    fn css_style_declaration_rejects_unitless_nonzero_lengths() {
+        // CSSOM §6.7.1 + CSS Values 4 §6: assigning a JS number to a length
+        // property stringifies it, but the resulting nonzero <number> is not a
+        // <length> and must leave the declaration block unchanged.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const head = document.createElement("head");
+            const body = document.createElement("body");
+            document.appendChild(html);
+            html.appendChild(head);
+            html.appendChild(body);
+            const style = document.createElement("style");
+            style.textContent = "#frame { height: 100%; }";
+            head.appendChild(style);
+            const frame = document.createElement("iframe");
+            frame.id = "frame";
+            body.appendChild(frame);
+            frame.style.height = innerHeight;
+            const invalidProperty = frame.style.height;
+            frame.style.width = 0;
+            globalThis.cssLengthAssignmentResult = [
+                invalidProperty,
+                getComputedStyle(frame).height,
+                frame.style.width,
+                CSS.supports("height", "518"),
+                CSS.supports("height", "0")
+            ].join("|");
+            "##,
+            "CSSStyleDeclaration length validation",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "cssLengthAssignmentResult"),
+            "|100%|0|false|true"
+        );
+    }
+
+    #[test]
+    fn hyperlink_url_components_update_href_with_url_setter_semantics() {
+        // HTML §4.6.3 (HyperlinkElementUtils): component setters parse with the
+        // URL state override and then update the href content attribute. SCM
+        // Music Player uses an <a> as a URL builder before creating its iframe;
+        // a no-op pathname setter sends that iframe to script.js instead of the
+        // player document.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const a = document.createElement("a");
+            a.href = "/script.js";
+            const absent = document.createElement("a");
+            absent.pathname = "/should-not-create-a-url";
+            a.pathname = "player";
+            a.search = "hostBridge=1";
+            a.hash = "destination";
+            const area = document.createElement("area");
+            area.href = "https://example.test/old";
+            area.pathname = "/new";
+            globalThis.hyperlinkSetterResult = [
+                a.href,
+                a.getAttribute("href"),
+                a.pathname,
+                a.search,
+                a.hash,
+                area.href,
+                absent.hasAttribute("href"),
+                absent.protocol
+            ].join("|");
+            "##,
+            "hyperlink URL component setters",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "hyperlinkSetterResult"),
+            "https://example.com/player?hostBridge=1#destination|https://example.com/player?hostBridge=1#destination|/player|?hostBridge=1|#destination|https://example.test/new|false|:"
+        );
+    }
+
+    #[test]
     fn geometry_media_images_and_frames_use_canonical_platform_state() {
         // CSSOM §7.2/§9, CSSOM View §§4/6, and HTML §§4.8.4/4.8.5. The assertions enter through
         // the shared prelude so wrapper behavior and the Lumen host calls are covered together.
@@ -7282,6 +7541,41 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "geometryResult"),
             "true|false|grid|100px 140px|240|80|true|30|25|https://example.com/large.png|false|true|true|child|https://example.com/child"
+        );
+    }
+
+    #[test]
+    fn marquee_interface_reflects_timing_and_controls_render_pause_state() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const marquee = document.createElement("marquee");
+            document.appendChild(marquee);
+            marquee.direction = "right";
+            marquee.scrollAmount = 9;
+            marquee.scrollDelay = 20;
+            marquee.loop = 3;
+            marquee.stop();
+            const stopped = marquee.hasAttribute("data-trust-marquee-stopped");
+            marquee.start();
+            globalThis.marqueeResult = [
+                marquee instanceof HTMLMarqueeElement,
+                marquee.direction,
+                marquee.scrollAmount,
+                marquee.scrollDelay,
+                marquee.loop,
+                stopped,
+                marquee.hasAttribute("data-trust-marquee-stopped"),
+                Number(marquee.getAttribute("data-trust-marquee-paused-total")) >= 0
+            ].join("|");
+            "#,
+            "marquee interface",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "marqueeResult"),
+            "true|right|9|20|3|true|false|true"
         );
     }
 
@@ -7372,6 +7666,189 @@ mod tests {
         let node_type = eval_value(&mut engine, "document.nodeType", "node type").unwrap();
         assert_eq!(node_type.as_num_opt(), Some(9.0));
         assert_eq!(crate::dom::DOCUMENT, 0);
+    }
+
+    #[test]
+    fn document_base_uri_resolves_relative_urls_for_documents_and_nodes() {
+        // DOM §4.4 `Node.baseURI` and HTML §2.4.3 document base URLs. A <base>
+        // element changes the base used by URL APIs without changing
+        // document.URL, and the value is exposed on both the Document and its
+        // descendant nodes.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement("html");
+            const head = document.createElement("head");
+            const body = document.createElement("body");
+            const base = document.createElement("base");
+            base.setAttribute("href", "/static/");
+            const target = document.createElement("div");
+            document.appendChild(html);
+            html.appendChild(head); html.appendChild(body);
+            head.appendChild(base); body.appendChild(target);
+            globalThis.baseUriResult = [
+                document.URL,
+                document.baseURI,
+                target.baseURI,
+                new URL("bundle.js", document.baseURI).href
+            ].join("|");
+            head.innerHTML = '<base href="/dynamic/">';
+            globalThis.dynamicBaseUriResult = [
+                document.baseURI,
+                target.baseURI,
+                new URL("bundle.js", target.baseURI).href
+            ].join("|");
+            "#,
+            "document base URL",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "baseUriResult"),
+            "https://example.com/|https://example.com/static/|https://example.com/static/|https://example.com/static/bundle.js"
+        );
+        assert_eq!(
+            string_value(&mut engine, "dynamicBaseUriResult"),
+            "https://example.com/dynamic/|https://example.com/dynamic/|https://example.com/dynamic/bundle.js"
+        );
+    }
+
+    #[test]
+    fn iframe_javascript_urls_execute_and_can_replace_the_frame_document() {
+        // HTML §7.4.2.3.2: javascript: navigations run decoded classic script
+        // in the target navigable; only a string completion creates replacement
+        // HTML. A script completion that mutates location is handled by the
+        // frame's ordinary queued src navigation path.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+
+            const mutated = document.createElement("iframe");
+            mutated.setAttribute("src", "javascript:document.body.innerHTML = '<p id=mutated>done</p>'");
+            body.appendChild(mutated);
+
+            const replaced = document.createElement("iframe");
+            replaced.setAttribute("src", "javascript:'<p id=replaced>done</p>'");
+            body.appendChild(replaced);
+
+            __trust.hydrateFrames();
+            globalThis.javascriptFrameResult = [
+                mutated.contentDocument.body.querySelector("#mutated").textContent,
+                replaced.contentDocument.body.querySelector("#replaced").textContent
+            ].join("|");
+            "##,
+            "iframe javascript URL navigation",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "javascriptFrameResult"),
+            "done|done"
+        );
+    }
+
+    #[test]
+    fn iframe_parser_document_write_stays_inside_its_source_parent() {
+        // WHATWG HTML §8.4.3 applies the active parser's insertion point to a
+        // nested navigable as well. SCM Player relies on this exact pattern:
+        // its parser script writes the full-size content iframe inside an
+        // absolutely positioned #contentW container.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<div id="contentW"><script>' +
+                'document.write(\'<iframe id="content"></iframe>\')' +
+                '<\/script><span id="after">after</span></div>' +
+                '<div id="playerW">player</div>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            const child = frame.contentDocument;
+            const content = child.getElementById("content");
+            globalThis.frameWriteResult = [
+                content.parentNode.id,
+                content.nextElementSibling.id,
+                child.getElementById("playerW").previousElementSibling.id,
+                child.currentScript === null
+            ].join("|");
+            "##,
+            "iframe parser document.write insertion point",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameWriteResult"),
+            "contentW|after|contentW|true"
+        );
+    }
+
+    #[test]
+    fn text_decoder_supports_utf16_labels_boms_streaming_and_fatal_errors() {
+        // Encoding §4.2/§7.2 and §14.2: UTF-16 labels, BOM precedence, and
+        // replacement versus fatal handling are part of the browser API. The
+        // one-byte streaming case checks that a decoder carries an incomplete
+        // code unit into the next decode call.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const leBytes = new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x3d, 0xd8, 0x00, 0xde]);
+            const beBytes = new Uint8Array([0xfe, 0xff, 0x00, 0x48, 0xd8, 0x3d, 0xde, 0x00]);
+            const le = new TextDecoder('utf-16', { fatal: false });
+            const be = new TextDecoder('utf-16be');
+            const keptBom = new TextDecoder('utf-16le', { ignoreBOM: true });
+            const streamed = new TextDecoder('utf-16le');
+            let fatal = false;
+            try { new TextDecoder('utf-16le', { fatal: true }).decode(new Uint8Array([0x48])); }
+            catch (error) { fatal = error instanceof TypeError; }
+            globalThis.textDecoderResult = [
+                le.encoding, le.decode(leBytes).codePointAt(1) === 0x1f600,
+                be.encoding, be.decode(beBytes) === 'H😀',
+                keptBom.decode(leBytes).charCodeAt(0) === 0xfeff,
+                streamed.decode(new Uint8Array([0x48]), { stream: true }) === '',
+                streamed.decode(new Uint8Array([0])) === 'H',
+                le.decode(new Uint8Array([0x48])) === '�', fatal
+            ].join('|');
+            "#,
+            "TextDecoder UTF-16",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "textDecoderResult"),
+            "utf-16le|true|utf-16be|true|true|true|true|true|true"
+        );
+    }
+
+    #[test]
+    fn text_encoder_encode_into_observes_utf8_boundaries_and_surrogates() {
+        // Encoding §7.4: encodeInto reports UTF-16 code units read and never emits a partial
+        // scalar value when the destination is too small.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const target = new Uint8Array(5);
+            const partial = new TextEncoder().encodeInto('Aé😀', target);
+            const lone = new Uint8Array(3);
+            const replacement = new TextEncoder().encodeInto('\ud800', lone);
+            globalThis.textEncoderResult = [
+                partial.read, partial.written, Array.from(target).slice(0, partial.written).join(','),
+                replacement.read, replacement.written, Array.from(lone).slice(0, replacement.written).join(',')
+            ].join('|');
+            "#,
+            "TextEncoder encodeInto",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "textEncoderResult"),
+            "2|3|65,195,169|1|3|239,191,189"
+        );
     }
 
     #[test]
