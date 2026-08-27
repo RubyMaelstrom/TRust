@@ -33,6 +33,54 @@
         return Math.max(timers.now, Number.isFinite(elapsed) ? elapsed : timers.now);
     }
 
+    // Geometry Interfaces Module Level 1 §3. Keep the four internal dimensions
+    // out of page-visible properties, expose derived edges for negative sizes,
+    // and let DOMRect override only the four mutable coordinates/dimensions.
+    const rectState = new WeakMap();
+    function rectNumber(value) { return value === undefined ? 0 : Number(value); }
+    function rectInit(other) {
+        other = other === null || other === undefined ? {} : Object(other);
+        return [rectNumber(other.x), rectNumber(other.y),
+                rectNumber(other.width), rectNumber(other.height)];
+    }
+    class DOMRectReadOnly {
+        constructor(x = 0, y = 0, width = 0, height = 0) {
+            rectState.set(this, {
+                x: rectNumber(x), y: rectNumber(y),
+                width: rectNumber(width), height: rectNumber(height),
+            });
+        }
+        static fromRect(other = {}) { return new DOMRectReadOnly(...rectInit(other)); }
+        get x() { return rectState.get(this).x; }
+        get y() { return rectState.get(this).y; }
+        get width() { return rectState.get(this).width; }
+        get height() { return rectState.get(this).height; }
+        get top() { const r = rectState.get(this); return Math.min(r.y, r.y + r.height); }
+        get right() { const r = rectState.get(this); return Math.max(r.x, r.x + r.width); }
+        get bottom() { const r = rectState.get(this); return Math.max(r.y, r.y + r.height); }
+        get left() { const r = rectState.get(this); return Math.min(r.x, r.x + r.width); }
+        toJSON() {
+            return { x: this.x, y: this.y, width: this.width, height: this.height,
+                     top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+        }
+        get [Symbol.toStringTag]() { return "DOMRectReadOnly"; }
+    }
+    class DOMRect extends DOMRectReadOnly {
+        static fromRect(other = {}) { return new DOMRect(...rectInit(other)); }
+        get x() { return super.x; }
+        set x(value) { rectState.get(this).x = Number(value); }
+        get y() { return super.y; }
+        set y(value) { rectState.get(this).y = Number(value); }
+        get width() { return super.width; }
+        set width(value) { rectState.get(this).width = Number(value); }
+        get height() { return super.height; }
+        set height(value) { rectState.get(this).height = Number(value); }
+        get [Symbol.toStringTag]() { return "DOMRect"; }
+    }
+    g.DOMRectReadOnly = DOMRectReadOnly;
+    g.DOMRect = DOMRect;
+    g.SVGRect = DOMRect;
+
     // --- node wrappers, identity-cached so wrap(id) === wrap(id) ---
     const W = new Map();
     function wrap(id) {
@@ -2903,9 +2951,7 @@
             try { r = __dom_rect(this.__id); } catch (e) { r = null; }
             if (r) {
                 const left = r[0], top = r[1], width = r[2], height = r[3];
-                return { x: left, y: top, left, top, width, height,
-                         right: left + width, bottom: top + height,
-                         toJSON() { return this; } };
+                return new DOMRect(left, top, width, height);
             }
             // Phase 3 (CSSOM View §"the getBoundingClientRect() method"): an
             // element with NO associated CSS layout box returns an ALL-ZERO
@@ -2926,11 +2972,9 @@
             if (this.isConnected &&
                 (t === "svg" || t === "canvas" || t === "iframe" ||
                  t === "object" || t === "math" || t === "embed")) {
-                return { x: 0, y: 0, left: 0, top: 0, right: g.innerWidth, bottom: g.innerHeight,
-                         width: g.innerWidth, height: g.innerHeight, toJSON() { return this; } };
+                return new DOMRect(0, 0, g.innerWidth, g.innerHeight);
             }
-            return { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0,
-                     width: 0, height: 0, toJSON() { return this; } };
+            return new DOMRect();
         }
         // getBoundingClientRect/getClientRects are VIEWPORT-relative (CSSOM
         // View): the document-origin `__rect()` shifted up/left by the page
@@ -2943,9 +2987,7 @@
             const r = this.__rect();
             const sx = g.scrollX || 0, sy = g.scrollY || 0;
             if (!sx && !sy) return r;
-            return { x: r.x - sx, y: r.y - sy, left: r.left - sx, top: r.top - sy,
-                     right: r.right - sx, bottom: r.bottom - sy,
-                     width: r.width, height: r.height, toJSON() { return this; } };
+            return new DOMRect(r.x - sx, r.y - sy, r.width, r.height);
         }
         getClientRects() { return [this.getBoundingClientRect()]; }
         get offsetWidth() { return this.__rect().width; }
@@ -6175,7 +6217,7 @@
         insertNode(node) { const c = this.startContainer; if (c && c.insertBefore) c.insertBefore(node, (c.childNodes && c.childNodes[this.startOffset]) || null); }
         surroundContents(node) { this.insertNode(node); }
         createContextualFragment(html) { const tpl = g.document.createElement("template"); tpl.innerHTML = String(html); return tpl.content; }
-        getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight }; }
+        getBoundingClientRect() { return new DOMRect(0, 0, g.innerWidth, g.innerHeight); }
         getClientRects() { return [this.getBoundingClientRect()]; }
         detach() {}
         toString() { return ""; }
@@ -6523,17 +6565,7 @@
     // Keep the geometry values immutable, as DOMRectReadOnly values are.
     function ioEntryRect(init) {
         init = init || {};
-        const x = init.x === undefined ? 0 : Number(init.x);
-        const y = init.y === undefined ? 0 : Number(init.y);
-        const width = init.width === undefined ? 0 : Number(init.width);
-        const height = init.height === undefined ? 0 : Number(init.height);
-        return Object.freeze({
-            x, y, width, height,
-            top: Math.min(y, y + height),
-            right: Math.max(x, x + width),
-            bottom: Math.max(y, y + height),
-            left: Math.min(x, x + width),
-        });
+        return DOMRectReadOnly.fromRect(init);
     }
     g.IntersectionObserverEntry = class IntersectionObserverEntry {
         constructor(init) {

@@ -7603,6 +7603,37 @@ mod tests {
     }
 
     #[test]
+    fn dom_rect_interfaces_follow_geometry_level_one() {
+        // Geometry Interfaces Module Level 1 §3: constructors/fromRect default
+        // missing dictionary members, readonly and mutable rectangles share
+        // derived edges, and negative dimensions reverse those edges.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const ro = DOMRectReadOnly.fromRect({ x: 5, y: 7, width: -2, height: -3 });
+            const rw = new DOMRect(1, 2, 3, 4);
+            rw.x = 9; rw.height = -6;
+            const json = rw.toJSON();
+            globalThis.domRectResult = [
+                ro.left, ro.top, ro.right, ro.bottom,
+                rw.x, rw.y, rw.width, rw.height, rw.top, rw.bottom,
+                rw instanceof DOMRectReadOnly, SVGRect === DOMRect,
+                Object.prototype.toString.call(ro), Object.prototype.toString.call(rw),
+                json.x, json.bottom, DOMRect.fromRect().width
+            ].join("|");
+            "##,
+            "Geometry Interfaces DOMRect boundary",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "domRectResult"),
+            "3|4|5|7|9|2|3|-6|-4|2|true|true|[object DOMRectReadOnly]|[object DOMRect]|9|2|0"
+        );
+    }
+
+    #[test]
     fn marquee_interface_reflects_timing_and_controls_render_pause_state() {
         let mut engine = platform_engine();
         eval(
