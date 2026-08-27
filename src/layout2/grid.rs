@@ -1348,6 +1348,8 @@ impl Flow<'_> {
             auto: [bool; 4],
             align: AlignItem,
             border_x: f32,
+            content_w: f32,
+            bp_cross: f32,
             /// The item's grid-area width (its containing block — css-grid
             /// §9.1; the §9.4.3 relative-offset percentage basis).
             area_w: f32,
@@ -1364,6 +1366,10 @@ impl Flow<'_> {
             let bp_l = s.border[LEFT] + self.pad(s, LEFT, area_w);
             let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, area_w);
             let bp_h = bp_l + bp_r;
+            let bp_cross = s.border[TOP]
+                + s.border[BOTTOM]
+                + self.pad(s, TOP, area_w)
+                + self.pad(s, BOTTOM, area_w);
             let to_content = |v: f32| {
                 if s.border_box {
                     (v - bp_h).max(0.0)
@@ -1399,6 +1405,8 @@ impl Flow<'_> {
             gitems.push(GItem {
                 it,
                 border_x: area_x + shift + m[LEFT],
+                content_w: w.max(0.0),
+                bp_cross,
                 cross_auto: matches!(s.height, Len::Auto),
                 area_w,
                 frag,
@@ -1452,7 +1460,17 @@ impl Flow<'_> {
             let last = p.rows.end - 1;
             let area_h = (row_y[last] + rows[last].base - area_y).max(0.0);
             if g.align == AlignItem::Stretch && g.cross_auto && !g.auto[TOP] && !g.auto[BOTTOM] {
-                g.frag.h = g.frag.h.max(area_h - g.m[TOP] - g.m[BOTTOM]).max(0.0);
+                // CSS Grid §11.6/Box Alignment §6.2: stretch changes the
+                // grid item's used size. Relayout with that now-definite
+                // content-box height so percentage-height descendants see
+                // the stretched containing block; patching only `frag.h`
+                // leaves their backgrounds and hit regions at the old
+                // intrinsic height.
+                let stretched = (area_h - g.m[TOP] - g.m[BOTTOM] - g.bp_cross).max(0.0);
+                let (frag, anchors) =
+                    self.item_frag(g.it, g.content_w, g.area_w, Some(stretched), inl);
+                g.frag = frag;
+                g.anchors = anchors;
             }
             let extra = area_h - (g.frag.h + g.m[TOP] + g.m[BOTTOM]);
             let shift = super::flow::cross_shift(extra, g.auto[TOP], g.auto[BOTTOM], g.align);

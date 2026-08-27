@@ -2376,7 +2376,23 @@ impl Flow<'_> {
                     if self.scroll_container(it.node) {
                         0.0
                     } else {
-                        let mut v = natural_main;
+                        // Flexbox §4.5 defines the automatic minimum from
+                        // two distinct inputs: the content-size suggestion is
+                        // the min-content block size, while `def_h` is the
+                        // specified-size suggestion that only CAPS it. The
+                        // flex-base probe above laid the item at `def_h`, so
+                        // using that fragment's forced height for both inputs
+                        // makes a percentage-height item unable to shrink.
+                        // Probe its contents with an indefinite block-size;
+                        // cyclic percentage heights then behave as auto, as
+                        // required for intrinsic block sizing.
+                        let mut v = if def_h.is_some() && shrink > 0.0 {
+                            let (content_frag, _) =
+                                self.item_frag_for_content_size(it, w, content_w, inl);
+                            (content_frag.h - bp_main).max(0.0)
+                        } else {
+                            natural_main
+                        };
                         if let Some(sp) = def_h {
                             v = v.min(sp.max(0.0));
                         }
@@ -2666,6 +2682,34 @@ impl Flow<'_> {
         def_h: Option<f32>,
         parent_inl: &InlineStyle,
     ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+        self.item_frag_inner(b, content_w, pct_basis, def_h, parent_inl, true)
+    }
+
+    /// Measure a flex item's content-size suggestion with an indefinite block
+    /// axis. CSS Flexbox §4.5 needs this independently of the preferred main
+    /// size. In particular, a percentage height is cyclic during intrinsic
+    /// block sizing and behaves as auto; a preferred `aspect-ratio` transfer is
+    /// likewise a separate transferred-size suggestion, not content.
+    fn item_frag_for_content_size<'t>(
+        &self,
+        b: &'t BoxNode,
+        content_w: f32,
+        pct_basis: f32,
+        parent_inl: &InlineStyle,
+    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+        self.item_frag_inner(b, content_w, pct_basis, None, parent_inl, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn item_frag_inner<'t>(
+        &self,
+        b: &'t BoxNode,
+        content_w: f32,
+        pct_basis: f32,
+        def_h: Option<f32>,
+        parent_inl: &InlineStyle,
+        transfer_preferred_ratio: bool,
+    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
         let s = &b.style;
         let inl = if b.node == NO_NODE {
             parent_inl.clone()
@@ -2686,13 +2730,16 @@ impl Flow<'_> {
         let def_h = def_h
             .or_else(|| self.iframe_auto_height(b, s, bt, bb))
             .or_else(|| {
-                s.aspect_ratio.map(|ratio| {
-                    if s.border_box {
-                        ((content_w + bp_l + bp_r) / ratio - bt - bb).max(0.0)
-                    } else {
-                        content_w / ratio
-                    }
-                })
+                transfer_preferred_ratio
+                    .then_some(s.aspect_ratio)
+                    .flatten()
+                    .map(|ratio| {
+                        if s.border_box {
+                            ((content_w + bp_l + bp_r) / ratio - bt - bb).max(0.0)
+                        } else {
+                            content_w / ratio
+                        }
+                    })
             });
         let mut cur = Cursor {
             y: bt,

@@ -2153,6 +2153,40 @@ mod tests {
     }
 
     #[test]
+    fn nested_inline_text_moves_with_its_vertically_aligned_parent() {
+        // CSS 2.2 §10.8.1 aligns an inline element's whole aligned subtree.
+        // Flattening the two anchors into independent runs must not leave them
+        // on the baseline while the parent's literal separator moves.
+        let layout = lay_graphical(
+            r##"<body style="margin:0"><p style="margin:0;line-height:40px">
+               <span style="vertical-align:middle"><a href="#a">SIGN UP</a>|<a href="#b">LOG IN</a></span>
+               </p></body>"##,
+            320.0,
+            &HashMap::new(),
+        );
+        let origins: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::DisplayCommand::GlyphRun { origin, shaped, .. }
+                    if ["SIGN", "UP", "|", "LOG", "IN"]
+                        .iter()
+                        .any(|part| shaped.text.contains(part)) =>
+                {
+                    Some(origin.y)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(origins.len() >= 3, "missing toolbar runs: {origins:?}");
+        assert!(
+            origins.iter().all(|y| (*y - origins[0]).abs() < 0.1),
+            "aligned subtree split across baselines: {origins:?}"
+        );
+    }
+
+    #[test]
     fn proportional_advances_decide_graphical_line_wrapping() {
         let style = crate::text::TextStyle::default();
         let narrow = crate::text::shape("iiii iiii", &style).advance;
@@ -2844,6 +2878,98 @@ mod tests {
             geometry.width < 30.0,
             "control must not inherit the surrounding 40px label metrics: {geometry:?}"
         );
+    }
+
+    #[test]
+    fn button_ua_border_box_keeps_its_authored_width() {
+        // WHATWG HTML Rendering §15.5.6: button controls use
+        // `box-sizing: border-box` in the UA style sheet. Padding and borders
+        // therefore fit inside an authored width instead of enlarging the
+        // control (as happened to Archive's compact sort-direction button).
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><button id=sort type=button
+               style="width:30px;padding:7px 8px;border:1px solid">↕</button></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let sort = dom.get_by_id("sort").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 200.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let geometry = layout.boxes.get(&sort).expect("button geometry");
+        assert!((geometry.width - 30.0).abs() < 0.1, "{geometry:?}");
+    }
+
+    #[test]
+    fn checkbox_and_radio_have_one_native_appearance() {
+        // WHATWG HTML Rendering §15.5.10: each checkable input is a single
+        // widget. The graphical glyph is its native appearance; a generic
+        // text-control fill/stroke must not be painted around it.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form>
+               <input id=c type=checkbox><input id=r type=radio name=g>
+               <input id=t type=text>
+               </form></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 200.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let shape_rect = |shape: &crate::render::PaintShape| match shape {
+            crate::render::PaintShape::Rect(rect)
+            | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
+            crate::render::PaintShape::Path(_) => None,
+        };
+        let checkable_has_surface = |node| {
+            let origin = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun {
+                        node: glyph_node,
+                        origin,
+                        ..
+                    } if *glyph_node == node => Some(*origin),
+                    _ => None,
+                });
+            let origin = origin.expect("native checkable glyph");
+            layout.paint.primitives.iter().any(|command| {
+                let rect = match command {
+                    crate::render::DisplayCommand::Fill { shape, .. }
+                    | crate::render::DisplayCommand::Stroke { shape, .. } => shape_rect(shape),
+                    _ => None,
+                };
+                rect.is_some_and(|rect| {
+                    origin.x >= rect.x
+                        && origin.x < rect.x + rect.width
+                        && origin.y >= rect.y
+                        && origin.y < rect.y + rect.height
+                })
+            })
+        };
+        assert!(!checkable_has_surface(dom.get_by_id("c").unwrap()));
+        assert!(!checkable_has_surface(dom.get_by_id("r").unwrap()));
+        assert!(layout.paint.primitives.iter().any(|command| matches!(
+            command,
+            crate::render::DisplayCommand::Fill {
+                brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                    255, 255, 255, 255
+                )),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -4879,6 +5005,43 @@ mod tests {
         let (raf, _) = find(&out, "after");
         assert_eq!(raf, 3, "row height = the tall item");
     }
+
+    #[test]
+    fn stretched_grid_item_relays_definite_height_to_descendants() {
+        // CSS Grid §11.6 and Box Alignment §6.2: after stretch changes an
+        // auto-sized item's used block size, percentage descendants resolve
+        // against that definite size. Archive-style result cards rely on the
+        // inner 100%-height surface filling every equal-height grid item.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><main style="display:grid;grid-template-columns:200px 200px">
+               <article id=tall><div id=tall-fill style="height:100%">a<br>b<br>c</div></article>
+               <article id=short><div id=short-fill style="height:100%">x</div></article>
+               </main></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let geometry = |id| *layout.boxes.get(&dom.get_by_id(id).unwrap()).unwrap();
+        let tall = geometry("tall");
+        let short = geometry("short");
+        let tall_fill = geometry("tall-fill");
+        let short_fill = geometry("short-fill");
+        assert!(
+            (tall.height - short.height).abs() < 0.1,
+            "{tall:?} {short:?}"
+        );
+        assert!(
+            (tall_fill.height - short_fill.height).abs() < 0.1,
+            "stretched descendants diverged: {tall_fill:?} {short_fill:?}"
+        );
+        assert!((short_fill.height - short.height).abs() < 0.1);
+    }
     // ---- the P4 gate: positioned + stacking + paint order + transforms ----
     // (Stacked cards paint with the top card visible, arrows land where
     // written, fixed rails pin, modals cover — Appendix E + cell compositing.)
@@ -5919,6 +6082,47 @@ mod tests {
     }
 
     #[test]
+    fn percentage_height_column_item_shrinks_to_leave_room_for_footer() {
+        // CSS Flexbox §4.5: a non-scroll flex item's automatic minimum is
+        // its content-size suggestion (its min-content main size), capped by
+        // the specified-size suggestion. These are separate measurements.
+        // A `height:100%` details pane therefore has a 225px flex base here,
+        // but only a 175px automatic minimum from its 160px image + 15px
+        // title. It can shrink to 185px and leave the fixed 40px stats footer
+        // inside the card. Treating the specified 225px layout as the content
+        // suggestion pins the details pane at 225px and spills the footer.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0">
+<div id="card" style="display:flex;flex-direction:column;width:220px;height:225px">
+  <div id="details" style="display:flex;flex-direction:column;height:100%">
+    <div style="height:160px;flex-shrink:0"></div>
+    <h3 style="height:15px;margin:0"></h3>
+  </div>
+  <div id="stats" style="height:40px;flex-shrink:0">stats</div>
+</div></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 400.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let card = layout.boxes.get(&node_by_id(&dom, "card")).unwrap();
+        let details = layout.boxes.get(&node_by_id(&dom, "details")).unwrap();
+        let stats = layout.boxes.get(&node_by_id(&dom, "stats")).unwrap();
+        assert!((card.height - 225.0).abs() < 0.1, "{card:?}");
+        assert!((details.height - 185.0).abs() < 0.1, "{details:?}");
+        assert!((stats.top - 185.0).abs() < 0.1, "{stats:?}");
+        assert!(
+            stats.top + stats.height <= card.top + card.height + 0.1,
+            "the stats footer must remain inside its card: {stats:?} in {card:?}"
+        );
+    }
+
+    #[test]
     fn region_seeds_voffset_from_the_scroll_top_signal() {
         // The live serializer bakes data-trust-scroll-top in CSS pixels plus
         // data-trust-node; the terminal adapter quantizes the signal to rows,
@@ -6812,6 +7016,88 @@ mod tests {
     }
 
     #[test]
+    fn graphical_link_descendants_keep_element_pointer_targets() {
+        // Pointer Events target determination starts with the rendered hit-test
+        // target, while DOM dispatch separately walks that target's event path
+        // to choose an ancestor activation target. Text itself does not
+        // generate an element box: glyphs target their generating element, but
+        // an <img> remains its own target. In both cases the inherited link
+        // still identifies the enclosing anchor's default action.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><a id=tile href="/details/item">
+                 <img id=thumb src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+                      width=40 height=30><span id=title>VHS Movies</span>
+               </a></body>"#,
+        );
+        let anchor = node_by_id(&dom, "tile");
+        let image = node_by_id(&dom, "thumb");
+        let title = node_by_id(&dom, "title");
+        dom.set_render_clickables(std::collections::HashSet::from([anchor]), true);
+        let base = Url::parse("https://archive.example/details/collection").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let linked_hits: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::HitRegion(region) if region.link.is_some() => {
+                    Some(region)
+                }
+                _ => None,
+            })
+            .collect();
+        let text_hit = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::HitRegion(region)
+                    if region.node == title
+                        && matches!(region.link,
+                            Some(crate::doc::Link::JsClick { node, ref href })
+                                if node == anchor && href == "/details/item") =>
+                {
+                    Some(region)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("linked text hit region: anchor={anchor} title={title} hits={linked_hits:?}")
+            });
+        assert_eq!(
+            text_hit.actor,
+            Some(title),
+            "glyph hit testing targets the element which generated the text box"
+        );
+
+        let image_hit = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::HitRegion(region)
+                    if region.node == image
+                        && matches!(region.link,
+                            Some(crate::doc::Link::JsClick { node, ref href })
+                                if node == anchor && href == "/details/item") =>
+                {
+                    Some(region)
+                }
+                _ => None,
+            })
+            .expect("linked image hit region");
+        assert_eq!(image_hit.actor, Some(image));
+    }
+
+    #[test]
     fn graphical_text_shadow_retains_front_to_back_layers_without_reflow() {
         let html = r#"<body style="margin:0"><span style="color:rgb(1,2,3);
             text-shadow:rgb(255,255,255) 3px 0 0,
@@ -7405,6 +7691,36 @@ mod tests {
     }
 
     #[test]
+    fn embedded_svg_auto_size_fills_its_definite_flex_viewport() {
+        // SVG 2 Geometry §7.8: `auto` width/height on an `svg` element are
+        // treated as 100%. A viewBox supplies the coordinate transform, not a
+        // 300×150 box that may escape the author's definite icon viewport.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id=viewport
+               style="display:flex;width:12px;height:12px;align-items:center">
+               <svg id=arrows viewBox="0 0 64 100"
+                    style="flex-grow:1;flex-shrink:1;flex-basis:0">
+                 <path d="M0 0h64v100H0z"/>
+               </svg></div></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let viewport = layout.boxes.get(&node_by_id(&dom, "viewport")).unwrap();
+        let arrows = layout.boxes.get(&node_by_id(&dom, "arrows")).unwrap();
+        assert!((viewport.width - 12.0).abs() < 0.1, "{viewport:?}");
+        assert!((viewport.height - 12.0).abs() < 0.1, "{viewport:?}");
+        assert!((arrows.width - 12.0).abs() < 0.1, "{arrows:?}");
+        assert!((arrows.height - 12.0).abs() < 0.1, "{arrows:?}");
+    }
+
+    #[test]
     fn graphical_outside_marker_uses_parent_paint_style_without_a_dom_node() {
         // CSS Display 3 §2.5: an anonymous box inherits through its box-tree
         // parent. The marker remains synthesized (`NO_NODE`) for interaction,
@@ -7541,6 +7857,42 @@ mod tests {
             }
         }
         panic!("expected overflowing direct text in the retained display list");
+    }
+
+    #[test]
+    fn legacy_clip_rect_suppresses_positioned_control_appearance() {
+        // CSS 2.2 §11.1.2: equal rect() edges produce a zero-area clip over
+        // the complete absolutely positioned box. This is the standard
+        // accessible-control idiom used beside a separately painted label.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form>
+               <input id=hidden type=checkbox style="position:absolute;clip:rect(0,0,0,0)">
+               <span>visible</span></form></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 200.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let hidden = dom.get_by_id("hidden").unwrap();
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::GlyphRun { node, clip, .. } if *node == hidden => {
+                    assert!(
+                        clip.is_some_and(|clip| clip.width == 0.0 && clip.height == 0.0),
+                        "hidden control escaped clip: {clip:?}"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("expected the clipped control's retained native glyph");
     }
 
     #[test]

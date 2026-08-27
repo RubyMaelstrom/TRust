@@ -271,6 +271,18 @@ impl BoxStyle {
         // raw `var(--x)` into Len made a valid declaration silently fall back
         // to `auto` (and could leak an intrinsic probe width into layout).
         let cv = |prop: &str| dom.computed_value_resolved(id, prop);
+        // SVG 2 Geometry §7.8: the used `auto` value of width/height on an
+        // `svg` element is 100%. Preserve that percentage in the typed style
+        // so flex/grid and ordinary containing-block resolution size the SVG
+        // viewport before its viewBox maps vector coordinates into it.
+        let size = |prop: &str| {
+            let value = Len::parse_or(cv(prop).as_deref(), u, vp, Len::Auto);
+            if tag == "svg" && matches!(&value, Len::Auto) {
+                Len::parse_or(Some("100%"), u, vp, Len::Auto)
+            } else {
+                value
+            }
+        };
         let side = |prop: &str, i: usize, ua: [f32; 4]| -> Len {
             Len::parse_or(cv(prop).as_deref(), u, vp, Len::px(ua[i]))
         };
@@ -295,10 +307,10 @@ impl BoxStyle {
                 border_side(dom, id, "left", u),
             ],
             outline: outline_of(dom, id, u),
-            width: Len::parse_or(cv("width").as_deref(), u, vp, Len::Auto),
+            width: size("width"),
             min_width: Len::parse_or(cv("min-width").as_deref(), u, vp, Len::Auto),
             max_width: Len::parse_or(cv("max-width").as_deref(), u, vp, Len::None),
-            height: Len::parse_or(cv("height").as_deref(), u, vp, Len::Auto),
+            height: size("height"),
             min_height: Len::parse_or(cv("min-height").as_deref(), u, vp, Len::Auto),
             max_height: Len::parse_or(cv("max-height").as_deref(), u, vp, Len::None),
             aspect_ratio: cv("aspect-ratio")
@@ -989,7 +1001,9 @@ pub(crate) enum VerticalAlign {
     Baseline,
     Top,
     Bottom,
-    Middle,
+    /// Half the parent inline box's x-height. CSS 2.2 §10.8.1 aligns this
+    /// box's midpoint to the parent baseline plus that distance.
+    Middle(f32),
     /// Positive values raise the inline box relative to the baseline.
     Shift(f32),
 }
@@ -1121,19 +1135,27 @@ impl InlineStyle {
                 }
             })
             .unwrap_or(crate::text::CssLineHeight::Normal);
-        // `vertical-align` is not inherited. CSS Inline 3 §4.5 positions the
-        // inline-level box relative to the line box's baseline.
-        s.vertical_align = match dom.computed_value_resolved(id, "vertical-align").as_deref() {
-            Some("top") | Some("text-top") => VerticalAlign::Top,
-            Some("bottom") | Some("text-bottom") => VerticalAlign::Bottom,
-            Some("middle") => VerticalAlign::Middle,
-            Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
-            Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
-            Some(value) => css_length_px(value, u)
-                .map(VerticalAlign::Shift)
-                .unwrap_or_default(),
-            None => VerticalAlign::Baseline,
-        };
+        // `vertical-align` is not inherited, but it positions an inline box's
+        // entire aligned subtree (CSS 2.2 §10.8.1). The IFC flattens nested
+        // inline boxes into pieces, so an undeclared descendant must retain
+        // the enclosing box's accumulated alignment instead of snapping its
+        // text back to the line baseline.
+        if dom.author_declares(id, "vertical-align") {
+            s.vertical_align = match dom.computed_value_resolved(id, "vertical-align").as_deref() {
+                Some("top") | Some("text-top") => VerticalAlign::Top,
+                Some("bottom") | Some("text-bottom") => VerticalAlign::Bottom,
+                // CSS Values defines `ex` from the first available font and
+                // permits 0.5em when no reliable metric is available. Parley does
+                // not currently expose x-height, so retain that specified fallback.
+                Some("middle") => VerticalAlign::Middle(parent.font_size * 0.25),
+                Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
+                Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
+                Some(value) => css_length_px(value, u)
+                    .map(VerticalAlign::Shift)
+                    .unwrap_or_default(),
+                None => VerticalAlign::Baseline,
+            };
+        }
         let wb = dom
             .computed_value_resolved(id, "word-break")
             .map(|v| v.trim().to_ascii_lowercase());

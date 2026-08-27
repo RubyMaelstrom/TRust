@@ -1484,6 +1484,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .iter()
             .map(|p| match p.vertical_align {
                 VerticalAlign::Shift(rise) => p.ascent + rise,
+                VerticalAlign::Middle(half_x) => p.box_height / 2.0 - half_x,
                 _ => p.ascent,
             })
             .fold(strut.baseline, f32::max);
@@ -1491,6 +1492,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .iter()
             .map(|p| match p.vertical_align {
                 VerticalAlign::Shift(rise) => p.descent - rise,
+                VerticalAlign::Middle(half_x) => p.box_height / 2.0 + half_x,
                 _ => p.descent,
             })
             .fold((strut.line_height - strut.baseline).max(0.0), f32::max);
@@ -1502,7 +1504,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 VerticalAlign::Shift(rise) => baseline - p.ascent - rise,
                 VerticalAlign::Top => 0.0,
                 VerticalAlign::Bottom => (height - p.box_height).max(0.0),
-                VerticalAlign::Middle => ((height - p.box_height) / 2.0).max(0.0),
+                VerticalAlign::Middle(half_x) => baseline + half_x - p.box_height / 2.0,
             };
         }
         // The pen is the line's used extent. A contain-fitted replaced box
