@@ -2751,6 +2751,14 @@ impl Dom {
             return self.cascaded(id, name);
         };
         let inherited = PROPS[idx].inherited;
+        // HTML Rendering §15.5.13 supplies `overflow:hidden !important` for
+        // marquee viewports. This UA-important declaration outranks author
+        // overflow on every axis and keeps only the animated contents clipped.
+        if self.tag_name(id) == Some("marquee")
+            && matches!(name, "overflow" | "overflow-x" | "overflow-y")
+        {
+            return Some(String::from("hidden"));
+        }
         if inherited && let Some(hit) = self.computed_cache_get(id, idx) {
             return hit;
         }
@@ -3771,6 +3779,18 @@ impl Dom {
             .collect()
     }
 
+    /// Text of author `<style>` sheets in document order. CSS Fonts 4 §4.1
+    /// makes `@font-face` resources available from every stylesheet in the
+    /// document, not only externally linked sheets; the HTTP preload phase
+    /// uses this before the resident actor starts so first layout can shape
+    /// with inline-declared web fonts.
+    pub(crate) fn inline_stylesheets(&self) -> Vec<String> {
+        self.descendants(DOCUMENT)
+            .filter(|&id| self.tag_name(id) == Some("style"))
+            .map(|id| self.text_content(id))
+            .collect()
+    }
+
     /// Attach fetched `<link rel=stylesheet>` bodies (keyed by the raw
     /// href attribute) to their link elements; the cascade reads them
     /// scope-aware like any `<style>`. ONE document walk collects the
@@ -4130,10 +4150,10 @@ impl Dom {
     /// The `<body>` of an iframe's nested document, when the JS prelude has
     /// realized one (a same-origin scripted/`srcdoc` frame builds an
     /// `<html><head><body>` subtree under the `<iframe>`; see
-    /// `FrameDocument`). The serializers flow this body inline so the frame's
-    /// content lays out as a normal block instead of the RAWTEXT the HTML
-    /// parser otherwise makes of `<iframe>` children. `None` for an empty or
-    /// cross-origin (never-loaded) frame.
+    /// `FrameDocument`). The serializers retain an equivalent body formatting
+    /// box inside the frame viewport instead of putting these nodes back under
+    /// an `<iframe>`, whose children the HTML parser treats as RAWTEXT. `None`
+    /// for an unrealized or cross-origin frame.
     pub fn frame_body(&self, id: NodeId) -> Option<NodeId> {
         let html = self
             .child_iter(id)
@@ -4159,11 +4179,49 @@ impl Dom {
                 })
                 .unwrap_or_else(|| fallback.to_string())
         };
-        format!(
-            "display:{display};width:{};height:{};overflow:hidden;",
-            dimension("width", "width", "300px"),
-            dimension("height", "height", "150px")
-        )
+        // HTML §4.8.5 makes the iframe the container for a distinct content
+        // navigable; CSS Display therefore gives the replaced viewport and the
+        // child document separate boxes. Keep every authored outer-box
+        // declaration (notably position/inset/z-index for player overlays),
+        // then normalize only the replacement div's display, used dimensions,
+        // and viewport clip. Dropping those outer declarations made fixed
+        // frames participate in parent flow.
+        let mut style = self.attr(id, "style").unwrap_or("").to_string();
+        append_style(&mut style, &self.baked_element_style(id, false));
+        append_style(
+            &mut style,
+            &format!(
+                "display:{display};width:{};height:{};overflow:hidden;",
+                dimension("width", "width", "300px"),
+                dimension("height", "height", "150px")
+            ),
+        );
+        style
+    }
+
+    /// Style for the presentation wrapper that stands in for a nested
+    /// document's `<body>`. CSS Display 3 §2 says an element's inner display
+    /// type selects the formatting context for its descendants, so serializing
+    /// only the body's children is not equivalent: it loses flex/grid/block
+    /// layout, alignment, sizing, overflow, and the inherited style context.
+    fn serialized_frame_body_style(&self, body: NodeId) -> String {
+        let mut style = self.attr(body, "style").unwrap_or("").to_string();
+        // The child <html> cannot be emitted inside the parent document, but
+        // inherited values that reached <body> through it still belong to the
+        // child document's styling context. Materialize those values here.
+        append_style(&mut style, &self.baked_element_style(body, true));
+        style
+    }
+
+    fn write_serialized_frame_body_open(&self, body: NodeId, out: &mut String) {
+        out.push_str("<div data-trust-frame-body=\"\"");
+        let style = self.serialized_frame_body_style(body);
+        if !style.is_empty() {
+            out.push_str(" style=\"");
+            out.push_str(&escape_attr(&style));
+            out.push('"');
+        }
+        out.push('>');
     }
 
     /// Load `html` as an iframe's nested document (the HTML "navigate an
@@ -5114,24 +5172,23 @@ impl Dom {
                 if matches!(tag, "script" | "noscript" | "style") || self.is_hidden(id) {
                     return;
                 }
-                // An iframe/frame with realized same-origin content: flow the
-                // nested document's body inline as a block, so the re-parse
-                // lays it out normally instead of as the RAWTEXT the HTML
-                // parser makes of <iframe> children. Empty/cross-origin frames
-                // emit nothing (unchanged).
+                // An iframe/frame is a replaced viewport for a distinct child
+                // navigable (HTML §4.8.5). Preserve that outer box even before
+                // content realizes, and preserve the nested BODY as a separate
+                // formatting box when it does. Putting BODY's children directly
+                // in the viewport loses its display/flex/alignment semantics.
                 if matches!(tag, "iframe" | "frame") {
+                    out.push_str("<div data-trust-frame=\"\" style=\"");
+                    out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
+                    out.push_str("\">");
                     if let Some(body) = self.frame_body(id) {
-                        let mut kids = self.child_iter(body).peekable();
-                        if kids.peek().is_some() {
-                            out.push_str("<div data-trust-frame=\"\" style=\"");
-                            out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
-                            out.push_str("\">");
-                            for c in kids {
-                                self.serialize_node_inner(c, host, keep_template, out);
-                            }
-                            out.push_str("</div>");
+                        self.write_serialized_frame_body_open(body, out);
+                        for c in self.child_iter(body) {
+                            self.serialize_node_inner(c, None, keep_template, out);
                         }
+                        out.push_str("</div>");
                     }
+                    out.push_str("</div>");
                     return;
                 }
                 // <slot> inside a shadow tree: project the host's light
@@ -5218,23 +5275,24 @@ impl Dom {
         if matches!(tag, "script" | "noscript" | "template" | "style") || self.is_hidden(id) {
             return;
         }
-        // iframe/frame nested-document content flows inline as a block (see the
-        // static serializer + `frame_body`): scripted/`srcdoc` frame content
-        // renders, RAWTEXT re-parse is avoided, empty/cross-origin frames emit
-        // nothing.
+        // Retain the iframe's replaced viewport and the nested document BODY as
+        // distinct boxes (see the static serializer + `frame_body`). This also
+        // keeps an empty/unrealized iframe's normal replaced-element footprint.
         if matches!(tag, "iframe" | "frame") {
+            out.push_str("<div data-trust-frame=\"\" style=\"");
+            out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
+            out.push_str("\">");
             if let Some(body) = self.frame_body(id) {
-                let mut kids = self.child_iter(body).peekable();
-                if kids.peek().is_some() {
-                    out.push_str("<div data-trust-frame=\"\" style=\"");
-                    out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
-                    out.push_str("\">");
-                    for c in kids {
-                        self.serialize_live_node(c, host, clickable, in_anchor, out);
-                    }
-                    out.push_str("</div>");
+                self.write_serialized_frame_body_open(body, out);
+                for c in self.child_iter(body) {
+                    // A child navigable starts a new document/tree scope. It
+                    // cannot inherit a shadow host or anchor context from the
+                    // element that embeds it in the parent document.
+                    self.serialize_live_node(c, None, clickable, false, out);
                 }
+                out.push_str("</div>");
             }
+            out.push_str("</div>");
             return;
         }
         if tag == "slot"
@@ -5506,42 +5564,7 @@ impl Dom {
         // inline style. `display:none` is dropped outright (never baked, see the
         // skip below); `visibility:hidden` IS kept + baked now (paint
         // suppression, Phase 2) so the re-parse paints it blank.
-        let mut bake = String::new();
-        for prop in PROPS.iter().filter(|p| p.baked).map(|p| p.name) {
-            if let Some(v) = self
-                .cascaded(id, prop)
-                .and_then(|value| self.resolve_pending_shorthand(id, prop, &value))
-            {
-                if prop == "display" && v == "none" {
-                    continue;
-                }
-                // Resolve `var(--x, …)` to the defined custom-property value
-                // now, while the stylesheets (and so the `--x` definitions) are
-                // still here — the re-parsed layout arena has neither.
-                let v = self.resolve_vars(id, &v);
-                // An undefined `var()` with no fallback resolves to nothing —
-                // don't bake an empty declaration.
-                if v.trim().is_empty() {
-                    continue;
-                }
-                bake.push_str(prop);
-                bake.push(':');
-                bake.push_str(&escape_attr(&v));
-                bake.push(';');
-            }
-        }
-        // CSS Color 4 §3.3 requires opacity to be applied to the element as a
-        // composited group. The resident DOM owns the external sheets, while a
-        // native frontend re-parses this snapshot without them, so preserve the
-        // exact computed alpha rather than reducing it to a visible/hidden bit.
-        // This also materializes `var()` substitution while custom-property
-        // definitions are still available. `effective_opacity` folds in the
-        // limited fill-mode animation state supported by this engine.
-        if self.cascaded(id, "opacity").is_some() {
-            bake.push_str("opacity:");
-            bake.push_str(&self.effective_opacity(id).to_string());
-            bake.push(';');
-        }
+        let bake = self.baked_element_style(id, false);
         let mut style_done = false;
         for a in attrs {
             let name: &str = &a.name.local;
@@ -5555,7 +5578,7 @@ impl Dom {
                 if !value.trim().is_empty() && !value.trim_end().ends_with(';') {
                     out.push(';');
                 }
-                out.push_str(&bake);
+                out.push_str(&escape_attr(&bake));
                 style_done = true;
             } else if name == "style" {
                 style_done = true;
@@ -5564,7 +5587,7 @@ impl Dom {
         }
         if !bake.is_empty() && !style_done {
             out.push_str(" style=\"");
-            out.push_str(&bake);
+            out.push_str(&escape_attr(&bake));
             out.push('"');
         }
         // Bake generated content (the layout arena has no `<style>` to
@@ -5610,6 +5633,50 @@ impl Dom {
         if self.has_clearing_pseudo(id) {
             out.push_str(" data-trust-clearfix=\"\"");
         }
+    }
+
+    /// The declarations that must cross from the resident cascade into the
+    /// stylesheet-free presentation arena. `materialize_inherited` is used for
+    /// a nested document BODY because its HTML ancestor cannot survive the
+    /// parent-document HTML reparse; normal elements retain inheritance through
+    /// their serialized ancestors and therefore bake only direct winners.
+    fn baked_element_style(&self, id: NodeId, materialize_inherited: bool) -> String {
+        let mut bake = String::new();
+        for definition in PROPS.iter().filter(|definition| definition.baked) {
+            let prop = definition.name;
+            let value = if materialize_inherited && definition.inherited {
+                self.computed_value_resolved(id, prop)
+            } else {
+                self.cascaded(id, prop)
+                    .and_then(|value| self.resolve_pending_shorthand(id, prop, &value))
+                    .map(|value| self.resolve_vars(id, &value))
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            if prop == "display" && value == "none" {
+                continue;
+            }
+            // An undefined `var()` with no fallback resolves to nothing — do
+            // not bake an empty declaration.
+            if value.trim().is_empty() {
+                continue;
+            }
+            bake.push_str(prop);
+            bake.push(':');
+            bake.push_str(&value);
+            bake.push(';');
+        }
+        // CSS Color 4 §3.3 requires opacity to be applied to the element as a
+        // composited group. Preserve the exact computed alpha rather than
+        // reducing it to a visible/hidden bit. `effective_opacity` also folds
+        // in the limited fill-mode animation state supported by this engine.
+        if self.cascaded(id, "opacity").is_some() {
+            bake.push_str("opacity:");
+            bake.push_str(&self.effective_opacity(id).to_string());
+            bake.push(';');
+        }
+        bake
     }
 
     /// Serialize the pseudo-element's own tracked declarations for the
@@ -6256,6 +6323,16 @@ fn escape_text(s: &str) -> Cow<'_, str> {
             .replace('<', "&lt;")
             .replace('>', "&gt;"),
     )
+}
+
+fn append_style(style: &mut String, declarations: &str) {
+    if declarations.is_empty() {
+        return;
+    }
+    if !style.trim().is_empty() && !style.trim_end().ends_with(';') {
+        style.push(';');
+    }
+    style.push_str(declarations);
 }
 
 fn escape_attr(s: &str) -> Cow<'_, str> {
@@ -7855,7 +7932,9 @@ fn ua_display(tag: &str) -> &'static str {
         "caption" => "table-caption",
         "colgroup" => "table-column-group",
         "col" => "table-column",
-        "button" | "input" | "select" | "textarea" | "meter" | "progress" => "inline-block",
+        "button" | "input" | "select" | "textarea" | "meter" | "progress" | "marquee" => {
+            "inline-block"
+        }
         "head" | "title" | "meta" | "link" | "style" | "script" | "base" | "noscript"
         | "template" | "source" | "track" | "datalist" => "none",
         _ => "inline",
@@ -9491,7 +9570,118 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     } else {
         normalize_css_value(v)
     };
+    // CSSOM §6.7.1 parses a declaration value against the property's grammar
+    // before it can enter a declaration block. CSS Values 4 §6 permits a
+    // unitless <number> as a <length> only when it is zero. In particular,
+    // `element.style.height = window.innerHeight` passes a string such as
+    // "768" to CSSStyleDeclaration; that assignment is invalid and must not
+    // override a valid stylesheet height. Keep this inexpensive grammar guard
+    // at the declaration boundary, where both inline and sheet declarations
+    // get the same fallback/cascade behavior.
+    if property_rejects_unitless_nonzero_length(&k)
+        && split_top_level_ws(&value)
+            .into_iter()
+            .any(is_bare_nonzero_css_number)
+    {
+        return None;
+    }
     Some((k, value, important))
+}
+
+/// Properties whose bare numeric components are lengths, never numbers.
+/// Functional tokens stay intact under `split_top_level_ws`, so numbers inside
+/// `calc()`/color functions are left to those grammars rather than mistaken
+/// for top-level lengths. Keep the corresponding CSSStyleDeclaration guard in
+/// `js_platform.js` aligned with this list.
+fn property_rejects_unitless_nonzero_length(property: &str) -> bool {
+    matches!(
+        property,
+        "width"
+            | "min-width"
+            | "max-width"
+            | "height"
+            | "min-height"
+            | "max-height"
+            | "inline-size"
+            | "min-inline-size"
+            | "max-inline-size"
+            | "block-size"
+            | "min-block-size"
+            | "max-block-size"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "margin-inline"
+            | "margin-block"
+            | "margin-inline-start"
+            | "margin-inline-end"
+            | "margin-block-start"
+            | "margin-block-end"
+            | "padding"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "padding-inline"
+            | "padding-block"
+            | "padding-inline-start"
+            | "padding-inline-end"
+            | "padding-block-start"
+            | "padding-block-end"
+            | "inset"
+            | "inset-inline"
+            | "inset-block"
+            | "inset-inline-start"
+            | "inset-inline-end"
+            | "inset-block-start"
+            | "inset-block-end"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "gap"
+            | "row-gap"
+            | "column-gap"
+            | "column-width"
+            | "flex-basis"
+            | "font-size"
+            | "letter-spacing"
+            | "word-spacing"
+            | "text-indent"
+            | "vertical-align"
+            | "border-width"
+            | "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width"
+            | "border-radius"
+            | "border-top-left-radius"
+            | "border-top-right-radius"
+            | "border-bottom-right-radius"
+            | "border-bottom-left-radius"
+            | "outline-width"
+            | "outline-offset"
+            | "background-position"
+            | "background-size"
+            | "object-position"
+            | "transform-origin"
+            | "translate"
+            | "box-shadow"
+            | "text-shadow"
+    )
+}
+
+fn is_bare_nonzero_css_number(value: &str) -> bool {
+    let value = value.trim_matches(|c: char| c == ',' || c == '/').trim();
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+        && value
+            .parse::<f64>()
+            .is_ok_and(|number| number.is_finite() && number != 0.0)
 }
 
 fn normalize_css_value(value: &str) -> String {
@@ -12927,6 +13117,114 @@ mod tests {
             !html2.contains("HELLO FRAME"),
             "stale content kept: {html2}"
         );
+    }
+
+    #[test]
+    fn frame_snapshot_keeps_outer_position_and_child_body_formatting_context() {
+        // HTML §4.8.5 keeps the iframe viewport separate from its content
+        // navigable. CSS Display 3 §2 and Flexbox §3 require the child BODY's
+        // own display type to continue governing its children. This is the
+        // stylesheet-neutral form of the SCM-player + Burgeritchi regression:
+        // the fixed frame used to enter parent flow, while BODY's flex box was
+        // discarded and its centered shell became a left-aligned block.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><iframe id=frame
+               style="position:fixed;inset:0;width:100%;height:100%;z-index:99"></iframe>
+               <p id=after style="margin:0">after</p></body>"#,
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<html style="font-family:serif"><head><style>
+               body{display:flex;flex-direction:column;align-items:center;
+                    min-height:100vh;margin:0}
+               </style></head><body><main id=shell style="width:400px">centered</main></body></html>"#,
+            "https://frame.test/",
+        )
+        .unwrap();
+
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(html.contains("data-trust-frame"), "{html}");
+        assert!(html.contains("data-trust-frame-body"), "{html}");
+
+        let snapshot = Dom::parse_document(&html);
+        let outer = snapshot
+            .descendants(DOCUMENT)
+            .find(|&id| snapshot.attr(id, "data-trust-frame").is_some())
+            .expect("serialized iframe viewport");
+        let body = snapshot
+            .child_iter(outer)
+            .find(|&id| snapshot.attr(id, "data-trust-frame-body").is_some())
+            .expect("serialized child body formatting box");
+        assert_eq!(
+            snapshot
+                .computed_value_resolved(outer, "position")
+                .as_deref(),
+            Some("fixed")
+        );
+        assert_eq!(snapshot.effective_display(body).as_deref(), Some("flex"));
+        assert_eq!(
+            snapshot
+                .computed_value_resolved(body, "flex-direction")
+                .as_deref(),
+            Some("column")
+        );
+        assert_eq!(
+            snapshot
+                .computed_value_resolved(body, "align-items")
+                .as_deref(),
+            Some("center")
+        );
+        assert_eq!(
+            snapshot
+                .computed_value_resolved(body, "font-family")
+                .as_deref(),
+            Some("serif"),
+            "inherited child-document style must not leak or disappear at the flattening boundary"
+        );
+    }
+
+    #[test]
+    fn unitless_nonzero_length_declaration_is_invalid_and_does_not_win_cascade() {
+        // CSS Values 4 §6 makes only zero a unit-optional <length>; CSSOM
+        // §6.7.1 therefore drops `height:518` before cascade resolution. SCM
+        // Music Player assigns `iframe.style.height = window.innerHeight`
+        // without "px". Browsers retain the valid stylesheet's 100% height;
+        // accepting the number as px froze TRust's outer page frame at the
+        // actor's early viewport measurement and clipped the lower document.
+        let dom = Dom::parse_document(
+            r#"<style>#frame{height:100%;margin-left:7px}</style><body>
+               <iframe id=frame style="height:518;margin:2 3px;width:0"></iframe>
+               </body>"#,
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(frame, "height").as_deref(),
+            Some("100%"),
+            "invalid inline height must not mask the valid stylesheet declaration"
+        );
+        assert_eq!(
+            dom.computed_value_resolved(frame, "margin-left").as_deref(),
+            Some("7px"),
+            "one unitless nonzero component invalidates the whole shorthand"
+        );
+        assert_eq!(
+            dom.computed_value_resolved(frame, "width").as_deref(),
+            Some("0"),
+            "unitless zero remains a valid length"
+        );
+    }
+
+    #[test]
+    fn unrealized_iframe_snapshot_keeps_replaced_element_footprint() {
+        let dom = Dom::parse_document(
+            r#"<body><iframe id=frame width=420 height=180></iframe><span>after</span></body>"#,
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        let html = dom.serialize(frame);
+        assert!(html.contains("data-trust-frame"), "{html}");
+        assert!(html.contains("width:420px"), "{html}");
+        assert!(html.contains("height:180px"), "{html}");
     }
 
     #[test]

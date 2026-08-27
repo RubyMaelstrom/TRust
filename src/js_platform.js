@@ -139,8 +139,9 @@
     // which resets the cache (setLocParts; the `<base>` guards in setAttribute/
     // removeAttribute and the child-mutation methods). `null` = (re)compute; any
     // real resolved base is a non-null string (so "" stays a valid cache hit).
-    // NOT tracked (self-heals on the next navigation, both vanishingly rare): a
-    // `<base>` injected via innerHTML, or a case-variant setAttribute("HREF").
+    // Bulk HTML insertion invalidates the cache as a whole because parsing can
+    // insert a <base> below an arbitrary target, and the HTML attribute setter
+    // already invalidates for case variants.
     let baseHrefCache = null;
     // HTML §7.2.2: Window.frameElement is a readonly IDL attribute whose
     // getter derives the value from the current browsing context. Keep that
@@ -899,6 +900,37 @@
         if (!parsed) return;
         const url = parsed[0];
         if (frame.__loadedSrc === url) return; // already navigated to this src
+        // HTML §7.4.2.3.2: a javascript: URL navigates by running its decoded
+        // classic-script source in the target navigable. A normal completion
+        // whose value is a string replaces the active document with that HTML;
+        // other completions leave the active document in place. Navigation
+        // initiated by the script itself (for example location.replace(...))
+        // is picked up by the ordinary queued src-attribute navigation below.
+        if (/^javascript:/i.test(url)) {
+            if (frameAncestorHasUrl(frame, url)) return;
+            frame.__loadedSrc = url;
+            const oldSrc = src;
+            let result = null;
+            try {
+                result = runInFrame(frame, function () {
+                    const encoded = String(url).slice("javascript:".length);
+                    let source = encoded;
+                    try { source = decodeURIComponent(encoded); } catch (e) {}
+                    try { return (0, eval)(source); }
+                    catch (e) {
+                        trust.errors.push("frame javascript URL: " + ((e && e.message) || e));
+                        return null;
+                    }
+                });
+            } catch (e) {
+                trust.errors.push("frame javascript URL: " + ((e && e.message) || e));
+            }
+            if (typeof result === "string" && frame.getAttribute("src") === oldSrc) {
+                loadFrameMarkup(frame, result, frameBaseURL(frame), frameURLFor(frame));
+            }
+            fireFrameLoad(frame);
+            return;
+        }
         // Only http(s) navigables are fetchable here (about:/data:/blob: render
         // nothing for now — a documented deviation).
         if (!/^https?:/i.test(url)) { frame.__loadedSrc = undefined; return; }
@@ -1704,6 +1736,10 @@
             const n = this.nodeType;
             return n === 3 ? "#text" : n === 9 ? "#document" : n === 8 ? "#comment" : n === 11 ? "#document-fragment" : "#node";
         }
+        // DOM §4.4 Node.baseURI: every node reports the serialized document
+        // base URL of its node document. The page scope's baseHref() follows
+        // HTML's document-base algorithm, including the first <base href>.
+        get baseURI() { return baseHref(); }
         get parentNode() { return wrap(__dom_parent(this.__id)); }
         get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
         get childNodes() { return __dom_children(this.__id).map(wrap); }
@@ -1918,6 +1954,44 @@
         };
     }
     const kebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+    // CSS Values 4 §6: a non-zero <length> requires a unit. CSSOM §6.7.1
+    // parses a value against the property's grammar before mutating its
+    // declaration block, so `el.style.height = 768` is ignored rather than
+    // becoming 768px. This is intentionally the same property family guarded
+    // by Rust's declaration parser: script and authored CSS must cascade alike.
+    const unitlessNonzeroLengthProperties = new Set([
+        "width", "min-width", "max-width", "height", "min-height", "max-height",
+        "inline-size", "min-inline-size", "max-inline-size",
+        "block-size", "min-block-size", "max-block-size",
+        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+        "margin-inline", "margin-block", "margin-inline-start", "margin-inline-end",
+        "margin-block-start", "margin-block-end",
+        "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "padding-inline", "padding-block", "padding-inline-start", "padding-inline-end",
+        "padding-block-start", "padding-block-end",
+        "inset", "inset-inline", "inset-block", "inset-inline-start", "inset-inline-end",
+        "inset-block-start", "inset-block-end", "top", "right", "bottom", "left",
+        "gap", "row-gap", "column-gap", "column-width", "flex-basis", "font-size",
+        "letter-spacing", "word-spacing", "text-indent", "vertical-align",
+        "border-width", "border-top-width", "border-right-width", "border-bottom-width",
+        "border-left-width", "border-radius", "border-top-left-radius",
+        "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
+        "outline-width", "outline-offset", "background-position", "background-size",
+        "object-position", "transform-origin", "translate", "box-shadow", "text-shadow"
+    ]);
+    const bareNonzeroCssNumber = (token) => {
+        token = token.replace(/^[,/]|[,/]$/g, "").trim();
+        return /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(token)
+            && Number(token) !== 0;
+    };
+    const acceptsStyleValue = (property, value) => {
+        property = String(property).toLowerCase();
+        value = String(value).trim();
+        if (!unitlessNonzeroLengthProperties.has(property)) return true;
+        // Parenthesized function tokens are not split, so their internal
+        // scalar numbers are handled by the function grammar.
+        return !value.split(/\s+/).some(bareNonzeroCssNumber);
+    };
     // el.style is backed by the REAL style attribute: writes are DOM
     // mutations (dirty bit, serialized, visibility honored). CSSOM §6.6.1's
     // declaration-block creation/attribute-change steps keep ONE parsed block
@@ -1935,7 +2009,11 @@
             const m = Object.create(null);
             for (const part of raw.split(";")) {
                 const i = part.indexOf(":");
-                if (i > 0) m[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim();
+                if (i > 0) {
+                    const key = part.slice(0, i).trim().toLowerCase();
+                    const value = part.slice(i + 1).trim();
+                    if (acceptsStyleValue(key, value)) m[key] = value;
+                }
             }
             parsedRaw = raw;
             parsedMap = m;
@@ -1965,7 +2043,12 @@
             get(_, p) {
                 if (typeof p !== "string") return undefined;
                 if (p === "cssText") return el.getAttribute("style") || "";
-                if (p === "setProperty") return (k, v) => { const m = parse(); m[String(k).toLowerCase()] = String(v); write(m); };
+                if (p === "setProperty") return (k, v) => {
+                    const m = parse(), key = String(k).toLowerCase(), value = String(v);
+                    if (!value) delete m[key];
+                    else if (acceptsStyleValue(key, value)) m[key] = value;
+                    write(m);
+                };
                 if (p === "getPropertyValue") return (k) => parse()[String(k).toLowerCase()] || "";
                 if (p === "removeProperty") return (k) => { const m = parse(); const key = String(k).toLowerCase(); const v = m[key] || ""; delete m[key]; write(m); return v; };
                 if (p === "length") return Object.keys(parse()).length;
@@ -1981,7 +2064,7 @@
                 const m = parse();
                 const key = kebab(p);
                 if (v === "" || v === null || v === undefined) delete m[key];
-                else m[key] = String(v);
+                else if (acceptsStyleValue(key, v)) m[key] = String(v);
                 write(m);
                 return true;
             },
@@ -2502,6 +2585,7 @@
         set innerHTML(v) {
             if (!MO.length) {
                 __dom_set_inner_html(this.__id, String(v));
+                baseHrefCache = null;
                 if (CE.defs.size) ceScan(this);
                 slotQueueCheck(this);
                 // HTML §4.8.6: innerHTML insertion still processes iframe
@@ -2512,6 +2596,7 @@
             }
             const removed = this.childNodes;
             __dom_set_inner_html(this.__id, String(v));
+            baseHrefCache = null;
             moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
             slotQueueCheck(this);
@@ -2558,12 +2643,14 @@
             const container = (p === "beforebegin" || p === "afterend") ? this.parentNode : this;
             if (!MO.length || !container) {
                 __dom_insert_adjacent(this.__id, p, String(h));
+                baseHrefCache = null;
                 if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
                 queueFrameNavigationsIn(container || this);
                 return;
             }
             const before = new Set(container.childNodes.map((k) => k.__id));
             __dom_insert_adjacent(this.__id, p, String(h));
+            baseHrefCache = null;
             const added = container.childNodes.filter((k) => !before.has(k.__id));
             moChildBulk(container, [], added);
             if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
@@ -3369,6 +3456,59 @@
         }
     }
 
+    // Obsolete but required by HTML §16.3.1. The rendering layer samples the
+    // same page-relative clock from these internal pause markers, so stop()
+    // freezes at the current step and start() resumes without counting the
+    // paused interval.
+    class HTMLMarqueeElement extends HTMLElement {
+        get behavior() { return this.getAttribute("behavior") || ""; }
+        set behavior(v) { this.setAttribute("behavior", String(v)); }
+        get bgColor() { return this.getAttribute("bgcolor") || ""; }
+        set bgColor(v) { this.setAttribute("bgcolor", String(v)); }
+        get direction() { return this.getAttribute("direction") || ""; }
+        set direction(v) { this.setAttribute("direction", String(v)); }
+        get height() { return this.getAttribute("height") || ""; }
+        set height(v) { this.setAttribute("height", String(v)); }
+        get width() { return this.getAttribute("width") || ""; }
+        set width(v) { this.setAttribute("width", String(v)); }
+        get hspace() { return Math.max(0, Number(this.getAttribute("hspace")) || 0) >>> 0; }
+        set hspace(v) { this.setAttribute("hspace", String(Number(v) >>> 0)); }
+        get vspace() { return Math.max(0, Number(this.getAttribute("vspace")) || 0) >>> 0; }
+        set vspace(v) { this.setAttribute("vspace", String(Number(v) >>> 0)); }
+        get scrollAmount() {
+            const n = Number(this.getAttribute("scrollamount"));
+            return Number.isFinite(n) && n >= 0 ? n >>> 0 : 6;
+        }
+        set scrollAmount(v) { this.setAttribute("scrollamount", String(Number(v) >>> 0)); }
+        get scrollDelay() {
+            const n = Number(this.getAttribute("scrolldelay"));
+            return Number.isFinite(n) && n >= 0 ? n >>> 0 : 85;
+        }
+        set scrollDelay(v) { this.setAttribute("scrolldelay", String(Number(v) >>> 0)); }
+        get trueSpeed() { return this.hasAttribute("truespeed"); }
+        set trueSpeed(v) { if (v) this.setAttribute("truespeed", ""); else this.removeAttribute("truespeed"); }
+        get loop() {
+            const n = Number(this.getAttribute("loop"));
+            return Number.isInteger(n) && n >= 1 ? n : -1;
+        }
+        set loop(v) {
+            const n = Number(v);
+            if (Number.isInteger(n) && (n > 0 || n === -1)) this.setAttribute("loop", String(n));
+        }
+        start() {
+            const stopped = Number(this.getAttribute("data-trust-marquee-stopped"));
+            if (!Number.isFinite(stopped) || stopped < 0) return;
+            const now = currentTime() / 1000;
+            const total = Number(this.getAttribute("data-trust-marquee-paused-total")) || 0;
+            this.setAttribute("data-trust-marquee-paused-total", String(Math.max(0, total + now - stopped)));
+            this.removeAttribute("data-trust-marquee-stopped");
+        }
+        stop() {
+            if (this.hasAttribute("data-trust-marquee-stopped")) return;
+            this.setAttribute("data-trust-marquee-stopped", String(currentTime() / 1000));
+        }
+    }
+
     // wrap() dispatches a node id (type 1) to its interface class by tag. The map
     // is memoized (localName is immutable, so a class only resolves once); an
     // interface with no specialized class falls back to the generic HTMLElement.
@@ -3422,14 +3562,32 @@
         set(v) { this.setAttribute(attr, String(v)); },
         configurable: true, enumerable: false,
     });
-    // The HTMLHyperlinkElementUtils URL decomposition (origin is read-only; the
-    // others have no-op setters — we don't rebuild href from a part). `i` is a
-    // function parameter so the getter never captures a block-scoped loop local
-    // (trap #6 hygiene).
+    // HTML §4.6.3: URL component getters reinitialize the hyperlink URL from
+    // its href content attribute, and component setters run the corresponding
+    // URL state-override parser before updating href. `i` is a function
+    // parameter so the getter never captures a block-scoped loop local (trap
+    // #6 hygiene). An href-less hyperlink has a null URL: protocol is ":" and
+    // the other decomposition members are empty; setters are no-ops.
     function urlPartDesc(i, readOnly) {
         const d = { configurable: true, enumerable: false,
-            get() { const u = __url_parse(this.getAttribute("href") || "", baseHref()); return u ? u[i] : ""; } };
-        if (!readOnly) d.set = function () {};
+            get() {
+                const raw = this.getAttribute("href");
+                if (raw === null) return i === 1 ? ":" : "";
+                const u = __url_parse(raw, baseHref());
+                return u ? u[i] : (i === 1 ? ":" : "");
+            } };
+        if (!readOnly) {
+            d.set = function (value) {
+                const raw = this.getAttribute("href");
+                if (raw === null) return;
+                const u = __url_parse(raw, baseHref());
+                if (!u) return;
+                const updated = __url_set(u[0], [
+                    "", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin",
+                ][i], String(value));
+                if (updated) this.setAttribute("href", updated[0]);
+            };
+        }
         return d;
     }
     function installUrlParts(Cls) {
@@ -3509,6 +3667,35 @@
         const attr = frame.getAttribute(axis);
         if (attr !== null && /^\s*\d+\s*$/.test(attr)) return +attr.trim();
         return axis === "width" ? 300 : 150;
+    }
+    // Last viewport size observed for each nested navigable. CSSOM View §13.1
+    // runs resize steps for every Document whose own viewport changed,
+    // including when an iframe's dimensions change. TRust multiplexes those
+    // Window objects through one realm, so this per-frame state is also what
+    // lets a top-level resize target each logical Window exactly once.
+    const frameViewportSizes = new WeakMap();
+    function rememberFrameViewport(frame, width, height) {
+        frameViewportSizes.set(frame, [width, height]);
+    }
+    function fireChangedFrameViewportResizes() {
+        let frames = [];
+        try { frames = g.document.querySelectorAll("iframe, frame"); } catch (e) { return; }
+        // Document order visits an embedding frame before frames in its child
+        // document. A parent handler may resize a nested iframe (SCM Player's
+        // outer resize handler does exactly that), so the child's dimensions
+        // are sampled only after that parent callback has completed.
+        for (let i = 0; i < frames.length; i++) {
+            const frame = frames[i];
+            if (!frame.__frameUrl) continue;
+            const width = frameViewportDimension(frame, "width");
+            const height = frameViewportDimension(frame, "height");
+            const old = frameViewportSizes.get(frame);
+            rememberFrameViewport(frame, width, height);
+            if (!old || (old[0] === width && old[1] === height)) continue;
+            runInFrame(frame, function () {
+                dispatch(g, new Event("resize"), false);
+            });
+        }
     }
     function mediaQueryListForViewport(query, viewport) {
         const q = String(query);
@@ -3705,6 +3892,10 @@
         get cookie() { return __cookie_get(); }
         set cookie(v) { __cookie_set(String(v)); }
         get location() { return g.location; }
+        // HTML §2.4.3: the document base URL is used by relative URL APIs,
+        // including new URL("_framework/dotnet.js", document.baseURI).
+        // document.URL is the document URL and may differ when <base> exists.
+        get baseURI() { return baseHref(); }
         // The document's origin domain. Spec returns the origin's effective
         // domain (the host); a terminal browser has no frames, so the host IS
         // the domain. The setter is the legacy same-origin relaxation — store
@@ -3903,8 +4094,8 @@
         get prerendering() { return false; }
         get wasDiscarded() { return false; }
         get visibilityStates() { return ["visible"]; }
-        write(s) { const host = this.body || this.documentElement; if (host) host.insertAdjacentHTML("beforeend", String(s)); }
-        writeln(s) { this.write(s + "\n"); }
+        write(...text) { documentWrite(this, text, false); }
+        writeln(...text) { documentWrite(this, text, true); }
         open() {} close() {}
     }
 
@@ -3953,11 +4144,18 @@
         get location() { return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location; }
         get URL() { return this.location.href; }
         get documentURI() { return this.location.href; }
+        // Parent-side access must use this child document's base rather than
+        // the currently active page scope.
+        get baseURI() { return frameBaseURL(this.__frame); }
         get implementation() { return wrap(0).implementation; }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
         open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
-        write(s) { this.body.insertAdjacentHTML("beforeend", String(s)); }
-        writeln(s) { this.write(s + "\n"); }
+        get currentScript() {
+            const script = typeof trust.currentScript === "number" ? wrap(trust.currentScript) : null;
+            return script && frameOwnerForNode(script) === this.__frame ? script : null;
+        }
+        write(...text) { documentWrite(this, text, false); }
+        writeln(...text) { documentWrite(this, text, true); }
         close() {}
         // These constructors must route to the canonical top document. While
         // a child scope is active, the bare `document` binding is THIS
@@ -4003,6 +4201,43 @@
             n = p;
         }
         return null;
+    }
+    // WHATWG HTML §8.4.3 `document.write()` inserts its string into the
+    // parser's input stream immediately before the insertion point. TRust has
+    // already materialized the source tree when it executes parser-created
+    // scripts, so retain the equivalent DOM cursor: immediately after the
+    // current script and before the source node that originally followed it.
+    // Advancing the cursor to the last inserted node preserves input-stream
+    // order across repeated writes, including writes that produce text and
+    // multiple sibling elements. Dynamically-created scripts have no parser
+    // insertion point (`__trustForceAsync` is their creation-time marker), so
+    // they retain the existing graceful append behavior until document.open's
+    // script-created parser is modeled in full.
+    function documentWrite(doc, values, lineFeed) {
+        let markup = "";
+        for (const value of values) markup += String(value);
+        if (lineFeed) markup += "\n";
+
+        const rawCurrent = trust.currentScript;
+        const script = typeof rawCurrent === "number" ? wrap(rawCurrent) : null;
+        const ownerFrame = doc instanceof FrameDocument ? doc.__frame : null;
+        if (script && script.localName === "script" && script.__trustForceAsync !== true &&
+            frameOwnerForNode(script) === ownerFrame && script.parentNode) {
+            const parent = script.parentNode;
+            let cursor = typeof script.__trustWriteCursor === "number"
+                ? wrap(script.__trustWriteCursor) : script;
+            if (!cursor || cursor.parentNode !== parent) cursor = script;
+            const sourceSuccessor = cursor.nextSibling;
+            cursor.insertAdjacentHTML("afterend", markup);
+            let tail = cursor;
+            while (tail.nextSibling && tail.nextSibling !== sourceSuccessor)
+                tail = tail.nextSibling;
+            script.__trustWriteCursor = tail.__id;
+            return;
+        }
+
+        const host = doc.body || doc.documentElement;
+        if (host) host.insertAdjacentHTML("beforeend", markup);
     }
     function frameURLFor(frame) {
         return frame && frame.__frameUrl ? String(frame.__frameUrl) : "about:blank";
@@ -4238,6 +4473,7 @@
         const frameLocation = makeFrameLocation(frame, parentLocation);
         const frameWidth = frameViewportDimension(frame, "width");
         const frameHeight = frameViewportDimension(frame, "height");
+        rememberFrameViewport(frame, frameWidth, frameHeight);
         Object.defineProperty(g, "location", {
             configurable: true, enumerable: true,
             get() { return frameLocation; },
@@ -5195,6 +5431,7 @@
     g.HTMLTemplateElement = HTMLTemplateElement; g.HTMLMetaElement = HTMLMetaElement;
     g.HTMLStyleElement = HTMLStyleElement; g.HTMLLinkElement = HTMLLinkElement;
     g.HTMLDialogElement = HTMLDialogElement;
+    g.HTMLMarqueeElement = HTMLMarqueeElement;
     // The rest of the standard HTML element interface zoo. Browsers expose a
     // constructor for every element kind; boot code patches their prototypes
     // and feature-detects them (YouTube's kevlar reads bare `HTMLTemplateElement`,
@@ -5206,7 +5443,7 @@
     for (const __n of ["Area","Audio","BR","Base","Body","Canvas","Data","DataList",
         "Details","Dialog","Div","DList","Embed","FieldSet","Heading","Head","HR",
         "Html","IFrame","Label","Legend","LI","Link","Map","Media","Menu","Meta",
-        "Meter","Mod","Object","OList","OptGroup","Option","Output","Paragraph",
+        "Marquee","Meter","Mod","Object","OList","OptGroup","Option","Output","Paragraph",
         "Param","Picture","Pre","Progress","Quote","Slot","Source","Span","Style",
         "TableCaption","TableCell","TableCol","Table","TableRow","TableSection",
         "Template","Time","Title","Track","UList","Unknown","Video"]) {
@@ -6458,6 +6695,12 @@
         g.innerWidth = w; g.innerHeight = h;
         try { dispatch(g, new Event("resize"), false); }
         catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        // CSSOM View §13.1 applies independently to every Document viewport.
+        // Dispatch in frame scope so the shared realm restores that frame's
+        // document/inner dimensions and filters Window listeners by their
+        // registration browsing context.
+        try { fireChangedFrameViewportResizes(); }
+        catch (e) { trust.errors.push("frame resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         // The viewport changed, so every element's box may have — deliver
         // ResizeObserver (a responsive grid re-columns) before intersections.
         trust.updateResizes();
@@ -7399,37 +7642,154 @@
         encode(s) {
             return __text_encode(String(s === undefined ? "" : s));
         }
+        encodeInto(s, destination) {
+            s = String(s === undefined ? "" : s);
+            if (!(destination instanceof Uint8Array)) {
+                throw new TypeError("TextEncoder.encodeInto destination must be a Uint8Array");
+            }
+            let read = 0, written = 0;
+            while (read < s.length) {
+                const first = s.charCodeAt(read);
+                let codePoint = first, units = 1;
+                if (first >= 0xd800 && first <= 0xdbff) {
+                    const second = read + 1 < s.length ? s.charCodeAt(read + 1) : 0;
+                    if (second >= 0xdc00 && second <= 0xdfff) {
+                        codePoint = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+                        units = 2;
+                    } else {
+                        codePoint = 0xfffd;
+                    }
+                } else if (first >= 0xdc00 && first <= 0xdfff) {
+                    codePoint = 0xfffd;
+                }
+                const needed = codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+                if (written + needed > destination.byteLength) break;
+                if (needed === 1) {
+                    destination[written++] = codePoint;
+                } else if (needed === 2) {
+                    destination[written++] = 0xc0 | (codePoint >> 6);
+                    destination[written++] = 0x80 | (codePoint & 0x3f);
+                } else if (needed === 3) {
+                    destination[written++] = 0xe0 | (codePoint >> 12);
+                    destination[written++] = 0x80 | ((codePoint >> 6) & 0x3f);
+                    destination[written++] = 0x80 | (codePoint & 0x3f);
+                } else {
+                    destination[written++] = 0xf0 | (codePoint >> 18);
+                    destination[written++] = 0x80 | ((codePoint >> 12) & 0x3f);
+                    destination[written++] = 0x80 | ((codePoint >> 6) & 0x3f);
+                    destination[written++] = 0x80 | (codePoint & 0x3f);
+                }
+                read += units;
+            }
+            return { read, written };
+        }
     };
     g.TextDecoder = class TextDecoder {
-        constructor(label) {
-            const l = String(label === undefined ? "utf-8" : label).toLowerCase();
-            if (l !== "utf-8" && l !== "utf8" && l !== "unicode-1-1-utf-8") throw new RangeError("TextDecoder: only utf-8 is supported");
+        // Encoding §4.2 and §7.2: labels are ASCII-case-insensitive and the
+        // UTF-16 labels select the corresponding endian decoder. UTF-16 has
+        // no encoder in the standard, but its decoder is required by deployed
+        // web content (including .NET's WebAssembly bootstrap).
+        constructor(label, options) {
+            const l = String(label === undefined ? "utf-8" : label).trim().toLowerCase();
+            const utf8 = ["unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8", "x-unicode20utf8"];
+            if (utf8.indexOf(l) >= 0) this.__encoding = "utf-8";
+            else if (l === "unicodefffe" || l === "utf-16be") this.__encoding = "utf-16be";
+            else if (["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"].indexOf(l) >= 0) this.__encoding = "utf-16le";
+            else throw new RangeError("The encoding label is invalid");
+            this.__fatal = !!(options && options.fatal);
+            this.__ignoreBOM = !!(options && options.ignoreBOM);
+            this.__doNotFlush = false;
+            this.__pendingBytes = [];
+            this.__pendingHigh = null;
+            this.__bomSeen = false;
         }
-        get encoding() { return "utf-8"; }
-        decode(input) {
-            if (input === undefined) return "";
-            const b = input instanceof Uint8Array ? input
-                : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
-                : new Uint8Array(input);
-            let out = "", i = 0;
-            while (i < b.length) {
-                const x = b[i];
-                let c, n;
-                if (x < 0x80) { c = x; n = 0; }
-                else if ((x & 0xe0) === 0xc0) { c = x & 31; n = 1; }
-                else if ((x & 0xf0) === 0xe0) { c = x & 15; n = 2; }
-                else if ((x & 0xf8) === 0xf0) { c = x & 7; n = 3; }
-                else { out += "�"; i += 1; continue; }
-                if (i + n >= b.length) { out += "�"; i += 1; continue; }
-                let ok = true;
-                for (let k = 1; k <= n; k++) {
-                    if ((b[i + k] & 0xc0) !== 0x80) { ok = false; break; }
-                    c = (c << 6) | (b[i + k] & 63);
-                }
-                if (!ok) { out += "�"; i += 1; continue; }
-                out += String.fromCodePoint(c);
-                i += n + 1;
+        get encoding() { return this.__encoding; }
+        get fatal() { return this.__fatal; }
+        get ignoreBOM() { return this.__ignoreBOM; }
+        decode(input, options) {
+            const stream = !!(options && options.stream);
+            if (!this.__doNotFlush) {
+                this.__pendingBytes = [];
+                this.__pendingHigh = null;
+                this.__bomSeen = false;
             }
+            this.__doNotFlush = stream;
+            let b;
+            if (input === undefined) b = new Uint8Array(0);
+            else if (input instanceof ArrayBuffer) b = new Uint8Array(input);
+            else if (ArrayBuffer.isView(input)) b = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+            else b = new Uint8Array(input);
+            if (this.__pendingBytes.length) {
+                const joined = new Uint8Array(this.__pendingBytes.length + b.length);
+                joined.set(this.__pendingBytes); joined.set(b, this.__pendingBytes.length); b = joined;
+                this.__pendingBytes = [];
+            }
+            if (this.__encoding === "utf-8") {
+                let out = "", i = 0;
+                if (!this.__ignoreBOM && !this.__bomSeen && b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) i = 3;
+                this.__bomSeen = true;
+                while (i < b.length) {
+                    const x = b[i];
+                    let c, n;
+                    if (x < 0x80) { c = x; n = 0; }
+                    else if ((x & 0xe0) === 0xc0) { c = x & 31; n = 1; }
+                    else if ((x & 0xf0) === 0xe0) { c = x & 15; n = 2; }
+                    else if ((x & 0xf8) === 0xf0) { c = x & 7; n = 3; }
+                    else { if (this.__fatal) throw new TypeError("The encoded data was not valid"); out += "�"; i += 1; continue; }
+                    if (i + n >= b.length) {
+                        if (stream) { this.__pendingBytes = Array.from(b.slice(i)); break; }
+                        if (this.__fatal) throw new TypeError("The encoded data was not valid");
+                        out += "�"; i += 1; continue;
+                    }
+                    let ok = true;
+                    for (let k = 1; k <= n; k++) {
+                        if ((b[i + k] & 0xc0) !== 0x80) { ok = false; break; }
+                        c = (c << 6) | (b[i + k] & 63);
+                    }
+                    if (!ok || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff) || (n === 1 && c < 0x80) || (n === 2 && c < 0x800) || (n === 3 && c < 0x10000)) {
+                        if (this.__fatal) throw new TypeError("The encoded data was not valid");
+                        out += "�"; i += 1; continue;
+                    }
+                    out += String.fromCodePoint(c); i += n + 1;
+                }
+                return out;
+            }
+
+            let orderLE = this.__encoding === "utf-16le", offset = 0;
+            if (!this.__bomSeen && b.length >= 2) {
+                if (b[0] === 0xfe && b[1] === 0xff) orderLE = false;
+                else if (b[0] === 0xff && b[1] === 0xfe) orderLE = true;
+                if (!this.__ignoreBOM && ((orderLE && b[0] === 0xff && b[1] === 0xfe) || (!orderLE && b[0] === 0xfe && b[1] === 0xff))) offset = 2;
+                this.__bomSeen = true;
+            }
+            let danglingByte = false;
+            if (((b.length - offset) & 1) !== 0) {
+                if (stream) {
+                    this.__pendingBytes = [b[b.length - 1]];
+                    b = b.slice(0, b.length - 1);
+                } else {
+                    if (this.__fatal) throw new TypeError("The encoded data was not valid");
+                    danglingByte = true;
+                    b = b.slice(0, b.length - 1);
+                }
+            }
+            let out = "", high = this.__pendingHigh;
+            const error = () => { if (this.__fatal) throw new TypeError("The encoded data was not valid"); out += "�"; };
+            if (danglingByte) error();
+            for (let i = offset; i < b.length; i += 2) {
+                const u = orderLE ? b[i] | (b[i + 1] << 8) : (b[i] << 8) | b[i + 1];
+                if (high !== null) {
+                    if (u >= 0xdc00 && u <= 0xdfff) { out += String.fromCodePoint(0x10000 + ((high - 0xd800) << 10) + u - 0xdc00); high = null; continue; }
+                    error(); high = null;
+                }
+                if (u >= 0xd800 && u <= 0xdbff) high = u;
+                else if (u >= 0xdc00 && u <= 0xdfff) error();
+                else out += String.fromCharCode(u);
+            }
+            if (high !== null) {
+                if (stream) this.__pendingHigh = high;
+                else { error(); this.__pendingHigh = null; }
+            } else this.__pendingHigh = null;
             return out;
         }
     };
@@ -9622,7 +9982,12 @@
                 return;
             }
             this.status = r[0]; this.__ctype = r[1];
-            this.__text = r[2] == null ? "" : r[2]; this.__bytes = r[3] != null ? r[3] : null;
+            this.__text = r[2] == null ? "" : r[2];
+            // Keep XHR's internal response body as a byte view. The host Fetch
+            // result is an ArrayBuffer so it can cross the realm boundary
+            // without stale typed-array bookkeeping; XHR's byte sequence is
+            // exposed through Array.from() and response consumers via this view.
+            this.__bytes = r[3] != null ? __bodyBytes(r[3]) : null;
             this.__hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
             if (this.__hdrs && this.__ctype && this.__hdrs["content-type"] === undefined) this.__hdrs["content-type"] = this.__ctype;
             this.__respObj = undefined; this.__respXML = undefined;
@@ -9806,12 +10171,13 @@
     // object (js-api), so reading the same export twice — and (Stage 6) a
     // funcref round-tripped through a Table/Global — yields the same function.
     const funcWrappers = new Map();
-    function exportedFunction(funcId) {
+    function exportedFunction(funcId, arity) {
         let f = funcWrappers.get(funcId);
         if (f) return f;
         f = function () {
             return unwrap(__wasm_call_export(funcId, Array.prototype.slice.call(arguments)));
         };
+        Object.defineProperty(f, "length", { value: Number.isFinite(arity) ? arity : 0 });
         Object.defineProperty(f, "__wasmFunc", { value: funcId });
         funcWrappers.set(funcId, f);
         return f;
@@ -10001,7 +10367,7 @@
                 kind = flat[i + 1],
                 sub = flat[i + 2],
                 auxiliaryType = flat[i + 3];
-            if (kind === "function") exports[name] = exportedFunction(sub);
+            if (kind === "function") exports[name] = exportedFunction(sub, Number(auxiliaryType));
             else if (kind === "global") exports[name] = makeGlobal(sub);
             else if (kind === "memory") exports[name] = makeMemory(sub);
             else if (kind === "table") exports[name] = makeTable(sub, auxiliaryType);

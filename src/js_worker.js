@@ -262,6 +262,39 @@
     TextEncoder.prototype.encode = function (s) {
         return __text_encode(String(s === undefined ? "" : s));
     };
+    TextEncoder.prototype.encodeInto = function (s, destination) {
+        s = String(s === undefined ? "" : s);
+        if (!(destination instanceof Uint8Array)) throw new TypeError("TextEncoder.encodeInto destination must be a Uint8Array");
+        var read = 0, written = 0;
+        while (read < s.length) {
+            var first = s.charCodeAt(read), cp = first, units = 1;
+            if (first >= 0xd800 && first <= 0xdbff) {
+                var second = read + 1 < s.length ? s.charCodeAt(read + 1) : 0;
+                if (second >= 0xdc00 && second <= 0xdfff) {
+                    cp = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+                    units = 2;
+                } else cp = 0xfffd;
+            } else if (first >= 0xdc00 && first <= 0xdfff) cp = 0xfffd;
+            var needed = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            if (written + needed > destination.byteLength) break;
+            if (needed === 1) destination[written++] = cp;
+            else if (needed === 2) {
+                destination[written++] = 0xc0 | (cp >> 6);
+                destination[written++] = 0x80 | (cp & 0x3f);
+            } else if (needed === 3) {
+                destination[written++] = 0xe0 | (cp >> 12);
+                destination[written++] = 0x80 | ((cp >> 6) & 0x3f);
+                destination[written++] = 0x80 | (cp & 0x3f);
+            } else {
+                destination[written++] = 0xf0 | (cp >> 18);
+                destination[written++] = 0x80 | ((cp >> 12) & 0x3f);
+                destination[written++] = 0x80 | ((cp >> 6) & 0x3f);
+                destination[written++] = 0x80 | (cp & 0x3f);
+            }
+            read += units;
+        }
+        return { read: read, written: written };
+    };
     function TextDecoder(label) { this.encoding = (label || "utf-8").toLowerCase(); this.fatal = false; }
     TextDecoder.prototype.decode = function (buf) {
         if (!buf) return "";

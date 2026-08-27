@@ -2007,7 +2007,7 @@ pub async fn execute_js_for_device(
             }
         }
     }
-    install_stylesheet_fonts(&sheets, &response.url).await;
+    install_stylesheet_fonts(&html, &sheets, &response.url).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = crate::js::BlobMap::default();
@@ -2709,22 +2709,37 @@ fn css_block_end(css: &str, open: usize) -> Option<usize> {
     None
 }
 
-async fn install_stylesheet_fonts(sheets: &[(String, String)], page_url: &Url) {
-    let mut faces = sheets
+fn document_font_faces(
+    html: &str,
+    sheets: &[(String, String)],
+    page_url: &Url,
+) -> Vec<(String, Vec<Url>)> {
+    // CSS Fonts 4 §4.1 defines downloadable faces from the complete set of
+    // sheets belonging to the document. Inline style URLs use the document
+    // base URL; external-sheet URLs were made absolute against their own sheet
+    // by `expand_stylesheet_imports` before reaching this point.
+    let document_base = base_with_doc_base(html, page_url);
+    let inline = crate::dom::Dom::parse_document(html).inline_stylesheets();
+    inline
         .iter()
-        .flat_map(|(_, css)| stylesheet_font_faces(css))
+        .chain(sheets.iter().map(|(_, css)| css))
+        .flat_map(|css| stylesheet_font_faces(css))
         .filter_map(|face| {
             let sources = face
                 .sources
                 .into_iter()
-                .filter_map(|source| page_url.join(&source).ok())
+                .filter_map(|source| document_base.join(&source).ok())
                 .filter(|url| {
                     matches!(url.scheme(), "http" | "https") && subresource_allowed(page_url, url)
                 })
                 .collect::<Vec<_>>();
             (!sources.is_empty()).then_some((face.family, sources))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_url: &Url) {
+    let mut faces = document_font_faces(html, sheets, page_url);
     faces.truncate(MAX_PAGE_WEB_FONTS);
     let fonts = futures::stream::iter(faces.into_iter().map(|(family, sources)| async move {
         // CSS Fonts 4 §4.3.3: try external references in specified order and
@@ -2796,7 +2811,7 @@ async fn css_only_with_sheets(
     sheets: Vec<(String, String)>,
 ) -> Response {
     let html = decode_body(&response.content_type, &response.body);
-    install_stylesheet_fonts(&sheets, &response.url).await;
+    install_stylesheet_fonts(&html, &sheets, &response.url).await;
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url).await;
     // The frame documents are fetched up front into a url→content map (Dom is
@@ -4562,6 +4577,35 @@ mod tests {
     }
 
     #[test]
+    fn document_font_faces_include_inline_sheets_and_use_each_css_base() {
+        let page = Url::parse("https://example.test/path/page.html").unwrap();
+        let html = "<base href='/assets/'><style>\
+                    @font-face{font-family:Inline;src:url(fonts/inline.ttf)}\
+                    </style>";
+        // External sheets have already passed through
+        // `expand_stylesheet_imports`, which absolutizes their URL tokens
+        // against the stylesheet URL rather than the document base.
+        let sheets = vec![(
+            "../css/site.css".into(),
+            "@font-face{font-family:External;\
+             src:url(https://cdn.example.test/fonts/external.woff2)}"
+                .into(),
+        )];
+        let faces = document_font_faces(html, &sheets, &page);
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces[0].0, "Inline");
+        assert_eq!(
+            faces[0].1[0].as_str(),
+            "https://example.test/assets/fonts/inline.ttf"
+        );
+        assert_eq!(faces[1].0, "External");
+        assert_eq!(
+            faces[1].1[0].as_str(),
+            "https://cdn.example.test/fonts/external.woff2"
+        );
+    }
+
+    #[test]
     fn discovers_css_background_image_urls_for_eager_fetch() {
         let base = Url::parse("https://example.test/path/").unwrap();
         let document = parse(
@@ -5530,16 +5574,16 @@ mod tests {
         let response = fetch(&Request::get(url)).await.unwrap();
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
-        // Cross-document navigation runs in parallel and completes as a later task. An actor may
-        // expose the parsed parent as its first rendering opportunity, so wait for the canonical
-        // frame projection instead of assuming it must be folded into that first paint.
-        if !body.contains("data-trust-frame") {
+        // Cross-document navigation runs in parallel and completes as a later task. The parsed
+        // parent already contains the iframe's replaced viewport before that navigation realizes,
+        // so wait for the CHILD BODY projection rather than merely its outer frame marker.
+        if !body.contains("INNER FRAME BODY") {
             let live = response
                 .live
                 .as_mut()
                 .expect("initial frame navigation keeps the page live");
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            while !body.contains("data-trust-frame") && std::time::Instant::now() < deadline {
+            while !body.contains("INNER FRAME BODY") && std::time::Instant::now() < deadline {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 match tokio::time::timeout(left, live.events.recv()).await {
                     Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
