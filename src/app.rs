@@ -375,7 +375,7 @@ struct DecodedImage {
     raw: std::sync::Arc<[u8]>,
     intrinsic: (u32, u32),
     /// Whether the raster has real transparency (mirrored into `image_alpha`
-    /// for layout's overlap compositor — LAYOUT_OVERHAUL_PLAN.md P8). SVG and
+    /// for layout's overlap compositor — layout2 architecture P8). SVG and
     /// opaque rasters are `false`, so they never trigger a composite group.
     has_alpha: bool,
 }
@@ -545,7 +545,7 @@ thread_local! {
 /// increments it per image; the run loop reads+resets it after each draw.
 pub(crate) static IMG_RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A live scroll region's retained state (INCREMENTAL_LAYOUT_PLAN.md §14): the
+/// A live scroll region's retained state (incremental-layout contract §14): the
 /// last patch fragment HTML (so the region can be re-laid in place — on an image
 /// decode, or to refresh it from current content after a full re-render) plus the
 /// per-child row cache that makes that re-lay O(changed messages). The region's
@@ -667,7 +667,7 @@ pub struct App {
     /// the same offset isn't re-sent and the page's `scroll` handler fires only
     /// on a real move. Cleared with the live page. (Phase 3 inner scroll.)
     region_scroll_sent: std::collections::HashMap<usize, usize>,
-    /// Per-region live state (INCREMENTAL_LAYOUT_PLAN.md §14 — the inner-scroll
+    /// Per-region live state (incremental-layout contract §14 — the inner-scroll
     /// de-lag), keyed by the actor node id so it survives the per-message re-parse
     /// AND a full re-render: the last patch FRAGMENT HTML + the memoized child-row
     /// cache. The cache lets a region patch reuse the laid rows of every unchanged
@@ -684,12 +684,12 @@ pub struct App {
     pending_decoded_urls: Vec<String>,
     /// The set of live clipped-region actor nodes last sent to the page actor
     /// (`PageCmd::LiveRegions`), so it patches a mutation ONLY when confined to a
-    /// real region (INCREMENTAL_LAYOUT_PLAN.md §4b). Re-sent only when it changes.
+    /// real region (incremental-layout contract §4b). Re-sent only when it changes.
     live_regions_sent: std::collections::HashSet<usize>,
     /// The set of cached inline IFC-boundary actor nodes last sent to the page
     /// actor (`PageCmd::LiveBoundaries`, the `Doc.boundaries` node set), so it
     /// proposes a general inline patch ONLY when the app has the box cached
-    /// (INCREMENTAL_LAYOUT_PLAN.md §14). Re-sent only when it changes.
+    /// (incremental-layout contract §14). Re-sent only when it changes.
     live_boundaries_sent: std::collections::HashSet<usize>,
     /// A page-script dispatch is in flight (drives the loading heart).
     page_busy: bool,
@@ -802,7 +802,7 @@ pub struct App {
     /// accumulated cache could outweigh the patch itself.
     image_sizes: crate::layout2::ImageSizes,
     /// URL→`has_alpha` mirror of `image_cache` (same insert-only sync), threaded
-    /// into layout so the overlap compositor (LAYOUT_OVERHAUL_PLAN.md P8) groups
+    /// into layout so the overlap compositor (layout2 architecture P8) groups
     /// only genuinely-transparent overlaps. An absent entry means "opaque / not
     /// yet decoded" — no grouping, the always-correct default.
     image_alpha: std::collections::HashMap<String, bool>,
@@ -1367,7 +1367,7 @@ impl App {
             self.sync_live_regions();
             // Tell the actor which inline IFC boundaries the app has cached, so
             // it proposes a general inline patch only when the box is splice-able
-            // (INCREMENTAL_LAYOUT_PLAN.md §14). Diffed.
+            // (incremental-layout contract §14). Diffed.
             self.sync_live_boundaries();
         }
         Ok(())
@@ -4142,7 +4142,7 @@ impl App {
 
     /// Tell the page actor which scroll boxes are CURRENTLY clipped regions (the
     /// live nodes of `Doc.regions`), so it patches a mutation ONLY when confined
-    /// to a real region (INCREMENTAL_LAYOUT_PLAN.md §4b). A box whose content
+    /// to a real region (incremental-layout contract §4b). A box whose content
     /// fits (no `Region`) is NOT included, so a mutation inside it takes the full
     /// path — never a failed patch + resync. Re-sent only when the set changes.
     fn sync_live_regions(&mut self) {
@@ -4172,7 +4172,7 @@ impl App {
     /// Tell the page actor which inline IFC boundaries the app has cached as
     /// splice-able boxes (the `Doc.boundaries` node set), so it proposes a
     /// general inline `Patched` ONLY when the box is in this set
-    /// (INCREMENTAL_LAYOUT_PLAN.md §14). A boundary the app hasn't cached (it
+    /// (incremental-layout contract §14). A boundary the app hasn't cached (it
     /// overlapped a region/carousel, or hasn't been captured yet) takes the full
     /// path — never a failed patch + resync. Re-sent only when the set changes.
     fn sync_live_boundaries(&mut self) {
@@ -4287,7 +4287,7 @@ impl App {
     /// engine, leaving whatever has rendered frozen on screen. It never
     /// closes the browser or drops to the telnet terminal; when nothing is
     /// loading and no engine is alive it's a no-op — you stay on the page.
-    /// (A Boa run already executing on a worker thread finishes its current
+    /// (A backend run already executing on a worker thread finishes its current
     /// budget window in the background — there's no mid-run cancel into the
     /// engine — but the UI stops waiting at once and the resident page actor
     /// is dropped, which ends it.)
@@ -4810,7 +4810,7 @@ impl App {
         self.start_image_loads(url, image_urls);
     }
 
-    /// Apply one incremental-layout patch (INCREMENTAL_LAYOUT_PLAN.md): re-lay
+    /// Apply one incremental-layout patch (incremental-layout contract): re-lay
     /// ONLY the boundary's subtree and splice it back, leaving the rest of the
     /// document untouched. Two arms: a live scroll `Region` swaps its buffer
     /// (Tier 1, structurally row-count-invariant); a general inline IFC boundary
@@ -4983,7 +4983,7 @@ impl App {
         true
     }
 
-    /// The general inline arm of `patch_live_doc` (INCREMENTAL_LAYOUT_PLAN.md §14):
+    /// The general inline arm of `patch_live_doc` (incremental-layout contract §14):
     /// re-lay a block-filling IFC boundary's subtree and splice its rows into
     /// `Doc.rows` at the cached box. The boundary fills its containing block, so
     /// its width is stable; only its HEIGHT can change. Tier 1 (height unchanged)
@@ -5043,7 +5043,7 @@ impl App {
         if laid.has_subframes {
             return false;
         }
-        // Width verify (INCREMENTAL_LAYOUT_PLAN.md §14 step 4.3). A SUB-BOX (flex/
+        // Width verify (incremental-layout contract §14 step 4.3). A SUB-BOX (flex/
         // grid item, inline-block) is content-sized: if its width CHANGED it
         // reshaped its siblings, so the in-place row splice is no longer valid →
         // resync (strict). A block-filling box fills its band regardless of
@@ -9386,7 +9386,7 @@ mod tests {
 
     #[test]
     fn a_region_patch_swaps_only_the_buffer_leaving_doc_rows_untouched() {
-        // INCREMENTAL_LAYOUT_PLAN.md Tier 1: a patch re-lays ONLY the region's
+        // incremental-layout contract Tier 1: a patch re-lays ONLY the region's
         // buffer; the document rows (the fixed band + everything outside) are
         // untouched, so nothing on the page moves.
         let mut app = region_app_with_node(None);
@@ -9439,7 +9439,7 @@ mod tests {
 
     #[test]
     fn an_inline_boundary_patch_splices_like_a_full_relayout() {
-        // INCREMENTAL_LAYOUT_PLAN.md §9/§14 (the splice-level differential): a
+        // incremental-layout contract §9/§14 (the splice-level differential): a
         // grown inline IFC boundary patched into Doc.rows is byte-for-byte the
         // same as a FULL re-layout of the mutated page — the patched box's rows
         // replace the old ones, and content OUTSIDE (HEADER above, FOOTER below)
@@ -9521,7 +9521,7 @@ mod tests {
 
     #[test]
     fn an_inline_boundary_tier1_patch_leaves_outside_rows_identical() {
-        // INCREMENTAL_LAYOUT_PLAN.md §14 Tier 1: a content change that keeps the
+        // incremental-layout contract §14 Tier 1: a content change that keeps the
         // box's HEIGHT splices in place — every row OUTSIDE the boundary is
         // byte-identical (nothing shifts).
         let mut app = super::App::new(None, 23);
@@ -9586,7 +9586,7 @@ mod tests {
 
     // IGNORED under the P9 flip (2026-07-07): layout2 (now the default engine)
     // does NOT emit sub-box (flex/grid-ITEM) boundaries — a documented v1 cut
-    // (see LAYOUT_OVERHAUL_PLAN.md P7: such a mutation takes the always-correct
+    // (see layout2 architecture P7: such a mutation takes the always-correct
     // full-relayout path instead of a Tier-2 splice). This is a perf deferral,
     // not a correctness gap; the whole test body is preserved to re-enable when
     // the incremental-layout arc adds sub-box boundaries to layout2. (Can't A/B
@@ -9595,7 +9595,7 @@ mod tests {
     #[test]
     #[ignore = "layout2 defers sub-box (flex/grid-item) boundaries — incremental-layout arc"]
     fn a_sub_box_boundary_patch_splices_like_a_full_relayout() {
-        // INCREMENTAL_LAYOUT_PLAN.md §14 (the widening): a flex-COLUMN ITEM (a
+        // incremental-layout contract §14 (the widening): a flex-COLUMN ITEM (a
         // sub-box, re-laid with subtree_root) that grows is patched into Doc.rows
         // byte-for-byte the same as a full re-layout — the sibling flex item below
         // it ("after") and the FOOTER are identity-shifted, never re-laid.

@@ -1118,8 +1118,9 @@ mod desktop {
         install_host_boundary(&mut engine);
 
         // HTML NavigatorID: navigator.userAgent exposes the environment settings object's default
-        // User-Agent value. Keep that identical to the HTTP client and Boa realm; the selected JS
-        // implementation is not a distinct user agent or an observable browser capability.
+        // User-Agent value. Keep that identical to the HTTP client and the
+        // selected JS realm; the engine implementation is not a distinct
+        // user agent or an observable browser capability.
         let config = format!(
             "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
             json_string(base.as_str()),
@@ -2100,7 +2101,7 @@ mod desktop {
     }
 
     /// Preserve the actor's retained-boundary protocol while the production frontends consume
-    /// complete typed layouts. This follows the same conservative rule as the Boa actor: every
+    /// complete typed layouts. This follows the same conservative rule as the other actor: every
     /// concrete dirty target must fit a confirmed patchable boundary, otherwise full rendering is
     /// the always-correct fallback.
     #[cfg(test)]
@@ -5450,9 +5451,9 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
     )
 }
 
-/// Keep the geometry used by CSSOM View reads on the same epoch-keyed layout pass as TRust's Boa
-/// adapter. The resulting rectangles remain floating-point CSS pixels; terminal quantization is
-/// still confined to `layout2::paint`.
+/// Keep the geometry used by CSSOM View reads on the same epoch-keyed layout pass as the other
+/// JavaScript adapter. The resulting rectangles remain floating-point CSS pixels; terminal
+/// quantization is still confined to `layout2::paint`.
 fn ensure_host_geom_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
     let (dom, base, viewport, cache, images) = {
         let state = ctx

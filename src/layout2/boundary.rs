@@ -1,4 +1,4 @@
-//! Incremental-layout boundary emission (INCREMENTAL_LAYOUT_PLAN.md, P7).
+//! Incremental-layout boundary emission (incremental-layout contract, P7).
 //!
 //! A relayout boundary is an element whose outer box is content-independent, so
 //! a mutation confined to its subtree can be re-laid alone and spliced back

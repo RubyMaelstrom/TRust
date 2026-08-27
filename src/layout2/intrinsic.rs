@@ -1,4 +1,4 @@
-//! The intrinsic-size query (css-sizing-3 min-/max-content), the plan's
+//! The intrinsic-size query (css-sizing-3 min-/max-content), the
 //! explicit, memoized replacement for the old engine's `measuring`-flag
 //! probes.
 //!

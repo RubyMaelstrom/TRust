@@ -6,9 +6,9 @@
 //! compression (`Accept-Encoding: gzip, deflate`), redirects followed here.
 //! HTTPS uses standard WebPKI validation (`tls::webpki_connector`),
 //! not TOFU. HTML renders through our own arena DOM (`dom.rs`) laid out
-//! into positioned rows (`layout.rs`); forms are extracted from that
-//! same arena. With JS on, `execute_js` first runs the page's scripts
-//! against the DOM (js.rs) and lays out what they built.
+//! into positioned rows by `layout2`; forms are extracted from that same
+//! arena. With JS on, `execute_js` first runs the page's scripts through the
+//! selected backend and lays out what they built.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -591,10 +591,10 @@ impl PageCache {
     }
 
     /// Block the calling (page) thread on a shared fetch. The module
-    /// loader needs this: it must NOT `.await` (yielding would let Boa
-    /// interleave another module load and cross up its per-referrer
-    /// `loaded_modules`), and it can't `block_on` (it already runs inside
-    /// one). With a runtime `handle` the fetch is driven on the runtime
+    /// module loader needs this: it must NOT `.await` (yielding would let the
+    /// loader interleave another module load and cross up per-referrer module
+    /// state), and it can't `block_on` (it already runs inside one). With a
+    /// runtime `handle` the fetch is driven on the runtime
     /// and waited on via a plain channel — no yield to the JS job loop.
     /// Without one (a no-net page whose cache holds only pre-seeded, ready
     /// futures) a bare executor resolves it. Speculative prefetch usually
@@ -693,8 +693,8 @@ pub async fn fetch_web_default_with_referrer(
     }
 }
 
-/// A process-global monotonic origin shared by every trace line (net
-/// requests in http.rs, JS phase markers in js.rs) so a single load's
+/// A process-global monotonic origin shared by every trace line (network
+/// requests and JavaScript phase markers) so a single load's
 /// timeline reads against one clock. Only consulted when tracing is on.
 pub fn trace_origin() -> Instant {
     static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -1756,7 +1756,8 @@ pub(crate) fn stylesheet_response_allowed(
 /// fetched") and the page never mounted. Matches `MAX_PAGE_PRELOADS` in spirit
 /// (both are "app code"). It is NOT a correctness cliff anymore: a classic
 /// script the execution loop reaches that wasn't prefetched is fetched on
-/// demand (see js.rs), bounded by `MAX_PAGE_FETCHES`.
+/// demand (see the selected JavaScript backend), bounded by
+/// `MAX_PAGE_FETCHES`.
 const MAX_PAGE_SCRIPTS: usize = 96;
 
 /// External stylesheets fetched for the cascade. A browser has no such cap;
@@ -1777,8 +1778,8 @@ const MAX_PAGE_PRELOADS: usize = 96;
 /// idle connections anyway.
 const PREFETCH_CONCURRENCY: usize = 8;
 
-/// Run an HTML page's JavaScript (js.rs) and swap the body for the
-/// post-JS document. External scripts are fetched here, with the same
+/// Run an HTML page's JavaScript through the selected backend and swap the
+/// body for the post-JS document. External scripts are fetched here, with the same
 /// caps and timeouts as pages — the page's own JS has no I/O at all.
 /// Never fails: trouble lands in `response.js` and the original body
 /// survives.
@@ -2023,8 +2024,8 @@ pub async fn execute_js_for_device(
         storage: Some(storage),
         blobs,
     };
-    // The page actor owns the engine on its own wide-stack thread (Boa's
-    // parser recursion — see CLAUDE.md). Its first event is `Static`
+    // The page actor owns the engine on its own dedicated stack. Its first
+    // event is `Static`
     // (nothing to interact with: actor already gone, free efficiency)
     // or `Updated` (alive: hand the channels to the app).
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
@@ -2032,7 +2033,7 @@ pub async fn execute_js_for_device(
     }
     // Inner-scroll GATE diagnostic: run the ONE-SHOT `transform` (which prints
     // the scroll-box report off the live, full-cascade arena — see
-    // `layout::scroll_box_report`) instead of the resident actor. Only when
+    // `layout2::scroll_box_report`) instead of the resident actor. Only when
     // `TRUST_DIAG_SCROLL_BOXES` is set, so production is unaffected.
     if std::env::var_os("TRUST_DIAG_SCROLL_BOXES").is_some() {
         let (out, outcome) = tokio::task::spawn_blocking(move || crate::js::transform(&html, &env))
@@ -3518,7 +3519,7 @@ pub fn parse_seeded(
             found_fixed,
             found_anchors,
         ) = {
-            // The fragment-tree engine (LAYOUT_OVERHAUL_PLAN.md). It emits the
+            // The fragment-tree engine (layout2 architecture). It emits the
             // pinned fixed layer (P4), vertical scroll regions + their
             // scroll_clips (P5b), carousels (P5c), and incremental-layout
             // boundaries (P7 — block-filling IFC boxes, so a live mutation
@@ -3642,7 +3643,7 @@ fn collect_hover_ids(
 }
 
 /// The result of laying out one incremental-layout region patch
-/// (INCREMENTAL_LAYOUT_PLAN.md): the boundary's freshly laid buffer + the
+/// (incremental-layout contract): the boundary's freshly laid buffer + the
 /// metadata the app needs to swap it into the live `Region`.
 pub struct RegionPatch {
     /// The region's new scrollable content buffer (replaces `Region.buffer`).
@@ -3704,7 +3705,7 @@ pub fn lay_region_patch(
     let t1 = std::time::Instant::now();
     // Re-lay the region's content into a fresh buffer, through the SAME engine
     // that laid the page out — so a patched region is consistent with the full
-    // render (LAYOUT_OVERHAUL_PLAN.md P7). The row cache is not used here (v1,
+    // render (layout2 architecture P7). The row cache is not used here (v1,
     // correctness over the reuse memo).
     let (rows, carousels, scroll_clips) = crate::layout2::lay_region_fragment(
         &dom,
@@ -3735,7 +3736,7 @@ pub fn lay_region_patch(
 }
 
 /// The result of laying one INLINE incremental-layout boundary patch
-/// (INCREMENTAL_LAYOUT_PLAN.md §14): the boundary's freshly laid rows (fragment-
+/// (incremental-layout contract §14): the boundary's freshly laid rows (fragment-
 /// relative cols) + the metadata the app needs to splice them into `Doc.rows`.
 /// (Distinct from `js::SubtreePatch`, the actor→app protocol message — this is
 /// the laid-out geometry the app derives from it.)
@@ -3791,7 +3792,7 @@ pub fn lay_subtree_patch(
     let image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
     // The subtree lays through the SAME engine that rendered the page, so a
     // patched boundary is byte-consistent with a full relayout
-    // (LAYOUT_OVERHAUL_PLAN.md P7).
+    // (layout2 architecture P7).
     let frag = crate::layout2::lay_subtree_fragment(
         &dom,
         url,
@@ -5866,7 +5867,7 @@ mod tests {
     // HIT — the library is rehydrated, not re-parsed/compiled. Both renders must
     // be byte-identical and error-free: the whole point is that reuse is
     // observably transparent. (Proof the hit path is wired and faithful; the
-    // js.rs unit tests prove the cache mechanics directly.)
+    // backend-specific tests prove the cache mechanics directly.)
     #[tokio::test]
     async fn execute_js_reuses_a_cached_cdn_library_across_two_loads() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -6843,7 +6844,7 @@ mod tests {
 
     /// The speculative-import-prefetch win: an entry module that STATICALLY
     /// imports many chunks pulls them concurrently (the scanner fires them
-    /// ahead of Boa's serial loader) instead of one-RTT-at-a-time. Mirrors
+    /// ahead of a serial module loader) instead of one-RTT-at-a-time. Mirrors
     /// `page_fetches_run_concurrently` for the module graph.
     #[tokio::test]
     async fn static_module_graph_prefetches_concurrently() {
@@ -9040,10 +9041,9 @@ mod tests {
     // A DIAMOND module graph (two siblings import one shared module)
     // served by a CONCURRENT, delaying server, so the two loads of the
     // shared module genuinely overlap. Before the loader serialized its
-    // fetch+parse, this raced: duplicate `Module` objects tripped Boa's
-    // loaded_modules assert (module/source.rs:420) or corrupted the graph
-    // into a stack overflow — archive.org crashed reliably. The shared
-    // module must load and EVALUATE exactly once.
+    // fetch+parse, this raced: duplicate module records could corrupt the
+    // graph into a stack overflow (archive.org exposed this reliably). The
+    // shared module must load and EVALUATE exactly once.
     #[tokio::test]
     async fn concurrent_diamond_module_graph_loads_shared_once() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -9168,8 +9168,8 @@ mod tests {
         server.abort();
     }
 
-    /// REAL Lit 3 (lit-core.min.js from target/canary, see js.rs canary
-    /// docs) driving the full pipeline: reactive properties, tagged
+    /// REAL Lit 3 (lit-core.min.js from target/canary) driving the full
+    /// pipeline: reactive properties, tagged
     /// templates, shadow rendering, @click bindings.
     /// `cargo test --release lit_canary -- --ignored --nocapture`
     #[tokio::test]

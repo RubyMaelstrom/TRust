@@ -233,7 +233,7 @@ pub(crate) fn build(
 
 /// Build a box tree rooted at an arbitrary element `boundary` (an incremental-
 /// layout relayout boundary — a scroll region or an inline IFC box), for a
-/// subtree fragment re-lay (INCREMENTAL_LAYOUT_PLAN.md). Same machinery as
+/// subtree fragment re-lay (incremental-layout contract). Same machinery as
 /// `build`, entered at `boundary` instead of the document root; `None` when the
 /// node generates no box (`display:none`/skipped).
 pub(crate) fn build_at(

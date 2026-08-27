@@ -1,6 +1,6 @@
-//! layout2 — the NEW layout engine (LAYOUT_OVERHAUL_PLAN.md).
+//! layout2 — TRust's standards-oriented layout engine.
 //!
-//! The standard architecture, replacing layout.rs's single-pass text flow:
+//! The standard architecture, replacing the former single-pass text flow:
 //!
 //! ```text
 //! styled DOM (dom.rs cascade, KEPT)
@@ -737,7 +737,7 @@ pub fn measure_boxes_css(
 }
 
 /// Lay one INLINE relayout-boundary subtree (a block-filling IFC box, NOT a
-/// scroll region) for the general incremental splice (INCREMENTAL_LAYOUT_PLAN.md
+/// scroll region) for the general incremental splice (incremental-layout contract
 /// §14; the layout2 sibling of `layout::lay_out_subtree_fragment`). `boundary`
 /// is the box in a re-parsed fragment DOM (`serialize_patch` output, inherited
 /// context materialized). `content_width` is the boundary's BORDER-box width
@@ -864,7 +864,7 @@ pub fn lay_subtree_fragment(
 }
 
 /// Lay one scroll REGION's subtree into a fresh scrollable buffer for an
-/// incremental region patch (INCREMENTAL_LAYOUT_PLAN.md; the layout2 sibling of
+/// incremental region patch (incremental-layout contract; the layout2 sibling of
 /// `layout::lay_out_region_fragment_cached`). `boundary` is the region node in a
 /// re-parsed fragment DOM (`serialize_patch` output, inherited context
 /// materialized); it is laid AS a fragment root at `content_width` (the existing
@@ -4540,7 +4540,8 @@ mod tests {
         // list in px (a grid-measuring library counts
         // `getComputedStyle(el).gridTemplateColumns.split(' ')`), NOT the
         // declared `repeat(auto-fill, …)`. `repeat(auto-fill, minmax(80px, 1fr))`
-        // at 640px = 8 tracks of 80px (js.rs serializes them to "80px 80px …").
+        // at 640px = 8 tracks of 80px (the JavaScript prelude serializes them
+        // to "80px 80px …").
         // The grid is EMPTY on purpose: a virtualized feed reads its resolved
         // columns BEFORE it has any cells (archive.org's infinite-scroller), and
         // a browser still sizes an empty grid's template.
@@ -7618,7 +7619,7 @@ mod tests {
 
     #[test]
     fn a_region_patch_buffer_matches_the_full_render_region() {
-        // INCREMENTAL_LAYOUT_PLAN.md §9 differential guard, layout2 edition: the
+        // incremental-layout contract §9 differential guard, layout2 edition: the
         // region buffer laid from a serialized PATCH fragment (re-parsed,
         // ancestor-less, inherited context MATERIALIZED by serialize_patch) is
         // byte-for-byte the region a full `lay_out_document` produces. The region
@@ -7709,7 +7710,7 @@ mod tests {
 
     #[test]
     fn an_inline_boundary_fragment_lays_like_the_full_document() {
-        // INCREMENTAL_LAYOUT_PLAN.md §9: a block-filling IFC boundary re-laid
+        // incremental-layout contract §9: a block-filling IFC boundary re-laid
         // from a serialized PATCH fragment (materialized inheritance) is byte-
         // for-byte the rows the FULL render produced for it. The boundary
         // inherits bold from <body>; without §4a materialization the fragment

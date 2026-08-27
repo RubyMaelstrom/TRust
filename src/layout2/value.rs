@@ -33,7 +33,8 @@ pub(crate) enum Len {
     None,
     /// The intrinsic-sizing keywords. P0 carries them so the parser is
     /// complete; the block algorithms treat them as `Auto` until the
-    /// intrinsic-size query lands (an explicit, memoized query per the plan).
+    /// intrinsic-size query lands (an explicit, memoized query by the layout
+    /// algorithms).
     MinContent,
     MaxContent,
     FitContent,

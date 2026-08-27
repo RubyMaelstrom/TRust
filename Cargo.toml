@@ -49,7 +49,8 @@ default = ["mimalloc", "lumen-backend"]
 # page's freed high-water to the OS (see `release_allocator_memory`).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Exactly one JavaScript backend is compiled into a browser artifact. Lumen is
-# the normal backend; Boa is retained as an explicit legacy comparison build.
+# the production backend; Boa is retained only for explicit legacy comparison
+# builds (`trust-boa` and `trust-desktop-boa`).
 lumen-backend = ["dep:lumen"]
 boa-backend = ["dep:boa_engine", "dep:boa_parser", "dep:boa_ast", "dep:boa_interner"]
 # Synthetic engine benchmark harness; omitted from ordinary browser builds.
@@ -60,8 +61,9 @@ accesskit = "0.24.1"
 accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 boa_engine = { version = "0.21", features = ["annex-b"], optional = true }
-# Direct dep for the lazy-parse control surface (`boa_parser::lazy`); the
-# vendored crate is shared with boa_engine via `[patch]` below.
+# Legacy Boa-only dependency for its lazy-parse control surface
+# (`boa_parser::lazy`); the vendored crate is shared with boa_engine via
+# `[patch]` below.
 boa_parser = { version = "0.21", optional = true }
 boa_ast = { version = "0.21", optional = true }
 boa_interner = { version = "0.21", optional = true }
@@ -143,13 +145,14 @@ wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl"
 vt100 = "0.16.2"
 winit = "0.30.13"
 softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
-# WebAssembly engine. wasmi is a pure-Rust interpreter (no
-# v8/C++), so it preserves the pure-Rust-engine ethos. Runtime parses BINARY
+# WebAssembly engine. wasmi is a pure-Rust interpreter (no v8/C++), so it
+# preserves the pure-Rust-engine ethos. Runtime parses BINARY
 # wasm only (the web ships binary), so the default `wat` feature is dropped;
 # `simd` is enabled because the SIMD proposal is finalized and the crate is
 # pure-Rust (v128 still cannot cross the JS boundary — that throws TypeError per
-# the JS-API spec — but a module may use SIMD internally). The real work is the
-# `WebAssembly.*` JS<->wasm bridge in src/js.rs.
+# the JS-API spec — but a module may use SIMD internally). The production
+# `WebAssembly.*` JS<->wasm bridge is in `src/lumen_backend.rs`; the legacy Boa
+# adapter remains in `src/js.rs`.
 wasmi = { version = "1", default-features = false, features = ["std", "simd"] }
 webpki-roots = "1.0.7"
 # CSS Fonts web resources commonly use WOFF or WOFF2 containers. `wuff`
@@ -179,7 +182,8 @@ image-webp = { path = "vendor/image-webp-0.2.4" }
 # renderer changes confined to the fork and drop the patch when Vello updates.
 vello_hybrid = { path = "vendor/vello_hybrid-0.2.0" }
 # TRust's legacy Boa fork. We retain it for regression comparisons and vendor
-# it so engine fixes remain in the engine instead of becoming js.rs shims. First fix:
+# it so engine fixes remain in the engine instead of becoming downstream
+# `js.rs` shims. First fix:
 # the cyclic-module `Debug` recursion that turned a recoverable module
 # assert into an uncatchable stack-overflow abort (see src/module/*).
 boa_engine = { path = "vendor/boa_engine-0.21.1" }
@@ -201,7 +205,7 @@ boa_gc = { path = "vendor/boa_gc-0.21.1" }
 # (`Parser::parse_script_raw`) that builds the AST without the scope-analysis
 # pass the public entries force on. Raw parse touches no scope and no realm, so
 # it can run on a worker thread with a private interner; this is the keystone of
-# parallel parse (the JS-engine perf plan's Step 5a): the lexer/parser bulk of
+# parallel parse: the lexer/parser bulk of
 # the "parse" phase moves off the page's `Context` thread, while scope analysis
 # + compile stay sequential on the page thread (global lexical bindings resolve
 # by slot index, so their order must be preserved). The analyzed AST holds
