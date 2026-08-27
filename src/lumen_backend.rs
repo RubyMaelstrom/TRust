@@ -1102,7 +1102,12 @@ mod desktop {
         // has no network runtime. Keep that local task source independent of `enable_network`.
         state.task_events = Some(host_tasks.clone());
         if let Some(handle) = env.net.clone() {
-            state.enable_network(response_url, handle, env.cache.clone(), host_tasks.clone());
+            state.enable_network(
+                response_url.clone(),
+                handle,
+                env.cache.clone(),
+                host_tasks.clone(),
+            );
             state.base = base.clone();
         }
 
@@ -1121,9 +1126,15 @@ mod desktop {
         // User-Agent value. Keep that identical to the HTTP client and the
         // selected JS realm; the engine implementation is not a distinct
         // user agent or an observable browser capability.
+        // WHATWG HTML §2.4.3 keeps a Document's URL distinct from its
+        // document base URL. A <base href> changes relative-URL resolution
+        // and Node.baseURI, but it must not rewrite Location or document.URL.
+        // SPA shells commonly serve the same markup at every route and select
+        // the route from location.pathname, so seeding the realm with `base`
+        // collapses every such navigation to the base path.
         let config = format!(
             "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
-            json_string(base.as_str()),
+            json_string(response_url.as_str()),
             json_string(crate::locale::LANGUAGE),
             json_string(crate::locale::LANGUAGES[0]),
             json_string(crate::locale::LANGUAGES[1]),
@@ -1134,7 +1145,7 @@ mod desktop {
                 .map(|parallelism| parallelism.get())
                 .unwrap_or(8),
             crate::http::GLOBAL_PRIVACY_CONTROL,
-            lumen_potentially_trustworthy(&base),
+            lumen_potentially_trustworthy(&response_url),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
@@ -2650,6 +2661,53 @@ mod desktop {
             assert_eq!(url, "https://www.youtube.com/watch?v=spa");
             assert!(!replace);
             assert!(handle.try_send_user(PageCmd::Click(target)).is_ok());
+        }
+
+        #[tokio::test]
+        async fn actor_keeps_document_url_distinct_from_base_url() {
+            // WHATWG HTML §2.4.3: the first <base href> supplies the document
+            // base URL, while the Document's URL remains the navigation URL.
+            // Client-side routers select a route from Location, so replacing
+            // it with the base URL makes every route mount the root page.
+            let html = r#"<!doctype html><html><head><base href="/"></head><body>
+                <output id="result"></output>
+                <script>
+                    document.getElementById("result").textContent = [
+                        location.href,
+                        location.pathname,
+                        document.URL,
+                        document.baseURI
+                    ].join("|");
+                </script>
+            </body></html>"#;
+            let route = "https://example.test/details/collection?tab=items";
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(route));
+
+            let rendered = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. } | PageEvt::Static { html, .. })
+                            if html.contains("id=\"result\"") =>
+                        {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("document URL test failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before rendering the document URL"),
+                    }
+                }
+            })
+            .await
+            .expect("document URL render timed out");
+
+            assert!(
+                rendered.contains(
+                    "https://example.test/details/collection?tab=items|/details/collection|https://example.test/details/collection?tab=items|https://example.test/"
+                ),
+                "Document URL and base URL were not kept distinct: {rendered}"
+            );
         }
 
         #[tokio::test]
