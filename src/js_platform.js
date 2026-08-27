@@ -476,10 +476,9 @@
         // DOM §2.2 composedPath(): non-empty only DURING dispatch (dispatch()
         // builds the path and empties it when it unwinds, per spec), ordered
         // target-first, and clipped so nodes inside a CLOSED shadow tree are
-        // invisible to listeners outside it (each struct carries `c` =
-        // root-of-closed-tree; slots aren't in our dispatch path, so the
-        // spec's slot-in-closed-tree branches are structurally never taken
-        // and are omitted).
+        // invisible to listeners outside it. Each struct carries `c` =
+        // root-of-closed-tree and `s` = slot-in-closed-tree, matching the
+        // standard's event-path item fields.
         composedPath() {
             const path = this.__path;
             if (!path || !path.length) {
@@ -494,14 +493,17 @@
             for (let i = path.length - 1; i >= 0; i--) {
                 if (path[i].c) hidden++;
                 if (path[i].n === this.currentTarget) { cti = i; break; }
+                if (path[i].s) hidden--;
             }
             let cur = hidden, max = hidden;
             for (let i = cti - 1; i >= 0; i--) {
                 if (path[i].c) cur++;
                 if (cur <= max) out.unshift(path[i].n);
+                if (path[i].s) { cur--; if (cur < max) max = cur; }
             }
             cur = hidden; max = hidden;
             for (let i = cti + 1; i < path.length; i++) {
+                if (path[i].s) cur++;
                 if (cur <= max) out.push(path[i].n);
                 if (path[i].c) { cur--; if (cur < max) max = cur; }
             }
@@ -682,6 +684,14 @@
             a = r.__host;
         }
     }
+    // DOM §4.2.2.3 and §4.4: assigned slots participate in Node's
+    // INTERNAL event-parent algorithm even though `parentNode` continues to
+    // expose the light tree. This primitive deliberately sees closed roots;
+    // the public Slottable.assignedSlot getter filters those below.
+    function assignedSlotInternal(node) {
+        if (!(node instanceof Element) && !(node instanceof Text)) return null;
+        return wrap(__dom_assigned_slot(node.__id));
+    }
     // "Dispatch" (DOM §2.9): capture down the composed path, at-target, then
     // bubble back up when the event bubbles (or the caller forces it — the
     // platform events we fire on the document that window listeners must see).
@@ -704,10 +714,11 @@
     // either; the capture phase must not start delivering them to window).
     //
     // COMPOSED FLAG (DOM: a shadow root's "get the parent" returns null when
-    // the event's composed flag is unset): a non-composed event stops at the
-    // root of its target's shadow tree — the first shadow hop on this walk —
-    // so `slotchange`, non-composed customEvents, etc. never leak out of a
-    // component. RELATEDTARGET (DOM §2.9 steps 5/9.6): a relatedTarget is
+    // the event's composed flag is unset AND that root owns the path's first
+    // target): a non-composed event originating inside a shadow tree stops at
+    // that root. A light-tree slottable's path can enter a shadow tree via its
+    // slot and leave again even when non-composed. RELATEDTARGET (DOM §2.9
+    // steps 5/9.6): a relatedTarget is
     // retargeted per path entry, the whole dispatch is skipped when target and
     // adjusted relatedTarget collapse to the same object (a mouseover wholly
     // inside a component, seen from outside), and propagation ends at the tree
@@ -732,22 +743,28 @@
             if (target === relatedAtTarget && target !== origRelated) return !ev.defaultPrevented;
             ev.relatedTarget = relatedAtTarget;
         }
-        let path = null; // [{ n, t: shadow-adjusted target, r: adjusted relatedTarget, c: root-of-closed-tree }], target-first
+        let path = null; // [{ n, t: shadow-adjusted target, r: adjusted relatedTarget, c: root-of-closed-tree, s: slot-in-closed-tree }], target-first
         if (forceBubble || ev.bubbles || captureCount > 0) {
             path = [];
             let n = target, t = target;
-            path.push({ n: n, t: t, r: relatedAtTarget, c: false });
+            path.push({ n: n, t: t, r: relatedAtTarget, c: false, s: false });
             if (n instanceof Node) {
                 let clipped = false; // ended at a shadow root / relatedTarget collapse, not the tree top
+                let assignedSlot = assignedSlotInternal(n);
+                let slottable = assignedSlot ? n : null;
                 for (;;) {
-                    const parent = n.parentNode;
+                    // Node's get-the-parent result is its assigned slot when
+                    // present, otherwise its actual tree parent.
+                    const parent = assignedSlot || n.parentNode;
                     if (parent) { n = parent; }
                     else if (n.__host) {
-                        // Shadow hop. Non-composed events stop AT the root of
-                        // the original target's tree — necessarily the first
-                        // hop this walk reaches.
-                        if (!ev.composed) { clipped = true; break; }
-                        t = n.__host; n = t; // retarget: outside sees the host
+                        // ShadowRoot's get-the-parent algorithm clips only
+                        // when this root owns the original event target.
+                        if (!ev.composed && rootOfNode(target) === n) { clipped = true; break; }
+                        n = n.__host;
+                        // Internal targets retarget to their host outside the
+                        // root; light-tree slottables remain themselves.
+                        t = retarget(target, n);
                         // The hop crossed into the tree where both ends of an
                         // over/out pair look the same → propagation ends
                         // (spec: "if parent is relatedTarget, set parent to
@@ -755,10 +772,22 @@
                         if (hasRelated && retarget(origRelated, n) === n) { clipped = true; break; }
                     }
                     else break;
+                    let slotInClosedTree = false;
+                    if (slottable) {
+                        // The assigned slot is the next event parent. Entering
+                        // a closed slot increments composedPath's hidden-tree
+                        // level until the matching closed shadow root.
+                        slottable = null;
+                        const root = rootOfNode(n);
+                        slotInClosedTree = root instanceof ShadowRoot && root.__mode === "closed";
+                    }
+                    assignedSlot = assignedSlotInternal(n);
+                    if (assignedSlot) slottable = n;
                     path.push({
                         n: n, t: t,
                         r: hasRelated ? retarget(origRelated, n) : null,
                         c: n instanceof ShadowRoot && n.__mode === "closed",
+                        s: slotInClosedTree,
                     });
                 }
                 // DOM: a document's "get the parent" returns NULL for `load`
@@ -775,7 +804,7 @@
                 // collapse) has no window in its path (DOM: only a document's
                 // "get the parent" returns the global).
                 if (!clipped && n.nodeType === 9 && target !== g && ev.type !== "load") {
-                    path.push({ n: g, t: t, r: hasRelated ? retarget(origRelated, g) : null, c: false });
+                    path.push({ n: g, t: t, r: hasRelated ? retarget(origRelated, g) : null, c: false, s: false });
                 }
             }
             ev.__path = path; // composedPath() reads it; emptied on unwind (spec)
@@ -1075,6 +1104,34 @@
     // The actor's entry points: dispatch a user click; enumerate nodes
     // with click listeners (delegation hosts included — the actor sorts
     // containers from buttons).
+    // DOM §2.9 builds an activation target from the click EVENT PATH, not by
+    // calling Element.closest() on the target after listeners have run. The
+    // path can begin at any Node, enters a shadow tree through an assigned
+    // slot, and leaves a ShadowRoot through its host.
+    function clickEventParent(node) {
+        if (!node) return null;
+        const slot = assignedSlotInternal(node);
+        if (slot) return slot;
+        if (node.parentNode) return node.parentNode;
+        return node.__host || null;
+    }
+    function hyperlinkActivationTarget(node) {
+        let current = node;
+        while (current) {
+            if (current.nodeType === 1
+                && (current.localName === "a" || current.localName === "area")
+                && current.hasAttribute("href")) {
+                return current;
+            }
+            current = clickEventParent(current);
+        }
+        return null;
+    }
+    // The dispatch algorithm chooses activationTarget BEFORE invoking event
+    // listeners. Retain that object until the Rust host asks for the uncanceled
+    // hyperlink default, so removing/reparenting the clicked subtree during a
+    // listener does not erase or replace the selected activation target.
+    let pendingClickHyperlink = null;
     // The submit control at or above `el` (the default action of clicking it
     // is to submit its form). A <button>'s type defaults to "submit";
     // type="button"/"reset" do not submit. <input type=submit|image> too.
@@ -1201,8 +1258,12 @@
             : new PointerEvent("click", init);
     }
     function activateClick(t, record, trusted) {
-        if (record) trust.lastClickSubmit = null;
+        if (record) {
+            trust.lastClickSubmit = null;
+            pendingClickHyperlink = null;
+        }
         if (!t) return false;
+        const hyperlink = hyperlinkActivationTarget(t);
         // HTML §6.6.2: user activation of a click-focusable area runs the
         // focusing steps. HTMLElement.click() is synthetic and deliberately
         // does not focus; the actor's trusted terminal click does.
@@ -1210,6 +1271,7 @@
         const ev = syntheticClickEvent(!!trusted);
         dispatch(t, ev, false);
         if (ev.defaultPrevented) return true;
+        if (record) pendingClickHyperlink = hyperlink;
         // HTML §4.11.2: the first <summary> child of a <details> element has
         // activation behavior that toggles the parent's boolean `open`
         // attribute. This is a default action of the click, so it must run
@@ -2429,6 +2491,15 @@
         get localName() { let t = this.__trustLN; if (t === undefined) t = this.__trustLN = __dom_tag(this.__id) || ""; return t; }
         get tagName() { let t = this.__tn; if (t === undefined) t = this.__tn = this.localName.toUpperCase(); return t; }
         get nodeName() { return this.tagName; }
+        // DOM Slottable.assignedSlot: finding a slot with the `open` flag
+        // hides slots whose root is closed, while event dispatch uses the
+        // unfiltered internal relation above.
+        get assignedSlot() {
+            const slot = assignedSlotInternal(this);
+            if (!slot) return null;
+            const root = rootOfNode(slot);
+            return root instanceof ShadowRoot && root.__mode === "closed" ? null : slot;
+        }
         // `Element.namespaceURI` — immutable, so cache it (undefined = uncached,
         // null = the null namespace). HTML elements report the XHTML namespace;
         // inline SVG/MathML their own. Vue 3 hydration reads
@@ -3869,7 +3940,17 @@
             this.data = d.slice(0, o) + String(s) + d.slice(o + c);
         }
     }
-    class Text extends CharacterData { get nodeType() { return 3; } get nodeName() { return "#text"; } get [Symbol.toStringTag]() { return "Text"; } }
+    class Text extends CharacterData {
+        get nodeType() { return 3; }
+        get nodeName() { return "#text"; }
+        get assignedSlot() {
+            const slot = assignedSlotInternal(this);
+            if (!slot) return null;
+            const root = rootOfNode(slot);
+            return root instanceof ShadowRoot && root.__mode === "closed" ? null : slot;
+        }
+        get [Symbol.toStringTag]() { return "Text"; }
+    }
 
     class Document extends Node {
         get nodeType() { return 9; }
@@ -4314,12 +4395,14 @@
     // owner and re-run its attribute-processing steps; only a top-level choice
     // is returned to the frontend as a page navigation.
     trust.followAnchorDefault = function (nodeId) {
-        let anchor = wrap(nodeId);
-        while (anchor && anchor.nodeType === 1 && anchor.localName !== "a")
-            anchor = anchor.parentNode;
-        if (!anchor || anchor.localName !== "a") return null;
+        let anchor = pendingClickHyperlink;
+        pendingClickHyperlink = null;
+        if (!anchor) anchor = hyperlinkActivationTarget(wrap(nodeId));
+        if (!anchor) return null;
         const raw = anchor.getAttribute("href");
-        if (raw === null || !String(raw).trim()) return null;
+        // Presence, not non-emptiness, creates the hyperlink. `href=""`
+        // resolves to the document's current base URL.
+        if (raw === null) return null;
         const subject = frameOwnerForNode(anchor);
         const base = subject ? frameBaseURL(subject) : baseHref();
         const parsed = __url_parse(String(raw), base);
@@ -6486,6 +6569,14 @@
     // (browser behaviour; a rootMargin still pre-buffers). Registry `IO` is a
     // PLAIN ARRAY, never a Boa Set/Map — same MapLock GC trap MO documents.
     const IO = [];
+    // Intersection Observer §3.2.4 gives notification its own task source.
+    // The rendering update records threshold crossings; it must not invoke
+    // author callbacks synchronously inside style/layout (unlike the
+    // ResizeObserver broadcast loop). One queued task drains all observers'
+    // pending entry queues for this document.
+    const ioNotify = [];
+    let ioTaskQueued = false;
+    let ioInitialUpdateTimer = null;
     // ResizeObserver registry — a PLAIN ARRAY (never a Boa Set/Map, the MapLock
     // GC trap MO documents). ResizeObserver is EDGE-TRIGGERED like IO: a target's
     // callback fires whenever its observed (border-box) size changes across the
@@ -6497,6 +6588,7 @@
     // the terminal resizes; without re-delivery it stays stuck at the mount-time
     // measurement and renders too few cards.
     const RO = [];
+    let roInitialUpdateTimer = null;
     // Parse a rootMargin string into 4 {v, pct} offsets in CSS-margin order
     // (top, right, bottom, left), each px or %. Percentages resolve per-axis
     // against the root rect (top/bottom vs height, left/right vs width); the px
@@ -6539,15 +6631,25 @@
             // previousThresholdIndex = -1) — i.e. observe() yields one initial
             // callback with the current state, isIntersecting possibly false.
             this.__targets = [];
+            this.__queuedEntries = [];
         }
         observe(el) {
             if (!el) return;
             for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
             this.__targets.push({ el: el, lastIndex: -1, lastIx: false });
             if (IO.indexOf(this) < 0) IO.push(this);
-            // Report the initial state on a macrotask (the existing settle drain
-            // runs it): a target observed at load still gets one callback.
-            g.setTimeout(() => trust.updateIntersections(), 0);
+            // Pending initial targets force a future rendering opportunity.
+            // The host normally reaches updateIntersections at the end of the
+            // current task's render; retain one coalesced timer as the fallback
+            // when observe() itself made no render-dirty DOM change. Scheduling
+            // one timer PER target made large registries drain hundreds of
+            // identical no-op tasks.
+            if (ioInitialUpdateTimer === null) {
+                ioInitialUpdateTimer = g.setTimeout(() => {
+                    ioInitialUpdateTimer = null;
+                    trust.updateIntersections();
+                }, 0);
+            }
         }
         unobserve(el) {
             for (let i = 0; i < this.__targets.length; i++) {
@@ -6556,7 +6658,11 @@
             if (!this.__targets.length) { const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
         }
         disconnect() { this.__targets = []; const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
-        takeRecords() { return []; }
+        takeRecords() {
+            const entries = this.__queuedEntries;
+            this.__queuedEntries = [];
+            return entries;
+        }
     };
     // W3C Intersection Observer §2.3 exposes every entry attribute on
     // IntersectionObserverEntry.prototype. Libraries use those Web IDL members
@@ -6601,14 +6707,37 @@
         target: { get() { return this.__entry.target; }, enumerable: true, configurable: true },
     });
 
+    function queueIntersectionObserverTask(observer) {
+        if (ioNotify.indexOf(observer) < 0) ioNotify.push(observer);
+        if (ioTaskQueued) return;
+        ioTaskQueued = true;
+        intersectionTasks.push({ frame: trust.__activeFrame || null, fn: function () {
+            ioTaskQueued = false;
+            const notify = ioNotify.splice(0);
+            for (let i = 0; i < notify.length; i++) {
+                const o = notify[i];
+                const entries = o.__queuedEntries;
+                o.__queuedEntries = [];
+                if (!entries.length) continue;
+                try { o.__cb(entries, o); }
+                catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            }
+        }});
+    }
+
     // The spec's "update intersection observations" step: for each observer ×
     // target, intersect the target's DOCUMENT-space box with the viewport
     // expanded by rootMargin, then queue an entry ONLY when the threshold index
-    // or isIntersecting changed (edge-triggered, per spec — not a flood). Run at
-    // every settle (an observe() self-schedules it) and on every scroll.
+    // or isIntersecting changed (edge-triggered, per spec — not a flood). Entry
+    // recording queues the separate IntersectionObserver notification task;
+    // callbacks never run synchronously inside this rendering-update step.
     trust.updateIntersections = function () {
+        if (ioInitialUpdateTimer !== null) {
+            g.clearTimeout(ioInitialUpdateTimer);
+            ioInitialUpdateTimer = null;
+        }
         if (!IO.length) return 0;
-        let delivered = 0;
+        let queued = 0;
         const sx = g.scrollX || 0, sy = g.scrollY || 0;
         const vw = g.innerWidth, vh = g.innerHeight;
         const observers = IO.slice();
@@ -6669,12 +6798,12 @@
                 }));
             }
             if (entries.length) {
-                delivered += entries.length;
-                try { o.__cb(entries, o); }
-                catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+                queued += entries.length;
+                o.__queuedEntries.push(...entries);
+                queueIntersectionObserverTask(o);
             }
         }
-        return delivered;
+        return queued;
     };
 
     // Apply a viewport scroll (CSS px, document origin): update the scroll
@@ -6774,10 +6903,15 @@
             // queues an initial observation with the current size).
             this.__targets.push({ el: el, lastW: -1, lastH: -1 });
             if (RO.indexOf(this) < 0) RO.push(this);
-            // Report the initial size on a later task. The live event loop runs
-            // that task after the current lifecycle/author task; one-shot
-            // snapshots drain it while producing their eventual state.
-            g.setTimeout(() => trust.updateResizes(), 0);
+            // A pending initial observation participates in the next rendering
+            // opportunity. Keep one fallback task for a late observe() that did
+            // not otherwise dirty rendering, coalesced across every target.
+            if (roInitialUpdateTimer === null) {
+                roInitialUpdateTimer = g.setTimeout(() => {
+                    roInitialUpdateTimer = null;
+                    trust.updateResizes();
+                }, 0);
+            }
         }
         unobserve(el) {
             for (let i = 0; i < this.__targets.length; i++) {
@@ -6794,6 +6928,10 @@
     // settle/dispatch/viewport-resize (`run_layout_observers`), so a component that
     // sizes itself off its container gets the corrected size as the layout evolves.
     trust.updateResizes = function () {
+        if (roInitialUpdateTimer !== null) {
+            g.clearTimeout(roInitialUpdateTimer);
+            roInitialUpdateTimer = null;
+        }
         if (!RO.length) return 0;
         let delivered = 0;
         const observers = RO.slice();
@@ -7391,6 +7529,7 @@
             domTasks.push({ fn: fn, frame: frame === undefined ? (trust.__activeFrame || null) : frame });
         }
     };
+    const intersectionTasks = [];
     const messageTasks = [];
     const __queue_message_task = function (fn) {
         if (typeof fn === "function") {
@@ -9276,15 +9415,16 @@
     };
     // HTML leaves selection among runnable task sources implementation-defined,
     // while requiring the event loop to keep making progress. Rotate among the
-    // five represented sources so a self-replenishing source cannot starve
+    // six represented sources so a self-replenishing source cannot starve
     // another one. FIFO ordering remains intact within each source.
     let platformSourceCursor = 0;
     trust.hasPlatformTask = function () {
-        return networkTasks.length > 0 || domTasks.length > 0 || trust.hasMessageTask() || idleTasks.length > 0;
+        return networkTasks.length > 0 || domTasks.length > 0 || intersectionTasks.length > 0 ||
+            trust.hasMessageTask() || idleTasks.length > 0;
     };
     trust.runPlatformTask = function () {
-        for (let offset = 0; offset < 5; offset++) {
-            const source = (platformSourceCursor + offset) % 5;
+        for (let offset = 0; offset < 6; offset++) {
+            const source = (platformSourceCursor + offset) % 6;
             let task = null;
             let label = "";
             if (source === 0 && networkTasks.length) {
@@ -9297,12 +9437,14 @@
             } else if (source === 3 && trust.hasPortMessageTask()) {
                 platformSourceCursor = 4;
                 return trust.runPortMessageTask();
-            } else if (source === 4 && idleTasks.length) {
+            } else if (source === 4 && intersectionTasks.length) {
+                task = intersectionTasks.shift(); label = "IntersectionObserver task";
+            } else if (source === 5 && idleTasks.length) {
                 platformSourceCursor = 0;
                 return trust.runIdleTask();
             }
             if (task) {
-                platformSourceCursor = (source + 1) % 5;
+                platformSourceCursor = (source + 1) % 6;
                 try { runInFrame(task.frame, task.fn); }
                 catch (e) { trust.errors.push(label + ": " + ((e && e.message) || e)); }
                 return true;
@@ -9330,6 +9472,7 @@
             ",raf=" + animationFrames.q.length +
             ",idle=" + idleCallbacks.pending.length + "/" + idleCallbacks.runnable.length + "/" + idleTasks.length +
             ",network=" + networkTasks.length + ",dom=" + domTasks.length +
+            ",intersection=" + intersectionTasks.length +
             ",posted=" + messageTasks.length + ",next=[" + sample + "]";
     };
 

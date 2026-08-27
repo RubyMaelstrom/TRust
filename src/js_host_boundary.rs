@@ -17,6 +17,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_set_hover", 1),
     ("__dom_children", 1),
     ("__dom_slot_assigned", 1),
+    ("__dom_assigned_slot", 1),
     ("__dom_next", 1),
     ("__dom_prev", 1),
     ("__dom_node_type", 1),
