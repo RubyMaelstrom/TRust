@@ -185,6 +185,44 @@ impl ControlStack {
         self.consume_fuel_instr = consume_fuel;
     }
 
+    /// Pushes a legacy WebAssembly `try` onto the control stack.
+    pub fn push_try(
+        &mut self,
+        ty: BlockType,
+        height: usize,
+        label: LabelRef,
+        handler: LabelRef,
+        try_id: u32,
+        consume_fuel: Option<Instr>,
+    ) {
+        debug_assert!(!self.orphaned_else_operands);
+        self.frames.push(ControlFrame::Try(TryControlFrame {
+            ty,
+            height: StackHeight::from(height),
+            is_branched_to: false,
+            consume_fuel,
+            label,
+            handler,
+            next_catch: handler,
+            try_id,
+            catch_all: false,
+        }));
+        self.consume_fuel_instr = consume_fuel;
+    }
+
+    /// Pushes a legacy `catch` or `catch_all` clause frame.
+    pub fn push_catch(
+        &mut self,
+        mut frame: TryControlFrame,
+        catch_all: bool,
+        next_catch: LabelRef,
+    ) {
+        debug_assert!(!self.orphaned_else_operands);
+        frame.catch_all = catch_all;
+        frame.next_catch = next_catch;
+        self.frames.push(ControlFrame::Catch(frame));
+    }
+
     /// Pushes a new Wasm `else` onto the [`ControlStack`].
     ///
     /// Returns iterator yielding the memorized `else` operands.
@@ -350,6 +388,81 @@ impl ControlStack {
     }
 }
 
+/// The shared state of a legacy `try` and its catch clauses.
+#[derive(Debug, Copy, Clone)]
+pub struct TryControlFrame {
+    /// The block type of the legacy exception construct.
+    ty: BlockType,
+    /// The value stack height upon entering the construct.
+    height: StackHeight,
+    /// Whether a branch targets the construct's label.
+    is_branched_to: bool,
+    /// The fuel instruction associated with the construct.
+    consume_fuel: Option<Instr>,
+    /// The label used to branch to the construct's end.
+    label: LabelRef,
+    /// The label of the first catch clause.
+    handler: LabelRef,
+    /// The label of the next catch clause or the fallback rethrow.
+    next_catch: LabelRef,
+    /// The stable identity used by runtime handler state.
+    try_id: u32,
+    /// Whether this frame represents `catch_all`.
+    catch_all: bool,
+}
+
+impl TryControlFrame {
+    /// Returns the runtime identity of the enclosing legacy `try`.
+    pub fn try_id(&self) -> u32 {
+        self.try_id
+    }
+
+    /// Returns the label of the first catch clause.
+    pub fn handler(&self) -> LabelRef {
+        self.handler
+    }
+
+    /// Returns the label of the next catch clause or fallback rethrow.
+    pub fn next_catch(&self) -> LabelRef {
+        self.next_catch
+    }
+
+    /// Returns whether this is a `catch_all` frame.
+    pub fn is_catch_all(&self) -> bool {
+        self.catch_all
+    }
+}
+
+impl ControlFrameBase for TryControlFrame {
+    fn ty(&self) -> BlockType {
+        self.ty
+    }
+
+    fn height(&self) -> usize {
+        self.height.into()
+    }
+
+    fn label(&self) -> LabelRef {
+        self.label
+    }
+
+    fn is_branched_to(&self) -> bool {
+        self.is_branched_to
+    }
+
+    fn branch_to(&mut self) {
+        self.is_branched_to = true;
+    }
+
+    fn len_branch_params(&self, engine: &Engine) -> u16 {
+        self.ty.len_results(engine)
+    }
+
+    fn consume_fuel_instr(&self) -> Option<Instr> {
+        self.consume_fuel
+    }
+}
+
 /// A Wasm control frame.
 #[derive(Debug)]
 pub enum ControlFrame {
@@ -361,6 +474,10 @@ pub enum ControlFrame {
     If(IfControlFrame),
     /// A Wasm `else` control frame.
     Else(ElseControlFrame),
+    /// A legacy WebAssembly `try` control frame.
+    Try(TryControlFrame),
+    /// A legacy WebAssembly `catch` or `catch_all` control frame.
+    Catch(TryControlFrame),
     /// A generic unreachable control frame.
     Unreachable(ControlFrameKind),
 }
@@ -386,6 +503,12 @@ impl From<IfControlFrame> for ControlFrame {
 impl From<ElseControlFrame> for ControlFrame {
     fn from(frame: ElseControlFrame) -> Self {
         Self::Else(frame)
+    }
+}
+
+impl From<TryControlFrame> for ControlFrame {
+    fn from(frame: TryControlFrame) -> Self {
+        Self::Try(frame)
     }
 }
 
@@ -428,6 +551,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.ty(),
             ControlFrame::If(frame) => frame.ty(),
             ControlFrame::Else(frame) => frame.ty(),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.ty(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrameBase::ty`")
             }
@@ -440,6 +564,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.height(),
             ControlFrame::If(frame) => frame.height(),
             ControlFrame::Else(frame) => frame.height(),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.height(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrameBase::height`")
             }
@@ -452,6 +577,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.label(),
             ControlFrame::If(frame) => frame.label(),
             ControlFrame::Else(frame) => frame.label(),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.label(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::label`")
             }
@@ -464,6 +590,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.is_branched_to(),
             ControlFrame::If(frame) => frame.is_branched_to(),
             ControlFrame::Else(frame) => frame.is_branched_to(),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.is_branched_to(),
             ControlFrame::Unreachable(_) => {
                 panic!(
                     "invalid query for unreachable control frame: `ControlFrame::is_branched_to`"
@@ -478,6 +605,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.branch_to(),
             ControlFrame::If(frame) => frame.branch_to(),
             ControlFrame::Else(frame) => frame.branch_to(),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.branch_to(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::branch_to`")
             }
@@ -490,6 +618,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.len_branch_params(engine),
             ControlFrame::If(frame) => frame.len_branch_params(engine),
             ControlFrame::Else(frame) => frame.len_branch_params(engine),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.len_branch_params(engine),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::len_branch_params`")
             }
@@ -502,6 +631,7 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.consume_fuel_instr(),
             ControlFrame::If(frame) => frame.consume_fuel_instr(),
             ControlFrame::Else(frame) => frame.consume_fuel_instr(),
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.consume_fuel_instr(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::consume_fuel_instr`")
             }
@@ -823,4 +953,10 @@ pub enum ControlFrameKind {
     If,
     /// An Wasm `else` control frame.
     Else,
+    /// A legacy WebAssembly `try` control frame.
+    Try,
+    /// A legacy WebAssembly `catch` control frame.
+    Catch,
+    /// A legacy WebAssembly `catch_all` control frame.
+    CatchAll,
 }

@@ -30,6 +30,23 @@ macro_rules! impl_binary_executors {
 }
 
 impl Executor<'_> {
+    /// Records a Wasm write after the access helper has finished borrowing the memory bytes.
+    #[inline]
+    pub fn mark_memory_dirty(
+        &self,
+        store: &mut StoreInner,
+        memory: Memory,
+        address: u64,
+        len: usize,
+    ) {
+        if let Ok(address) = usize::try_from(address) {
+            let memory = self.get_memory(memory);
+            store
+                .resolve_memory_mut(&memory)
+                .mark_dirty_range(address, len);
+        }
+    }
+
     /// Returns the register `value` and `offset` parameters for a `load` [`Op`].
     pub fn fetch_value_and_offset_hi(&self) -> (Slot, Offset64Hi) {
         // Safety: Wasmi translation guarantees that `Op::SlotAndImm32` exists.
@@ -112,6 +129,6 @@ impl Executor<'_> {
         'store: 'bytes,
     {
         let memory = self.get_memory(memory);
-        store.resolve_memory_mut(&memory).data_mut()
+        store.resolve_memory_mut(&memory).data_mut_untracked()
     }
 }

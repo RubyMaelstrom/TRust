@@ -60,7 +60,7 @@ impl CallStack {
 
     /// Returns the number of [`CallFrame`]s on the [`CallStack`].
     #[inline(always)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.frames.len()
     }
 

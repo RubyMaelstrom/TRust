@@ -237,6 +237,17 @@ macro_rules! impl_visit_operator {
         }
         impl_visit_operator!($($rest)*);
     };
+    ( @exceptions TryTable { $arg:ident: $argty:ty } => $visit:ident $_ann:tt $($rest:tt)* ) => {
+        fn $visit(&mut self, $arg: $argty) -> Self::Output {
+            let offset = self.current_pos();
+            let arg_cloned = $arg.clone();
+            self.validate_then_translate(
+                move |validator| validator.visitor(offset).$visit(arg_cloned),
+                move |translator| translator.$visit($arg),
+            )
+        }
+        impl_visit_operator!($($rest)*);
+    };
     ( @reference_types TypedSelectMulti { tys: $tys_type:ty } => $visit:ident $_ann:tt $($rest:tt)* ) => {
         fn $visit(&mut self, tys: $tys_type) -> Self::Output {
             let offset = self.current_pos();
@@ -267,6 +278,12 @@ macro_rules! impl_visit_operator {
         impl_visit_operator!(@@supported $($rest)*);
     };
     ( @wide_arithmetic $($rest:tt)* ) => {
+        impl_visit_operator!(@@supported $($rest)*);
+    };
+    ( @exceptions $($rest:tt)* ) => {
+        impl_visit_operator!(@@supported $($rest)*);
+    };
+    ( @legacy_exceptions $($rest:tt)* ) => {
         impl_visit_operator!(@@supported $($rest)*);
     };
     ( @@supported $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident $_ann:tt $($rest:tt)* ) => {

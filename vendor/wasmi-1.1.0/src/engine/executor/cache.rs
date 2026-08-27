@@ -219,7 +219,7 @@ impl CachedMemory {
     /// [`Memory`]: crate::Memory
     #[inline]
     fn load_default_memory(ctx: &mut StoreInner, memory: &Memory) -> NonNull<[u8]> {
-        ctx.resolve_memory_mut(memory).data_mut().into()
+        ctx.resolve_memory_mut(memory).data_mut_untracked().into()
     }
 
     /// Returns a shared slice to the bytes of the cached default linear memory.

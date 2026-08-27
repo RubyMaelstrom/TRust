@@ -31,6 +31,7 @@ use wasmparser::{
     Parser as WasmParser,
     Payload,
     TableSectionReader,
+    TagSectionReader,
     TypeSectionReader,
     Validator,
 };
@@ -151,6 +152,21 @@ impl ModuleParser {
             .map(|import| import.map(Import::from).map_err(Error::from));
         module.push_imports(imports)?;
         Ok(())
+    }
+
+    /// Process module exception tag declarations.
+    fn process_tags(
+        &mut self,
+        section: TagSectionReader,
+        module: &mut ModuleBuilder,
+    ) -> Result<(), Error> {
+        if let Some(validator) = &mut self.validator {
+            validator.tag_section(&section)?;
+        }
+        let tags = section
+            .into_iter()
+            .map(|tag| tag.map(|tag| FuncTypeIdx::from(tag.func_type_idx)).map_err(Error::from));
+        module.push_tags(tags)
     }
 
     /// Process module function declarations.

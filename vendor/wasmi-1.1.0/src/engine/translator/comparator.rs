@@ -840,6 +840,11 @@ impl UpdateBranchOffset for Op {
                 offset.init(new_offset);
                 return Ok(());
             }
+            | Op::ExceptionTry { handler: offset, .. }
+            | Op::ExceptionCatch { next: offset, .. } => {
+                offset.init(new_offset);
+                return Ok(());
+            }
             _ => {}
         };
         let offset = match self {

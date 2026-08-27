@@ -30,6 +30,10 @@ impl PageWasm {
 struct MemorySlot {
     memory: wasmi::Memory,
     buffer_pages: u64,
+    /// Last JS-side ArrayBuffer generation committed to Wasmi.
+    js_version: u64,
+    /// Last Wasmi-side memory generation exposed to the JS ArrayBuffer mirror.
+    wasm_version: u64,
 }
 
 struct WasmState {
@@ -98,6 +102,8 @@ impl WasmState {
         self.memories.push(MemorySlot {
             memory: value,
             buffer_pages: pages,
+            js_version: 0,
+            wasm_version: value.data_version(&self.store),
         });
         index
     }
@@ -461,38 +467,89 @@ fn module_for_page(page: &PageWasm, id: Option<usize>) -> Option<wasmi::Module> 
     }
 }
 
-fn sync_store_from_buffers(ctx: &Ctx, state: &mut WasmState, buffers: &[Option<Value>]) {
-    for (index, slot) in state.memories.iter().enumerate() {
+fn sync_store_from_buffers(ctx: &mut Ctx, state: &mut WasmState, buffers: &[Option<Value>]) {
+    for (index, slot) in state.memories.iter_mut().enumerate() {
         let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
             continue;
         };
-        let Some(bytes) = ctx.buffer_source_bytes(buffer, false) else {
+        let version = ctx.array_buffer_version(buffer).unwrap_or(0);
+        if version == slot.js_version {
             continue;
-        };
+        }
+        let dirty_ranges = ctx
+            .take_array_buffer_dirty_ranges(buffer)
+            .unwrap_or_default();
         let data = slot.memory.data_mut(&mut state.store);
-        if data.len() == bytes.len() {
-            data.copy_from_slice(&bytes);
+        let mirrored = if dirty_ranges.is_empty() {
+            let Some(bytes) = ctx.buffer_source_bytes(buffer, false) else {
+                continue;
+            };
+            if data.len() != bytes.len() {
+                false
+            } else {
+                data.copy_from_slice(&bytes);
+                true
+            }
+        } else {
+            dirty_ranges.iter().all(|range| {
+                let Some(destination) = data.get_mut(range.clone()) else {
+                    return false;
+                };
+                let Some(length) = range.end.checked_sub(range.start) else {
+                    return false;
+                };
+                if !ctx.array_buffer_copy_range(buffer, range.start, length, destination) {
+                    return false;
+                }
+                true
+            })
+        };
+        if mirrored {
+            let _ = slot.memory.take_dirty_ranges(&mut state.store);
+            slot.js_version = version;
+            slot.wasm_version = slot.memory.data_version(&state.store);
         }
     }
 }
 
 fn sync_buffers_from_store(ctx: &mut Ctx, state: &mut WasmState, buffers: &mut [Option<Value>]) {
     for index in 0..state.memories.len() {
-        let memory = state.memories[index].memory;
+        let slot = &mut state.memories[index];
+        let memory = slot.memory;
         let pages = memory.size(&state.store);
-        if pages != state.memories[index].buffer_pages {
-            state.memories[index].buffer_pages = pages;
+        let dirty_ranges = memory.take_dirty_ranges(&mut state.store);
+        if pages != slot.buffer_pages {
+            slot.buffer_pages = pages;
+            slot.wasm_version = memory.data_version(&state.store);
             if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
                 ctx.detach_array_buffer(&buffer);
             }
             continue;
         }
+        let version = memory.data_version(&state.store);
+        if version == slot.wasm_version && dirty_ranges.is_empty() {
+            continue;
+        }
         let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
+            slot.wasm_version = version;
             continue;
         };
-        if !ctx.array_buffer_set_bytes(buffer, memory.data(&state.store))
-            && let Some(buffer) = buffers.get_mut(index).and_then(Option::take)
-        {
+        let data = memory.data(&state.store);
+        let ranges = if dirty_ranges.is_empty() {
+            std::iter::once(0..data.len()).collect::<Vec<_>>()
+        } else {
+            dirty_ranges
+        };
+        let mirrored = ranges.iter().all(|range| {
+            let Some(bytes) = data.get(range.clone()) else {
+                return false;
+            };
+            ctx.array_buffer_set_range(buffer, range.start, bytes)
+        });
+        if mirrored {
+            slot.wasm_version = version;
+            slot.js_version = ctx.array_buffer_version(buffer).unwrap_or(slot.js_version);
+        } else if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
             ctx.detach_array_buffer(&buffer);
         }
     }
@@ -506,21 +563,42 @@ fn sync_active_buffers_to_js(ctx: &mut Ctx) {
     let _ = with_active_caller(|caller| {
         let _ = with_active_state(|state| {
             for index in 0..state.memories.len() {
-                let memory = state.memories[index].memory;
+                let slot = &mut state.memories[index];
+                let memory = slot.memory;
                 let pages = memory.size(&*caller);
-                if pages != state.memories[index].buffer_pages {
-                    state.memories[index].buffer_pages = pages;
+                let dirty_ranges = memory.take_dirty_ranges(&mut *caller);
+                if pages != slot.buffer_pages {
+                    slot.buffer_pages = pages;
+                    slot.wasm_version = memory.data_version(&*caller);
                     if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
                         ctx.detach_array_buffer(&buffer);
                     }
                     continue;
                 }
+                let version = memory.data_version(&*caller);
+                if version == slot.wasm_version && dirty_ranges.is_empty() {
+                    continue;
+                }
                 let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
+                    slot.wasm_version = version;
                     continue;
                 };
-                if !ctx.array_buffer_set_bytes(buffer, memory.data(&*caller))
-                    && let Some(buffer) = buffers.get_mut(index).and_then(Option::take)
-                {
+                let data = memory.data(&*caller);
+                let ranges = if dirty_ranges.is_empty() {
+                    std::iter::once(0..data.len()).collect::<Vec<_>>()
+                } else {
+                    dirty_ranges
+                };
+                let mirrored = ranges.iter().all(|range| {
+                    let Some(bytes) = data.get(range.clone()) else {
+                        return false;
+                    };
+                    ctx.array_buffer_set_range(buffer, range.start, bytes)
+                });
+                if mirrored {
+                    slot.wasm_version = version;
+                    slot.js_version = ctx.array_buffer_version(buffer).unwrap_or(slot.js_version);
+                } else if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
                     ctx.detach_array_buffer(&buffer);
                 }
             }
@@ -539,16 +617,46 @@ fn sync_active_buffers_to_wasm(ctx: &mut Ctx) {
     let buffers = page.buffers.borrow();
     let _ = with_active_caller(|caller| {
         let _ = with_active_state(|state| {
-            for (index, slot) in state.memories.iter().enumerate() {
+            for (index, slot) in state.memories.iter_mut().enumerate() {
                 let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
                     continue;
                 };
-                let Some(bytes) = ctx.buffer_source_bytes(buffer, false) else {
+                let version = ctx.array_buffer_version(buffer).unwrap_or(0);
+                if version == slot.js_version {
                     continue;
-                };
+                }
+                let dirty_ranges = ctx
+                    .take_array_buffer_dirty_ranges(buffer)
+                    .unwrap_or_default();
                 let data = slot.memory.data_mut(&mut *caller);
-                if data.len() == bytes.len() {
-                    data.copy_from_slice(&bytes);
+                let mirrored = if dirty_ranges.is_empty() {
+                    let Some(bytes) = ctx.buffer_source_bytes(buffer, false) else {
+                        continue;
+                    };
+                    if data.len() != bytes.len() {
+                        false
+                    } else {
+                        data.copy_from_slice(&bytes);
+                        true
+                    }
+                } else {
+                    dirty_ranges.iter().all(|range| {
+                        let Some(destination) = data.get_mut(range.clone()) else {
+                            return false;
+                        };
+                        let Some(length) = range.end.checked_sub(range.start) else {
+                            return false;
+                        };
+                        if !ctx.array_buffer_copy_range(buffer, range.start, length, destination) {
+                            return false;
+                        }
+                        true
+                    })
+                };
+                if mirrored {
+                    let _ = slot.memory.take_dirty_ranges(&mut *caller);
+                    slot.js_version = version;
+                    slot.wasm_version = slot.memory.data_version(&*caller);
                 }
             }
         });
@@ -1231,6 +1339,14 @@ pub(super) fn host_instance_exports(
                 return Ok(ctx.make_array(Vec::new()));
             };
             for (name, kind) in descriptors {
+                let function_arity = if kind == "function" {
+                    instance
+                        .get_func(&state.store, &name)
+                        .map(|function| function.ty(&state.store).params().len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 let id = match kind {
                     "function" => instance
                         .get_func(&state.store, &name)
@@ -1247,7 +1363,9 @@ pub(super) fn host_instance_exports(
                     _ => None,
                 };
                 let Some(id) = id else { continue };
-                let auxiliary = if kind == "table" {
+                let auxiliary = if kind == "function" {
+                    function_arity.to_string()
+                } else if kind == "table" {
                     state
                         .tables
                         .get(id)
@@ -1257,8 +1375,9 @@ pub(super) fn host_instance_exports(
                             _ => "",
                         })
                         .unwrap_or("")
+                        .to_string()
                 } else {
-                    ""
+                    String::new()
                 };
                 output.push(Value::from_string(name));
                 output.push(Value::from_string(kind.to_string()));
@@ -1271,6 +1390,17 @@ pub(super) fn host_instance_exports(
                 return Ok(ctx.make_array(Vec::new()));
             };
             for (name, kind) in descriptors {
+                let function_arity = if kind == "function" {
+                    with_active_caller(|caller| {
+                        instance
+                            .get_func(&*caller, &name)
+                            .map(|function| function.ty(&*caller).params().len())
+                    })
+                    .flatten()
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
                 let registered = with_active_caller(|caller| match kind {
                     "function" => instance
                         .get_func(&*caller, &name)
@@ -1289,7 +1419,9 @@ pub(super) fn host_instance_exports(
                 })
                 .flatten();
                 let Some(id) = registered else { continue };
-                let auxiliary = if kind == "table" {
+                let auxiliary = if kind == "function" {
+                    function_arity.to_string()
+                } else if kind == "table" {
                     with_active_caller(|caller| {
                         instance.get_table(&*caller, &name).map(|table| {
                             match table.ty(&*caller).element() {
@@ -1301,8 +1433,9 @@ pub(super) fn host_instance_exports(
                     })
                     .flatten()
                     .unwrap_or("")
+                    .to_string()
                 } else {
-                    ""
+                    String::new()
                 };
                 output.push(Value::from_string(name));
                 output.push(Value::from_string(kind.to_string()));
@@ -1777,6 +1910,37 @@ pub(super) fn host_memory_buffer(
     let Some(id) = arg_id(args, 0) else {
         return Ok(Value::Undefined);
     };
+    let existing_buffer = {
+        page.buffers
+            .borrow()
+            .get(id)
+            .and_then(Option::as_ref)
+            .cloned()
+    };
+    if let Some(buffer) = existing_buffer {
+        let unchanged = match page.state.try_borrow() {
+            Ok(state) => state.as_ref().is_some_and(|state| {
+                state
+                    .memories
+                    .get(id)
+                    .is_some_and(|slot| slot.memory.data_version(&state.store) == slot.wasm_version)
+            }),
+            Err(_) => {
+                // A memory.buffer getter may run from an imported callback while the Wasmi store
+                // is active. Bring only changed Wasmi memory into the existing JS object; the
+                // helper also handles growth by detaching the old object.
+                sync_active_buffers_to_js(ctx);
+                page.buffers
+                    .borrow()
+                    .get(id)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|current| ctx.object_addr(current) == ctx.object_addr(&buffer))
+            }
+        };
+        if unchanged {
+            return Ok(buffer);
+        }
+    }
     let bytes = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {
             let Some(state) = state_slot.as_mut() else {
@@ -1820,6 +1984,15 @@ pub(super) fn host_memory_buffer(
         .cloned()
         && ctx.array_buffer_set_bytes(&buffer, &bytes)
     {
+        let version = ctx.array_buffer_version(&buffer).unwrap_or(0);
+        if let Ok(mut state) = page.state.try_borrow_mut()
+            && let Some(state) = state.as_mut()
+            && let Some(slot) = state.memories.get_mut(id)
+        {
+            let _ = slot.memory.take_dirty_ranges(&mut state.store);
+            slot.wasm_version = slot.memory.data_version(&state.store);
+            slot.js_version = version;
+        }
         return Ok(buffer);
     }
     let buffer = ctx.make_host_keyed_array_buffer(&bytes)?;
@@ -1828,6 +2001,15 @@ pub(super) fn host_memory_buffer(
         buffers.resize(id + 1, None);
     }
     buffers[id] = Some(buffer.clone());
+    let version = ctx.array_buffer_version(&buffer).unwrap_or(0);
+    if let Ok(mut state) = page.state.try_borrow_mut()
+        && let Some(state) = state.as_mut()
+        && let Some(slot) = state.memories.get_mut(id)
+    {
+        let _ = slot.memory.take_dirty_ranges(&mut state.store);
+        slot.wasm_version = slot.memory.data_version(&state.store);
+        slot.js_version = version;
+    }
     Ok(buffer)
 }
 

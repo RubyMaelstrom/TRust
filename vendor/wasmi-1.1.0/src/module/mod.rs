@@ -79,6 +79,7 @@ struct ModuleHeaderInner {
     memories: Box<[MemoryType]>,
     globals: Box<[GlobalType]>,
     globals_init: Box<[ConstExpr]>,
+    tags: Box<[FuncTypeIdx]>,
     exports: Map<Box<str>, ExternIdx>,
     export_order: Box<[Box<str>]>,
     start: Option<FuncIdx>,
@@ -115,6 +116,12 @@ impl ModuleHeader {
     /// Returns the [`TableType`] of the indexed Wasm table.
     pub fn get_type_of_table(&self, table_idx: TableIdx) -> &TableType {
         &self.inner.tables[table_idx.into_u32() as usize]
+    }
+
+    /// Returns the function type associated with a legacy exception tag.
+    pub fn get_type_of_tag(&self, tag_idx: u32) -> &DedupFuncType {
+        let func_type_idx = self.inner.tags[tag_idx as usize];
+        self.get_func_type(func_type_idx)
     }
 
     /// Returns the [`EngineFunc`] for the given [`FuncIdx`].

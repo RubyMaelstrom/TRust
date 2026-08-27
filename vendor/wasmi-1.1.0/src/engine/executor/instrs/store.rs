@@ -69,8 +69,17 @@ impl Executor<'_> {
     where
         UntypedVal: ReadAs<T>,
     {
-        let memory = self.fetch_memory_bytes_mut(memory, store);
-        store_wrap(memory, address, u64::from(offset), value)?;
+        let result = {
+            let memory_bytes = self.fetch_memory_bytes_mut(memory, store);
+            store_wrap(memory_bytes, address, u64::from(offset), value)
+        };
+        result?;
+        self.mark_memory_dirty(
+            store,
+            memory,
+            address.saturating_add(u64::from(offset)),
+            core::mem::size_of::<T>(),
+        );
         Ok(())
     }
 
@@ -92,8 +101,17 @@ impl Executor<'_> {
         value: T,
         store_wrap_at: WasmStoreAtOp<T>,
     ) -> Result<(), Error> {
-        let memory = self.fetch_memory_bytes_mut(memory, store);
-        store_wrap_at(memory, usize::from(address), value)?;
+        let result = {
+            let memory_bytes = self.fetch_memory_bytes_mut(memory, store);
+            store_wrap_at(memory_bytes, usize::from(address), value)
+        };
+        result?;
+        self.mark_memory_dirty(
+            store,
+            memory,
+            usize::from(address) as u64,
+            core::mem::size_of::<T>(),
+        );
         Ok(())
     }
 
@@ -109,6 +127,7 @@ impl Executor<'_> {
     /// - `i64.store32`
     fn execute_store_wrap_mem0<T>(
         &mut self,
+        store: &mut StoreInner,
         address: u64,
         offset: Offset64,
         value: T,
@@ -117,8 +136,17 @@ impl Executor<'_> {
     where
         UntypedVal: ReadAs<T>,
     {
-        let memory = self.fetch_default_memory_bytes_mut();
-        store_wrap(memory, address, u64::from(offset), value)?;
+        let result = {
+            let memory = self.fetch_default_memory_bytes_mut();
+            store_wrap(memory, address, u64::from(offset), value)
+        };
+        result?;
+        self.mark_memory_dirty(
+            store,
+            Memory::from(0),
+            address.saturating_add(u64::from(offset)),
+            core::mem::size_of::<T>(),
+        );
         Ok(())
     }
 
@@ -162,6 +190,7 @@ impl Executor<'_> {
 
     fn execute_store_offset16<T>(
         &mut self,
+        store: &mut StoreInner,
         ptr: Slot,
         offset: Offset16,
         value: Slot,
@@ -172,12 +201,19 @@ impl Executor<'_> {
     {
         let ptr = self.get_stack_slot_as::<u64>(ptr);
         let value = self.get_stack_slot_as::<T>(value);
-        self.execute_store_wrap_mem0::<T>(ptr, Offset64::from(offset), value, store_op)?;
+        self.execute_store_wrap_mem0::<T>(
+            store,
+            ptr,
+            Offset64::from(offset),
+            value,
+            store_op,
+        )?;
         self.try_next_instr()
     }
 
     fn execute_store_offset16_imm16<T>(
         &mut self,
+        store: &mut StoreInner,
         ptr: Slot,
         offset: Offset16,
         value: T,
@@ -187,7 +223,13 @@ impl Executor<'_> {
         UntypedVal: ReadAs<T>,
     {
         let ptr = self.get_stack_slot_as::<u64>(ptr);
-        self.execute_store_wrap_mem0::<T>(ptr, Offset64::from(offset), value, store_op)?;
+        self.execute_store_wrap_mem0::<T>(
+            store,
+            ptr,
+            Offset64::from(offset),
+            value,
+            store_op,
+        )?;
         self.try_next_instr()
     }
 
@@ -252,11 +294,12 @@ macro_rules! impl_execute_istore {
             #[allow(clippy::cast_lossless)]
             pub fn $fn_store_off16_imm16(
                 &mut self,
+                store: &mut StoreInner,
                 ptr: Slot,
                 offset: Offset16,
                 value: $from_ty,
             ) -> Result<(), Error> {
-                self.execute_store_offset16_imm16::<$ty>(ptr, offset, <$to_ty>::from(value) as _, $store_fn)
+                self.execute_store_offset16_imm16::<$ty>(store, ptr, offset, <$to_ty>::from(value) as _, $store_fn)
             }
 
             #[doc = concat!("Executes an [`Op::", stringify!($var_store_at_imm16), "`].")]
@@ -332,11 +375,12 @@ macro_rules! impl_execute_istore_trunc {
             #[doc = concat!("Executes an [`Op::", stringify!($var_store_off16), "`].")]
             pub fn $fn_store_off16(
                 &mut self,
+                store: &mut StoreInner,
                 ptr: Slot,
                 offset: Offset16,
                 value: Slot,
             ) -> Result<(), Error> {
-                self.execute_store_offset16::<$ty>(ptr, offset, value, $store_fn)
+                self.execute_store_offset16::<$ty>(store, ptr, offset, value, $store_fn)
             }
 
             #[doc = concat!("Executes an [`Op::", stringify!($var_store_at), "`].")]
@@ -431,11 +475,12 @@ macro_rules! impl_execute_store {
             #[doc = concat!("Executes an [`Op::", stringify!($var_store_off16), "`].")]
             pub fn $fn_store_off16(
                 &mut self,
+                store: &mut StoreInner,
                 ptr: Slot,
                 offset: Offset16,
                 value: Slot,
             ) -> Result<(), Error> {
-                self.execute_store_offset16::<$ty>(ptr, offset, value, $store_fn)
+                self.execute_store_offset16::<$ty>(store, ptr, offset, value, $store_fn)
             }
 
             #[doc = concat!("Executes an [`Op::", stringify!($var_store_at), "`].")]

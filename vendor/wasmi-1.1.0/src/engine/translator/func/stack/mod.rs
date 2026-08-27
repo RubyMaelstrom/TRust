@@ -20,6 +20,7 @@ pub use self::{
         IfControlFrame,
         IfReachability,
         LoopControlFrame,
+        TryControlFrame,
     },
     operand::{ImmediateOperand, Operand, TempOperand},
     operands::{OperandIdx, PreservedAllLocalsIter, PreservedLocalsIter},
@@ -244,6 +245,39 @@ impl Stack {
             reachability,
             else_operands,
         );
+        Ok(())
+    }
+
+    /// Pushes a legacy Wasm `try` onto the [`Stack`].
+    pub fn push_try(
+        &mut self,
+        ty: BlockType,
+        handler: LabelRef,
+        end: LabelRef,
+        try_id: u32,
+    ) -> Result<(), Error> {
+        debug_assert!(!self.controls.is_empty());
+        let len_params = usize::from(ty.len_params(&self.engine));
+        let block_height = self.height() - len_params;
+        debug_assert!(self
+            .operands
+            .peek(len_params)
+            .all(|operand| operand.is_temp()));
+        let consume_fuel = self.consume_fuel_instr();
+        self.controls
+            .push_try(ty, block_height, end, handler, try_id, consume_fuel);
+        Ok(())
+    }
+
+    /// Replaces the current legacy `try` control frame with a catch clause.
+    pub fn push_catch(
+        &mut self,
+        frame: TryControlFrame,
+        catch_all: bool,
+        next_catch: LabelRef,
+    ) -> Result<(), Error> {
+        debug_assert!(!self.controls.is_empty());
+        self.controls.push_catch(frame, catch_all, next_catch);
         Ok(())
     }
 

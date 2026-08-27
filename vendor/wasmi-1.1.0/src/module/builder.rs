@@ -42,6 +42,7 @@ pub struct ModuleBuilder {
     pub memories: Vec<MemoryType>,
     pub globals: Vec<GlobalType>,
     pub globals_init: Vec<ConstExpr>,
+    pub tags: Vec<FuncTypeIdx>,
     pub exports: Map<Box<str>, ExternIdx>,
     pub export_order: Vec<Box<str>>,
     pub start: Option<FuncIdx>,
@@ -64,6 +65,7 @@ impl ModuleBuilder {
             memories: Vec::new(),
             globals: Vec::new(),
             globals_init: Vec::new(),
+            tags: Vec::new(),
             exports: Map::new(),
             export_order: Vec::new(),
             start: None,
@@ -103,6 +105,7 @@ impl ModuleBuilder {
                 memories: take(&mut self.memories).into(),
                 globals: take(&mut self.globals).into(),
                 globals_init: take(&mut self.globals_init).into(),
+                tags: take(&mut self.tags).into(),
                 exports: take(&mut self.exports),
                 export_order: take(&mut self.export_order).into(),
                 start: self.start,
@@ -256,6 +259,15 @@ impl ModuleBuilder {
             let func_type = self.func_types[func_type_idx.into_u32() as usize];
             self.funcs.push(func_type);
         }
+        Ok(())
+    }
+
+    /// Pushes the exception tag declarations to the module under construction.
+    pub fn push_tags<T>(&mut self, tags: T) -> Result<(), Error>
+    where
+        T: IntoIterator<Item = Result<FuncTypeIdx, Error>>,
+    {
+        self.tags = tags.into_iter().collect::<Result<Vec<_>, _>>()?;
         Ok(())
     }
 
