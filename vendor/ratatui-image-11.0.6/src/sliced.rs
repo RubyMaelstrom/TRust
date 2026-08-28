@@ -373,8 +373,17 @@ mod sixel_slice {
         font_height: u16,
         is_tmux: bool,
         header: &'a str,
+        raster_height: Option<RasterHeight>,
         bands: Vec<&'a str>,
     }
+
+    #[derive(Clone, Copy)]
+    struct RasterHeight {
+        value: usize,
+        start: usize,
+        end: usize,
+    }
+
     impl<'a> SlicedSixelData<'a> {
         /// Render this slice, reusing a previously built byte-string when the
         /// slice key (`skip`/`drop` + target cell box) is unchanged. The
@@ -424,8 +433,21 @@ mod sixel_slice {
             sixel::render(&data, area, buf);
         }
 
+        fn band_window(
+            &self,
+            skip_line_count: usize,
+            drop_line_count: usize,
+        ) -> (usize, usize) {
+            let font_height = self.font_height as usize;
+            let skip_bands = skip_line_count.saturating_mul(font_height).div_ceil(6);
+            let visible_rows = (self.size.height as usize).saturating_sub(drop_line_count);
+            let bottom_band = visible_rows.saturating_mul(font_height) / 6;
+            (skip_bands, bottom_band)
+        }
+
         fn bands(&self, skip_line_count: usize, drop_line_count: usize) -> Vec<&str> {
-            let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
+            let (skip_bands, bottom_band) =
+                self.band_window(skip_line_count, drop_line_count);
 
             let bands: Vec<&str> = self.bands.to_vec();
             // The band index of the visible region's BOTTOM edge, counted from
@@ -437,9 +459,6 @@ mod sixel_slice {
             // `skip_bands * 6` pixels PAST the bottom of its cell box — over the
             // status bar and off the screen bottom, which scrolls the terminal
             // and leaves the title row + scrollbar corrupted until a full redraw.
-            let bottom_band = (((self.size.height.saturating_sub(drop_line_count as u16))
-                * self.font_height)
-                / 6) as usize;
             let take_bands = bottom_band.saturating_sub(skip_bands);
 
             let sliced_bands: Vec<&str> = bands
@@ -476,9 +495,26 @@ mod sixel_slice {
             let mut data = String::from("\x1b7");
             data.push_str(start);
             clear_area(&mut data, escape, width, height);
-            data.push_str(self.header);
 
             let sliced_bands = self.bands(skip_line_count, drop_line_count);
+            if let Some(raster_height) = self.raster_height {
+                // DEC VT330/VT340 Programmer Reference Manual, Vol. 2,
+                // §14.3.2: Pv is the vertical image size in pixels. Slicing
+                // re-anchors the retained bands at the current text position,
+                // so its header must declare that retained vertical extent,
+                // not the off-screen source image's full height.
+                let (skip_bands, bottom_band) =
+                    self.band_window(skip_line_count, drop_line_count);
+                let top = skip_bands.saturating_mul(6);
+                let bottom = bottom_band.saturating_mul(6).min(raster_height.value);
+                let visible_height = bottom.saturating_sub(top.min(bottom));
+
+                data.push_str(&self.header[..raster_height.start]);
+                data.push_str(&visible_height.to_string());
+                data.push_str(&self.header[raster_height.end..]);
+            } else {
+                data.push_str(self.header);
+            }
             data.push_str(&sliced_bands.join("-"));
 
             // Do not append a Graphics New Line after the final visible band.
@@ -516,6 +552,7 @@ mod sixel_slice {
                 let data = &s.data[dcs_start..];
                 let header_end = find_sixel_data_start(data);
                 let (header, body) = data.split_at(header_end);
+                let raster_height = find_raster_height(header);
                 let body = body.split_once(st).map_or(body, |(body, _)| body);
                 let body = body.strip_suffix('-').unwrap_or(body);
                 let bands = if body.is_empty() {
@@ -528,10 +565,45 @@ mod sixel_slice {
                     font_height,
                     is_tmux,
                     header,
+                    raster_height,
                     bands,
                 }
             })
         }
+    }
+
+    fn find_raster_height(header: &str) -> Option<RasterHeight> {
+        let bytes = header.as_bytes();
+        let q = bytes.iter().position(|byte| *byte == b'q')?;
+        let quote = bytes[q + 1..].iter().position(|byte| *byte == b'"')? + q + 1;
+        let mut i = quote + 1;
+
+        // Raster attributes are `" Pan ; Pad ; Ph ; Pv`. Walk the first
+        // three numeric parameters to the start of Pv. Empty parameters are
+        // syntactically zero, although current icy_sixel always emits digits.
+        for _ in 0..3 {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&b';') {
+                return None;
+            }
+            i += 1;
+        }
+
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let value = header[start..i].parse().ok()?;
+        Some(RasterHeight {
+            value,
+            start,
+            end: i,
+        })
     }
 
     fn find_sixel_data_start(data: &str) -> usize {
@@ -602,6 +674,7 @@ mod sixel_slice {
 
     #[cfg(test)]
     mod tests {
+        use image::DynamicImage;
         use ratatui::layout::Size;
 
         use crate::{
@@ -695,6 +768,28 @@ mod sixel_slice {
                 "5 visible rows ⇒ 5 bands, not the old overshoot of 7"
             );
             assert_eq!(visible, vec!["b2", "b3", "b4", "b5", "b6"]);
+        }
+
+        #[test]
+        fn clipped_sixel_raster_height_matches_the_emitted_slice() {
+            // DEC VT330/VT340 Programmer Reference Manual, Vol. 2, §14.3.2:
+            // Pv declares the image's vertical pixel size. Once bands from the
+            // top and bottom are removed, retaining the source Pv advertises
+            // off-screen rows that no longer belong to this re-anchored image.
+            for is_tmux in [false, true] {
+                let image = DynamicImage::new_rgb8(8, 60);
+                let sixel = Sixel::new(image, Size::new(1, 10), is_tmux).unwrap();
+                assert!(sixel.data.contains("\"1;1;8;60"));
+                let sliced = SlicedSixel::from_sixel(sixel, 6, is_tmux);
+                let sliced = sliced.borrow_dependent();
+
+                let full = sliced.to_sequence(0, 0, 1, 10);
+                assert!(full.contains("\"1;1;8;60"));
+
+                let clipped = sliced.to_sequence(2, 3, 1, 5);
+                assert!(clipped.contains("\"1;1;8;30"));
+                assert!(!clipped.contains("\"1;1;8;60"));
+            }
         }
 
         #[test]

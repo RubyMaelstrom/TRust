@@ -2530,15 +2530,13 @@ mod desktop {
                 PageEnv::bare("https://archive.org/details/vhsvault"),
             );
             tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    match events.recv().await {
-                        Some(PageEvt::Updated { .. }) => break,
-                        Some(PageEvt::Trouble(errors)) => {
-                            panic!("initial page task failed: {errors:?}")
-                        }
-                        Some(other) => panic!("expected live page update, got {other:?}"),
-                        None => panic!("Lumen actor closed before initial render"),
+                match events.recv().await {
+                    Some(PageEvt::Updated { .. }) => {}
+                    Some(PageEvt::Trouble(errors)) => {
+                        panic!("initial page task failed: {errors:?}")
                     }
+                    Some(other) => panic!("expected live page update, got {other:?}"),
+                    None => panic!("Lumen actor closed before initial render"),
                 }
             })
             .await
