@@ -67,7 +67,7 @@ boa_engine = { version = "0.21", features = ["annex-b"], optional = true }
 boa_parser = { version = "0.21", optional = true }
 boa_ast = { version = "0.21", optional = true }
 boa_interner = { version = "0.21", optional = true }
-bytes = "1.11.1"
+bytes = "1.12.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Default features = the pure-Rust `miniz_oxide` backend. NEVER enable the
 # `zlib`/`zlib-ng`/`cloudflare_zlib`/`miniz-sys` features — those pull a C
@@ -75,7 +75,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 # the WHATWG Compression Streams API; the latter prevents sites from falling
 # back to large interpreted JavaScript codecs.
 flate2 = "1"
-futures = "0.3.32"
+futures = "0.3.34"
 html5ever = "0.39"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
@@ -91,14 +91,14 @@ mimalloc = { version = "0.1", optional = true }
 # Linux/FreeBSD discovery is owned by `font_system`, so do not activate
 # Fontique's native-system feature there. Other targets retain their native
 # platform catalog until their equivalent configuration policy is owned here.
-parley = { version = "0.11.0", default-features = false, features = ["std"] }
+parley = { version = "0.11.1", default-features = false, features = ["std"] }
 # Pure-Rust, path-backed catalog used to give usvg the exact same installed
-# font set that is registered with Parley. The `fs` feature parses metadata
-# with ttf-parser and keeps font bytes lazy; `fontconfig` and `memmap` stay off.
-fontdb = { version = "0.23.0", default-features = false, features = ["fs"] }
-# Character-presence checks for SVG fallback use the same parser as fontdb.
-# Keeping the version aligned avoids parsing selected fonts through two table
-# implementations.
+# font set that is registered with Parley. The `fs` feature indexes path-backed
+# metadata while keeping font bytes lazy; `fontconfig` and `memmap` stay off.
+fontdb = { version = "0.24.0", default-features = false, features = ["fs"] }
+# Character-presence checks for SVG fallback use ttf-parser directly. fontdb
+# 0.24 uses its own minimal metadata parser for catalog construction, while
+# selected-font coverage still needs ttf-parser's public cmap API.
 ttf-parser = "0.25.1"
 # Vello CPU's retained glyph cache/backend API. Keeping this direct dependency
 # at the thin renderer adapter lets TRust forward variation coordinates and
@@ -117,14 +117,14 @@ serde_json = "1"
 # `system-fonts` off: that feature independently interprets host Fontconfig
 # state and would make HTML and SVG resolve different catalogs. `memmap-fonts`
 # is deliberately omitted; selected SVG fonts are read safely on demand.
-resvg = { version = "0.47.0", default-features = false, features = ["text", "raster-images"] }
+resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images"] }
 roxmltree = "0.21.1"
-rcgen = "0.14.8"
+rcgen = "0.14.9"
 sha2 = "0.11.0"
 textwrap = "0.16.2"
 tiny-skia = "0.12.0"
 svgtypes = "0.16.1"
-tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
 tokio-rustls = "0.26.4"
 tui-term = "0.3.4"
 unicode-width = "0.2"
@@ -141,7 +141,7 @@ vello_cpu = { version = "0.2.0", default-features = false, features = ["std", "t
 # to `render::vello_hybrid`, and CPU remains the reference/fallback backend.
 vello_hybrid = { version = "0.2.0", default-features = false, features = ["std", "text"] }
 vello_common = { version = "0.2.0", default-features = false, features = ["std"] }
-wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12", "gles"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12", "gles"] }
 vt100 = "0.16.2"
 winit = "0.30.13"
 softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
@@ -154,14 +154,14 @@ softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "
 # `WebAssembly.*` JS<->wasm bridge is in `src/lumen_backend.rs`; the legacy Boa
 # adapter remains in `src/js.rs`.
 wasmi = { version = "1", default-features = false, features = ["std", "simd"] }
-webpki-roots = "1.0.7"
+webpki-roots = "1.0.9"
 # CSS Fonts web resources commonly use WOFF or WOFF2 containers. `wuff`
 # decodes both to the SFNT bytes consumed by Fontique/Skrifa, entirely in
 # Rust (including its default Brotli and DEFLATE backends).
 wuff = "0.2.8"
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
-parley = { version = "0.11.0", default-features = false, features = ["system"] }
+parley = { version = "0.11.1", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 # Compiles readable `.wat` text into wasm bytes for the WebAssembly test
@@ -170,7 +170,7 @@ parley = { version = "0.11.0", default-features = false, features = ["system"] }
 wat = "1"
 
 [patch.crates-io]
-fontique = { path = "vendor/fontique-0.11.0" }
+fontique = { path = "vendor/fontique-0.11.1" }
 crossterm = { path = "vendor/crossterm-0.29.0" }
 # image-webp 0.2.4 indexes an always-RGBA animation canvas with a three-byte
 # stride when disposal is followed by an opaque subframe. Carry upstream
@@ -235,6 +235,10 @@ wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
 # The terminal's own post-sixel cursor (below the graphic) made such cells (the
 # scrollbar thumb beside a 1-cell icon) print at stray positions, leaving
 # persistent visual breaks in the scrollbar column.
+# 2026-08-28: icy_sixel 0.5.1 began declaring the full source height with the
+# DEC raster-attributes command. SlicedSixel now rewrites Pv to the retained
+# vertical slice, so a viewport-clipped image cannot advertise off-screen rows
+# and scroll/corrupt the surrounding terminal frame.
 ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
 
 # Optimized binary: whole-program LTO and a single codegen unit trade

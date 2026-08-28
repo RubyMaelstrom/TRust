@@ -1119,8 +1119,10 @@ mod tests {
             ViewportMetrics::from_physical(PhysicalSize::new(120, 80), ScaleFactor::new(1.0)),
             &snapshot,
         );
-        let mut style = crate::text::TextStyle::default();
-        style.size = 28.0;
+        let style = crate::text::TextStyle {
+            size: 28.0,
+            ..Default::default()
+        };
         scene.primitives.push(DisplayCommand::GlyphRun {
             origin: CssPoint::new(12.0, 38.0),
             shaped: crate::text::shape("M", &style),
