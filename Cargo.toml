@@ -256,3 +256,15 @@ strip = "symbols"
 inherits = "release"
 debug = true
 strip = false
+
+# Fast browser-workload gate: retain optimized/release semantics without paying the production
+# ThinLTO + single-codegen-unit link on every Lumen iteration. Incremental object reuse and broad
+# codegen parallelism make subsequent engine edits cheap; `cargo build --release` remains the only
+# acceptance/promotion artifact.
+[profile.browser-check]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 64
+incremental = true
+strip = "none"

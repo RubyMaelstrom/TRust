@@ -155,6 +155,7 @@ pub struct RenderedPage {
     pub image_urls: Vec<String>,
     pub eager_image_urls: Vec<String>,
     pub lazy_image_handles: std::collections::HashSet<crate::render::ImageHandle>,
+    pub deferred_images: Vec<crate::doc::DeferredImage>,
     /// Composed-tree ancestry and named-fragment geometry needed for native
     /// interaction. These are resolved facts, not a second mutable DOM.
     pub parents: std::collections::HashMap<crate::dom::NodeId, crate::dom::NodeId>,
@@ -176,6 +177,7 @@ impl Clone for RenderedPage {
             image_urls: self.image_urls.clone(),
             eager_image_urls: self.eager_image_urls.clone(),
             lazy_image_handles: self.lazy_image_handles.clone(),
+            deferred_images: self.deferred_images.clone(),
             parents: self.parents.clone(),
             fragment_y: self.fragment_y.clone(),
             semantics: self.semantics.clone(),
@@ -197,6 +199,7 @@ impl RenderedPage {
             && self.image_urls == other.image_urls
             && self.eager_image_urls == other.eager_image_urls
             && self.lazy_image_handles == other.lazy_image_handles
+            && self.deferred_images == other.deferred_images
             && self.parents == other.parents
             && self.fragment_y == other.fragment_y
             && self.semantics.content_eq(&other.semantics)
@@ -218,6 +221,43 @@ pub fn render_arena(
     let (forms, controls) = extract_forms_arena(dom, base, seed);
     let resources = collect_image_urls(dom, base, viewport, device_pixel_ratio);
     let layout = crate::layout2::lay_out_graphical(dom, base, viewport, &forms, &controls, images);
+    let deferred_images = resources
+        .lazy_nodes
+        .iter()
+        .filter(|(_, source)| {
+            resources
+                .lazy_handles
+                .contains(&crate::render::ImageHandle::for_source(source))
+        })
+        .filter_map(|(node, source)| {
+            let rect = layout.boxes.get(node)?;
+            // A lazy image in a fixed-position subtree is viewport-relative.
+            // Treating a transformed fixed containing block as fixed here can
+            // only prefetch it early; it cannot strand a visible resource.
+            let mut current = Some(*node);
+            let mut fixed = false;
+            while let Some(candidate) = current {
+                if dom
+                    .computed_value_resolved(candidate, "position")
+                    .is_some_and(|position| position.trim() == "fixed")
+                {
+                    fixed = true;
+                    break;
+                }
+                current = dom.parent_flat(candidate);
+            }
+            Some(crate::doc::DeferredImage {
+                source: source.clone(),
+                rect: crate::render::CssRect::new(
+                    rect.left as f32,
+                    rect.top as f32,
+                    rect.width as f32,
+                    rect.height as f32,
+                ),
+                fixed,
+            })
+        })
+        .collect();
     // The desktop adapter needs ancestry only for nodes participating in the
     // measured presentation. Retaining every DOM edge made mutations inside a
     // display:none subtree look like frontend changes even though CSS Display
@@ -266,6 +306,7 @@ pub fn render_arena(
         image_urls: resources.all,
         eager_image_urls: resources.eager,
         lazy_image_handles: resources.lazy_handles,
+        deferred_images,
         parents,
         fragment_y,
         semantics,
@@ -323,6 +364,7 @@ pub fn adapt_rendered_terminal(
     viewport: crate::layout2::TerminalViewport,
     alpha: &std::collections::HashMap<String, bool>,
 ) -> Doc {
+    let deferred_images = rendered.deferred_images.clone();
     let output = crate::layout2::adapt_terminal(&rendered.layout, viewport, alpha);
     let hover_ids = if rendered.direct_actor_nodes {
         rendered
@@ -345,6 +387,8 @@ pub fn adapt_rendered_terminal(
         forms: rendered.forms,
         rows: output.rows,
         image_urls: rendered.image_urls,
+        eager_image_urls: rendered.eager_image_urls,
+        deferred_images,
         blobs: None,
         carousels: output.carousels,
         fixed: output.fixed,
@@ -3603,7 +3647,9 @@ pub fn parse_seeded(
         meta: Some(content_type.to_string()),
         forms,
         rows,
+        eager_image_urls: image_urls.clone(),
         image_urls,
+        deferred_images: Vec::new(),
         blobs: None,
         carousels,
         fixed,
@@ -3837,6 +3883,7 @@ pub(crate) struct CollectedImages {
     pub(crate) all: Vec<String>,
     pub(crate) eager: Vec<String>,
     pub(crate) lazy_handles: std::collections::HashSet<crate::render::ImageHandle>,
+    pub(crate) lazy_nodes: Vec<(crate::dom::NodeId, String)>,
 }
 
 pub(crate) fn collect_image_urls(
@@ -3848,6 +3895,7 @@ pub(crate) fn collect_image_urls(
     let mut urls = Vec::new();
     let mut eager = Vec::new();
     let mut lazy_handles = std::collections::HashSet::new();
+    let mut lazy_nodes = Vec::new();
     for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         // `<img src>` and `<video poster>` (the poster renders as the video's
         // clickable thumbnail) both feed the decode pipeline.
@@ -3893,6 +3941,7 @@ pub(crate) fn collect_image_urls(
         }
         if is_lazy && !eager.contains(&u) {
             lazy_handles.insert(handle);
+            lazy_nodes.push((id, u));
         } else {
             lazy_handles.remove(&handle);
             if !eager.contains(&u) {
@@ -3964,6 +4013,7 @@ pub(crate) fn collect_image_urls(
         all: urls,
         eager,
         lazy_handles,
+        lazy_nodes,
     }
 }
 
@@ -4717,7 +4767,7 @@ mod tests {
         let dom = crate::dom::Dom::parse_document(
             r#"<img loading="lazy" src="giant-3840.webp"
                  srcset="small-640.webp 640w, medium-960.webp 960w, giant-3840.webp 3840w"
-                 sizes="100vw">
+                 sizes="100vw" width="800" height="450">
                <video poster="poster.webp"></video>"#,
         );
         let images = collect_image_urls(
@@ -4744,6 +4794,55 @@ mod tests {
                     "https://www.example.test/gallery/medium-960.webp"
                 ))
         );
+
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let doc = adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            rendered,
+            crate::layout2::TerminalViewport::from_font_pixels(100, 38, (8, 16)),
+            no_alpha(),
+        );
+        assert_eq!(
+            doc.eager_image_urls,
+            vec![String::from("https://www.example.test/gallery/poster.webp")],
+            "the terminal commit must not widen the eager set back to all images"
+        );
+        assert!(doc.deferred_images.iter().any(|image| {
+            image.source == "https://www.example.test/gallery/medium-960.webp"
+                && image.rect.width > 0.0
+                && image.rect.height > 0.0
+        }));
+    }
+
+    #[test]
+    fn graphical_discovery_marks_lazy_images_in_fixed_subtrees_viewport_relative() {
+        let base = Url::parse("https://www.example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<div style="position:fixed;left:0;bottom:0">
+                 <img loading="lazy" src="status.webp" width="80" height="20">
+               </div>"#,
+        );
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+
+        assert!(rendered.deferred_images.iter().any(|image| {
+            image.source == "https://www.example.test/status.webp" && image.fixed
+        }));
     }
 
     #[test]
@@ -8304,6 +8403,293 @@ mod tests {
             std::fs::write(&out, &html).unwrap();
             eprintln!("post-settle body ({}B) -> {out}", html.len());
         }
+    }
+
+    /// Live browser-workload acceptance gate. Unlike `diag_all_errors`, this diagnostic fails on
+    /// engine-fatal errors or when a site's meaningful DOM milestone is not reached. It is kept
+    /// ignored because it intentionally depends on the current public site and network:
+    ///
+    /// `TRUST_BROWSER_GATE=https://www.youtube.com/ cargo test browser_workload_gate -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live network acceptance gate, needs TRUST_BROWSER_GATE=<url>"]
+    async fn browser_workload_gate() {
+        let target = std::env::var("TRUST_BROWSER_GATE")
+            .expect("set TRUST_BROWSER_GATE to an absolute http(s) URL");
+        let settle_seconds = std::env::var("TRUST_BROWSER_GATE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(45);
+        let viewport: (u16, u16) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split_once('x')
+                    .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+            })
+            .unwrap_or((200, 50));
+        let url = parse_url(&target).expect("browser workload URL is absolute");
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let response = fetch(&Request::get(url))
+            .await
+            .expect("workload fetch succeeds");
+        let mut response = execute_js(response, viewport, (8, 16), Default::default()).await;
+        let mut html = String::from_utf8_lossy(&response.body).into_owned();
+        let mut rendered = response.rendered.take().map(|rendered| *rendered);
+        let mut errors = response
+            .js
+            .as_ref()
+            .map(|outcome| outcome.errors.clone())
+            .unwrap_or_default();
+        let mut updates = 0usize;
+        let mut had_live_actor = false;
+        let mut scheduler_responded = true;
+        let started = std::time::Instant::now();
+        if let Some(mut live) = response.live.take() {
+            had_live_actor = true;
+            scheduler_responded = false;
+            // A browser command must remain dispatchable even while the page has
+            // recursively queued microtasks, timers, resource completions, or
+            // animation frames. An invalid element scroll is an intentional
+            // no-op which the resident actor acknowledges with `Settled`; unlike
+            // lifecycle/platform tasks, it cannot be confused with unsolicited
+            // page work. This is the real command path used by the frontend and
+            // catches the starvation that previously hid YouTube's search UI.
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::SetScroll {
+                    node: usize::MAX,
+                    top: 0.0,
+                    left: 0.0,
+                })
+                .await
+                .expect("live browser actor accepts responsiveness probe");
+            let scheduler_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let remaining =
+                    scheduler_deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "{host} resident page actor did not dispatch a browser command within 10s; errors={errors:#?}"
+                );
+                match tokio::time::timeout(remaining, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Settled)) => {
+                        scheduler_responded = true;
+                        break;
+                    }
+                    Ok(Some(crate::js::PageEvt::Updated {
+                        html: updated,
+                        mut outcome,
+                    })) => {
+                        updates += 1;
+                        html = updated;
+                        if let Some(next) = outcome.rendered.take() {
+                            rendered = Some(*next);
+                        }
+                        errors.extend(outcome.errors);
+                    }
+                    Ok(Some(crate::js::PageEvt::Static {
+                        html: updated,
+                        mut outcome,
+                    })) => {
+                        html = updated;
+                        if let Some(next) = outcome.rendered.take() {
+                            rendered = Some(*next);
+                        }
+                        errors.extend(outcome.errors);
+                        break;
+                    }
+                    Ok(Some(crate::js::PageEvt::Trouble(mut trouble))) => {
+                        errors.append(&mut trouble)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            assert!(
+                scheduler_responded,
+                "{host} resident page actor ended before acknowledging the browser command probe; errors={errors:#?}"
+            );
+            // Exercise the same first displayed-page correction as `App::sync_page_viewport`.
+            // The fetch starts against the provisional content area, while committing the page
+            // changes that area by at least the status row. Real applications (YouTube among
+            // them) use the resulting CSSOM View `resize` task to select their responsive UI.
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::Viewport(crate::layout2::Viewport::new(
+                    f32::from(viewport.0) * 8.0,
+                    f32::from(viewport.1.saturating_sub(1)) * 16.0,
+                )))
+                .await
+                .expect("live browser actor accepts initial viewport correction");
+            let deadline = started + std::time::Duration::from_secs(settle_seconds);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated {
+                        html: updated,
+                        mut outcome,
+                    })) => {
+                        updates += 1;
+                        html = updated;
+                        if let Some(next) = outcome.rendered.take() {
+                            rendered = Some(*next);
+                        }
+                        errors.extend(outcome.errors);
+                    }
+                    Ok(Some(crate::js::PageEvt::Static {
+                        html: updated,
+                        mut outcome,
+                    })) => {
+                        html = updated;
+                        if let Some(next) = outcome.rendered.take() {
+                            rendered = Some(*next);
+                        }
+                        errors.extend(outcome.errors);
+                        break;
+                    }
+                    Ok(Some(crate::js::PageEvt::Trouble(mut trouble))) => {
+                        errors.append(&mut trouble)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+
+        if host.ends_with("youtube.com")
+            || host.ends_with("twitch.tv")
+            || host.ends_with("steampowered.com")
+        {
+            assert!(
+                had_live_actor,
+                "{host} did not retain a resident page actor"
+            );
+            assert!(
+                scheduler_responded,
+                "{host} resident page actor ended before acknowledging a browser command"
+            );
+        }
+
+        let fatal_errors = errors
+            .iter()
+            .filter(|error| {
+                error.contains("Maximum call stack size exceeded")
+                    || error.contains("stack overflow")
+                    || error.contains("fatal runtime error")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            fatal_errors.is_empty(),
+            "browser workload hit fatal engine errors: {fatal_errors:#?}"
+        );
+
+        let dom = crate::dom::Dom::parse_document(&html);
+        let node_count = dom.node_count();
+        if let Ok(path) = std::env::var("TRUST_BROWSER_GATE_OUT") {
+            std::fs::write(&path, html.as_bytes()).expect("write browser gate snapshot");
+            eprintln!("BROWSER_GATE snapshot={}B -> {path}", html.len());
+        }
+        let minimum_nodes = if host.ends_with("youtube.com") {
+            // Presentation serialization varies with experiments, consent, and
+            // recommendation data. This is only an empty-shell guard; the search
+            // control below is the functional acceptance condition.
+            800
+        } else if host.ends_with("twitch.tv") {
+            800
+        } else if host.ends_with("steampowered.com") {
+            // Steam's useful presentation is currently about 2,450 nodes; the
+            // old 3,000-node assertion rejected a complete storefront. Semantic
+            // landmarks below are the acceptance condition, not raw bulk.
+            2_000
+        } else {
+            std::env::var("TRUST_BROWSER_GATE_MIN_NODES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1)
+        };
+        assert!(
+            node_count >= minimum_nodes,
+            "{host} stopped at {node_count} DOM nodes; expected at least {minimum_nodes}; errors={errors:#?}"
+        );
+
+        if host.ends_with("youtube.com") {
+            let has_search_input = dom.descendants(crate::dom::DOCUMENT).any(|node| {
+                dom.tag_name(node) == Some("input")
+                    && (dom.attr(node, "id") == Some("search")
+                        || dom.attr(node, "name") == Some("search_query")
+                        || dom
+                            .attr(node, "aria-label")
+                            .is_some_and(|label| label.eq_ignore_ascii_case("search")))
+            });
+            assert!(
+                has_search_input,
+                "YouTube did not create its searchable input after {settle_seconds}s; nodes={node_count}; errors={errors:#?}"
+            );
+        } else if host.ends_with("twitch.tv") {
+            let has_search_input = dom.descendants(crate::dom::DOCUMENT).any(|node| {
+                dom.tag_name(node) == Some("input")
+                    && (dom.attr(node, "data-a-target") == Some("tw-input")
+                        || dom.attr(node, "aria-label") == Some("Search Input"))
+            });
+            let has_front_page_carousel = dom
+                .descendants(crate::dom::DOCUMENT)
+                .any(|node| dom.attr(node, "data-a-target") == Some("front-page-carousel"));
+            let live_channel_cards = dom
+                .descendants(crate::dom::DOCUMENT)
+                .filter(|node| dom.attr(*node, "data-a-target") == Some("side-nav-live-status"))
+                .count();
+            assert!(
+                has_search_input && has_front_page_carousel && live_channel_cards >= 3,
+                "Twitch homepage milestones missing after {settle_seconds}s: search={has_search_input} carousel={has_front_page_carousel} live_channel_cards={live_channel_cards}; nodes={node_count}; errors={errors:#?}"
+            );
+        } else if host.ends_with("steampowered.com") {
+            let has_search_input = dom.descendants(crate::dom::DOCUMENT).any(|node| {
+                dom.tag_name(node) == Some("input")
+                    && dom.attr(node, "name") == Some("term")
+                    && dom
+                        .attr(node, "placeholder")
+                        .is_some_and(|value| value.to_ascii_lowercase().contains("search"))
+            });
+            let has_featured_carousel = dom
+                .descendants(crate::dom::DOCUMENT)
+                .any(|node| dom.attr(node, "id") == Some("home_maincap_v7"));
+            let has_special_offers = dom
+                .descendants(crate::dom::DOCUMENT)
+                .any(|node| dom.attr(node, "id") == Some("module_special_offers"));
+            let tab_titles = dom
+                .descendants(crate::dom::DOCUMENT)
+                .filter(|node| {
+                    dom.attr(*node, "class").is_some_and(|classes| {
+                        classes
+                            .split_ascii_whitespace()
+                            .any(|class| class == "tab_item_title")
+                    })
+                })
+                .count();
+            assert!(
+                has_search_input && has_featured_carousel && has_special_offers && tab_titles >= 5,
+                "Steam storefront milestones missing after {settle_seconds}s: search={has_search_input} featured={has_featured_carousel} offers={has_special_offers} catalog_titles={tab_titles}; nodes={node_count}; errors={errors:#?}"
+            );
+        }
+
+        if let Some(rendered) = rendered {
+            eprintln!(
+                "BROWSER_GATE resources={} eager={} deferred={}",
+                rendered.image_urls.len(),
+                rendered.eager_image_urls.len(),
+                rendered.deferred_images.len()
+            );
+        }
+
+        eprintln!(
+            "BROWSER_GATE host={host} elapsed={:.3}s nodes={node_count} updates={updates} errors={}",
+            started.elapsed().as_secs_f64(),
+            errors.len()
+        );
     }
 
     /// Fetch a page, run JS through settle, decode the REAL images, lay it out,

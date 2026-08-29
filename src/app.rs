@@ -915,6 +915,29 @@ fn rect_has(r: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.right() && row >= r.y && row < r.bottom()
 }
 
+/// HTML lazy-loading uses an implementation-defined IntersectionObserver root
+/// margin so resources can arrive shortly before they become visible. Retain
+/// one viewport on either side: bounded regardless of document length and
+/// sufficient for a page-scroll gesture without eagerly draining a catalog.
+fn deferred_image_candidates(
+    images: &[crate::doc::DeferredImage],
+    scroll_y: f32,
+    viewport_height: f32,
+) -> Vec<String> {
+    let near_top = (scroll_y - viewport_height).max(0.0);
+    let near_bottom = scroll_y + 2.0 * viewport_height;
+    let mut urls = Vec::new();
+    for image in images {
+        let bottom = image.rect.y + image.rect.height;
+        if (image.fixed || (bottom >= near_top && image.rect.y <= near_bottom))
+            && !urls.contains(&image.source)
+        {
+            urls.push(image.source.clone());
+        }
+    }
+    urls
+}
+
 /// Map a pointer coordinate on a scrollbar track to a scroll position, with the
 /// thumb CENTERED on the cursor (click a spot → the thumb lands there, drag
 /// follows). `origin`/`len` are the track's start and length in cells on the
@@ -1181,9 +1204,13 @@ impl App {
                         let cur_max = doc_rows.saturating_sub(self.last_inner.1 as usize);
                         let lss = self.last_scroll_sent;
                         let sint = self.scroll_intent;
+                        let load_fetch = self.fetch_rx.is_some() || self.img_rx.is_some();
+                        let load_images = self.imgs_in_flight.len();
+                        let load_encodes = self.image_encoding.len();
+                        let load_page = self.page_busy;
                         let _ = writeln!(
                             std::io::stderr(),
-                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | SCROLL[pos={cur_scroll} max={cur_max} intent={sint} last_sent={lss:?}] | img_renders/s={imgr} sixel_seq[build={seq_builds} hit={seq_hits} prewarm={seq_prewarms}] evts[upd={} pat={} scr={} set={}]",
+                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | load[fetch={load_fetch} images={load_images} encodes={load_encodes} page={load_page}] | SCROLL[pos={cur_scroll} max={cur_max} intent={sint} last_sent={lss:?}] | img_renders/s={imgr} sixel_seq[build={seq_builds} hit={seq_hits} prewarm={seq_prewarms}] evts[upd={} pat={} scr={} set={}]",
                             us / 1000,
                             pus / 1000,
                             ius / 1000,
@@ -1354,6 +1381,7 @@ impl App {
             // root read innerHeight), then the settled scroll position.
             self.sync_page_viewport();
             self.sync_page_scroll();
+            self.start_visible_lazy_image_loads();
             // And any freshly decoded image sizes, so the engine measures
             // images exactly like the app renders them (one geometry truth).
             self.sync_page_image_sizes();
@@ -2938,6 +2966,31 @@ impl App {
         self.imgs_tasks.push(task);
     }
 
+    /// Resume HTML `loading=lazy` images whose retained CSS-pixel paint boxes
+    /// intersect the viewport or one viewport of look-ahead. HTML delegates
+    /// the lazy-load intersection observer's root margin to the user agent;
+    /// one viewport keeps scrolling smooth while bounding initial network and
+    /// decode work on catalog-sized pages.
+    fn start_visible_lazy_image_loads(&mut self) {
+        let font = self.picker.font_size();
+        let cell_h = f32::from(font.height.max(1));
+        let viewport_h = f32::from(self.last_inner.1.max(1)) * cell_h;
+        let Some((page, urls)) = self.browser.as_ref().and_then(|browser| {
+            let Link::Http(page) = &browser.doc.url else {
+                return None;
+            };
+            let urls = deferred_image_candidates(
+                &browser.doc.deferred_images,
+                browser.scroll as f32 * cell_h,
+                viewport_h,
+            );
+            Some((page.clone(), urls))
+        }) else {
+            return;
+        };
+        self.start_image_loads(page, urls);
+    }
+
     /// Abort every in-flight image batch — the network work itself, not just
     /// the result delivery — and forget what was in flight. A result already
     /// queued on the channel still arrives; `apply_pending_image_decodes`
@@ -3586,7 +3639,7 @@ impl App {
         // The blob byte mirror rides the Doc (into history too) so the image
         // pipeline can decode this page's `<img src="blob:…">` at any time.
         doc.blobs = response.blobs.clone().map(crate::doc::BlobsHandle);
-        let image_urls = doc.image_urls.clone();
+        let eager_image_urls = doc.eager_image_urls.clone();
         let page = response.url.clone();
         // JS visibility: a clean run gets a quiet badge; script errors
         // get a count (the page still rendered — no notice).
@@ -3650,7 +3703,8 @@ impl App {
             self.scroll_to_fragment(frag);
         }
         // Kick off the parallel image pipeline; decoded images re-flow in.
-        self.start_image_loads(page, image_urls);
+        self.start_image_loads(page, eager_image_urls);
+        self.start_visible_lazy_image_loads();
         if let Some(refresh) = declarative_refresh
             && let Some(deadline) = tokio::time::Instant::now().checked_add(refresh.delay)
         {
@@ -4784,7 +4838,7 @@ impl App {
         // anything already cached, so a shell image still in flight (not
         // yet cached) is merely re-fetched by the new batch, never lost,
         // and the per-batch channel still closes when done (idle-CPU gate).
-        let image_urls = g.doc.image_urls.clone();
+        let eager_image_urls = g.doc.eager_image_urls.clone();
         // A deliberate reposition (following an off-screen selection) adopts its
         // new scroll as the intent; the "keep" path left it None to preserve the
         // reader's intended place across a transient shrink.
@@ -4807,7 +4861,8 @@ impl App {
                 self.notice = true;
             }
         }
-        self.start_image_loads(url, image_urls);
+        self.start_image_loads(url, eager_image_urls);
+        self.start_visible_lazy_image_loads();
     }
 
     /// Apply one incremental-layout patch (incremental-layout contract): re-lay
@@ -7685,6 +7740,32 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
 mod tests {
     use super::{HISTORY_CAP, History};
     use crate::doc::Link;
+
+    #[test]
+    fn lazy_image_candidates_follow_viewport_and_keep_fixed_content_eager() {
+        let image = |source: &str, y: f32, fixed: bool| crate::doc::DeferredImage {
+            source: source.into(),
+            rect: crate::render::CssRect::new(0.0, y, 100.0, 100.0),
+            fixed,
+        };
+        let images = vec![
+            image("near", 900.0, false),
+            image("far", 4_000.0, false),
+            image("fixed", 0.0, true),
+            image("near", 950.0, false),
+        ];
+
+        assert_eq!(
+            super::deferred_image_candidates(&images, 0.0, 800.0),
+            vec![String::from("near"), String::from("fixed")],
+            "one viewport of look-ahead loads once per source"
+        );
+        assert_eq!(
+            super::deferred_image_candidates(&images, 3_200.0, 800.0),
+            vec![String::from("far"), String::from("fixed")],
+            "scrolling resumes the newly-near resource"
+        );
+    }
 
     fn parse_for_app(
         app: &super::App,
@@ -11807,6 +11888,33 @@ mod tests {
             !app.imgs_in_flight.is_empty(),
             "the live update kicked off the image pipeline for the new tile"
         );
+    }
+
+    #[tokio::test]
+    async fn live_lazy_image_waits_for_its_viewport_band() {
+        let html = r#"
+            <button onclick="void 0">menu</button>
+            <div style="height:5000px">spacer</div>
+            <img loading="lazy" src="far-tile.png" width="320" height="180" alt="far tile">
+        "#;
+        let mut app = live_form_app(html).await;
+        let deferred = app.browser.as_ref().unwrap().doc.deferred_images.clone();
+        assert_eq!(deferred.len(), 1, "the actor retained one deferred image");
+        assert!(
+            app.imgs_in_flight.is_empty(),
+            "an off-screen lazy image must not keep initial loading alive"
+        );
+
+        let cell_h = f32::from(app.picker.font_size().height.max(1));
+        app.browser.as_mut().unwrap().scroll = (deferred[0].rect.y / cell_h) as usize;
+        app.start_visible_lazy_image_loads();
+        assert!(
+            app.imgs_in_flight
+                .iter()
+                .any(|url| url.ends_with("far-tile.png")),
+            "approaching the image resumes its fetch"
+        );
+        app.abort_image_loads();
     }
 
     #[test]
