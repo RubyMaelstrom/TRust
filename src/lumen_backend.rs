@@ -18,11 +18,6 @@ use std::time::{Duration, Instant};
 mod lumen_wasm;
 
 const DEFAULT_URL: &str = "https://example.com/";
-// TRust provisions 64 MiB for every resident page and worker engine thread; the standalone
-// benchmark runs on the process's 8 MiB main stack. Lumen's 128-depth default remains unchanged
-// for small-stack embedders, while browser platform shims and ordinary author recursion share
-// this explicitly bounded headroom (ECMA-262 §9.4 execution contexts).
-const TRUST_LUMEN_MAX_EVAL_DEPTH: u32 = 256;
 const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
     width: 640.0,
     height: 384.0,
@@ -450,7 +445,6 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let mut engine = lumen::Engine::new();
-    engine.set_max_eval_depth(TRUST_LUMEN_MAX_EVAL_DEPTH);
     engine.set_tier(tier);
     engine.set_tier_threshold(threshold);
     let clock = Rc::new(RealmClock::new());
@@ -821,6 +815,10 @@ mod desktop {
         }
         let mut lifecycle_complete = false;
         let mut lifecycle_submission = None;
+        // HTML leaves selection among task queues to the user agent. Alternate a ready normal
+        // browser-command lane with page-owned work so neither a continuously due timer nor a
+        // continuously replenished frontend queue can exclude the other task sources.
+        let mut prefer_command = true;
 
         // A truly inert document does not need a resident realm. Complete its load task first so
         // a load handler can still create controls, timers, workers, observers, or navigation;
@@ -918,6 +916,12 @@ mod desktop {
                 immediate = Some(Wake::Interaction(Some(command)));
             } else if hover.has_changed().unwrap_or(false) {
                 immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
+            // HTML §8.1.7 lets a user agent choose among runnable task queues while preserving
+            // FIFO order within each task source. Browser-state changes such as a viewport resize
+            // must be selected promptly: putting this bounded queue behind every already-due
+            // author timer lets a busy page starve its own resize task forever.
+            } else if prefer_command && let Ok(command) = cmds.try_recv() {
+                immediate = Some(Wake::Cmd(Some(command)));
             } else if let Some(task) = deferred_host_task
                 .take()
                 .or_else(|| host_rx.try_recv().ok())
@@ -935,6 +939,8 @@ mod desktop {
             } else if timer_due {
                 immediate = Some(Wake::Timer);
             } else if let Ok(command) = cmds.try_recv() {
+                // No page-owned source was runnable, so drain the command lane
+                // without manufacturing an idle turn solely for alternation.
                 immediate = Some(Wake::Cmd(Some(command)));
             } else if let Some(deadline) = idle_deadline {
                 immediate = Some(Wake::Idle(deadline));
@@ -996,6 +1002,7 @@ mod desktop {
                         break;
                     }
                     prefer_timer = true;
+                    prefer_command = false;
                 }
                 Wake::Hover(Some(hover)) => {
                     if !dispatch_command(
@@ -1040,6 +1047,7 @@ mod desktop {
                         break;
                     }
                     prefer_timer = true;
+                    prefer_command = true;
                 }
                 Wake::Host(None) => break,
                 Wake::Platform => {
@@ -1054,6 +1062,7 @@ mod desktop {
                         break;
                     }
                     prefer_timer = true;
+                    prefer_command = true;
                 }
                 Wake::Idle(deadline) => {
                     prepare_unbounded_task(&interrupt);
@@ -1073,6 +1082,7 @@ mod desktop {
                         break;
                     }
                     prefer_timer = true;
+                    prefer_command = true;
                 }
                 Wake::Timer => {
                     prepare_unbounded_task(&interrupt);
@@ -1086,6 +1096,7 @@ mod desktop {
                         break;
                     }
                     prefer_timer = false;
+                    prefer_command = true;
                 }
                 Wake::Lifecycle => {
                     lifecycle_complete = true;
@@ -1105,6 +1116,7 @@ mod desktop {
                         break 'event_loop;
                     }
                     prefer_timer = true;
+                    prefer_command = true;
                 }
             }
             report_task_trace(&mut page);
@@ -1198,7 +1210,6 @@ mod desktop {
         // startup pay native-code generation for large numbers of one-shot functions. Lumen's
         // LUMEN_TIER and LUMEN_TIER_THRESHOLD diagnostics remain available through Engine::new.
         let mut engine = lumen::Engine::new_with_interrupt(interrupt);
-        engine.set_max_eval_depth(TRUST_LUMEN_MAX_EVAL_DEPTH);
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
@@ -2346,7 +2357,13 @@ mod desktop {
         #[cfg(not(test))]
         let render_handled = false;
         #[cfg(test)]
-        if dom_dirty && !environment_dirty {
+        if dom_dirty
+            && !environment_dirty
+            // The ignored public-site acceptance gate must exercise the same
+            // complete typed-render path as release binaries. Boundary patches
+            // are a test-only protocol used by focused actor tests.
+            && std::env::var_os("TRUST_BROWSER_GATE").is_none()
+        {
             match emit_boundary_patch(page, events) {
                 BoundaryPatchResult::FullRender => {}
                 BoundaryPatchResult::Unchanged => render_handled = true,
@@ -2369,10 +2386,11 @@ mod desktop {
                 .as_ref()
                 .is_none_or(|previous| !previous.visually_eq(&rendered));
             #[cfg(test)]
-            let diagnostic_changed = page
-                .last_diagnostic_render
-                .as_deref()
-                .is_none_or(|previous| previous != crate::js::render_canonical(&html));
+            let diagnostic_changed = std::env::var_os("TRUST_BROWSER_GATE").is_none()
+                && page
+                    .last_diagnostic_render
+                    .as_deref()
+                    .is_none_or(|previous| previous != crate::js::render_canonical(&html));
             #[cfg(not(test))]
             let diagnostic_changed = false;
             let changed = presentation_changed || diagnostic_changed;
@@ -2890,6 +2908,139 @@ mod desktop {
             .await
             .expect("idle callback did not receive an actor-selected idle period");
             assert!(rendered.contains("<output id=\"result\">idle:false:true</output>"));
+        }
+
+        #[tokio::test]
+        async fn actor_does_not_starve_browser_commands_behind_due_timers() {
+            // WHATWG HTML §8.1.7 permits the user agent to choose among task queues, while
+            // preserving each task source's order. That scheduling freedom cannot make a
+            // continuously due timer queue prevent the browser from ever updating the page's
+            // viewport: real responsive applications depend on the resulting resize task.
+            let html = r#"<!doctype html><html><body>
+                <output id="result">waiting</output>
+                <script>
+                    for (let i = 0; i < 16; ++i) {
+                        setInterval(function () {
+                            const until = performance.now() + 20;
+                            while (performance.now() < until) {}
+                        }, 1);
+                    }
+                    window.addEventListener("resize", function () {
+                        document.getElementById("result").textContent =
+                            "resized:" + innerWidth + "x" + innerHeight;
+                    });
+                </script>
+            </body></html>"#;
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if matches!(events.recv().await, Some(PageEvt::Updated { .. })) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("initial Lumen render timed out");
+
+            // Let the interval become overdue before queuing the browser task. Each callback
+            // takes longer than its repeat interval, so the timer queue remains continuously due.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            handle
+                .cmds
+                .send(PageCmd::Viewport(crate::layout2::Viewport::new(
+                    400.0, 320.0,
+                )))
+                .await
+                .unwrap();
+            let resized = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome })
+                            if html.contains("resized:400x320") =>
+                        {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("viewport command failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before viewport command"),
+                    }
+                }
+            })
+            .await;
+            assert!(resized.is_ok(), "due timers starved the viewport task");
+        }
+
+        #[tokio::test]
+        async fn actor_does_not_starve_due_timers_behind_browser_commands() {
+            // The inverse fairness edge is equally important: prioritizing a browser-command
+            // task source is not permission to exclude the timer task source indefinitely.
+            // Queue the follow-up commands while the first handler is still running, after it
+            // has made a zero-delay timer runnable.
+            let html = r#"<!doctype html><html><body>
+                <button id="target">schedule</button>
+                <output id="result">waiting</output>
+                <script>
+                    document.getElementById("target").addEventListener("click", function () {
+                        setTimeout(function () {
+                            document.getElementById("result").textContent = "timer-ran";
+                        }, 0);
+                        const until = performance.now() + 100;
+                        while (performance.now() < until) {}
+                    });
+                </script>
+            </body></html>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if matches!(events.recv().await, Some(PageEvt::Updated { .. })) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("initial Lumen render timed out");
+
+            handle.cmds.send(PageCmd::Click(target)).await.unwrap();
+            for _ in 0..16 {
+                handle
+                    .cmds
+                    .send(PageCmd::SetScroll {
+                        node: usize::MAX,
+                        top: 0.0,
+                        left: 0.0,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let settled_before_timer = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut settled = 0usize;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) if html.contains("timer-ran") => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break settled;
+                        }
+                        Some(PageEvt::Settled) => settled += 1,
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("timer fairness fixture failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the timer task"),
+                    }
+                }
+            })
+            .await
+            .expect("browser commands starved a runnable timer task");
+            assert!(
+                settled_before_timer < 16,
+                "the actor drained the browser command queue before selecting the timer"
+            );
         }
 
         #[tokio::test]
@@ -4384,7 +4535,6 @@ fn run_lumen_worker(
     });
 
     let mut engine = lumen::Engine::new_with_interrupt(interrupt);
-    engine.set_max_eval_depth(TRUST_LUMEN_MAX_EVAL_DEPTH);
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
     state.configure_module_loading(&mut engine);

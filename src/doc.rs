@@ -326,6 +326,22 @@ impl PartialEq for BlobsHandle {
 }
 impl Eq for BlobsHandle {}
 
+/// One `loading=lazy` image retained by the presentation adapter until its
+/// paint rectangle approaches the viewport. Coordinates remain CSS pixels;
+/// terminal rows are converted at the scheduling boundary exactly once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeferredImage {
+    pub source: String,
+    pub rect: crate::render::CssRect,
+    /// Fixed/top-layer images are viewport-relative and therefore eligible
+    /// regardless of the document scroll position.
+    pub fixed: bool,
+}
+
+// Layout sanitizes every CSS rectangle to finite coordinates, so the derived
+// equality is reflexive for values admitted to this presentation contract.
+impl Eq for DeferredImage {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
     /// The URL this document was fetched from.
@@ -348,9 +364,19 @@ pub struct Doc {
     /// navigates these instead of `lines`.
     pub rows: Vec<crate::layout2::Row>,
     /// Absolute http(s) URLs of every `<img>` on the page (HTML only), in
-    /// document order. The app's decode pipeline fetches these; once
-    /// decoded, a re-layout turns the alt-text placeholders into pixels.
+    /// document order. This is the complete resource-retention set, not the
+    /// initial fetch list: `loading=lazy` images remain here so cache sweeping
+    /// and a later viewport intersection cannot lose them.
     pub image_urls: Vec<String>,
+    /// Images whose HTML lazy-loading state is eager. The app starts only this
+    /// set at document commit; missing/invalid `loading` values are eager per
+    /// HTML's lazy-loading attribute definition.
+    pub eager_image_urls: Vec<String>,
+    /// Paint-space placements of deferred images. The terminal frontend uses
+    /// these retained CSS-pixel rectangles to resume a lazy image when it is in
+    /// or approaching the viewport, without fetching an off-screen catalog at
+    /// initial page load.
+    pub deferred_images: Vec<DeferredImage>,
     /// The page's `blob:` URL byte mirror (see `js::BlobMap`), set by the app
     /// from the JS response. The image pipeline decodes `<img src="blob:…">`
     /// from it (a client-generated image — Steam's login QR); it rides the Doc
@@ -432,6 +458,8 @@ impl Doc {
             forms: Vec::new(),
             rows: Vec::new(),
             image_urls: Vec::new(),
+            eager_image_urls: Vec::new(),
+            deferred_images: Vec::new(),
             blobs: None,
             carousels: Vec::new(),
             fixed: Vec::new(),
