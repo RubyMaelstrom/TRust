@@ -7546,21 +7546,52 @@
         timers.ids.delete(id);
         timers.q = timers.q.filter((timer) => timer.id !== id);
     };
-    function runTimerTask(task) {
-        const previousNesting = timers.activeNesting;
+    // A browser host invokes a queued timer handler as the entry point of its
+    // task, with no platform JavaScript execution context underneath it
+    // (ECMA-262 §9.5 and HTML §8.7). These two hooks let the Lumen host perform
+    // that call directly while this prelude retains the normative timer
+    // bookkeeping. The synchronous fallback below uses the same hooks for
+    // embedders which still drive tick()/tickTo() entirely from JavaScript.
+    function beginTimerTask(task) {
+        task.__previousNesting = timers.activeNesting;
         timers.activeNesting = task.nesting;
+        task.__frameToken = (task.frame || null) === trust.__activeFrame
+            ? null : enterFrame(task.frame || null);
+        return task.fn;
+    }
+    function finishTimerTask(task, error, failed) {
         try {
-            runInFrame(task.frame, () => task.fn.apply(g, task.args || []));
-        } catch (e) {
-            trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""));
+            if (failed) {
+                trust.errors.push("timer: " + ((error && error.message) || error) +
+                    (error && error.stack ? "\n" + error.stack : ""));
+            }
         } finally {
-            timers.activeNesting = previousNesting;
+            if (task.__frameToken) leaveFrame(task.__frameToken);
+            timers.activeNesting = task.__previousNesting;
+            delete task.__frameToken;
+            delete task.__previousNesting;
+            if (task.every !== null && timers.ids.has(task.id)) {
+                addTimer(task.fn, task.every, task.args, true, task.id, task.nesting);
+            } else {
+                timers.ids.delete(task.id);
+            }
         }
-        if (task.every !== null && timers.ids.has(task.id)) {
-            addTimer(task.fn, task.every, task.args, true, task.id, task.nesting);
-        } else {
-            timers.ids.delete(task.id);
+    }
+    trust.beginTimerTask = beginTimerTask;
+    trust.finishTimerTask = finishTimerTask;
+    function runTimerTask(task, completionValue) {
+        const handler = beginTimerTask(task);
+        let error;
+        let failed = false;
+        try {
+            handler.apply(g, task.args || []);
+        } catch (e) {
+            error = e;
+            failed = true;
+        } finally {
+            finishTimerTask(task, error, failed);
         }
+        return completionValue;
     }
     g.requestAnimationFrame = function (callback) {
         if (typeof callback !== "function") throw new TypeError("requestAnimationFrame callback must be callable");
@@ -7706,8 +7737,10 @@
         // before later ones once the corresponding waits complete.
         timers.now = Math.max(timers.now, observedNow, best.at);
         __clockSync();
-        runTimerTask(best);
-        return true;
+        // The queued task is the final action in this strict-mode selector.
+        // Keep it in proper tail position so the platform selector does not
+        // consume author recursion headroom while the handler executes.
+        return runTimerTask(best, true);
     };
     // At REST (not the load/dispatch fast-forward settle above), the actor
     // advances time by the REAL wall clock and fires the earliest timer task
@@ -7731,30 +7764,41 @@
         }
         return best ? { id: best.id, nesting: best.nesting, wait: best.wait } : null;
     };
-    trust.tickTo = function (absMs) {
+    // Select and remove one due timer without invoking author code. An object
+    // is a timer for the host to dispatch; null asks it to use tickTo() for an
+    // earlier animation-frame opportunity; false means no task was due.
+    trust.takeTimerTaskTo = function (absMs) {
         absMs = Math.max(currentTime(), absMs);
         let task = null;
         for (const t of timers.q) {
             if (t.at > absMs) continue;
-            if (!task || t.at < task.at || (t.at === task.at && t.id < task.id)) {
-                task = t;
-            }
+            if (!task || t.at < task.at || (t.at === task.at && t.id < task.id)) task = t;
         }
         if (animationFrames.deadline !== null && animationFrames.deadline <= absMs &&
-            (!task || animationFrames.deadline <= task.at)) {
+            (!task || animationFrames.deadline <= task.at)) return null;
+        timers.now = absMs;
+        __clockSync();
+        if (!task) return false;
+        timers.q.splice(timers.q.indexOf(task), 1);
+        return task;
+    };
+    trust.tickTo = function (absMs) {
+        const task = trust.takeTimerTaskTo(absMs);
+        if (task === null) {
+            absMs = Math.max(currentTime(), absMs);
             timers.now = absMs;
             __clockSync();
             return runAnimationFrameCallbacks(absMs);
         }
-        if (task) {
-            timers.q.splice(timers.q.indexOf(task), 1);
-            timers.now = absMs;
-            __clockSync();
-            runTimerTask(task);
+        if (task !== false) {
+            // As above, dispatch the selected task in proper tail position.
+            // The clock was committed before author code runs; currentTime()
+            // continues from that anchor while the callback is executing.
+            return runTimerTask(task, 1);
         }
         timers.now = absMs;
         __clockSync();
-        return task ? 1 : 0;
+        return 0;
     };
     // The clocks share the page time origin. Explicit fast-forward advances
     // `timers.now`; between checkpoints PageClock continues from host monotonic
