@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 mod lumen_wasm;
 
 const DEFAULT_URL: &str = "https://example.com/";
+// TRust provisions 64 MiB for every resident page and worker engine thread; the standalone
+// benchmark runs on the process's 8 MiB main stack. Lumen's 128-depth default remains unchanged
+// for small-stack embedders, while browser platform shims and ordinary author recursion share
+// this explicitly bounded headroom (ECMA-262 §9.4 execution contexts).
+const TRUST_LUMEN_MAX_EVAL_DEPTH: u32 = 256;
 const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
     width: 640.0,
     height: 384.0,
@@ -348,10 +353,103 @@ pub fn parse_tier(name: &str) -> Result<Tier, String> {
     }
 }
 
+fn engine_call_trust_method(
+    engine: &mut lumen::Engine,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, EvalError> {
+    let global = engine.global_this();
+    let trust = engine
+        .ctx()
+        .member_get(&global, "__trust")
+        .map_err(EvalError::Throw)?;
+    let function = engine
+        .ctx()
+        .member_get(&trust, name)
+        .map_err(EvalError::Throw)?;
+    engine.call_function_interruptible(&function, trust, args)
+}
+
+/// Dispatch one HTML timer task with the author callback as the engine entry point.
+///
+/// ECMA-262 §9.5 requires a host job to begin when the Agent's execution-context stack is empty;
+/// HTML §8.7 then invokes the stored handler with the WindowProxy callback-this value and its
+/// trailing arguments. The platform prelude selects the task and owns its nesting/repeat/frame
+/// bookkeeping, but calling the handler here avoids placing those self-hosted helper frames below
+/// author code. `null` from the selector means an animation-frame opportunity won the ordering
+/// race, which remains a batched JavaScript algorithm and falls back to `tickTo`.
+fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<bool, EvalError> {
+    const MAX_TIMER_ARGUMENTS: usize = 65_536;
+
+    let selected = engine_call_trust_method(engine, "takeTimerTaskTo", &[Value::Num(deadline)])?;
+    match selected {
+        Value::Bool(false) => return Ok(false),
+        Value::Null => {
+            let ran = engine_call_trust_method(engine, "tickTo", &[Value::Num(deadline)])?;
+            return Ok(ran.as_num_opt().is_some_and(|count| count > 0.0));
+        }
+        Value::Obj(_) => {}
+        other => {
+            let message = format!(
+                "timer selector returned {}, expected task, null, or false",
+                other.type_of()
+            );
+            let error = engine.ctx().make_error("TypeError", message);
+            return Err(EvalError::Throw(error));
+        }
+    }
+
+    let args_value = engine
+        .ctx()
+        .member_get(&selected, "args")
+        .map_err(EvalError::Throw)?;
+    let length = engine
+        .ctx()
+        .member_get(&args_value, "length")
+        .map_err(EvalError::Throw)?
+        .as_num_opt()
+        .unwrap_or(0.0);
+    if !length.is_finite() || length < 0.0 || length > MAX_TIMER_ARGUMENTS as f64 {
+        let error = engine.ctx().make_error(
+            "RangeError",
+            "timer callback argument list exceeds the host task limit",
+        );
+        return Err(EvalError::Throw(error));
+    }
+    let mut args = Vec::with_capacity(length as usize);
+    for index in 0..length as usize {
+        args.push(
+            engine
+                .ctx()
+                .member_get(&args_value, &index.to_string())
+                .map_err(EvalError::Throw)?,
+        );
+    }
+
+    let handler = engine_call_trust_method(engine, "beginTimerTask", &[selected.clone()])?;
+    let global = engine.global_this();
+    let (callback_error, callback_failed, callback_interrupted) =
+        match engine.call_function_interruptible(&handler, global, &args) {
+            Ok(_) => (Value::Undefined, false, None),
+            Err(EvalError::Throw(error)) => (error, true, None),
+            Err(EvalError::Interrupted(reason)) => (Value::Undefined, false, Some(reason)),
+        };
+    engine_call_trust_method(
+        engine,
+        "finishTimerTask",
+        &[selected, callback_error, Value::Bool(callback_failed)],
+    )?;
+    if let Some(reason) = callback_interrupted {
+        return Err(EvalError::Interrupted(reason));
+    }
+    Ok(true)
+}
+
 pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeReport, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let mut engine = lumen::Engine::new();
+    engine.set_max_eval_depth(TRUST_LUMEN_MAX_EVAL_DEPTH);
     engine.set_tier(tier);
     engine.set_tier_threshold(threshold);
     let clock = Rc::new(RealmClock::new());
@@ -386,32 +484,22 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
         .run_microtasks_interruptible()
         .map_err(|reason| format!("benchmark microtasks interrupted: {}", reason.message()))?;
 
-    let global = engine.global_this();
-    let trust = engine
-        .ctx()
-        .get_member(&global, "__trust")
-        .map_err(|_| "read __trust after benchmark".to_string())?;
-    let tick = engine
-        .ctx()
-        .get_member(&trust, "tick")
-        .map_err(|_| "read __trust.tick after benchmark".to_string())?;
     let mut timer_turns = 0usize;
     loop {
-        let ran = engine
-            .call_function_interruptible(&tick, trust.clone(), &[])
-            .map_err(|error| describe_eval_error(&mut engine, error, "__trust.tick"))?;
-        engine.run_microtasks_interruptible().map_err(|reason| {
-            format!("__trust.tick microtasks interrupted: {}", reason.message())
-        })?;
-        match ran {
-            Value::Bool(true) => timer_turns += 1,
-            Value::Bool(false) => break,
-            other => {
-                return Err(format!(
-                    "__trust.tick returned {}, expected boolean",
-                    value_string(&mut engine, &other)
-                ));
-            }
+        let deadline = engine_call_trust_method(&mut engine, "nextDeadline", &[])
+            .map_err(|error| describe_eval_error(&mut engine, error, "__trust.nextDeadline"))?;
+        let Value::Num(deadline) = deadline else {
+            break;
+        };
+        let ran = dispatch_timer_task_to(&mut engine, deadline)
+            .map_err(|error| describe_eval_error(&mut engine, error, "timer task"))?;
+        engine
+            .run_microtasks_interruptible()
+            .map_err(|reason| format!("timer task microtasks interrupted: {}", reason.message()))?;
+        if ran {
+            timer_turns += 1;
+        } else {
+            break;
         }
         if timer_turns > 100_000 {
             return Err("TRust one-shot event loop exceeded 100000 turns".to_string());
@@ -517,11 +605,9 @@ mod desktop {
             let Some(deadline) = trust_number(&mut page, "nextDeadline") else {
                 break;
             };
-            let ran = call_trust(&mut page, "tickTo", &[Value::Num(deadline)], "timer task")
-                .and_then(|value| value.as_num_opt())
-                .unwrap_or(0.0);
+            let ran = dispatch_timer_task(&mut page, deadline, "timer task");
             checkpoint(&mut page, "timer task");
-            if ran <= 0.0 {
+            if !ran {
                 break;
             }
         }
@@ -990,14 +1076,9 @@ mod desktop {
                 Wake::Timer => {
                     prepare_unbounded_task(&interrupt);
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
-                    let ran =
-                        call_trust(&mut page, "tickTo", &[Value::Num(real_now)], "timer task")
-                            .and_then(|value| value.as_num_opt())
-                            .unwrap_or(0.0);
-                    if ran > 0.0
-                        && let Some(trace) = page.task_trace.as_mut()
-                    {
-                        trace.timer_tasks += ran as u64;
+                    let ran = dispatch_timer_task(&mut page, real_now, "timer task");
+                    if ran && let Some(trace) = page.task_trace.as_mut() {
+                        trace.timer_tasks += 1;
                     }
                     checkpoint(&mut page, "timer task");
                     if !finish_task_with_ack(&mut page, &events, false) {
@@ -1116,6 +1197,7 @@ mod desktop {
         // startup pay native-code generation for large numbers of one-shot functions. Lumen's
         // LUMEN_TIER and LUMEN_TIER_THRESHOLD diagnostics remain available through Engine::new.
         let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+        engine.set_max_eval_depth(TRUST_LUMEN_MAX_EVAL_DEPTH);
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
@@ -1452,6 +1534,26 @@ mod desktop {
                     .push(format!("{label}: Lumen engine panic — page JS halted"));
                 page.outcome.panicked = true;
                 None
+            }
+        }
+    }
+
+    fn dispatch_timer_task(page: &mut LumenPage, deadline: f64, label: &str) -> bool {
+        let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_timer_task_to(&mut page.engine, deadline)
+        }));
+        match dispatched {
+            Ok(Ok(ran)) => ran,
+            Ok(Err(error)) => {
+                record_eval_error(page, error, label);
+                false
+            }
+            Err(_) => {
+                page.outcome
+                    .errors
+                    .push(format!("{label}: Lumen engine panic — page JS halted"));
+                page.outcome.panicked = true;
+                false
             }
         }
     }
@@ -4281,6 +4383,7 @@ fn run_lumen_worker(
     });
 
     let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+    engine.set_max_eval_depth(TRUST_LUMEN_MAX_EVAL_DEPTH);
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
     state.configure_module_loading(&mut engine);
@@ -8315,12 +8418,12 @@ mod tests {
                 .unwrap()
                 .as_num_opt()
                 .unwrap();
-            eval(
-                &mut engine,
-                &format!("__trust.tickTo({deadline})"),
-                "timer task",
-            )
-            .unwrap();
+            let dispatched = dispatch_timer_task_to(&mut engine, deadline);
+            let ran = match dispatched {
+                Ok(ran) => ran,
+                Err(error) => panic!("{}", describe_eval_error(&mut engine, error, "timer task")),
+            };
+            assert!(ran);
             run_microtask_checkpoint(&mut engine);
         }
         assert_eq!(
@@ -8339,6 +8442,41 @@ mod tests {
             string_value(&mut engine, "String(timerResult.thisValues.every(Boolean))"),
             "true"
         );
+    }
+
+    #[test]
+    fn top_level_timer_dispatch_preserves_author_recursion_headroom() {
+        // HTML §8.7 invokes the Function handler itself with WindowProxy as
+        // callback-this. A top-level task needs no nested-navigable state
+        // switch; routing it through two extra JS callbacks made otherwise
+        // valid author recursion hit Lumen's bounded call-stack guard early.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.timerDepthResult = "pending";
+            function timerDepthRecurse(n) {
+                return n ? timerDepthRecurse(n - 1) : 0;
+            }
+            setTimeout(function () {
+                try {
+                    timerDepthRecurse(124);
+                    timerDepthResult = this === window ? "ok" : "wrong-this";
+                } catch (error) {
+                    timerDepthResult = error.name;
+                }
+            }, 0);
+            "#,
+            "timer recursion setup",
+        )
+        .unwrap();
+        let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+        let ran = match dispatched {
+            Ok(ran) => ran,
+            Err(error) => panic!("{}", describe_eval_error(&mut engine, error, "timer task")),
+        };
+        assert!(ran);
+        assert_eq!(string_value(&mut engine, "timerDepthResult"), "ok");
     }
 
     #[test]
