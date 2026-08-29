@@ -426,7 +426,8 @@ fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<b
         );
     }
 
-    let handler = engine_call_trust_method(engine, "beginTimerTask", &[selected.clone()])?;
+    let handler =
+        engine_call_trust_method(engine, "beginTimerTask", std::slice::from_ref(&selected))?;
     let global = engine.global_this();
     let (callback_error, callback_failed, callback_interrupted) =
         match engine.call_function_interruptible(&handler, global, &args) {
@@ -8450,33 +8451,47 @@ mod tests {
         // callback-this. A top-level task needs no nested-navigable state
         // switch; routing it through two extra JS callbacks made otherwise
         // valid author recursion hit Lumen's bounded call-stack guard early.
-        let mut engine = platform_engine();
-        eval(
-            &mut engine,
-            r#"
-            globalThis.timerDepthResult = "pending";
-            function timerDepthRecurse(n) {
-                return n ? timerDepthRecurse(n - 1) : 0;
-            }
-            setTimeout(function () {
-                try {
-                    timerDepthRecurse(124);
-                    timerDepthResult = this === window ? "ok" : "wrong-this";
-                } catch (error) {
-                    timerDepthResult = error.name;
-                }
-            }, 0);
-            "#,
-            "timer recursion setup",
-        )
-        .unwrap();
-        let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
-        let ran = match dispatched {
-            Ok(ran) => ran,
-            Err(error) => panic!("{}", describe_eval_error(&mut engine, error, "timer task")),
-        };
-        assert!(ran);
-        assert_eq!(string_value(&mut engine, "timerDepthResult"), "ok");
+        // Rust's test harness provisions a much smaller native stack than the 64 MiB resident
+        // page thread. Exercise meaningful author depth on an explicitly sized host stack, as
+        // Lumen's configurable recursion-budget test does, so the native guard page cannot win
+        // before the JavaScript assertion on otherwise loaded test runs.
+        std::thread::Builder::new()
+            .name(String::from("trust-timer-depth-test"))
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut engine = platform_engine();
+                eval(
+                    &mut engine,
+                    r#"
+                    globalThis.timerDepthResult = "pending";
+                    function timerDepthRecurse(n) {
+                        return n ? timerDepthRecurse(n - 1) : 0;
+                    }
+                    setTimeout(function () {
+                        try {
+                            timerDepthRecurse(124);
+                            timerDepthResult = this === window ? "ok" : "wrong-this";
+                        } catch (error) {
+                            timerDepthResult = error.name;
+                        }
+                    }, 0);
+                    "#,
+                    "timer recursion setup",
+                )
+                .unwrap();
+                let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+                let ran = match dispatched {
+                    Ok(ran) => ran,
+                    Err(error) => {
+                        panic!("{}", describe_eval_error(&mut engine, error, "timer task"))
+                    }
+                };
+                assert!(ran);
+                assert_eq!(string_value(&mut engine, "timerDepthResult"), "ok");
+            })
+            .expect("spawn timer-depth test thread")
+            .join()
+            .expect("timer-depth test thread");
     }
 
     #[test]
