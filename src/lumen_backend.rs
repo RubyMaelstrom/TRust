@@ -6433,12 +6433,10 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     if let Some(id) = host_arg_node(&dom, args, 0) {
         let context_tag = dom.tag_name(id).unwrap_or("div").to_owned();
         let target = dom.content_target(id);
-        for child in dom.children(target) {
-            dom.detach(child);
-        }
-        for node in dom.parse_fragment_into(&context_tag, &html) {
-            dom.append(target, node);
-        }
+        // HTML's innerHTML setter parses first, then DOM's replace-all
+        // operation removes the old children and inserts the parsed fragment.
+        let nodes = dom.parse_fragment_into(&context_tag, &html);
+        dom.replace_all_children(target, nodes);
     }
     Ok(Value::Undefined)
 }
