@@ -3663,6 +3663,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_adopt", 2, host_adopt),
     ("__dom_parent", 1, host_parent),
     ("__dom_is_connected", 1, host_is_connected),
+    ("__dom_connected_many", 1, host_connected_many),
+    ("__dom_epoch", 0, host_dom_epoch),
+    ("__dom_nodelist_for_each", 4, host_nodelist_for_each),
     ("__dom_contains", 2, host_contains),
     ("__dom_set_hover", 1, host_set_hover),
     ("__dom_children", 1, host_children),
@@ -6188,6 +6191,68 @@ fn host_is_connected(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     ))
 }
 
+/// Batch the current connectedness of deferred static-NodeList results. The
+/// IDs originate in a native query array, but validate every value because the
+/// host functions are also visible to page JavaScript.
+fn host_connected_many(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(array) = args.first().cloned() else {
+        return Ok(ctx.make_array(Vec::new()));
+    };
+    let dom = host_dom(ctx);
+    let maximum = dom.borrow().node_count();
+    let length = ctx
+        .member_get(&array, "length")?
+        .as_num_opt()
+        .filter(|length| length.is_finite() && *length >= 0.0)
+        .map_or(0, |length| length.min(maximum as f64) as usize);
+    let mut ids = Vec::with_capacity(length);
+    for index in 0..length {
+        ids.push(
+            ctx.member_get(&array, &index.to_string())?
+                .as_num_opt()
+                .filter(|number| number.is_finite() && *number >= 0.0)
+                .map(|number| number as usize),
+        );
+    }
+    let values = {
+        let dom = dom.borrow();
+        ids.into_iter()
+            .map(|id| Value::Bool(id.is_some_and(|id| dom.is_valid(id) && dom.is_connected(id))))
+            .collect()
+    };
+    Ok(ctx.make_array(values))
+}
+
+fn host_dom_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let epoch = dom.borrow().epoch();
+    Ok(Value::Num(epoch as f64))
+}
+
+fn host_nodelist_for_each(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let values = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if !callback.is_callable() {
+        return Err(ctx.make_error("TypeError", "NodeList callback is not callable"));
+    }
+    let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let owner = args.get(3).cloned().unwrap_or(Value::Undefined);
+    let length = ctx
+        .member_get(&values, "length")?
+        .as_num_opt()
+        .filter(|length| length.is_finite() && *length >= 0.0)
+        .map_or(0, |length| length.min(usize::MAX as f64) as usize);
+    for index in 0..length {
+        let value = ctx.member_get(&values, &index.to_string())?;
+        ctx.invoke(
+            callback.clone(),
+            this_arg.clone(),
+            &[value, Value::Num(index as f64), owner.clone()],
+        )?;
+    }
+    Ok(Value::Undefined)
+}
+
 fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -6502,31 +6567,36 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 fn host_query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let selector = host_arg_string(ctx, args, 1);
     let first_only = matches!(args.get(2), Some(Value::Bool(true)));
-    let dom = host_dom(ctx);
-    let ids = {
-        let dom = dom.borrow();
-        match (
-            host_arg_node(&dom, args, 0),
-            SelectorList::parse_cached(&selector),
-        ) {
-            (Some(root), Some(selector)) => dom.query(root, &selector, first_only),
-            _ => Vec::new(),
-        }
+    let Some(selector) = SelectorList::parse_cached(&selector) else {
+        return Ok(Value::Null);
     };
-    Ok(host_ids_array(ctx, ids))
+    let dom = host_dom(ctx);
+    let (ids, epoch, connected) = {
+        let dom = dom.borrow();
+        let root = host_arg_node(&dom, args, 0);
+        let ids = root.map_or_else(Vec::new, |root| dom.query(root, &selector, first_only));
+        (
+            ids,
+            dom.epoch(),
+            root.is_some_and(|root| dom.is_connected(root)),
+        )
+    };
+    if first_only {
+        Ok(host_ids_array(ctx, ids))
+    } else {
+        let ids = host_ids_array(ctx, ids);
+        Ok(ctx.make_array(vec![ids, Value::Num(epoch as f64), Value::Bool(connected)]))
+    }
 }
 
 fn host_matches(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let selector = host_arg_string(ctx, args, 1);
+    let Some(selector) = SelectorList::parse_cached(&selector) else {
+        return Ok(Value::Null);
+    };
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    let matches = match (
-        host_arg_node(&dom, args, 0),
-        SelectorList::parse_cached(&selector),
-    ) {
-        (Some(id), Some(selector)) => dom.matches(id, &selector),
-        _ => false,
-    };
+    let matches = host_arg_node(&dom, args, 0).is_some_and(|id| dom.matches(id, &selector));
     Ok(Value::Bool(matches))
 }
 
@@ -7541,7 +7611,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 112, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 115, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -7552,7 +7622,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 112);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 115);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -9011,6 +9081,99 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "extendedDomResult"),
             "true|true|1|v|tail|b|true|shade|true|2|true|https://example.com/c%20d?q=1#h"
+        );
+    }
+
+    #[test]
+    fn query_selector_all_returns_a_static_lazy_nodelist() {
+        // DOM §4.2.10.1 and ParentNode.querySelectorAll: the result is a new,
+        // static NodeList with supported indexed properties and iterable<Node>.
+        // Retaining native IDs until consumption is unobservable, but a
+        // length-only query must not manufacture wrappers for every result.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const root = document.createElement("section");
+            document.appendChild(root);
+            root.innerHTML = '<span id="old-a">a</span><span id="old-b">b</span>';
+            const before = __trust.nodeWrapperCacheState()[0];
+            const list = root.querySelectorAll("span");
+            const length = list.length;
+            const afterLength = __trust.nodeWrapperCacheState()[0];
+
+            // Static membership survives replacement; the first indexed read
+            // lazily creates exactly one wrapper for the now-detached node.
+            root.innerHTML = '<span id="new">new</span>';
+            const oldFirst = list[0];
+            const afterFirst = __trust.nodeWrapperCacheState()[0];
+            let callbackShape = "";
+            list.forEach((node, index, owner) => {
+                callbackShape += node.textContent + index + (owner === list ? "t" : "f");
+            });
+            const iterated = Array.from(list, node => node.id).join(",");
+            const entries = Array.from(list.entries(), pair => pair[0] + ":" + pair[1].id).join(",");
+            const keys = Array.from(list.keys()).join(",");
+            const ownKeys = Object.keys(list).join(",");
+            list[0] = null;
+            let constructorError = "";
+            try { new NodeList(); } catch (error) { constructorError = error.name; }
+            let missingItemError = "";
+            try { list.item(); } catch (error) { missingItemError = error.name; }
+            let indexedDefineError = "";
+            try { Object.defineProperty(list, "99", { value: null }); }
+            catch (error) { indexedDefineError = error.name; }
+            const deleteSupported = delete list[0];
+            const deleteUnsupported = delete list[99];
+            let preventExtensionsError = "";
+            try { Object.preventExtensions(list); }
+            catch (error) { preventExtensionsError = error.name; }
+            const syntaxErrors = [];
+            for (const operation of [
+                () => root.querySelector("["),
+                () => root.querySelectorAll("["),
+                () => root.matches("["),
+                () => root.closest("[")
+            ]) {
+                try { operation(); } catch (error) { syntaxErrors.push(error.name); }
+            }
+
+            globalThis.staticNodeListResult = [
+                list instanceof NodeList,
+                Array.isArray(list),
+                Object.prototype.toString.call(list),
+                typeof list.map,
+                length,
+                before === afterLength,
+                afterFirst === before + 1,
+                oldFirst.textContent,
+                list.item(0) === oldFirst,
+                list.item(99) === null,
+                list[99] === undefined,
+                list[0] === oldFirst,
+                callbackShape,
+                iterated,
+                entries,
+                keys,
+                ownKeys,
+                root.querySelectorAll("span") !== root.querySelectorAll("span"),
+                constructorError,
+                missingItemError,
+                indexedDefineError,
+                deleteSupported,
+                deleteUnsupported,
+                Object.isExtensible(list),
+                preventExtensionsError,
+                syntaxErrors.join(",")
+            ].join("|");
+            "##,
+            "static lazy NodeList",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "staticNodeListResult"),
+            "true|false|[object NodeList]|undefined|2|true|true|a|true|true|true|true|a0tb1t|old-a,old-b|0:old-a,1:old-b|0,1|0,1|true|TypeError|TypeError|TypeError|false|true|true|TypeError|SyntaxError,SyntaxError,SyntaxError,SyntaxError"
         );
     }
 

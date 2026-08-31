@@ -6242,7 +6242,13 @@ impl Dom {
         for d in self.descendants(root) {
             // ParentNode queries only return elements. Avoid entering the full
             // selector matcher for text/comments in mixed-content trees.
-            if self.tag_name(d).is_none() {
+            let Some(tag) = self.tag_name(d) else {
+                continue;
+            };
+            // Selector matching is right-to-left. When every selector-list
+            // branch has an explicit rightmost type selector, reject other
+            // element types before entering compound/pseudo/ancestor matching.
+            if !selectors.might_match_subject_tag(tag) {
                 continue;
             }
             // `:scope` in the selector resolves to this query root.
@@ -6930,7 +6936,7 @@ fn svg_resource_color(value: &str) -> String {
 /// combinators, in comma lists. Interaction pseudos (`:hover`…) and
 /// pseudo-elements parse but never match — valid CSS that can't be true in
 /// our world.
-pub struct SelectorList(Vec<Complex>);
+pub struct SelectorList(Vec<Complex>, Option<Vec<String>>);
 
 struct Complex(Vec<(Combinator, Compound)>);
 
@@ -7662,8 +7668,32 @@ impl SelectorList {
         if list.is_empty() {
             None
         } else {
-            Some(SelectorList(list))
+            // A selector-list can be tag-prefiltered only if EVERY branch has
+            // an explicit, non-universal subject type. Otherwise an untagged
+            // branch (for example `.item` or `:is(div, span)`) can match any
+            // element and the conservative filter is disabled.
+            let mut subject_tags = Vec::with_capacity(list.len());
+            for complex in &list {
+                let tag = complex
+                    .0
+                    .last()
+                    .and_then(|(_, compound)| compound.tag.as_deref());
+                let Some(tag) = tag.filter(|tag| *tag != "*") else {
+                    return Some(SelectorList(list, None));
+                };
+                if !subject_tags.iter().any(|existing| existing == tag) {
+                    subject_tags.push(tag.to_owned());
+                }
+            }
+            Some(SelectorList(list, Some(subject_tags)))
         }
+    }
+
+    #[inline]
+    fn might_match_subject_tag(&self, tag: &str) -> bool {
+        self.1
+            .as_ref()
+            .is_none_or(|tags| tags.iter().any(|candidate| candidate == tag))
     }
 
     /// `parse`, memoized per thread — the JS `querySelector*`/`matches`
@@ -10682,7 +10712,7 @@ fn parse_style_rule(
     let (decl_text, nested) = split_block(block);
     let decls = collect_decls(&decl_text);
     if !decls.is_empty()
-        && let Some(SelectorList(complexes)) = SelectorList::parse(resolved.trim())
+        && let Some(SelectorList(complexes, _)) = SelectorList::parse(resolved.trim())
     {
         for selector in complexes {
             out.push(StyleRule {
@@ -11944,6 +11974,11 @@ mod tests {
             dom.query(DOCUMENT, &a, false),
             dom.query(DOCUMENT, &SelectorList::parse(".x > .y").unwrap(), false)
         );
+        assert_eq!(
+            SelectorList::parse("span, a.x").unwrap().1,
+            Some(vec!["span".to_string(), "a".to_string()])
+        );
+        assert!(SelectorList::parse("span, .x").unwrap().1.is_none());
     }
 
     #[test]

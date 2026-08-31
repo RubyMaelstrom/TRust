@@ -268,12 +268,27 @@
     function wrap(id) {
         return wrapKnown(id, undefined);
     }
-    // Every result of a ParentNode selector query has the query root's
-    // connectedness. Carry that one known bit through wrapper creation rather
-    // than asking the arena again for every member of a large static NodeList.
-    function wrapQueryResults(root, ids) {
-        const connected = !!__dom_is_connected(root.__id);
-        return ids.map((id) => wrapKnown(id, connected));
+    // DOM ParentNode.querySelectorAll returns a NEW STATIC NodeList. Preserve
+    // the native IDs here and defer wrapper creation until an indexed access or
+    // iteration actually consumes a node; `.length`-only queries stay entirely
+    // on the native ID list.
+    function wrapQueryResults(root, result) {
+        if (result === null) {
+            throw new DOMException("The selector is not valid", "SyntaxError");
+        }
+        return makeStaticNodeList(result[0], result[1], result[2]);
+    }
+    function wrapQueryResult(result) {
+        if (result === null) {
+            throw new DOMException("The selector is not valid", "SyntaxError");
+        }
+        return result.length ? wrap(result[0]) : null;
+    }
+    function selectorMatchesResult(result) {
+        if (result === null) {
+            throw new DOMException("The selector is not valid", "SyntaxError");
+        }
+        return !!result;
     }
     // Diagnostic-only census for focused host GC tests. The public DOM never
     // exposes the cache or its arena ids.
@@ -2369,7 +2384,10 @@
             if (el.checked !== want) { nativeSet(el, "checked", want); changed = true; }
         } else if (tag === "select") {
             if (!el.__trustResetSelected) {
-                el.__trustResetSelected = el.querySelectorAll("option").map(o => o.hasAttribute("selected"));
+                el.__trustResetSelected = Array.from(
+                    el.querySelectorAll("option"),
+                    o => o.hasAttribute("selected")
+                );
             }
             for (const o of el.querySelectorAll("option")) {
                 const ov = o.getAttribute("value") === null ? o.textContent : o.getAttribute("value");
@@ -3306,7 +3324,7 @@
         // Keeping these off Node is observable (`"querySelectorAll" in text`
         // is false) and prevents code that tests for ParentNode from treating
         // an inserted text node as an element.
-        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
@@ -3756,7 +3774,7 @@
             if (!this.__cl) this.__cl = new DOMTokenList(this);
             return this.__cl;
         }
-        matches(s) { return !!__dom_matches(this.__id, String(s)); }
+        matches(s) { return selectorMatchesResult(__dom_matches(this.__id, String(s))); }
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
         // HTML `HTMLElement.click()`: fire a synthetic, non-trusted `click`
@@ -5177,7 +5195,7 @@
         // elements' parsed sheets. Didn't exist at all before — code iterating
         // it threw on `undefined`.
         get styleSheets() {
-            return new StyleSheetList(this.querySelectorAll("style").map((s) => s.sheet));
+            return new StyleSheetList(Array.from(this.querySelectorAll("style"), (s) => s.sheet));
         }
         createElement(t) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
@@ -5259,7 +5277,7 @@
         // DOM Standard ParentNode methods. Document used to inherit these
         // from Node; keep its own implementation now that CharacterData no
         // longer exposes selector methods.
-        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
@@ -6099,7 +6117,7 @@
         get nodeType() { return 11; }
         get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "DocumentFragment"; }
-        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
@@ -6358,7 +6376,7 @@
         get adoptedStyleSheets() { return this.__adopted || (this.__adopted = []); }
         set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
         getElementById(i) { const r = this.querySelectorAll("[id]"); for (const e of r) if (e.id === String(i)) return e; return null; }
-        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
@@ -6896,11 +6914,140 @@
         for (const p of [Element.prototype, CharacterData.prototype]) move(p, CHILD_NODE);
         for (const n of [...PARENT_NODE, ...CHILD_NODE]) delete Node.prototype[n];
     }
-    // querySelectorAll/getElementsBy* return real Arrays (so .map/.forEach/
-    // spread all work); these constructors exist for the `'NodeList' in window`
-    // / `instanceof` feature checks code performs. NamedNodeMap is the type of
-    // Element.attributes.
-    class NodeList {}
+    // DOM §4.2.10.1: querySelectorAll returns a new STATIC NodeList with
+    // supported indexed properties, item(), length, and iterable<Node>. The
+    // backing IDs are immutable, while wrappers are materialized only when an
+    // operation consumes nodes. Iteration snapshots all wrappers up front so a
+    // callback that mutates the DOM runs against the same platform objects; one
+    // batched native connectedness query retains them correctly.
+    const NODE_LIST_DATA = new WeakMap();
+    const NODE_LIST_INDEX = /^(0|[1-9][0-9]*)$/;
+    function nodeListData(list) {
+        const data = NODE_LIST_DATA.get(list);
+        if (!data) throw new TypeError("Illegal invocation");
+        return data;
+    }
+    function nodeListIndex(property, length) {
+        const index = nodeListArrayIndex(property);
+        return index >= 0 && index < length ? index : -1;
+    }
+    function nodeListArrayIndex(property) {
+        if (typeof property !== "string" || !NODE_LIST_INDEX.test(property)) return -1;
+        const index = Number(property);
+        // ECMA-262's ArrayIndex excludes 2^32 - 1 itself. Web IDL uses that
+        // definition for every indexed legacy-platform-object internal method.
+        return Number.isSafeInteger(index) && index < 0xffffffff ? index : -1;
+    }
+    function nodeListItem(data, index) {
+        let wrapper = data.wrappers[index];
+        if (wrapper === undefined) {
+            // One isolated indexed read stays lazy. A second distinct index is
+            // overwhelmingly an indexed loop; materialize the static result in
+            // one connectedness batch rather than crossing the host boundary
+            // once per remaining node.
+            if (!data.materialized && data.firstIndex !== -1 && data.firstIndex !== index) {
+                materializeNodeListData(data);
+                return data.wrappers[index];
+            }
+            // Reuse the query root's connectedness only while the arena epoch
+            // proves the result nodes have not moved. A delayed indexed read
+            // after any mutation asks for this node's current state instead.
+            const knownConnected = __dom_epoch() === data.epoch
+                ? data.connected : undefined;
+            wrapper = wrapKnown(data.ids[index], knownConnected);
+            data.wrappers[index] = wrapper;
+            data.firstIndex = index;
+        }
+        return wrapper;
+    }
+    function materializeNodeListData(data) {
+        if (data.materialized) return data.wrappers;
+        if (__dom_epoch() === data.epoch) {
+            for (let i = 0; i < data.ids.length; i++) {
+                if (data.wrappers[i] === undefined)
+                    data.wrappers[i] = wrapKnown(data.ids[i], data.connected);
+            }
+        } else {
+            const connected = __dom_connected_many(data.ids);
+            for (let i = 0; i < data.ids.length; i++) {
+                if (data.wrappers[i] === undefined)
+                    data.wrappers[i] = wrapKnown(data.ids[i], !!connected[i]);
+            }
+        }
+        data.materialized = true;
+        return data.wrappers;
+    }
+    function materializeNodeList(list) {
+        return materializeNodeListData(nodeListData(list));
+    }
+    class NodeList {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return nodeListData(this).ids.length; }
+        item(index) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            const data = nodeListData(this);
+            index = index >>> 0;
+            return index < data.ids.length ? nodeListItem(data, index) : null;
+        }
+        entries() { return materializeNodeList(this).entries(); }
+        keys() { return nodeListData(this).ids.keys(); }
+        values() { return materializeNodeList(this).values(); }
+        forEach(callback, thisArg) {
+            if (typeof callback !== "function") throw new TypeError("callback is not callable");
+            const values = materializeNodeList(this);
+            return __dom_nodelist_for_each(values, callback, thisArg, this);
+        }
+        [Symbol.iterator]() { return this.values(); }
+        get [Symbol.toStringTag]() { return "NodeList"; }
+    }
+    function makeStaticNodeList(ids, epoch, connected) {
+        const target = Object.create(NodeList.prototype);
+        let proxy;
+        proxy = new Proxy(target, {
+            get(t, property, receiver) {
+                const index = nodeListIndex(property, ids.length);
+                return index < 0 ? Reflect.get(t, property, receiver)
+                    : nodeListItem(NODE_LIST_DATA.get(proxy), index);
+            },
+            has(t, property) {
+                return nodeListIndex(property, ids.length) >= 0 || Reflect.has(t, property);
+            },
+            ownKeys(t) {
+                const keys = [];
+                for (let i = 0; i < ids.length; i++) keys.push(String(i));
+                return keys.concat(Reflect.ownKeys(t));
+            },
+            getOwnPropertyDescriptor(t, property) {
+                const index = nodeListIndex(property, ids.length);
+                if (index < 0) return Reflect.getOwnPropertyDescriptor(t, property);
+                return { value: nodeListItem(NODE_LIST_DATA.get(proxy), index),
+                         writable: false, enumerable: true, configurable: true };
+            },
+            set(t, property, value, receiver) {
+                if (nodeListArrayIndex(property) >= 0) return false;
+                return Reflect.set(t, property, value, receiver);
+            },
+            defineProperty(t, property, descriptor) {
+                if (nodeListArrayIndex(property) >= 0) return false;
+                return Reflect.defineProperty(t, property, descriptor);
+            },
+            deleteProperty(t, property) {
+                const index = nodeListArrayIndex(property);
+                if (index >= 0) return index >= ids.length;
+                return Reflect.deleteProperty(t, property);
+            },
+            preventExtensions() { return false; },
+        });
+        NODE_LIST_DATA.set(proxy, {
+            ids: ids,
+            wrappers: new Array(ids.length),
+            materialized: false,
+            firstIndex: -1,
+            epoch: epoch,
+            connected: !!connected,
+        });
+        return proxy;
+    }
     class HTMLCollection {}
     // WHATWG DOM/HTML collections are live, array-indexed legacy platform
     // objects. Recompute membership at each observable operation so DOM moves,
@@ -6949,6 +7096,9 @@
             }
         }
         forEach(fn, thisArg) { return this.__list().forEach(fn, thisArg); }
+        entries() { return this.__list().entries(); }
+        keys() { return this.__list().keys(); }
+        values() { return this.__list().values(); }
         [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "RadioNodeList"; }
     }
