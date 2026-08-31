@@ -2869,6 +2869,11 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__dom_is_connected", 1, sys_is_connected),
     ("__dom_connected_many", 1, sys_connected_many),
     ("__dom_epoch", 0, sys_dom_epoch),
+    (
+        "__dom_install_readonly_indexed",
+        3,
+        sys_install_readonly_indexed,
+    ),
     ("__dom_nodelist_for_each", 4, sys_nodelist_for_each),
     ("__dom_contains", 2, sys_contains),
     ("__dom_set_hover", 1, sys_set_hover),
@@ -3186,6 +3191,16 @@ fn sys_dom_epoch(_: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<
     let dom = page_dom(ctx);
     let epoch = dom.borrow().epoch();
     Ok(JsValue::from(epoch as f64))
+}
+
+/// Boa has no native Web IDL indexed exotic hook; the shared prelude retains its standards-
+/// equivalent Proxy fallback for the explicit comparison backend.
+fn sys_install_readonly_indexed(
+    _: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(false))
 }
 
 fn sys_nodelist_for_each(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

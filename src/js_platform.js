@@ -7000,14 +7000,31 @@
         [Symbol.iterator]() { return this.values(); }
         get [Symbol.toStringTag]() { return "NodeList"; }
     }
+    function nodeListIndexedGetter(index) {
+        return nodeListItem(nodeListData(this), index);
+    }
     function makeStaticNodeList(ids, epoch, connected) {
         const target = Object.create(NodeList.prototype);
+        const data = {
+            ids: ids,
+            wrappers: new Array(ids.length),
+            materialized: false,
+            firstIndex: -1,
+            epoch: epoch,
+            connected: !!connected,
+        };
+        NODE_LIST_DATA.set(target, data);
+        // Lumen installs Web IDL's indexed legacy-platform-object internal methods directly.
+        // Comparison engines without that audited hook return false and use the equivalent Proxy
+        // below. Keeping the fallback here preserves one shared browser contract.
+        if (__dom_install_readonly_indexed(target, ids.length, nodeListIndexedGetter))
+            return target;
         let proxy;
         proxy = new Proxy(target, {
             get(t, property, receiver) {
                 const index = nodeListIndex(property, ids.length);
                 return index < 0 ? Reflect.get(t, property, receiver)
-                    : nodeListItem(NODE_LIST_DATA.get(proxy), index);
+                    : nodeListItem(data, index);
             },
             has(t, property) {
                 return nodeListIndex(property, ids.length) >= 0 || Reflect.has(t, property);
@@ -7020,7 +7037,7 @@
             getOwnPropertyDescriptor(t, property) {
                 const index = nodeListIndex(property, ids.length);
                 if (index < 0) return Reflect.getOwnPropertyDescriptor(t, property);
-                return { value: nodeListItem(NODE_LIST_DATA.get(proxy), index),
+                return { value: nodeListItem(data, index),
                          writable: false, enumerable: true, configurable: true };
             },
             set(t, property, value, receiver) {
@@ -7038,14 +7055,7 @@
             },
             preventExtensions() { return false; },
         });
-        NODE_LIST_DATA.set(proxy, {
-            ids: ids,
-            wrappers: new Array(ids.length),
-            materialized: false,
-            firstIndex: -1,
-            epoch: epoch,
-            connected: !!connected,
-        });
+        NODE_LIST_DATA.set(proxy, data);
         return proxy;
     }
     class HTMLCollection {}

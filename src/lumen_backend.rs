@@ -3665,6 +3665,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_is_connected", 1, host_is_connected),
     ("__dom_connected_many", 1, host_connected_many),
     ("__dom_epoch", 0, host_dom_epoch),
+    (
+        "__dom_install_readonly_indexed",
+        3,
+        host_install_readonly_indexed,
+    ),
     ("__dom_nodelist_for_each", 4, host_nodelist_for_each),
     ("__dom_contains", 2, host_contains),
     ("__dom_set_hover", 1, host_set_hover),
@@ -6229,6 +6234,31 @@ fn host_dom_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value,
     Ok(Value::Num(epoch as f64))
 }
 
+/// Install Lumen's native Web IDL indexed-property internal methods on a freshly-created
+/// platform object. Boa returns `false` from the same canonical boundary and uses the portable
+/// JavaScript Proxy implementation instead.
+fn host_install_readonly_indexed(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let length = args
+        .get(1)
+        .and_then(Value::as_num_opt)
+        .filter(|length| {
+            length.is_finite()
+                && *length >= 0.0
+                && length.fract() == 0.0
+                && *length <= u32::MAX as f64
+        })
+        .ok_or_else(|| ctx.make_error("TypeError", "indexed-property length must be a uint32"))?
+        as u32;
+    let getter = args.get(2).cloned().unwrap_or(Value::Undefined);
+    ctx.install_readonly_indexed_properties(&target, length, getter)?;
+    Ok(Value::Bool(true))
+}
+
 fn host_nodelist_for_each(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let values = args.first().cloned().unwrap_or(Value::Undefined);
     let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -7611,7 +7641,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 115, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 116, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -7622,7 +7652,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 115);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 116);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
