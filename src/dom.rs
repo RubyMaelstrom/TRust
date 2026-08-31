@@ -1032,13 +1032,21 @@ impl Dom {
     /// (a fresh leaf node) pays one tag check; only subtree attaches walk,
     /// early-exiting on the first sheet element found.
     fn note_tree_style_mutation(&mut self, parent: Option<NodeId>, child: NodeId) {
-        let styled = match &self.nodes[child].data {
-            NodeData::Text(_) => parent.is_some_and(|p| self.tag_name(p) == Some("style")),
-            NodeData::Element { .. } | NodeData::Fragment => self.subtree_has_style(child),
-            _ => false,
-        };
+        let styled = parent.is_some_and(|parent| self.tree_mutation_changes_style(parent, child));
         if styled && let Some(scope) = parent {
             self.touch_style_at(scope);
+        }
+    }
+
+    /// Whether adding/removing `child` directly below `parent` can change the
+    /// active sheet set. Kept separate from the invalidation itself so DOM's
+    /// replace-all algorithm can coalesce an ordered group of removals and the
+    /// insertion into one cache invalidation.
+    fn tree_mutation_changes_style(&self, parent: NodeId, child: NodeId) -> bool {
+        match &self.nodes[child].data {
+            NodeData::Text(_) => self.tag_name(parent) == Some("style"),
+            NodeData::Element { .. } | NodeData::Fragment => self.subtree_has_style(child),
+            _ => false,
         }
     }
 
@@ -1801,6 +1809,85 @@ impl Dom {
         self.nodes[parent].last_child = Some(child);
         self.set_owner_document_subtree(child, owner_document);
         self.touch_content(Some(parent));
+    }
+
+    /// Link a newly-created, detached node while constructing another detached
+    /// subtree. This is not a DOM mutation: no script can observe the nodes yet,
+    /// and the eventual insertion performs ownership and cache invalidation for
+    /// the completed subtree exactly once.
+    fn append_fresh(&mut self, parent: NodeId, child: NodeId) {
+        debug_assert!(self.nodes[child].parent.is_none());
+        debug_assert!(self.nodes[child].prev_sibling.is_none());
+        debug_assert!(self.nodes[child].next_sibling.is_none());
+
+        let old_last = self.nodes[parent].last_child;
+        self.nodes[child].parent = Some(parent);
+        self.nodes[child].prev_sibling = old_last;
+        self.nodes[child].owner_document = self.nodes[parent].owner_document;
+        if let Some(last) = old_last {
+            self.nodes[last].next_sibling = Some(child);
+        } else {
+            self.nodes[parent].first_child = Some(child);
+        }
+        self.nodes[parent].last_child = Some(child);
+    }
+
+    /// DOM Standard §4.2.3's *replace all* tree operation for a list of freshly
+    /// parsed, detached roots. The caller performs the observable custom-element,
+    /// MutationObserver, and navigable steps around this arena operation. Here we
+    /// preserve removal/insertion order while coalescing equivalent internal
+    /// ownership and render-cache bookkeeping for the completed mutation.
+    pub fn replace_all_children(&mut self, parent: NodeId, new_children: Vec<NodeId>) {
+        let had_children = self.nodes[parent].first_child.is_some();
+        if !had_children && new_children.is_empty() {
+            return;
+        }
+
+        let mut style_changed = new_children
+            .iter()
+            .any(|&child| self.tree_mutation_changes_style(parent, child));
+        if !style_changed {
+            style_changed = self
+                .child_iter(parent)
+                .any(|child| self.tree_mutation_changes_style(parent, child));
+        }
+
+        // Snapshot each next link before severing it. Removed subtrees remain
+        // intact and detached, retaining their node identities and listeners.
+        let mut old = self.nodes[parent].first_child;
+        while let Some(child) = old {
+            old = self.nodes[child].next_sibling;
+            let node = &mut self.nodes[child];
+            node.parent = None;
+            node.prev_sibling = None;
+            node.next_sibling = None;
+        }
+        self.nodes[parent].first_child = None;
+        self.nodes[parent].last_child = None;
+
+        let owner_document = self.nodes[parent].owner_document;
+        let mut previous = None;
+        for child in new_children {
+            debug_assert!(self.nodes[child].parent.is_none());
+            debug_assert!(self.nodes[child].prev_sibling.is_none());
+            debug_assert!(self.nodes[child].next_sibling.is_none());
+            self.nodes[child].parent = Some(parent);
+            self.nodes[child].prev_sibling = previous;
+            if let Some(previous) = previous {
+                self.nodes[previous].next_sibling = Some(child);
+            } else {
+                self.nodes[parent].first_child = Some(child);
+            }
+            self.set_owner_document_subtree(child, owner_document);
+            previous = Some(child);
+        }
+        self.nodes[parent].last_child = previous;
+
+        if style_changed {
+            self.touch_style_at(parent);
+        } else {
+            self.touch_content(Some(parent));
+        }
     }
 
     /// Insert `child` under `parent` immediately before `reference`;
@@ -4791,12 +4878,12 @@ impl Dom {
             }
             for c in other.child_iter(sc) {
                 let cc = self.transplant(other, c);
-                self.append(frag, cc);
+                self.append_fresh(frag, cc);
             }
         }
         for c in other.child_iter(id) {
             let cc = self.transplant(other, c);
-            self.append(copy, cc);
+            self.append_fresh(copy, cc);
         }
         copy
     }
@@ -6057,6 +6144,11 @@ impl Dom {
     pub fn query(&self, root: NodeId, selectors: &SelectorList, first_only: bool) -> Vec<NodeId> {
         let mut out = Vec::new();
         for d in self.descendants(root) {
+            // ParentNode queries only return elements. Avoid entering the full
+            // selector matcher for text/comments in mixed-content trees.
+            if self.tag_name(d).is_none() {
+                continue;
+            }
             // `:scope` in the selector resolves to this query root.
             if self.matches_scoped(d, selectors, Some(root)) {
                 out.push(d);
@@ -13584,6 +13676,66 @@ mod tests {
         assert_eq!(dom.text_content(host), "onetwo");
         let html = dom.serialize(DOCUMENT);
         assert!(html.contains("<p class=\"x\">one</p>two"), "{html}");
+    }
+
+    #[test]
+    fn replace_all_batches_bookkeeping_and_preserves_detached_subtrees() {
+        // HTML §8.5.4 parses the fragment before DOM §4.2.3 replace-all.
+        // Constructing the detached result must not dirty the live tree; the
+        // completed replacement is one attributed content mutation.
+        let mut dom = Dom::parse_document(
+            "<body><div id=host><section id=old><b>kept</b></section></div></body>",
+        );
+        let host = dom.get_by_id("host").unwrap();
+        let old = dom.get_by_id("old").unwrap();
+        let old_child = dom.node(old).first_child.unwrap();
+        let _ = dom.take_dirty_targets();
+        let before_parse = dom.epoch();
+
+        let nodes =
+            dom.parse_fragment_into("div", "<p id=first>one</p><p id=second><i>two</i></p>");
+        assert_eq!(
+            dom.epoch(),
+            before_parse,
+            "detached parsing is unobservable"
+        );
+
+        dom.replace_all_children(host, nodes);
+        assert_eq!(dom.epoch(), before_parse + 1);
+        assert_eq!(
+            dom.take_dirty_targets(),
+            Some(vec![(host, DirtyKind::Content)])
+        );
+        assert_eq!(dom.node(old).parent, None);
+        assert_eq!(dom.node(old).first_child, Some(old_child));
+        assert_eq!(dom.node(old_child).parent, Some(old));
+        assert_eq!(dom.text_content(old), "kept");
+        assert_eq!(dom.text_content(host), "onetwo");
+        let children = dom.children(host);
+        assert_eq!(dom.attr(children[0], "id"), Some("first"));
+        assert_eq!(dom.attr(children[1], "id"), Some("second"));
+        assert!(
+            children
+                .iter()
+                .all(|&child| dom.owner_document(child) == Some(DOCUMENT))
+        );
+    }
+
+    #[test]
+    fn replace_all_invalidates_a_changed_sheet_set_once() {
+        let mut dom =
+            Dom::parse_document("<head id=host><style>.old{color:red}</style></head><body></body>");
+        let host = dom.get_by_id("host").unwrap();
+        let _ = dom.take_dirty_targets();
+        let before_epoch = dom.epoch();
+        let before_style_epoch = dom.style_epoch;
+        let nodes = dom.parse_fragment_into("head", "<style>.new{color:blue}</style>");
+
+        dom.replace_all_children(host, nodes);
+
+        assert_eq!(dom.epoch(), before_epoch + 1);
+        assert_eq!(dom.style_epoch, before_style_epoch + 1);
+        assert!(dom.take_dirty_targets().is_none());
     }
 
     #[test]
