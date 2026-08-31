@@ -2867,6 +2867,9 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__dom_adopt", 2, sys_adopt),
     ("__dom_parent", 1, sys_parent),
     ("__dom_is_connected", 1, sys_is_connected),
+    ("__dom_connected_many", 1, sys_connected_many),
+    ("__dom_epoch", 0, sys_dom_epoch),
+    ("__dom_nodelist_for_each", 4, sys_nodelist_for_each),
     ("__dom_contains", 2, sys_contains),
     ("__dom_set_hover", 1, sys_set_hover),
     ("__dom_children", 1, sys_children),
@@ -3144,6 +3147,74 @@ fn sys_is_connected(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
     let d = dom.borrow();
     let connected = arg_node(&d, args, 0).is_some_and(|id| d.is_connected(id));
     Ok(JsValue::from(connected))
+}
+
+/// Batch the current connectedness of native query results. A static NodeList
+/// defers wrapper creation until author code consumes its nodes; materializing
+/// an iterator uses this single boundary crossing so each wrapper receives the
+/// correct current retention state even if the DOM changed after the query.
+fn sys_connected_many(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(array) = args
+        .first()
+        .and_then(JsValue::as_object)
+        .and_then(|object| JsArray::from_object(object.clone()).ok())
+    else {
+        return Ok(JsArray::new(ctx).into());
+    };
+    let dom = page_dom(ctx);
+    let maximum = dom.borrow().node_count() as u64;
+    let length = array.length(ctx)?.min(maximum) as usize;
+    let mut ids = Vec::with_capacity(length);
+    for index in 0..length {
+        ids.push(
+            array
+                .at(index as i64, ctx)?
+                .as_number()
+                .filter(|number| number.is_finite() && *number >= 0.0)
+                .map(|number| number as usize),
+        );
+    }
+    let connected = {
+        let dom = dom.borrow();
+        ids.into_iter()
+            .map(|id| JsValue::from(id.is_some_and(|id| dom.is_valid(id) && dom.is_connected(id))))
+    };
+    Ok(JsArray::from_iter(connected, ctx).into())
+}
+
+fn sys_dom_epoch(_: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let epoch = dom.borrow().epoch();
+    Ok(JsValue::from(epoch as f64))
+}
+
+fn sys_nodelist_for_each(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let values = args
+        .first()
+        .and_then(JsValue::as_object)
+        .and_then(|object| JsArray::from_object(object.clone()).ok())
+        .ok_or_else(|| {
+            boa_engine::JsNativeError::typ().with_message("NodeList values must be an Array")
+        })?;
+    let callback = args
+        .get(1)
+        .and_then(JsValue::as_callable)
+        .cloned()
+        .ok_or_else(|| {
+            boa_engine::JsNativeError::typ().with_message("NodeList callback is not callable")
+        })?;
+    let this_arg = args.get(2).cloned().unwrap_or_else(JsValue::undefined);
+    let owner = args.get(3).cloned().unwrap_or_else(JsValue::undefined);
+    let length = values.length(ctx)?;
+    for index in 0..length {
+        let value = values.at(index as i64, ctx)?;
+        callback.call(
+            &this_arg,
+            &[value, JsValue::from(index as f64), owner.clone()],
+            ctx,
+        )?;
+    }
+    Ok(JsValue::undefined())
 }
 
 /// `__dom_contains(a, b)` → is `a` a STRICT ancestor of `b`? The subtree
@@ -3865,25 +3936,40 @@ fn sys_insert_adjacent(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
 fn sys_query(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let selector = arg_str(args, 1, ctx);
     let first_only = args.get(2).is_some_and(JsValue::to_boolean);
-    let dom = page_dom(ctx);
-    let ids = {
-        let d = dom.borrow();
-        match (arg_node(&d, args, 0), SelectorList::parse_cached(&selector)) {
-            (Some(root), Some(sel)) => d.query(root, &sel, first_only),
-            _ => Vec::new(),
-        }
+    let Some(selector) = SelectorList::parse_cached(&selector) else {
+        return Ok(JsValue::null());
     };
-    Ok(ids_array(ids, ctx))
+    let dom = page_dom(ctx);
+    let (ids, epoch, connected) = {
+        let d = dom.borrow();
+        let root = arg_node(&d, args, 0);
+        let ids = root.map_or_else(Vec::new, |root| d.query(root, &selector, first_only));
+        (
+            ids,
+            d.epoch(),
+            root.is_some_and(|root| d.is_connected(root)),
+        )
+    };
+    if first_only {
+        Ok(ids_array(ids, ctx))
+    } else {
+        let ids = ids_array(ids, ctx);
+        Ok(JsArray::from_iter(
+            [ids, JsValue::from(epoch as f64), JsValue::from(connected)],
+            ctx,
+        )
+        .into())
+    }
 }
 
 fn sys_matches(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let selector = arg_str(args, 1, ctx);
+    let Some(selector) = SelectorList::parse_cached(&selector) else {
+        return Ok(JsValue::null());
+    };
     let dom = page_dom(ctx);
     let d = dom.borrow();
-    let hit = match (arg_node(&d, args, 0), SelectorList::parse_cached(&selector)) {
-        (Some(id), Some(sel)) => d.matches(id, &sel),
-        _ => false,
-    };
+    let hit = arg_node(&d, args, 0).is_some_and(|id| d.matches(id, &selector));
     Ok(JsValue::from(hit))
 }
 
