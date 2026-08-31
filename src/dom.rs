@@ -1832,6 +1832,102 @@ impl Dom {
         self.nodes[parent].last_child = Some(child);
     }
 
+    /// Unlink a node while html5ever is constructing its private parse arena.
+    /// Parser tree surgery is not a mutation of the live page, so it must not
+    /// invalidate style/layout caches or walk node-document ownership.
+    fn parser_detach(&mut self, id: NodeId) {
+        let (parent, previous, next) = {
+            let node = &self.nodes[id];
+            (node.parent, node.prev_sibling, node.next_sibling)
+        };
+        if let Some(previous) = previous {
+            self.nodes[previous].next_sibling = next;
+        }
+        if let Some(next) = next {
+            self.nodes[next].prev_sibling = previous;
+        }
+        if let Some(parent) = parent {
+            if self.nodes[parent].first_child == Some(id) {
+                self.nodes[parent].first_child = next;
+            }
+            if self.nodes[parent].last_child == Some(id) {
+                self.nodes[parent].last_child = previous;
+            }
+        }
+        let node = &mut self.nodes[id];
+        node.parent = None;
+        node.prev_sibling = None;
+        node.next_sibling = None;
+    }
+
+    /// Append within html5ever's private arena. Unlike [`Self::append_fresh`],
+    /// this accepts an already-linked node because the HTML adoption-agency and
+    /// foster-parenting algorithms move existing parser nodes.
+    fn parser_append(&mut self, parent: NodeId, child: NodeId) {
+        self.parser_detach(child);
+        let previous = self.nodes[parent].last_child;
+        self.nodes[child].parent = Some(parent);
+        self.nodes[child].prev_sibling = previous;
+        if let Some(previous) = previous {
+            self.nodes[previous].next_sibling = Some(child);
+        } else {
+            self.nodes[parent].first_child = Some(child);
+        }
+        self.nodes[parent].last_child = Some(child);
+    }
+
+    /// Insert within html5ever's private arena, preserving DOM pre-insert's
+    /// self-reference behavior even though well-formed parser calls ordinarily
+    /// supply a distinct reference node.
+    fn parser_insert_before(&mut self, parent: NodeId, child: NodeId, reference: NodeId) {
+        debug_assert_eq!(self.nodes[reference].parent, Some(parent));
+        let reference = if reference == child {
+            let Some(next) = self.nodes[child].next_sibling else {
+                self.parser_append(parent, child);
+                return;
+            };
+            next
+        } else {
+            reference
+        };
+        self.parser_detach(child);
+        let previous = self.nodes[reference].prev_sibling;
+        self.nodes[child].parent = Some(parent);
+        self.nodes[child].prev_sibling = previous;
+        self.nodes[child].next_sibling = Some(reference);
+        self.nodes[reference].prev_sibling = Some(child);
+        if let Some(previous) = previous {
+            self.nodes[previous].next_sibling = Some(child);
+        } else {
+            self.nodes[parent].first_child = Some(child);
+        }
+    }
+
+    fn parser_append_text(&mut self, parent: NodeId, text: &str) {
+        if let Some(last) = self.nodes[parent].last_child
+            && let NodeData::Text(existing) = &mut self.nodes[last].data
+        {
+            existing.push_str(text);
+            return;
+        }
+        let text = self.new_node(NodeData::Text(text.to_owned()));
+        self.parser_append(parent, text);
+    }
+
+    fn parser_insert_text_before(&mut self, sibling: NodeId, text: &str) {
+        if let Some(previous) = self.nodes[sibling].prev_sibling
+            && let NodeData::Text(existing) = &mut self.nodes[previous].data
+        {
+            existing.push_str(text);
+            return;
+        }
+        let Some(parent) = self.nodes[sibling].parent else {
+            return;
+        };
+        let text = self.new_node(NodeData::Text(text.to_owned()));
+        self.parser_insert_before(parent, text, sibling);
+    }
+
     /// DOM Standard §4.2.3's *replace all* tree operation for a list of freshly
     /// parsed, detached roots. The caller performs the observable custom-element,
     /// MutationObserver, and navigable steps around this arena operation. Here we
@@ -11696,7 +11792,13 @@ impl TreeSink for Sink {
     type ElemName<'a> = Ref<'a, QualName>;
 
     fn finish(self) -> Dom {
-        self.dom.into_inner()
+        let mut dom = self.dom.into_inner();
+        // Preserve the initial document's conservative "needs a full render"
+        // state without retaining O(nodes) private parser mutation records.
+        if dom.nodes.len() > 1 {
+            dom.touch();
+        }
+        dom
     }
 
     fn parse_error(&self, _msg: Cow<'static, str>) {}
@@ -11733,8 +11835,8 @@ impl TreeSink for Sink {
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
         let mut dom = self.dom.borrow_mut();
         match child {
-            NodeOrText::AppendNode(n) => dom.append(*parent, n),
-            NodeOrText::AppendText(t) => dom.append_text(*parent, &t),
+            NodeOrText::AppendNode(n) => dom.parser_append(*parent, n),
+            NodeOrText::AppendText(t) => dom.parser_append_text(*parent, &t),
         }
     }
 
@@ -11759,7 +11861,7 @@ impl TreeSink for Sink {
     ) {
         let mut dom = self.dom.borrow_mut();
         let dt = dom.new_node(NodeData::Doctype);
-        dom.append(DOCUMENT, dt);
+        dom.parser_append(DOCUMENT, dt);
     }
 
     fn get_template_contents(&self, target: &NodeId) -> NodeId {
@@ -11784,18 +11886,8 @@ impl TreeSink for Sink {
             return;
         };
         match new_node {
-            NodeOrText::AppendNode(n) => dom.insert_before(parent, n, Some(*sibling)),
-            NodeOrText::AppendText(t) => {
-                // Merge into the preceding text node when there is one.
-                if let Some(prev) = dom.nodes[*sibling].prev_sibling
-                    && let NodeData::Text(existing) = &mut dom.nodes[prev].data
-                {
-                    existing.push_str(&t);
-                    return;
-                }
-                let tn = dom.create_text(&t);
-                dom.insert_before(parent, tn, Some(*sibling));
-            }
+            NodeOrText::AppendNode(n) => dom.parser_insert_before(parent, n, *sibling),
+            NodeOrText::AppendText(t) => dom.parser_insert_text_before(*sibling, &t),
         }
     }
 
@@ -11819,13 +11911,13 @@ impl TreeSink for Sink {
     }
 
     fn remove_from_parent(&self, target: &NodeId) {
-        self.dom.borrow_mut().detach(*target);
+        self.dom.borrow_mut().parser_detach(*target);
     }
 
     fn reparent_children(&self, node: &NodeId, new_parent: &NodeId) {
         let mut dom = self.dom.borrow_mut();
-        for c in dom.children(*node) {
-            dom.append(*new_parent, c);
+        while let Some(child) = dom.nodes[*node].first_child {
+            dom.parser_append(*new_parent, child);
         }
     }
 
@@ -12047,11 +12139,35 @@ mod tests {
 
     #[test]
     fn parses_and_serializes_a_document() {
-        let dom = Dom::parse_document(
+        let mut dom = Dom::parse_document(
             "<html><head><title>T</title></head><body><p id=a>hi <b>there</b></p></body></html>",
         );
         let html = dom.serialize(DOCUMENT);
         assert!(html.contains("<p id=\"a\">hi <b>there</b></p>"), "{html}");
+        assert_eq!(dom.epoch(), 1, "private parser work is coalesced");
+        assert!(dom.take_dirty());
+        assert!(dom.take_dirty_targets().is_none());
+    }
+
+    #[test]
+    fn parser_tree_surgery_preserves_foster_parenting_and_adoption_agency() {
+        // HTML §13.2.6.4.1 foster-parents the div before the table, while
+        // §13.2.6.4.7's adoption-agency algorithm repairs the misnested
+        // formatting elements. Both operations move already-linked nodes and
+        // therefore exercise the parser-only unlink/insert primitives.
+        let dom = Dom::parse_document(
+            "<body><table id=table><div id=foster>outside</div><tr><td>cell</td></tr></table>\
+             <p id=misnested><b>one<i>two</b>three</i>four</p></body>",
+        );
+        let foster = dom.get_by_id("foster").unwrap();
+        let table = dom.get_by_id("table").unwrap();
+        assert_eq!(dom.node(foster).next_sibling, Some(table));
+        assert_eq!(dom.node(foster).parent, dom.node(table).parent);
+        let repaired = dom.serialize_js(dom.get_by_id("misnested").unwrap());
+        assert!(
+            repaired.contains("<b>one<i>two</i></b><i>three</i>four"),
+            "{repaired}"
+        );
     }
 
     #[test]
