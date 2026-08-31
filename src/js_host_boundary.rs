@@ -16,6 +16,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_is_connected", 1),
     ("__dom_connected_many", 1),
     ("__dom_epoch", 0),
+    ("__dom_install_readonly_indexed", 3),
     ("__dom_nodelist_for_each", 4),
     ("__dom_contains", 2),
     ("__dom_set_hover", 1),
