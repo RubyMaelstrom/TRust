@@ -736,6 +736,67 @@ pub fn measure_boxes_css(
     (boxes, flow.grid_tracks.into_inner(), scrolling_areas)
 }
 
+/// CSSOM View layout plus the paint-ordered hit-test display list.
+///
+/// `elementFromPoint()` is a forced-layout API just like the box geometry
+/// getters, but its normative result is selected in paint order after clips,
+/// transforms, scrolling, and pointer hit-test eligibility are applied. Keep
+/// those products on one fragment pass so an editor doing a bounding-box read
+/// immediately before hit testing does not lay the document out twice.
+#[allow(clippy::type_complexity)]
+pub fn measure_cssom_with_paint_css(
+    dom: &Dom,
+    base: &Url,
+    viewport: Viewport,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+) -> (
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+    HashMap<NodeId, PxRect>,
+    crate::render::PagePaint,
+) {
+    let vp = Vp {
+        w: viewport.width,
+        h: viewport.height,
+    };
+    let Some(root) = tree::build(dom, base, controls, forms, vp) else {
+        return (
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            crate::render::PagePaint {
+                width: viewport.width,
+                ..Default::default()
+            },
+        );
+    };
+    let flow = Flow {
+        dom,
+        base,
+        forms,
+        images,
+        vp,
+        imemo: Default::default(),
+        grid_tracks: Default::default(),
+    };
+    let (frag, flow_bottom, _anchors, fixed, top_layer) = flow.layout(&root);
+    let (boxes, scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
+    let (paint, _patch_boundaries, _boundaries) = graphics::paint(
+        dom,
+        base,
+        images,
+        &frag,
+        &fixed,
+        &top_layer,
+        flow_bottom,
+        vp.w,
+        vp.h,
+    );
+    (boxes, flow.grid_tracks.into_inner(), scrolling_areas, paint)
+}
+
 /// Lay one INLINE relayout-boundary subtree (a block-filling IFC box, NOT a
 /// scroll region) for the general incremental splice (incremental-layout contract
 /// §14; the layout2 sibling of `layout::lay_out_subtree_fragment`). `boundary`
@@ -1724,6 +1785,20 @@ mod tests {
             40,
         );
         assert_eq!(row_text(&out.rows[0]), "B-mid-A");
+    }
+
+    #[test]
+    fn generated_inline_block_is_laid_without_a_dom_node() {
+        // CSS Pseudo 4 §4.1 makes ::before/::after fully styleable and CSS
+        // Display 3 §2 classifies inline-block as an inline-level block
+        // container. Its generated box has no DOM node, but must still take
+        // the ordinary shrink-to-fit path and participate in the line.
+        let out = lay(
+            r#"<head><style>#a::before{content:"B";display:inline-block}</style></head>
+               <body style="margin:0"><p id=a style="margin:0">mid</p></body>"#,
+            40,
+        );
+        assert_eq!(row_text(&out.rows[0]), "Bmid");
     }
 
     #[test]
@@ -4654,6 +4729,51 @@ mod tests {
         assert_eq!((r, a2.col), (0, 10));
         let (r2, b2) = find(&out, "b2");
         assert_eq!((r2, b2.col), (1, 10));
+    }
+
+    #[test]
+    fn deep_unchanged_stretch_chain_lays_out_once_per_level() {
+        // Flexbox §9.4 step 5 redoes an item's descendant layout only when
+        // its used cross size changed from its hypothetical cross size. A
+        // one-child auto-height row has no such change. Unconditionally doing
+        // the stretch pass made each level lay the entire child subtree twice,
+        // so this ordinary generated-markup shape grew as 2^N (Instagram's
+        // logged-out shell contains a much larger version of the same shape).
+        let mut html = String::from(r#"<body style="margin:0">"#);
+        for _ in 0..32 {
+            html.push_str(r#"<div style="display:flex">"#);
+        }
+        html.push_str("leaf");
+        for _ in 0..32 {
+            html.push_str("</div>");
+        }
+        html.push_str("</body>");
+
+        let out = lay(&html, 80);
+        let (row, leaf) = find(&out, "leaf");
+        assert_eq!((row, leaf.col), (0, 0));
+    }
+
+    #[test]
+    fn deep_auto_column_chain_lays_out_once_per_level() {
+        // Flexbox §§9.4 and 9.8: resolving an auto-height column item to its
+        // unchanged natural main size does not make that size definite. Its
+        // first layout is therefore already the required hypothetical-cross-
+        // size layout. Repeating the whole subtree at every ancestor grows as
+        // 2^N; real SSR component trees commonly contain this shape.
+        let mut html = String::from(r#"<body style="margin:0">"#);
+        for _ in 0..32 {
+            html.push_str(r#"<div style="display:flex;flex-direction:column">"#);
+        }
+        html.push_str("leaf");
+        for _ in 0..32 {
+            html.push_str("</div>");
+        }
+        html.push_str("</body>");
+
+        let out = lay(&html, 80);
+        let (row, leaf) = find(&out, "leaf");
+        assert_eq!((row, leaf.col), (0, 0));
     }
 
     #[test]

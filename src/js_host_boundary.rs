@@ -2,6 +2,7 @@
 
 pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_create_element", 1),
+    ("__dom_create_element_ns", 3),
     ("__dom_create_text", 1),
     ("__dom_create_fragment", 0),
     ("__dom_parse_document", 1),
@@ -23,12 +24,14 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_node_type", 1),
     ("__dom_tag", 1),
     ("__dom_namespace", 1),
+    ("__dom_element_name", 1),
     ("__dom_get_attr", 2),
     ("__dom_computed", 2),
     ("__image_current_src", 1),
     ("__image_complete", 1),
     ("__match_media", 3),
     ("__dom_rect", 1),
+    ("__dom_elements_from_point", 5),
     ("__dom_scroll_get", 2),
     ("__dom_scroll_set", 3),
     ("__dom_set_attr", 3),
@@ -46,6 +49,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_get_by_id", 1),
     ("__dom_upgrade_candidates", 2),
     ("__dom_ce_candidates", 1),
+    ("__dom_wrapper_subtree", 1),
     ("__dom_clone", 2),
     ("__dom_doc_element", 0),
     ("__html_dda", 0),
@@ -60,9 +64,15 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__http_fetch", 5),
     ("__http_fetch_async", 5),
     ("__dom_run_injected_script", 1),
+    ("__dom_run_classic_script", 3),
+    ("__dom_allocate_job_context", 0),
+    ("__dom_create_window_realm", 8),
+    ("__dom_set_job_context", 1),
+    ("__dom_release_job_context", 1),
     ("__dom_load_injected_stylesheet", 1),
     ("__cookie_get", 0),
     ("__cookie_set", 1),
+    ("__clock_now", 0),
     ("__clock_set", 1),
     ("__storage_get", 2),
     ("__storage_set", 3),
@@ -104,3 +114,20 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__wasm_table_set", 3),
     ("__wasm_table_grow", 3),
 ];
+
+/// Serialize a non-negative CSS pixel length with stable layout precision and
+/// without non-canonical trailing zeroes.
+pub(crate) fn serialize_css_px(value: f64) -> String {
+    let mut number = format!("{:.4}", value.max(0.0));
+    while number.ends_with('0') {
+        number.pop();
+    }
+    if number.ends_with('.') {
+        number.pop();
+    }
+    if number.is_empty() {
+        number.push('0');
+    }
+    number.push_str("px");
+    number
+}

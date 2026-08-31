@@ -60,6 +60,7 @@ fn add(map: &mut HashMap<NodeId, Rect>, node: NodeId, r: Rect) {
 struct Own {
     own: HashMap<NodeId, Rect>,
     block: HashMap<NodeId, Rect>,
+    css_size: HashMap<NodeId, [f32; 2]>,
     nodes: HashSet<NodeId>,
 }
 
@@ -76,6 +77,9 @@ fn walk(f: &Frag<'_>, o: &mut Own) {
             };
             add(&mut o.block, f.node, r);
             add(&mut o.own, f.node, r);
+            if let Some(size) = f.css_size {
+                o.css_size.insert(f.node, size);
+            }
         }
     }
     if let FragKind::Line(line) = &f.kind {
@@ -142,6 +146,7 @@ fn select_into(
     dom: &Dom,
     content: &HashMap<NodeId, Rect>,
     block: &HashMap<NodeId, Rect>,
+    css_size: &HashMap<NodeId, [f32; 2]>,
     out: &mut HashMap<NodeId, PxRect>,
     scroll: &mut HashMap<NodeId, PxRect>,
 ) {
@@ -156,6 +161,8 @@ fn select_into(
                 top: c.y0 as f64,
                 width: (c.x1 - c.x0) as f64,
                 height: (c.y1 - c.y0) as f64,
+                css_width: css_size.get(&node).map(|size| f64::from(size[0])),
+                css_height: css_size.get(&node).map(|size| f64::from(size[1])),
             },
         );
         if dom.is_scroll_container(node)
@@ -169,6 +176,8 @@ fn select_into(
                     top: cbox.y0 as f64,
                     width: (cbox.x1 - cbox.x0) as f64,
                     height: (cbox.y1 - cbox.y0) as f64,
+                    css_width: None,
+                    css_height: None,
                 },
             );
         }
@@ -203,11 +212,25 @@ pub(super) fn boxes(
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
     let mut scroll: HashMap<NodeId, PxRect> = HashMap::new();
     let flow_content = composed_union(dom, &flow.own, |_| true);
-    select_into(dom, &flow_content, &flow.block, &mut out, &mut scroll);
+    select_into(
+        dom,
+        &flow_content,
+        &flow.block,
+        &flow.css_size,
+        &mut out,
+        &mut scroll,
+    );
     if !fx.own.is_empty() {
         let fixed_nodes = fx.nodes;
         let fx_content = composed_union(dom, &fx.own, |id| fixed_nodes.contains(&id));
-        select_into(dom, &fx_content, &fx.block, &mut out, &mut scroll);
+        select_into(
+            dom,
+            &fx_content,
+            &fx.block,
+            &fx.css_size,
+            &mut out,
+            &mut scroll,
+        );
     }
     (out, scroll)
 }

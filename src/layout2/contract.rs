@@ -163,6 +163,11 @@ pub struct PxRect {
     pub top: f64,
     pub width: f64,
     pub height: f64,
+    /// CSSOM §9 used values for the `width`/`height` properties. These differ
+    /// from border-box geometry for content-box sizing and remain absent for
+    /// inline/anonymous boxes to which the properties do not apply.
+    pub css_width: Option<f64>,
+    pub css_height: Option<f64>,
 }
 
 /// The context a CSS length resolves in: the element's computed font-size

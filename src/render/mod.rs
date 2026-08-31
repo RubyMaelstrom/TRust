@@ -1152,6 +1152,44 @@ impl Scene {
             })
     }
 
+    /// Every CSS box at `point`, in topmost-first paint order, for CSSOM View's
+    /// `elementsFromPoint()` algorithm. Unlike the UI's activation hit test,
+    /// ordinary non-interactive elements remain candidates. Multiple fragments
+    /// associated with the same element collapse to its first (topmost) entry.
+    fn page_element_hits_at(&self, point: CssPoint) -> Vec<PageHit> {
+        let states = interaction_states(&self.primitives);
+        let mut seen = std::collections::HashSet::new();
+        self.primitives
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, primitive)| {
+                let DisplayCommand::HitRegion(region) = primitive else {
+                    return None;
+                };
+                if seen.contains(&region.node) {
+                    return None;
+                }
+                let state = states.get(index)?.as_ref()?;
+                let hit = point_in_interaction_state(point, state)
+                    .then(|| state.transform.inverse())
+                    .flatten()
+                    .map(|inverse| inverse.map_point(point))
+                    .filter(|local| region.rect.contains(*local));
+                hit.map(|_| {
+                    seen.insert(region.node);
+                    PageHit {
+                        rect: transformed_bounds(region.rect, state.transform),
+                        node: region.node,
+                        actor: region.actor,
+                        link: region.link.clone(),
+                        cursor: region.cursor.clone(),
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Semantic interactive regions in document paint order. Unlike pointer
     /// hit testing this intentionally retains regions outside the current
     /// viewport clip so keyboard traversal can move focus to them and then
@@ -1513,6 +1551,33 @@ impl Scene {
             }
         }
     }
+}
+
+/// Resolve CSSOM View hit-test candidates against the same composed display
+/// list used by the graphical frontend. `point` is viewport-relative and
+/// `scroll` is the top-level viewport scroll in CSS pixels.
+pub fn page_element_hits_at(
+    page: &PagePaint,
+    viewport: CssSize,
+    scroll: CssPoint,
+    point: CssPoint,
+) -> Vec<PageHit> {
+    let physical = PhysicalSize::new(
+        viewport.width.ceil().max(1.0) as u32,
+        viewport.height.ceil().max(1.0) as u32,
+    );
+    let metrics = ViewportMetrics::from_physical(physical, Default::default());
+    let mut scene = Scene {
+        viewport: metrics,
+        primitives: Vec::new(),
+        controls: Vec::new(),
+        content_viewport: CssRect::new(0.0, 0.0, viewport.width, viewport.height),
+        image_store: ImageStore::default(),
+        page_scroll_containers: Vec::new(),
+        page_size: CssSize::default(),
+    };
+    scene.append_page(page, scroll);
+    scene.page_element_hits_at(point)
 }
 
 /// Sample HTML's discrete marquee motion. The scroll interval and distance

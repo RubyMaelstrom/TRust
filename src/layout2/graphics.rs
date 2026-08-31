@@ -338,13 +338,20 @@ impl<'a, 't> Builder<'a, 't> {
     }
 
     fn collect_scroll_containers(&mut self, fragment: &Frag<'_>) {
+        let nested_viewport = fragment.node != NO_NODE
+            && matches!(self.dom.tag_name(fragment.node), Some("iframe" | "frame"));
         if fragment.node != NO_NODE
             && !matches!(self.dom.tag_name(fragment.node), Some("html" | "body"))
             && (self.dom.is_scroll_container(fragment.node)
-                || self.dom.is_hscroll_container(fragment.node))
+                || self.dom.is_hscroll_container(fragment.node)
+                || nested_viewport)
         {
             let viewport = padding_box(fragment);
             let (right, bottom) = subtree_extent(fragment);
+            let content = CssSize::new(
+                (right - viewport.x).max(viewport.width),
+                (bottom - viewport.y).max(viewport.height),
+            );
             self.scroll_containers.push(ScrollContainer {
                 node: fragment.node,
                 actor: if self.dom.render_live() {
@@ -355,16 +362,19 @@ impl<'a, 't> Builder<'a, 't> {
                         .and_then(|value| value.parse().ok())
                 },
                 viewport,
-                content: CssSize::new(
-                    (right - viewport.x).max(viewport.width),
-                    (bottom - viewport.y).max(viewport.height),
-                ),
+                content,
                 offset: CssPoint::new(
                     self.dom.scroll_metric(fragment.node, 1).unwrap_or(0.0) as f32,
                     self.dom.scroll_metric(fragment.node, 0).unwrap_or(0.0) as f32,
                 ),
-                horizontal: self.dom.is_hscroll_container(fragment.node),
-                vertical: self.dom.is_scroll_container(fragment.node),
+                // An iframe is itself a nested viewport. HTML's default
+                // scrolling behavior supplies scroll mechanisms only on axes
+                // whose child document overflows that viewport; authored CSS
+                // scroll containers retain their explicit axis eligibility.
+                horizontal: self.dom.is_hscroll_container(fragment.node)
+                    || (nested_viewport && content.width > viewport.width),
+                vertical: self.dom.is_scroll_container(fragment.node)
+                    || (nested_viewport && content.height > viewport.height),
             });
         }
         for child in &fragment.children {
@@ -1403,6 +1413,7 @@ fn paint_atomic_control_box(
         w: rect.width,
         h: rect.height,
         border: style.border,
+        css_size: None,
         paint: Default::default(),
         clip: parent.clip,
         kind: FragKind::Block,

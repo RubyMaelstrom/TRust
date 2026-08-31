@@ -14,7 +14,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
-use html5ever::{Attribute, ParseOpts, QualName, ns};
+use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
 
 pub type NodeId = usize;
 
@@ -85,13 +85,15 @@ pub struct CascDiag {
     pub style_index_builds: u64,
     /// Total author rules parsed into the index.
     pub rules: u64,
-    /// `computed_value` invocations (inheritance/UA-default resolution).
-    pub computed_value_calls: u64,
-    /// `cascaded` invocations (post-winner-map: each is a hash lookup).
-    pub cascaded_calls: u64,
     /// Cumulative time building per-element cascade winner maps (one build
     /// per element per epoch — the inline-style parse + matched-decl scan).
     pub cascaded_us: u64,
+    /// Cold per-element selector-match memo builds and the candidate rules
+    /// tested while building them.
+    pub matched_rule_builds: u64,
+    pub matched_candidates: u64,
+    /// Cumulative selector matching time for those cold memo builds.
+    pub matched_us: u64,
 }
 
 impl CascDiag {
@@ -99,9 +101,10 @@ impl CascDiag {
         style_index_us: 0,
         style_index_builds: 0,
         rules: 0,
-        computed_value_calls: 0,
-        cascaded_calls: 0,
         cascaded_us: 0,
+        matched_rule_builds: 0,
+        matched_candidates: 0,
+        matched_us: 0,
     };
 }
 
@@ -146,6 +149,13 @@ pub struct Dom {
     /// Monotonic mutation counter (bumped with `dirty`); keys the
     /// cached visibility cascade so it rebuilds only after changes.
     epoch: u64,
+    /// Geometry invalidations retained independently of the frontend's incremental-render
+    /// queue. TRust stores nested Documents in one arena, but HTML §7.3.1.3 gives each child
+    /// navigable its own active Document: a mutation inside that Document cannot change the
+    /// embedding iframe's box in its container Document. The CSSOM View cache consumes this log
+    /// only when deciding whether a cached top-level iframe rectangle remains usable.
+    geometry_dirty_nodes: FxHashMap<NodeId, DirtyKind>,
+    geometry_dirty_attributed: bool,
     /// Monotonic STYLE epoch: advances only when the SHEET SET can have
     /// changed — exactly the triggers the standards define for sheet
     /// (re)creation (HTML §4.2.6: a `<style>`'s sheet re-creates when its
@@ -173,6 +183,11 @@ pub struct Dom {
     /// layout's per-element reads would re-walk without this; cleared when
     /// the epoch advances.
     computed_cache: RefCell<ComputedCache>,
+    /// Memoized inherited custom-property source values for the current DOM
+    /// epoch. CSS Custom Properties §2 makes every unregistered `--*`
+    /// property inherited; a deep application tree otherwise re-walks the
+    /// same ancestor chain for every `var()` in every resolved box property.
+    custom_prop_cache: RefCell<CustomPropCache>,
     /// Memoized selector-match results for the current epoch: for an element,
     /// the indices (into its tree scope's rule vec) of every author rule whose
     /// selector matches it. Selector matching is the cascade's dominant cost on
@@ -200,6 +215,12 @@ pub struct Dom {
     /// numeric composition walks ancestors, so it's cached like the other
     /// per-element cascade reads.
     font_cache: RefCell<NodeCache<f32>>,
+    /// Memoized line-decoration propagation for the current DOM epoch.
+    /// `text-decoration-line` does not inherit, but decorations established by
+    /// an ancestor propagate through its in-flow descendant boxes. Layout asks
+    /// for the accumulated pair more than once per element, so recursively
+    /// share each ancestor's result instead of re-walking the full chain.
+    decoration_cache: RefCell<NodeCache<(bool, bool)>>,
     /// Repeated DOM string getters (textContent/innerHTML/outerHTML) can be
     /// hot in framework render loops. Cache each completed value only for the
     /// current DOM epoch; the next tree/attribute/text mutation drops the map
@@ -327,6 +348,14 @@ struct ScrollBox {
 /// are arena-internal, so SipHash's DoS resistance buys nothing.
 type ComputedCache = (u64, FxHashMap<(NodeId, usize), Option<String>>);
 
+/// Per-epoch memo for inherited custom-property source values. Custom
+/// properties form an open-ended, case-sensitive name space, so keep a small
+/// name map per node rather than allocating a `(node, String)` key on every
+/// cache hit. The cached value is the same cascaded-or-inherited token stream
+/// that [`Dom::custom_prop`] returned before memoization; `var()` dependency
+/// resolution and cycle detection still happen at the use site.
+type CustomPropCache = (u64, FxHashMap<NodeId, FxHashMap<String, Option<String>>>);
+
 /// A node-indexed, epoch-STAMPED slot cache for the per-epoch memos keyed
 /// by bare `NodeId`. NodeIds are dense arena indices, so a Vec slot
 /// replaces hashing entirely, and the stamp compare replaces the per-epoch
@@ -434,15 +463,19 @@ impl Dom {
             shadow_hosts: FxHashMap::default(),
             dirty: false,
             epoch: 0,
+            geometry_dirty_nodes: FxHashMap::default(),
+            geometry_dirty_attributed: true,
             style_epoch: 0,
             adopted_styles: FxHashMap::default(),
             external_sheets: FxHashMap::default(),
             style_cache: RefCell::new(None),
             computed_cache: RefCell::new((u64::MAX, FxHashMap::default())),
+            custom_prop_cache: RefCell::new((u64::MAX, FxHashMap::default())),
             matched_cache: RefCell::new(NodeCache::default()),
             cascaded_cache: RefCell::new(NodeCache::default()),
             hidden_cache: RefCell::new(NodeCache::default()),
             font_cache: RefCell::new(NodeCache::default()),
+            decoration_cache: RefCell::new(NodeCache::default()),
             serialization_cache: RefCell::new((u64::MAX, FxHashMap::default())),
             viewport_px: (0.0, 0.0),
             device_pixel_ratio: 1.0,
@@ -828,6 +861,9 @@ impl Dom {
             return false;
         }
         self.mark();
+        for (&node, &kind) in &changed {
+            self.record_geometry_dirty(node, kind);
+        }
         self.dirty_nodes.extend(changed);
         true
     }
@@ -918,18 +954,40 @@ impl Dom {
         }
     }
 
+    /// Coalesce repeated geometry invalidations per arena node. This keeps the queue bounded by
+    /// the DOM itself even on a page that mutates forever without reading layout. Attribute
+    /// changes dominate content changes, which dominate paint-only changes, because the strongest
+    /// retained kind is the one the cache must prove isolated before reusing a box.
+    fn record_geometry_dirty(&mut self, id: NodeId, kind: DirtyKind) {
+        let strength = |kind| match kind {
+            DirtyKind::Paint => 0,
+            DirtyKind::Content => 1,
+            DirtyKind::Attr => 2,
+        };
+        self.geometry_dirty_nodes
+            .entry(id)
+            .and_modify(|old| {
+                if strength(kind) > strength(*old) {
+                    *old = kind;
+                }
+            })
+            .or_insert(kind);
+    }
+
     /// An UNATTRIBUTED mutation — one we can't pin to a single element (a global
     /// stylesheet/viewport change). Forces the next render to a full relayout
     /// (no incremental patch), since it may have changed anything.
     fn touch(&mut self) {
         self.mark();
         self.dirty_attributed = false;
+        self.geometry_dirty_attributed = false;
     }
 
     /// An attribute change on `id` (its own styling/box may have changed).
     fn touch_attr(&mut self, id: NodeId) {
         self.mark();
         self.dirty_nodes.push((id, DirtyKind::Attr));
+        self.record_geometry_dirty(id, DirtyKind::Attr);
     }
 
     /// A mutation that can change the SHEET SET (`<style>`/`<link>` tree,
@@ -954,7 +1012,12 @@ impl Dom {
     fn touch_style_at(&mut self, scope: NodeId) {
         self.style_epoch = self.style_epoch.wrapping_add(1);
         if self.is_connected(scope) {
-            self.touch();
+            // A stylesheet invalidates its whole tree scope, so the frontend still needs the
+            // conservative full-render signal. Retain the scope for geometry separately: HTML's
+            // child Document cannot restyle the navigable container in its container Document.
+            self.mark();
+            self.dirty_attributed = false;
+            self.record_geometry_dirty(scope, DirtyKind::Attr);
         } else {
             self.touch_content(Some(scope));
         }
@@ -1001,6 +1064,7 @@ impl Dom {
         self.mark();
         if let Some(i) = id {
             self.dirty_nodes.push((i, DirtyKind::Content));
+            self.record_geometry_dirty(i, DirtyKind::Content);
         }
     }
 
@@ -1011,6 +1075,19 @@ impl Dom {
     pub fn take_dirty_targets(&mut self) -> Option<Vec<(NodeId, DirtyKind)>> {
         let attributed = std::mem::replace(&mut self.dirty_attributed, true);
         let nodes = std::mem::take(&mut self.dirty_nodes);
+        attributed.then_some(nodes)
+    }
+
+    /// Consume geometry invalidations accumulated since the last full CSSOM View measure pass.
+    /// `None` means an unscoped change (viewport/global sheet state) occurred; otherwise every
+    /// returned node names the tree scope in which the change occurred. This queue is separate
+    /// from [`Self::take_dirty_targets`] because synchronous geometry reads happen before or after
+    /// arbitrary frontend render checkpoints.
+    pub fn take_geometry_dirty_targets(&mut self) -> Option<Vec<(NodeId, DirtyKind)>> {
+        let attributed = std::mem::replace(&mut self.geometry_dirty_attributed, true);
+        let nodes = std::mem::take(&mut self.geometry_dirty_nodes)
+            .into_iter()
+            .collect();
         attributed.then_some(nodes)
     }
 
@@ -1637,6 +1714,28 @@ impl Dom {
         })
     }
 
+    /// Create an element with the exact expanded name produced by DOM's
+    /// `validate and extract` algorithm. Validation and Web IDL conversion live
+    /// in the engine-neutral platform prelude; the arena must preserve the
+    /// resulting namespace, optional prefix, and local name without HTML case
+    /// folding (DOM §4.5 `createElementNS`).
+    pub fn create_element_ns(
+        &mut self,
+        namespace: &str,
+        prefix: Option<&str>,
+        local_name: &str,
+    ) -> NodeId {
+        let namespace = Namespace::from(namespace);
+        let template_contents = (namespace == ns!(html) && local_name == "template")
+            .then(|| self.new_node(NodeData::Fragment));
+        let name = QualName::new(prefix.map(Prefix::from), namespace, local_name.into());
+        self.new_node(NodeData::Element {
+            name,
+            attrs: Vec::new(),
+            template_contents,
+        })
+    }
+
     pub fn create_text(&mut self, text: &str) -> NodeId {
         self.new_node(NodeData::Text(text.to_string()))
     }
@@ -1840,6 +1939,14 @@ impl Dom {
                 let ns = &*name.ns;
                 (!ns.is_empty()).then_some(ns)
             }
+            _ => None,
+        }
+    }
+
+    /// DOM `Element.prefix`, retained as part of the element's qualified name.
+    pub fn namespace_prefix(&self, id: NodeId) -> Option<&str> {
+        match &self.nodes[id].data {
+            NodeData::Element { name, .. } => name.prefix.as_deref(),
             _ => None,
         }
     }
@@ -2749,7 +2856,6 @@ impl Dom {
     /// here, so a property inherits everywhere by being marked `inherited`
     /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
-        casc_bump(|d| d.computed_value_calls += 1);
         let Some(idx) = prop_index(name) else {
             // Untracked: no UA default, no inheritance — author cascade.
             return self.cascaded(id, name);
@@ -2812,6 +2918,14 @@ impl Dom {
     /// the initial values for the positional/sizing surface implemented by
     /// TRust so script cannot confuse `""` with a non-`auto` inset.
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
+        // CSS Fonts 4 §2.5 defines the computed value of `font-size` as an
+        // absolute length. Do not expose the authored percentage/relative
+        // token (or the internal `None` used for initial `medium`) through
+        // CSSOM: percentages and font-relative units have already composed
+        // numerically with inheritance in `font_px`.
+        if name == "font-size" {
+            return Some(format!("{}px", self.font_px(id)));
+        }
         self.computed_value_resolved(id, name)
             .or_else(|| cssom_initial_value(name).map(str::to_string))
     }
@@ -2969,41 +3083,48 @@ impl Dom {
     }
 
     /// The accumulated `(underline, line-through)` for an element's text.
-    /// `text-decoration` is not inherited but PROPAGATED — the lines paint
-    /// across descendant boxes and accumulate — so this walks ancestors→self:
-    /// each `<u>/<ins>` adds underline, each `<s>/<strike>/<del>` adds
-    /// line-through, an author `text-decoration(-line)` adds its named lines,
-    /// and `none` clears both from that point down. Replaces the layout's
-    /// emphasis threading for the two decoration flags.
+    ///
+    /// CSS Text Decoration 3 §2.1 says line decorations are not inherited:
+    /// they propagate through the box tree and accumulate with decorations
+    /// established by descendants. In particular, `none` establishes no line;
+    /// it does not inhibit a line propagated from an ancestor. The memoized
+    /// parent recursion implements that accumulation for the element ancestry
+    /// represented by the current layout.
     pub fn text_decoration(&self, id: NodeId) -> (bool, bool) {
-        let mut chain = vec![id];
-        while let Some(&c) = chain.last() {
-            match self.nodes[c].parent {
-                Some(p) => chain.push(p),
-                None => break,
-            }
+        if let Some(&hit) = self.decoration_cache.borrow().get(id, self.epoch) {
+            return hit;
         }
-        let (mut underline, mut strike) = (false, false);
-        for &e in chain.iter().rev() {
-            match self.tag_name(e) {
+
+        let (mut underline, mut strike) = self
+            .parent_composed(id)
+            .map_or((false, false), |parent| self.text_decoration(parent));
+
+        // An author declaration on the same element outranks the HTML UA
+        // decoration for <u>/<s> and friends. `none` therefore suppresses that
+        // element's UA line while leaving the parent's propagated lines alone.
+        if let Some(value) = self
+            .cascaded(id, "text-decoration-line")
+            .or_else(|| self.cascaded(id, "text-decoration"))
+        {
+            if !value.split_whitespace().any(|token| token == "none") {
+                underline |= value.split_whitespace().any(|token| token == "underline");
+                strike |= value
+                    .split_whitespace()
+                    .any(|token| token == "line-through");
+            }
+        } else {
+            match self.tag_name(id) {
                 Some("u" | "ins") => underline = true,
                 Some("s" | "strike" | "del") => strike = true,
                 _ => {}
             }
-            if let Some(v) = self
-                .cascaded(e, "text-decoration-line")
-                .or_else(|| self.cascaded(e, "text-decoration"))
-            {
-                if v.split_whitespace().any(|t| t == "none") {
-                    underline = false;
-                    strike = false;
-                } else {
-                    underline |= v.contains("underline");
-                    strike |= v.contains("line-through");
-                }
-            }
         }
-        (underline, strike)
+
+        let result = (underline, strike);
+        self.decoration_cache
+            .borrow_mut()
+            .put(id, self.epoch, result);
+        result
     }
 
     /// The author-cascade winner for one property on the element itself:
@@ -3011,7 +3132,6 @@ impl Dom {
     /// styles beat tree rules, `!important`/layers/specificity/source order
     /// resolved by `CascadeKey` when the maps are built.
     fn cascaded(&self, id: NodeId, prop: &str) -> Option<String> {
-        casc_bump(|d| d.cascaded_calls += 1);
         self.cascaded_maps(id).elem.get(prop).cloned()
     }
 
@@ -3222,11 +3342,29 @@ impl Dom {
     /// cascaded declaration, else inherited from the composed parent (custom
     /// properties inherit). `None` if undefined up the whole chain.
     fn custom_prop(&self, id: NodeId, name: &str) -> Option<String> {
-        if let Some(v) = self.cascaded(id, name) {
-            return Some(v);
+        if let Some(hit) = {
+            let cache = self.custom_prop_cache.borrow();
+            (cache.0 == self.epoch)
+                .then(|| cache.1.get(&id).and_then(|node| node.get(name)).cloned())
+                .flatten()
+        } {
+            return hit;
         }
-        self.style_parent(id)
-            .and_then(|p| self.custom_prop(p, name))
+        let value = self.cascaded(id, name).or_else(|| {
+            self.style_parent(id)
+                .and_then(|parent| self.custom_prop(parent, name))
+        });
+        let mut cache = self.custom_prop_cache.borrow_mut();
+        if cache.0 != self.epoch {
+            cache.0 = self.epoch;
+            cache.1.clear();
+        }
+        cache
+            .1
+            .entry(id)
+            .or_default()
+            .insert(name.to_owned(), value.clone());
+        value
     }
 
     /// Substitute `var(--name, fallback)` references in a CSS value to a plain
@@ -3290,13 +3428,13 @@ impl Dom {
     /// computed-value time* — a `var()` references a guaranteed-invalid/undefined
     /// property with no usable fallback, or it closes a dependency cycle.
     fn substitute_vars(&self, id: NodeId, value: &str, active: &mut Vec<String>) -> Option<String> {
-        if !value.contains("var(") {
+        if find_var_function(value).is_none() {
             return Some(value.to_owned());
         }
         let mut out = String::new();
         let mut rest = value;
         let mut guard = 0;
-        while let Some(pos) = rest.find("var(") {
+        while let Some(pos) = find_var_function(rest) {
             guard += 1;
             if guard > 64 {
                 out.push_str(rest);
@@ -3705,12 +3843,15 @@ impl Dom {
         if let Some(hit) = self.matched_cache.borrow().get(id, self.epoch) {
             return hit.clone();
         }
+        let started = casc_diag_on().then(std::time::Instant::now);
+        let mut candidate_count = 0u64;
         let index = self.style_index();
         let scope = self.tree_scope(id);
         let matched = match (index.scopes.get(&scope), index.buckets.get(&scope)) {
             (Some(rules), Some(b)) => {
                 let mut out: Vec<u32> = Vec::new();
-                let test = |dom: &Dom, ri: u32, out: &mut Vec<u32>| {
+                let mut test = |dom: &Dom, ri: u32, out: &mut Vec<u32>| {
+                    candidate_count += 1;
                     if dom.matches_complex(id, &rules[ri as usize].selector.0, None) {
                         out.push(ri);
                     }
@@ -3754,6 +3895,13 @@ impl Dom {
         self.matched_cache
             .borrow_mut()
             .put(id, self.epoch, matched.clone());
+        if let Some(started) = started {
+            casc_bump(|diag| {
+                diag.matched_rule_builds += 1;
+                diag.matched_candidates += candidate_count;
+                diag.matched_us += started.elapsed().as_micros() as u64;
+            });
+        }
         matched
     }
 
@@ -3935,6 +4083,39 @@ impl Dom {
         while let Some(id) = stack.pop() {
             out.push(id);
             self.push_composed_children(id, &mut stack);
+        }
+        out
+    }
+
+    /// Node ids in the shadow-including inclusive subtree rooted at `root`.
+    ///
+    /// This is the DOM Standard's shadow-including traversal, with the shadow
+    /// root node itself included as well as its children. The JavaScript
+    /// binding uses it only when a subtree changes connectedness: wrappers for
+    /// connected platform objects retain identity and custom-element/shadow
+    /// state, while wrappers below a detached root can return to weak storage.
+    pub(crate) fn wrapper_subtree_ids(&self, root: NodeId) -> Vec<NodeId> {
+        if !self.is_valid(root) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+
+            let start = stack.len();
+            let mut child = self.nodes[id].first_child;
+            while let Some(child_id) = child {
+                stack.push(child_id);
+                child = self.nodes[child_id].next_sibling;
+            }
+            stack[start..].reverse();
+
+            // A shadow root is not a light-tree child of its host, but it and
+            // its descendants are part of the host's shadow-including subtree.
+            if let Some(shadow) = self.shadow_root(id) {
+                stack.push(shadow);
+            }
         }
         out
     }
@@ -4177,6 +4358,27 @@ impl Dom {
             .find(|&c| self.tag_name(c) == Some("html"))?;
         self.child_iter(html)
             .find(|&c| self.tag_name(c) == Some("body"))
+    }
+
+    /// The nearest iframe/frame whose active nested document contains `id`.
+    ///
+    /// Nested documents share this arena for layout, but CSSOM View hit testing
+    /// is scoped to one `Document`: a top-level query returns the embedding
+    /// iframe element, while the child document may return boxes inside it.
+    /// Walking the composed parent chain also keeps shadow-tree descendants in
+    /// their containing document without exposing a deeper nested document.
+    pub fn frame_owner(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            let parent = self.parent_composed(node)?;
+            if matches!(self.tag_name(parent), Some("iframe" | "frame"))
+                && self.frame_body(parent).is_some()
+            {
+                return Some(parent);
+            }
+            current = Some(parent);
+        }
+        None
     }
 
     fn serialized_frame_wrapper_style(&self, id: NodeId) -> String {
@@ -4618,13 +4820,10 @@ impl Dom {
         out
     }
 
-    /// Serialize for JS consumption (`outerHTML`). Identical to `serialize`
-    /// except `<template>` elements serialize WITH their content fragment as
-    /// children — the HTML serialization standard ("if the node is a template
-    /// element, serialize its template contents"). Frameworks that recover
-    /// in-DOM template/slot markup by reading `outerHTML` (Vue 2's DOM-template
-    /// compiler reads `el.outerHTML`) need the template content present; the
-    /// layout/`Doc.raw` `serialize` keeps dropping it (inert, not laid out).
+    /// Serialize for JavaScript (`outerHTML`) with HTML's DOM serialization
+    /// semantics. Unlike the presentation serializer this keeps inert/hidden
+    /// elements, template contents, iframe markup, and light DOM rather than
+    /// substituting the painted shadow/frame tree.
     pub fn serialize_js(&self, root: NodeId) -> String {
         self.cached_string(root, 2, || {
             let mut out = String::new();
@@ -5173,21 +5372,21 @@ impl Dom {
         String::new()
     }
 
-    /// `keep_template`: when true, `<template>` elements serialize WITH their
-    /// content fragment as children (the JS/`outerHTML` path — see
-    /// `serialize_js`); when false they are dropped entirely (the layout/
-    /// `Doc.raw` path, where template content is inert and must not be flowed).
+    /// `js_serialization`: when true, run HTML's fragment serialization surface
+    /// used by innerHTML/outerHTML, including inert, hidden, and template
+    /// content. When false this is the presentation serializer: non-rendered
+    /// nodes are deliberately omitted before layout.
     fn serialize_node_inner(
         &self,
         id: NodeId,
         host: Option<NodeId>,
-        keep_template: bool,
+        js_serialization: bool,
         out: &mut String,
     ) {
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
                 for c in self.child_iter(id) {
-                    self.serialize_node_inner(c, host, keep_template, out);
+                    self.serialize_node_inner(c, host, js_serialization, out);
                 }
             }
             NodeData::Doctype => {}
@@ -5198,7 +5397,34 @@ impl Dom {
                 out.push_str(&t.replace("--", "- -"));
                 out.push_str("-->");
             }
-            NodeData::Text(t) => out.push_str(&escape_text(t)),
+            NodeData::Text(t) => {
+                // HTML §13.3, serializing HTML fragments: text whose parent is
+                // a raw-text/script-data element is appended literally. This
+                // is observable through `script.innerHTML`; template engines
+                // commonly store markup in `<script type="text/template">`
+                // and expect the getter to return markup, not `&lt;...&gt;`.
+                let raw_text_parent = js_serialization
+                    && self.nodes[id].parent.is_some_and(|parent| {
+                        matches!(
+                            self.tag_name(parent),
+                            Some(
+                                "style"
+                                    | "script"
+                                    | "xmp"
+                                    | "iframe"
+                                    | "noembed"
+                                    | "noframes"
+                                    | "plaintext"
+                                    | "noscript"
+                            )
+                        )
+                    });
+                if raw_text_parent {
+                    out.push_str(t);
+                } else {
+                    out.push_str(&escape_text(t));
+                }
+            }
             NodeData::Element { name, attrs, .. } => {
                 let tag: &str = &name.local;
                 // A `<template>` is dropped from the layout serializer (inert),
@@ -5207,7 +5433,7 @@ impl Dom {
                 // template is UA `display:none` yet a browser always serializes
                 // its contents.
                 if tag == "template" {
-                    if keep_template {
+                    if js_serialization {
                         out.push('<');
                         out.push_str(tag);
                         self.write_attrs(id, attrs, &mut |_, _| None, out);
@@ -5221,7 +5447,9 @@ impl Dom {
                     }
                     return;
                 }
-                if matches!(tag, "script" | "noscript" | "style") || self.is_hidden(id) {
+                if !js_serialization
+                    && (matches!(tag, "script" | "noscript" | "style") || self.is_hidden(id))
+                {
                     return;
                 }
                 // An iframe/frame is a replaced viewport for a distinct child
@@ -5229,14 +5457,14 @@ impl Dom {
                 // content realizes, and preserve the nested BODY as a separate
                 // formatting box when it does. Putting BODY's children directly
                 // in the viewport loses its display/flex/alignment semantics.
-                if matches!(tag, "iframe" | "frame") {
+                if !js_serialization && matches!(tag, "iframe" | "frame") {
                     out.push_str("<div data-trust-frame=\"\" style=\"");
                     out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
                     out.push_str("\">");
                     if let Some(body) = self.frame_body(id) {
                         self.write_serialized_frame_body_open(body, out);
                         for c in self.child_iter(body) {
-                            self.serialize_node_inner(c, None, keep_template, out);
+                            self.serialize_node_inner(c, None, js_serialization, out);
                         }
                         out.push_str("</div>");
                     }
@@ -5245,13 +5473,14 @@ impl Dom {
                 }
                 // <slot> inside a shadow tree: project the host's light
                 // children (or the slot's own fallback content).
-                if tag == "slot"
+                if !js_serialization
+                    && tag == "slot"
                     && let Some(h) = host
                 {
                     let assigned = self.slot_assigned(h, self.attr(id, "name"));
                     if assigned.is_empty() {
                         for c in self.child_iter(id) {
-                            self.serialize_node_inner(c, host, keep_template, out);
+                            self.serialize_node_inner(c, host, js_serialization, out);
                         }
                     } else {
                         for c in assigned.into_iter().flat_map(|c| {
@@ -5261,7 +5490,7 @@ impl Dom {
                                 vec![c]
                             }
                         }) {
-                            self.serialize_node_inner(c, None, keep_template, out);
+                            self.serialize_node_inner(c, None, js_serialization, out);
                         }
                     }
                     return;
@@ -5276,13 +5505,13 @@ impl Dom {
                 // A shadow root renders IN PLACE of the light children
                 // (flattened — text extraction wants content, not
                 // composition fidelity).
-                if let Some(root) = self.shadow_root(id) {
+                if !js_serialization && let Some(root) = self.shadow_root(id) {
                     for c in self.child_iter(root) {
-                        self.serialize_node_inner(c, Some(id), keep_template, out);
+                        self.serialize_node_inner(c, Some(id), js_serialization, out);
                     }
                 } else {
                     for c in self.child_iter(id) {
-                        self.serialize_node_inner(c, host, keep_template, out);
+                        self.serialize_node_inner(c, host, js_serialization, out);
                     }
                 }
                 out.push_str("</");
@@ -6628,6 +6857,16 @@ enum VarResult {
     Resolved(String),
     Undefined,
     Cycle,
+}
+
+/// CSS function names are ASCII case-insensitive, while the custom-property
+/// identifier inside `var()` is not. Returning a byte offset is safe because a
+/// match starts on the ASCII `v`, never inside a UTF-8 continuation byte.
+fn find_var_function(value: &str) -> Option<usize> {
+    value
+        .as_bytes()
+        .windows(4)
+        .position(|candidate| candidate.eq_ignore_ascii_case(b"var("))
 }
 
 #[derive(PartialEq)]
@@ -8031,7 +8270,8 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
 fn is_tracked(name: &str) -> bool {
     // Custom properties (`--foo`) are always stored so `var()` references can
     // resolve to their defined (cascaded, inherited) value at bake time, not
-    // just the fallback. They inherit and are case-folded like everything else.
+    // just the fallback. Unlike ordinary CSS property names, custom-property
+    // names are case-sensitive (CSS Custom Properties §2).
     name.starts_with("--") || PROPS.iter().any(|p| p.name == name)
 }
 
@@ -9689,14 +9929,23 @@ impl RuleBuckets {
 /// `/images/HeartDot.png`). Preserve those tokens while normalizing the rest.
 fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     let (k, v) = decl.split_once(':')?;
-    let k = k.trim().to_ascii_lowercase();
+    let k = k.trim();
+    // CSS Custom Properties §2: custom-property names compare codepoint for
+    // codepoint, and their arbitrary token streams retain author casing.
+    // Ordinary property names remain ASCII case-insensitive.
+    let custom = k.starts_with("--");
+    let k = if custom {
+        k.to_string()
+    } else {
+        k.to_ascii_lowercase()
+    };
     let v = v.trim();
     let (v, important) = match v.rsplit_once('!') {
         Some((head, bang)) if bang.trim().eq_ignore_ascii_case("important") => (head, true),
         _ => (v, false),
     };
     let v = v.trim();
-    let value = if k == "content" {
+    let value = if custom || k == "content" {
         v.to_string()
     } else {
         normalize_css_value(v)
@@ -9851,6 +10100,26 @@ fn normalize_css_value(value: &str) -> String {
             for (_, inner) in chars.by_ref() {
                 out.push(inner);
                 if inner == ')' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // `var()`'s function name is ASCII-insensitive like other CSS syntax,
+        // but its first argument is a case-sensitive custom-property name.
+        // Normalize the function token, then copy that argument verbatim;
+        // fallback tokens resume ordinary normalization in the outer loop.
+        if value
+            .get(i..i.saturating_add(4))
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case("var("))
+        {
+            out.push_str("var(");
+            chars.next();
+            chars.next();
+            chars.next();
+            for (_, inner) in chars.by_ref() {
+                out.push(inner);
+                if matches!(inner, ',' | ')') {
                     break;
                 }
             }
@@ -12736,16 +13005,20 @@ mod tests {
     }
 
     #[test]
-    fn text_decoration_accumulates_and_resets() {
-        // Underline + line-through accumulate across nesting (each box adds
-        // its line); `text-decoration:none` clears both from there down.
+    fn text_decoration_accumulates_without_none_inhibiting_ancestor_lines() {
+        // CSS Text Decoration 3 §2.1: lines accumulate across nesting, while
+        // `none` establishes no new line and cannot cancel a propagated line.
+        // An author declaration can still suppress the UA-origin line that the
+        // same semantic element would otherwise establish.
         let dom = Dom::parse_document(
             "<body><u id=u>under <s id=s>both</s>\
-             <span id=clear style='text-decoration:none'>neither</span></u></body>",
+             <span id=none style='text-decoration:none'>still underlined</span></u>\
+             <u id=own-none style='text-decoration:none'>not underlined</u></body>",
         );
         let u = dom.get_by_id("u").unwrap();
         let s = dom.get_by_id("s").unwrap();
-        let clear = dom.get_by_id("clear").unwrap();
+        let none = dom.get_by_id("none").unwrap();
+        let own_none = dom.get_by_id("own-none").unwrap();
         assert_eq!(dom.text_decoration(u), (true, false), "<u> underlines");
         assert_eq!(
             dom.text_decoration(s),
@@ -12753,9 +13026,14 @@ mod tests {
             "<s> inside <u> adds strike, keeps underline"
         );
         assert_eq!(
-            dom.text_decoration(clear),
+            dom.text_decoration(none),
+            (true, false),
+            "none cannot inhibit the ancestor's propagated underline"
+        );
+        assert_eq!(
+            dom.text_decoration(own_none),
             (false, false),
-            "text-decoration:none clears both"
+            "author none suppresses this element's UA-origin underline"
         );
     }
 
@@ -12896,6 +13174,41 @@ mod tests {
         // A global (unattributed) stylesheet change forces a full relayout.
         dom.set_adopted_styles(DOCUMENT, "div{font-weight:bold}");
         assert_eq!(dom.take_dirty_targets(), None);
+    }
+
+    #[test]
+    fn geometry_dirty_log_retains_nested_document_scope_across_render_drains() {
+        // HTML §7.3.1.3 gives an iframe's content navigable a distinct active Document even
+        // though TRust stores its nodes below the iframe in one arena. The geometry queue must
+        // survive the frontend dirty-target drain and retain enough scope to distinguish a child
+        // Document mutation from a mutation of the embedding element in the container Document.
+        let mut dom = Dom::parse_document("<body id=outer></body>");
+        let outer = dom.get_by_id("outer").unwrap();
+        let frame = dom.create_element("iframe");
+        let html = dom.create_element("html");
+        let body = dom.create_element("body");
+        let child = dom.create_element("p");
+        dom.append(outer, frame);
+        dom.append(frame, html);
+        dom.append(html, body);
+        dom.append(body, child);
+        let _ = dom.take_dirty_targets();
+        let _ = dom.take_geometry_dirty_targets();
+
+        dom.set_attr(child, "class", "updated");
+        let _ = dom.take_dirty_targets();
+        let child_changes = dom
+            .take_geometry_dirty_targets()
+            .expect("child mutation remains attributed");
+        assert_eq!(child_changes, vec![(child, DirtyKind::Attr)]);
+        assert_eq!(dom.frame_owner(child), Some(frame));
+
+        dom.set_attr(frame, "width", "410");
+        let container_changes = dom
+            .take_geometry_dirty_targets()
+            .expect("container mutation remains attributed");
+        assert_eq!(container_changes, vec![(frame, DirtyKind::Attr)]);
+        assert_eq!(dom.frame_owner(frame), None);
     }
 
     #[test]
@@ -14018,6 +14331,60 @@ mod tests {
         assert!(
             dom.serialize(c).contains("min-width:8rem"),
             ":root-defined --cell resolves"
+        );
+    }
+
+    #[test]
+    fn inherited_custom_property_cache_is_case_sensitive_and_epoch_scoped() {
+        // CSS Custom Properties §2: unregistered custom properties inherit,
+        // their names compare codepoint-for-codepoint, and a mutation must be
+        // visible at the next computed-value read. The deep chain is also the
+        // Speedometer complex-DOM shape which makes repeated uncached ancestor
+        // walks dominate a forced layout.
+        let depth = 128;
+        let mut html =
+            String::from("<div id=root style='--Base:red;--Tone:VAR(--Base);--tone:blue'>");
+        for _ in 0..depth {
+            html.push_str("<div>");
+        }
+        html.push_str(
+            "<span id=leaf style='color:var(--Tone);background-color:var(--tone)'>x</span>",
+        );
+        for _ in 0..=depth {
+            html.push_str("</div>");
+        }
+        let mut dom = Dom::parse_document(&html);
+        let root = dom.get_by_id("root").unwrap();
+        let leaf = dom.get_by_id("leaf").unwrap();
+
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "background-color")
+                .as_deref(),
+            Some("blue")
+        );
+        assert!(
+            dom.custom_prop_cache.borrow().1.len() >= depth,
+            "the first inherited lookup memoizes the ancestor path"
+        );
+
+        dom.set_attr(
+            root,
+            "style",
+            "--Base:green;--Tone:VAR(--Base);--tone:purple",
+        );
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("green"),
+            "a new DOM epoch cannot reuse the old inherited value"
+        );
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "background-color")
+                .as_deref(),
+            Some("purple")
         );
     }
 

@@ -59,7 +59,11 @@ pub enum WorkerOut {
 pub type BlobMap =
     std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, String)>>>;
 
-pub(crate) const MAX_PAGE_FETCHES: usize = 256;
+/// After this many actual or speculative cache-miss fetches, stop issuing additional optional
+/// module prefetches. Required Fetch/HTML requests must never consult this optimization threshold:
+/// Fetch Standard §5.6 calls Fetch for every valid `fetch()` request and only a network error
+/// rejects the resulting promise.
+pub(crate) const MAX_PAGE_FETCHES_WITH_SPECULATION: usize = 256;
 pub(crate) const MAX_SPECULATIVE_IMPORTS: usize = 64;
 
 pub(crate) fn host_boundary_signatures() -> impl Iterator<Item = (&'static str, usize)> {

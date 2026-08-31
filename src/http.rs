@@ -218,9 +218,14 @@ pub fn render_arena(
     seed: Option<&[Form]>,
     images: &crate::layout2::ImageSizes,
 ) -> RenderedPage {
+    let diagnostic = std::env::var_os("TRUST_DIAG_FRAME").is_some();
+    let started = diagnostic.then(std::time::Instant::now);
     let (forms, controls) = extract_forms_arena(dom, base, seed);
+    let forms_elapsed = started.map(|started| started.elapsed());
     let resources = collect_image_urls(dom, base, viewport, device_pixel_ratio);
+    let resources_elapsed = started.map(|started| started.elapsed());
     let layout = crate::layout2::lay_out_graphical(dom, base, viewport, &forms, &controls, images);
+    let layout_elapsed = started.map(|started| started.elapsed());
     let deferred_images = resources
         .lazy_nodes
         .iter()
@@ -297,6 +302,20 @@ pub fn render_arena(
         &controls,
         None,
     );
+    if let (Some(started), Some(forms_elapsed), Some(resources_elapsed), Some(layout_elapsed)) =
+        (started, forms_elapsed, resources_elapsed, layout_elapsed)
+    {
+        eprintln!(
+            "DIAGRENDER nodes={} total={}ms forms={}ms resources={}ms layout={}ms metadata={}ms boxes={}",
+            dom.node_count(),
+            started.elapsed().as_millis(),
+            forms_elapsed.as_millis(),
+            (resources_elapsed - forms_elapsed).as_millis(),
+            (layout_elapsed - resources_elapsed).as_millis(),
+            (started.elapsed() - layout_elapsed).as_millis(),
+            layout.boxes.len(),
+        );
+    }
     RenderedPage {
         layout: std::sync::Arc::new(layout),
         viewport,
@@ -1800,21 +1819,19 @@ pub(crate) fn stylesheet_response_allowed(
 /// fetched") and the page never mounted. Matches `MAX_PAGE_PRELOADS` in spirit
 /// (both are "app code"). It is NOT a correctness cliff anymore: a classic
 /// script the execution loop reaches that wasn't prefetched is fetched on
-/// demand (see the selected JavaScript backend), bounded by
-/// `MAX_PAGE_FETCHES`.
+/// demand (see the selected JavaScript backend). The preload count is an
+/// optimization bound, not a correctness cliff for required scripts.
 const MAX_PAGE_SCRIPTS: usize = 96;
 
-/// External stylesheets fetched for the cascade. A browser has no such cap;
-/// it's only a lid on hostile pages. It must clear a real design system's
-/// sheet count — GitHub links ~33 distinct sheets (Primer, theme variants,
-/// per-view + per-component CSS modules), with structural sheets (the nav, the
-/// repo layout) LAST. At the old 16 those were dropped after the leading color-
-/// theme sheets, so menus rendered un-collapsed and grids lost their tracks.
-const MAX_PAGE_SHEETS: usize = 48;
+// External stylesheets fetched for the cascade have no count cap. CSS Cascade
+// requires every applicable stylesheet to participate in source order; unlike
+// optional prefetches, dropping a later sheet changes computed style and is
+// observable. The request pool still bounds concurrency, while the normal
+// body/cache limits bound each resource's storage.
 
 /// Module-graph prefetches (`<link rel=modulepreload>` + module entry
-/// srcs); archive.org announces ~32. Matches MAX_PAGE_FETCHES in
-/// spirit: enough for real apps, a lid on hostile pages.
+/// srcs); archive.org announces ~32. This only bounds optional early work;
+/// required graph dependencies remain fetchable on demand.
 const MAX_PAGE_PRELOADS: usize = 96;
 
 /// Concurrent subresource fetches per page load — browser-ish
@@ -1909,7 +1926,6 @@ pub async fn execute_js_for_device(
         jobs.extend(
             crate::js::external_stylesheets(&html)
                 .into_iter()
-                .take(MAX_PAGE_SHEETS)
                 .map(|s| (Kind::Sheet, s)),
         );
     }
@@ -1926,7 +1942,6 @@ pub async fn execute_js_for_device(
     jobs.extend(
         crate::js::sprite_use_sheets(&html)
             .into_iter()
-            .take(MAX_PAGE_SHEETS)
             .map(|s| (Kind::Sprite, s)),
     );
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
@@ -2019,7 +2034,6 @@ pub async fn execute_js_for_device(
                         url,
                         response.url.clone(),
                         Vec::new(),
-                        0,
                     )
                     .await;
                     sheets.push((raw, css));
@@ -2169,13 +2183,11 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
     .await;
 }
 
-/// Fetch a page's external stylesheets — the same set + caps `execute_js`
-/// uses — concurrently, returning `(href, css)` in document order.
+/// Fetch every external stylesheet a page declares concurrently, returning
+/// `(href, css)` in document order. The request pool bounds simultaneous I/O;
+/// no arbitrary declaration-count cutoff is applied to the cascade.
 async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
-    let jobs: Vec<String> = crate::js::external_stylesheets(html)
-        .into_iter()
-        .take(MAX_PAGE_SHEETS)
-        .collect();
+    let jobs: Vec<String> = crate::js::external_stylesheets(html).into_iter().collect();
     let fetched = futures::stream::iter(jobs.into_iter().map(|raw| {
         let base = base.clone();
         async move {
@@ -2209,7 +2221,7 @@ async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
     futures::stream::iter(fetched.into_iter().map(|(raw, url, css)| {
         let page_url = page_url.clone();
         async move {
-            let expanded = expand_stylesheet_imports(css, url, page_url, Vec::new(), 0).await;
+            let expanded = expand_stylesheet_imports(css, url, page_url, Vec::new()).await;
             (raw, expanded)
         }
     }))
@@ -2230,9 +2242,6 @@ impl StylesheetResponseExt for Response {
     }
 }
 
-const MAX_STYLESHEET_IMPORT_DEPTH: usize = 16;
-const MAX_PAGE_WEB_FONTS: usize = 32;
-
 #[derive(Clone, Debug)]
 struct CssImport {
     start: usize,
@@ -2242,8 +2251,8 @@ struct CssImport {
 }
 
 /// CSS Cascade 5 §2.2: replace each applicable `@import` in source order by
-/// the imported rules. Imports are recursively bounded and cycle-checked; a
-/// failed resource contributes no rules. URL tokens are then made absolute
+/// the imported rules. Imports are cycle-checked; a failed resource contributes
+/// no rules. URL tokens are then made absolute
 /// against the stylesheet that contained them, as CSSOM URL resolution
 /// requires, rather than against the HTML document.
 fn expand_stylesheet_imports(
@@ -2251,13 +2260,10 @@ fn expand_stylesheet_imports(
     sheet_url: Url,
     page_url: Url,
     mut ancestry: Vec<String>,
-    depth: usize,
 ) -> futures::future::BoxFuture<'static, String> {
     use futures::FutureExt as _;
     async move {
-        if depth >= MAX_STYLESHEET_IMPORT_DEPTH
-            || ancestry.iter().any(|seen| seen == sheet_url.as_str())
-        {
+        if ancestry.iter().any(|seen| seen == sheet_url.as_str()) {
             return String::new();
         }
         ancestry.push(sheet_url.to_string());
@@ -2293,7 +2299,6 @@ fn expand_stylesheet_imports(
                 url,
                 page_url.clone(),
                 ancestry.clone(),
-                depth + 1,
             )
             .await;
             out.push_str(&wrap_import_condition(child, &import.condition));
@@ -2783,8 +2788,7 @@ fn document_font_faces(
 }
 
 async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_url: &Url) {
-    let mut faces = document_font_faces(html, sheets, page_url);
-    faces.truncate(MAX_PAGE_WEB_FONTS);
+    let faces = document_font_faces(html, sheets, page_url);
     let fonts = futures::stream::iter(faces.into_iter().map(|(family, sources)| async move {
         // CSS Fonts 4 §4.3.3: try external references in specified order and
         // proceed to the next item when loading or format decoding fails.
@@ -2892,15 +2896,6 @@ async fn css_only_with_sheets(
     response.content_type = String::from("text/html; charset=utf-8");
     response
 }
-
-/// Bounded nesting for the no-JS frame load: a frame whose document holds
-/// more frames is followed this many levels deep, after which deeper frames
-/// render empty (a hostile-page lid; the circular guard already stops a
-/// self-embed at any depth).
-const MAX_FRAME_DEPTH: usize = 8;
-/// Total frame documents loaded per page — the script-less analogue of the
-/// JS pipeline's `MAX_PAGE_FETCHES` ceiling, so a frame bomb can't fan out.
-const MAX_FRAME_LOADS: usize = 32;
 
 fn strip_fragment(u: &str) -> &str {
     u.split('#').next().unwrap_or(u)
@@ -3069,22 +3064,52 @@ fn base_with_doc_base(html: &str, doc_url: &Url) -> Url {
 }
 
 /// Resolve a frame's `src` to the URL it would navigate to, applying the same
-/// gating in the prefetch and install passes: http(s) only (about:/data:/blob:
-/// render nothing — a documented deviation), no private-network pivot, and the
-/// spec circular-navigation guard (a frame may not load a URL already held by
-/// an inclusive ancestor navigable). `None` means "don't load".
+/// gating in the prefetch and install passes: network URLs cannot pivot into a
+/// private address space, while local `data:` resources are handled by the
+/// scheme-fetch path below. The circular-navigation guard follows HTML (a
+/// frame may not load a URL already held by an inclusive ancestor navigable).
+/// `None` means "don't load".
 fn resolve_frame_src(src: &str, base: &Url, page_url: &Url, ancestors: &[String]) -> Option<Url> {
     let url = base.join(src.trim()).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
+    if !matches!(url.scheme(), "http" | "https" | "data") {
         return None;
     }
-    if !subresource_allowed(page_url, &url) {
+    if url.scheme() != "data" && !subresource_allowed(page_url, &url) {
         return None;
     }
     if ancestors.iter().any(|a| a == strip_fragment(url.as_str())) {
         return None;
     }
     Some(url)
+}
+
+/// Fetch a local `data:` frame document using Fetch's data-URL processor. The
+/// no-JavaScript presentation path has no in-realm `fetch`, so it performs the
+/// same byte decode directly before the normal HTML media-type gate.
+fn data_frame_document(url: &Url) -> Option<String> {
+    let media = url
+        .as_str()
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(',').map(|(metadata, _)| metadata))
+        .map(|metadata| {
+            let metadata = metadata.trim();
+            let metadata = metadata
+                .strip_suffix(";base64")
+                .or_else(|| metadata.strip_suffix(";BASE64"))
+                .unwrap_or(metadata);
+            if metadata.is_empty() || metadata.starts_with(';') {
+                "text/plain"
+            } else {
+                metadata.split(';').next().unwrap_or("text/plain")
+            }
+        })
+        .unwrap_or("text/plain")
+        .to_ascii_lowercase();
+    if media != "text/html" && media != "application/xhtml+xml" {
+        return None;
+    }
+    let bytes = crate::img::decode_data_url(url.as_str())?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Scan one document's markup for its frames' `src` URLs to fetch and inline
@@ -3122,8 +3147,9 @@ fn scan_frame_sources(
 /// Fetch every frame document a script-less page (and its nested frames) needs,
 /// into a `url → content` map, breadth-first so each level's `src` fetches
 /// overlap. `srcdoc` frames hold no URL but their markup is still scanned for
-/// nested `src` frames. Bounded by depth and a total-frame cap; only 2xx
-/// `text/html` responses are kept.
+/// nested `src` frames. Only successful HTML responses are kept; local
+/// `data:` documents use their scheme fetch algorithm without touching the
+/// network.
 async fn prefetch_frame_documents(
     html: &str,
     base: &Url,
@@ -3131,25 +3157,23 @@ async fn prefetch_frame_documents(
 ) -> std::collections::HashMap<String, String> {
     use std::collections::VecDeque;
     let mut map: HashMap<String, String> = HashMap::new();
-    // (document markup, its base, fragment-stripped ancestor URLs, depth)
-    let mut queue: VecDeque<(String, Url, Vec<String>, usize)> = VecDeque::new();
+    // (document markup, its base, fragment-stripped ancestor URLs)
+    let mut queue: VecDeque<(String, Url, Vec<String>)> = VecDeque::new();
     queue.push_back((
         html.to_string(),
         base.clone(),
         vec![strip_fragment(page_url.as_str()).to_string()],
-        0,
     ));
-    let mut loaded = 0usize;
 
-    while let Some((markup, base, ancestors, depth)) = queue.pop_front() {
-        if depth >= MAX_FRAME_DEPTH || loaded >= MAX_FRAME_LOADS {
-            continue;
-        }
+    while let Some((markup, base, ancestors)) = queue.pop_front() {
         let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors);
 
         // Fetch this level's `src` documents concurrently.
         let fetched: Vec<Option<(Url, String)>> =
             futures::stream::iter(srcs.into_iter().map(|url| async move {
+                if url.scheme() == "data" {
+                    return data_frame_document(&url).map(|body| (url, body));
+                }
                 let resp = fetch(&Request::get(url.clone())).await.ok()?;
                 let media = resp
                     .content_type
@@ -3168,20 +3192,16 @@ async fn prefetch_frame_documents(
             .await;
 
         for (url, body) in fetched.into_iter().flatten() {
-            if loaded >= MAX_FRAME_LOADS {
-                break;
-            }
-            loaded += 1;
             let mut child_ancestors = ancestors.clone();
             child_ancestors.push(strip_fragment(url.as_str()).to_string());
             // Nested frames in the fetched content resolve against ITS url.
-            queue.push_back((body.clone(), url.clone(), child_ancestors, depth + 1));
+            queue.push_back((body.clone(), url.clone(), child_ancestors));
             map.insert(url.to_string(), body);
         }
         // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
         // (base/origin inherit the parent document, per about:srcdoc).
         for srcdoc in srcdocs {
-            queue.push_back((srcdoc, base.clone(), ancestors.clone(), depth + 1));
+            queue.push_back((srcdoc, base.clone(), ancestors.clone()));
         }
     }
     map
@@ -3213,20 +3233,15 @@ fn install_page_frames(
         }
         b
     };
-    // (subtree root, base for that subtree, fragment-stripped ancestor URLs, depth)
-    let mut queue: VecDeque<(NodeId, Url, Vec<String>, usize)> = VecDeque::new();
+    // (subtree root, base for that subtree, fragment-stripped ancestor URLs)
+    let mut queue: VecDeque<(NodeId, Url, Vec<String>)> = VecDeque::new();
     queue.push_back((
         DOCUMENT,
         base,
         vec![strip_fragment(page_url.as_str()).to_string()],
-        0,
     ));
-    let mut loaded = 0usize;
 
-    while let Some((root, base, ancestors, depth)) = queue.pop_front() {
-        if depth >= MAX_FRAME_DEPTH || loaded >= MAX_FRAME_LOADS {
-            continue;
-        }
+    while let Some((root, base, ancestors)) = queue.pop_front() {
         // Collect each frame's content first (immutable borrow), then install
         // (mutable borrow) — can't hold the descendants borrow across install.
         let mut plans: Vec<(NodeId, String, Url, Option<Url>)> = Vec::new();
@@ -3248,16 +3263,12 @@ fn install_page_frames(
         }
 
         for (frame, content, frame_base, frame_url) in plans {
-            if loaded >= MAX_FRAME_LOADS {
-                break;
-            }
             if let Some(body) = dom.install_frame_document(frame, &content, frame_base.as_str()) {
-                loaded += 1;
                 let mut child_ancestors = ancestors.clone();
                 if let Some(u) = &frame_url {
                     child_ancestors.push(strip_fragment(u.as_str()).to_string());
                 }
-                queue.push_back((body, frame_base, child_ancestors, depth + 1));
+                queue.push_back((body, frame_base, child_ancestors));
             }
         }
     }
@@ -3606,15 +3617,13 @@ pub fn parse_seeded(
         if diag {
             let c = crate::dom::take_casc_diag();
             eprintln!(
-                "DIAGPARSE html={}KB nodes={} dom={}ms forms={}ms layout={}ms total={}ms | computed_value={} cascaded={}calls/{}ms css_parse={}ms rules={}",
+                "DIAGPARSE html={}KB nodes={} dom={}ms forms={}ms layout={}ms total={}ms | cascade={}ms css_parse={}ms rules={}",
                 html.len() / 1024,
                 dom.node_count(),
                 t_dom.as_millis(),
                 t_forms.as_millis(),
                 t2.elapsed().as_millis(),
                 t0.elapsed().as_millis(),
-                c.computed_value_calls,
-                c.cascaded_calls,
                 c.cascaded_us / 1000,
                 c.style_index_us / 1000,
                 c.rules,
@@ -5440,7 +5449,7 @@ mod tests {
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let body = String::from_utf8_lossy(&response.body).into_owned();
         assert!(body.contains("external ran + inline"), "{body}");
         assert!(!body.contains("js is off"), "{body}");
         assert!(!body.contains("<script"), "{body}");
@@ -5560,7 +5569,7 @@ mod tests {
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let body = String::from_utf8_lossy(&response.body).into_owned();
         assert!(body.contains("start-legacy-inline"), "{body}");
         assert!(
             !body.contains("BAD-"),
@@ -5716,6 +5725,116 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn execute_js_loads_data_and_blob_html_iframe_sources() {
+        // HTML's iframe navigation accepts all Fetch URL schemes.  data: and
+        // blob: documents are local scheme fetches, not HTTP requests, and
+        // must replace the child navigable's initial about:blank document.
+        let response = Response {
+            url: parse_url("https://example.test/schemes").unwrap(),
+            status: 200,
+            content_type: String::from("text/html"),
+            headers: Vec::new(),
+            body: br#"<body><script>
+                const dataFrame = document.createElement('iframe');
+                dataFrame.src = 'data:text/html;base64,PGJvZHk+PHAgaWQ9ImRhdGEtY2hpbGQiPkRBVEEgRlJBTUUgQk9EWTwvcD48L2JvZHk+';
+                document.body.appendChild(dataFrame);
+                const blobFrame = document.createElement('iframe');
+                const documentBlob = new Blob(['<body><p id="blob-child">BLOB FRAME BODY</p></body>'], {type:'text/html'});
+                blobFrame.src = URL.createObjectURL(documentBlob);
+                document.body.appendChild(blobFrame);
+            </script></body>"#.to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        };
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("DATA FRAME BODY") || !body.contains("BLOB FRAME BODY") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("local-scheme iframe navigation keeps the page live");
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while (!body.contains("DATA FRAME BODY") || !body.contains("BLOB FRAME BODY"))
+                && std::time::Instant::now() < deadline
+            {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        body = html;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        assert!(
+            body.contains("DATA FRAME BODY"),
+            "data iframe missing: {body}"
+        );
+        assert!(
+            body.contains("BLOB FRAME BODY"),
+            "blob iframe missing: {body}"
+        );
+        assert!(!body.contains("<iframe"), "iframe element survived: {body}");
+        assert!(
+            response
+                .js
+                .as_ref()
+                .is_none_or(|outcome| outcome.errors.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_js_does_not_resurrect_a_detached_iframe_navigation() {
+        // HTML destroys a child navigable when its iframe is removed.  The
+        // queued attribute-processing task must therefore abort rather than
+        // execute a detached srcdoc script against the parent Document.
+        let response = Response {
+            url: parse_url("https://example.test/detached-frame").unwrap(),
+            status: 200,
+            content_type: String::from("text/html"),
+            headers: Vec::new(),
+            body: br#"<body><div id=out>OK</div><script>
+                const frame = document.createElement('iframe');
+                frame.srcdoc = '<script>parent.document.getElementById("out").textContent="BAD"<\/script>';
+                document.body.appendChild(frame);
+                frame.remove();
+                document.body.dataset.done = 'yes';
+            </script></body>"#.to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        };
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            body.contains(">OK</div>"),
+            "detached frame changed parent: {body}"
+        );
+        assert!(!body.contains("BAD"), "detached frame script ran: {body}");
+        assert!(
+            body.contains("data-done=\"yes\""),
+            "script did not run: {body}"
+        );
+        assert!(
+            response
+                .js
+                .as_ref()
+                .is_none_or(|outcome| outcome.errors.is_empty())
+        );
+    }
+
     // A nested browsing context owns its own stylesheet set (HTML iframe
     // navigable + CSS Cascade tree scope).  Its link must still be obtained
     // and applied to the projected frame body; otherwise controls such as
@@ -5822,7 +5941,8 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
                       <body><h1>PARENT PAGE</h1>\
                       <iframe srcdoc=\"<p>SRCDOC BODY</p>\"></iframe>\
-                      <iframe src=\"/inner\"></iframe></body>"
+                      <iframe src=\"/inner\"></iframe>\
+                      <iframe src=\"data:text/html;base64,PGJvZHk+PHA+REFUQSBTVEFUSUMgRlJBTUUgQk9EWTwvcD48L2JvZHk+\"></iframe></body>"
                 } else if text.starts_with("GET /inner ") {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
                       <body><p>INNER FRAME BODY</p><a href=\"deep.html\">go</a>\
@@ -5851,12 +5971,49 @@ mod tests {
             body.contains("NESTED FRAME BODY"),
             "nested frame missing: {body}"
         );
+        assert!(
+            body.contains("DATA STATIC FRAME BODY"),
+            "data frame missing: {body}"
+        );
         assert!(!body.contains("<iframe"), "iframe element survived: {body}");
         assert!(
             body.contains(&format!("http://127.0.0.1:{port}/deep.html")),
             "relative link not resolved against the frame url: {body}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn css_only_follows_finite_srcdoc_nesting_without_depth_cutoff() {
+        // A finite document tree is valid regardless of nesting depth. The
+        // queue is iterative, so following this eleven-level tree must not
+        // depend on a hidden frame-depth budget.
+        let mut nested = String::from("<p>DEEP FRAME BODY</p>");
+        for _ in 0..11 {
+            let encoded = crate::img::base64_encode(nested.as_bytes());
+            nested = format!("<iframe src=\"data:text/html;base64,{encoded}\"></iframe>");
+        }
+        let response = Response {
+            url: parse_url("https://example.test/deep-frames").unwrap(),
+            status: 200,
+            content_type: String::from("text/html"),
+            headers: Vec::new(),
+            body: format!("<body>{nested}</body>").into_bytes(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        };
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            body.contains("DEEP FRAME BODY"),
+            "deep frame was truncated: {body}"
+        );
+        assert!(!body.contains("<iframe"), "iframe element survived: {body}");
     }
 
     #[tokio::test]
@@ -8409,7 +8566,7 @@ mod tests {
     /// engine-fatal errors or when a site's meaningful DOM milestone is not reached. It is kept
     /// ignored because it intentionally depends on the current public site and network:
     ///
-    /// `TRUST_BROWSER_GATE=https://www.youtube.com/ cargo test browser_workload_gate -- --ignored --nocapture`
+    /// `TRUST_BROWSER_GATE=https://www.youtube.com/ TRUST_BROWSER_GATE_CLICK='Reject the use' TRUST_BROWSER_GATE_EXPECT_CONTROL_GONE='Reject the use' cargo test browser_workload_gate -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "live network acceptance gate, needs TRUST_BROWSER_GATE=<url>"]
     async fn browser_workload_gate() {
@@ -8419,6 +8576,19 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(45);
+        let expected_html = std::env::var("TRUST_BROWSER_GATE_EXPECT_HTML_CONTAINS").ok();
+        // A named-control gate may need to click before its final milestone
+        // exists (Speedometer starts on `data-visible-section="home"` and
+        // only creates `summary` after the click). Keep the old behavior when
+        // this optional precondition is omitted, while allowing a precise
+        // initial-vs-final pair for interactive workloads.
+        let initial_expected_html =
+            std::env::var("TRUST_BROWSER_GATE_EXPECT_INITIAL_HTML_CONTAINS")
+                .ok()
+                .or_else(|| expected_html.clone());
+        let requested_click = std::env::var("TRUST_BROWSER_GATE_CLICK").ok();
+        let unexpected_html = std::env::var("TRUST_BROWSER_GATE_EXPECT_HTML_NOT_CONTAINS").ok();
+        let expect_no_errors = std::env::var_os("TRUST_BROWSER_GATE_EXPECT_NO_ERRORS").is_some();
         let viewport: (u16, u16) = std::env::var("TRUST_DIAG_VP")
             .ok()
             .and_then(|value| {
@@ -8524,6 +8694,13 @@ mod tests {
                 .expect("live browser actor accepts initial viewport correction");
             let deadline = started + std::time::Duration::from_secs(settle_seconds);
             loop {
+                if initial_expected_html
+                    .as_deref()
+                    .is_some_and(|expected| html.contains(expected))
+                    || (expect_no_errors && !errors.is_empty())
+                {
+                    break;
+                }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -8558,6 +8735,92 @@ mod tests {
                     Ok(None) | Err(_) => break,
                 }
             }
+
+            // Drive a named control through the same canonical actor node used by the
+            // frontends. Public-site experiments make raw arena ids unstable, while the
+            // renderer-independent semantic tree retains the HTML-AAM accessible name and
+            // activation target. This turns the workload gate into an interaction check (for
+            // example YouTube's consent buttons or Speedometer's Start button) without a
+            // site-specific selector or coordinate guess.
+            if let Some(requested_name) = requested_click.as_deref() {
+                let requested_name = requested_name.to_ascii_lowercase();
+                let target = rendered
+                    .as_ref()
+                    .and_then(|page| {
+                        page.semantics.nodes.iter().find(|node| {
+                            node.dom_node.is_some()
+                                && node.actions.contains(&crate::accessibility::Action::Activate)
+                                && node.name.to_ascii_lowercase().contains(&requested_name)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{host} did not expose an activatable control whose accessible name contains {requested_name:?}"
+                        )
+                    });
+                let target_node = target
+                    .dom_node
+                    .expect("matched semantic node has a DOM node");
+                let target_name = target.name.clone();
+                eprintln!(
+                    "BROWSER_GATE activating {target_name:?} at canonical node {target_node}"
+                );
+                live.handle
+                    .cmds
+                    .send(crate::js::PageCmd::Click(target_node))
+                    .await
+                    .expect("live browser actor accepts named activation");
+
+                let click_seconds = std::env::var("TRUST_BROWSER_GATE_CLICK_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(20);
+                let click_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(click_seconds);
+                loop {
+                    if expected_html
+                        .as_deref()
+                        .is_some_and(|expected| html.contains(expected))
+                        || (expect_no_errors && !errors.is_empty())
+                    {
+                        break;
+                    }
+                    let remaining =
+                        click_deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, live.events.recv()).await {
+                        Ok(Some(crate::js::PageEvt::Updated {
+                            html: updated,
+                            mut outcome,
+                        })) => {
+                            updates += 1;
+                            html = updated;
+                            if let Some(next) = outcome.rendered.take() {
+                                rendered = Some(*next);
+                            }
+                            errors.extend(outcome.errors);
+                        }
+                        Ok(Some(crate::js::PageEvt::Static {
+                            html: updated,
+                            mut outcome,
+                        })) => {
+                            html = updated;
+                            if let Some(next) = outcome.rendered.take() {
+                                rendered = Some(*next);
+                            }
+                            errors.extend(outcome.errors);
+                            break;
+                        }
+                        Ok(Some(crate::js::PageEvt::Trouble(mut trouble))) => {
+                            errors.append(&mut trouble)
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            }
         }
 
         if host.ends_with("youtube.com")
@@ -8573,6 +8836,27 @@ mod tests {
                 "{host} resident page actor ended before acknowledging a browser command"
             );
         }
+        if requested_click.is_some() {
+            assert!(
+                had_live_actor,
+                "{host} named-control gate requested a click but the page was classified static"
+            );
+        }
+
+        if let Ok(expected_gone) = std::env::var("TRUST_BROWSER_GATE_EXPECT_CONTROL_GONE") {
+            let expected_gone = expected_gone.to_ascii_lowercase();
+            let lingering = rendered.as_ref().and_then(|page| {
+                page.semantics.nodes.iter().find(|node| {
+                    node.actions
+                        .contains(&crate::accessibility::Action::Activate)
+                        && node.name.to_ascii_lowercase().contains(&expected_gone)
+                })
+            });
+            assert!(
+                lingering.is_none(),
+                "{host} still exposes an activatable control matching {expected_gone:?} after the requested click: {lingering:#?}; errors={errors:#?}"
+            );
+        }
 
         let fatal_errors = errors
             .iter()
@@ -8586,6 +8870,12 @@ mod tests {
             fatal_errors.is_empty(),
             "browser workload hit fatal engine errors: {fatal_errors:#?}"
         );
+        if !errors.is_empty() {
+            eprintln!("BROWSER_GATE errors ({}):", errors.len());
+            for (index, error) in errors.iter().enumerate() {
+                eprintln!("  [{index}] {error}");
+            }
+        }
 
         let dom = crate::dom::Dom::parse_document(&html);
         let node_count = dom.node_count();
@@ -8593,11 +8883,51 @@ mod tests {
             std::fs::write(&path, html.as_bytes()).expect("write browser gate snapshot");
             eprintln!("BROWSER_GATE snapshot={}B -> {path}", html.len());
         }
+        if let Some(expected_html) = expected_html {
+            assert!(
+                html.contains(&expected_html),
+                "{host} did not reach the required HTML milestone {expected_html:?} after {settle_seconds}s; errors={errors:#?}"
+            );
+        }
+        if host.ends_with("browserbench.org") {
+            // Speedometer's result page marks a completed, statistically
+            // usable run with `class="valid"` and writes the numeric score to
+            // #result-number. Reaching the summary section alone is not enough:
+            // a failed/aborted run can display that section too.
+            assert!(
+                html.contains("class=\"valid\""),
+                "Speedometer did not report a valid summary; errors={errors:#?}"
+            );
+            let score = html
+                .split("id=\"result-number\"")
+                .nth(1)
+                .and_then(|rest| rest.split('>').nth(1))
+                .and_then(|rest| rest.split('<').next())
+                .and_then(|value| value.trim().parse::<f64>().ok());
+            assert!(
+                score.is_some_and(|value| value.is_finite() && value > 0.0),
+                "Speedometer summary did not contain a positive numeric score; errors={errors:#?}"
+            );
+        }
+        if let Some(unexpected_html) = unexpected_html {
+            assert!(
+                !html.contains(&unexpected_html),
+                "{host} retained forbidden HTML milestone {unexpected_html:?} after {settle_seconds}s; errors={errors:#?}"
+            );
+        }
+        if expect_no_errors {
+            assert!(
+                errors.is_empty(),
+                "{host} reported script errors during a no-error workload gate: {errors:#?}"
+            );
+        }
         let minimum_nodes = if host.ends_with("youtube.com") {
             // Presentation serialization varies with experiments, consent, and
-            // recommendation data. This is only an empty-shell guard; the search
-            // control below is the functional acceptance condition.
-            800
+            // history settings. A signed-out page with history disabled has no
+            // recommendation cards and is currently about 570 nodes. This is
+            // only an empty-shell guard; the search control below is the
+            // functional acceptance condition.
+            400
         } else if host.ends_with("twitch.tv") {
             800
         } else if host.ends_with("steampowered.com") {
@@ -8642,9 +8972,15 @@ mod tests {
                 .descendants(crate::dom::DOCUMENT)
                 .filter(|node| dom.attr(*node, "data-a-target") == Some("side-nav-live-status"))
                 .count();
+            let front_page_channel_cards = dom
+                .descendants(crate::dom::DOCUMENT)
+                .filter(|node| dom.attr(*node, "data-a-target") == Some("preview-card-title-link"))
+                .count();
             assert!(
-                has_search_input && has_front_page_carousel && live_channel_cards >= 3,
-                "Twitch homepage milestones missing after {settle_seconds}s: search={has_search_input} carousel={has_front_page_carousel} live_channel_cards={live_channel_cards}; nodes={node_count}; errors={errors:#?}"
+                has_search_input
+                    && has_front_page_carousel
+                    && (front_page_channel_cards >= 3 || live_channel_cards >= 3),
+                "Twitch homepage milestones missing after {settle_seconds}s: search={has_search_input} carousel={has_front_page_carousel} front_page_channel_cards={front_page_channel_cards} live_side_nav_cards={live_channel_cards}; nodes={node_count}; errors={errors:#?}"
             );
         } else if host.ends_with("steampowered.com") {
             let has_search_input = dom.descendants(crate::dom::DOCUMENT).any(|node| {
