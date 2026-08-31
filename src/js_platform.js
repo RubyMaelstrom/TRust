@@ -2,8 +2,44 @@
     "use strict";
     const g = globalThis;
     const cfg = g.__trust_cfg || { url: "about:blank", ua: "TRust/0.1", language: "en-US", languages: ["en-US", "en"], width: 640, height: 384 };
+    // A nested Window Realm receives its parent-owned iframe Element as the
+    // browsing-context anchor. The value deliberately crosses the Realm
+    // boundary: Window.frameElement and the parent's element reference must
+    // retain object identity for a same-origin child.
+    const realmRootFrame = cfg.frameElement || null;
+    const configuredAgentTimeOffset = Number(cfg.agentTimeOffset);
+    const agentTimeOffset = Number.isFinite(configuredAgentTimeOffset) &&
+        configuredAgentTimeOffset >= 0 ? configuredAgentTimeOffset : 0;
     const trust = { errors: [], logs: [], readyState: "loading" };
     g.__trust = trust;
+    const childWindowTrusts = new Set();
+    trust.attachChildWindow = function (childWindow) {
+        const childTrust = childWindow && childWindow.__trust;
+        if (childTrust && childTrust !== trust) {
+            childTrust.oneShot = trust.oneShot;
+            childWindowTrusts.add(childTrust);
+        }
+    };
+    trust.detachChildWindow = function (childWindow) {
+        const childTrust = childWindow && childWindow.__trust;
+        if (childTrust) childWindowTrusts.delete(childTrust);
+    };
+    trust.takeErrors = function () {
+        const errors = trust.errors.splice(0);
+        for (const childTrust of childWindowTrusts) {
+            const childErrors = childTrust.takeErrors();
+            if (childErrors) errors.push(childErrors);
+        }
+        return errors.join("\u0000");
+    };
+    trust.takeLogs = function () {
+        const logs = trust.logs.splice(0);
+        for (const childTrust of childWindowTrusts) {
+            const childLogs = childTrust.takeLogs();
+            if (childLogs) logs.push(childLogs);
+        }
+        return logs.join("\u0000");
+    };
 
     // --- the virtual clock ---
     // The engine's timer clock (ms since page start). Explicit timer advances
@@ -15,21 +51,22 @@
     // HTML §8.7 keeps timer IDs independently from queued tasks. `activeNesting`
     // is the currently-running timer task's nesting level, or zero for any
     // other task; it drives the normative four-millisecond nested-timer clamp.
-    const timers = { q: [], ids: new Set(), now: 0, seq: 1, activeNesting: 0 };
+    const timers = { q: [], now: 0, activeNesting: 0 };
     // HTML §8.10: animation-frame callbacks belong to a per-target callback
     // map, not the timer task source. `q` preserves insertion order; `deadline`
     // represents the next rendering opportunity selected by the host.
-    const animationFrames = { q: [], deadline: null, seq: 0 };
+    const animationFrames = { q: [], deadline: null };
     // The absolute epoch the virtual clock is anchored to — the REAL host
     // time at prelude boot (the Rust clock answers real time until the first
     // __clockSync). Every `timers.now` advance re-anchors the Rust clock.
     const __epoch0 = Date.now();
-    const __clockSync = typeof __clock_set === "function"
+    const __clockNow = typeof __clock_now === "function" ? __clock_now : Date.now;
+    const __clockSync = typeof __clock_set === "function" && !realmRootFrame
         ? function () { __clock_set(__epoch0 + timers.now); }
         : function () {};
     __clockSync();
     function currentTime() {
-        const elapsed = Date.now() - __epoch0;
+        const elapsed = __clockNow() - __epoch0;
         return Math.max(timers.now, Number.isFinite(elapsed) ? elapsed : timers.now);
     }
 
@@ -82,19 +119,143 @@
     g.SVGRect = DOMRect;
 
     // --- node wrappers, identity-cached so wrap(id) === wrap(id) ---
+    // Web IDL converts an interface value back to the JavaScript object that
+    // represents that SAME platform object. This is more than an `===` detail:
+    // custom-element state, event-handler properties, expandos, and the
+    // Element→ShadowRoot association live on our wrapper today. Consequently a
+    // wrapper in the connected shadow-including tree must stay strong even if
+    // page JS temporarily drops its last reference. Detached transient nodes
+    // remain weak so virtual-DOM churn does not root the entire Rust arena.
     const W = new Map();
-    function wrap(id) {
+    const CONNECTED_W = new Map();
+    // Infra namespace constants used by DOM's expanded-name algorithms.
+    const HTML_NS = "http://www.w3.org/1999/xhtml";
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
+    const XML_NS = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS_NS = "http://www.w3.org/2000/xmlns/";
+    // Shadow mode is native element state conceptually. The Rust arena owns
+    // the host→root association; retain the one bit not stored there so a
+    // reconstructed host wrapper never exposes a closed root.
+    const CLOSED_SHADOW_HOSTS = new Set();
+    const wrapperFinalizer = typeof g.FinalizationRegistry === "function"
+        ? new g.FinalizationRegistry(function (record) {
+            if (W.get(record.id) === record.reference) W.delete(record.id);
+        })
+        : null;
+    function cachedWrapper(id, knownConnected) {
+        const connected = CONNECTED_W.get(id);
+        if (connected) return connected;
+        const reference = W.get(id);
+        if (!reference) return null;
+        const wrapper = typeof reference.deref === "function" ? (reference.deref() || null) : reference;
+        if (wrapper && typeof g.WeakRef === "function"
+            && (knownConnected === true
+                || (knownConnected === undefined && __dom_is_connected(id))))
+            CONNECTED_W.set(id, wrapper);
+        return wrapper;
+    }
+    function rememberWrapper(id, wrapper, knownConnected) {
+        if (typeof g.WeakRef !== "function") {
+            W.set(id, wrapper);
+            return wrapper;
+        }
+        const reference = new g.WeakRef(wrapper);
+        W.set(id, reference);
+        if (wrapperFinalizer) wrapperFinalizer.register(wrapper, { id: id, reference: reference });
+        if (knownConnected === true
+            || (knownConnected === undefined && __dom_is_connected(id)))
+            CONNECTED_W.set(id, wrapper);
+        return wrapper;
+    }
+    // Synchronize only wrappers that already exist; never materialize a whole
+    // inserted subtree merely for cache bookkeeping. The Rust walk includes
+    // light descendants, each attached shadow root, and its descendants.
+    function syncKnownWrapperRetention(ids, connected) {
+        if (typeof g.WeakRef !== "function") return;
+        for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            if (!connected) {
+                // A connected platform wrapper is already the strong-map
+                // value. Avoid a second weak-map lookup and WeakRef.deref()
+                // while demoting a known-removed subtree; wrappers for an
+                // already-detached target are absent here and its listeners
+                // are already in DETACHED_LS.
+                const wrapper = CONNECTED_W.get(id);
+                CONNECTED_W.delete(id);
+                if (wrapper) detachListenerTarget(wrapper);
+                continue;
+            }
+            const reference = W.get(id);
+            const wrapper = reference && (typeof reference.deref === "function"
+                ? reference.deref() : reference);
+            if (!reference) continue;
+            if (wrapper) {
+                CONNECTED_W.set(id, wrapper);
+                attachListenerTarget(wrapper);
+            }
+        }
+    }
+    function syncWrapperSubtreeRetention(rootId) {
+        if (typeof g.WeakRef !== "function") return;
+        syncKnownWrapperRetention(__dom_wrapper_subtree(rootId), __dom_is_connected(rootId));
+    }
+    // HTML innerHTML and DOM textContent both use DOM "replace all". Snapshot
+    // the old child subtrees in one arena traversal before the replacement so
+    // bulk removals do not cross the JS/Rust boundary once per old child. An
+    // element's own shadow tree is not among its children, so fall back to the
+    // explicit old roots when the replacement target is itself a shadow host.
+    function snapshotRemovedWrapperSubtrees(target, removedRoots) {
+        if (typeof g.WeakRef !== "function" || !removedRoots.length) return [];
+        const canWalkInclusiveTarget = target.__trustLN !== "template"
+            && __dom_shadow_root(target.__id) == null;
+        if (canWalkInclusiveTarget) {
+            const ids = __dom_wrapper_subtree(target.__id);
+            if (ids.length && ids[0] === target.__id) ids.shift();
+            return ids;
+        }
+        const ids = [];
+        for (let i = 0; i < removedRoots.length; i++) {
+            const subtree = __dom_wrapper_subtree(removedRoots[i]);
+            for (let j = 0; j < subtree.length; j++) ids.push(subtree[j]);
+        }
+        return ids;
+    }
+    function seedElementName(element, localName, namespace, prefix) {
+        element.__trustLN = localName || "";
+        element.__trustNS = namespace === undefined ? null : namespace;
+        element.__trustPrefix = prefix === undefined ? null : prefix;
+        return element;
+    }
+    function cacheElementName(element) {
+        const parts = __dom_element_name(element.__id) || ["", null, null];
+        return seedElementName(element, parts[0], parts[1], parts[2]);
+    }
+    function newElementWrapper(id, localName, namespace, prefix) {
+        const wrapper = seedElementName(
+            new (classFor(localName, namespace))(id),
+            localName,
+            namespace,
+            prefix
+        );
+        return rememberWrapper(id, wrapper);
+    }
+    function wrapKnown(id, knownConnected) {
         if (id === null || id === undefined) return null;
-        let w = W.get(id);
+        if (realmRootFrame && Number(id) === realmRootFrame.__id) return realmRootFrame;
+        let w = cachedWrapper(id, knownConnected);
         if (w) return w;
         const t = __dom_node_type(id);
         if (t === 1) {
-            // Dispatch to the element's interface class by tag (HTMLSelectElement,
-            // HTMLVideoElement, …); seed the lazily-cached localName since we
-            // already read it, keeping this ~syscall-neutral vs the old wrap.
-            const tag = __dom_tag(id) || "";
-            w = new (classFor(tag))(id);
-            w.__trustLN = tag;
+            // DOM chooses an element interface from BOTH its local name and
+            // namespace. Fetch all immutable expanded-name parts in one host
+            // crossing so parsed inline SVG and script-created SVG get the SVG
+            // interface chain without adding a syscall to this hot path.
+            const parts = __dom_element_name(id) || ["", null, null];
+            w = seedElementName(
+                new (classFor(parts[0], parts[1]))(id),
+                parts[0], parts[1], parts[2]
+            );
         } else {
             w = t === 9 ? new Document(id)
                 : t === 3 ? new Text(id)
@@ -102,9 +263,27 @@
                 : t === 11 ? new DocumentFragment(id)
                 : new Node(id);
         }
-        W.set(id, w);
-        return w;
+        return rememberWrapper(id, w, knownConnected);
     }
+    function wrap(id) {
+        return wrapKnown(id, undefined);
+    }
+    // Every result of a ParentNode selector query has the query root's
+    // connectedness. Carry that one known bit through wrapper creation rather
+    // than asking the arena again for every member of a large static NodeList.
+    function wrapQueryResults(root, ids) {
+        const connected = !!__dom_is_connected(root.__id);
+        return ids.map((id) => wrapKnown(id, connected));
+    }
+    // Diagnostic-only census for focused host GC tests. The public DOM never
+    // exposes the cache or its arena ids.
+    trust.nodeWrapperCacheState = function () {
+        let live = 0;
+        for (const reference of W.values()) {
+            if (typeof reference.deref !== "function" || reference.deref() !== undefined) live++;
+        }
+        return [W.size, live, CONNECTED_W.size];
+    };
 
     // A <script> element runs when it is FIRST inserted into the document
     // (HTML "prepare a script") — the universal SDK-loader idiom
@@ -176,6 +355,11 @@
     // is hoisted alongside the other iframe helpers below.)
     function maybeProcessInsertedFrame(frame, parent) {
         if (!parent.isConnected) return;
+        const src = frame.getAttribute("src");
+        const blank = frame.getAttribute("srcdoc") === null &&
+            (src === null || src.trim() === "");
+        createInitialFrameWindow(frame, blank);
+        if (blank) return;
         queueFrameNavigation(frame);
     }
 
@@ -196,7 +380,7 @@
     // value outside the page-visible object: challenge scripts are allowed to
     // define or freeze an own `frameElement` property, and frame bookkeeping
     // must not try to overwrite page-owned descriptors while restoring state.
-    let frameElementState = null;
+    let frameElementState = realmRootFrame;
     // Lazily-minted, then cached `document.all` (`[[IsHTMLDDA]]`) — see the
     // `Document` class `get all()`. Per-page (fresh per realm), so its identity is
     // stable within a page but never shared across pages.
@@ -313,10 +497,8 @@
     }
     function baseHref() {
         if (baseHrefCache !== null) return baseHrefCache;
-        const b = g.document.querySelector("base[href]");
-        if (!b) return (baseHrefCache = g.location.href);
-        const u = __url_parse(b.getAttribute("href") || "", g.location.href);
-        return (baseHrefCache = u ? u[0] : g.location.href);
+        const currentFrame = trust.__activeFrame || null;
+        return (baseHrefCache = documentBaseURL(currentFrame));
     }
     // Resolve a (possibly relative) request URL against the document base URL —
     // the base for fetch()/XHR per Fetch §"Request" and XHR `open()` (the API
@@ -334,10 +516,212 @@
     // pays nothing for the capture phase (no ancestor walk on non-bubbling
     // events, no extra pass).
     const LS = new Map();
+    // Detached Nodes remain fully usable when author code retains them, but a
+    // host side table must not itself keep an otherwise-unreachable detached
+    // document alive. Connected/event-discovery targets stay enumerable in
+    // LS; detached targets retain the same listener map weakly until reinserted.
+    const DETACHED_LS = new WeakMap();
+    function detachListenerTarget(target) {
+        const listeners = target && LS.get(target);
+        if (!listeners || !target || typeof target !== "object") return;
+        LS.delete(target);
+        DETACHED_LS.set(target, listeners);
+    }
+    function attachListenerTarget(target) {
+        const listeners = target && DETACHED_LS.get(target);
+        if (!listeners) return;
+        DETACHED_LS.delete(target);
+        LS.set(target, listeners);
+    }
+    // HTML §7.2.3: WindowProxy identity survives navigation, but its
+    // [[Window]] normally changes with the active Document. TRust multiplexes
+    // those logical Window objects through `g`; retain per-Window listener,
+    // event-handler, and AnimationFrameProvider state so a reused iframe cannot
+    // inherit work from its previous Document. The initial about:blank Window
+    // is retained for its first same-origin navigation.
+    let nextWindowSettingsContext = 1;
+    function allocateWindowSettingsContext() {
+        if (typeof __dom_allocate_job_context === "function") {
+            const context = Number(__dom_allocate_job_context());
+            if (Number.isSafeInteger(context) && context > 0) return context;
+            throw new DOMException("Unable to allocate Window settings", "InvalidStateError");
+        }
+        return nextWindowSettingsContext++;
+    }
+    const windowSettingsFrames = new Map();
+    function createWindowState(frame, context) {
+        return {
+            listenerTarget: {}, handlers: Object.create(null),
+            animationFrameIdentifier: 0,
+            timerIds: new Set(), timerIdentifier: 1,
+            hasElementScrollListener: false,
+            customElementState: null, customElementRegistry: null,
+            scopedGlobalDescriptors: null, authorGlobalDescriptors: null,
+            // HTML has a 1:1 mapping between a realm, global object, and
+            // environment settings object. Lumen uses this opaque token both
+            // to restore promise-job settings and to partition module maps.
+            hostSettingsContext: context === undefined
+                ? (frame ? allocateWindowSettingsContext() : 0)
+                : context,
+        };
+    }
+    const configuredSettingsContext = Number(cfg.hostSettingsContext);
+    const topWindowState = createWindowState(
+        null,
+        Number.isSafeInteger(configuredSettingsContext) && configuredSettingsContext > 0
+            ? configuredSettingsContext : 0
+    );
+    const frameWindowStates = new WeakMap();
+    const framesWithNonInitialDocuments = new WeakSet();
+    if (realmRootFrame && topWindowState.hostSettingsContext > 0)
+        windowSettingsFrames.set(topWindowState.hostSettingsContext, realmRootFrame);
+    function installFrameWindowState(frame, state) {
+        frameWindowStates.set(frame, state);
+        windowSettingsFrames.set(state.hostSettingsContext, frame);
+        return state;
+    }
+    function activeWindowState() {
+        const frame = trust.__activeFrame || null;
+        if (!frame || frame === realmRootFrame) return topWindowState;
+        let state = frameWindowStates.get(frame);
+        if (!state) {
+            state = installFrameWindowState(frame, createWindowState(frame));
+        }
+        return state;
+    }
+    function retireWindowState(frame, state) {
+        if (!state) return;
+        const listeners = LS.get(state.listenerTarget);
+        if (listeners) {
+            for (const list of listeners.values())
+                captureCount -= list.capN || 0;
+            LS.delete(state.listenerTarget);
+        }
+        animationFrames.q = animationFrames.q.filter(
+            (entry) => entry.windowState !== state
+        );
+        if (!animationFrames.q.length) animationFrames.deadline = null;
+        state.timerIds.clear();
+        timers.q = timers.q.filter((timer) => timer.windowState !== state);
+        function discardTasks(queue) {
+            for (let i = queue.length - 1; i >= 0; i--) {
+                if (queue[i].windowState === state) queue.splice(i, 1);
+            }
+        }
+        discardTasks(networkTasks);
+        discardTasks(domTasks);
+        discardTasks(intersectionTasks);
+        discardTasks(messageTasks);
+        discardTasks(portMessages);
+        for (let i = MO.length - 1; i >= 0; i--) {
+            if (MO[i].__windowState === state) MO.splice(i, 1);
+        }
+        for (let i = IO.length - 1; i >= 0; i--) {
+            if (IO[i].__windowState === state) IO.splice(i, 1);
+        }
+        for (let i = RO.length - 1; i >= 0; i--) {
+            if (RO[i].__windowState === state) RO.splice(i, 1);
+        }
+        for (let i = ioNotify.length - 1; i >= 0; i--) {
+            if (ioNotify[i].__windowState === state) ioNotify.splice(i, 1);
+        }
+        moRecomputeKinds();
+        if (!IO.length) ioInitialUpdatePending = false;
+        if (!RO.length) roInitialUpdatePending = false;
+        if (!intersectionTasks.length) ioTaskQueued = false;
+        windowSettingsFrames.delete(state.hostSettingsContext);
+        __dom_release_job_context(state.hostSettingsContext);
+    }
+    function resetFrameWindowState(frame) {
+        if (!framesWithNonInitialDocuments.has(frame)) {
+            framesWithNonInitialDocuments.add(frame);
+            windowStateForFrame(frame);
+            return;
+        }
+        // Replacing the active Document destroys every child navigable owned
+        // by that Document before the old subtree is unlinked.
+        for (const child of frame.childNodes) destroyFrameNavigablesIn(child);
+        if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
+        const old = frameWindowStates.get(frame);
+        retireWindowState(frame, old);
+        installFrameWindowState(frame, createWindowState(frame));
+        trust.detachChildWindow(frame.__contentRealmWindow);
+        frame.__contentRealmWindow = undefined;
+        frame.__trustInitialAboutBlank = false;
+        frame.__contentDoc = undefined;
+        // requestAnimationFrame is a writable Window property. A replacement
+        // Window starts with the platform method rather than an override made
+        // by the previous Document.
+        frame.__trustAnimationFrameMethods = undefined;
+    }
+    function destroyFrameNavigable(frame) {
+        if (!frame) return;
+        let descendants = [];
+        try { descendants = frame.querySelectorAll("iframe, frame"); } catch (e) {}
+        for (let i = descendants.length - 1; i >= 0; i--)
+            destroyFrameNavigable(descendants[i]);
+        const pending = frame.__trustPendingNavigationReservations;
+        if (pending) {
+            for (const reservation of pending.slice())
+                retireFrameNavigationReservation(frame, reservation);
+            frame.__trustPendingNavigationReservations = undefined;
+        }
+        retireWindowState(frame, frameWindowStates.get(frame));
+        frameWindowStates.delete(frame);
+        framesWithNonInitialDocuments.delete(frame);
+        frame.__trustLoadGeneration = (frame.__trustLoadGeneration || 0) + 1;
+        frame.__loadedSrc = undefined;
+        frame.__loadedSrcdoc = undefined;
+        frame.__frameUrl = undefined;
+        trust.detachChildWindow(frame.__contentRealmWindow);
+        frame.__contentDoc = undefined;
+        frame.__contentWin = undefined;
+        frame.__contentRealmWindow = undefined;
+        frame.__trustInitialAboutBlank = false;
+        frame.__trustInitialLoadFired = false;
+        frame.__trustParentWindow = undefined;
+        frame.__trustTopWindow = undefined;
+        frame.__trustAnimationFrameMethods = undefined;
+    }
+    function destroyFrameNavigableDescendantsIn(root) {
+        if (!root) return;
+        let descendants = [];
+        try { descendants = root.querySelectorAll("iframe, frame"); } catch (e) {}
+        for (const frame of descendants) {
+            const owner = frameOwnerForNode(frame);
+            if (!owner || !root.contains(owner)) destroyFrameNavigable(frame);
+        }
+    }
+    function destroyFrameNavigablesIn(root) {
+        if (!root) return;
+        if (root.__trustLN === "iframe" || root.__trustLN === "frame") {
+            destroyFrameNavigable(root);
+            return;
+        }
+        destroyFrameNavigableDescendantsIn(root);
+    }
+    function windowStateForFrame(frame) {
+        if (frame === realmRootFrame) return topWindowState;
+        let state = frameWindowStates.get(frame);
+        if (!state) {
+            state = installFrameWindowState(frame, createWindowState(frame));
+        }
+        return state;
+    }
+    function listenerRegistryTarget(target) {
+        return target === g ? activeWindowState().listenerTarget : target;
+    }
     let captureCount = 0;
     function lsFor(target, type) {
-        let m = LS.get(target);
-        if (!m) { m = new Map(); LS.set(target, m); }
+        const registryTarget = listenerRegistryTarget(target);
+        let m = LS.get(registryTarget) || DETACHED_LS.get(registryTarget);
+        if (!m) {
+            m = new Map();
+            if (registryTarget instanceof Node && !registryTarget.isConnected)
+                DETACHED_LS.set(registryTarget, m);
+            else
+                LS.set(registryTarget, m);
+        }
         let l = m.get(type);
         if (!l) { l = []; m.set(type, l); }
         return l;
@@ -409,6 +793,15 @@
     // trusted input by passing a non-standard constructor option or assigning
     // to the readonly `isTrusted` attribute.
     const trustedEvents = new WeakSet();
+    // DOM §2.7 gives every EventTarget an internal "get the parent"
+    // algorithm. Most non-Node targets return null, but IndexedDB overrides it
+    // for request -> transaction -> connection propagation. Keep these links
+    // internal: author properties must not be able to rewrite an event path.
+    const eventParents = new WeakMap();
+    // DOM's dispatch algorithm has one legacy exception-reporting output used
+    // exclusively by IndexedDB. Listener exceptions remain reported normally,
+    // while this unexposed flag lets IndexedDB abort the associated transaction.
+    const eventsWithListenerExceptions = new WeakSet();
     function createTrustedEvent(C, type, opts) {
         const ev = new C(type, opts);
         trustedEvents.add(ev);
@@ -619,7 +1012,10 @@
                                               () => af.call(cur, ev));
                     if (result === false) ev.preventDefault();
                 }
-                catch (e) { trust.errors.push("on" + ev.type + ": " + ((e && e.message) || e)); }
+                catch (e) {
+                    eventsWithListenerExceptions.add(ev);
+                    trust.errors.push("on" + ev.type + ": " + ((e && e.message) || e));
+                }
                 if (ev.__stopNow) return;
             }
         }
@@ -653,7 +1049,10 @@
                     else entry.fn.handleEvent(ev);
                 });
             }
-            catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            catch (e) {
+                eventsWithListenerExceptions.add(ev);
+                trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""));
+            }
             if (ev.__stopNow) break;
         }
     }
@@ -724,15 +1123,24 @@
     // inside a component, seen from outside), and propagation ends at the tree
     // where a hop makes them collapse mid-walk.
     function dispatch(target, ev, forceBubble) {
+        eventsWithListenerExceptions.delete(ev);
         // Each browsing context owns a distinct Window/EventTarget. TRust
         // currently multiplexes those Window objects through one engine global,
         // so retain the active nested navigable as part of the logical target.
-        // Without this filter a child `load` also invoked the parent window's
-        // listeners (and the eventual parent `load` invoked every child
-        // listener), violating DOM's per-EventTarget listener-list rule.
-        if (target === g && !ev.__windowTargetSet) {
+        // Without this filter a child Window/Document event also invokes the
+        // parent window's listeners (and a top Document event invokes every
+        // child listener), violating DOM's per-EventTarget listener-list rule.
+        const targetFrame = target instanceof Node
+            ? frameOwnerForNode(target)
+            : target && target.nodeType === 9 && target.__frame
+                ? target.__frame
+                : trust.__activeFrame || null;
+        if (target instanceof Node || (target && target.nodeType === 9)) {
             ev.__windowTargetSet = true;
-            ev.__frameTarget = trust.__activeFrame || null;
+            ev.__frameTarget = targetFrame;
+        } else if (target === g && !ev.__windowTargetSet) {
+            ev.__windowTargetSet = true;
+            ev.__frameTarget = targetFrame;
         }
         ev.target = target;
         const origRelated = ev.relatedTarget;
@@ -756,6 +1164,21 @@
                     // Node's get-the-parent result is its assigned slot when
                     // present, otherwise its actual tree parent.
                     const parent = assignedSlot || n.parentNode;
+                    // A nested Document's nodes live below their embedding
+                    // element only in TRust's presentation arena. DOM trees do
+                    // not cross browsing-context boundaries: the child root's
+                    // parent is its own Document, whose event parent is its own
+                    // Window. Insert that logical boundary instead of letting
+                    // the path escape through the <iframe> into the embedder.
+                    if (parent && targetFrame && parent === targetFrame) {
+                        n = frameDocument(targetFrame);
+                        path.push({
+                            n: n, t: t,
+                            r: hasRelated ? retarget(origRelated, n) : null,
+                            c: false, s: false,
+                        });
+                        break;
+                    }
                     if (parent) { n = parent; }
                     else if (n.__host) {
                         // ShadowRoot's get-the-parent algorithm clips only
@@ -805,6 +1228,22 @@
                 // "get the parent" returns the global).
                 if (!clipped && n.nodeType === 9 && target !== g && ev.type !== "load") {
                     path.push({ n: g, t: t, r: hasRelated ? retarget(origRelated, g) : null, c: false, s: false });
+                }
+            } else if (n && n.nodeType === 9 && target !== g && ev.type !== "load") {
+                // FrameDocument is the nested-document facade rather than a
+                // Node wrapper, but DOM gives its events the same Window parent
+                // as every other Document event path.
+                path.push({ n: g, t: t, r: hasRelated ? retarget(origRelated, g) : null, c: false, s: false });
+            } else {
+                // DOM EventTarget "get the parent" overrides for non-Node
+                // targets. IndexedDB defines request -> transaction ->
+                // connection; the connection itself returns null. These path
+                // entries keep the request as the shadow-adjusted target.
+                for (;;) {
+                    const parent = eventParents.get(n) || null;
+                    if (!parent) break;
+                    n = parent;
+                    path.push({ n: n, t: target, r: null, c: false, s: false });
                 }
             }
             ev.__path = path; // composedPath() reads it; emptied on unwind (spec)
@@ -922,39 +1361,248 @@
     // document has loaded. A macrotask so parent onload / addEventListener
     // handlers attached during the current turn still observe it (same shape
     // as the synthetic image-load pass).
-    function fireFrameLoad(frame) {
-        // HTML document lifecycle queues the iframe load event steps on the
-        // DOM manipulation task source, independently of messaging and timers.
+    function retireFrameNavigationReservation(frame, reservation) {
+        if (!reservation || !reservation.active) return;
+        reservation.active = false;
+        const pending = frame && frame.__trustPendingNavigationReservations;
+        if (pending) {
+            const index = pending.indexOf(reservation);
+            if (index >= 0) pending.splice(index, 1);
+        }
+        trust.pendingFrameNavigationTasks = Math.max(
+            0, trust.pendingFrameNavigationTasks - 1);
+    }
+    function retireFrameNavigation(frame, generation) {
+        const pending = frame && frame.__trustPendingNavigationReservations;
+        if (!pending) return;
+        for (const reservation of pending) {
+            if (reservation.generation === generation) {
+                retireFrameNavigationReservation(frame, reservation);
+                return;
+            }
+        }
+    }
+    function queueFrameElementLoad(frame, generation) {
         __queue_dom_task(function () {
-            // The nested document's Window also receives its load event. The
-            // iframe element's load below is a separate parent-document event;
-            // both are observable and child bootstraps commonly wait on the
-            // former before creating their interactive surface.
-            try { runInFrame(frame, function () { dispatch(g, new Event("load"), false); }); } catch (e) {}
+            if (frame.__trustLoadGeneration !== generation) {
+                retireFrameNavigation(frame, generation);
+                return;
+            }
             try { dispatch(frame, new Event("load"), false); } catch (e) {}
-        }, 0);
+            // Navigation remains load-delaying until the iframe element's
+            // load-event steps have run. This is the completion point used by
+            // the parent Document's own load-event delay list.
+            retireFrameNavigation(frame, generation);
+        }, realmRootFrame || frameOwnerForNode(frame) || 0);
+    }
+    trust.queueFrameElementLoad = function (frameId, generation) {
+        const frame = wrap(Number(frameId));
+        if (!frame) return false;
+        queueFrameElementLoad(frame, Number(generation));
+        return true;
+    };
+    function fireFrameLoad(frame, generation) {
+        // HTML's document lifecycle first queues the child Window's `load` as
+        // a global DOM-manipulation task. The navigable-container algorithm
+        // then queues the iframe load-event steps as a distinct element task.
+        // Keeping those tasks separate is observable: microtasks after the
+        // child load run before the parent's iframe `load` handler begins.
+        if (trust.taskQueueState) {
+            const frameLoadListeners = lsFor(frame, "load");
+            trust.lastFrameLoadState = frame.__id + "/onload=" + typeof frame.onload +
+                "/listeners=" + frameLoadListeners.length + "/generation=" + generation;
+        }
+        __queue_dom_task(function () {
+            // A queued completion belongs to the Document that initiated it.
+            // If `src`/`srcdoc` navigated the element again in the meantime,
+            // that old Document must not fire the new Document's load event.
+            if (frame.__trustLoadGeneration !== generation) return;
+            frame.__trustReadyState = "complete";
+            try { runInFrame(frame, function () { dispatch(g, new Event("load"), false); }); } catch (e) {}
+            // The iframe element is an EventTarget in its node document's
+            // Realm. Queue its load-event steps only after the child Window
+            // load task has run, so the intervening event-loop checkpoint is
+            // observable. Logical single-Realm frames use the local queue;
+            // real child Realms route the element task to their owner Realm.
+            const ownerTrust = realmRootFrame && cfg.parentWindow && cfg.parentWindow.__trust;
+            if (ownerTrust && ownerTrust !== trust)
+                ownerTrust.queueFrameElementLoad(frame.__id, generation);
+            else queueFrameElementLoad(frame, generation);
+        }, realmRootFrame || frame);
     }
     // Install markup as the frame's content navigable, then process any frames
-    // nested inside it (bounded by the circular guard + the page fetch cap).
-    function loadFrameMarkup(frame, markup, base, frameUrl) {
+    // nested inside it. The circular-navigation guard prevents only the
+    // recursive URL cycle required by HTML; navigation itself has no arbitrary
+    // depth/count cutoff.
+    function beginFrameLoad(frame) {
+        const generation = (frame.__trustLoadGeneration || 0) + 1;
+        frame.__trustLoadGeneration = generation;
+        return generation;
+    }
+    function createFrameWindowRealm(frame, frameUrl) {
+        if (typeof __dom_create_window_realm !== "function") return null;
+        const windowState = windowStateForFrame(frame);
+        let childWindow;
+        try {
+            childWindow = __dom_create_window_realm(
+                windowState.hostSettingsContext,
+                frame.__id,
+                frameUrl,
+                cfg,
+                g,
+                g.top || g,
+                frame,
+                trust.now ? trust.now() : performance.now()
+            );
+        } catch (e) {
+            trust.errors.push("Window Realm: " + ((e && e.message) || e));
+        }
+        if (!childWindow || !childWindow.__trust) return null;
+        frame.__contentRealmWindow = childWindow;
+        frame.__contentDoc = childWindow.document;
+        trust.attachChildWindow(childWindow);
+        return childWindow;
+    }
+    function createInitialFrameWindow(frame, fireElementLoad) {
+        if (!frame || frame.__contentRealmWindow || frame.__trustInitialAboutBlank)
+            return frame && frame.__contentRealmWindow || null;
+
+        // HTML §7.3.2.1 creates and completely loads a populated initial
+        // about:blank Document, with its own Window Realm, as part of creating
+        // the iframe's child navigable. It exists before attribute navigation.
+        frame.__frameUrl = "about:blank";
+        frame.__trustReadyState = "complete";
+        const replacedRoots = frame.childNodes;
+        if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
+        frame.__contentDoc = undefined;
+        frame.__contentWin = undefined;
+        __dom_load_frame(frame.__id, "", nodeBaseHref(frame));
+        for (let i = 0; i < replacedRoots.length; i++)
+            syncWrapperSubtreeRetention(replacedRoots[i].__id);
+
+        const childWindow = createFrameWindowRealm(frame, "about:blank");
+        if (childWindow) frame.__trustInitialAboutBlank = true;
+        else frame.__contentDoc = frameDocument(frame);
+
+        // Processing missing/empty src on initial insertion runs the iframe
+        // load-event steps against the already-complete initial Document.
+        if (fireElementLoad && !frame.__trustInitialLoadFired) {
+            frame.__trustInitialLoadFired = true;
+            try { dispatch(frame, new Event("load"), false); } catch (e) {}
+        }
+        return childWindow;
+    }
+    function loadFrameMarkup(frame, markup, base, frameUrl, generation) {
+        const initialWindow = frame.__trustInitialAboutBlank
+            ? frame.__contentRealmWindow : null;
+        const reuseInitialWindow = !!(initialWindow && initialWindow.__trust &&
+            frameSameOrigin(frameUrl));
+        if (initialWindow) framesWithNonInitialDocuments.add(frame);
+        if (!reuseInitialWindow) resetFrameWindowState(frame);
+        frame.__trustInitialAboutBlank = false;
         frame.__frameUrl = frameUrl;
         frame.__trustParentWindow = undefined;
         frame.__trustTopWindow = undefined;
+        frame.__trustReadyState = "loading";
+        const replacedRoots = frame.childNodes;
+        if (reuseInitialWindow) {
+            for (const root of replacedRoots) destroyFrameNavigablesIn(root);
+        }
         __dom_load_frame(frame.__id, String(markup == null ? "" : markup), base);
-        runFrameScripts(frame);
-        // Stylesheet links are fetched after parser scripts begin. The
-        // nested script may itself create the challenge DOM; delaying this
-        // optional resource task keeps a stylesheet failure from aborting the
-        // content navigable before its required script runs.
-        loadFrameStyles(frame);
-        queueFrameNavigationsIn(frame);
+        for (let i = 0; i < replacedRoots.length; i++)
+            syncWrapperSubtreeRetention(replacedRoots[i].__id);
+
+        // HTML §7.5.1 reuses the initial about:blank Window for the first
+        // same-origin navigation, but replaces its Document. Other
+        // cross-document navigations create a fresh Window and Realm.
+        if (reuseInitialWindow) {
+            try {
+                if (initialWindow.__trust.replaceInitialDocument(frame.__id, frameUrl)) {
+                    frame.__contentRealmWindow = initialWindow;
+                    frame.__contentDoc = initialWindow.document;
+                    initialWindow.__trust.finishParsedFrameLoad(frame.__id, generation);
+                    return;
+                }
+            } catch (e) {
+                trust.errors.push("initial Window reuse: " + ((e && e.message) || e));
+            }
+            // A failed reuse must not leave the old Realm registered under the
+            // settings token used by its replacement.
+            resetFrameWindowState(frame);
+        }
+
+        // Lumen exposes the same-Agent Realm boundary here; the legacy
+        // comparison backend returns null and retains the scoped single-Realm
+        // fallback below.
+        const childWindow = createFrameWindowRealm(frame, frameUrl);
+        if (childWindow) {
+            childWindow.__trust.finishParsedFrameLoad(frame.__id, generation);
+            return;
+        }
+        finishParsedFrameLoad(frame, generation);
     }
+
+    function finishParsedFrameLoad(frame, generation) {
+        // A cross-document navigation creates a new Document object. All
+        // access paths within this navigation must subsequently return that
+        // same object (Web IDL interface identity / Window.document).
+        frame.__contentDoc = frameDocument(frame);
+        // The native parse is atomic; at this boundary the parser has reached
+        // EOF and parser-deferred/module scripts are about to run.
+        frame.__trustReadyState = "interactive";
+        queueFrameNavigationsIn(frame);
+
+        // HTML §13.2.7: parser-deferred and module scripts run before
+        // DOMContentLoaded. HTML then waits for everything delaying load (such
+        // as scripts and style sheets) before the Window and iframe load
+        // events. Fetch the independent resources together; their load/error
+        // events form this compact nested-document implementation's completion
+        // boundary.
+        let allScriptsDone = false;
+        let stylesDone = false;
+        let domContentLoaded = false;
+        function maybeFinishLoad() {
+            if (generation !== frame.__trustLoadGeneration ||
+                !domContentLoaded || !allScriptsDone || !stylesDone) return;
+            fireFrameLoad(frame, generation);
+        }
+        loadFrameStyles(frame, function () {
+            stylesDone = true;
+            maybeFinishLoad();
+        });
+        runFrameScripts(frame, function () {
+            if (generation !== frame.__trustLoadGeneration) return;
+            try {
+                runInFrame(frame, function () {
+                    dispatch(g.document, new Event("DOMContentLoaded", { bubbles: true }), false);
+                });
+            } catch (e) {}
+            domContentLoaded = true;
+            maybeFinishLoad();
+        }, function () {
+            allScriptsDone = true;
+            maybeFinishLoad();
+        });
+    }
+    trust.finishParsedFrameLoad = function (frameId, generation) {
+        frameId = Number(frameId);
+        const frame = realmRootFrame && realmRootFrame.__id === frameId
+            ? realmRootFrame : wrap(frameId);
+        if (!frame) return false;
+        frame.__contentRealmWindow = g;
+        frame.__contentDoc = frameDocument(frame);
+        finishParsedFrameLoad(frame, Number(generation));
+        return true;
+    };
     // "Process the iframe attributes". The initialInsertion / re-process cases
     // collapse into one idempotent function: the __loaded* de-dup makes a
     // repeat call for the SAME state a no-op, so the load sweep, the lazy
     // contentDocument getter, and src/srcdoc attribute changes all route here.
     function processIframeAttributes(frame) {
-        if (!frame) return;
+        // A queued attribute task may outlive removal of its iframe. The
+        // removed navigable is destroyed by the DOM removal steps and must not
+        // be resurrected by that stale task.
+        if (!frame || !frame.isConnected) return;
         const ln = frame.localName;
         if (ln !== "iframe" && ln !== "frame") return;
         // srcdoc takes priority over src (spec).
@@ -965,15 +1613,19 @@
             frame.__loadedSrc = undefined;
             // about:srcdoc: the markup IS the document; base/origin inherit the
             // parent document.
-            loadFrameMarkup(frame, srcdoc, g.location.href, "about:srcdoc");
-            fireFrameLoad(frame);
+            const generation = beginFrameLoad(frame);
+            loadFrameMarkup(frame, srcdoc, nodeBaseHref(frame), "about:srcdoc", generation);
             return;
         }
         frame.__loadedSrcdoc = undefined;
         // Shared attribute processing steps → a URL, or null (= about:blank).
         const src = frame.getAttribute("src");
         if (!src || src.trim() === "") { frame.__loadedSrc = undefined; return; }
-        const parsed = __url_parse(src, baseHref());
+        // HTML §4.8.5's shared iframe/frame attribute-processing steps
+        // encoding-parse this URL relative to the ELEMENT'S node Document.
+        // The incumbent Window can already be the child when parent-side code
+        // rereads contentDocument; it must not affect the embedding URL base.
+        const parsed = __url_parse(src, nodeBaseHref(frame));
         if (!parsed) return;
         const url = parsed[0];
         if (frame.__loadedSrc === url) return; // already navigated to this src
@@ -986,6 +1638,7 @@
         if (/^javascript:/i.test(url)) {
             if (frameAncestorHasUrl(frame, url)) return;
             frame.__loadedSrc = url;
+            const generation = beginFrameLoad(frame);
             const oldSrc = src;
             let result = null;
             try {
@@ -1003,27 +1656,73 @@
                 trust.errors.push("frame javascript URL: " + ((e && e.message) || e));
             }
             if (typeof result === "string" && frame.getAttribute("src") === oldSrc) {
-                loadFrameMarkup(frame, result, frameBaseURL(frame), frameURLFor(frame));
+                loadFrameMarkup(frame, result, frameBaseURL(frame), frameURLFor(frame), generation);
+            } else {
+                fireFrameLoad(frame, generation);
             }
-            fireFrameLoad(frame);
             return;
         }
-        // Only http(s) navigables are fetchable here (about:/data:/blob: render
-        // nothing for now — a documented deviation).
+        // Fetch-scheme navigations use the same local scheme algorithms as
+        // Fetch: data: decodes its payload in place and blob: resolves from
+        // the origin's object-URL store.  These schemes are valid iframe
+        // resources; treating them as an HTTP-only special case would leave
+        // the child navigable at its initial about:blank Document, contrary
+        // to HTML's "navigate an iframe" steps.
+        if (url.slice(0, 5).toLowerCase() === "data:") {
+            if (frameAncestorHasUrl(frame, url)) return;
+            frame.__loadedSrc = url;
+            const generation = beginFrameLoad(frame);
+            const parts = __dataURLParts(url);
+            const essence = parts && String(parts.ctype || "")
+                .split(";", 1)[0].trim().toLowerCase();
+            if (parts && (essence === "text/html" || essence === "application/xhtml+xml")) {
+                loadFrameMarkup(frame, parts.text, url, url, generation);
+            } else {
+                // Unsupported document types still complete navigation and
+                // fire the iframe load event; the terminal presentation layer
+                // has no plugin/document viewer for them.
+                fireFrameLoad(frame, generation);
+            }
+            return;
+        }
+        if (url.slice(0, 5).toLowerCase() === "blob:") {
+            if (frameAncestorHasUrl(frame, url)) return;
+            frame.__loadedSrc = url;
+            const generation = beginFrameLoad(frame);
+            const entry = __resolveBlobURL(url);
+            const essence = entry && String(entry.type || "")
+                .split(";", 1)[0].trim().toLowerCase();
+            if (entry && (essence === "text/html" || essence === "application/xhtml+xml")) {
+                const text = new g.TextDecoder().decode(__latin1ToBytes(entry.bytes));
+                loadFrameMarkup(frame, text, url, url, generation);
+            } else {
+                fireFrameLoad(frame, generation);
+            }
+            return;
+        }
+        if (url.toLowerCase() === "about:blank") {
+            if (frameAncestorHasUrl(frame, url)) return;
+            frame.__loadedSrc = url;
+            const generation = beginFrameLoad(frame);
+            loadFrameMarkup(frame, "", nodeBaseHref(frame), "about:blank", generation);
+            return;
+        }
         if (!/^https?:/i.test(url)) { frame.__loadedSrc = undefined; return; }
         if (frameAncestorHasUrl(frame, url)) return; // circular-navigation guard
         frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
+        const generation = beginFrameLoad(frame);
         let r;
         try { r = __http_fetch(url, "GET", null, null, null); } catch (e) { r = null; }
-        if (!r) { fireFrameLoad(frame); return; }
+        if (!r) { fireFrameLoad(frame, generation); return; }
         const status = r[0] | 0;
         const ctype = String(r[1] || "").toLowerCase();
         const isHtml = ctype === "" || ctype.indexOf("text/html") >= 0 ||
             ctype.indexOf("application/xhtml") >= 0;
         if (status >= 200 && status < 300 && isHtml) {
-            loadFrameMarkup(frame, r[2] || "", url, url);
+            loadFrameMarkup(frame, r[2] || "", url, url, generation);
+        } else {
+            fireFrameLoad(frame, generation);
         }
-        fireFrameLoad(frame);
     }
     // Process every frame within `root` (the document at load, or a freshly
     // installed frame document for nested frames). Idempotent (the __loaded*
@@ -1033,6 +1732,11 @@
         try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
         for (let i = 0; i < frames.length; i++) {
             try {
+                const src = frames[i].getAttribute("src");
+                const blank = frames[i].getAttribute("srcdoc") === null &&
+                    (src === null || src.trim() === "");
+                createInitialFrameWindow(frames[i], blank);
+                if (blank) continue;
                 processIframeAttributes(frames[i]);
                 loadFrameStyles(frames[i]);
             } catch (e) {}
@@ -1053,19 +1757,28 @@
             return false;
         frame.__trustNavigationQueued = true;
         trust.pendingFrameNavigationTasks++;
+        const reservation = { active: true, generation: null };
+        (frame.__trustPendingNavigationReservations ||=
+            []).push(reservation);
         __queue_dom_task(function () {
             frame.__trustNavigationQueued = false;
+            if (!frame.isConnected) {
+                retireFrameNavigationReservation(frame, reservation);
+                return;
+            }
+            const previousGeneration = frame.__trustLoadGeneration || 0;
             try {
                 processIframeAttributes(frame);
                 loadFrameStyles(frame);
             } catch (e) {}
-            // processIframeAttributes queues this frame's load event while
-            // it is running. Append retirement afterward so parent load is
-            // still delayed through that observable event.
-            __queue_dom_task(function () {
-                trust.pendingFrameNavigationTasks = Math.max(
-                    0, trust.pendingFrameNavigationTasks - 1);
-            });
+            // A successful navigation retires from queueFrameElementLoad,
+            // after the child Window and iframe load-event tasks. If the
+            // attributes changed before this task ran, no load task exists;
+            // retire the stale navigation entry here instead.
+            const generation = frame.__trustLoadGeneration || 0;
+            if (generation === previousGeneration)
+                retireFrameNavigationReservation(frame, reservation);
+            else reservation.generation = generation;
         });
         return true;
     }
@@ -1073,6 +1786,11 @@
         let frames;
         try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
         for (let i = 0; i < frames.length; i++) {
+            const src = frames[i].getAttribute("src");
+            const blank = frames[i].getAttribute("srcdoc") === null &&
+                (src === null || src.trim() === "");
+            createInitialFrameWindow(frames[i], blank);
+            if (blank) continue;
             queueFrameNavigation(frames[i]);
         }
         return frames.length;
@@ -1096,6 +1814,11 @@
     // load sweep (or for a frame inserted after load). The de-dup guards keep a
     // repeat call cheap; a frame with neither src nor srcdoc stays about:blank.
     function ensureFrameProcessed(frame) {
+        const src = frame.getAttribute("src");
+        const blank = frame.getAttribute("srcdoc") === null &&
+            (src === null || src.trim() === "");
+        createInitialFrameWindow(frame, blank);
+        if (blank) return;
         if (frame.getAttribute("src") !== null || frame.getAttribute("srcdoc") !== null) {
             try { processIframeAttributes(frame); } catch (e) {}
         }
@@ -1378,6 +2101,7 @@
     trust.scriptEvent = function (id, type) {
         const t = wrap(id);
         if (!t) return;
+        t.__trustResourceSettled = String(type);
         const ev = new Event(type);
         dispatch(t, ev, false);
     };
@@ -1784,7 +2508,17 @@
     // the base constructor (the standard polyfill trick), so
     // `class X extends HTMLElement { constructor(){ super(); ... } }`
     // initializes the EXISTING wrapper.
-    const CE = { defs: new Map(), tags: new Map(), waiting: new Map(), upgrading: null };
+    function createCustomElementState() {
+        return { defs: new Map(), tags: new Map(), waiting: new Map(), upgrading: null };
+    }
+    function customElementStateForWindow(windowState) {
+        return windowState.customElementState ||
+            (windowState.customElementState = createCustomElementState());
+    }
+    // HTML §4.13.4 associates the global custom-element registry with the
+    // Window's Document. `enterFrame` switches this reference alongside the
+    // active Document, avoiding a proxy/map lookup on every DOM mutation.
+    let CE = customElementStateForWindow(topWindowState);
     // EventTarget is the root of the node + window hierarchy (Node and Window
     // both extend it), so the spec's listener methods live here ONCE and
     // everything inherits them. It must be declared before Node/Window (class
@@ -1803,7 +2537,8 @@
                 // handler) keeps the page resident so the wheel write-back can
                 // fire it (see `trust.hasScrollWork`). Window/document scroll is
                 // tracked separately via the listener map.
-                if (String(type) === "scroll" && this !== g.document) g.__elScroll = true;
+                if (String(type) === "scroll" && this !== g.document)
+                    activeWindowState().hasElementScrollListener = true;
             }
         }
         removeEventListener(type, fn, options) { removeL(this, type, fn, options); }
@@ -1830,8 +2565,9 @@
                     const tag = CE.tags.get(c);
                     if (tag) {
                         this.__id = __dom_create_element(tag);
+                        seedElementName(this, tag, HTML_NS, null);
                         this.__ceUpgraded = true;
-                        W.set(this.__id, this);
+                        rememberWrapper(this.__id, this);
                         return;
                     }
                     c = Object.getPrototypeOf(c);
@@ -1847,9 +2583,9 @@
             return n === 3 ? "#text" : n === 9 ? "#document" : n === 8 ? "#comment" : n === 11 ? "#document-fragment" : "#node";
         }
         // DOM §4.4 Node.baseURI: every node reports the serialized document
-        // base URL of its node document. The page scope's baseHref() follows
-        // HTML's document-base algorithm, including the first <base href>.
-        get baseURI() { return baseHref(); }
+        // base URL of its node document, even when another Window is the
+        // incumbent settings object while this getter runs.
+        get baseURI() { return nodeBaseHref(this); }
         get parentNode() { return wrap(__dom_parent(this.__id)); }
         get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
         get childNodes() { return __dom_children(this.__id).map(wrap); }
@@ -1866,12 +2602,25 @@
         get textContent() { return __dom_text(this.__id); }
         set textContent(v) {
             v = v === null || v === undefined ? "" : String(v);
-            if (!MO.length) { __dom_set_text(this.__id, v); slotQueueCheck(this); return; }
+            if (!MO.length) {
+                const removedRoots = __dom_children(this.__id);
+                for (let i = 0; i < removedRoots.length; i++)
+                    destroyFrameNavigablesIn(wrap(removedRoots[i]));
+                __dom_set_text(this.__id, v);
+                for (let i = 0; i < removedRoots.length; i++)
+                    syncWrapperSubtreeRetention(removedRoots[i]);
+                slotQueueCheck(this);
+                return;
+            }
             const t = this.nodeType;
             if (t === 3 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
             // On an element, textContent replaces all children with one text node.
             const removed = this.childNodes;
+            for (let i = 0; i < removed.length; i++)
+                destroyFrameNavigablesIn(removed[i]);
             __dom_set_text(this.__id, v);
+            for (let i = 0; i < removed.length; i++)
+                syncWrapperSubtreeRetention(removed[i].__id);
             moChildBulk(this, removed, this.childNodes);
             slotQueueCheck(this);
         }
@@ -1899,7 +2648,15 @@
         // observable for DOMParser trees before and after adoptNode; returning
         // the live document for every node made cross-document adoption
         // indistinguishable from a no-op.
-        get ownerDocument() { return wrap(__dom_owner_document(this.__id)); }
+        get ownerDocument() {
+            // Each iframe content navigable has its own Document even though
+            // TRust stores its nodes in the page actor's shared arena.  The
+            // arena-level owner id is therefore only the fallback for top-level
+            // and detached documents; a node below a realized frame belongs to
+            // that frame's stable Document facade.
+            const frame = frameOwnerForNode(this);
+            return frame ? frameDocument(frame) : wrap(__dom_owner_document(this.__id));
+        }
         get isConnected() {
             return !!__dom_is_connected(this.__id);
         }
@@ -1911,6 +2668,7 @@
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
             // (returns false, unmutated) when `c` is an inclusive ancestor.
             if (!__dom_append(this.__id, c.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
@@ -1925,6 +2683,7 @@
             const insertion = __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
             if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
@@ -1942,6 +2701,8 @@
             if (MO.length) moChildRemove(this, c);
             if (CE.defs.size) ceDisconnect(c);
             __dom_detach(c.__id);
+            destroyFrameNavigablesIn(c);
+            syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             return c;
         }
@@ -1952,8 +2713,11 @@
             const insertion = __dom_insert_before(this.__id, n.__id, old.__id);
             if (insertion === -1) throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            syncWrapperSubtreeRetention(n.__id);
             if (CE.defs.size) ceDisconnect(old);
             __dom_detach(old.__id);
+            destroyFrameNavigablesIn(old);
+            syncWrapperSubtreeRetention(old.__id);
             slotQueueCheck(this);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
@@ -1964,7 +2728,7 @@
             else if (n.__trustLN === "iframe" || n.__trustLN === "frame") maybeProcessInsertedFrame(n, this);
             return old;
         }
-        remove() { if (this.__trustLN === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); slotQueueCheck(p); }
+        remove() { if (this.__trustLN === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); destroyFrameNavigablesIn(this); syncWrapperSubtreeRetention(this.__id); slotQueueCheck(p); }
         append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
         prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
         // The ChildNode mixin: lit's svg templates go through
@@ -2463,6 +3227,79 @@
         return behavior;
     }
 
+    // CSSOM View §7 `offsetParent`: operate within the node's own flat tree and
+    // return the nearest ancestor that establishes the applicable positioned
+    // containing block.  A nested Document boundary is never an ancestor in
+    // that flat tree, even though TRust's native arena parents the child root
+    // beneath its iframe for shared layout.
+    function flatTreeParentElement(node) {
+        const slot = assignedSlotInternal(node);
+        if (slot) return slot;
+        let parent = node.parentNode;
+        if (parent && parent.nodeType === 11 && parent.__host) parent = parent.__host;
+        return parent && parent.nodeType === 1 ? parent : null;
+    }
+    function offsetBoxRect(element) {
+        try { return __dom_rect(element.__id); }
+        catch (_) { return null; }
+    }
+    function establishesPositionContainingBlock(style, fixed) {
+        const position = String(style.position || "static").toLowerCase();
+        if (!fixed && position !== "static") return true;
+        // CSS Positioned Layout §2.1 delegates these additional containing
+        // blocks to the defining modules.  These computed values cover the
+        // interoperable transform/filter/contain/will-change cases.
+        const transform = String(style.transform || "none").toLowerCase();
+        const perspective = String(style.perspective || "none").toLowerCase();
+        const filter = String(style.filter || "none").toLowerCase();
+        const backdrop = String(style.backdropFilter || style["backdrop-filter"] || "none").toLowerCase();
+        if ((transform && transform !== "none") ||
+            (perspective && perspective !== "none") ||
+            (filter && filter !== "none") || (backdrop && backdrop !== "none")) return true;
+        const contain = String(style.contain || "none").toLowerCase().split(/\s+/);
+        if (contain.some((token) => token === "layout" || token === "paint" ||
+            token === "strict" || token === "content")) return true;
+        const willChange = String(style.willChange || style["will-change"] || "auto")
+            .toLowerCase().split(/\s*,\s*/);
+        return willChange.some((token) => token === "transform" || token === "perspective" ||
+            token === "filter" || token === "backdrop-filter" || token === "contain");
+    }
+    function cssomOffsetParent(element) {
+        const document = element.ownerDocument;
+        if (!document || !offsetBoxRect(element)) return null;
+        const root = document.documentElement, body = document.body;
+        if (element === root || element === body) return null;
+
+        const elementStyle = g.getComputedStyle(element);
+        const position = String(elementStyle.position || "static").toLowerCase();
+        const fixed = position === "fixed";
+        let ancestor = flatTreeParentElement(element);
+        while (ancestor && ancestor.ownerDocument === document) {
+            if (offsetBoxRect(ancestor)) {
+                const style = g.getComputedStyle(ancestor);
+                if (establishesPositionContainingBlock(style, fixed) ||
+                    (!fixed && ancestor === body) ||
+                    (!fixed && position === "static" &&
+                        (ancestor.localName === "td" || ancestor.localName === "th" ||
+                         ancestor.localName === "table"))) return ancestor;
+            }
+            ancestor = flatTreeParentElement(ancestor);
+        }
+        return null;
+    }
+    function cssomOffsetCoordinate(element, axis) {
+        const rect = offsetBoxRect(element);
+        const document = element.ownerDocument;
+        if (!rect || !document || element === document.body) return 0;
+        const parent = cssomOffsetParent(element);
+        if (!parent) return Math.round(axis === "top" ? rect[1] : rect[0]);
+        const parentRect = offsetBoxRect(parent);
+        if (!parentRect) return Math.round(axis === "top" ? rect[1] : rect[0]);
+        const parentStyle = g.getComputedStyle(parent);
+        const border = parseFloat(axis === "top" ? parentStyle.borderTopWidth : parentStyle.borderLeftWidth) || 0;
+        return Math.round((axis === "top" ? rect[1] - parentRect[1] : rect[0] - parentRect[0]) - border);
+    }
+
     class Element extends Node {
         // DOM Standard ParentNode: selector methods are exposed on Element,
         // Document, and DocumentFragment—not on CharacterData/Text nodes.
@@ -2470,7 +3307,7 @@
         // is false) and prevents code that tests for ParentNode from treating
         // an inserted text node as an element.
         querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
-        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
         // nodeType and the tag are IMMUTABLE for a node: `wrap()` already
@@ -2488,8 +3325,25 @@
         // — sharing `__ln` clobbered our cached tag AND made YT read our string
         // where it expected its object (`"div".next = …` → "cannot set
         // non-writable property"). Keep every per-node internal field `__trust*`.
-        get localName() { let t = this.__trustLN; if (t === undefined) t = this.__trustLN = __dom_tag(this.__id) || ""; return t; }
-        get tagName() { let t = this.__tn; if (t === undefined) t = this.__tn = this.localName.toUpperCase(); return t; }
+        get localName() {
+            if (this.__trustLN === undefined) cacheElementName(this);
+            return this.__trustLN;
+        }
+        get prefix() {
+            if (this.__trustPrefix === undefined) cacheElementName(this);
+            return this.__trustPrefix;
+        }
+        get tagName() {
+            let qualifiedName = this.__trustQN;
+            if (qualifiedName === undefined) {
+                qualifiedName = this.prefix === null
+                    ? this.localName
+                    : this.prefix + ":" + this.localName;
+                if (this.namespaceURI === HTML_NS) qualifiedName = qualifiedName.toUpperCase();
+                this.__trustQN = qualifiedName;
+            }
+            return qualifiedName;
+        }
         get nodeName() { return this.tagName; }
         // DOM Slottable.assignedSlot: finding a slot with the `open` flag
         // hides slots whose root is closed, while event dispatch uses the
@@ -2505,8 +3359,16 @@
         // inline SVG/MathML their own. Vue 3 hydration reads
         // `el.namespaceURI.includes("svg")`, so a missing value threw on every
         // SSR Vue/Nuxt page (joinpeertube).
-        get namespaceURI() { let n = this.__ns; if (n === undefined) n = this.__ns = __dom_namespace(this.__id); return n; }
-        get [Symbol.toStringTag]() { return htmlInterfaceName(this.localName); }
+        get namespaceURI() {
+            if (this.__trustNS === undefined) cacheElementName(this);
+            return this.__trustNS;
+        }
+        get [Symbol.toStringTag]() {
+            return this.namespaceURI === HTML_NS ? htmlInterfaceName(this.localName)
+                : this.namespaceURI === SVG_NS ? svgInterfaceName(this.localName)
+                : this.namespaceURI === MATHML_NS ? "MathMLElement"
+                : "Element";
+        }
         // NOTE: type-SPECIFIC IDL surfaces (HTMLMediaElement media state on
         // <video>/<audio>, the <canvas> 2d context, HTMLSelectElement options,
         // HTMLInputElement value/checked/type, anchor URL parts, iframe
@@ -2702,8 +3564,12 @@
         // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
+            const removedRoots = __dom_children(this.__id);
+            const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
+            if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
             if (!MO.length) {
                 __dom_set_inner_html(this.__id, String(v));
+                syncKnownWrapperRetention(removedWrapperIds, false);
                 baseHrefCache = null;
                 if (CE.defs.size) ceScan(this);
                 slotQueueCheck(this);
@@ -2715,6 +3581,7 @@
             }
             const removed = this.childNodes;
             __dom_set_inner_html(this.__id, String(v));
+            syncKnownWrapperRetention(removedWrapperIds, false);
             baseHrefCache = null;
             moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
@@ -2727,17 +3594,35 @@
         // property binding (lit's PropertyPart) now sets a plain expando here.
         attachShadow(init) {
             const id = __dom_attach_shadow(this.__id);
-            let sr = W.get(id);
+            let sr = cachedWrapper(id);
             if (!(sr instanceof ShadowRoot)) {
                 sr = new ShadowRoot(id);
-                W.set(id, sr);
+                rememberWrapper(id, sr);
             }
             sr.__host = this;
             sr.__mode = init && init.mode === "closed" ? "closed" : "open";
+            if (sr.__mode === "closed") CLOSED_SHADOW_HOSTS.add(this.__id);
+            else CLOSED_SHADOW_HOSTS.delete(this.__id);
             this.__sr = sr;
             return sr;
         }
-        get shadowRoot() { return this.__sr && this.__sr.__mode === "open" ? this.__sr : null; }
+        get shadowRoot() {
+            if (CLOSED_SHADOW_HOSTS.has(this.__id)) return null;
+            let root = this.__sr;
+            if (!root) {
+                const id = __dom_shadow_root(this.__id);
+                if (id === null || id === undefined) return null;
+                root = cachedWrapper(id);
+                if (!(root instanceof ShadowRoot)) {
+                    root = new ShadowRoot(id);
+                    rememberWrapper(id, root);
+                }
+                root.__host = this;
+                root.__mode = "open";
+                this.__sr = root;
+            }
+            return root.__mode === "open" ? root : null;
+        }
         // ElementInternals, minimally: form components construct with
         // this unguarded (archive.org's dropdowns) — always-valid,
         // form-less internals keep them booting.
@@ -2800,10 +3685,69 @@
         get dataset() {
             if (!this.__ds) {
                 const el = this;
-                this.__ds = new Proxy(Object.create(DOMStringMap.prototype), {
-                    get(_, p) { return typeof p === "string" ? (el.getAttribute("data-" + kebab(p)) ?? undefined) : undefined; },
-                    set(_, p, v) { if (typeof p === "string") el.setAttribute("data-" + kebab(p), String(v)); return true; },
-                    has(_, p) { return typeof p === "string" && el.getAttribute("data-" + kebab(p)) !== null; },
+                const target = Object.create(DOMStringMap.prototype);
+                // WHATWG HTML §3.2.6.6: supported named properties are the
+                // current data-* attributes, in attribute-list order. A named
+                // property is an OWN enumerable property for Web IDL purposes;
+                // Object.keys/spread/Object.assign therefore must see it. GitLab
+                // enumerates dataset before JSON-parsing its boot data.
+                function pairs() {
+                    const result = [];
+                    const names = el.getAttributeNames();
+                    for (let index = 0; index < names.length; index++) {
+                        const attribute = names[index];
+                        if (!attribute.startsWith("data-") || /[A-Z]/.test(attribute.slice(5))) continue;
+                        const property = attribute.slice(5).replace(/-([a-z])/g,
+                            (_, letter) => letter.toUpperCase());
+                        result.push([property, attribute]);
+                    }
+                    return result;
+                }
+                function attributeFor(property) {
+                    const list = pairs();
+                    for (let index = 0; index < list.length; index++)
+                        if (list[index][0] === property) return list[index][1];
+                    return null;
+                }
+                this.__ds = new Proxy(target, {
+                    get(t, p, receiver) {
+                        if (typeof p === "string") {
+                            const attribute = attributeFor(p);
+                            if (attribute !== null) return el.getAttribute(attribute);
+                        }
+                        return Reflect.get(t, p, receiver);
+                    },
+                    set(t, p, v, receiver) {
+                        if (typeof p !== "string") return Reflect.set(t, p, v, receiver);
+                        if (/-[a-z]/.test(p))
+                            throw new DOMException("A dataset property cannot contain a hyphen followed by a lowercase letter.", "SyntaxError");
+                        // Web IDL DOMString uses ToString; concatenation retains
+                        // the required Symbol exception unlike String(Symbol).
+                        el.setAttribute("data-" + kebab(p), "" + v);
+                        return true;
+                    },
+                    deleteProperty(t, p) {
+                        if (typeof p !== "string") return Reflect.deleteProperty(t, p);
+                        const attribute = attributeFor(p);
+                        if (attribute !== null) el.removeAttribute(attribute);
+                        return true;
+                    },
+                    has(t, p) {
+                        return (typeof p === "string" && attributeFor(p) !== null) || Reflect.has(t, p);
+                    },
+                    ownKeys(t) {
+                        return pairs().map((pair) => pair[0]).concat(Reflect.ownKeys(t));
+                    },
+                    getOwnPropertyDescriptor(t, p) {
+                        if (typeof p === "string") {
+                            const attribute = attributeFor(p);
+                            if (attribute !== null) return {
+                                configurable: true, enumerable: true, writable: true,
+                                value: el.getAttribute(attribute),
+                            };
+                        }
+                        return Reflect.getOwnPropertyDescriptor(t, p);
+                    },
                 });
             }
             return this.__ds;
@@ -3061,11 +4005,11 @@
             return new DOMRect(r.x - sx, r.y - sy, r.width, r.height);
         }
         getClientRects() { return [this.getBoundingClientRect()]; }
-        get offsetWidth() { return this.__rect().width; }
-        get offsetHeight() { return this.__rect().height; }
-        get offsetTop() { return this.__rect().top; }
-        get offsetLeft() { return this.__rect().left; }
-        get offsetParent() { return g.document.body; }
+        get offsetWidth() { const r = offsetBoxRect(this); return r ? Math.round(r[2]) : 0; }
+        get offsetHeight() { const r = offsetBoxRect(this); return r ? Math.round(r[3]) : 0; }
+        get offsetTop() { return cssomOffsetCoordinate(this, "top"); }
+        get offsetLeft() { return cssomOffsetCoordinate(this, "left"); }
+        get offsetParent() { return cssomOffsetParent(this); }
         // The root element's client area IS the viewport (CSSOM View): a page
         // reading `document.documentElement.clientHeight` to size against the
         // window must get the viewport, not the full document height. Every
@@ -3622,13 +4566,27 @@
         }
     }
 
-    // wrap() dispatches a node id (type 1) to its interface class by tag. The map
-    // is memoized (localName is immutable, so a class only resolves once); an
-    // interface with no specialized class falls back to the generic HTMLElement.
-    // Reuses htmlInterfaceName + the interface-constructor globals (set below).
+    // DOM §4.9 chooses an element interface from its namespace and local name,
+    // not its spelling alone. Memoize the pair: HTML <a> is an
+    // HTMLAnchorElement, SVG <a> an SVGAElement, and a null/custom-namespace <a>
+    // remains the generic Element.
+    const SVG_IFACE_IRREGULAR = {
+        svg: "SVG", a: "A", g: "G", tspan: "TSpan", textpath: "TextPath",
+        clippath: "ClipPath", lineargradient: "LinearGradient",
+        radialgradient: "RadialGradient", foreignobject: "ForeignObject",
+    };
+    function svgInterfaceName(local) {
+        const value = String(local || "");
+        const lower = value.toLowerCase();
+        const suffix = SVG_IFACE_IRREGULAR[lower]
+            || (lower ? lower.charAt(0).toUpperCase() + lower.slice(1) : "");
+        const name = "SVG" + suffix + "Element";
+        return g[name] ? name : "SVGElement";
+    }
     const ELEM_CLASS = new Map();
-    function classFor(local) {
-        let C = ELEM_CLASS.get(local);
+    function classFor(local, namespace) {
+        const key = String(namespace) + "\0" + String(local);
+        let C = ELEM_CLASS.get(key);
         if (C !== undefined) return C;
         // The interface class comes from the GLOBAL (so a page that subclasses,
         // say, HTMLElement keeps inheriting our methods). BUT a page may REPLACE
@@ -3642,9 +4600,18 @@
         // use our OWN lexical base classes for construction (they faithfully
         // forward the id to the Node constructor); the global is only consulted
         // for the genuinely-specialized interfaces it still owns.
-        const name = htmlInterfaceName(local);
-        C = name === "HTMLElement" ? HTMLElement : g[name] || HTMLElement;
-        ELEM_CLASS.set(local, C);
+        if (namespace === HTML_NS) {
+            const name = htmlInterfaceName(local);
+            C = name === "HTMLElement" ? HTMLElement : g[name] || HTMLElement;
+        } else if (namespace === SVG_NS) {
+            const name = svgInterfaceName(local);
+            C = name === "SVGElement" ? SVGElement : g[name] || SVGElement;
+        } else if (namespace === MATHML_NS) {
+            C = MathMLElement;
+        } else {
+            C = Element;
+        }
+        ELEM_CLASS.set(key, C);
         return C;
     }
 
@@ -3792,7 +4759,8 @@
     }
     function fireChangedFrameViewportResizes() {
         let frames = [];
-        try { frames = g.document.querySelectorAll("iframe, frame"); } catch (e) { return; }
+        try { frames = g.document.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
+        let changed = 0;
         // Document order visits an embedding frame before frames in its child
         // document. A parent handler may resize a nested iframe (SCM Player's
         // outer resize handler does exactly that), so the child's dimensions
@@ -3805,11 +4773,26 @@
             const old = frameViewportSizes.get(frame);
             rememberFrameViewport(frame, width, height);
             if (!old || (old[0] === width && old[1] === height)) continue;
-            runInFrame(frame, function () {
-                dispatch(g, new Event("resize"), false);
-            });
+            changed++;
+            // Lumen creates a genuine child Realm for each navigable. Its
+            // Window/EventTarget and listener registry therefore live in the
+            // child global, not in this parent Realm's scoped facade. Route
+            // the resize steps through that Window when present; the
+            // runInFrame path remains for the legacy single-Realm backend.
+            const childWindow = frame.__contentRealmWindow;
+            if (childWindow && childWindow !== g && childWindow.__trust &&
+                typeof childWindow.__trust.setViewport === "function") {
+                try { childWindow.__trust.setViewport(width, height); }
+                catch (e) { trust.errors.push("frame resize handler: " + ((e && e.message) || e)); }
+            } else {
+                runInFrame(frame, function () {
+                    dispatch(g, new Event("resize"), false);
+                });
+            }
         }
+        return changed;
     }
+    trust.updateFrameResizes = fireChangedFrameViewportResizes;
     function mediaQueryListForViewport(query, viewport) {
         const q = String(query);
         return {
@@ -3833,12 +4816,20 @@
     function installFrameSurface(Cls) {
         Object.defineProperty(Cls.prototype, "contentDocument", { configurable: true, enumerable: false,
             get() {
+                if (!this.isConnected) return null;
                 ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
                 if (this.__frameUrl && !frameSameOrigin(this.__frameUrl)) return null;
-                return this.__contentDoc || (this.__contentDoc = new FrameDocument(this));
+                if (this.__contentRealmWindow) return this.__contentRealmWindow.document;
+                return frameDocument(this);
             } });
         Object.defineProperty(Cls.prototype, "contentWindow", { configurable: true, enumerable: false,
             get() {
+                if (!this.isConnected) return null;
+                ensureFrameProcessed(this);
+                if (this.__contentRealmWindow &&
+                    (!this.__frameUrl || frameSameOrigin(this.__frameUrl))) {
+                    return this.__contentRealmWindow;
+                }
                 if (!this.__contentWin) {
                     const frame = this;
                     this.__contentWin = {
@@ -3889,8 +4880,45 @@
                         innerHeight: { configurable: true, enumerable: true,
                             get() { return frameViewportDimension(frame, "height"); } },
                     });
-                    this.__contentWin.self = this.__contentWin;
-                    this.__contentWin.window = this.__contentWin;
+                    // WindowProxy forwards ordinary property access to its
+                    // current Window. The compact single-global frame model
+                    // needs one extra step for callable properties: invoking
+                    // a child global function obtained through contentWindow
+                    // must keep the child's Document, Location, and scoped
+                    // scheduling APIs active for the whole call.
+                    const facade = this.__contentWin;
+                    const callableWrappers = new WeakMap();
+                    let proxy;
+                    function scopedCallable(callable) {
+                        let wrapped = callableWrappers.get(callable);
+                        if (wrapped) return wrapped;
+                        wrapped = new Proxy(callable, {
+                            apply(target, thisArg, args) {
+                                return runInFrame(frame, function () {
+                                    return Reflect.apply(target, thisArg === proxy ? g : thisArg, args);
+                                });
+                            },
+                            construct(target, args, newTarget) {
+                                return runInFrame(frame, function () {
+                                    return Reflect.construct(target, args,
+                                        newTarget === wrapped ? target : newTarget);
+                                });
+                            },
+                        });
+                        callableWrappers.set(callable, wrapped);
+                        return wrapped;
+                    }
+                    proxy = new Proxy(facade, {
+                        get(target, property, receiver) {
+                            if (Object.prototype.hasOwnProperty.call(target, property))
+                                return Reflect.get(target, property, receiver);
+                            const value = runInFrame(frame, function () { return g[property]; });
+                            return typeof value === "function" ? scopedCallable(value) : value;
+                        },
+                    });
+                    proxy.self = proxy;
+                    proxy.window = proxy;
+                    this.__contentWin = proxy;
                 }
                 return this.__contentWin;
             } });
@@ -3950,6 +4978,47 @@
             return root instanceof ShadowRoot && root.__mode === "closed" ? null : slot;
         }
         get [Symbol.toStringTag]() { return "Text"; }
+    }
+
+    // WHATWG DOM §1.4 `valid element local name` and `validate and extract`.
+    // This intentionally follows the current, HTML-parser-compatible grammar;
+    // older XML Name productions are stricter and are no longer the DOM API's
+    // normative validation rule.
+    const VALID_ELEMENT_LOCAL_NAME = /^(?:[A-Za-z][^\0\t\n\f\r\u0020\/>]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9\-\.:_\u0080-\u{10FFFF}]*)$/u;
+    function validNamespacePrefix(value) {
+        return value.length > 0 && !/[\0\t\n\f\r\u0020\/>]/.test(value);
+    }
+    function validateAndExtractElementName(namespace, qualifiedName) {
+        if (namespace === "") namespace = null;
+        let prefix = null;
+        let localName = qualifiedName;
+        const colon = qualifiedName.indexOf(":");
+        if (colon !== -1) {
+            prefix = qualifiedName.slice(0, colon);
+            localName = qualifiedName.slice(colon + 1);
+            if (!validNamespacePrefix(prefix)) {
+                throw new DOMException("The qualified name has an invalid namespace prefix.", "InvalidCharacterError");
+            }
+        }
+        if (!VALID_ELEMENT_LOCAL_NAME.test(localName)) {
+            throw new DOMException("The qualified name has an invalid element local name.", "InvalidCharacterError");
+        }
+        if (prefix !== null && namespace === null) {
+            throw new DOMException("A namespace prefix requires a namespace.", "NamespaceError");
+        }
+        if (prefix === "xml" && namespace !== XML_NS) {
+            throw new DOMException("The xml prefix requires the XML namespace.", "NamespaceError");
+        }
+        if ((qualifiedName === "xmlns" || prefix === "xmlns") && namespace !== XMLNS_NS) {
+            throw new DOMException("The xmlns name requires the XMLNS namespace.", "NamespaceError");
+        }
+        if (namespace === XMLNS_NS && qualifiedName !== "xmlns" && prefix !== "xmlns") {
+            throw new DOMException("The XMLNS namespace requires the xmlns name or prefix.", "NamespaceError");
+        }
+        return [namespace, prefix, localName];
+    }
+    function asciiLower(value) {
+        return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
     }
 
     class Document extends Node {
@@ -4018,7 +5087,7 @@
         // HTML §2.4.3: the document base URL is used by relative URL APIs,
         // including new URL("_framework/dotnet.js", document.baseURI).
         // document.URL is the document URL and may differ when <base> exists.
-        get baseURI() { return baseHref(); }
+        get baseURI() { return nodeBaseHref(this); }
         // The document's origin domain. Spec returns the origin's effective
         // domain (the host); a terminal browser has no frames, so the host IS
         // the domain. The setter is the legacy same-origin relaxation — store
@@ -4089,6 +5158,7 @@
             if (oldId === -4) throw new DOMException("The node is a document", "NotSupportedError");
             if (oldId === -5) throw new DOMException("The node is a shadow root", "HierarchyRequestError");
             if (oldId < 0) throw new TypeError("The node is not valid");
+            syncWrapperSubtreeRetention(node.__id);
             const oldDocument = wrap(oldId);
             if (oldDocument !== this) ceAdopt(node, oldDocument, this);
             return node;
@@ -4110,19 +5180,42 @@
             return new StyleSheetList(this.querySelectorAll("style").map((s) => s.sheet));
         }
         createElement(t) {
-            const el = wrap(__dom_create_element(String(t)));
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
+            const localName = asciiLower(String(t));
+            if (!VALID_ELEMENT_LOCAL_NAME.test(localName)) {
+                throw new DOMException("The tag name is not a valid element local name.", "InvalidCharacterError");
+            }
+            const el = newElementWrapper(
+                __dom_create_element(localName), localName, HTML_NS, null
+            );
             // HTML's script-element creation steps give dynamically created
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
             // this marker and therefore default to false.
             if (el.localName === "script") el.__trustForceAsync = true;
-            const ctor = CE.defs.get(String(t).toLowerCase());
+            const ctor = CE.defs.get(localName);
             if (ctor) upgradeElement(el, ctor);
             return el;
         }
         get adoptedStyleSheets() { return this.__adopted || (this.__adopted = []); }
         set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
-        createElementNS(_, t) { return this.createElement(t); }
+        createElementNS(namespace, qualifiedName) {
+            if (arguments.length < 2) throw new TypeError("Failed to execute 'createElementNS': 2 arguments required");
+            namespace = namespace === null || namespace === undefined ? null : String(namespace);
+            qualifiedName = String(qualifiedName);
+            const extracted = validateAndExtractElementName(namespace, qualifiedName);
+            const localName = extracted[2];
+            const el = newElementWrapper(
+                __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName),
+                localName, extracted[0], extracted[1]
+            );
+            if (extracted[0] === HTML_NS && localName === "script") el.__trustForceAsync = true;
+            if (extracted[0] === HTML_NS) {
+                const ctor = CE.defs.get(localName);
+                if (ctor) upgradeElement(el, ctor);
+            }
+            return el;
+        }
         createTextNode(s) { return wrap(__dom_create_text(s === undefined ? "" : String(s))); }
         createComment(s) { return wrap(__dom_create_comment(s === undefined ? "" : String(s))); }
         // A detached Attr (DOM §4.9.2): a plain object matching what the
@@ -4151,7 +5244,8 @@
             else if (options && typeof options === "object") {
                 subtree = !options.selfOnly;
                 const registry = options.customElementRegistry;
-                if (registry !== undefined && registry !== null && registry !== customElements)
+                if (registry !== undefined && registry !== null &&
+                    registry !== currentCustomElementRegistry())
                     throw new DOMException("Unsupported custom element registry", "NotSupportedError");
             }
             const clone = n.cloneNode(subtree);
@@ -4166,11 +5260,11 @@
         // from Node; keep its own implementation now that CharacterData no
         // longer exposes selector methods.
         querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
-        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
-        createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
+        createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
         createRange() { return new Range(); }
         getElementById(i) {
@@ -4188,23 +5282,10 @@
             const esc = String(n).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
             return this.querySelectorAll('[name="' + esc + '"]');
         }
-        // `document.elementFromPoint(x, y)` (CSSOM View): the topmost element at
-        // the viewport coordinate, or null when the point is outside the
-        // viewport. A terminal browser does no JS-side pixel hit-testing, so we
-        // can't resolve WHICH element sits under the point — but the method must
-        // EXIST (Microsoft Clarity and other analytics/heatmap/tooltip libraries
-        // call it during boot; missing it is a "not a function" TypeError that
-        // aborts their init). Honest deviation, consistent with our other
-        // geometry shims (getBoundingClientRect returns the viewport box, not 0):
-        // an in-viewport point answers with the body (the element that fills the
-        // viewport in a normal document) rather than null, so callers that gate
-        // on a returned element proceed instead of treating the page as empty.
-        elementFromPoint(x, y) {
-            x = +x; y = +y;
-            if (!(x >= 0 && y >= 0 && x < g.innerWidth && y < g.innerHeight)) return null;
-            return this.body || this.documentElement || null;
-        }
-        elementsFromPoint(x, y) { const el = this.elementFromPoint(x, y); return el ? [el] : []; }
+        // CSSOM View §5: force canonical layout and select boxes in topmost-first
+        // paint order, after transforms, clips, scrolling, and pointer-events.
+        elementFromPoint(x, y) { return documentElementFromPoint(this, x, y, arguments.length); }
+        elementsFromPoint(x, y) { return documentElementsFromPoint(this, x, y, arguments.length); }
         createEvent(type) { const C = EVENT_INTERFACES[String(type)] || Event; return new C(""); }
         hasFocus() { return true; }
         // A TRust document is always a visible, focused, non-prerendering
@@ -4236,6 +5317,10 @@
     class FrameDocument {
         constructor(frameEl) {
             this.__frame = frameEl;
+            // Nested documents share the native arena, so the iframe element
+            // is their subtree root for host scans (custom-element upgrade,
+            // wrapper retention, and similar document-scoped algorithms).
+            this.__id = frameEl.__id;
             this.nodeType = 9;
         }
         // The content navigable's document element, found live in the arena.
@@ -4244,7 +5329,11 @@
         // first access so `document.write` has a <body> to write into. (Found,
         // not cached, so it stays correct after a (re)navigation replaces it.)
         get documentElement() {
-            const kids = this.__frame.childNodes;
+            // The iframe Element belongs to the parent Realm. Calling its
+            // `childNodes` getter would therefore manufacture every nested
+            // node wrapper with the parent's interface prototypes. Resolve
+            // native ids here and wrap them in this Document's Realm instead.
+            const kids = __dom_children(this.__frame.__id).map(wrap);
             for (let i = 0; i < kids.length; i++) {
                 const c = kids[i];
                 if (c.nodeType === 1 && c.localName === "html") return c;
@@ -4259,7 +5348,7 @@
         get head() { return this.documentElement.querySelector("head") || this.documentElement; }
         get body() { return this.documentElement.querySelector("body") || this.documentElement; }
         get defaultView() { return trust.__activeFrame === this.__frame ? g : this.__frame.contentWindow; }
-        get readyState() { return "complete"; }
+        get readyState() { return this.__frame.__trustReadyState || "complete"; }
         get cookie() { return ""; }
         set cookie(_v) {}
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
@@ -4286,20 +5375,38 @@
         // first `document.createElement()` (reCAPTCHA creates its checkbox
         // subtree this way).
         createElement(t) { return wrap(0).createElement(t); }
-        createElementNS(_n, t) { return wrap(0).createElement(t); }
+        createElementNS(namespace, qualifiedName) {
+            return Document.prototype.createElementNS.call(this, namespace, qualifiedName);
+        }
         createTextNode(s) { return wrap(0).createTextNode(s); }
         createComment(s) { return wrap(0).createComment(s); }
         createAttribute(n) { return wrap(0).createAttribute(n); }
         createAttributeNS(ns, n) { return wrap(0).createAttributeNS(ns, n); }
         createDocumentFragment() { return wrap(0).createDocumentFragment(); }
+        // DOM §4.5: clone into this Document, preserving the requested
+        // subtree and applying this realm's fallback custom-element registry.
+        // The native arena is shared, but the Document operation and reaction
+        // boundary are identical to the top-level implementation.
+        importNode(node, options) { return Document.prototype.importNode.call(this, node, options); }
         createEvent(t) { return wrap(0).createEvent(t); }
         createRange() { return new Range(); }
+        // DOM §4.5: traversal objects are created by every Document, not only
+        // the top-level one. The traverser's root can be any node in this
+        // nested document; its whatToShow/filter state is retained verbatim.
+        createTreeWalker(root, whatToShow, filter) {
+            return new TreeWalker(root, whatToShow, filter);
+        }
+        createNodeIterator(root, whatToShow, filter) {
+            return new NodeIterator(root, whatToShow, filter);
+        }
         getElementById(i) { return this.documentElement.querySelector('[id="' + String(i).replace(/"/g, '\\"') + '"]'); }
         getElementsByTagName(t) { return this.documentElement.getElementsByTagName(t); }
         getElementsByClassName(c) { return this.documentElement.querySelectorAll("." + String(c)); }
         getElementsByName(n) { return this.documentElement.querySelectorAll('[name="' + String(n).replace(/"/g, '\\"') + '"]'); }
         querySelector(s) { return this.documentElement.querySelector(s); }
         querySelectorAll(s) { return this.documentElement.querySelectorAll(s); }
+        elementFromPoint(x, y) { return documentElementFromPoint(this, x, y, arguments.length); }
+        elementsFromPoint(x, y) { return documentElementsFromPoint(this, x, y, arguments.length); }
         addEventListener(type, fn, options) { addL(this, type, fn, options); }
         removeEventListener(type, fn, options) { removeL(this, type, fn, options); }
         dispatchEvent(ev) {
@@ -4307,6 +5414,44 @@
             return dispatch(this, ev, false);
         }
         hasFocus() { return true; }
+    }
+    function frameDocument(frame) {
+        return frame.__contentDoc || (frame.__contentDoc = new FrameDocument(frame));
+    }
+
+    // CSSOM View §5 `elementFromPoint()` / `elementsFromPoint()`. The native
+    // layout boundary returns arena ids for hit-testable boxes in paint order;
+    // this WebIDL-facing layer owns conversion, viewport checks, stable wrappers,
+    // nested-Document scoping, and the mandatory root-element fallback.
+    function documentElementsFromPoint(doc, x, y, argumentCount) {
+        if (argumentCount < 2) throw new TypeError("2 arguments required");
+        x = Number(x); y = Number(y);
+        if (!Number.isFinite(x) || !Number.isFinite(y))
+            throw new TypeError("coordinates must be finite doubles");
+
+        const frame = doc && doc.__frame || null;
+        // DOMParser-created/detached Documents have no associated viewport.
+        if (!frame && doc.__id !== 0) return [];
+        const width = frame ? frameViewportDimension(frame, "width") : +g.innerWidth;
+        const height = frame ? frameViewportDimension(frame, "height") : +g.innerHeight;
+        if (x < 0 || y < 0 || x > width || y > height) return [];
+
+        const ids = __dom_elements_from_point(
+            frame ? frame.__id : 0, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+        );
+        const result = [];
+        for (const id of ids || []) {
+            const element = wrap(id);
+            if (element && element.nodeType === 1 && result.indexOf(element) < 0)
+                result.push(element);
+        }
+        const root = doc.documentElement;
+        if (root && result[result.length - 1] !== root) result.push(root);
+        return result;
+    }
+    function documentElementFromPoint(doc, x, y, argumentCount) {
+        const elements = documentElementsFromPoint(doc, x, y, argumentCount);
+        return elements.length ? elements[0] : null;
     }
 
     // A nested document has its own browsing-context global in HTML, and a
@@ -4318,8 +5463,10 @@
     let topFrameState = null;
     function frameOwnerForNode(node) {
         let n = node;
-        while (n && n.parentNode) {
-            const p = n.parentNode;
+        while (n) {
+            const p = n.parentNode || n.__host;
+            if (!p) break;
+            if (realmRootFrame && p.__id === realmRootFrame.__id) return realmRootFrame;
             if (p.localName === "iframe" || p.localName === "frame") return p;
             n = p;
         }
@@ -4365,25 +5512,38 @@
     function frameURLFor(frame) {
         return frame && frame.__frameUrl ? String(frame.__frameUrl) : "about:blank";
     }
+    // HTML §2.4.3 document base URLs and DOM §4.4 Node.baseURI. Nested
+    // documents share TRust's presentation arena, so select <base href> by
+    // node-Document ownership rather than by whichever Window happens to be
+    // active. `locState` remains the top Document URL while scoped child
+    // execution temporarily replaces the global Location object.
+    function documentBaseURL(frame) {
+        const owner = frame || null;
+        const documentURL = owner ? frameURLFor(owner) : locState.href;
+        const doc = owner ? frameDocument(owner) : wrap(0);
+        let bases = [];
+        try { bases = doc.querySelectorAll("base[href]"); } catch (e) {}
+        for (let i = 0; i < bases.length; i++) {
+            if ((frameOwnerForNode(bases[i]) || null) !== owner) continue;
+            const parsed = __url_parse(bases[i].getAttribute("href") || "", documentURL);
+            if (parsed) return parsed[0];
+            break;
+        }
+        return documentURL;
+    }
+    function nodeBaseHref(node) {
+        const owner = frameOwnerForNode(node);
+        return (owner || null) === (trust.__activeFrame || null)
+            ? baseHref() : documentBaseURL(owner);
+    }
     function frameBaseURL(frame) {
-        const parentURL = frameURLFor(frame);
-        let base = parentURL;
-        try {
-            const b = new FrameDocument(frame).querySelector("base[href]");
-            if (b) {
-                const p = __url_parse(b.getAttribute("href") || "", parentURL);
-                if (p) base = p[0];
-            }
-        } catch (e) {}
-        return base;
+        return documentBaseURL(frame);
     }
     function frameResourceURL(node) {
         if (!node) return "";
         const raw = node.getAttribute("src") || node.getAttribute("href") || "";
         if (!String(raw).trim()) return "";
-        const owner = frameOwnerForNode(node);
-        const base = owner ? frameBaseURL(owner) : baseHref();
-        const p = __url_parse(raw, base);
+        const p = __url_parse(raw, nodeBaseHref(node));
         return p ? p[0] : raw;
     }
     trust.resourceURL = function (nodeId) { return frameResourceURL(wrap(nodeId)); };
@@ -4404,8 +5564,7 @@
         // resolves to the document's current base URL.
         if (raw === null) return null;
         const subject = frameOwnerForNode(anchor);
-        const base = subject ? frameBaseURL(subject) : baseHref();
-        const parsed = __url_parse(String(raw), base);
+        const parsed = __url_parse(String(raw), nodeBaseHref(anchor));
         if (!parsed) return null;
         const url = String(parsed[0] || "");
         if (!url || /^javascript:/i.test(url)) return null;
@@ -4482,6 +5641,106 @@
         const parent = __url_parse(href, href);
         return !!(child && parent && child[8] === parent[8]);
     }
+    // A Window owns its AnimationFrameProvider methods. Until Lumen-backed
+    // nested navigables receive independent engine globals, preserve these
+    // writable Window properties at the same scoped-Window boundary used for
+    // document/location. In particular, monkey-patching requestAnimationFrame
+    // in a child Window must neither replace the parent's method nor disappear
+    // before child code is called again through its WindowProxy.
+    let pristineAnimationFrameMethods = null;
+    let topAnimationFrameMethods = null;
+    // Ordinary cross-document navigation creates a new Realm and Window
+    // (HTML §7.5.1). TRust shares one engine realm between compact nested
+    // documents, so preserve the writable Window-level platform bindings that
+    // frameworks patch in practice. This is intentionally a descriptor bank,
+    // not a wrapper layer: calls within one Window still hit its values
+    // directly, and switching cost is paid only at a Window boundary.
+    const SCOPED_WINDOW_GLOBALS = [
+        "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+        "queueMicrotask", "Promise", "fetch", "XMLHttpRequest",
+        "MutationObserver", "WebKitMutationObserver",
+        "IntersectionObserver", "ResizeObserver", "PerformanceObserver",
+        "FileReader",
+    ];
+    let pristineWindowGlobalDescriptors = null;
+    let pristineWindowOwnKeys = null;
+    function captureAuthorWindowGlobals() {
+        const descriptors = new Map();
+        if (!pristineWindowOwnKeys) return descriptors;
+        for (const key of Reflect.ownKeys(g)) {
+            if (!pristineWindowOwnKeys.has(key))
+                descriptors.set(key, Object.getOwnPropertyDescriptor(g, key));
+        }
+        return descriptors;
+    }
+    function captureScopedWindowGlobals() {
+        const descriptors = Object.create(null);
+        for (const name of SCOPED_WINDOW_GLOBALS) {
+            descriptors[name] = Object.getOwnPropertyDescriptor(g, name) || null;
+        }
+        return descriptors;
+    }
+    function initializeScopedWindowGlobals() {
+        pristineWindowGlobalDescriptors = captureScopedWindowGlobals();
+        pristineWindowOwnKeys = new Set(Reflect.ownKeys(g));
+        topWindowState.scopedGlobalDescriptors = captureScopedWindowGlobals();
+        topWindowState.authorGlobalDescriptors = captureAuthorWindowGlobals();
+    }
+    function saveScopedWindowGlobals(windowState) {
+        if (pristineWindowGlobalDescriptors) {
+            windowState.scopedGlobalDescriptors = captureScopedWindowGlobals();
+            windowState.authorGlobalDescriptors = captureAuthorWindowGlobals();
+        }
+    }
+    function restoreScopedWindowGlobals(windowState) {
+        if (!pristineWindowGlobalDescriptors) return;
+        // Ordinary properties created by author code belong to one Window's
+        // global object. TRust currently multiplexes compact iframe Windows
+        // through one engine global, so remove the previous Window's expandos
+        // and install the target Window's descriptors at the same boundary as
+        // its GlobalEnvironment and writable platform bindings. HTML §7.5.1
+        // otherwise-observable Realm identity is preserved without scanning
+        // the global on ordinary property access.
+        for (const key of Reflect.ownKeys(g)) {
+            if (!pristineWindowOwnKeys.has(key)) {
+                try { delete g[key]; } catch (e) {}
+            }
+        }
+        const authorDescriptors = windowState.authorGlobalDescriptors;
+        if (authorDescriptors) {
+            for (const [key, descriptor] of authorDescriptors) {
+                try { Object.defineProperty(g, key, descriptor); } catch (e) {}
+            }
+        }
+        const descriptors = windowState.scopedGlobalDescriptors ||
+            pristineWindowGlobalDescriptors;
+        for (const name of SCOPED_WINDOW_GLOBALS) {
+            const descriptor = descriptors[name];
+            try {
+                if (descriptor) Object.defineProperty(g, name, descriptor);
+                else delete g[name];
+            } catch (e) {}
+        }
+    }
+    function animationFrameMethods() {
+        return {
+            request: g.requestAnimationFrame,
+            cancel: g.cancelAnimationFrame,
+        };
+    }
+    function saveAnimationFrameMethods(frame) {
+        const methods = animationFrameMethods();
+        if (frame) frame.__trustAnimationFrameMethods = methods;
+        else topAnimationFrameMethods = methods;
+    }
+    function restoreAnimationFrameMethods(frame) {
+        const methods = frame
+            ? (frame.__trustAnimationFrameMethods || pristineAnimationFrameMethods)
+            : topAnimationFrameMethods;
+        if (!methods) return;
+        g.requestAnimationFrame = methods.request;
+        g.cancelAnimationFrame = methods.cancel;
+    }
     // A WindowProxy's target is fixed by the browsing context it represents.
     // The same Boa object is used for every scoped Window, so these facades
     // preserve the important distinction for nested frames: `parent` targets
@@ -4501,7 +5760,7 @@
         // Same-origin child code may read the parent's document. The
         // cross-origin case deliberately omits it, matching WindowProxy's
         // restricted property surface.
-        if (sameOrigin) parent.document = targetFrame ? new FrameDocument(targetFrame) :
+        if (sameOrigin) parent.document = targetFrame ? frameDocument(targetFrame) :
             (topFrameState && topFrameState.document) || wrap(0);
         const nextParent = targetFrame && frameParentFrame(targetFrame);
         parent.parent = nextParent
@@ -4579,13 +5838,34 @@
         g.scrollX = state.scrollX; g.scrollY = state.scrollY;
         baseHrefCache = state.base;
     }
+    // Each Lumen-backed nested Window owns this entire platform Realm. Internal
+    // task records use null for "the Realm's Window" in a few generic paths,
+    // while DOM-owned callbacks retain `realmRootFrame`. They are the same
+    // Window/GlobalEnvironment (HTML §7.3.2.1; ECMA-262 §9.3), not two logical
+    // Windows to multiplex through one global. Normalize that sentinel before
+    // deciding whether a legacy scoped-Window switch is necessary.
+    function localFrame(frame) {
+        return frame || realmRootFrame || null;
+    }
     function enterFrame(frame) {
-        const token = { state: captureFrameState(), active: trust.__activeFrame || null };
+        frame = localFrame(frame);
+        const token = {
+            state: captureFrameState(),
+            active: trust.__activeFrame || null,
+            customElementState: CE,
+            switchedWindow: trust.__activeFrame !== frame,
+        };
+        saveAnimationFrameMethods(token.active);
         if (trust.__activeFrame === frame) return token;
+        saveScopedWindowGlobals(activeWindowState());
         if (!frame) {
             if (!topFrameState) topFrameState = token.state;
             restoreFrameState(topFrameState);
+            restoreAnimationFrameMethods(null);
             trust.__activeFrame = null;
+            CE = customElementStateForWindow(topWindowState);
+            restoreScopedWindowGlobals(topWindowState);
+            __dom_set_job_context(topWindowState.hostSettingsContext);
             return token;
         }
         if (!topFrameState && !trust.__activeFrame) topFrameState = token.state;
@@ -4604,7 +5884,7 @@
             get() { return frameLocation; },
             set(v) { frameLocation.assign(v); },
         });
-        g.document = new FrameDocument(frame);
+        g.document = frameDocument(frame);
         const topWindow = frame.__trustTopWindow || makeParentWindow(topLocation, frame,
             frameSameOriginWithParent(frame, topLocation), null, null);
         const parent = parentFrame
@@ -4616,20 +5896,36 @@
         frameElementState = frame; g.name = frame.getAttribute("name") || "";
         if (g.__trust_cfg) g.__trust_cfg.url = url;
         g.innerWidth = frameWidth; g.innerHeight = frameHeight;
+        restoreAnimationFrameMethods(frame);
         baseHrefCache = null;
         trust.__activeFrame = frame;
+        const windowState = windowStateForFrame(frame);
+        CE = customElementStateForWindow(windowState);
+        restoreScopedWindowGlobals(windowState);
+        __dom_set_job_context(windowState.hostSettingsContext);
         return token;
     }
     function leaveFrame(token) {
         if (!token) return;
+        saveAnimationFrameMethods(trust.__activeFrame || null);
+        if (token.switchedWindow) saveScopedWindowGlobals(activeWindowState());
         restoreFrameState(token.state);
         trust.__activeFrame = token.active;
+        CE = token.customElementState;
+        if (token.switchedWindow) restoreScopedWindowGlobals(activeWindowState());
+        restoreAnimationFrameMethods(token.active);
+        __dom_set_job_context(activeWindowState().hostSettingsContext);
     }
     function runInFrame(frame, fn) {
-        const token = enterFrame(frame || null);
+        frame = localFrame(frame);
+        // Besides avoiding needless state copies, this is the common real-Realm
+        // path: event, timer, and rendering callbacks already execute with the
+        // correct Window global and environment-settings object active.
+        if (trust.__activeFrame === frame) return fn();
+        const token = enterFrame(frame);
         try { return fn(); } finally { leaveFrame(token); }
     }
-    trust.__activeFrame = null;
+    trust.__activeFrame = realmRootFrame;
     trust.bindFrameForNode = function (nodeId) {
         const node = wrap(nodeId);
         const frame = frameOwnerForNode(node);
@@ -4641,17 +5937,59 @@
         if (!frame) return;
         (trust.__frameBindings || (trust.__frameBindings = [])).push(enterFrame(frame));
     };
+    trust.bindWindowSettings = function (contextId) {
+        const id = Number(contextId);
+        const frame = id > 0 ? (windowSettingsFrames.get(id) || null) : null;
+        (trust.__frameBindings || (trust.__frameBindings = [])).push(enterFrame(frame));
+    };
     trust.restoreFrame = function () {
         const stack = trust.__frameBindings;
         if (stack && stack.length) leaveFrame(stack.pop());
     };
 
-    function loadFrameStyles(frame) {
+    function waitForFrameResource(node, start, done) {
+        if (node.__trustResourceSettled) { done(); return; }
+        let finished = false;
+        function finish() {
+            if (finished) return;
+            finished = true;
+            removeL(node, "load", finish, false);
+            removeL(node, "error", finish, false);
+            done();
+        }
+        addL(node, "load", finish, { once: true });
+        addL(node, "error", finish, { once: true });
+        start();
+        // Host failures can dispatch synchronously when no resource task can
+        // be queued. Do not strand the document lifecycle in that case.
+        if (node.__trustResourceSettled) finish();
+    }
+    function loadFrameStyles(frame, done) {
+        done = typeof done === "function" ? done : function () {};
         runInFrame(frame, function () {
             let links;
-            try { links = new FrameDocument(frame).querySelectorAll("link"); } catch (e) { return; }
+            try { links = frameDocument(frame).querySelectorAll("link"); }
+            catch (e) { done(); return; }
+            const sheets = [];
             for (const link of links) {
-                try { maybeLoadStylesheet(link); } catch (e) {}
+                try {
+                    const rel = (link.rel || link.getAttribute("rel") || "").toLowerCase();
+                    if (frameOwnerForNode(link) === frame &&
+                        rel.split(/\s+/).indexOf("stylesheet") >= 0 &&
+                        (link.href || link.getAttribute("href"))) sheets.push(link);
+                } catch (e) {}
+            }
+            if (!sheets.length) { done(); return; }
+            let pending = sheets.length;
+            function settled() {
+                pending--;
+                if (pending === 0) done();
+            }
+            for (const link of sheets) {
+                waitForFrameResource(link, function () {
+                    try { maybeLoadStylesheet(link); }
+                    catch (e) { link.__trustResourceSettled = "error"; }
+                }, settled);
             }
         });
     }
@@ -4673,13 +6011,22 @@
         if (!nosniff) return true;
         return /^(application|text)\/(java|ecma)script(?:$|;)/i.test(String(response[1] || "").trim());
     }
-    function runFrameScripts(frame) {
+    function runFrameScripts(frame, parserDone, allDone) {
+        parserDone = typeof parserDone === "function" ? parserDone : function () {};
+        allDone = typeof allDone === "function" ? allDone : function () {};
         runInFrame(frame, function () {
             let scripts;
-            try { scripts = new FrameDocument(frame).querySelectorAll("script"); } catch (e) { return; }
+            try { scripts = frameDocument(frame).querySelectorAll("script"); }
+            catch (e) { parserDone(); allDone(); return; }
+            const orderedModules = [];
+            const asyncModules = [];
             for (const script of scripts) {
                 if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id)) continue;
                 const ty = (script.getAttribute("type") || "").trim().toLowerCase();
+                if (ty === "module") {
+                    (script.hasAttribute("async") ? asyncModules : orderedModules).push(script);
+                    continue;
+                }
                 if (ty && ty !== "text/javascript" && ty !== "application/javascript" &&
                     ty !== "text/ecmascript") continue;
                 if (script.hasAttribute("nomodule")) continue;
@@ -4687,28 +6034,64 @@
                 let source = script.textContent || "";
                 const src = script.getAttribute("src");
                 try {
+                    let name = g.location.href;
                     if (src) {
                         const url = frameResourceURL(script);
+                        name = url;
                         const response = __http_fetch(url, "GET", null, null, null);
                         if (!frameClassicScriptResponseOK(response)) {
-                            trust.errors.push("frame script " + url + ": network error");
+                            trust.scriptEvent(script.__id, "error");
                             continue;
                         }
                         source = response[2] || "";
                     }
-                    const old = trust.currentScript;
-                    trust.currentScript = script.__id;
-                    try { (0, eval)(source); }
-                    catch (e) { trust.errors.push("frame script: " + ((e && e.message) || e)); }
-                    trust.currentScript = old;
+                    // HTML "run a classic script" creates and evaluates a
+                    // Script Record. Indirect eval is observably different:
+                    // its `let`/`const` declarations live in a temporary eval
+                    // environment rather than the Realm [[GlobalEnv]], so an
+                    // earlier script's closure cannot resolve them. Enter the
+                    // engine's synchronous ScriptEvaluation boundary instead.
+                    __dom_run_classic_script(script.__id, source, name);
+                    if (src) trust.scriptEvent(script.__id, "load");
                 } catch (e) {
                     trust.errors.push("frame script: " + ((e && e.message) || e));
+                    if (src) trust.scriptEvent(script.__id, "error");
                 }
             }
-            // The parser-created document reaches interactive after its parser
-            // scripts. Fire the child document event before the parent iframe's
-            // load task, matching HTML's nested-document lifecycle ordering.
-            try { dispatch(g.document, new Event("DOMContentLoaded"), false); } catch (e) {}
+
+            // Parser-created modules fetch in parallel when `async`; modules
+            // without it execute in tree order after parsing. Lumen's injected
+            // module completion event follows the evaluation promise, so it is
+            // also the load-delay boundary (including top-level await).
+            let remaining = orderedModules.length + asyncModules.length;
+            let parserFinished = false;
+            function finishParser() {
+                if (parserFinished) return;
+                parserFinished = true;
+                parserDone();
+            }
+            function finishOne() {
+                remaining--;
+                if (remaining === 0) allDone();
+            }
+            function startModule(script, settled) {
+                SCRIPTS_STARTED.add(script.__id);
+                waitForFrameResource(script, function () {
+                    __dom_run_injected_script(script.__id);
+                }, function () {
+                    settled();
+                    finishOne();
+                });
+            }
+            for (const script of asyncModules) startModule(script, function () {});
+            function startOrdered(index) {
+                if (index >= orderedModules.length) { finishParser(); return; }
+                // HTML §4.12.1.1's `already started` flag permits exactly
+                // one preparation/start for this parser-created script.
+                startModule(orderedModules[index], function () { startOrdered(index + 1); });
+            }
+            startOrdered(0);
+            if (remaining === 0) allDone();
         });
     }
 
@@ -4717,7 +6100,7 @@
         get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "DocumentFragment"; }
         querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
-        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
     }
@@ -4846,15 +6229,26 @@
     // a sanitizer that removes the current node detaches it, so iteration
     // would stop at that subtree; benign for the content we run it on.
     class NodeIterator {
-        constructor(root, whatToShow) {
+        constructor(root, whatToShow, filter) {
             this.root = root;
             this.referenceNode = root;
             this.pointerBeforeReferenceNode = true;
             this.whatToShow = (whatToShow === undefined ? 0xFFFFFFFF : whatToShow) >>> 0;
+            this.filter = filter || null;
+            this.__active = false;
         }
-        __shows(n) {
+        __filter(n) {
             const bit = n.nodeType === 1 ? 1 : n.nodeType === 3 ? 4 : n.nodeType === 8 ? 128 : 0;
-            return (this.whatToShow & bit) !== 0;
+            if ((this.whatToShow & bit) === 0) return 3;
+            if (this.filter === null) return 1;
+            if (this.__active) throw new DOMException("The traversal filter is active", "InvalidStateError");
+            this.__active = true;
+            try {
+                return typeof this.filter === "function"
+                    ? this.filter(n) : this.filter.acceptNode(n);
+            } finally {
+                this.__active = false;
+            }
         }
         // The document-order successor of `n` within `root`.
         __after(n) {
@@ -4877,14 +6271,38 @@
                     if (!nx) return null;
                     node = nx;
                 }
-                if (this.__shows(node)) {
+                // NodeIterator treats FILTER_REJECT like FILTER_SKIP: unlike a
+                // TreeWalker it never prunes a rejected node's descendants.
+                if (this.__filter(node) === 1) {
                     this.referenceNode = node;
                     this.pointerBeforeReferenceNode = false;
                     return node;
                 }
             }
         }
-        previousNode() { return null; }
+        __before(n) {
+            if (n === this.root) return null;
+            let previous = n.previousSibling;
+            if (!previous) return n.parentNode;
+            while (previous.lastChild) previous = previous.lastChild;
+            return previous;
+        }
+        previousNode() {
+            let node = this.referenceNode;
+            let before = this.pointerBeforeReferenceNode;
+            for (;;) {
+                if (!before) before = true;
+                else {
+                    node = this.__before(node);
+                    if (!node) return null;
+                }
+                if (this.__filter(node) === 1) {
+                    this.referenceNode = node;
+                    this.pointerBeforeReferenceNode = true;
+                    return node;
+                }
+            }
+        }
         detach() {}
     }
     // DOMParser: parse a markup string into a detached document. `text/html`
@@ -4929,7 +6347,11 @@
         get activeElement() { return activeElementFor(this); }
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
+            const removedRoots = __dom_children(this.__id);
+            const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
+            if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
             __dom_set_inner_html(this.__id, String(v));
+            syncKnownWrapperRetention(removedWrapperIds, false);
             if (CE.defs.size) ceScan(this);
             slotQueueCheck(this);
         }
@@ -4937,7 +6359,7 @@
         set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
         getElementById(i) { const r = this.querySelectorAll("[id]"); for (const e of r) if (e.id === String(i)) return e; return null; }
         querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
-        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
         getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
     }
@@ -5098,34 +6520,97 @@
             catch (e) { trust.errors.push("attributeChangedCallback: " + ((e && e.message) || e)); }
         }
     }
-    const customElements = {
+    const RESERVED_CUSTOM_ELEMENT_NAMES = new Set([
+        "annotation-xml", "color-profile", "font-face", "font-face-src",
+        "font-face-uri", "font-face-format", "font-face-name", "missing-glyph",
+    ]);
+    // HTML's valid-custom-element-name grammar (PCENChar). Keep this check at
+    // the registry boundary: names are DOMStrings, not ASCII-lowercased before
+    // validation, so an uppercase name is a SyntaxError rather than an alias.
+    const VALID_CUSTOM_ELEMENT_NAME = /^[a-z](?:[-.0-9_a-z\u00b7\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u037d\u037f-\u1fff\u200c-\u200d\u203f-\u2040\u2070-\u218f\u2c00-\u2fef\u3001-\ud7ff\uf900-\ufdcf\ufdf0-\ufffd]|[\u{10000}-\u{effff}])*-[-.0-9_a-z\u00b7\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u037d\u037f-\u1fff\u200c-\u200d\u203f-\u2040\u2070-\u218f\u2c00-\u2fef\u3001-\ud7ff\uf900-\ufdcf\ufdf0-\ufffd\u{10000}-\u{effff}]*$/u;
+    function isValidCustomElementName(name) {
+        return VALID_CUSTOM_ELEMENT_NAME.test(name) &&
+            !RESERVED_CUSTOM_ELEMENT_NAMES.has(name);
+    }
+    class CustomElementRegistry {
+        constructor(state, windowState, frame) {
+            // The public constructor creates an initially-empty scoped
+            // registry. Window-associated registries pass their state through
+            // the internal three-argument path below.
+            this.__state = state || createCustomElementState();
+            this.__windowState = windowState || null;
+            this.__frame = frame || null;
+        }
+        __isCurrentWindowRegistry() {
+            if (!this.__windowState) return false;
+            const current = this.__frame
+                ? frameWindowStates.get(this.__frame)
+                : topWindowState;
+            return current === this.__windowState;
+        }
+        __withAssociatedDocument(callback) {
+            if (!this.__isCurrentWindowRegistry()) return;
+            runInFrame(this.__frame, callback);
+        }
         define(name, ctor) {
-            name = String(name).toLowerCase();
-            if (CE.defs.has(name)) return;
+            name = String(name);
+            if (typeof ctor !== "function")
+                throw new TypeError("Custom element constructor must be a constructor");
+            if (!isValidCustomElementName(name))
+                throw new DOMException("Invalid custom element name", "SyntaxError");
+            const state = this.__state;
+            if (state.defs.has(name) || state.tags.has(ctor))
+                throw new DOMException("Custom element already defined", "NotSupportedError");
             // The registration-time observedAttributes read (see above).
             try { void (ctor.observedAttributes || []); } catch (e) { /* page's problem */ }
-            CE.defs.set(name, ctor);
-            CE.tags.set(ctor, name);
-            ceUpgradeName(name, ctor);
-            Promise.resolve().then(() => ceConnectName(name));
-            const w = CE.waiting.get(name);
-            if (w) { CE.waiting.delete(name); w.resolve(ctor); }
-        },
-        get(name) { return CE.defs.get(String(name).toLowerCase()); },
-        getName(ctor) { return CE.tags.get(ctor) || null; },
+            state.defs.set(name, ctor);
+            state.tags.set(ctor, name);
+            this.__withAssociatedDocument(() => {
+                ceUpgradeName(name, ctor);
+                Promise.resolve().then(() => ceConnectName(name));
+            });
+            const w = state.waiting.get(name);
+            if (w) { state.waiting.delete(name); w.resolve(ctor); }
+        }
+        get(name) { return this.__state.defs.get(String(name)); }
+        getName(ctor) { return this.__state.tags.get(ctor) || null; }
         whenDefined(name) {
-            name = String(name).toLowerCase();
-            if (CE.defs.has(name)) return Promise.resolve(CE.defs.get(name));
-            let w = CE.waiting.get(name);
+            name = String(name);
+            if (!isValidCustomElementName(name))
+                return Promise.reject(new DOMException("Invalid custom element name", "SyntaxError"));
+            const state = this.__state;
+            if (state.defs.has(name)) return Promise.resolve(state.defs.get(name));
+            let w = state.waiting.get(name);
             if (!w) {
                 w = {};
                 w.promise = new Promise((resolve) => { w.resolve = resolve; });
-                CE.waiting.set(name, w);
+                state.waiting.set(name, w);
             }
             return w.promise;
-        },
-        upgrade(root) { if (CE.defs.size) ceScan(root); },
-    };
+        }
+        upgrade(root) {
+            const state = this.__state;
+            const old = CE;
+            CE = state;
+            try { if (state.defs.size) ceScan(root); }
+            finally { CE = old; }
+        }
+        get [Symbol.toStringTag]() { return "CustomElementRegistry"; }
+    }
+    function customElementRegistryForWindow(windowState, frame) {
+        if (!windowState.customElementRegistry) {
+            windowState.customElementRegistry = new CustomElementRegistry(
+                customElementStateForWindow(windowState), windowState, frame
+            );
+        }
+        return windowState.customElementRegistry;
+    }
+    function currentCustomElementRegistry() {
+        const frame = trust.__activeFrame || null;
+        return customElementRegistryForWindow(
+            activeWindowState(), frame === realmRootFrame ? null : frame
+        );
+    }
     // Scopes (document / shadow roots) that ever adopted sheets, so a
     // later replaceSync() re-pushes their joined text to the cascade.
     const adoptedScopes = [];
@@ -5354,9 +6839,11 @@
         return s;
     }
 
-    // Distinct subclasses so `instanceof` answers honestly (false for
-    // our wrappers): Vue picks SVG namespaces by SVGElement checks.
-    class SVGElement extends Element { get [Symbol.toStringTag]() { return "SVGElement"; } }
+    // Distinct namespace bases so `instanceof` answers honestly. The dynamic
+    // @@toStringTag on Element reports the concrete interface selected for an
+    // expanded name (e.g. SVGRectElement versus HTMLUnknownElement).
+    class SVGElement extends Element {}
+    class MathMLElement extends Element {}
     // (HTMLInputElement/HTMLSelectElement/… are defined with their real per-
     // interface bodies right after Element, above — not empty stubs anymore.)
 
@@ -5539,8 +7026,20 @@
     g.CSSNamespaceRule = CSSNamespaceRule; g.CSSCounterStyleRule = CSSCounterStyleRule;
     g.CSSPropertyRule = CSSPropertyRule; g.CSSRuleList = CSSRuleList;
     g.StyleSheetList = StyleSheetList;
-    g.customElements = customElements;
+    g.CustomElementRegistry = CustomElementRegistry;
+    if (realmRootFrame) {
+        Object.defineProperty(g, "customElements", {
+            configurable: true, enumerable: true,
+            value: customElementRegistryForWindow(topWindowState, null),
+        });
+    } else {
+        Object.defineProperty(g, "customElements", {
+            configurable: true, enumerable: true,
+            get: currentCustomElementRegistry,
+        });
+    }
     g.SVGElement = SVGElement;
+    g.MathMLElement = MathMLElement;
     g.HTMLInputElement = HTMLInputElement; g.HTMLSelectElement = HTMLSelectElement;
     g.HTMLTextAreaElement = HTMLTextAreaElement; g.HTMLFormElement = HTMLFormElement;
     g.HTMLAnchorElement = HTMLAnchorElement; g.HTMLImageElement = HTMLImageElement;
@@ -5900,7 +7399,9 @@
     };
     g.FileReader.EMPTY = 0; g.FileReader.LOADING = 1; g.FileReader.DONE = 2;
 
-    g.window = g; g.self = g; g.top = g; g.parent = g;
+    g.window = g; g.self = g;
+    g.top = cfg.topWindow || g;
+    g.parent = cfg.parentWindow || g;
     // `window.frames` is the WindowProxy itself in a browser (an array-like of
     // child browsing contexts). With no child frames it's just `window`, so
     // `window.frames[name]` is a plain undefined lookup rather than a throw.
@@ -5910,7 +7411,7 @@
     g.frames = g;
     g.DOMTokenList = DOMTokenList;
     g.DOMStringMap = DOMStringMap;
-    g.document = wrap(0);
+    g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(0);
 
     // --- environment ---
     const L = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "", "", "", ""];
@@ -5957,6 +7458,22 @@
         if (u === undefined || u === null) return;
         const p = __url_parse(String(u), locState.href);
         if (p) setLocParts(p);
+    };
+    trust.replaceInitialDocument = function (frameId, url) {
+        if (!realmRootFrame || Number(frameId) !== realmRootFrame.__id)
+            return false;
+        // HTML §7.5.1's one Window-to-two-Documents exception: a first
+        // same-origin navigation reuses the initial about:blank Window and
+        // Realm, while installing a distinct active Document and updating the
+        // existing Location object's URL state.
+        if (realmRootFrame.__contentDoc)
+            detachListenerTarget(realmRootFrame.__contentDoc);
+        realmRootFrame.__contentDoc = new FrameDocument(realmRootFrame);
+        g.document = realmRootFrame.__contentDoc;
+        if (g.__trust_cfg) g.__trust_cfg.url = String(url);
+        updateLoc(url);
+        baseHrefCache = null;
+        return true;
     };
     // HTML §Location component setters: copy the URL, apply the component with
     // the URL parser's state-override semantics (`__url_set` = the same WHATWG
@@ -6505,6 +8022,7 @@
             if (typeof cb !== "function")
                 throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not a function");
             this.__cb = cb;
+            this.__windowState = activeWindowState();
             this.__records = [];
             this.__targets = []; // array of registrations: { target, childList, … }
         }
@@ -6576,7 +8094,7 @@
     // pending entry queues for this document.
     const ioNotify = [];
     let ioTaskQueued = false;
-    let ioInitialUpdateTimer = null;
+    let ioInitialUpdatePending = false;
     // ResizeObserver registry — a PLAIN ARRAY (never a Boa Set/Map, the MapLock
     // GC trap MO documents). ResizeObserver is EDGE-TRIGGERED like IO: a target's
     // callback fires whenever its observed (border-box) size changes across the
@@ -6588,7 +8106,11 @@
     // the terminal resizes; without re-delivery it stays stuck at the mount-time
     // measurement and renders too few cards.
     const RO = [];
-    let roInitialUpdateTimer = null;
+    let roInitialUpdatePending = false;
+    trust.hasRenderingUpdate = function () {
+        return ioInitialUpdatePending || roInitialUpdatePending;
+    };
+    trust.hasResizeObserver = function () { return RO.length > 0; };
     // Parse a rootMargin string into 4 {v, pct} offsets in CSS-margin order
     // (top, right, bottom, left), each px or %. Percentages resolve per-axis
     // against the root rect (top/bottom vs height, left/right vs width); the px
@@ -6618,6 +8140,7 @@
     g.IntersectionObserver = class {
         constructor(cb, opts) {
             this.__cb = cb;
+            this.__windowState = activeWindowState();
             opts = opts || {};
             // An element root (scroll container) isn't modelled — the terminal
             // has one scroll, the document's — so any root is treated as the
@@ -6638,18 +8161,9 @@
             for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
             this.__targets.push({ el: el, lastIndex: -1, lastIx: false });
             if (IO.indexOf(this) < 0) IO.push(this);
-            // Pending initial targets force a future rendering opportunity.
-            // The host normally reaches updateIntersections at the end of the
-            // current task's render; retain one coalesced timer as the fallback
-            // when observe() itself made no render-dirty DOM change. Scheduling
-            // one timer PER target made large registries drain hundreds of
-            // identical no-op tasks.
-            if (ioInitialUpdateTimer === null) {
-                ioInitialUpdateTimer = g.setTimeout(() => {
-                    ioInitialUpdateTimer = null;
-                    trust.updateIntersections();
-                }, 0);
-            }
+            // Intersection Observer §3.2.4 requests an update during HTML's
+            // next rendering opportunity. It does not manufacture a timer.
+            ioInitialUpdatePending = true;
         }
         unobserve(el) {
             for (let i = 0; i < this.__targets.length; i++) {
@@ -6711,7 +8225,8 @@
         if (ioNotify.indexOf(observer) < 0) ioNotify.push(observer);
         if (ioTaskQueued) return;
         ioTaskQueued = true;
-        intersectionTasks.push({ frame: trust.__activeFrame || null, fn: function () {
+        const frame = trust.__activeFrame || null;
+        intersectionTasks.push({ frame: frame, windowState: activeWindowState(), fn: function () {
             ioTaskQueued = false;
             const notify = ioNotify.splice(0);
             for (let i = 0; i < notify.length; i++) {
@@ -6732,10 +8247,7 @@
     // recording queues the separate IntersectionObserver notification task;
     // callbacks never run synchronously inside this rendering-update step.
     trust.updateIntersections = function () {
-        if (ioInitialUpdateTimer !== null) {
-            g.clearTimeout(ioInitialUpdateTimer);
-            ioInitialUpdateTimer = null;
-        }
+        ioInitialUpdatePending = false;
         if (!IO.length) return 0;
         let queued = 0;
         const sx = g.scrollX || 0, sy = g.scrollY || 0;
@@ -6856,16 +8368,10 @@
         g.innerWidth = w; g.innerHeight = h;
         try { dispatch(g, new Event("resize"), false); }
         catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
-        // CSSOM View §13.1 applies independently to every Document viewport.
-        // Dispatch in frame scope so the shared realm restores that frame's
-        // document/inner dimensions and filters Window listeners by their
-        // registration browsing context.
-        try { fireChangedFrameViewportResizes(); }
-        catch (e) { trust.errors.push("frame resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
-        // The viewport changed, so every element's box may have — deliver
-        // ResizeObserver (a responsive grid re-columns) before intersections.
-        trust.updateResizes();
-        trust.updateIntersections();
+        // HTML's next rendering opportunity recalculates layout before CSSOM
+        // View §13.1 runs resize steps for every nested Document. The actor's
+        // rendering update invokes updateFrameResizes after fresh geometry;
+        // sampling here would observe the old iframe box and lose the event.
     };
 
     // The terminal wheel scrolled an inner-scroll region: the actor has already
@@ -6887,15 +8393,15 @@
     // inner-scroll region's un-pin handler). Peeks without creating entries.
     trust.hasScrollWork = function () {
         if (IO.length) return true;
-        if (g.__elScroll) return true;
-        const wm = LS.get(g);
+        if (activeWindowState().hasElementScrollListener) return true;
+        const wm = LS.get(listenerRegistryTarget(g));
         if (wm) { const l = wm.get("scroll"); if (l && l.length) return true; }
         const dm = LS.get(g.document);
         if (dm) { const l = dm.get("scroll"); if (l && l.length) return true; }
         return typeof g.onscroll === "function";
     };
     g.ResizeObserver = class {
-        constructor(cb) { this.__cb = cb; this.__targets = []; }
+        constructor(cb) { this.__cb = cb; this.__targets = []; this.__windowState = activeWindowState(); }
         observe(el) {
             if (!el) return;
             for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
@@ -6903,15 +8409,9 @@
             // queues an initial observation with the current size).
             this.__targets.push({ el: el, lastW: -1, lastH: -1 });
             if (RO.indexOf(this) < 0) RO.push(this);
-            // A pending initial observation participates in the next rendering
-            // opportunity. Keep one fallback task for a late observe() that did
-            // not otherwise dirty rendering, coalesced across every target.
-            if (roInitialUpdateTimer === null) {
-                roInitialUpdateTimer = g.setTimeout(() => {
-                    roInitialUpdateTimer = null;
-                    trust.updateResizes();
-                }, 0);
-            }
+            // Resize Observer §3.4 integrates this initial delivery into
+            // HTML's next rendering update; it is not a timer task.
+            roInitialUpdatePending = true;
         }
         unobserve(el) {
             for (let i = 0; i < this.__targets.length; i++) {
@@ -6924,14 +8424,12 @@
     // The spec's ResizeObserver delivery ("gather active observations" → "broadcast"):
     // for each observer × target, measure the target's CURRENT border box and fire
     // the callback ONLY when its size changed since the last delivery (edge-
-    // triggered — not a flood). Run in the "update the rendering" step at every
-    // settle/dispatch/viewport-resize (`run_layout_observers`), so a component that
-    // sizes itself off its container gets the corrected size as the layout evolves.
+    // triggered — not a flood). Run only in HTML's "update the rendering"
+    // step, so a component that sizes itself off its container gets the
+    // corrected size as the layout evolves without turning every task into a
+    // synchronous layout opportunity.
     trust.updateResizes = function () {
-        if (roInitialUpdateTimer !== null) {
-            g.clearTimeout(roInitialUpdateTimer);
-            roInitialUpdateTimer = null;
-        }
+        roInitialUpdatePending = false;
         if (!RO.length) return 0;
         let delivered = 0;
         const observers = RO.slice();
@@ -7019,14 +8517,22 @@
         if (entry && entry.timeoutTimer !== null) g.clearTimeout(entry.timeoutTimer);
     };
     trust.hasIdleRequest = function () {
-        return idleCallbacks.pending.length > 0 || idleCallbacks.runnable.length > 0;
+        if (idleCallbacks.pending.length > 0 || idleCallbacks.runnable.length > 0) return true;
+        for (const childTrust of childWindowTrusts)
+            if (childTrust.hasIdleRequest()) return true;
+        return false;
     };
     trust.startIdlePeriod = function (deadline) {
-        deadline = Math.min(currentTime() + 50, Math.max(currentTime(), Number(deadline)));
+        deadline = Number(deadline) - agentTimeOffset;
+        deadline = Math.min(currentTime() + 50, Math.max(currentTime(), deadline));
         idleCallbacks.runnable.push(...idleCallbacks.pending);
         idleCallbacks.pending.length = 0;
         if (idleCallbacks.runnable.length) idleTasks.push({ kind: "period", deadline });
-        return idleCallbacks.runnable.length > 0;
+        let started = idleCallbacks.runnable.length > 0;
+        const agentDeadline = deadline + agentTimeOffset;
+        for (const childTrust of childWindowTrusts)
+            started = childTrust.startIdlePeriod(agentDeadline) || started;
+        return started;
     };
     trust.runIdleTask = function () {
         if (!idleTasks.length) return false;
@@ -7324,33 +8830,67 @@
     // runs its entire suite from `onload`.
     function installEventHandlers(obj, add, remove, types) {
         for (const type of types) {
-            let current = null;
             Object.defineProperty(obj, "on" + type, {
                 configurable: true,
                 enumerable: true,
-                get() { return current; },
+                get() { return activeWindowState().handlers[type] || null; },
                 set(v) {
+                    const handlers = activeWindowState().handlers;
+                    const current = handlers[type] || null;
                     if (current) remove(type, current);
-                    current = typeof v === "function" ? v : null;
-                    if (current) add(type, current);
+                    const next = typeof v === "function" ? v : null;
+                    handlers[type] = next;
+                    if (next) add(type, next);
                 },
             });
         }
     }
-    installEventHandlers(g, g.addEventListener, g.removeEventListener, [
-        "load", "unload", "beforeunload", "pageshow", "pagehide",
-        "resize", "scroll", "scrollend", "hashchange", "popstate", "message",
-        "error", "online", "offline", "focus", "blur", "languagechange",
-    ]);
-    // GlobalEventHandlers on* IDL attributes on Document and Element (they
-    // share Node.prototype). The spec backs each by add/removeEventListener;
-    // `this`-relative so a setter registers on the node itself. Two reasons
-    // this matters broadly: (1) feature detection — libraries probe event
-    // support via `('on'+name) in document` / `in element` (React's change
-    // plugin gates the whole `input`-event path on `'oninput' in document`,
-    // and without it falls back to a legacy keyup/selectionchange polyfill
-    // that never sees our input dispatch → controlled inputs go dead); (2)
-    // `el.onclick = fn` assignment works as a real listener.
+    // WHATWG HTML §8.1.8.2: GlobalEventHandlers is included by HTMLElement,
+    // Document, and Window. Keep the normative list together so all three
+    // surfaces — including our same-realm nested-document facade — answer the
+    // same feature probes. The second list contains partial-interface event
+    // handlers defined by UI Events, Pointer Events, Touch Events, and CSS
+    // Animations/Transitions, plus the long-shipped loadend handler.
+    const GLOBAL_EVENT_HANDLER_TYPES = [
+        "abort", "auxclick", "beforeinput", "beforematch", "beforetoggle", "blur",
+        "cancel", "canplay", "canplaythrough", "change", "click", "close", "command",
+        "contextlost", "contextmenu", "contextrestored", "copy", "cuechange", "cut",
+        "dblclick", "drag", "dragend", "dragenter", "dragleave", "dragover", "dragstart",
+        "drop", "durationchange", "emptied", "ended", "error", "focus", "formdata",
+        "input", "invalid", "keydown", "keypress", "keyup", "load", "loadeddata",
+        "loadedmetadata", "loadstart", "mousedown", "mouseenter", "mouseleave",
+        "mousemove", "mouseout", "mouseover", "mouseup", "paste", "pause", "play",
+        "playing", "progress", "ratechange", "reset", "resize", "scroll", "scrollend",
+        "securitypolicyviolation", "seeked", "seeking", "select", "slotchange", "stalled",
+        "submit", "suspend", "timeupdate", "toggle", "volumechange", "waiting",
+        "webkitanimationend", "webkitanimationiteration", "webkitanimationstart",
+        "webkittransitionend", "wheel",
+    ];
+    const EXTENDED_EVENT_HANDLER_TYPES = [
+        "focusin", "focusout", "selectionchange", "loadend",
+        "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
+        "pointerenter", "pointerleave", "pointercancel", "gotpointercapture",
+        "lostpointercapture", "touchstart", "touchend", "touchmove", "touchcancel",
+        "animationstart", "animationend", "animationiteration", "transitionstart",
+        "transitionend", "transitioncancel", "copy", "cut", "paste",
+        "compositionstart", "compositionupdate", "compositionend",
+    ];
+    const ELEMENT_DOCUMENT_HANDLER_TYPES = GLOBAL_EVENT_HANDLER_TYPES.concat(
+        EXTENDED_EVENT_HANDLER_TYPES);
+    const WINDOW_EVENT_HANDLER_TYPES = [
+        "afterprint", "beforeprint", "beforeunload", "hashchange", "languagechange",
+        "message", "messageerror", "offline", "online", "pagehide", "pagereveal",
+        "pageshow", "pageswap", "popstate", "rejectionhandled", "storage",
+        "unhandledrejection", "unload",
+    ];
+    installEventHandlers(g, g.addEventListener, g.removeEventListener,
+        Array.from(new Set(ELEMENT_DOCUMENT_HANDLER_TYPES.concat(WINDOW_EVENT_HANDLER_TYPES))));
+
+    // IDL event-handler setters are backed by event listeners. Keep storage
+    // `this`-relative so each Document/Element has an independent handler.
+    // This is also required for standards-based feature detection: React's
+    // change plugin probes `'oninput' in document` and otherwise selects a
+    // non-standard legacy-IE attachEvent path.
     // `on<event>` storage is NAMESPACED `__trustOn` (not `__on`): D3's
     // `selection.on()` stores its listener descriptors in `node.__on` (and YT
     // bundles D3), so a shared `__on` would cross our handler map with D3's.
@@ -7371,26 +8911,11 @@
             });
         }
     }
-    installHandlerProps(Node.prototype, [
-        "click", "dblclick", "auxclick", "contextmenu",
-        "mousedown", "mouseup", "mousemove", "mouseover", "mouseout",
-        "mouseenter", "mouseleave", "wheel",
-        "keydown", "keyup", "keypress",
-        "input", "beforeinput", "change", "submit", "reset", "invalid",
-        "focus", "blur", "focusin", "focusout",
-        "select", "selectionchange",
-        "scroll", "scrollend", "load", "error", "abort", "loadstart", "loadend", "progress",
-        "drag", "dragstart", "dragend", "dragenter", "dragleave", "dragover", "drop",
-        "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
-        "pointerenter", "pointerleave", "pointercancel", "gotpointercapture", "lostpointercapture",
-        "touchstart", "touchend", "touchmove", "touchcancel",
-        "animationstart", "animationend", "animationiteration",
-        "transitionstart", "transitionend", "transitioncancel",
-        "copy", "cut", "paste", "compositionstart", "compositionupdate", "compositionend",
-        "play", "pause", "ended", "canplay", "canplaythrough", "durationchange",
-        "timeupdate", "volumechange", "waiting", "seeked", "seeking",
-        "toggle", "beforetoggle", "cancel", "close",
-    ]);
+    installHandlerProps(Element.prototype, ELEMENT_DOCUMENT_HANDLER_TYPES);
+    installHandlerProps(Document.prototype,
+        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange"]));
+    installHandlerProps(FrameDocument.prototype,
+        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange"]));
     // Performance + the Performance Timeline API. We keep no real timing
     // buffer, so the getEntries* trio returns empty arrays — but they MUST
     // exist: GitHub's React Router calls `performance.getEntriesByName(url,
@@ -7488,11 +9013,15 @@
     function timerDelay(timeout, parentNesting) {
         return parentNesting > 5 && timeout < 4 ? 4 : timeout;
     }
-    function addTimer(handler, timeout, args, repeat, previousId, parentNesting) {
-        const id = previousId === undefined ? timers.seq++ : previousId;
+    function addTimer(handler, timeout, args, repeat, previousId, parentNesting,
+                      windowState, frame) {
+        windowState = windowState || activeWindowState();
+        if (frame === undefined) frame = trust.__activeFrame || null;
+        const id = previousId === undefined
+            ? windowState.timerIdentifier++ : previousId;
         const nesting = parentNesting + 1;
         const wait = timerDelay(timeout, parentNesting);
-        timers.ids.add(id);
+        windowState.timerIds.add(id);
         timers.q.push({
             id,
             at: currentTime() + wait,
@@ -7501,7 +9030,8 @@
             args,
             nesting,
             wait,
-            frame: trust.__activeFrame || null,
+            frame,
+            windowState,
         });
         return id;
     }
@@ -7520,20 +9050,25 @@
     const networkTasks = [];
     const __queue_network_task = function (fn, frame) {
         if (typeof fn === "function") {
-            networkTasks.push({ fn: fn, frame: frame === undefined ? (trust.__activeFrame || null) : frame });
+            frame = frame === undefined ? (trust.__activeFrame || null) : frame;
+            networkTasks.push({ fn: fn, frame: frame,
+                windowState: frame ? windowStateForFrame(frame) : topWindowState });
         }
     };
     const domTasks = [];
     const __queue_dom_task = function (fn, frame) {
         if (typeof fn === "function") {
-            domTasks.push({ fn: fn, frame: frame === undefined ? (trust.__activeFrame || null) : frame });
+            frame = frame === undefined ? (trust.__activeFrame || null) : frame;
+            domTasks.push({ fn: fn, frame: frame,
+                windowState: frame ? windowStateForFrame(frame) : topWindowState });
         }
     };
     const intersectionTasks = [];
     const messageTasks = [];
     const __queue_message_task = function (fn) {
         if (typeof fn === "function") {
-            messageTasks.push({ fn: fn, frame: trust.__activeFrame || null });
+            messageTasks.push({ fn: fn, frame: trust.__activeFrame || null,
+                windowState: activeWindowState() });
         }
     };
     g.setInterval = function (fn, d) {
@@ -7543,8 +9078,11 @@
     };
     g.clearTimeout = g.clearInterval = function (id) {
         id = Number(id) | 0;
-        timers.ids.delete(id);
-        timers.q = timers.q.filter((timer) => timer.id !== id);
+        const windowState = activeWindowState();
+        windowState.timerIds.delete(id);
+        timers.q = timers.q.filter(
+            (timer) => timer.windowState !== windowState || timer.id !== id
+        );
     };
     // A browser host invokes a queued timer handler as the entry point of its
     // task, with no platform JavaScript execution context underneath it
@@ -7553,27 +9091,43 @@
     // bookkeeping. The synchronous fallback below uses the same hooks for
     // embedders which still drive tick()/tickTo() entirely from JavaScript.
     function beginTimerTask(task) {
+        const owner = task && task.__trustTimerOwner;
+        if (owner && owner !== trust) return owner.beginTimerTask(task);
         task.__previousNesting = timers.activeNesting;
         timers.activeNesting = task.nesting;
+        task.__trustTimerThis = g;
         task.__frameToken = (task.frame || null) === trust.__activeFrame
             ? null : enterFrame(task.frame || null);
         return task.fn;
     }
     function finishTimerTask(task, error, failed) {
+        const owner = task && task.__trustTimerOwner;
+        if (owner && owner !== trust) {
+            try { return owner.finishTimerTask(task, error, failed); }
+            finally { try { delete task.__trustTimerOwner; } catch (_) {} }
+        }
         try {
             if (failed) {
+                let handlerSource = "";
+                try {
+                    handlerSource = Function.prototype.toString.call(task.fn);
+                    if (handlerSource.length > 768) handlerSource = handlerSource.slice(0, 768) + "…";
+                } catch (_) {}
                 trust.errors.push("timer: " + ((error && error.message) || error) +
-                    (error && error.stack ? "\n" + error.stack : ""));
+                    (error && error.stack ? "\n" + error.stack : "") +
+                    (handlerSource ? "\nTimer handler: " + handlerSource : ""));
             }
         } finally {
             if (task.__frameToken) leaveFrame(task.__frameToken);
             timers.activeNesting = task.__previousNesting;
             delete task.__frameToken;
             delete task.__previousNesting;
-            if (task.every !== null && timers.ids.has(task.id)) {
-                addTimer(task.fn, task.every, task.args, true, task.id, task.nesting);
+            delete task.__trustTimerThis;
+            if (task.every !== null && task.windowState.timerIds.has(task.id)) {
+                addTimer(task.fn, task.every, task.args, true, task.id, task.nesting,
+                    task.windowState, task.frame);
             } else {
-                timers.ids.delete(task.id);
+                task.windowState.timerIds.delete(task.id);
             }
         }
     }
@@ -7593,29 +9147,43 @@
         }
         return completionValue;
     }
+    trust.runSelectedTimerTask = function (task) { return runTimerTask(task, 1); };
     g.requestAnimationFrame = function (callback) {
         if (typeof callback !== "function") throw new TypeError("requestAnimationFrame callback must be callable");
-        const id = ++animationFrames.seq;
-        animationFrames.q.push({ id, callback, frame: trust.__activeFrame || null });
+        const windowState = activeWindowState();
+        const id = ++windowState.animationFrameIdentifier;
+        animationFrames.q.push({
+            id, callback, windowState, frame: trust.__activeFrame || null,
+        });
         if (animationFrames.deadline === null) animationFrames.deadline = currentTime() + 16;
         return id;
     };
     g.cancelAnimationFrame = function (handle) {
         handle = Number(handle);
-        animationFrames.q = animationFrames.q.filter((entry) => entry.id !== handle);
+        const windowState = activeWindowState();
+        animationFrames.q = animationFrames.q.filter(
+            (entry) => entry.windowState !== windowState || entry.id !== handle
+        );
         if (!animationFrames.q.length) animationFrames.deadline = null;
     };
+    pristineAnimationFrameMethods = animationFrameMethods();
+    topAnimationFrameMethods = pristineAnimationFrameMethods;
     function runAnimationFrameCallbacks(now) {
         // HTML "run the animation frame callbacks": snapshot the callback-map
         // keys, then remove each callback immediately before invoking it. A
         // callback queued during this pass is therefore deferred to the next
         // rendering opportunity, while an earlier callback can still cancel a
         // later handle from this snapshot.
-        const handles = animationFrames.q.map((entry) => entry.id);
+        // `q` combines the ordered callback maps of several target Documents.
+        // Snapshot the map entries themselves, not their numeric handles:
+        // handles are only unique within one target, and a navigation during a
+        // callback can replace a Document then reuse its handle before this
+        // rendering opportunity has finished.
+        const callbacks = animationFrames.q.slice();
         animationFrames.deadline = null;
         let invoked = 0;
-        for (const handle of handles) {
-            const index = animationFrames.q.findIndex((entry) => entry.id === handle);
+        for (const callbackEntry of callbacks) {
+            const index = animationFrames.q.indexOf(callbackEntry);
             if (index < 0) continue;
             const entry = animationFrames.q.splice(index, 1)[0];
             invoked++;
@@ -7639,42 +9207,41 @@
         const resolve = trust.pendingFetches[id];
         if (resolve) { delete trust.pendingFetches[id]; resolve(value); }
     };
-    g.queueMicrotask = (fn) => { Promise.resolve().then(fn).catch((e) => trust.errors.push("microtask: " + ((e && e.message) || e))); };
-    // FinalizationRegistry (ES2021). Boa ships WeakRef/WeakMap/WeakSet but not
-    // this; libraries that build caches keyed on GC (Apollo's @wry/caches,
-    // emotion, lit's reactive controllers) feature-detect it, and some construct
-    // it unconditionally → a bare ReferenceError without it. The cleanup callback
-    // is NEVER guaranteed to run (spec §FinalizationRegistry — implementations
-    // "may never" call it), and a headless parse-time engine has no JS-visible GC
-    // finalization hook, so we never fire it. We still validate inputs like a real
-    // engine and track the unregister token WEAKLY (a WeakSet — no leak) so
-    // unregister() answers correctly. This is a conformant "never collects"
-    // registry, not a fake.
-    class FinalizationRegistry {
-        constructor(cleanup) {
-            if (typeof cleanup !== "function") throw new TypeError("FinalizationRegistry: cleanup callback must be callable");
-            this.__cleanup = cleanup;
-            this.__tokens = new WeakSet();
-        }
-        get [Symbol.toStringTag]() { return "FinalizationRegistry"; }
-        register(target, heldValue, unregisterToken) {
-            if (target === null || (typeof target !== "object" && typeof target !== "function"))
-                throw new TypeError("FinalizationRegistry.register: target must be an object");
-            if (target === heldValue)
-                throw new TypeError("FinalizationRegistry.register: target and held value must not be the same");
-            if (unregisterToken !== undefined) {
-                if (typeof unregisterToken !== "object" && typeof unregisterToken !== "function")
-                    throw new TypeError("FinalizationRegistry.register: unregister token must be an object");
-                this.__tokens.add(unregisterToken);
+    g.queueMicrotask = (fn) => {
+        Promise.resolve().then(fn).catch((e) => trust.errors.push(
+            "microtask: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")
+        ));
+    };
+    // Keep a conforming engine's native FinalizationRegistry. The fallback is
+    // only for the legacy Boa comparison backend, whose collector exposes no
+    // cleanup hook; ECMA-262 permits cleanup jobs never to be enqueued.
+    if (typeof g.FinalizationRegistry !== "function") {
+        class FinalizationRegistryFallback {
+            constructor(cleanup) {
+                if (typeof cleanup !== "function") throw new TypeError("FinalizationRegistry: cleanup callback must be callable");
+                this.__cleanup = cleanup;
+                this.__tokens = new WeakSet();
+            }
+            get [Symbol.toStringTag]() { return "FinalizationRegistry"; }
+            register(target, heldValue, unregisterToken) {
+                if (target === null || (typeof target !== "object" && typeof target !== "function"))
+                    throw new TypeError("FinalizationRegistry.register: target must be an object");
+                if (target === heldValue)
+                    throw new TypeError("FinalizationRegistry.register: target and held value must not be the same");
+                if (unregisterToken !== undefined) {
+                    if (typeof unregisterToken !== "object" && typeof unregisterToken !== "function")
+                        throw new TypeError("FinalizationRegistry.register: unregister token must be an object");
+                    this.__tokens.add(unregisterToken);
+                }
+            }
+            unregister(unregisterToken) {
+                if (unregisterToken === null || (typeof unregisterToken !== "object" && typeof unregisterToken !== "function"))
+                    throw new TypeError("FinalizationRegistry.unregister: token must be an object");
+                return this.__tokens.delete(unregisterToken);
             }
         }
-        unregister(unregisterToken) {
-            if (unregisterToken === null || (typeof unregisterToken !== "object" && typeof unregisterToken !== "function"))
-                throw new TypeError("FinalizationRegistry.unregister: token must be an object");
-            return this.__tokens.delete(unregisterToken);
-        }
+        g.FinalizationRegistry = FinalizationRegistryFallback;
     }
-    g.FinalizationRegistry = FinalizationRegistry;
     // The HTML structured-clone algorithm — via the SAME wire codec workers
     // use (`__sc_serialize`/`__sc_deserialize`, defined below; single source
     // of truth). Cycles, Map/Set, ArrayBuffer/typed arrays/DataView, Date/
@@ -7712,6 +9279,10 @@
         if (trust.oneShot && trust.hasIdleRequest && trust.hasIdleRequest()) {
             trust.startIdlePeriod(currentTime() + 50);
             if (trust.runPlatformTask()) return true;
+        }
+        for (const childTrust of childWindowTrusts) {
+            childTrust.oneShot = trust.oneShot;
+            if (childTrust.tick()) return true;
         }
         const observedNow = currentTime();
         const limit = trust.oneShot ? observedNow + 1000 : observedNow;
@@ -7751,32 +9322,94 @@
     // `now` anchors the wall-clock delta it measures forward from. A re-armed
     // repeating timer is initialized again after its handler finishes, as the
     // standard requires, so a long callback never causes a catch-up burst.
-    trust.now = () => currentTime();
-    trust.nextDeadline = function () {
+    trust.now = () => currentTime() + agentTimeOffset;
+    function ownNextDeadline() {
         let best = animationFrames.deadline;
         for (const t of timers.q) if (best === null || t.at < best) best = t.at;
         return best;
+    }
+    trust.nextDeadline = function () {
+        const own = ownNextDeadline();
+        let best = own === null ? null : own + agentTimeOffset;
+        for (const childTrust of childWindowTrusts) {
+            const child = childTrust.nextDeadline();
+            if (child !== null && (best === null || child < best)) best = child;
+        }
+        return best;
+    };
+    trust.nextDeadlineIsAnimationFrame = function () {
+        const own = ownNextDeadline();
+        let owner = trust;
+        let best = own === null ? null : own + agentTimeOffset;
+        for (const childTrust of childWindowTrusts) {
+            const child = childTrust.nextDeadline();
+            if (child !== null && (best === null || child < best)) {
+                best = child;
+                owner = childTrust;
+            }
+        }
+        if (best === null) return false;
+        if (owner !== trust) return owner.nextDeadlineIsAnimationFrame();
+        if (animationFrames.deadline === null) return false;
+        for (const timer of timers.q)
+            if (timer.at < animationFrames.deadline) return false;
+        return true;
     };
     trust.nextTimerInfo = function () {
         let best = null;
         for (const timer of timers.q) {
             if (!best || timer.at < best.at || (timer.at === best.at && timer.id < best.id)) best = timer;
         }
-        return best ? { id: best.id, nesting: best.nesting, wait: best.wait } : null;
+        let info = best ? { id: best.id, nesting: best.nesting, wait: best.wait } : null;
+        let deadline = best ? best.at + agentTimeOffset : null;
+        for (const childTrust of childWindowTrusts) {
+            const childDeadline = childTrust.nextDeadline();
+            if (childDeadline !== null && (deadline === null || childDeadline < deadline)) {
+                deadline = childDeadline;
+                info = childTrust.nextTimerInfo();
+            }
+        }
+        return info;
     };
     // Select and remove one due timer without invoking author code. An object
     // is a timer for the host to dispatch; null asks it to use tickTo() for an
     // earlier animation-frame opportunity; false means no task was due.
+    let selectedAnimationOwner = null;
     trust.takeTimerTaskTo = function (absMs) {
-        absMs = Math.max(currentTime(), absMs);
+        absMs = Math.max(trust.now(), absMs);
+        const ownDeadline = ownNextDeadline();
+        const ownAgentDeadline = ownDeadline === null ? null : ownDeadline + agentTimeOffset;
+        let childOwner = null;
+        let childDeadline = null;
+        for (const childTrust of childWindowTrusts) {
+            const deadline = childTrust.nextDeadline();
+            if (deadline !== null && deadline <= absMs &&
+                (childDeadline === null || deadline < childDeadline)) {
+                childDeadline = deadline;
+                childOwner = childTrust;
+            }
+        }
+        if (childOwner && (ownAgentDeadline === null || childDeadline < ownAgentDeadline)) {
+            const selected = childOwner.takeTimerTaskTo(absMs);
+            if (selected && typeof selected === "object" && !selected.__trustTimerOwner) {
+                Object.defineProperty(selected, "__trustTimerOwner", {
+                    configurable: true, value: childOwner,
+                });
+            } else if (selected === null) {
+                selectedAnimationOwner = childOwner;
+            }
+            return selected;
+        }
+
+        const localAbsMs = Math.max(currentTime(), absMs - agentTimeOffset);
         let task = null;
         for (const t of timers.q) {
-            if (t.at > absMs) continue;
+            if (t.at > localAbsMs) continue;
             if (!task || t.at < task.at || (t.at === task.at && t.id < task.id)) task = t;
         }
-        if (animationFrames.deadline !== null && animationFrames.deadline <= absMs &&
+        if (animationFrames.deadline !== null && animationFrames.deadline <= localAbsMs &&
             (!task || animationFrames.deadline <= task.at)) return null;
-        timers.now = absMs;
+        timers.now = localAbsMs;
         __clockSync();
         if (!task) return false;
         timers.q.splice(timers.q.indexOf(task), 1);
@@ -7785,7 +9418,12 @@
     trust.tickTo = function (absMs) {
         const task = trust.takeTimerTaskTo(absMs);
         if (task === null) {
-            absMs = Math.max(currentTime(), absMs);
+            if (selectedAnimationOwner) {
+                const owner = selectedAnimationOwner;
+                selectedAnimationOwner = null;
+                return owner.tickTo(absMs);
+            }
+            absMs = Math.max(currentTime(), absMs - agentTimeOffset);
             timers.now = absMs;
             __clockSync();
             return runAnimationFrameCallbacks(absMs);
@@ -7794,9 +9432,14 @@
             // As above, dispatch the selected task in proper tail position.
             // The clock was committed before author code runs; currentTime()
             // continues from that anchor while the callback is executing.
+            const owner = task.__trustTimerOwner;
+            if (owner && owner !== trust) {
+                try { return owner.runSelectedTimerTask(task); }
+                finally { try { delete task.__trustTimerOwner; } catch (_) {} }
+            }
             return runTimerTask(task, 1);
         }
-        timers.now = absMs;
+        timers.now = Math.max(currentTime(), absMs - agentTimeOffset);
         __clockSync();
         return 0;
     };
@@ -8260,7 +9903,6 @@
                         const copy = view.slice();
                         chunks.push(copy);
                         total += copy.byteLength;
-                        if (total > 16 * 1024 * 1024) throw new RangeError("CompressionStream input exceeds the 16 MiB page limit");
                     },
                     flush(controller) {
                         const input = new Uint8Array(total);
@@ -9197,7 +10839,6 @@
                 else throw new TypeError("ReadableStream body chunk must be a BufferSource");
                 const copy = view.slice();
                 total += copy.byteLength;
-                if (total > 16 * 1024 * 1024) throw new RangeError("Body exceeds the 16 MiB page limit");
                 chunks.push(copy);
                 return pump();
             });
@@ -9318,6 +10959,1461 @@
     }
     Object.assign(Response.prototype, __bodyMethods);
     g.Response = Response;
+
+    // --- CacheStorage / Cache -------------------------------------------------
+    // Service Workers §5 exposes this API on every secure Window and worker.
+    // Cache storage is distinct from the HTTP cache: scripts explicitly create
+    // named request/response lists and those lists only change through this API.
+    // The host Web Storage map gives us a session-lifetime, origin-keyed backing
+    // store shared by successive page realms. Cache ids are separate from names
+    // so `caches.delete(name)` does not invalidate an already-referenced Cache,
+    // as required by §5.5.4.
+    const __cacheToken = {};
+    const __cacheNamesKind = "cache-storage-names";
+    const __cacheDataKind = "cache-storage-data";
+    const __cacheNamesKey = "map";
+    const __cacheQuota = 64 * 1024 * 1024;
+    const __cacheNameLimit = 1024;
+
+    function __cacheDOMString(value) {
+        // Web IDL DOMString conversion is ECMAScript ToString. Concatenation,
+        // unlike String(Symbol), retains ToString's required Symbol exception.
+        return "" + value;
+    }
+    function __cacheNames() {
+        const encoded = __storage_get(__cacheNamesKind, __cacheNamesKey);
+        if (encoded === null) return { next: 1, entries: [] };
+        try {
+            const parsed = JSON.parse(encoded);
+            if (parsed && Number.isFinite(parsed.next) && Array.isArray(parsed.entries)) return parsed;
+        } catch (e) {}
+        return { next: 1, entries: [] };
+    }
+    function __cacheSaveNames(names) {
+        if (names.entries.length > __cacheNameLimit)
+            throw new DOMException("The CacheStorage quota was exceeded.", "QuotaExceededError");
+        __storage_set(__cacheNamesKind, __cacheNamesKey, JSON.stringify(names));
+    }
+    function __cacheLoad(id) {
+        const encoded = __storage_get(__cacheDataKind, id);
+        if (encoded === null) return [];
+        try { const parsed = JSON.parse(encoded); return Array.isArray(parsed) ? parsed : []; }
+        catch (e) { return []; }
+    }
+    function __cacheSave(id, records) {
+        const encoded = JSON.stringify(records);
+        let total = encoded.length;
+        const count = __storage_len(__cacheDataKind);
+        for (let index = 0; index < count; index++) {
+            const key = __storage_key(__cacheDataKind, index);
+            if (key === null || key === id) continue;
+            const value = __storage_get(__cacheDataKind, key);
+            if (value !== null) total += value.length;
+        }
+        if (total > __cacheQuota)
+            throw new DOMException("The CacheStorage quota was exceeded.", "QuotaExceededError");
+        __storage_set(__cacheDataKind, id, encoded);
+    }
+    function __cacheHeaders(headers) {
+        const entries = [];
+        headers.forEach((value, name) => entries.push([name, value]));
+        return entries;
+    }
+    function __cacheHeader(entries, name) {
+        name = name.toLowerCase();
+        for (let index = 0; index < entries.length; index++) {
+            if (entries[index][0].toLowerCase() === name) return entries[index][1];
+        }
+        return null;
+    }
+    function __cacheRequest(input) {
+        return input instanceof Request ? input : new Request(input);
+    }
+    function __cacheRequestRecord(request) {
+        return {
+            url: request.__url,
+            method: request.__method,
+            headers: __cacheHeaders(request.__headers),
+        };
+    }
+    function __cacheComparableURL(value, ignoreSearch) {
+        const url = new URL(value);
+        url.hash = "";
+        if (ignoreSearch) url.search = "";
+        return url.href;
+    }
+    // Service Workers §5 "Request Matches Cached Item". Fragments never
+    // participate; query strings and Vary-selected request headers do unless
+    // their corresponding CacheQueryOptions member says otherwise.
+    function __cacheMatches(query, record, options) {
+        options = options || {};
+        if (!options.ignoreMethod && query.method !== "GET") return false;
+        if (__cacheComparableURL(query.url, !!options.ignoreSearch) !==
+            __cacheComparableURL(record.request.url, !!options.ignoreSearch)) return false;
+        if (options.ignoreVary) return true;
+        const vary = __cacheHeader(record.response.headers, "vary");
+        if (vary === null) return true;
+        const fields = vary.split(",");
+        for (let index = 0; index < fields.length; index++) {
+            const field = fields[index].trim().toLowerCase();
+            if (field === "*" ||
+                __cacheHeader(record.request.headers, field) !== __cacheHeader(query.headers, field))
+                return false;
+        }
+        return true;
+    }
+    function __cacheResponse(record) {
+        const response = new Response(null, {
+            status: record.status,
+            statusText: record.statusText,
+            headers: record.headers,
+            url: record.url,
+        });
+        response.type = record.type;
+        response.redirected = record.redirected;
+        response.__bytes = record.body;
+        return response;
+    }
+    function __cacheResponseRecord(request, response) {
+        const protocol = new URL(request.__url).protocol;
+        if ((protocol !== "http:" && protocol !== "https:") || request.__method !== "GET")
+            return Promise.reject(new TypeError("Cache.put only accepts HTTP(S) GET requests"));
+        if (!(response instanceof Response))
+            return Promise.reject(new TypeError("Cache.put requires a Response"));
+        if (response.status === 206)
+            return Promise.reject(new TypeError("A partial response cannot be stored in a Cache"));
+        const vary = response.headers.get("vary");
+        if (vary !== null && vary.split(",").some((field) => field.trim() === "*"))
+            return Promise.reject(new TypeError("A response with Vary: * cannot be stored in a Cache"));
+        const body = response.body;
+        if (response.bodyUsed || (body !== null && body.locked))
+            return Promise.reject(new TypeError("The response body is disturbed or locked"));
+        return response.arrayBuffer().then((buffer) => ({
+            request: __cacheRequestRecord(request),
+            response: {
+                status: response.status,
+                statusText: response.statusText,
+                headers: __cacheHeaders(response.headers),
+                url: response.url,
+                type: response.type,
+                redirected: response.redirected,
+                body: __bodyWire(new Uint8Array(buffer)),
+            },
+        }));
+    }
+    function __cacheCommit(id, additions) {
+        let records = __cacheLoad(id);
+        const added = [];
+        for (let index = 0; index < additions.length; index++) {
+            const addition = additions[index];
+            if (added.some((record) => __cacheMatches(addition.request, record, {})))
+                throw new DOMException("A Cache batch operation contains duplicate requests.", "InvalidStateError");
+            records = records.filter((record) => !__cacheMatches(addition.request, record, {}));
+            records.push(addition);
+            added.push(addition);
+        }
+        __cacheSave(id, records);
+    }
+
+    class Cache {
+        constructor(token, id) {
+            if (token !== __cacheToken) throw new TypeError("Illegal constructor");
+            this.__id = id;
+        }
+        match(request, options) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("Cache.match requires a request"));
+            return this.matchAll(request, options).then((responses) => responses[0]);
+        }
+        matchAll(request, options) {
+            try {
+                const omitted = arguments.length === 0;
+                const query = omitted ? null : __cacheRequestRecord(__cacheRequest(request));
+                if (query !== null && query.method !== "GET" && !(options && options.ignoreMethod))
+                    return Promise.resolve(Object.freeze([]));
+                const records = __cacheLoad(this.__id);
+                const responses = [];
+                for (let index = 0; index < records.length; index++) {
+                    if (query === null || __cacheMatches(query, records[index], options))
+                        responses.push(__cacheResponse(records[index].response));
+                }
+                return Promise.resolve(Object.freeze(responses));
+            } catch (error) { return Promise.reject(error); }
+        }
+        add(request) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("Cache.add requires a request"));
+            return this.addAll([request]);
+        }
+        addAll(requests) {
+            let list;
+            try { list = Array.from(requests, (request) => __cacheRequest(request)); }
+            catch (error) { return Promise.reject(error); }
+            for (let index = 0; index < list.length; index++) {
+                const protocol = new URL(list[index].__url).protocol;
+                if ((protocol !== "http:" && protocol !== "https:") || list[index].__method !== "GET")
+                    return Promise.reject(new TypeError("Cache.addAll only accepts HTTP(S) GET requests"));
+            }
+            return Promise.all(list.map((request) => g.fetch(request))).then((responses) => {
+                for (let index = 0; index < responses.length; index++) {
+                    const response = responses[index];
+                    const vary = response.headers.get("vary");
+                    if (response.type === "error" || !response.ok || response.status === 206 ||
+                        (vary !== null && vary.split(",").some((field) => field.trim() === "*")))
+                        throw new TypeError("Cache.addAll received an uncacheable response");
+                }
+                return Promise.all(responses.map((response, index) =>
+                    __cacheResponseRecord(list[index], response)));
+            }).then((records) => { __cacheCommit(this.__id, records); return undefined; });
+        }
+        put(request, response) {
+            if (arguments.length < 2) return Promise.reject(new TypeError("Cache.put requires a request and response"));
+            let normalized;
+            try { normalized = __cacheRequest(request); }
+            catch (error) { return Promise.reject(error); }
+            return __cacheResponseRecord(normalized, response).then((record) => {
+                __cacheCommit(this.__id, [record]);
+                return undefined;
+            });
+        }
+        delete(request, options) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("Cache.delete requires a request"));
+            try {
+                const query = __cacheRequestRecord(__cacheRequest(request));
+                if (query.method !== "GET" && !(options && options.ignoreMethod))
+                    return Promise.resolve(false);
+                const records = __cacheLoad(this.__id);
+                const kept = records.filter((record) => !__cacheMatches(query, record, options));
+                if (kept.length === records.length) return Promise.resolve(false);
+                __cacheSave(this.__id, kept);
+                return Promise.resolve(true);
+            } catch (error) { return Promise.reject(error); }
+        }
+        keys(request, options) {
+            try {
+                const omitted = arguments.length === 0;
+                const query = omitted ? null : __cacheRequestRecord(__cacheRequest(request));
+                if (query !== null && query.method !== "GET" && !(options && options.ignoreMethod))
+                    return Promise.resolve(Object.freeze([]));
+                const records = __cacheLoad(this.__id);
+                const requests = [];
+                for (let index = 0; index < records.length; index++) {
+                    const record = records[index];
+                    if (query === null || __cacheMatches(query, record, options)) {
+                        requests.push(new Request(record.request.url, {
+                            method: record.request.method,
+                            headers: record.request.headers,
+                        }));
+                    }
+                }
+                return Promise.resolve(Object.freeze(requests));
+            } catch (error) { return Promise.reject(error); }
+        }
+        get [Symbol.toStringTag]() { return "Cache"; }
+    }
+
+    class CacheStorage {
+        constructor(token) {
+            if (token !== __cacheToken) throw new TypeError("Illegal constructor");
+        }
+        match(request, options) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.match requires a request"));
+            try {
+                const names = __cacheNames();
+                if (options && Object.prototype.hasOwnProperty.call(options, "cacheName")) {
+                    const name = __cacheDOMString(options.cacheName);
+                    const entry = names.entries.find((item) => item[0] === name);
+                    return entry ? new Cache(__cacheToken, entry[1]).match(request, options)
+                        : Promise.resolve(undefined);
+                }
+                let promise = Promise.resolve(undefined);
+                for (let index = 0; index < names.entries.length; index++) {
+                    const cache = new Cache(__cacheToken, names.entries[index][1]);
+                    promise = promise.then((response) => response === undefined ? cache.match(request, options) : response);
+                }
+                return promise;
+            } catch (error) { return Promise.reject(error); }
+        }
+        has(cacheName) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.has requires a cache name"));
+            try {
+                const name = __cacheDOMString(cacheName);
+                return Promise.resolve(__cacheNames().entries.some((entry) => entry[0] === name));
+            } catch (error) { return Promise.reject(error); }
+        }
+        open(cacheName) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.open requires a cache name"));
+            try {
+                const name = __cacheDOMString(cacheName);
+                const names = __cacheNames();
+                const existing = names.entries.find((entry) => entry[0] === name);
+                if (existing) return Promise.resolve(new Cache(__cacheToken, existing[1]));
+                const id = String(names.next++);
+                names.entries.push([name, id]);
+                if (names.entries.length > __cacheNameLimit)
+                    throw new DOMException("The CacheStorage quota was exceeded.", "QuotaExceededError");
+                // Create the request/response list before publishing its name.
+                // If quota rejects the list write, open() must not leave a
+                // visible half-created CacheStorage entry.
+                __cacheSave(id, []);
+                __cacheSaveNames(names);
+                return Promise.resolve(new Cache(__cacheToken, id));
+            } catch (error) { return Promise.reject(error); }
+        }
+        delete(cacheName) {
+            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.delete requires a cache name"));
+            try {
+                const name = __cacheDOMString(cacheName);
+                const names = __cacheNames();
+                const index = names.entries.findIndex((entry) => entry[0] === name);
+                if (index < 0) return Promise.resolve(false);
+                names.entries.splice(index, 1);
+                __cacheSaveNames(names);
+                return Promise.resolve(true);
+            } catch (error) { return Promise.reject(error); }
+        }
+        keys() { return Promise.resolve(__cacheNames().entries.map((entry) => entry[0])); }
+        get [Symbol.toStringTag]() { return "CacheStorage"; }
+    }
+
+    if (secureContext) {
+        g.Cache = Cache;
+        g.CacheStorage = CacheStorage;
+        Object.defineProperty(g, "caches", {
+            configurable: true,
+            enumerable: true,
+            get: (() => {
+                const storage = new CacheStorage(__cacheToken);
+                return () => storage;
+            })(),
+        });
+    }
+
+    // --- Indexed Database ----------------------------------------------------
+    // Indexed Database 3 §§2.7, 4, and 5. Requests complete on database tasks;
+    // a transaction is active while it is created and while one of its request
+    // events is dispatched, then commits atomically after its ordered request
+    // list drains. Values cross the same StructuredSerializeForStorage-style
+    // boundary as workers rather than retaining aliases to author objects.
+    //
+    // The host map is session-lifetime and origin-keyed. Keeping one serialized
+    // database per key makes a read/write transaction's publication a single
+    // host operation: its private snapshot is either wholly installed or not
+    // installed at all.
+    const __idbToken = {};
+    const __idbDataKind = "indexed-database";
+    const __idbQuota = 64 * 1024 * 1024;
+    const __idbCatalog = new Map();
+    // Indexed Database 3 §2.8.2 serializes open/delete requests for each
+    // storage key + database name. A queue entry remains current while an
+    // upgrade is blocked or its versionchange transaction is live.
+    const __idbConnectionQueues = new Map();
+    const __idbConnectionFinishes = new WeakMap();
+
+    function __idbStartConnectionRequest(name) {
+        const queue = __idbConnectionQueues.get(name);
+        if (!queue || !queue.length || queue[0].started) return;
+        const entry = queue[0]; entry.started = true;
+        __queue_dom_task(() => entry.run(() => {
+            if (entry.finished) return;
+            entry.finished = true;
+            const current = __idbConnectionQueues.get(name);
+            if (!current || current[0] !== entry) return;
+            current.shift();
+            if (!current.length) __idbConnectionQueues.delete(name);
+            else __idbStartConnectionRequest(name);
+        }));
+    }
+    function __idbEnqueueConnectionRequest(name, run) {
+        let queue = __idbConnectionQueues.get(name);
+        if (!queue) { queue = []; __idbConnectionQueues.set(name, queue); }
+        queue.push({ run: run, started: false, finished: false });
+        __idbStartConnectionRequest(name);
+    }
+    function __idbFinishConnectionRequest(request) {
+        const finish = __idbConnectionFinishes.get(request);
+        if (!finish) return;
+        __idbConnectionFinishes.delete(request);
+        finish();
+    }
+
+    function __idbException(name, message) { return new DOMException(message || name, name); }
+    function __idbDOMString(value) { return "" + value; }
+    function __idbCloneData(value) { return JSON.parse(JSON.stringify(value)); }
+    function __idbDefaultData() { return { version: 0, stores: [] }; }
+    function __idbLoadData(name) {
+        const encoded = __storage_get(__idbDataKind, name);
+        if (encoded === null) return null;
+        try {
+            const data = JSON.parse(encoded);
+            if (data && Number.isSafeInteger(data.version) && Array.isArray(data.stores)) return data;
+        } catch (_) {}
+        return null;
+    }
+    function __idbSaveData(name, data) {
+        const encoded = JSON.stringify(data);
+        let total = encoded.length;
+        const count = __storage_len(__idbDataKind);
+        for (let index = 0; index < count; index++) {
+            const key = __storage_key(__idbDataKind, index);
+            if (key === null || key === name) continue;
+            const value = __storage_get(__idbDataKind, key);
+            if (value !== null) total += value.length;
+        }
+        if (total > __idbQuota)
+            throw __idbException("QuotaExceededError", "The IndexedDB quota was exceeded.");
+        __storage_set(__idbDataKind, name, encoded);
+    }
+    function __idbDatabaseState(name, create) {
+        let state = __idbCatalog.get(name);
+        if (state) return state;
+        let data = __idbLoadData(name);
+        if (data === null && !create) return null;
+        if (data === null) data = __idbDefaultData();
+        state = {
+            name: name,
+            data: data,
+            connections: new Set(),
+            transactions: [],
+            connectionWaiters: new Set(),
+        };
+        __idbCatalog.set(name, state);
+        return state;
+    }
+    function __idbStore(data, name) {
+        return data.stores.find((store) => store.name === name) || null;
+    }
+    function __idbSortedNames(values) {
+        const names = values.map(String).sort();
+        const list = {};
+        Object.defineProperty(list, "length", { enumerable: false, value: names.length });
+        for (let index = 0; index < names.length; index++) {
+            Object.defineProperty(list, index, { enumerable: true, value: names[index] });
+        }
+        Object.defineProperties(list, {
+            item: { enumerable: false, value(index) {
+                index = Number(index);
+                return Number.isInteger(index) && index >= 0 && index < names.length ? names[index] : null;
+            } },
+            contains: { enumerable: false, value(name) { return names.includes(String(name)); } },
+            [Symbol.iterator]: { enumerable: false, value: function* () { yield* names; } },
+            [Symbol.toStringTag]: { enumerable: false, value: "DOMStringList" },
+        });
+        return Object.freeze(list);
+    }
+    function __idbEncodeNumber(value) {
+        if (value === Infinity) return "+i";
+        if (value === -Infinity) return "-i";
+        if (Object.is(value, -0)) return "-0";
+        return value;
+    }
+    function __idbDecodeNumber(value) {
+        return value === "+i" ? Infinity : value === "-i" ? -Infinity : value === "-0" ? -0 : value;
+    }
+    // Indexed Database §7.4, "convert a value to a key". The compact tagged
+    // form is storage-safe (including infinities and -0) and preserves the
+    // standard type ordering used by cmp(), ranges, records, and cursors.
+    function __idbKey(value, seen) {
+        if (typeof value === "number") {
+            if (Number.isNaN(value)) throw __idbException("DataError", "NaN is not a valid IndexedDB key.");
+            return { t: "n", v: __idbEncodeNumber(value) };
+        }
+        if (value instanceof Date) {
+            const time = value.getTime();
+            if (Number.isNaN(time)) throw __idbException("DataError", "An invalid Date is not an IndexedDB key.");
+            return { t: "d", v: time };
+        }
+        if (typeof value === "string") return { t: "s", v: value };
+        if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+            const bytes = value instanceof ArrayBuffer
+                ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+            return { t: "b", v: Array.from(bytes) };
+        }
+        if (Array.isArray(value)) {
+            seen = seen || new Set();
+            if (seen.has(value)) throw __idbException("DataError", "A cyclic array is not an IndexedDB key.");
+            seen.add(value);
+            const keys = [];
+            for (let index = 0; index < value.length; index++) {
+                if (!Object.prototype.hasOwnProperty.call(value, index))
+                    throw __idbException("DataError", "A sparse array is not an IndexedDB key.");
+                keys.push(__idbKey(value[index], seen));
+            }
+            seen.delete(value);
+            return { t: "a", v: keys };
+        }
+        throw __idbException("DataError", "The value is not a valid IndexedDB key.");
+    }
+    function __idbMultiEntryKey(value) {
+        if (!Array.isArray(value)) return __idbKey(value);
+        const keys = [];
+        for (let index = 0; index < value.length; index++) {
+            let key;
+            try { key = __idbKey(value[index]); }
+            catch (_) { continue; }
+            if (!keys.some((item) => __idbCompare(item, key) === 0)) keys.push(key);
+        }
+        return { t: "a", v: keys };
+    }
+    function __idbKeyValue(key) {
+        if (key.t === "n") return __idbDecodeNumber(key.v);
+        if (key.t === "d") return new Date(key.v);
+        if (key.t === "s") return key.v;
+        if (key.t === "b") return new Uint8Array(key.v).buffer;
+        return key.v.map(__idbKeyValue);
+    }
+    function __idbCompare(a, b) {
+        const order = { n: 0, d: 1, s: 2, b: 3, a: 4 };
+        if (a.t !== b.t) return order[a.t] < order[b.t] ? -1 : 1;
+        if (a.t === "n") {
+            const av = __idbDecodeNumber(a.v), bv = __idbDecodeNumber(b.v);
+            return av < bv ? -1 : av > bv ? 1 : 0;
+        }
+        if (a.t === "d") return a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
+        if (a.t === "s") return a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
+        if (a.t === "b") {
+            const length = Math.min(a.v.length, b.v.length);
+            for (let index = 0; index < length; index++) {
+                if (a.v[index] !== b.v[index]) return a.v[index] < b.v[index] ? -1 : 1;
+            }
+            return a.v.length < b.v.length ? -1 : a.v.length > b.v.length ? 1 : 0;
+        }
+        const length = Math.min(a.v.length, b.v.length);
+        for (let index = 0; index < length; index++) {
+            const compared = __idbCompare(a.v[index], b.v[index]);
+            if (compared) return compared;
+        }
+        return a.v.length < b.v.length ? -1 : a.v.length > b.v.length ? 1 : 0;
+    }
+    function __idbKeyPathValid(path) {
+        if (Array.isArray(path)) return path.length > 0 && path.every(__idbKeyPathValid);
+        if (typeof path !== "string") return false;
+        return path === "" || path.split(".").every((part) => /^[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*$/u.test(part));
+    }
+    function __idbExtractPath(value, path) {
+        if (Array.isArray(path)) {
+            const keys = [];
+            for (const part of path) {
+                const extracted = __idbExtractPath(value, part);
+                if (extracted === undefined) return undefined;
+                keys.push(extracted);
+            }
+            return keys;
+        }
+        if (path === "") return value;
+        let current = value;
+        for (const part of path.split(".")) {
+            if (current === null || current === undefined || !(part in Object(current))) return undefined;
+            current = current[part];
+        }
+        return current;
+    }
+    function __idbInjectPath(value, path, key) {
+        if (typeof path !== "string" || path === "" || value === null ||
+            (typeof value !== "object" && typeof value !== "function")) return false;
+        const parts = path.split(".");
+        let current = value;
+        for (let index = 0; index + 1 < parts.length; index++) {
+            const part = parts[index];
+            if (!(part in current)) current[part] = {};
+            current = current[part];
+            if (current === null || (typeof current !== "object" && typeof current !== "function")) return false;
+        }
+        try { current[parts[parts.length - 1]] = __idbKeyValue(key); return true; }
+        catch (_) { return false; }
+    }
+
+    class IDBKeyRange {
+        constructor(token, lower, upper, lowerOpen, upperOpen) {
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.__lower = lower; this.__upper = upper;
+            this.lowerOpen = !!lowerOpen; this.upperOpen = !!upperOpen;
+        }
+        get lower() { return this.__lower === null ? undefined : __idbKeyValue(this.__lower); }
+        get upper() { return this.__upper === null ? undefined : __idbKeyValue(this.__upper); }
+        includes(value) { return __idbRangeIncludes(this, __idbKey(value)); }
+        static only(value) {
+            const key = __idbKey(value); return new IDBKeyRange(__idbToken, key, key, false, false);
+        }
+        static lowerBound(value, open) {
+            return new IDBKeyRange(__idbToken, __idbKey(value), null, !!open, true);
+        }
+        static upperBound(value, open) {
+            return new IDBKeyRange(__idbToken, null, __idbKey(value), true, !!open);
+        }
+        static bound(lower, upper, lowerOpen, upperOpen) {
+            const low = __idbKey(lower), high = __idbKey(upper);
+            if (__idbCompare(low, high) > 0)
+                throw __idbException("DataError", "The lower key is greater than the upper key.");
+            return new IDBKeyRange(__idbToken, low, high, !!lowerOpen, !!upperOpen);
+        }
+        get [Symbol.toStringTag]() { return "IDBKeyRange"; }
+    }
+    function __idbRange(query, nullMeansUnbounded) {
+        if ((query === undefined || query === null) && nullMeansUnbounded) return null;
+        return query instanceof IDBKeyRange ? query : IDBKeyRange.only(query);
+    }
+    function __idbRangeIncludes(range, key) {
+        if (range === null) return true;
+        if (range.__lower !== null) {
+            const lower = __idbCompare(key, range.__lower);
+            if (lower < 0 || (lower === 0 && range.lowerOpen)) return false;
+        }
+        if (range.__upper !== null) {
+            const upper = __idbCompare(key, range.__upper);
+            if (upper > 0 || (upper === 0 && range.upperOpen)) return false;
+        }
+        return true;
+    }
+
+    class IDBRequest extends EventTarget {
+        constructor(token, source, transaction) {
+            super();
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.__source = source || null; this.__transaction = transaction || null;
+            this.__done = false; this.__result = undefined; this.__error = null;
+        }
+        get result() {
+            if (!this.__done) throw __idbException("InvalidStateError", "The request is still pending.");
+            return this.__result;
+        }
+        get error() {
+            if (!this.__done) throw __idbException("InvalidStateError", "The request is still pending.");
+            return this.__error;
+        }
+        get source() { return this.__source; }
+        get transaction() { return this.__transaction; }
+        get readyState() { return this.__done ? "done" : "pending"; }
+        get [Symbol.toStringTag]() { return "IDBRequest"; }
+    }
+    class IDBOpenDBRequest extends IDBRequest {
+        constructor(token) { super(token, null, null); }
+        get [Symbol.toStringTag]() { return "IDBOpenDBRequest"; }
+    }
+    class IDBVersionChangeEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            this.oldVersion = init && init.oldVersion !== undefined ? Number(init.oldVersion) : 0;
+            this.newVersion = init && init.newVersion !== undefined ? init.newVersion : null;
+        }
+        get [Symbol.toStringTag]() { return "IDBVersionChangeEvent"; }
+    }
+    installHandlerProps(IDBRequest.prototype, ["success", "error"]);
+    installHandlerProps(IDBOpenDBRequest.prototype, ["blocked", "upgradeneeded"]);
+
+    function __idbVersionEvent(target, type, oldVersion, newVersion) {
+        const event = createTrustedEvent(IDBVersionChangeEvent, type,
+            { oldVersion: oldVersion, newVersion: newVersion });
+        dispatch(target, event, false);
+        return event;
+    }
+    function __idbRequestEvent(request, type, bubbles, cancelable) {
+        const event = createTrustedEvent(Event, type,
+            { bubbles: !!bubbles, cancelable: !!cancelable });
+        dispatch(request, event, false);
+        return event;
+    }
+    function __idbScopesOverlap(a, b) {
+        for (const name of a.__scope) if (b.__scope.includes(name)) return true;
+        return false;
+    }
+    function __idbCanStart(transaction) {
+        const transactions = transaction.__db.transactions;
+        const index = transactions.indexOf(transaction);
+        for (let priorIndex = 0; priorIndex < index; priorIndex++) {
+            const prior = transactions[priorIndex];
+            if (prior.__state === "finished" || !__idbScopesOverlap(transaction, prior)) continue;
+            if (transaction.mode !== "readonly" || prior.mode !== "readonly") return false;
+        }
+        return true;
+    }
+    function __idbMaybeStartTransactions(database) {
+        for (const transaction of database.transactions) {
+            if (transaction.__started || transaction.__state === "finished") continue;
+            if (!__idbCanStart(transaction)) continue;
+            transaction.__started = true;
+            transaction.__data = __idbCloneData(database.data);
+            __idbProcess(transaction);
+        }
+    }
+    function __idbFinishConnectionClose(connection) {
+        if (!connection.__closePending) return;
+        if (connection.__db.transactions.some((transaction) =>
+            transaction.__connection === connection && transaction.__state !== "finished")) return;
+        connection.__closed = true;
+        connection.__db.connections.delete(connection);
+        // §§5.1–5.3 wait on actual closure, not merely close-pending. Notify
+        // blocked open/delete operations without polling or an idle spin.
+        for (const waiter of Array.from(connection.__db.connectionWaiters)) waiter();
+    }
+    function __idbCommit(transaction) {
+        if (transaction.__state === "finished" || transaction.__commitTask) return;
+        transaction.__state = "committing";
+        transaction.__commitTask = true;
+        __queue_dom_task(() => {
+            if (transaction.__state === "finished") return;
+            try {
+                if (transaction.mode !== "readonly") {
+                    __idbSaveData(transaction.__db.name, transaction.__data);
+                    transaction.__db.data = transaction.__data;
+                    transaction.__connection.__version = transaction.__data.version;
+                }
+                transaction.__state = "finished";
+                transaction.__db.transactions = transaction.__db.transactions.filter((item) => item !== transaction);
+                dispatch(transaction, createTrustedEvent(Event, "complete"), false);
+                if (transaction.__openRequest) {
+                    transaction.__openRequest.__transaction = null;
+                    transaction.__connection.__db.__upgrade = null;
+                    __idbOpenSuccess(transaction.__openRequest, transaction.__connection);
+                }
+            } catch (error) { __idbAbort(transaction, error); return; }
+            __idbFinishConnectionClose(transaction.__connection);
+            __idbMaybeStartTransactions(transaction.__db);
+        });
+    }
+    function __idbAbort(transaction, error) {
+        if (transaction.__state === "finished") return;
+        transaction.__state = "finished";
+        transaction.__error = error || null;
+        transaction.__db.transactions = transaction.__db.transactions.filter((item) => item !== transaction);
+        const pending = transaction.__requests.splice(0);
+        for (const request of pending) {
+            request.__done = true; request.__result = undefined;
+            request.__error = __idbException("AbortError", "The transaction was aborted.");
+            __queue_dom_task(() => __idbRequestEvent(request, "error", true, true));
+        }
+        __queue_dom_task(() => {
+            dispatch(transaction,
+                createTrustedEvent(Event, "abort", { bubbles: true }), false);
+            if (transaction.__openRequest) {
+                transaction.__connection.__db.__upgrade = null;
+                transaction.__openRequest.__transaction = null;
+                transaction.__openRequest.__done = true;
+                transaction.__openRequest.__result = undefined;
+                transaction.__openRequest.__error = __idbException("AbortError", "The version change transaction was aborted.");
+                __idbRequestEvent(transaction.__openRequest, "error", true, true);
+                // §5.1 closes a connection whose upgrade request failed before
+                // allowing the next same-name connection request to proceed.
+                transaction.__connection.__closePending = true;
+                __idbFinishConnectionRequest(transaction.__openRequest);
+            }
+            __idbFinishConnectionClose(transaction.__connection);
+            __idbMaybeStartTransactions(transaction.__db);
+        });
+    }
+    function __idbProcess(transaction) {
+        if (!transaction.__started || transaction.__processing ||
+            transaction.__state === "finished") return;
+        if (!transaction.__requests.length) {
+            if (transaction.__state === "inactive" || transaction.__state === "committing") __idbCommit(transaction);
+            return;
+        }
+        transaction.__processing = true;
+        __queue_dom_task(() => {
+            if (transaction.__state === "finished") { transaction.__processing = false; return; }
+            const request = transaction.__requests.shift();
+            let result, error = null;
+            try { result = request.__operation(); }
+            catch (caught) { error = caught instanceof DOMException ? caught : __idbException("UnknownError", String(caught && caught.message || caught)); }
+            request.__done = true;
+            request.__result = error ? undefined : result;
+            request.__error = error;
+            transaction.__state = "active";
+            const event = __idbRequestEvent(request, error ? "error" : "success", !!error, !!error);
+            if (transaction.__state === "active") transaction.__state = "inactive";
+            transaction.__processing = false;
+            // Indexed Database 3 §§5.9–5.10: a listener exception aborts with
+            // AbortError even if an error event was canceled. DOM dispatch
+            // reports that condition through its IndexedDB-only legacy output.
+            if (eventsWithListenerExceptions.has(event)) {
+                __idbAbort(transaction,
+                    __idbException("AbortError", "An IndexedDB event listener threw an exception."));
+                return;
+            }
+            if (error && !event.defaultPrevented) { __idbAbort(transaction, error); return; }
+            __idbProcess(transaction);
+        });
+    }
+    function __idbQueueRequest(source, operation, request) {
+        const transaction = source instanceof IDBCursor ? source.__transaction
+            : source instanceof IDBIndex ? source.objectStore.transaction : source.transaction;
+        request = request || new IDBRequest(__idbToken, source, transaction);
+        request.__operation = operation;
+        request.__done = false; request.__error = null; request.__result = undefined;
+        // Indexed Database 3 §2.8: ordinary requests return their transaction
+        // from EventTarget's get-the-parent algorithm. Open requests are never
+        // queued here and therefore retain their required null parent.
+        eventParents.set(request, transaction);
+        transaction.__requests.push(request);
+        __idbProcess(transaction);
+        return request;
+    }
+    function __idbRequireActive(transaction) {
+        if (transaction.__state !== "active")
+            throw __idbException("TransactionInactiveError", "The transaction is not active.");
+    }
+
+    class IDBTransaction extends EventTarget {
+        constructor(token, connection, scope, mode, durability, upgradeData, openRequest) {
+            super();
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.__connection = connection; this.__db = connection.__db;
+            this.__scope = scope.slice(); this.mode = mode; this.durability = durability;
+            this.__state = "active"; this.__started = mode === "versionchange";
+            this.__processing = false; this.__requests = []; this.__error = null;
+            this.__data = upgradeData || null; this.__openRequest = openRequest || null;
+            this.__handles = new Map(); this.__commitTask = false;
+            // Indexed Database 3 §2.7.1: a transaction's event parent is its
+            // database connection, whose own event parent is null.
+            eventParents.set(this, connection);
+            this.__db.transactions.push(this);
+        }
+        get objectStoreNames() { return __idbSortedNames(this.__scope); }
+        get db() { return this.__connection; }
+        get error() { return this.__error; }
+        objectStore(name) {
+            name = __idbDOMString(name);
+            if (this.__state === "finished") throw __idbException("InvalidStateError", "The transaction has finished.");
+            if (!this.__scope.includes(name)) throw __idbException("NotFoundError", "The object store is outside this transaction's scope.");
+            let handle = this.__handles.get(name);
+            if (!handle) { handle = new IDBObjectStore(__idbToken, this, name); this.__handles.set(name, handle); }
+            return handle;
+        }
+        abort() {
+            if (this.__state === "committing" || this.__state === "finished")
+                throw __idbException("InvalidStateError", "The transaction cannot be aborted.");
+            __idbAbort(this, null);
+        }
+        commit() {
+            __idbRequireActive(this);
+            this.__state = "committing";
+            if (!this.__requests.length && !this.__processing) __idbCommit(this);
+        }
+        get [Symbol.toStringTag]() { return "IDBTransaction"; }
+    }
+    installHandlerProps(IDBTransaction.prototype, ["abort", "complete", "error"]);
+
+    function __idbStoreForHandle(handle) {
+        const data = handle.transaction.__data || handle.transaction.__db.data;
+        const store = __idbStore(data, handle.__name);
+        if (!store) throw __idbException("InvalidStateError", "The object store was deleted.");
+        return store;
+    }
+    function __idbRecordList(store, range, direction) {
+        const records = store.records.filter((record) => __idbRangeIncludes(range, record.key));
+        records.sort((left, right) => __idbCompare(left.key, right.key));
+        if (direction === "prev" || direction === "prevunique") records.reverse();
+        return records;
+    }
+    function __idbIndexKeys(index, serialized) {
+        let value, extracted, key;
+        try {
+            value = g.__sc_deserialize(serialized);
+            extracted = __idbExtractPath(value, index.keyPath);
+            if (extracted === undefined) return [];
+            key = index.multiEntry ? __idbMultiEntryKey(extracted) : __idbKey(extracted);
+        } catch (_) { return []; }
+        return index.multiEntry && key.t === "a" ? key.v : [key];
+    }
+    // Indexed Database §6.3: index records are ordered by index key and then
+    // by the referenced object-store key. They are derived here from the
+    // transaction snapshot, avoiding a second persisted copy that could drift
+    // from its object store after rollback.
+    function __idbIndexRecordList(handle, range, direction) {
+        const index = handle.__index(), store = __idbStoreForHandle(handle.objectStore);
+        let records = [];
+        for (const record of store.records) {
+            for (const key of __idbIndexKeys(index, record.value)) {
+                if (__idbRangeIncludes(range, key)) records.push({
+                    key: key, primaryKey: record.key, value: record.value,
+                });
+            }
+        }
+        records.sort((left, right) => {
+            const keyOrder = __idbCompare(left.key, right.key);
+            return keyOrder || __idbCompare(left.primaryKey, right.primaryKey);
+        });
+        if (direction === "nextunique" || direction === "prevunique") {
+            records = records.filter((record, index) =>
+                index === 0 || __idbCompare(record.key, records[index - 1].key) !== 0);
+        }
+        if (direction === "prev" || direction === "prevunique") records.reverse();
+        return records;
+    }
+    function __idbSourceRecordList(source, range, direction) {
+        return source instanceof IDBIndex
+            ? __idbIndexRecordList(source, range, direction)
+            : __idbRecordList(__idbStoreForHandle(source), range, direction);
+    }
+    function __idbValidateUniqueIndexes(store, candidate, replacedKey) {
+        for (const index of store.indexes) {
+            if (!index.unique) continue;
+            const keys = __idbIndexKeys(index, candidate.value);
+            for (const record of store.records) {
+                if (replacedKey && __idbCompare(record.key, replacedKey) === 0) continue;
+                const existing = __idbIndexKeys(index, record.value);
+                for (const key of keys) for (const other of existing) {
+                    if (__idbCompare(key, other) === 0)
+                        throw __idbException("ConstraintError", "A unique index key already exists.");
+                }
+            }
+        }
+    }
+    function __idbCount(value) {
+        if (value === undefined) return undefined;
+        const number = Number(value);
+        if (!Number.isFinite(number) || number < 0 || Math.floor(number) !== number || number > 4294967295)
+            throw new TypeError("The count is outside the unsigned long range.");
+        return number;
+    }
+    function __idbStoreKey(store, serialized, keyGiven, suppliedKey) {
+        let key;
+        if (store.keyPath !== null) {
+            if (keyGiven) throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
+            const value = g.__sc_deserialize(serialized);
+            const extracted = __idbExtractPath(value, store.keyPath);
+            if (extracted !== undefined) key = __idbKey(extracted);
+            else if (!store.autoIncrement) throw __idbException("DataError", "The inline key path produced no key.");
+            else {
+                key = { t: "n", v: store.nextKey };
+                if (!__idbInjectPath(value, store.keyPath, key))
+                    throw __idbException("DataError", "The generated key could not be injected into the value.");
+                serialized = g.__sc_serialize(value);
+            }
+        } else if (keyGiven) key = __idbKey(suppliedKey);
+        else if (store.autoIncrement) key = { t: "n", v: store.nextKey };
+        else throw __idbException("DataError", "An out-of-line key is required.");
+        if (store.autoIncrement) {
+            const numeric = key.t === "n" ? __idbDecodeNumber(key.v) : NaN;
+            if (Number.isFinite(numeric) && numeric >= store.nextKey)
+                store.nextKey = Math.min(Math.floor(numeric) + 1, 9007199254740992);
+        }
+        return { key: key, value: serialized };
+    }
+    class IDBObjectStore {
+        constructor(token, transaction, name) {
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.transaction = transaction; this.__name = name; this.__keyPathValue = undefined;
+        }
+        get name() { return this.__name; }
+        set name(value) {
+            const transaction = this.transaction;
+            if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Renaming requires a versionchange transaction.");
+            __idbRequireActive(transaction);
+            const name = __idbDOMString(value), store = __idbStoreForHandle(this);
+            if (name === this.__name) return;
+            if (__idbStore(transaction.__data, name)) throw __idbException("ConstraintError", "An object store already has that name.");
+            const old = this.__name; store.name = name; this.__name = name;
+            const scopeIndex = transaction.__scope.indexOf(old); if (scopeIndex >= 0) transaction.__scope[scopeIndex] = name;
+            transaction.__handles.delete(old); transaction.__handles.set(name, this);
+        }
+        get keyPath() {
+            const path = __idbStoreForHandle(this).keyPath;
+            if (!Array.isArray(path)) return path;
+            if (this.__keyPathValue === undefined) this.__keyPathValue = path.slice();
+            return this.__keyPathValue;
+        }
+        get indexNames() { return __idbSortedNames(__idbStoreForHandle(this).indexes.map((index) => index.name)); }
+        get autoIncrement() { return !!__idbStoreForHandle(this).autoIncrement; }
+        put(value, key) { return this.__addOrPut(value, key, arguments.length > 1, false); }
+        add(value, key) { return this.__addOrPut(value, key, arguments.length > 1, true); }
+        __addOrPut(value, key, keyGiven, noOverwrite) {
+            const transaction = this.transaction; __idbRequireActive(transaction);
+            if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            // Clone during the method call, before the request is returned.
+            const serialized = g.__sc_serialize(value);
+            const initialStore = __idbStoreForHandle(this);
+            if (initialStore.keyPath !== null && keyGiven)
+                throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
+            if (initialStore.keyPath === null && !initialStore.autoIncrement && !keyGiven)
+                throw __idbException("DataError", "An out-of-line key is required.");
+            if (keyGiven) __idbKey(key);
+            return __idbQueueRequest(this, () => {
+                const store = __idbStoreForHandle(this);
+                // A failed request reverts every change made by that operation
+                // (§5.6), including key-generator advancement. Stage against a
+                // private store copy and publish only after all constraints pass.
+                const staged = __idbCloneData(store);
+                const record = __idbStoreKey(staged, serialized, keyGiven, key);
+                const index = staged.records.findIndex((item) => __idbCompare(item.key, record.key) === 0);
+                if (index >= 0 && noOverwrite) throw __idbException("ConstraintError", "The key already exists.");
+                __idbValidateUniqueIndexes(staged, record, index >= 0 ? record.key : null);
+                if (index >= 0) staged.records[index] = record; else staged.records.push(record);
+                Object.assign(store, staged);
+                return __idbKeyValue(record.key);
+            });
+        }
+        delete(query) {
+            const transaction = this.transaction; __idbRequireActive(transaction);
+            if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            const range = __idbRange(query, false);
+            return __idbQueueRequest(this, () => {
+                const store = __idbStoreForHandle(this);
+                store.records = store.records.filter((record) => !__idbRangeIncludes(range, record.key));
+                return undefined;
+            });
+        }
+        clear() {
+            const transaction = this.transaction; __idbRequireActive(transaction);
+            if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            return __idbQueueRequest(this, () => { __idbStoreForHandle(this).records = []; return undefined; });
+        }
+        get(query) { return this.__first(query, false); }
+        getKey(query) { return this.__first(query, true); }
+        __first(query, keyOnly) {
+            __idbRequireActive(this.transaction);
+            const range = __idbRange(query, false);
+            return __idbQueueRequest(this, () => {
+                const record = __idbRecordList(__idbStoreForHandle(this), range, "next")[0];
+                if (!record) return undefined;
+                return keyOnly ? __idbKeyValue(record.key) : g.__sc_deserialize(record.value);
+            });
+        }
+        getAll(query, count) { return this.__all(query, count, false, arguments.length > 0); }
+        getAllKeys(query, count) { return this.__all(query, count, true, arguments.length > 0); }
+        __all(query, count, keyOnly, queryGiven) {
+            __idbRequireActive(this.transaction);
+            const range = __idbRange(queryGiven ? query : null, true), limit = __idbCount(count);
+            return __idbQueueRequest(this, () => {
+                let records = __idbRecordList(__idbStoreForHandle(this), range, "next");
+                if (limit !== undefined && limit !== 0) records = records.slice(0, limit);
+                return records.map((record) => keyOnly ? __idbKeyValue(record.key) : g.__sc_deserialize(record.value));
+            });
+        }
+        count(query) {
+            __idbRequireActive(this.transaction);
+            const range = __idbRange(arguments.length ? query : null, true);
+            return __idbQueueRequest(this, () => __idbRecordList(__idbStoreForHandle(this), range, "next").length);
+        }
+        openCursor(query, direction) { return this.__openCursor(query, direction, false, arguments.length > 0); }
+        openKeyCursor(query, direction) { return this.__openCursor(query, direction, true, arguments.length > 0); }
+        __openCursor(query, direction, keyOnly, queryGiven) {
+            __idbRequireActive(this.transaction);
+            direction = direction === undefined ? "next" : String(direction);
+            if (!["next", "nextunique", "prev", "prevunique"].includes(direction)) throw new TypeError("Invalid cursor direction.");
+            const range = __idbRange(queryGiven ? query : null, true);
+            const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
+                : new IDBCursorWithValue(__idbToken, this, direction, range);
+            const request = new IDBRequest(__idbToken, this, this.transaction);
+            cursor.__request = request;
+            return __idbQueueRequest(this, () => cursor.__iterate(), request);
+        }
+        createIndex(name, keyPath, options) {
+            const transaction = this.transaction;
+            if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Index creation requires a versionchange transaction.");
+            __idbRequireActive(transaction);
+            name = __idbDOMString(name); options = options || {};
+            if (!__idbKeyPathValid(keyPath)) throw __idbException("SyntaxError", "The index key path is invalid.");
+            if (Array.isArray(keyPath) && options.multiEntry) throw __idbException("InvalidAccessError", "A sequence key path cannot be multiEntry.");
+            const store = __idbStoreForHandle(this);
+            if (store.indexes.some((index) => index.name === name)) throw __idbException("ConstraintError", "The index already exists.");
+            store.indexes.push({ name: name, keyPath: Array.isArray(keyPath) ? keyPath.slice() : String(keyPath), unique: !!options.unique, multiEntry: !!options.multiEntry });
+            const handle = new IDBIndex(__idbToken, this, name);
+            // Index population is an asynchronous request in the upgrade
+            // transaction. createIndex() still returns synchronously; an
+            // existing-data uniqueness violation aborts the transaction later.
+            __idbQueueRequest(this, () => {
+                if (!handle.unique) return undefined;
+                const records = __idbIndexRecordList(handle, null, "next");
+                for (let index = 1; index < records.length; index++) {
+                    if (__idbCompare(records[index - 1].key, records[index].key) === 0)
+                        throw __idbException("ConstraintError", "Existing records violate the unique index.");
+                }
+                return undefined;
+            });
+            return handle;
+        }
+        index(name) {
+            name = __idbDOMString(name);
+            if (!__idbStoreForHandle(this).indexes.some((index) => index.name === name))
+                throw __idbException("NotFoundError", "The index does not exist.");
+            return new IDBIndex(__idbToken, this, name);
+        }
+        deleteIndex(name) {
+            const transaction = this.transaction;
+            if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Index deletion requires a versionchange transaction.");
+            __idbRequireActive(transaction); name = __idbDOMString(name);
+            const store = __idbStoreForHandle(this), index = store.indexes.findIndex((item) => item.name === name);
+            if (index < 0) throw __idbException("NotFoundError", "The index does not exist.");
+            store.indexes.splice(index, 1);
+        }
+        get [Symbol.toStringTag]() { return "IDBObjectStore"; }
+    }
+
+    class IDBIndex {
+        constructor(token, objectStore, name) {
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.objectStore = objectStore; this.__name = name; this.__keyPathValue = undefined;
+        }
+        __index() {
+            const index = __idbStoreForHandle(this.objectStore).indexes.find((item) => item.name === this.__name);
+            if (!index) throw __idbException("InvalidStateError", "The index was deleted.");
+            return index;
+        }
+        get name() { return this.__name; }
+        set name(value) {
+            const transaction = this.objectStore.transaction;
+            if (transaction.mode !== "versionchange")
+                throw __idbException("InvalidStateError", "Renaming an index requires a versionchange transaction.");
+            __idbRequireActive(transaction);
+            const name = __idbDOMString(value), index = this.__index();
+            if (name === this.__name) return;
+            const store = __idbStoreForHandle(this.objectStore);
+            if (store.indexes.some((item) => item.name === name))
+                throw __idbException("ConstraintError", "An index already has that name.");
+            index.name = name; this.__name = name;
+        }
+        get keyPath() {
+            const path = this.__index().keyPath;
+            if (!Array.isArray(path)) return path;
+            if (this.__keyPathValue === undefined) this.__keyPathValue = path.slice();
+            return this.__keyPathValue;
+        }
+        get multiEntry() { return this.__index().multiEntry; }
+        get unique() { return this.__index().unique; }
+        get(query) { return this.__first(query, false); }
+        getKey(query) { return this.__first(query, true); }
+        __first(query, keyOnly) {
+            __idbRequireActive(this.objectStore.transaction);
+            const range = __idbRange(query, false);
+            return __idbQueueRequest(this, () => {
+                const record = __idbIndexRecordList(this, range, "next")[0];
+                if (!record) return undefined;
+                return keyOnly ? __idbKeyValue(record.primaryKey) : g.__sc_deserialize(record.value);
+            });
+        }
+        getAll(query, count) { return this.__all(query, count, false, arguments.length > 0); }
+        getAllKeys(query, count) { return this.__all(query, count, true, arguments.length > 0); }
+        __all(query, count, keyOnly, queryGiven) {
+            __idbRequireActive(this.objectStore.transaction);
+            let direction = "next", rangeQuery = queryGiven ? query : null, limit = count;
+            if (queryGiven && query && typeof query === "object" && !(query instanceof IDBKeyRange) &&
+                !(query instanceof Date) && !Array.isArray(query) &&
+                !(query instanceof ArrayBuffer) && !ArrayBuffer.isView(query) &&
+                ("query" in query || "count" in query || "direction" in query)) {
+                rangeQuery = query.query === undefined ? null : query.query;
+                limit = query.count;
+                direction = query.direction === undefined ? "next" : String(query.direction);
+            }
+            if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
+                throw new TypeError("Invalid retrieval direction.");
+            const range = __idbRange(rangeQuery, true), bounded = __idbCount(limit);
+            return __idbQueueRequest(this, () => {
+                let records = __idbIndexRecordList(this, range, direction);
+                if (bounded !== undefined && bounded !== 0) records = records.slice(0, bounded);
+                return records.map((record) => keyOnly
+                    ? __idbKeyValue(record.primaryKey) : g.__sc_deserialize(record.value));
+            });
+        }
+        count(query) {
+            __idbRequireActive(this.objectStore.transaction);
+            const range = __idbRange(arguments.length ? query : null, true);
+            return __idbQueueRequest(this, () => __idbIndexRecordList(this, range, "next").length);
+        }
+        openCursor(query, direction) { return this.__openCursor(query, direction, false, arguments.length > 0); }
+        openKeyCursor(query, direction) { return this.__openCursor(query, direction, true, arguments.length > 0); }
+        __openCursor(query, direction, keyOnly, queryGiven) {
+            __idbRequireActive(this.objectStore.transaction);
+            direction = direction === undefined ? "next" : String(direction);
+            if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
+                throw new TypeError("Invalid cursor direction.");
+            const range = __idbRange(queryGiven ? query : null, true);
+            const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
+                : new IDBCursorWithValue(__idbToken, this, direction, range);
+            const request = new IDBRequest(__idbToken, this, this.objectStore.transaction);
+            cursor.__request = request;
+            return __idbQueueRequest(this, () => cursor.__iterate(), request);
+        }
+        get [Symbol.toStringTag]() { return "IDBIndex"; }
+    }
+
+    class IDBCursor {
+        constructor(token, source, direction, range) {
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.source = source; this.direction = direction; this.__range = range;
+            this.__transaction = source instanceof IDBIndex
+                ? source.objectStore.transaction : source.transaction;
+            this.__request = null;
+            this.__gotValue = false; this.__position = -1; this.__records = null;
+            this.__key = undefined; this.__primaryKey = undefined; this.__value = undefined;
+        }
+        get request() { return this.__request; }
+        get key() {
+            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            return this.__key;
+        }
+        get primaryKey() {
+            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            return this.__primaryKey;
+        }
+        __iterate(skip, target) {
+            this.__records = __idbSourceRecordList(this.source, this.__range, this.direction);
+            let next = this.__position + (skip || 1);
+            if (target) {
+                while (next < this.__records.length &&
+                    (this.direction.startsWith("prev")
+                        ? __idbCompare(this.__records[next].key, target) > 0
+                        : __idbCompare(this.__records[next].key, target) < 0)) next++;
+            }
+            if (next >= this.__records.length) {
+                this.__gotValue = false; this.__position = this.__records.length;
+                this.__key = this.__primaryKey = this.__value = undefined;
+                return null;
+            }
+            this.__position = next;
+            const record = this.__records[next];
+            this.__key = __idbKeyValue(record.key);
+            this.__primaryKey = __idbKeyValue(record.primaryKey || record.key);
+            this.__value = g.__sc_deserialize(record.value); this.__gotValue = true;
+            return this;
+        }
+        continue(key) {
+            __idbRequireActive(this.__transaction);
+            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
+            let target = null;
+            if (arguments.length) {
+                target = __idbKey(key);
+                const compared = __idbCompare(target, __idbKey(this.__key));
+                if ((this.direction.startsWith("next") && compared <= 0) ||
+                    (this.direction.startsWith("prev") && compared >= 0))
+                    throw __idbException("DataError", "The continuation key does not advance the cursor.");
+            }
+            this.__gotValue = false;
+            return __idbQueueRequest(this, () => this.__iterate(1, target), this.__request), undefined;
+        }
+        advance(count) {
+            count = Number(count);
+            if (!Number.isInteger(count) || count <= 0 || count > 4294967295) throw new TypeError("Cursor advance count must be a positive unsigned long.");
+            __idbRequireActive(this.__transaction);
+            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
+            this.__gotValue = false;
+            return __idbQueueRequest(this, () => this.__iterate(count), this.__request), undefined;
+        }
+        delete() {
+            __idbRequireActive(this.__transaction);
+            if (this.__transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            const key = __idbKey(this.__primaryKey);
+            return __idbQueueRequest(this, () => {
+                const store = __idbStoreForHandle(this.source instanceof IDBIndex
+                    ? this.source.objectStore : this.source);
+                store.records = store.records.filter((record) => __idbCompare(record.key, key) !== 0);
+                return undefined;
+            });
+        }
+        update(value) {
+            __idbRequireActive(this.__transaction);
+            if (this.__transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            if (!this.__gotValue || !(this instanceof IDBCursorWithValue))
+                throw __idbException("InvalidStateError", "The cursor cannot update a value.");
+            const store = this.source instanceof IDBIndex ? this.source.objectStore : this.source;
+            return store.put(value, this.__primaryKey);
+        }
+        get [Symbol.toStringTag]() { return "IDBCursor"; }
+    }
+    class IDBCursorWithValue extends IDBCursor {
+        get value() {
+            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            return this.__value;
+        }
+        get [Symbol.toStringTag]() { return "IDBCursorWithValue"; }
+    }
+
+    class IDBDatabase extends EventTarget {
+        constructor(token, state, version) {
+            super();
+            if (token !== __idbToken) throw new TypeError("Illegal constructor");
+            this.__db = state; this.__version = version;
+            this.__closePending = false; this.__closed = false;
+            state.connections.add(this);
+        }
+        get name() { return this.__db.name; }
+        get version() { return this.__version; }
+        get objectStoreNames() {
+            const data = this.__db.__upgrade && this.__db.__upgrade.__connection === this
+                ? this.__db.__upgrade.__data : this.__db.data;
+            return __idbSortedNames(data.stores.map((store) => store.name));
+        }
+        transaction(storeNames, mode, options) {
+            if (arguments.length === 0) throw new TypeError("IDBDatabase.transaction requires store names.");
+            if (this.__db.__upgrade) throw __idbException("InvalidStateError", "A versionchange transaction is active.");
+            if (this.__closePending || this.__closed) throw __idbException("InvalidStateError", "The connection is closing.");
+            const scope = typeof storeNames === "string" ? [storeNames]
+                : Array.from(storeNames, __idbDOMString);
+            const unique = Array.from(new Set(scope));
+            if (!unique.length) throw __idbException("InvalidAccessError", "A transaction scope cannot be empty.");
+            for (const name of unique) if (!__idbStore(this.__db.data, name))
+                throw __idbException("NotFoundError", "An object store in the scope does not exist.");
+            mode = mode === undefined ? "readonly" : String(mode);
+            if (mode !== "readonly" && mode !== "readwrite") throw new TypeError("Invalid transaction mode.");
+            const durability = options && options.durability !== undefined ? String(options.durability) : "default";
+            if (!["default", "strict", "relaxed"].includes(durability)) throw new TypeError("Invalid transaction durability.");
+            const transaction = new IDBTransaction(__idbToken, this, unique, mode, durability);
+            // HTML invokes IndexedDB transaction cleanup after the current task.
+            // This queued database task is therefore behind all synchronous
+            // requests made by the author in the creating task.
+            __queue_dom_task(() => {
+                if (transaction.__state === "active") transaction.__state = "inactive";
+                __idbMaybeStartTransactions(transaction.__db);
+                __idbProcess(transaction);
+            });
+            return transaction;
+        }
+        createObjectStore(name, options) {
+            const transaction = this.__db.__upgrade;
+            if (!transaction || transaction.__connection !== this)
+                throw __idbException("InvalidStateError", "Object stores can only be created during an upgrade.");
+            __idbRequireActive(transaction); name = __idbDOMString(name); options = options || {};
+            let keyPath = options.keyPath === undefined ? null : options.keyPath;
+            if (keyPath !== null) {
+                if (!__idbKeyPathValid(keyPath)) throw __idbException("SyntaxError", "The object store key path is invalid.");
+                keyPath = Array.isArray(keyPath) ? keyPath.slice() : String(keyPath);
+            }
+            if (__idbStore(transaction.__data, name)) throw __idbException("ConstraintError", "The object store already exists.");
+            if (options.autoIncrement && (keyPath === "" || Array.isArray(keyPath)))
+                throw __idbException("InvalidAccessError", "This key path cannot use autoIncrement.");
+            transaction.__data.stores.push({ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
+            if (!transaction.__scope.includes(name)) transaction.__scope.push(name);
+            return transaction.objectStore(name);
+        }
+        deleteObjectStore(name) {
+            const transaction = this.__db.__upgrade;
+            if (!transaction || transaction.__connection !== this)
+                throw __idbException("InvalidStateError", "Object stores can only be deleted during an upgrade.");
+            __idbRequireActive(transaction); name = __idbDOMString(name);
+            const index = transaction.__data.stores.findIndex((store) => store.name === name);
+            if (index < 0) throw __idbException("NotFoundError", "The object store does not exist.");
+            transaction.__data.stores.splice(index, 1);
+            transaction.__scope = transaction.__scope.filter((item) => item !== name);
+        }
+        close() { this.__closePending = true; __idbFinishConnectionClose(this); }
+        get [Symbol.toStringTag]() { return "IDBDatabase"; }
+    }
+    installHandlerProps(IDBDatabase.prototype, ["abort", "close", "error", "versionchange"]);
+
+    function __idbOpenSuccess(request, connection) {
+        __queue_dom_task(() => {
+            request.__result = connection; request.__error = null; request.__done = true;
+            __idbRequestEvent(request, "success", false, false);
+            __idbFinishConnectionRequest(request);
+        });
+    }
+    function __idbWaitForConnections(request, state, version, continuation) {
+        // Capture the standard's openConnections set. Connections that are
+        // already close-pending receive no versionchange event, but still block
+        // until their outstanding transactions finish and they truly close.
+        const open = Array.from(state.connections).filter((connection) => !connection.__closed);
+        if (!open.length) { continuation(); return; }
+        for (const connection of open) {
+            if (connection.__closePending) continue;
+            __queue_dom_task(() => {
+                if (!connection.__closed && !connection.__closePending)
+                    __idbVersionEvent(connection, "versionchange", state.data.version, version);
+            });
+        }
+        __queue_dom_task(() => {
+            const remaining = open.filter((connection) => !connection.__closed);
+            if (remaining.length) __idbVersionEvent(request, "blocked", state.data.version, version);
+            if (!remaining.length) { continuation(); return; }
+            let waiting = true;
+            const resume = () => {
+                if (!waiting || open.some((connection) => !connection.__closed)) return;
+                waiting = false;
+                state.connectionWaiters.delete(resume);
+                __queue_dom_task(continuation);
+            };
+            state.connectionWaiters.add(resume);
+        });
+    }
+    class IDBFactory {
+        constructor(token) { if (token !== __idbToken) throw new TypeError("Illegal constructor"); }
+        open(name, version) {
+            if (arguments.length === 0) throw new TypeError("IDBFactory.open requires a database name.");
+            name = __idbDOMString(name);
+            if (version !== undefined) {
+                version = Number(version);
+                if (!Number.isSafeInteger(version) || version <= 0) throw new TypeError("The database version must be a positive unsigned long long.");
+            }
+            const request = new IDBOpenDBRequest(__idbToken);
+            __idbEnqueueConnectionRequest(name, (finish) => {
+                __idbConnectionFinishes.set(request, finish);
+                const state = __idbDatabaseState(name, true);
+                const requested = version === undefined ? (state.data.version || 1) : version;
+                if (state.data.version > requested) {
+                    request.__done = true; request.__error = __idbException("VersionError", "The requested version is lower than the database version.");
+                    __idbRequestEvent(request, "error", true, true);
+                    __idbFinishConnectionRequest(request);
+                    return;
+                }
+                const openConnection = () => {
+                    const connection = new IDBDatabase(__idbToken, state, requested);
+                    if (state.data.version === requested) { __idbOpenSuccess(request, connection); return; }
+                    const oldVersion = state.data.version;
+                    const data = __idbCloneData(state.data); data.version = requested;
+                    const transaction = new IDBTransaction(__idbToken, connection,
+                        data.stores.map((store) => store.name), "versionchange", "default", data, request);
+                    state.__upgrade = transaction;
+                    request.__result = connection; request.__transaction = transaction; request.__done = true;
+                    transaction.__state = "active";
+                    __idbVersionEvent(request, "upgradeneeded", oldVersion, requested);
+                    if (transaction.__state === "active") transaction.__state = "inactive";
+                    __idbProcess(transaction);
+                };
+                if (state.data.version < requested)
+                    __idbWaitForConnections(request, state, requested, openConnection);
+                else openConnection();
+            });
+            return request;
+        }
+        deleteDatabase(name) {
+            if (arguments.length === 0) throw new TypeError("IDBFactory.deleteDatabase requires a database name.");
+            name = __idbDOMString(name);
+            const request = new IDBOpenDBRequest(__idbToken);
+            __idbEnqueueConnectionRequest(name, (finish) => {
+                __idbConnectionFinishes.set(request, finish);
+                const state = __idbDatabaseState(name, false);
+                const oldVersion = state ? state.data.version : 0;
+                const remove = () => {
+                    __storage_remove(__idbDataKind, name); __idbCatalog.delete(name);
+                    request.__done = true; request.__result = undefined; request.__error = null;
+                    __idbVersionEvent(request, "success", oldVersion, null);
+                    __idbFinishConnectionRequest(request);
+                };
+                if (state) __idbWaitForConnections(request, state, null, remove); else remove();
+            });
+            return request;
+        }
+        databases() {
+            const result = [];
+            const count = __storage_len(__idbDataKind);
+            for (let index = 0; index < count; index++) {
+                const name = __storage_key(__idbDataKind, index);
+                if (name === null) continue;
+                const data = __idbLoadData(name);
+                if (data && data.version) result.push({ name: name, version: data.version });
+            }
+            for (const [name, state] of __idbCatalog) {
+                if (state.data.version && !result.some((entry) => entry.name === name))
+                    result.push({ name: name, version: state.data.version });
+            }
+            return Promise.resolve(result);
+        }
+        cmp(first, second) {
+            if (arguments.length < 2) throw new TypeError("IDBFactory.cmp requires two keys.");
+            return __idbCompare(__idbKey(first), __idbKey(second));
+        }
+        get [Symbol.toStringTag]() { return "IDBFactory"; }
+    }
+
+    g.IDBRequest = IDBRequest; g.IDBOpenDBRequest = IDBOpenDBRequest;
+    g.IDBVersionChangeEvent = IDBVersionChangeEvent; g.IDBFactory = IDBFactory;
+    g.IDBDatabase = IDBDatabase; g.IDBTransaction = IDBTransaction;
+    g.IDBObjectStore = IDBObjectStore; g.IDBIndex = IDBIndex;
+    g.IDBKeyRange = IDBKeyRange; g.IDBCursor = IDBCursor;
+    g.IDBCursorWithValue = IDBCursorWithValue;
+    Object.defineProperty(g, "indexedDB", {
+        configurable: true, enumerable: true,
+        value: new IDBFactory(__idbToken), writable: false,
+    });
+
     // AbortSignal is a real EventTarget (it dispatches "abort"), and the
     // statics `abort`/`timeout`/`any` are widely referenced — YouTube's
     // kevlar bundle reads the bare `AbortSignal` global, a ReferenceError
@@ -9375,7 +12471,9 @@
         postMessage(data) {
             const other = this.__other;
             if (!other || this.__closed || other.__closed) return;
-            portMessages.push({ target: other, data: data, frame: other.__frame || null });
+            const frame = other.__frame || null;
+            portMessages.push({ target: other, data: data, frame: frame,
+                windowState: frame ? windowStateForFrame(frame) : topWindowState });
         }
         start() { if (!this.__closed) this.__started = true; }
         close() {
@@ -9463,12 +12561,18 @@
     // another one. FIFO ordering remains intact within each source.
     let platformSourceCursor = 0;
     trust.hasPlatformTask = function () {
-        return networkTasks.length > 0 || domTasks.length > 0 || intersectionTasks.length > 0 ||
-            trust.hasMessageTask() || idleTasks.length > 0;
+        if (networkTasks.length > 0 || domTasks.length > 0 || intersectionTasks.length > 0 ||
+            trust.hasMessageTask() || idleTasks.length > 0) return true;
+        for (const childTrust of childWindowTrusts) {
+            if (childTrust && childTrust.hasPlatformTask()) return true;
+        }
+        return false;
     };
     trust.runPlatformTask = function () {
-        for (let offset = 0; offset < 6; offset++) {
-            const source = (platformSourceCursor + offset) % 6;
+        const children = Array.from(childWindowTrusts);
+        const sourceCount = 6 + children.length;
+        for (let offset = 0; offset < sourceCount; offset++) {
+            const source = (platformSourceCursor + offset) % sourceCount;
             let task = null;
             let label = "";
             if (source === 0 && networkTasks.length) {
@@ -9484,11 +12588,17 @@
             } else if (source === 4 && intersectionTasks.length) {
                 task = intersectionTasks.shift(); label = "IntersectionObserver task";
             } else if (source === 5 && idleTasks.length) {
-                platformSourceCursor = 0;
+                platformSourceCursor = (source + 1) % sourceCount;
                 return trust.runIdleTask();
+            } else if (source >= 6) {
+                const childTrust = children[source - 6];
+                if (childTrust && childTrust.runPlatformTask()) {
+                    platformSourceCursor = (source + 1) % sourceCount;
+                    return true;
+                }
             }
             if (task) {
-                platformSourceCursor = (source + 1) % 6;
+                platformSourceCursor = (source + 1) % sourceCount;
                 try { runInFrame(task.frame, task.fn); }
                 catch (e) { trust.errors.push(label + ": " + ((e && e.message) || e)); }
                 return true;
@@ -9512,12 +12622,31 @@
                 handler = String(handler).replace(/\s+/g, " ").slice(0, 72);
                 return Math.round(timer.at - currentTime()) + "ms/n" + timer.nesting + "/w" + timer.wait + ":" + handler;
             }).join("|");
+        const domSample = domTasks.slice(0, 2).map(function (task) {
+            let handler;
+            try { handler = Function.prototype.toString.call(task.fn); }
+            catch (_) { handler = task.fn && task.fn.name || "<unknown>"; }
+            return String(handler).replace(/\s+/g, " ").slice(0, 96);
+        }).join("|");
+        const loadSample = lsFor(g, "load").slice(0, 4).map(function (entry) {
+            let handler;
+            try { handler = Function.prototype.toString.call(entry.fn); }
+            catch (_) { handler = entry.fn && entry.fn.name || "<unknown>"; }
+            return (entry.frame && entry.frame.__id || "top") + ":" +
+                String(handler).replace(/\s+/g, " ").slice(0, 64);
+        }).join("|");
+        const childSamples = [];
+        for (const childTrust of childWindowTrusts)
+            childSamples.push(childTrust.taskQueueState());
         return "timers=" + timers.q.length + "(once=" + oneShots + ",interval=" + intervals + ")" +
             ",raf=" + animationFrames.q.length +
             ",idle=" + idleCallbacks.pending.length + "/" + idleCallbacks.runnable.length + "/" + idleTasks.length +
-            ",network=" + networkTasks.length + ",dom=" + domTasks.length +
+            ",network=" + networkTasks.length + ",dom=" + domTasks.length + "[" + domSample + "]" +
+            ",loadListeners=" + lsFor(g, "load").length + "[" + loadSample + "]" +
+            ",frameLoad=" + (trust.lastFrameLoadState || "none") +
             ",intersection=" + intersectionTasks.length +
-            ",posted=" + messageTasks.length + ",next=[" + sample + "]";
+            ",posted=" + messageTasks.length + ",next=[" + sample + "]" +
+            ",children=" + childSamples.length + "{" + childSamples.join(";") + "}";
     };
 
     // BroadcastChannel: same-origin cross-context messaging. A terminal
@@ -10783,4 +13912,7 @@
     g.WebAssembly = WebAssembly;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 /*__WASM_END__*/
+    // All platform globals have now been installed. New logical Windows clone
+    // this pristine descriptor surface before author script can patch it.
+    initializeScopedWindowGlobals();
 })();

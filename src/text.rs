@@ -939,6 +939,31 @@ mod tests {
     }
 
     #[test]
+    fn thai_text_has_dictionary_line_break_opportunities() {
+        // CSS Text 3 §5 requires soft-wrap opportunities to follow the
+        // writing system's line-breaking rules; UAX #14 class SA delegates
+        // scripts such as Thai to dictionary-based segmentation. A repeated
+        // no-space Thai phrase must therefore wrap without overflow-wrap's
+        // emergency breaking behavior.
+        let style = TextStyle {
+            language: Some(String::from("th")),
+            ..TextStyle::default()
+        };
+        let text = "ภาษาไทยภาษาไทย";
+        let end = first_line_end(
+            text,
+            &style,
+            shape("ภาษาไทย", &style).advance + 1.0,
+            TextBreakStyle {
+                wrap: true,
+                ..TextBreakStyle::default()
+            },
+        );
+        assert!(end > 0 && end < text.len(), "unexpected first line: {end}");
+        assert!(text.is_char_boundary(end));
+    }
+
+    #[test]
     fn mixed_script_and_bidi_keep_clusters_and_fallback_runs() {
         let shaped = shape("abc שלום 世界", &TextStyle::default());
         assert!(!shaped.runs.is_empty());

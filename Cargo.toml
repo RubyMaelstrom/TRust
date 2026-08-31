@@ -91,7 +91,7 @@ mimalloc = { version = "0.1", optional = true }
 # Linux/FreeBSD discovery is owned by `font_system`, so do not activate
 # Fontique's native-system feature there. Other targets retain their native
 # platform catalog until their equivalent configuration policy is owned here.
-parley = { version = "0.11.1", default-features = false, features = ["std"] }
+parley = { version = "0.11.1", default-features = false, features = ["std", "complex-scripts"] }
 # Pure-Rust, path-backed catalog used to give usvg the exact same installed
 # font set that is registered with Parley. The `fs` feature indexes path-backed
 # metadata while keeping font bytes lazy; `fontconfig` and `memmap` stay off.
@@ -161,7 +161,7 @@ webpki-roots = "1.0.9"
 wuff = "0.2.8"
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
-parley = { version = "0.11.1", default-features = false, features = ["system"] }
+parley = { version = "0.11.1", default-features = false, features = ["system", "complex-scripts"] }
 
 [dev-dependencies]
 # Compiles readable `.wat` text into wasm bytes for the WebAssembly test

@@ -53,6 +53,10 @@ pub(crate) struct Frag<'t> {
     /// positioned fragment offers its abspos descendants — §10.1) is the
     /// border box inset by these.
     pub border: [f32; 4],
+    /// Used values of the CSS `width` and `height` properties. `None` for
+    /// anonymous/line fragments and boxes to which those properties do not
+    /// apply. CSSOM §9 exposes these instead of the computed `auto`/percentage.
+    pub css_size: Option<[f32; 2]>,
     /// How the Appendix E painter treats this fragment.
     pub paint: PaintFlags,
     /// The effective clip rectangle (absolute px) applied to this fragment's
@@ -160,6 +164,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
         w: fragment.w,
         h: fragment.h,
         border: fragment.border,
+        css_size: fragment.css_size,
         paint: fragment.paint,
         clip: fragment.clip,
         kind,
@@ -266,6 +271,7 @@ impl<'t> Frag<'t> {
             w: 0.0,
             h: 0.0,
             border: [0.0; 4],
+            css_size: None,
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Block,
@@ -378,6 +384,7 @@ fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag<'_> {
         w: 0.0,
         h: 0.0,
         border: [0.0; 4],
+        css_size: None,
         paint: PaintFlags::default(),
         clip: None,
         kind: FragKind::Oof(m.b, Box::new(m.ctx)),
@@ -1335,13 +1342,23 @@ impl Flow<'_> {
         cur: &mut Cursor,
         a0: usize,
     ) -> Frag<'t> {
+        let border_box_width = h.bp_l + h.content_w + h.bp_r;
+        let vertical_edges = b.style.border[TOP]
+            + self.pad(&b.style, TOP, cb.0)
+            + b.style.border[BOTTOM]
+            + self.pad(&b.style, BOTTOM, cb.0);
         let mut frag = Frag {
             node: b.node,
             x,
             y,
-            w: h.bp_l + h.content_w + h.bp_r,
+            w: border_box_width,
             h: frag_h,
             border: b.style.border,
+            css_size: Some(if b.style.border_box {
+                [border_box_width, frag_h]
+            } else {
+                [h.content_w, (frag_h - vertical_edges).max(0.0)]
+            }),
             paint: paint_flags(&b.style, false),
             clip: None,
             kind: FragKind::Block,
@@ -1416,6 +1433,7 @@ impl Flow<'_> {
                 w: 0.0,
                 h: 0.0,
                 border: [0.0; 4],
+                css_size: None,
                 paint: PaintFlags::default(),
                 clip: None,
                 kind: FragKind::Oof(ob, Box::new(inl.clone())),
@@ -1446,6 +1464,7 @@ impl Flow<'_> {
                 w: line.width,
                 h: hpx,
                 border: [0.0; 4],
+                css_size: None,
                 paint: PaintFlags::default(),
                 clip: None,
                 kind: FragKind::Line(line_frag),
@@ -1573,6 +1592,7 @@ impl Flow<'_> {
             w,
             h,
             border: [0.0; 4],
+            css_size: None,
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
@@ -2224,11 +2244,24 @@ impl Flow<'_> {
                     // the stretched child overflows its card.
                     let stretched =
                         (cross - fi[i].m[TOP] - fi[i].m[BOTTOM] - fi[i].bp_cross).max(0.0);
-                    let used = calcs[i].target.max(0.0);
-                    let (frag2, anc2) =
-                        self.item_frag(fi[i].b, used, content_w, Some(stretched), inl);
-                    fi[i].frag = Some(frag2);
-                    fi[i].anchors = anc2;
+                    let hypothetical = fi[i]
+                        .frag
+                        .as_ref()
+                        .map(|frag| (frag.h - fi[i].bp_cross).max(0.0))
+                        .unwrap_or(0.0);
+                    // Flexbox §9.4 step 5 requires the second descendant
+                    // layout only when resolving the used cross size actually
+                    // CHANGED the item's hypothetical cross size. Re-laying an
+                    // unchanged, auto-height stretch item is both unnecessary
+                    // and pathologically expensive: N nested one-child flex
+                    // rows otherwise perform 2^N identical subtree layouts.
+                    if (stretched - hypothetical).abs() > 0.01 {
+                        let used = calcs[i].target.max(0.0);
+                        let (frag2, anc2) =
+                            self.item_frag(fi[i].b, used, content_w, Some(stretched), inl);
+                        fi[i].frag = Some(frag2);
+                        fi[i].anchors = anc2;
+                    }
                 }
                 let it = &mut fi[i];
                 let frag = it.frag.as_mut().expect("laid above");
@@ -2286,6 +2319,7 @@ impl Flow<'_> {
     ) -> (Vec<Frag<'t>>, f32) {
         let mut fi: Vec<FItem> = Vec::with_capacity(items.len());
         let mut calcs: Vec<FlexCalc> = Vec::with_capacity(items.len());
+        let mut post_flex_main_definite: Vec<bool> = Vec::with_capacity(items.len());
         for it in items {
             let s = &it.style;
             let (m, auto) = self.margins_of(s, content_w);
@@ -2362,6 +2396,17 @@ impl Flow<'_> {
                 l => l.resolve(def_ch).map(to_content_v),
             }
             .unwrap_or(natural_main);
+            // Flexbox §9.8: a post-flexing main size is definite when either
+            // the container's main size or the item's flex basis is definite.
+            // Keep this separate from the numeric target: an auto-height
+            // container can produce the same number without making percentage
+            // heights inside its item definite.
+            let basis_definite = match &basis {
+                Len::Auto => def_h.is_some(),
+                Len::MinContent | Len::MaxContent | Len::FitContent => false,
+                value => value.resolve(def_ch).is_some(),
+            };
+            post_flex_main_definite.push(def_ch.is_some() || basis_definite);
             let max_main = match &s.max_height {
                 Len::None => f32::INFINITY,
                 l => l
@@ -2506,7 +2551,24 @@ impl Flow<'_> {
                 // percentage-height descendant resolving against the stale
                 // pre-shrink guess, so an `overflow:auto` panel inside never
                 // sees a bounded box and just renders unclipped.
-                if fi[i].def_h != Some(used) {
+                let prior_main = fi[i]
+                    .frag
+                    .as_ref()
+                    .map(|frag| (frag.h - bp_main).max(0.0))
+                    .unwrap_or(0.0);
+                let main_size_changed = (prior_main - used).abs() > 0.01;
+                let became_definite = post_flex_main_definite[i]
+                    && fi[i]
+                        .def_h
+                        .is_none_or(|height| (height - used).abs() > 0.01);
+                // §9.4 performs hypothetical-cross-size layout with the used
+                // main size. The first pass is already that layout when an
+                // indefinite, auto-height item kept its natural main size.
+                // Repeating it in that case adds no information and turns a
+                // nested one-child column into 2^N work. A changed target still
+                // needs layout, as does an unchanged target that became
+                // definite under §9.8 so percentage descendants can resolve.
+                if main_size_changed || became_definite {
                     let w = fi[i].frag.as_ref().expect("laid above").w;
                     let (frag2, anc2) = self.item_frag(fi[i].b, w, content_w, Some(used), inl);
                     fi[i].frag = Some(frag2);
@@ -2973,6 +3035,11 @@ impl Flow<'_> {
                 w: bp_l + content_w + bp_r,
                 h: bt + content_h + bb,
                 border: s.border,
+                css_size: Some(if s.border_box {
+                    [bp_l + content_w + bp_r, bt + content_h + bb]
+                } else {
+                    [content_w, content_h]
+                }),
                 // `item = true`: only flex/grid items and out-of-flow boxes
                 // lay through here, and for the (always-positioned)
                 // out-of-flow ones the item bit can't change the result.
@@ -3050,6 +3117,7 @@ impl Flow<'_> {
             w: r.box_w,
             h: r.box_h,
             border: [0.0; 4],
+            css_size: None,
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
@@ -3360,6 +3428,7 @@ impl Flow<'_> {
                             w: 0.0,
                             h: 0.0,
                             border: [0.0; 4],
+                            css_size: None,
                             paint: PaintFlags {
                                 positioned: true,
                                 sc: true,
@@ -3771,7 +3840,12 @@ impl Flow<'_> {
                 // it as an ordinary shrink-to-fit inline-block collapsed the
                 // viewport to the moving text, so a loop restarted partway
                 // across the containing block instead of at its start edge.
-                if self.dom.tag_name(ab.node) == Some("marquee") {
+                // CSS Pseudo 4 §4.1 makes ::before/::after fully styleable,
+                // so an `inline-block` pseudo reaches this path as a generated
+                // box with no DOM node. The WHATWG HTML Rendering §15.5.13
+                // available-size exception applies only to an actual MARQUEE
+                // element; anonymous/generated atom boxes use shrink-to-fit.
+                if ab.node != NO_NODE && self.dom.tag_name(ab.node) == Some("marquee") {
                     avail.clamp(min_w, max_w)
                 } else {
                     self.shrink_to_fit(ab, avail, parent_inl)

@@ -552,21 +552,33 @@ struct PageClock;
 
 impl boa_engine::context::Clock for PageClock {
     fn now(&self) -> boa_engine::context::time::JsInstant {
-        let ms = PAGE_CLOCK_ANCHOR.get().map_or_else(
-            || {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as f64
-            },
-            |anchor| anchor.epoch_ms + anchor.monotonic.elapsed().as_secs_f64() * 1000.0,
-        );
+        let ms = page_clock_now_ms();
         let ms = ms.max(0.0); // JsInstant is epoch-relative and non-negative
         boa_engine::context::time::JsInstant::new(
             (ms / 1000.0) as u64,
             ((ms % 1000.0) * 1_000_000.0) as u32,
         )
     }
+}
+
+fn page_clock_now_ms() -> f64 {
+    PAGE_CLOCK_ANCHOR.get().map_or_else(
+        || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+        },
+        |anchor| anchor.epoch_ms + anchor.monotonic.elapsed().as_secs_f64() * 1000.0,
+    )
+}
+
+/// High Resolution Time §§7.1: expose the realm clock without `Date`'s
+/// integral-millisecond conversion so `performance.now()` can measure short
+/// tasks against the same monotonic source used by timers and `Date`.
+fn sys_clock_now(_: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::new(page_clock_now_ms()))
 }
 
 /// `__clock_set(epochMs)` — anchor the engine's `Date` clock to the page's
@@ -581,6 +593,46 @@ fn sys_clock_set(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<
             monotonic: Instant::now(),
         }));
     }
+    Ok(JsValue::undefined())
+}
+
+fn sys_set_job_context(_: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    // The maintained Lumen backend uses this engine hook to restore HTML environment settings
+    // around promise jobs. Boa remains a comparison-only backend and has no equivalent job hook.
+    Ok(JsValue::undefined())
+}
+
+fn sys_release_job_context(
+    _: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    // Boa is comparison-only and does not multiplex HTML settings objects
+    // through one engine realm. Keep the canonical host surface identical.
+    Ok(JsValue::new(false))
+}
+
+fn sys_allocate_job_context(
+    _: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    // The comparison backend still multiplexes iframe Windows through one
+    // Realm, but settings identifiers must remain unique if the shared
+    // platform prelude creates nested browsing contexts.
+    static NEXT_CONTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let context = NEXT_CONTEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(JsValue::new(context as f64))
+}
+
+fn sys_create_window_realm(
+    _: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    // Boa is comparison-only and does not expose a same-Agent multi-Realm
+    // embedding API. The platform prelude detects this undefined result and
+    // retains its existing scoped-Window fallback.
     Ok(JsValue::undefined())
 }
 
@@ -2106,6 +2158,7 @@ type GeomCache = (
     std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    Option<crate::render::PagePaint>,
 );
 
 /// Backing for the JS geometry APIs (`getBoundingClientRect`, `offset*`/
@@ -2123,6 +2176,7 @@ struct PageGeom {
     /// Output-device density for HTML's source-candidate selection only.
     device_pixel_ratio: std::cell::Cell<f32>,
     cache: Rc<RefCell<GeomCache>>,
+    hit_testing_active: std::cell::Cell<bool>,
     /// Decoded image intrinsic sizes (URL → intrinsic CSS/image pixels), pushed
     /// by the app as
     /// its image pipeline finishes (`PageCmd::ImageSizes`). The measure pass
@@ -2801,6 +2855,7 @@ type BoaHostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 /// the shared Rust DOM, protocol, layout, and resource state.
 const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__dom_create_element", 1, sys_create_element),
+    ("__dom_create_element_ns", 3, sys_create_element_ns),
     ("__dom_create_text", 1, sys_create_text),
     ("__dom_create_fragment", 0, sys_create_fragment),
     ("__dom_parse_document", 1, sys_parse_document),
@@ -2822,12 +2877,14 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__dom_node_type", 1, sys_node_type),
     ("__dom_tag", 1, sys_tag),
     ("__dom_namespace", 1, sys_namespace),
+    ("__dom_element_name", 1, sys_element_name),
     ("__dom_get_attr", 2, sys_get_attr),
     ("__dom_computed", 2, sys_computed_style),
     ("__image_current_src", 1, sys_image_current_src),
     ("__image_complete", 1, sys_image_complete),
     ("__match_media", 3, sys_match_media),
     ("__dom_rect", 1, sys_rect),
+    ("__dom_elements_from_point", 5, sys_elements_from_point),
     ("__dom_scroll_get", 2, sys_scroll_get),
     ("__dom_scroll_set", 3, sys_scroll_set),
     ("__dom_set_attr", 3, sys_set_attr),
@@ -2845,6 +2902,7 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__dom_get_by_id", 1, sys_get_by_id),
     ("__dom_upgrade_candidates", 2, sys_upgrade_candidates),
     ("__dom_ce_candidates", 1, sys_ce_candidates),
+    ("__dom_wrapper_subtree", 1, sys_wrapper_subtree),
     ("__dom_clone", 2, sys_clone),
     ("__dom_doc_element", 0, sys_doc_element),
     ("__html_dda", 0, sys_html_dda),
@@ -2859,6 +2917,11 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__http_fetch", 5, sys_http_fetch),
     ("__http_fetch_async", 5, sys_http_fetch_async),
     ("__dom_run_injected_script", 1, sys_run_injected_script),
+    ("__dom_run_classic_script", 3, sys_run_classic_script),
+    ("__dom_allocate_job_context", 0, sys_allocate_job_context),
+    ("__dom_create_window_realm", 8, sys_create_window_realm),
+    ("__dom_set_job_context", 1, sys_set_job_context),
+    ("__dom_release_job_context", 1, sys_release_job_context),
     (
         "__dom_load_injected_stylesheet",
         1,
@@ -2866,6 +2929,7 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ),
     ("__cookie_get", 0, sys_cookie_get),
     ("__cookie_set", 1, sys_cookie_set),
+    ("__clock_now", 0, sys_clock_now),
     ("__clock_set", 1, sys_clock_set),
     ("__storage_get", 2, sys_storage_get),
     ("__storage_set", 3, sys_storage_set),
@@ -2940,6 +3004,19 @@ fn sys_create_element(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
     let tag = arg_str(args, 0, ctx);
     let dom = page_dom(ctx);
     let id = dom.borrow_mut().create_element(&tag);
+    Ok(id_value(Some(id)))
+}
+
+fn sys_create_element_ns(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let namespace = arg_str(args, 0, ctx);
+    let prefix = arg_str(args, 1, ctx);
+    let local_name = arg_str(args, 2, ctx);
+    let dom = page_dom(ctx);
+    let id = dom.borrow_mut().create_element_ns(
+        &namespace,
+        (!prefix.is_empty()).then_some(prefix.as_str()),
+        &local_name,
+    );
     Ok(id_value(Some(id)))
 }
 
@@ -3199,6 +3276,26 @@ fn sys_namespace(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     )
 }
 
+fn sys_element_name(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let Some(id) = arg_node(&d, args, 0) else {
+        return Ok(JsValue::null());
+    };
+    let Some(local_name) = d.tag_name(id) else {
+        return Ok(JsValue::null());
+    };
+    Ok(JsArray::from_iter(
+        [
+            str_value(local_name),
+            d.namespace_uri(id).map_or_else(JsValue::null, str_value),
+            d.namespace_prefix(id).map_or_else(JsValue::null, str_value),
+        ],
+        ctx,
+    )
+    .into())
+}
+
 fn sys_get_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let name = arg_str(args, 1, ctx);
     let dom = page_dom(ctx);
@@ -3227,6 +3324,14 @@ fn sys_set_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 /// or null when unset. The prelude falls back to inline style on null.
 fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let name = arg_str(args, 1, ctx);
+    // CSSOM §9: width/height resolve to their used values for a rendered box,
+    // not the computed `auto`/percentage. The fragment stores the property box
+    // size separately from its border-box geometry, honoring `box-sizing`.
+    if (name == "width" || name == "height")
+        && let Some(v) = resolved_box_size(ctx, args, name == "width")
+    {
+        return Ok(str_value(&v));
+    }
     // `grid-template-columns`/`-rows` resolve to the USED track list (CSSOM
     // resolved value), which layout captured — a grid-measuring library counts
     // `getComputedStyle(el).gridTemplateColumns.split(' ')`, so the declared
@@ -3373,7 +3478,7 @@ fn sys_image_complete(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
 /// caller can read either map; `None` when the page has no `PageGeom` (its URL
 /// didn't parse), where geometry is simply absent.
 fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
-    let (base, viewport, cache, images) = {
+    let (base, viewport, cache, images, hit_testing_active) = {
         let host = ctx.realm().host_defined();
         host.get::<PageGeom>().map(|g| {
             (
@@ -3381,6 +3486,7 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
                 g.viewport.get(),
                 g.cache.clone(),
                 g.images.clone(),
+                g.hit_testing_active.get(),
             )
         })
     }?;
@@ -3393,17 +3499,32 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
         // JS geometry reads the same engine that laid the page out
         // (layout2 architecture P7): the boxes come straight off the fragment
         // tree AND one pass yields the used grid track sizes.
-        let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
-            &d,
-            &base,
-            viewport,
-            &forms,
-            &controls,
-            &images.borrow(),
-        );
+        let (boxes, tracks, scrolling_areas, paint) = if hit_testing_active {
+            let (boxes, tracks, scrolling_areas, paint) =
+                crate::layout2::measure_cssom_with_paint_css(
+                    &d,
+                    &base,
+                    viewport,
+                    &forms,
+                    &controls,
+                    &images.borrow(),
+                );
+            (boxes, tracks, scrolling_areas, Some(paint))
+        } else {
+            let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
+                &d,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                &images.borrow(),
+            );
+            (boxes, tracks, scrolling_areas, None)
+        };
         c.1 = boxes;
         c.2 = tracks;
         c.3 = scrolling_areas;
+        c.4 = paint;
         c.0 = epoch;
     }
     drop(c);
@@ -3436,6 +3557,23 @@ fn resolved_grid_tracks(ctx: &mut Context, args: &[JsValue], columns: bool) -> O
     )
 }
 
+fn resolved_box_size(ctx: &mut Context, args: &[JsValue], width: bool) -> Option<String> {
+    let cache = ensure_geom_cache(ctx)?;
+    let id = {
+        let dom = page_dom(ctx);
+        let d = dom.borrow();
+        arg_node(&d, args, 0)?
+    };
+    let cached = cache.borrow();
+    let rect = cached.1.get(&id)?;
+    let value = if width {
+        rect.css_width?
+    } else {
+        rect.css_height?
+    };
+    Some(crate::js_host_boundary::serialize_css_px(value))
+}
+
 fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let Some(cache) = ensure_geom_cache(ctx) else {
         return Ok(JsValue::null());
@@ -3459,6 +3597,70 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         .into(),
         None => JsValue::null(),
     })
+}
+
+/// CSSOM View §5 paint-ordered hit-test candidates for Document methods.
+fn sys_elements_from_point(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let scope = args
+        .first()
+        .and_then(JsValue::as_number)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value as usize)
+        .unwrap_or(DOCUMENT);
+    let number = |index| args.get(index).and_then(JsValue::as_number).unwrap_or(0.0) as f32;
+    let (x, y, scroll_x, scroll_y) = (number(1), number(2), number(3), number(4));
+
+    let viewport = {
+        let host = ctx.realm().host_defined();
+        host.get::<PageGeom>().map(|geom| {
+            if !geom.hit_testing_active.replace(true) || geom.cache.borrow().4.is_none() {
+                geom.cache.borrow_mut().0 = u64::MAX;
+            }
+            geom.viewport.get()
+        })
+    };
+    let Some(viewport) = viewport else {
+        return Ok(JsArray::new(ctx).into());
+    };
+    let Some(cache) = ensure_geom_cache(ctx) else {
+        return Ok(JsArray::new(ctx).into());
+    };
+    let cached = cache.borrow();
+    let Some(paint) = cached.4.as_ref() else {
+        return Ok(JsArray::new(ctx).into());
+    };
+    let point = if scope == DOCUMENT {
+        crate::core::CssPoint::new(x, y)
+    } else if let Some(frame) = paint
+        .scroll_containers
+        .iter()
+        .find(|container| container.node == scope)
+    {
+        crate::core::CssPoint::new(
+            frame.viewport.x - scroll_x + x,
+            frame.viewport.y - scroll_y + y,
+        )
+    } else {
+        return Ok(JsArray::new(ctx).into());
+    };
+    let hits = crate::render::page_element_hits_at(
+        paint,
+        crate::core::CssSize::new(viewport.width, viewport.height),
+        crate::core::CssPoint::new(scroll_x, scroll_y),
+        point,
+    );
+    drop(cached);
+
+    let wanted_frame = (scope != DOCUMENT).then_some(scope);
+    let nodes = {
+        let dom = page_dom(ctx);
+        let dom = dom.borrow();
+        hits.into_iter()
+            .filter(|hit| dom.frame_owner(hit.node) == wanted_frame)
+            .map(|hit| JsValue::from(hit.node as f64))
+            .collect::<Vec<_>>()
+    };
+    Ok(JsArray::from_iter(nodes, ctx).into())
 }
 
 /// `__dom_scroll_get(id, which)` → an inner-scroll metric in px (CSSOM View,
@@ -3719,6 +3921,17 @@ fn sys_ce_candidates(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
             Some(root) => d.custom_elements_composed(root),
             None => Vec::new(),
         }
+    };
+    Ok(ids_array(ids, ctx))
+}
+
+fn sys_wrapper_subtree(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let ids = {
+        let dom = dom.borrow();
+        arg_node(&dom, args, 0)
+            .map(|root| dom.wrapper_subtree_ids(root))
+            .unwrap_or_default()
     };
     Ok(ids_array(ids, ctx))
 }
@@ -4378,17 +4591,11 @@ fn sys_crypto_sha256_digest(_: &JsValue, args: &[JsValue], ctx: &mut Context) ->
 fn sys_compression_encode(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     use std::io::Write as _;
 
-    const MAX_STREAM_CODEC_BYTES: usize = 16 * 1024 * 1024;
     let format = arg_str(args, 0, ctx);
     let input = arg_buffer_source_bytes(args, 1, ctx).ok_or_else(|| {
         boa_engine::JsNativeError::typ()
             .with_message("CompressionStream input must be a BufferSource")
     })?;
-    if input.len() > MAX_STREAM_CODEC_BYTES {
-        return Err(boa_engine::JsNativeError::range()
-            .with_message("CompressionStream input exceeds the 16 MiB page limit")
-            .into());
-    }
 
     let output = match format.as_str() {
         "deflate" => {
@@ -4415,11 +4622,6 @@ fn sys_compression_encode(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
     .map_err(|error| {
         boa_engine::JsNativeError::typ().with_message(format!("CompressionStream failed: {error}"))
     })?;
-    if output.len() > MAX_STREAM_CODEC_BYTES {
-        return Err(boa_engine::JsNativeError::range()
-            .with_message("CompressionStream output exceeds the 16 MiB page limit")
-            .into());
-    }
     Ok(boa_engine::object::builtins::JsUint8Array::from_iter(output, ctx)?.into())
 }
 
@@ -6336,6 +6538,30 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
     Ok(JsValue::undefined())
 }
 
+/// Run parser-owned nested-document source as an ECMAScript Script Record. This differs from the
+/// indirect `eval` previously used by the shared platform: top-level lexical declarations belong
+/// to the Realm's persistent Global Environment Record and remain visible to sibling scripts.
+fn sys_run_classic_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let node_id = {
+        let dom = page_dom(ctx);
+        let dom = dom.borrow();
+        let Some(node_id) = arg_node(&dom, args, 0) else {
+            return Ok(JsValue::undefined());
+        };
+        node_id
+    };
+    let source = arg_str(args, 1, ctx);
+    let name = arg_str(args, 2, ctx);
+    let _ = ctx.eval(Source::from_bytes(
+        format!("__trust.bindFrameForNode({node_id})").as_bytes(),
+    ));
+    let old_current_script = replace_current_script(ctx, Some(node_id));
+    eval_injected(ctx, &name, source.as_bytes());
+    replace_current_script(ctx, old_current_script);
+    let _ = ctx.eval(Source::from_bytes(b"__trust.restoreFrame()"));
+    Ok(JsValue::undefined())
+}
+
 /// Queue an inserted module script's fetch/evaluate steps. HTML's "prepare
 /// the script element" algorithm treats a dynamically inserted module as an
 /// asynchronous module graph, rather than as a classic `eval`; using the
@@ -7803,7 +8029,9 @@ fn load_page(
                     std::collections::HashMap::new(),
                     std::collections::HashMap::new(),
                     std::collections::HashMap::new(),
+                    None,
                 ))),
+                hit_testing_active: std::cell::Cell::new(false),
                 images: Rc::new(RefCell::new(crate::layout2::ImageSizes::new())),
             });
         }

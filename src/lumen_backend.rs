@@ -23,12 +23,29 @@ const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
     height: 384.0,
 };
 
-type LumenGeomCache = (
-    u64,
-    std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
-    std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
-    std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
-);
+struct LumenGeomCache {
+    epoch: u64,
+    boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
+    scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    paint: Option<crate::render::PagePaint>,
+    /// The cached boxes belonging to the container Document remain valid. A nested Document may
+    /// have advanced the arena-wide epoch without affecting these boxes (HTML §7.3.1.3).
+    top_document_valid: bool,
+}
+
+impl LumenGeomCache {
+    fn empty() -> Self {
+        Self {
+            epoch: u64::MAX,
+            boxes: Default::default(),
+            tracks: Default::default(),
+            scrolling_areas: Default::default(),
+            paint: None,
+            top_document_valid: false,
+        }
+    }
+}
 
 type LumenFetchResult = Option<(u16, String, Vec<u8>, String)>;
 type LumenResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
@@ -50,6 +67,7 @@ enum LumenHostTask {
         result: LumenFetchResult,
     },
     ResourceDone {
+        context: u64,
         node_id: usize,
         name: String,
         kind: LumenResourceKind,
@@ -78,7 +96,14 @@ struct LumenNetwork {
     cache: Arc<crate::http::PageCache>,
     fetched: Arc<std::sync::atomic::AtomicUsize>,
     next_fetch_id: usize,
-    pending_fetches: HashMap<usize, Value>,
+    pending_fetches: HashMap<usize, LumenPendingFetch>,
+}
+
+struct LumenPendingFetch {
+    /// Fetch's task destination: the environment whose global receives the
+    /// networking task and owns the resulting Response/Body objects.
+    context: u64,
+    resolve: Value,
 }
 
 #[derive(Clone)]
@@ -162,6 +187,7 @@ struct HostState {
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
+    hit_testing_active: Cell<bool>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
     pending_resources: usize,
@@ -171,6 +197,8 @@ struct HostState {
     workers: Option<LumenPageWorkers>,
     worker_self: Option<LumenWorkerSelf>,
     wasm: lumen_wasm::PageWasm,
+    next_window_context: u64,
+    window_realms: HashMap<u64, Value>,
 }
 
 impl HostState {
@@ -188,12 +216,8 @@ impl HostState {
             blobs: Default::default(),
             viewport: Cell::new(DEFAULT_VIEWPORT),
             device_pixel_ratio: Cell::new(1.0),
-            geom_cache: Rc::new(RefCell::new((
-                u64::MAX,
-                Default::default(),
-                Default::default(),
-                Default::default(),
-            ))),
+            geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
+            hit_testing_active: Cell::new(false),
             images: Default::default(),
             task_events: None,
             pending_resources: 0,
@@ -203,6 +227,8 @@ impl HostState {
             workers: None,
             worker_self: None,
             wasm: lumen_wasm::PageWasm::new(),
+            next_window_context: 1,
+            window_realms: HashMap::new(),
         }
     }
 
@@ -374,8 +400,6 @@ fn engine_call_trust_method(
 /// author code. `null` from the selector means an animation-frame opportunity won the ordering
 /// race, which remains a batched JavaScript algorithm and falls back to `tickTo`.
 fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<bool, EvalError> {
-    const MAX_TIMER_ARGUMENTS: usize = 65_536;
-
     let selected = engine_call_trust_method(engine, "takeTimerTaskTo", &[Value::Num(deadline)])?;
     match selected {
         Value::Bool(false) => return Ok(false),
@@ -404,10 +428,14 @@ fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<b
         .map_err(EvalError::Throw)?
         .as_num_opt()
         .unwrap_or(0.0);
-    if !length.is_finite() || length < 0.0 || length > MAX_TIMER_ARGUMENTS as f64 {
+    // HTML invokes the handler with the task's stored variadic argument list;
+    // the standard does not impose an embedder-selected element count. The
+    // platform array has an integral ECMAScript length, so only reject values
+    // that cannot be represented as a host allocation index.
+    if !length.is_finite() || length < 0.0 || length.fract() != 0.0 || length > usize::MAX as f64 {
         let error = engine.ctx().make_error(
             "RangeError",
-            "timer callback argument list exceeds the host task limit",
+            "timer callback argument list has an invalid length",
         );
         return Err(EvalError::Throw(error));
     }
@@ -423,9 +451,12 @@ fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<b
 
     let handler =
         engine_call_trust_method(engine, "beginTimerTask", std::slice::from_ref(&selected))?;
-    let global = engine.global_this();
+    let callback_this = engine
+        .ctx()
+        .member_get(&selected, "__trustTimerThis")
+        .unwrap_or_else(|_| engine.global_this());
     let (callback_error, callback_failed, callback_interrupted) =
-        match engine.call_function_interruptible(&handler, global, &args) {
+        match engine.call_function_interruptible(&handler, callback_this, &args) {
             Ok(_) => (Value::Undefined, false, None),
             Err(EvalError::Throw(error)) => (error, true, None),
             Err(EvalError::Interrupted(reason)) => (Value::Undefined, false, Some(reason)),
@@ -539,6 +570,11 @@ mod desktop {
 
     const PAGE_STACK: usize = 64 * 1024 * 1024;
     const HOST_TASK_RENDER_BURST: usize = 64;
+    /// WHATWG HTML "update the rendering" is a rendering task selected at a
+    /// hardware-constrained rendering opportunity, not the tail of every
+    /// ordinary task. Model a foreground 60 Hz display; if rendering is slow,
+    /// re-arming from the next pending update naturally drops missed frames.
+    const RENDER_INTERVAL: Duration = Duration::from_micros(16_667);
 
     /// Run the Lumen page pipeline as a one-shot transformation.
     ///
@@ -605,6 +641,9 @@ mod desktop {
             if !ran {
                 break;
             }
+        }
+        if trust_bool(&mut page, "hasRenderingUpdate") {
+            let _ = render_with_observers(&mut page);
         }
         page.outcome.elapsed = page.started.elapsed();
         let output = page.dom.borrow().serialize(DOCUMENT);
@@ -687,6 +726,10 @@ mod desktop {
         /// Viewport, density, and decoded intrinsic-size changes can require layout even when no
         /// DOM mutation occurred during the host task.
         render_environment_dirty: bool,
+        /// DOM/environment changes and observer registrations awaiting HTML's
+        /// next rendering opportunity. Ordinary task completion only sets this
+        /// bit; it never runs style/layout or rendering observers itself.
+        render_pending: bool,
         task_trace: Option<ActorTaskTrace>,
     }
 
@@ -698,6 +741,7 @@ mod desktop {
         Platform,
         Idle(f64),
         Timer,
+        Render,
         Lifecycle,
     }
 
@@ -886,6 +930,7 @@ mod desktop {
         let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
         let mut prefer_timer = false;
         let mut deferred_host_task = None;
+        let mut render_deadline = None;
 
         'event_loop: loop {
             if matches!(
@@ -900,6 +945,13 @@ mod desktop {
             virtual_origin = now - elapsed;
             let deadline = trust_number(&mut page, "nextDeadline");
             let timer_due = deadline.is_some_and(|deadline| deadline <= now);
+            if trust_bool(&mut page, "hasRenderingUpdate") {
+                page.render_pending = true;
+            }
+            if page.render_pending && render_deadline.is_none() {
+                render_deadline = Some(Instant::now() + RENDER_INTERVAL);
+            }
+            let render_due = render_deadline.is_some_and(|deadline| deadline <= Instant::now());
             let platform_ready = trust_bool(&mut page, "hasPlatformTask");
             let idle_deadline = if !platform_ready && trust_bool(&mut page, "hasIdleRequest") {
                 let end = deadline.map_or(now + 50.0, |deadline| deadline.min(now + 50.0));
@@ -922,6 +974,8 @@ mod desktop {
             // author timer lets a busy page starve its own resize task forever.
             } else if prefer_command && let Ok(command) = cmds.try_recv() {
                 immediate = Some(Wake::Cmd(Some(command)));
+            } else if render_due {
+                immediate = Some(Wake::Render);
             } else if let Some(task) = deferred_host_task
                 .take()
                 .or_else(|| host_rx.try_recv().ok())
@@ -946,8 +1000,16 @@ mod desktop {
                 immediate = Some(Wake::Idle(deadline));
             }
 
-            let wait = deadline
+            let timer_wait = deadline
                 .map(|deadline| Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0));
+            let render_wait =
+                render_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let (wait, timeout_wake) = match (timer_wait, render_wait) {
+                (Some(timer), Some(render)) if render < timer => (Some(render), Wake::Render),
+                (Some(timer), _) => (Some(timer), Wake::Timer),
+                (None, Some(render)) => (Some(render), Wake::Render),
+                (None, None) => (None, Wake::Timer),
+            };
             let wake = immediate.unwrap_or_else(|| {
                 // Lumen's forced host collection is an idle hook, not a task-
                 // boundary hook. A future timer/animation-frame deadline means
@@ -967,7 +1029,7 @@ mod desktop {
                         changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
                         task = host_rx.recv() => Wake::Host(task),
                         command = cmds.recv() => Wake::Cmd(command),
-                        () = sleep_or_pending(wait) => Wake::Timer,
+                        () = sleep_or_pending(wait) => timeout_wake,
                     }
                 })
             });
@@ -992,6 +1054,7 @@ mod desktop {
                     Wake::Platform => trace.platform_turns += 1,
                     Wake::Idle(_) => trace.idle_turns += 1,
                     Wake::Timer => trace.timer_turns += 1,
+                    Wake::Render => {}
                     Wake::Lifecycle => trace.lifecycle_turns += 1,
                 }
             }
@@ -1043,7 +1106,7 @@ mod desktop {
                     // channel. Preserve it for the next event-loop turn instead of dropping
                     // the completion at the fairness boundary.
                     deferred_host_task = next;
-                    if !finish_task_with_ack(&mut page, &events, false) {
+                    if !finish_internal_task(&mut page, &events) {
                         break;
                     }
                     prefer_timer = true;
@@ -1052,13 +1115,22 @@ mod desktop {
                 Wake::Host(None) => break,
                 Wake::Platform => {
                     prepare_unbounded_task(&interrupt);
+                    if page.task_trace.is_some() {
+                        let queues = call_trust(&mut page, "taskQueueState", &[], "task trace")
+                            .map(|value| value_string(&mut page.engine, &value))
+                            .unwrap_or_else(|| String::from("unavailable"));
+                        eprintln!("lumen: platform task begin queues={queues}");
+                    }
                     let ran = call_trust(&mut page, "runPlatformTask", &[], "platform task")
                         .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+                    if page.task_trace.is_some() {
+                        eprintln!("lumen: platform task end ran={ran}");
+                    }
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.platform_tasks += 1;
                     }
                     checkpoint(&mut page, "platform task");
-                    if !finish_task_with_ack(&mut page, &events, false) {
+                    if !finish_internal_task(&mut page, &events) {
                         break;
                     }
                     prefer_timer = true;
@@ -1078,7 +1150,7 @@ mod desktop {
                         trace.platform_tasks += 1;
                     }
                     checkpoint(&mut page, "idle task");
-                    if !finish_task_with_ack(&mut page, &events, false) {
+                    if !finish_internal_task(&mut page, &events) {
                         break;
                     }
                     prefer_timer = true;
@@ -1087,12 +1159,37 @@ mod desktop {
                 Wake::Timer => {
                     prepare_unbounded_task(&interrupt);
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
+                    let animation_frame = trust_bool(&mut page, "nextDeadlineIsAnimationFrame");
+                    if page.task_trace.is_some() {
+                        let queues = call_trust(&mut page, "taskQueueState", &[], "task trace")
+                            .map(|value| value_string(&mut page.engine, &value))
+                            .unwrap_or_else(|| String::from("unavailable"));
+                        eprintln!(
+                            "lumen: timer task begin deadline={real_now:.3} animation_frame={animation_frame} queues={queues}"
+                        );
+                    }
+                    let timer_started = Instant::now();
                     let ran = dispatch_timer_task(&mut page, real_now, "timer task");
+                    if page.task_trace.is_some() {
+                        eprintln!(
+                            "lumen: timer task end ran={ran} elapsed={:.3}s",
+                            timer_started.elapsed().as_secs_f64()
+                        );
+                    }
                     if ran && let Some(trace) = page.task_trace.as_mut() {
                         trace.timer_tasks += 1;
                     }
                     checkpoint(&mut page, "timer task");
-                    if !finish_task_with_ack(&mut page, &events, false) {
+                    // requestAnimationFrame callbacks are step 14 of the same
+                    // HTML rendering update whose style/layout and observer
+                    // steps follow them. Ordinary timer tasks merely request a
+                    // future rendering opportunity when they mutate the page.
+                    let finished = if animation_frame {
+                        finish_task_with_ack(&mut page, &events, false)
+                    } else {
+                        finish_internal_task(&mut page, &events)
+                    };
+                    if !finished {
                         break;
                     }
                     prefer_timer = false;
@@ -1112,12 +1209,23 @@ mod desktop {
                     // TRust's acknowledgement for a frontend command. Exposing one for this
                     // internal lifecycle task can overtake the next click already queued by
                     // the frontend and make that click appear to have done nothing.
-                    if !finish_task_with_ack(&mut page, &events, false) {
+                    if !finish_internal_task(&mut page, &events) {
                         break 'event_loop;
                     }
                     prefer_timer = true;
                     prefer_command = true;
                 }
+                Wake::Render => {
+                    render_deadline = None;
+                    if !finish_task_with_ack(&mut page, &events, false) {
+                        break;
+                    }
+                    prefer_timer = true;
+                    prefer_command = true;
+                }
+            }
+            if !page.render_pending {
+                render_deadline = None;
             }
             report_task_trace(&mut page);
             // Ordinary tasks have no wall-clock deadline. Clear an explicit
@@ -1317,6 +1425,7 @@ mod desktop {
             live_boundaries: HashSet::new(),
             boundary_render: HashMap::new(),
             render_environment_dirty: false,
+            render_pending: false,
             task_trace: ActorTaskTrace::enabled(),
         };
         let _ = evaluate_task(
@@ -1475,6 +1584,7 @@ mod desktop {
             || trust_bool(page, "hasPlatformTask")
             || trust_bool(page, "hasIdleRequest")
             || trust_bool(page, "hasScrollWork")
+            || trust_bool(page, "hasResizeObserver")
             || trust_bool(page, "hasInitialFramesPending")
     }
 
@@ -1586,6 +1696,7 @@ mod desktop {
     }
 
     fn checkpoint(page: &mut LumenPage, label: &str) {
+        let started = Instant::now();
         if let Err(reason) = page.engine.run_microtasks_interruptible()
             && !matches!(
                 reason,
@@ -1598,14 +1709,20 @@ mod desktop {
             ));
         }
         drain_diagnostics(page);
+        if page.task_trace.is_some() && started.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "lumen: {label} checkpoint elapsed={:.3}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
 
     fn drain_diagnostics(page: &mut LumenPage) {
         let error_start = page.outcome.errors.len();
         let console_start = page.outcome.console.len();
         for (source, errors) in [
-            ("__trust.errors.splice(0).join('\\u0000')", true),
-            ("__trust.logs.splice(0).join('\\u0000')", false),
+            ("__trust.takeErrors()", true),
+            ("__trust.takeLogs()", false),
         ] {
             let Ok(Ok(value)) = page.engine.eval_value_interruptible(source) else {
                 continue;
@@ -1784,6 +1901,13 @@ mod desktop {
     /// callbacks cannot force another layout inside this rendering opportunity.
     fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
         let mut rendered = extract_live(page);
+        // CSSOM View §13.1 compares each nested Document's viewport after the
+        // layout pass that established its iframe dimensions. The parent
+        // resize task updates the top-level viewport first; run the nested
+        // resize steps here, then repaint if a child handler changed the DOM.
+        if trust_number(page, "updateFrameResizes").unwrap_or(0.0) > 0.0 {
+            rendered = extract_live(page);
+        }
         for _ in 0..6 {
             let resized = trust_number(page, "updateResizes").unwrap_or(0.0);
             checkpoint(page, "rendering observers");
@@ -1798,7 +1922,7 @@ mod desktop {
 
     /// SVG 2 §5.6: a same-origin external `<use href="sheet.svg#symbol">` obtains the external
     /// resource document before the use-element shadow tree can be rendered. Keep the resource
-    /// cache and request cap identical to the other Lumen subresource paths.
+    /// cache and request policy identical to the other required Lumen subresource paths.
     fn prime_page_svg_sprites(page: &mut LumenPage) {
         let urls = page.dom.borrow().external_svg_use_sheets(&page.base);
         for url in urls {
@@ -1815,17 +1939,9 @@ mod desktop {
                 let shared = if let Some(shared) = network.cache.peek(&url) {
                     shared
                 } else {
-                    if network
+                    network
                         .fetched
-                        .fetch_update(
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                            |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
-                        )
-                        .is_err()
-                    {
-                        return None;
-                    }
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     network.cache.fetch(&network.handle, url.clone())
                 };
                 Some((network.handle.clone(), shared))
@@ -2098,7 +2214,7 @@ mod desktop {
                         }
                     }
                     if changed {
-                        state.geom_cache.borrow_mut().0 = u64::MAX;
+                        state.geom_cache.borrow_mut().epoch = u64::MAX;
                     }
                 }
                 if changed {
@@ -2122,7 +2238,7 @@ mod desktop {
                             return false;
                         }
                         state.viewport.set(viewport);
-                        state.geom_cache.borrow_mut().0 = u64::MAX;
+                        state.geom_cache.borrow_mut().epoch = u64::MAX;
                         true
                     });
                 page.dom
@@ -2161,7 +2277,7 @@ mod desktop {
                             return false;
                         }
                         state.device_pixel_ratio.set(ratio);
-                        state.geom_cache.borrow_mut().0 = u64::MAX;
+                        state.geom_cache.borrow_mut().epoch = u64::MAX;
                         true
                     });
                 page.dom.borrow_mut().set_device_pixel_ratio(ratio);
@@ -2324,6 +2440,27 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         acknowledge_settle: bool,
     ) -> bool {
+        finish_task_maybe_render(page, events, acknowledge_settle, true)
+    }
+
+    fn finish_internal_task(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+    ) -> bool {
+        finish_task_maybe_render(page, events, false, false)
+    }
+
+    /// Complete one HTML event-loop task. History/navigation/form/error side
+    /// effects are observable at task completion, but HTML §8.1.7.3 queues
+    /// "update the rendering" on its distinct rendering task source. Only an
+    /// actual rendering opportunity (or a browser interaction that needs an
+    /// immediate presentation acknowledgement) consumes `render_pending`.
+    fn finish_task_maybe_render(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        acknowledge_settle: bool,
+        render_now: bool,
+    ) -> bool {
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
             let _ = events.blocking_send(PageEvt::Trouble(errors));
@@ -2346,6 +2483,7 @@ mod desktop {
         let mut sent_primary = false;
         let dom_dirty = page.dom.borrow_mut().take_dirty();
         let environment_dirty = std::mem::take(&mut page.render_environment_dirty);
+        page.render_pending |= dom_dirty || environment_dirty;
         if let Some(trace) = page.task_trace.as_mut() {
             trace.finishes += 1;
             if dom_dirty || environment_dirty {
@@ -2357,7 +2495,9 @@ mod desktop {
         #[cfg(not(test))]
         let render_handled = false;
         #[cfg(test)]
-        if dom_dirty
+        if render_now
+            && page.render_pending
+            && dom_dirty
             && !environment_dirty
             // The ignored public-site acceptance gate must exercise the same
             // complete typed-render path as release binaries. Boundary patches
@@ -2376,11 +2516,24 @@ mod desktop {
                 }
             }
         }
-        if (dom_dirty || environment_dirty) && !render_handled {
+        if render_handled {
+            page.render_pending = false;
+        }
+        if render_now && page.render_pending && !render_handled {
             if let Some(trace) = page.task_trace.as_mut() {
                 trace.render_passes += 1;
             }
+            let render_started = Instant::now();
             let (html, rendered, _) = render_with_observers(page);
+            if page.task_trace.is_some() && render_started.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "lumen: rendering update elapsed={:.3}s boxes={} html={}B",
+                    render_started.elapsed().as_secs_f64(),
+                    rendered.layout.boxes.len(),
+                    html.len()
+                );
+            }
+            page.render_pending = false;
             let presentation_changed = page
                 .last_render
                 .as_ref()
@@ -2628,6 +2781,115 @@ mod desktop {
                 clicked.is_ok(),
                 "click render preceded its mandatory microtask checkpoint"
             );
+        }
+
+        #[tokio::test]
+        async fn actor_async_request_submit_preserves_hidden_successful_controls() {
+            // WHATWG HTML §§4.10.22.3–4.10.22.4 and
+            // HTMLFormElement.requestSubmit(): mirror Reddit's verification
+            // document. An async DOMContentLoaded handler mutates a hidden
+            // named control, then no-argument requestSubmit() constructs the
+            // entry list without selecting an arbitrary submit button.
+            let html = r#"<!doctype html><html><body>
+                <main>Please wait</main>
+                <form action="/verify" method="get" hidden>
+                    <input type="hidden" name="solution" value="0">
+                    <input type="hidden" name="token" value="abc">
+                    <button name="go" value="chosen">Continue</button>
+                </form>
+                <script>
+                    document.addEventListener("DOMContentLoaded", async function () {
+                        const form = document.forms[0];
+                        const answer = await (async value => value + value)(21);
+                        form.elements.namedItem("solution").value = answer;
+                        form.requestSubmit();
+                    }, { once: true });
+                </script>
+            </body></html>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            let submission = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        }
+                        Some(PageEvt::SubmitForm {
+                            submitter,
+                            submission,
+                            ..
+                        }) => {
+                            assert_eq!(
+                                submitter, None,
+                                "no-argument requestSubmit has no submitter"
+                            );
+                            break submission.expect("entry list built in the live DOM");
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("requestSubmit actor errors: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before requestSubmit navigation"),
+                    }
+                }
+            })
+            .await
+            .expect("async requestSubmit timed out");
+
+            assert_eq!(submission.action, "https://example.com/verify");
+            assert_eq!(submission.method, "get");
+            assert_eq!(submission.body, "solution=42&token=abc");
+        }
+
+        #[tokio::test]
+        async fn actor_coalesces_ordinary_tasks_before_resize_observer_rendering() {
+            // WHATWG HTML §8.1.7.3 selects rendering from its own task source,
+            // and Resize Observer §3.4 runs inside that rendering update. Two
+            // already-runnable port-message tasks may therefore be coalesced;
+            // the observer must not expose the intermediate box size merely
+            // because one ordinary task completed.
+            let html = r#"<!doctype html><html><body>
+                <div id="box" style="width:10px;height:10px"></div>
+                <output id="result"></output>
+                <script>
+                    const box = document.getElementById("box");
+                    const result = document.getElementById("result");
+                    const seen = [];
+                    new ResizeObserver(function (entries) {
+                        seen.push(Math.round(entries[0].contentRect.width));
+                        result.textContent = seen.join(",");
+                    }).observe(box);
+                    const channel = new MessageChannel();
+                    channel.port1.onmessage = function (event) {
+                        box.style.width = event.data + "px";
+                    };
+                    channel.port2.postMessage(20);
+                    channel.port2.postMessage(30);
+                </script>
+            </body></html>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let mut exposed_intermediate_size = false;
+            let final_render = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) => {
+                            exposed_intermediate_size |= html.contains(">10,20</output>");
+                            if html.contains(">10,30</output>") {
+                                break html;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("rendering-opportunity fixture failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("actor closed before its rendering opportunity"),
+                    }
+                }
+            })
+            .await
+            .expect("coalesced rendering opportunity timed out");
+
+            assert!(!exposed_intermediate_size, "{final_render}");
         }
 
         #[tokio::test]
@@ -2979,7 +3241,9 @@ mod desktop {
             // The inverse fairness edge is equally important: prioritizing a browser-command
             // task source is not permission to exclude the timer task source indefinitely.
             // Queue the follow-up commands while the first handler is still running, after it
-            // has made a zero-delay timer runnable.
+            // has made a zero-delay timer runnable. Observe its history update at task
+            // completion rather than its DOM paint: HTML schedules that paint separately on
+            // the rendering task source, so intervening commands may legitimately settle.
             let html = r#"<!doctype html><html><body>
                 <button id="target">schedule</button>
                 <output id="result">waiting</output>
@@ -2987,6 +3251,7 @@ mod desktop {
                     document.getElementById("target").addEventListener("click", function () {
                         setTimeout(function () {
                             document.getElementById("result").textContent = "timer-ran";
+                            history.pushState(null, "", "?timer-ran");
                         }, 0);
                         const until = performance.now() + 100;
                         while (performance.now() < until) {}
@@ -3022,8 +3287,7 @@ mod desktop {
                 let mut settled = 0usize;
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Updated { html, outcome }) if html.contains("timer-ran") => {
-                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        Some(PageEvt::HistoryUpdate { url, .. }) if url.ends_with("?timer-ran") => {
                             break settled;
                         }
                         Some(PageEvt::Settled) => settled += 1,
@@ -3172,6 +3436,208 @@ mod desktop {
                 "parent load did not follow initial iframe load task"
             );
         }
+
+        #[tokio::test]
+        async fn iframe_load_waits_for_parser_module_and_dom_content_loaded() {
+            // HTML §4.12.1.1 and §13.2.7: a parser-created module without `async`
+            // executes after parsing and before DOMContentLoaded. The nested
+            // document reaches `complete`, and its container's load event fires,
+            // only after the module's load-delaying work is done. Speedometer's
+            // Web Components suites intentionally initialize their shadow tree
+            // from these modules and begin measuring from the iframe load event.
+            let html = r##"<!doctype html><html><body>
+                <output id="phase">waiting</output>
+                <script>
+                    const phase = document.getElementById("phase");
+                    globalThis.topDclCount = 0;
+                    window.addEventListener("DOMContentLoaded", function () { topDclCount++; });
+                    const frame = document.createElement("iframe");
+                    frame.srcdoc = '<template id="probe-template">' +
+                        '<span id="ready">ready</span></template>' +
+                        '<frame-load-probe></frame-load-probe><scr' +
+                        'ipt type="module">' +
+                        'customElements.define("frame-load-probe", class extends HTMLElement {' +
+                        'connectedCallback() { const node = document.importNode(' +
+                        'document.getElementById("probe-template").content, true);' +
+                        'this.attachShadow({mode:"open"}).append(node); }});' +
+                        'document.addEventListener("DOMContentLoaded", function () {' +
+                        'document.body.setAttribute("data-dcl", document.readyState); });' +
+                        'window.addEventListener("DOMContentLoaded", function () {' +
+                        'document.body.setAttribute("data-window-dcl", document.readyState); });' +
+                        '</scr' + 'ipt>';
+                    frame.addEventListener("load", function () {
+                        const child = frame.contentDocument;
+                        const probe = child.querySelector("frame-load-probe");
+                        phase.textContent = [
+                            probe && probe.shadowRoot &&
+                                probe.shadowRoot.querySelector("#ready").textContent,
+                            child.body.getAttribute("data-dcl"),
+                            child.body.getAttribute("data-window-dcl"),
+                            child.readyState,
+                            topDclCount
+                        ].join("|");
+                    });
+                    document.body.appendChild(frame);
+                </script>
+            </body></html>"##;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let mut last_html = String::new();
+            let mut last_errors = Vec::new();
+            let loaded = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            last_errors = outcome.errors;
+                            if html.contains("ready|interactive|interactive|complete|1") {
+                                assert!(last_errors.is_empty(), "{last_errors:?}");
+                                break;
+                            }
+                            last_html = html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("iframe module lifecycle failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before iframe load"),
+                    }
+                }
+            })
+            .await;
+            assert!(
+                loaded.is_ok(),
+                "iframe load did not follow its parser module; errors={last_errors:?}, html={last_html}"
+            );
+        }
+
+        #[tokio::test]
+        async fn recreated_iframe_document_has_an_independent_module_map() {
+            // HTML §8.1.3.2 assigns a module map to each environment settings
+            // object, and §4.8.5 destroys an iframe's child navigable when the
+            // element is removed. Reusing the same external module URL in a
+            // new iframe must evaluate it again for that new Window/Document.
+            let html = r##"<!doctype html><html><body>
+                <output id="result">waiting</output>
+                <script>
+                    const results = [];
+                    const moduleURL = "data:text/javascript,customElements.define(%22x-settings-repeat%22%2Cclass%20extends%20HTMLElement%7BconnectedCallback()%7Bthis.setAttribute(%22data-upgraded%22%2C%22yes%22)%7D%7D)%3B";
+                    function installFrame() {
+                        const frame = document.createElement("iframe");
+                        frame.srcdoc = '<x-settings-repeat></x-settings-repeat><scr' +
+                            'ipt>const recreatedFrameLexical = "yes";' +
+                            'document.body.setAttribute("data-classic", recreatedFrameLexical);</scr' +
+                            'ipt><scr' +
+                            'ipt type="module" src="' + moduleURL + '"></scr' + 'ipt>';
+                        frame.addEventListener("load", function () {
+                            const element = frame.contentDocument.querySelector("x-settings-repeat");
+                            results.push([
+                                frame.contentDocument.body.getAttribute("data-classic"),
+                                element && element.getAttribute("data-upgraded")
+                            ].join(":"));
+                            frame.remove();
+                            if (results.length < 2) installFrame();
+                            else document.getElementById("result").textContent = results.join("|");
+                        });
+                        document.body.insertBefore(frame, document.body.firstChild);
+                    }
+                    installFrame();
+                </script>
+            </body></html>"##;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let mut last_html = String::new();
+            let mut last_errors = Vec::new();
+            let completed = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            last_errors = outcome.errors;
+                            if html.contains("<output id=\"result\">yes:yes|yes:yes</output>") {
+                                assert!(last_errors.is_empty(), "{last_errors:?}");
+                                break;
+                            }
+                            last_html = html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("recreated iframe module-map test failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the second iframe module"),
+                    }
+                }
+            })
+            .await;
+            assert!(
+                completed.is_ok(),
+                "second iframe reused the removed iframe's module map; errors={last_errors:?}, html={last_html}"
+            );
+        }
+
+        #[tokio::test]
+        async fn iframe_parser_module_is_started_once() {
+            // HTML §4.12.1.1 gives every script element an `already
+            // started` flag: preparation returns immediately once it is set.
+            // A parser-created module therefore evaluates and fires `load`
+            // exactly once. Starting an ordered module twice also advances the
+            // parser's completion accounting twice and can expose iframe load
+            // before a later application module has finished.
+            let html = r##"<!doctype html><html><body>
+                <output id="result">waiting</output>
+                <script>
+                    const frame = document.createElement("iframe");
+                    frame.srcdoc =
+                        '<scr' + 'ipt type="module">' +
+                        'document.body.setAttribute("data-one", "ready");' +
+                        '</scr' + 'ipt>' +
+                        '<scr' + 'ipt type="module">' +
+                        'document.body.setAttribute("data-two", "ready");' +
+                        '</scr' + 'ipt>' +
+                        '<scr' + 'ipt type="module">' +
+                        'await new Promise(resolve => setTimeout(resolve, 20));' +
+                        'document.body.setAttribute("data-three", "ready");' +
+                        '</scr' + 'ipt>';
+                    frame.addEventListener("load", function () {
+                        const body = frame.contentDocument.body;
+                        document.getElementById("result").textContent = [
+                            body.getAttribute("data-one"),
+                            body.getAttribute("data-two"),
+                            body.getAttribute("data-three")
+                        ].join("|");
+                    });
+                    document.body.appendChild(frame);
+                </script>
+            </body></html>"##;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let mut last_html = String::new();
+            let completed = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains("<output id=\"result\">ready|ready|ready</output>") {
+                                break;
+                            }
+                            assert!(
+                                !html.contains("<output id=\"result\">ready|"),
+                                "iframe load preceded its final ordered module: {html}"
+                            );
+                            last_html = html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("iframe module once-only check failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before iframe module settled"),
+                    }
+                }
+            })
+            .await;
+            assert!(
+                completed.is_ok(),
+                "parser module ran or loaded more than once: {last_html}"
+            );
+        }
     }
 }
 
@@ -3185,6 +3651,7 @@ pub(crate) use desktop::transform;
 /// used to install functions into each new realm.
 const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_create_element", 1, host_create_element),
+    ("__dom_create_element_ns", 3, host_create_element_ns),
     ("__dom_create_text", 1, host_create_text),
     ("__dom_create_fragment", 0, host_create_fragment),
     ("__dom_parse_document", 1, host_parse_document),
@@ -3206,6 +3673,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_node_type", 1, host_node_type),
     ("__dom_tag", 1, host_tag),
     ("__dom_namespace", 1, host_namespace),
+    ("__dom_element_name", 1, host_element_name),
     ("__dom_get_attr", 2, host_get_attr),
     ("__dom_set_attr", 3, host_set_attr),
     ("__dom_remove_attr", 2, host_remove_attr),
@@ -3221,6 +3689,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_get_by_id", 1, host_get_by_id),
     ("__dom_upgrade_candidates", 2, host_upgrade_candidates),
     ("__dom_ce_candidates", 1, host_ce_candidates),
+    ("__dom_wrapper_subtree", 1, host_wrapper_subtree),
     ("__dom_clone", 2, host_clone),
     ("__dom_doc_element", 0, host_doc_element),
     ("__html_dda", 0, host_html_dda),
@@ -3235,6 +3704,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__http_fetch", 5, host_http_fetch),
     ("__http_fetch_async", 5, host_http_fetch_async),
     ("__dom_run_injected_script", 1, host_run_injected_script),
+    ("__dom_run_classic_script", 3, host_run_classic_script),
+    ("__dom_allocate_job_context", 0, host_allocate_job_context),
+    ("__dom_create_window_realm", 8, host_create_window_realm),
+    ("__dom_set_job_context", 1, host_set_job_context),
+    ("__dom_release_job_context", 1, host_release_job_context),
     (
         "__dom_load_injected_stylesheet",
         1,
@@ -3253,11 +3727,13 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__image_complete", 1, host_image_complete),
     ("__match_media", 3, host_match_media),
     ("__dom_rect", 1, host_rect),
+    ("__dom_elements_from_point", 5, host_elements_from_point),
     ("__dom_scroll_get", 2, host_scroll_get),
     ("__dom_scroll_set", 3, host_scroll_set),
     ("__dom_load_frame", 3, host_load_frame),
     ("__cookie_get", 0, host_cookie_get),
     ("__cookie_set", 1, host_cookie_set),
+    ("__clock_now", 0, host_clock_now),
     ("__clock_set", 1, host_clock_set),
     ("__storage_get", 2, host_storage_get),
     ("__storage_set", 3, host_storage_set),
@@ -3302,6 +3778,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
     debug_assert!(lumen_registry_matches_canonical_boundary());
+    engine.set_host_job_context_hooks(host_enter_job_context, host_leave_job_context);
     for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
         engine.define_global(name, len, host_fn);
     }
@@ -3409,17 +3886,14 @@ fn prepare_host_request(
     let network = state.network.as_mut()?;
     if !matches!(resolved.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(&page, &resolved)
-        || network
-            .fetched
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
-            )
-            .is_err()
     {
         return None;
     }
+    // Fetch Standard §5.6 invokes Fetch for every successfully constructed request. A count of
+    // earlier page requests is neither a network error nor a specified rejection condition.
+    network
+        .fetched
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut request = crate::http::Request {
         method,
         url: resolved,
@@ -3505,6 +3979,7 @@ enum AsyncFetchSource {
 fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (target, method, body, headers) = host_fetch_args(ctx, args);
     let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+    let context = ctx.host_job_context();
 
     let dispatch = {
         let Some(state) = ctx.host_mut::<HostState>() else {
@@ -3527,7 +4002,13 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             (Some(network), Some(source), Some(events)) => {
                 let id = network.next_fetch_id;
                 network.next_fetch_id += 1;
-                network.pending_fetches.insert(id, resolve.clone());
+                network.pending_fetches.insert(
+                    id,
+                    LumenPendingFetch {
+                        context,
+                        resolve: resolve.clone(),
+                    },
+                );
                 Some((
                     id,
                     network.handle.clone(),
@@ -3569,6 +4050,187 @@ fn host_call_trust(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, V
     let trust = host_trust(ctx)?;
     let function = ctx.member_get(&trust, name)?;
     ctx.invoke(function, trust, args)
+}
+
+fn host_allocate_job_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
+    };
+    let context = state.next_window_context;
+    if context > MAX_SAFE_INTEGER {
+        return Err(ctx.make_error(
+            "QuotaExceededError",
+            "exhausted HTML environment-settings identifiers",
+        ));
+    }
+    state.next_window_context = context.saturating_add(1);
+    Ok(Value::Num(context as f64))
+}
+
+fn platform_prelude_snapshot() -> Result<&'static [u8], String> {
+    static SNAPSHOT: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
+    match SNAPSHOT.get_or_init(|| lumen::compile_snapshot(crate::js::PRELUDE)) {
+        Ok(snapshot) => Ok(snapshot.as_slice()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// HTML §7.2.2/§7.5.1 creates a fresh Window Realm for a new Document while
+/// retaining the browsing context's WindowProxy identity. The native DOM arena
+/// remains shared, but author globals, intrinsics, platform prototypes, module
+/// maps, and promise-job settings belong to this newly-created Realm.
+fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let context = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map_or(0, |value| value as u64);
+    if context == 0 {
+        return Err(ctx.make_error(
+            "InvalidStateError",
+            "a Window Realm requires a live environment-settings object",
+        ));
+    }
+    let frame_id = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(frame_id) = host_arg_node(&dom, args, 1) else {
+            return Err(ctx.make_error("InvalidStateError", "invalid navigable container"));
+        };
+        if !matches!(dom.tag_name(frame_id), Some("iframe" | "frame")) {
+            return Err(ctx.make_error("InvalidStateError", "invalid navigable container"));
+        }
+        frame_id
+    };
+
+    let url = host_arg_string(ctx, args, 2);
+    let source_config = args.get(3).cloned().unwrap_or(Value::Undefined);
+    let parent_window = args.get(4).cloned().unwrap_or(Value::Undefined);
+    let top_window = args.get(5).cloned().unwrap_or(Value::Undefined);
+    let frame_element = args.get(6).cloned().unwrap_or(Value::Undefined);
+    let agent_time_offset = args
+        .get(7)
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    let snapshot = platform_prelude_snapshot().map_err(|error| {
+        ctx.make_error(
+            "SyntaxError",
+            format!("compile TRust platform prelude: {error}"),
+        )
+    })?;
+    // Realm creation and bootstrap form one synchronous publication operation.
+    // Defer collection across both phases so partially initialized intrinsics
+    // cannot be swept before the new global is published.
+    ctx.suspend_gc();
+    let realm = ctx.create_embed_realm();
+    // Root the new Window Realm before running its platform bootstrap. The
+    // bootstrap allocates a complete set of intrinsics and may cross an
+    // allocation/GC safepoint; the host owns the nascent environment from the
+    // moment HTML creates its navigable, even before the child global is
+    // published through the iframe element.
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.window_realms.insert(context, realm.clone());
+    }
+    let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
+        realm_ctx.set_host_job_context(context);
+        for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+            realm_ctx.define_embed_global(name, len, host_fn);
+        }
+
+        let config = realm_ctx.new_object_with_proto(&Value::Null);
+        for name in [
+            "ua",
+            "language",
+            "languages",
+            "width",
+            "height",
+            "devicePixelRatio",
+            "hardwareConcurrency",
+            "globalPrivacyControl",
+            "secureContext",
+        ] {
+            if let Ok(value) = realm_ctx.member_get(&source_config, name) {
+                realm_ctx.member_set(&config, name, value)?;
+            }
+        }
+        realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
+        realm_ctx.member_set(&config, "frameId", Value::Num(frame_id as f64))?;
+        realm_ctx.member_set(&config, "hostSettingsContext", Value::Num(context as f64))?;
+        realm_ctx.member_set(&config, "frameElement", frame_element.clone())?;
+        realm_ctx.member_set(&config, "parentWindow", parent_window.clone())?;
+        realm_ctx.member_set(&config, "topWindow", top_window.clone())?;
+        realm_ctx.member_set(&config, "agentTimeOffset", Value::Num(agent_time_offset))?;
+        let global = realm_ctx.global_this();
+        realm_ctx.member_set(&global, "__trust_cfg", config)?;
+
+        let bootstrap_result = realm_ctx.eval_classic_snapshot_interruptible(snapshot);
+        match bootstrap_result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(EvalError::Throw(error))) => Err(error),
+            Ok(Err(EvalError::Interrupted(reason))) => Err(realm_ctx.make_error(
+                "AbortError",
+                format!("Window Realm bootstrap interrupted: {}", reason.message()),
+            )),
+            Err(error) => Err(realm_ctx.make_error(
+                "SyntaxError",
+                format!(
+                    "Window Realm bootstrap parse error at line {}: {}",
+                    error.line, error.message
+                ),
+            )),
+        }
+    });
+    ctx.resume_gc();
+    match installed {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) | Err(error) => {
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                state.window_realms.remove(&context);
+            }
+            return Err(error);
+        }
+    }
+    Ok(realm)
+}
+
+fn host_set_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let context = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map_or(0, |value| value as u64);
+    ctx.set_host_job_context(context);
+    Ok(Value::Undefined)
+}
+
+fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let context = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map_or(0, |value| value as u64);
+    if context == 0 {
+        return Ok(Value::Bool(false));
+    }
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.window_realms.remove(&context);
+        if let Some(network) = state.network.as_mut() {
+            network
+                .pending_fetches
+                .retain(|_, pending| pending.context != context);
+        }
+    }
+    Ok(Value::Bool(ctx.release_host_job_context(context)))
+}
+
+fn host_enter_job_context(ctx: &mut Ctx, context: u64) {
+    let _ = host_call_trust(ctx, "bindWindowSettings", &[Value::Num(context as f64)]);
+}
+
+fn host_leave_job_context(ctx: &mut Ctx) {
+    let _ = host_call_trust(ctx, "restoreFrame", &[]);
 }
 
 fn host_resource_url(ctx: &mut Ctx, node_id: usize, fallback: Option<String>) -> Option<String> {
@@ -3643,6 +4305,7 @@ fn send_resource_completion(
     result: LumenResourceResult,
     external: bool,
 ) -> bool {
+    let context = ctx.host_job_context();
     let Some((events, pending)) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
         state.pending_resources += 1;
@@ -3652,6 +4315,7 @@ fn send_resource_completion(
     };
     if events
         .send(LumenHostTask::ResourceDone {
+            context,
             node_id,
             name,
             kind,
@@ -3675,6 +4339,7 @@ fn spawn_resource_fetch(
     request: crate::http::Request,
 ) -> bool {
     let name = request.url.to_string();
+    let context = ctx.host_job_context();
     let Some((handle, cache, events)) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
         let network = state.network.as_ref()?;
@@ -3704,6 +4369,7 @@ fn spawn_resource_fetch(
             }),
         };
         let _ = events.send(LumenHostTask::ResourceDone {
+            context,
             node_id,
             name,
             kind,
@@ -3720,7 +4386,7 @@ fn queue_resource_error(ctx: &mut Ctx, node_id: usize, kind: LumenResourceKind, 
     }
 }
 
-fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, source: String) {
+fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: String) {
     let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
     let trust = host_trust(ctx).ok();
     let old_current = trust
@@ -3729,26 +4395,48 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, source: String) {
     if let Some(trust) = trust.as_ref() {
         let _ = ctx.member_set(trust, "currentScript", Value::Num(node_id as f64));
     }
-    let result = (|| {
-        let global = ctx.global_this();
-        let indirect_eval = ctx.member_get(&global, "eval")?;
-        ctx.invoke(
-            indirect_eval,
-            Value::Undefined,
-            &[Value::from_string(source)],
-        )
-    })();
-    if let Err(error) = result {
-        let message = ctx
-            .coerce_string(&error)
-            .map(|message| message.to_string())
-            .unwrap_or_else(|_| String::from("injected inline script failed"));
-        host_push_injected_error(ctx, format!("injected-inline: {message}"));
+    match ctx.eval_classic_script_interruptible(&source) {
+        Ok(Ok(_)) => {}
+        Ok(Err(EvalError::Throw(error))) => {
+            let message = ctx
+                .coerce_string(&error)
+                .map(|message| message.to_string())
+                .unwrap_or_else(|_| String::from("classic script threw"));
+            host_push_injected_error(ctx, format!("{name}: {message}"));
+        }
+        Ok(Err(EvalError::Interrupted(reason))) => {
+            host_push_injected_error(ctx, format!("{name}: {}", reason.message()));
+        }
+        Err(error) => host_push_injected_error(
+            ctx,
+            format!(
+                "{name} parse error at line {}: {}",
+                error.line, error.message
+            ),
+        ),
     }
     if let (Some(trust), Some(old_current)) = (trust.as_ref(), old_current) {
         let _ = ctx.member_set(trust, "currentScript", old_current);
     }
     let _ = host_call_trust(ctx, "restoreFrame", &[]);
+}
+
+/// HTML §8.1.4.4 "run a classic script": nested-document parser scripts are Script Records,
+/// not indirect eval code. This synchronous entry is safe from a native platform callback and
+/// retains the Realm's persistent global lexical environment across sibling script elements.
+fn host_run_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let node_id = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(node_id) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Undefined);
+        };
+        node_id
+    };
+    let source = host_arg_string(ctx, args, 1);
+    let name = host_arg_string(ctx, args, 2);
+    host_eval_inline_classic(ctx, node_id, &name, source);
+    Ok(Value::Undefined)
 }
 
 /// HTML §4.12.1.1 post-connection and prepare-the-script-element steps for scripts inserted
@@ -3809,10 +4497,21 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         }
     } else if module {
         let base = state_base(ctx);
+        // HTML §4.12.1.1 creates a new JavaScript module script for each
+        // inline script element. Its document URL is the base URL used to
+        // resolve imports, not a shared module-map identity. Give Lumen a
+        // stable per-element fragment so sibling inline modules cannot alias
+        // one another while relative imports still resolve against `base`.
+        let name = url::Url::parse(&base)
+            .map(|mut url| {
+                url.set_fragment(Some(&format!("inline-module-{node_id}")));
+                url.to_string()
+            })
+            .unwrap_or_else(|_| format!("{base}#inline-module-{node_id}"));
         if !send_resource_completion(
             ctx,
             node_id,
-            base,
+            name,
             LumenResourceKind::ModuleScript,
             Some((
                 200,
@@ -3827,7 +4526,8 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     } else if !text.is_empty() {
         // A non-parser-inserted inline classic script executes immediately in the element's
         // post-connection steps. Its exception is reported, not rethrown from appendChild().
-        host_eval_inline_classic(ctx, node_id, text);
+        let name = state_base(ctx);
+        host_eval_inline_classic(ctx, node_id, &name, text);
     }
     Ok(Value::Undefined)
 }
@@ -4711,16 +5411,9 @@ fn module_dependency_loader(
     let response = if let Some(shared) = cache.peek(&resolved) {
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     } else {
-        if fetched
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
-            )
-            .is_err()
-        {
-            return None;
-        }
+        // HTML's fetch-a-module-script graph algorithm requires this dependency. Keep the count
+        // as diagnostics, but never turn historical activity into a synthetic load failure.
+        fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shared = cache.fetch(handle, resolved.clone());
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     };
@@ -4806,21 +5499,11 @@ fn queue_dynamic_module_load(
     let shared = if let Some(shared) = network.cache.peek(&resolved) {
         shared
     } else {
-        if network
+        // ECMA-262 HostLoadImportedModule plus HTML's module-script fetch do not permit a host to
+        // fail a required dynamic import merely because this Document made earlier requests.
+        network
             .fetched
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
-            )
-            .is_err()
-        {
-            let _ = loader.events.send(LumenHostTask::DynamicModule {
-                request_id,
-                result: None,
-            });
-            return;
-        }
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         network.cache.fetch(&network.handle, resolved.clone())
     };
     let events = loader.events.clone();
@@ -4885,7 +5568,9 @@ fn speculate_module_imports(
                 .fetch_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
-                    |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
+                    |count| {
+                        (count < crate::js::MAX_PAGE_FETCHES_WITH_SPECULATION).then_some(count + 1)
+                    },
                 )
                 .is_err()
         {
@@ -5026,63 +5711,77 @@ fn run_injected_module_task(
             network.fetched.clone(),
         ))
     });
-    let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Some((page, handle, cache, fetched)) = snapshot {
-            let loader_page = page.clone();
-            engine.eval_module_attrs_interruptible(
-                source,
-                name,
-                move |specifier, referrer, _attributes| {
-                    module_dependency_loader(
-                        &loader_page,
-                        &handle,
-                        &cache,
-                        &fetched,
-                        specifier,
-                        referrer,
-                    )
-                },
-            )
-        } else {
-            engine.eval_module_attrs_interruptible(
-                source,
-                name,
-                |_specifier, _referrer, _attributes| None,
-            )
-        }
-    }));
-    match evaluated {
-        Ok(Ok(lumen::ExecutionOutcome::Value(_))) => {
-            if !track_module_evaluation(engine, node_id, name) {
-                fire_engine_script_event(engine, node_id, "load");
+    // HTML runs a module with its preparation-time Document's realm/settings.
+    // TRust multiplexes same-agent nested Window realms through one Lumen
+    // global, so enter the script element's owning frame for evaluation and
+    // the immediately-following microtask checkpoint. This is the module
+    // counterpart of `run_injected_classic_task` above.
+    let _ = host_call_trust(
+        engine.ctx(),
+        "bindFrameForNode",
+        &[Value::Num(node_id as f64)],
+    );
+    let result = (|| {
+        let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some((page, handle, cache, fetched)) = snapshot {
+                let loader_page = page.clone();
+                engine.eval_module_attrs_interruptible(
+                    source,
+                    name,
+                    move |specifier, referrer, _attributes| {
+                        module_dependency_loader(
+                            &loader_page,
+                            &handle,
+                            &cache,
+                            &fetched,
+                            specifier,
+                            referrer,
+                        )
+                    },
+                )
+            } else {
+                engine.eval_module_attrs_interruptible(
+                    source,
+                    name,
+                    |_specifier, _referrer, _attributes| None,
+                )
             }
-            engine.run_microtasks_interruptible().map_err(|reason| {
-                format!("module {name} microtasks interrupted: {}", reason.message())
-            })?;
+        }));
+        match evaluated {
+            Ok(Ok(lumen::ExecutionOutcome::Value(_))) => {
+                if !track_module_evaluation(engine, node_id, name) {
+                    fire_engine_script_event(engine, node_id, "load");
+                }
+                engine.run_microtasks_interruptible().map_err(|reason| {
+                    format!("module {name} microtasks interrupted: {}", reason.message())
+                })?;
+            }
+            Ok(Ok(lumen::ExecutionOutcome::Throw { name: ty, message })) => {
+                push_engine_error(engine, format!("module {name}: {ty}: {message}"));
+                fire_engine_script_event(engine, node_id, "error");
+            }
+            Ok(Ok(lumen::ExecutionOutcome::Interrupted { reason })) => {
+                return Err(format!("module {name} interrupted: {}", reason.message()));
+            }
+            Ok(Err(error)) => {
+                push_engine_error(
+                    engine,
+                    format!(
+                        "module {name} parse error at line {}: {}",
+                        error.line, error.message
+                    ),
+                );
+                fire_engine_script_event(engine, node_id, "error");
+            }
+            Err(_) => {
+                push_engine_error(engine, format!("module {name}: Lumen engine panic"));
+                fire_engine_script_event(engine, node_id, "error");
+            }
         }
-        Ok(Ok(lumen::ExecutionOutcome::Throw { name: ty, message })) => {
-            push_engine_error(engine, format!("module {name}: {ty}: {message}"));
-            fire_engine_script_event(engine, node_id, "error");
-        }
-        Ok(Ok(lumen::ExecutionOutcome::Interrupted { reason })) => {
-            return Err(format!("module {name} interrupted: {}", reason.message()));
-        }
-        Ok(Err(error)) => {
-            push_engine_error(
-                engine,
-                format!(
-                    "module {name} parse error at line {}: {}",
-                    error.line, error.message
-                ),
-            );
-            fire_engine_script_event(engine, node_id, "error");
-        }
-        Err(_) => {
-            push_engine_error(engine, format!("module {name}: Lumen engine panic"));
-            fire_engine_script_event(engine, node_id, "error");
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    let _ = host_call_trust(engine.ctx(), "restoreFrame", &[]);
+    result
 }
 
 fn run_resource_task(
@@ -5210,20 +5909,56 @@ fn dispatch_websocket_task(
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
         LumenHostTask::FetchDone { id, result } => {
-            let resolve = engine
+            let pending = engine
                 .ctx()
                 .host_mut::<HostState>()
                 .and_then(|state| state.network.as_mut())
                 .and_then(|network| network.pending_fetches.remove(&id));
-            let Some(resolve) = resolve else {
+            let Some(pending) = pending else {
                 return Ok(());
             };
-            let value = host_fetch_result_value(engine.ctx(), result);
-            engine
-                .call_function_interruptible(&resolve, Value::Undefined, &[value])
-                .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))?;
+            // Fetch §2 records a global object as the fetch params' task
+            // destination and queues response processing on that global's
+            // networking task source. Construct the Response payload in that
+            // Realm as well: Fetch §5.3 consumes the Body using the response
+            // object's relevant global, including its ArrayBuffer intrinsics.
+            let context = pending.context;
+            let resolve = pending.resolve;
+            let run = move |engine: &mut lumen::Engine| {
+                let value = host_fetch_result_value(engine.ctx(), result);
+                engine
+                    .call_function_interruptible(&resolve, Value::Undefined, &[value])
+                    .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))
+            };
+            if context == engine.ctx().host_job_context() {
+                run(engine)?;
+            } else {
+                let realm = engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .and_then(|state| state.window_realms.get(&context).cloned());
+                let Some(realm) = realm else {
+                    // A task associated with a no-longer-active Document is
+                    // not runnable on the Window event loop.
+                    return Ok(());
+                };
+                match engine.with_embed_realm(&realm, run) {
+                    Ok(result) => {
+                        result?;
+                    }
+                    Err(error) => {
+                        let message = engine
+                            .ctx()
+                            .coerce_string(&error)
+                            .map(|message| message.to_string())
+                            .unwrap_or_else(|_| String::from("unknown Window Realm"));
+                        return Err(format!("fetch task Realm: {message}"));
+                    }
+                }
+            }
         }
         LumenHostTask::ResourceDone {
+            context,
             node_id,
             name,
             kind,
@@ -5233,7 +5968,38 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
             }
-            run_resource_task(engine, node_id, name, kind, result, external)?;
+            // HTML §8.1.7.2 queues element work against the element's relevant
+            // global/Document. A parallel resource fetch therefore retains
+            // the environment-settings token captured at preparation time;
+            // dispatching through the actor's root Realm would fire load/error
+            // against the wrong Realm-local listener registry.
+            if context == engine.ctx().host_job_context() {
+                run_resource_task(engine, node_id, name, kind, result, external)?;
+            } else {
+                let realm = engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .and_then(|state| state.window_realms.get(&context).cloned());
+                let Some(realm) = realm else {
+                    // Its Document was replaced while the fetch was in
+                    // flight. Tasks whose document is no longer active are
+                    // not runnable in the Window event loop.
+                    return Ok(());
+                };
+                match engine.with_embed_realm(&realm, move |engine| {
+                    run_resource_task(engine, node_id, name, kind, result, external)
+                }) {
+                    Ok(result) => result?,
+                    Err(error) => {
+                        let message = engine
+                            .ctx()
+                            .coerce_string(&error)
+                            .map(|message| message.to_string())
+                            .unwrap_or_else(|_| String::from("unknown Window Realm"));
+                        return Err(format!("resource task Realm: {message}"));
+                    }
+                }
+            }
         }
         LumenHostTask::DynamicModule { request_id, result } => {
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
@@ -5288,6 +6054,19 @@ fn host_create_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let tag = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let id = dom.borrow_mut().create_element(&tag);
+    Ok(host_id_value(Some(id)))
+}
+
+fn host_create_element_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let namespace = host_arg_string(ctx, args, 0);
+    let prefix = host_arg_string(ctx, args, 1);
+    let local_name = host_arg_string(ctx, args, 2);
+    let dom = host_dom(ctx);
+    let id = dom.borrow_mut().create_element_ns(
+        &namespace,
+        (!prefix.is_empty()).then_some(prefix.as_str()),
+        &local_name,
+    );
     Ok(host_id_value(Some(id)))
 }
 
@@ -5500,6 +6279,14 @@ fn host_clock_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
+fn host_clock_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(
+        ctx.host_mut::<HostState>()
+            .map(|state| state.clock.now_ms())
+            .unwrap_or(0.0),
+    ))
+}
+
 fn host_node_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -5535,6 +6322,26 @@ fn host_namespace(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             None => Value::Null,
         },
     )
+}
+
+fn host_element_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Null);
+    };
+    let Some(local_name) = dom.tag_name(id) else {
+        return Ok(Value::Null);
+    };
+    Ok(ctx.make_array(vec![
+        Value::from_string(local_name.to_owned()),
+        dom.namespace_uri(id)
+            .map(|namespace| Value::from_string(namespace.to_owned()))
+            .unwrap_or(Value::Null),
+        dom.namespace_prefix(id)
+            .map(|prefix| Value::from_string(prefix.to_owned()))
+            .unwrap_or(Value::Null),
+    ]))
 }
 
 fn host_get_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -5755,6 +6562,17 @@ fn host_ce_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     Ok(host_ids_array(ctx, ids))
 }
 
+fn host_wrapper_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let ids = {
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+            .map(|root| dom.wrapper_subtree_ids(root))
+            .unwrap_or_default()
+    };
+    Ok(host_ids_array(ctx, ids))
+}
+
 /// DOM §4.4 cloneNode, including HTML template contents via the shared arena clone algorithm.
 fn host_clone(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let deep = matches!(args.get(1), Some(Value::Bool(true)));
@@ -5955,8 +6773,8 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
 /// Keep the geometry used by CSSOM View reads on the same epoch-keyed layout pass as the other
 /// JavaScript adapter. The resulting rectangles remain floating-point CSS pixels; terminal
 /// quantization is still confined to `layout2::paint`.
-fn ensure_host_geom_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
-    let (dom, base, viewport, cache, images) = {
+fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {
+    let (dom_handle, base, viewport, cache, images, hit_testing_active) = {
         let state = ctx
             .host_mut::<HostState>()
             .expect("HostState installed before any Lumen host call");
@@ -5966,39 +6784,142 @@ fn ensure_host_geom_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
             state.viewport.get(),
             state.geom_cache.clone(),
             state.images.clone(),
+            state.hit_testing_active.get(),
         )
     };
-    let dom = dom.borrow();
+    let dom = dom_handle.borrow();
     let epoch = dom.epoch();
     let mut cached = cache.borrow_mut();
-    if cached.0 != epoch {
+    let rebuilt = cached.epoch != epoch;
+    if rebuilt {
+        let measure_started = std::env::var_os("TRUST_DIAG_FRAME")
+            .is_some()
+            .then(Instant::now);
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
-        let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
-            &dom,
-            &base,
-            viewport,
-            &forms,
-            &controls,
-            &images.borrow(),
-        );
-        cached.1 = boxes;
-        cached.2 = tracks;
-        cached.3 = scrolling_areas;
-        cached.0 = epoch;
+        let (boxes, tracks, scrolling_areas, paint) = if hit_testing_active {
+            let (boxes, tracks, scrolling_areas, paint) =
+                crate::layout2::measure_cssom_with_paint_css(
+                    &dom,
+                    &base,
+                    viewport,
+                    &forms,
+                    &controls,
+                    &images.borrow(),
+                );
+            (boxes, tracks, scrolling_areas, Some(paint))
+        } else {
+            let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
+                &dom,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                &images.borrow(),
+            );
+            (boxes, tracks, scrolling_areas, None)
+        };
+        if let Some(measure_started) = measure_started {
+            let cascade = crate::dom::take_casc_diag();
+            eprintln!(
+                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{}ms css_parse={}ms rules={}",
+                dom.node_count(),
+                measure_started.elapsed().as_millis(),
+                cascade.cascaded_us / 1000,
+                cascade.matched_rule_builds,
+                cascade.matched_candidates,
+                cascade.matched_us / 1000,
+                cascade.style_index_us / 1000,
+                cascade.rules,
+            );
+        }
+        cached.boxes = boxes;
+        cached.tracks = tracks;
+        cached.scrolling_areas = scrolling_areas;
+        cached.paint = paint;
+        cached.epoch = epoch;
+        cached.top_document_valid = true;
     }
     drop(cached);
+    drop(dom);
+    if rebuilt {
+        // The full measure incorporated every mutation through `epoch`; begin the next
+        // document-scope classification window from an empty invalidation log.
+        let _ = dom_handle.borrow_mut().take_geometry_dirty_targets();
+    }
     cache
 }
 
+/// CSSOM View §5 `elementsFromPoint()`: return paint-ordered arena node ids.
+/// The JavaScript binding performs WebIDL conversion, viewport bounds checks,
+/// wrapper conversion, and the required root-element fallback.
+fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let scope = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value as usize)
+        .unwrap_or(DOCUMENT);
+    let x = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
+    let y = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
+    let scroll_x = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
+    let scroll_y = args.get(4).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
+
+    let viewport = {
+        let state = ctx
+            .host_mut::<HostState>()
+            .expect("HostState installed before any Lumen host call");
+        if !state.hit_testing_active.replace(true) || state.geom_cache.borrow().paint.is_none() {
+            state.geom_cache.borrow_mut().epoch = u64::MAX;
+        }
+        state.viewport.get()
+    };
+    let cache = ensure_host_geom_cache(ctx, "elements-from-point");
+    let cached = cache.borrow();
+    let Some(paint) = cached.paint.as_ref() else {
+        return Ok(ctx.make_array(Vec::new()));
+    };
+    let point = if scope == DOCUMENT {
+        crate::core::CssPoint::new(x, y)
+    } else if let Some(frame) = paint
+        .scroll_containers
+        .iter()
+        .find(|container| container.node == scope)
+    {
+        crate::core::CssPoint::new(
+            frame.viewport.x - scroll_x + x,
+            frame.viewport.y - scroll_y + y,
+        )
+    } else {
+        return Ok(ctx.make_array(Vec::new()));
+    };
+    let hits = crate::render::page_element_hits_at(
+        paint,
+        crate::core::CssSize::new(viewport.width, viewport.height),
+        crate::core::CssPoint::new(scroll_x, scroll_y),
+        point,
+    );
+    drop(cached);
+
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let wanted_frame = (scope != DOCUMENT).then_some(scope);
+    let nodes = hits
+        .into_iter()
+        .filter(|hit| dom.frame_owner(hit.node) == wanted_frame)
+        .map(|hit| Value::Num(hit.node as f64))
+        .collect();
+    Ok(ctx.make_array(nodes))
+}
+
 fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Option<String> {
-    let cache = ensure_host_geom_cache(ctx);
+    let cache = ensure_host_geom_cache(ctx, "computed-grid-tracks");
     let id = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
         host_arg_node(&dom, args, 0)?
     };
     let cached = cache.borrow();
-    let (column_tracks, row_tracks) = cached.2.get(&id)?;
+    let (column_tracks, row_tracks) = cached.tracks.get(&id)?;
     let tracks = if columns { column_tracks } else { row_tracks };
     if tracks.is_empty() {
         return None;
@@ -6012,10 +6933,32 @@ fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Op
     )
 }
 
+fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<String> {
+    let cache = ensure_host_geom_cache(ctx, "computed-box-size");
+    let id = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)?
+    };
+    let cached = cache.borrow();
+    let rect = cached.boxes.get(&id)?;
+    let value = if width {
+        rect.css_width?
+    } else {
+        rect.css_height?
+    };
+    Some(crate::js_host_boundary::serialize_css_px(value))
+}
+
 /// CSSOM §7.2/§9 resolved-value backing. Grid track lists are used values captured by the same
 /// layout pass; all other properties come from the canonical DOM cascade.
 fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 1);
+    if (name == "width" || name == "height")
+        && let Some(value) = host_resolved_box_size(ctx, args, name == "width")
+    {
+        return Ok(Value::from_string(value));
+    }
     if (name == "grid-template-columns" || name == "grid-template-rows")
         && let Some(value) = host_resolved_grid_tracks(ctx, args, name == "grid-template-columns")
     {
@@ -6088,13 +7031,70 @@ fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 /// CSSOM View §6 bounding-box backing, sourced directly from canonical layout fragments.
 fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let cache = ensure_host_geom_cache(ctx);
-    let id = {
-        let dom = host_dom(ctx);
-        let dom = dom.borrow();
-        host_arg_node(&dom, args, 0)
+    let dom_handle = host_dom(ctx);
+    let cache = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call")
+        .geom_cache
+        .clone();
+    let (id, epoch, top_level_frame) = {
+        let dom = dom_handle.borrow();
+        let id = host_arg_node(&dom, args, 0);
+        let top_level_frame = id.is_some_and(|id| {
+            matches!(dom.tag_name(id), Some("iframe" | "frame")) && dom.frame_owner(id).is_none()
+        });
+        (id, dom.epoch(), top_level_frame)
     };
-    let rect = id.and_then(|id| cache.borrow().1.get(&id).copied());
+    let (cached_epoch, top_document_valid) = {
+        let cached = cache.borrow();
+        (cached.epoch, cached.top_document_valid)
+    };
+    let reuse_cached = if cached_epoch == epoch {
+        true
+    } else if cached_epoch != u64::MAX && top_document_valid && top_level_frame {
+        // HTML §7.3.1.3 makes an iframe's content navigable own a distinct active Document.
+        // TRust keeps those nodes in the page arena, so its broad epoch advances for both
+        // Documents. CSSOM View asks for the embedding element's border box in the container
+        // Document; changes confined to nested Documents cannot alter that box. Consume the
+        // independent geometry log to prove that confinement. Any unattributed or container-
+        // Document mutation permanently rejects reuse until a full measure refreshes the cache.
+        let changes = dom_handle.borrow_mut().take_geometry_dirty_targets();
+        let nested_documents_only = changes.is_some_and(|nodes| {
+            let dom = dom_handle.borrow();
+            let mut rejected = Vec::new();
+            for (node, kind) in nodes {
+                let owner = dom.frame_owner(node);
+                let tag = dom.tag_name(node);
+                // CSSOM View getClientRects returns no rectangles without an associated box.
+                // A currently disconnected mutation therefore cannot affect a connected frame;
+                // if that subtree is subsequently inserted, the insertion records its connected
+                // parent as a separate invalidation before any synchronous geometry read.
+                let nested = !dom.is_connected(node)
+                    || owner.is_some()
+                    || (kind == crate::dom::DirtyKind::Content
+                        && matches!(tag, Some("iframe" | "frame")));
+                if !nested && rejected.len() < 8 {
+                    rejected.push((node, kind, tag.map(str::to_string), owner));
+                }
+            }
+            if !rejected.is_empty() && std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+                eprintln!("DIAGGEOM top-document-invalidations={rejected:?}");
+            }
+            rejected.is_empty()
+        });
+        if !nested_documents_only {
+            cache.borrow_mut().top_document_valid = false;
+        }
+        nested_documents_only
+    } else {
+        false
+    };
+    let cache = if reuse_cached {
+        cache
+    } else {
+        ensure_host_geom_cache(ctx, "bounding-rect")
+    };
+    let rect = id.and_then(|id| cache.borrow().boxes.get(&id).copied());
     Ok(match rect {
         Some(rect) => ctx.make_array(vec![
             Value::Num(rect.left),
@@ -6111,13 +7111,13 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u8;
     let scrolling_area = if matches!(which, 2 | 3) {
-        let cache = ensure_host_geom_cache(ctx);
+        let cache = ensure_host_geom_cache(ctx, "scrolling-area");
         let id = {
             let dom = host_dom(ctx);
             let dom = dom.borrow();
             host_arg_node(&dom, args, 0)
         };
-        id.and_then(|id| cache.borrow().3.get(&id).copied())
+        id.and_then(|id| cache.borrow().scrolling_areas.get(&id).copied())
     } else {
         None
     };
@@ -6307,7 +7307,6 @@ fn host_crypto_sha256_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
 fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     use std::io::Write as _;
 
-    const MAX_STREAM_CODEC_BYTES: usize = 16 * 1024 * 1024;
     let format = host_arg_string(ctx, args, 0);
     let input = args
         .get(1)
@@ -6318,12 +7317,6 @@ fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
                 "CompressionStream input must be a BufferSource",
             )
         })?;
-    if input.len() > MAX_STREAM_CODEC_BYTES {
-        return Err(ctx.make_error(
-            "RangeError",
-            "CompressionStream input exceeds the 16 MiB page limit",
-        ));
-    }
     let output = match format.as_str() {
         "deflate" => {
             let mut encoder =
@@ -6343,12 +7336,6 @@ fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         _ => return Err(ctx.make_error("TypeError", "Unsupported compression format")),
     }
     .map_err(|error| ctx.make_error("TypeError", format!("CompressionStream failed: {error}")))?;
-    if output.len() > MAX_STREAM_CODEC_BYTES {
-        return Err(ctx.make_error(
-            "RangeError",
-            "CompressionStream output exceeds the 16 MiB page limit",
-        ));
-    }
     ctx.make_uint8array(&output)
 }
 
@@ -6556,7 +7543,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 102, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 112, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -6567,13 +7554,69 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 102);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 112);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
+    }
+
+    #[test]
+    fn create_element_ns_preserves_expanded_names_and_element_interfaces() {
+        // WHATWG DOM §1.4 "validate and extract" and §4.5 createElementNS:
+        // namespace, prefix, and local name select the element interface and
+        // remain observable. This is the construction path React uses for SVG;
+        // losing the namespace made Stockcharts omit its interactive SVG layer.
+        let mut engine = platform_engine();
+        let actual = string_value(
+            &mut engine,
+            r#"(() => {
+                const SVG = 'http://www.w3.org/2000/svg';
+                const MATH = 'http://www.w3.org/1998/Math/MathML';
+                const XML = 'http://www.w3.org/XML/1998/namespace';
+                const XMLNS = 'http://www.w3.org/2000/xmlns/';
+                const svg = document.createElementNS(SVG, 'svg');
+                const rect = document.createElementNS(SVG, 'rect');
+                rect.setAttribute('class', 'react-stockcharts-crosshair-cursor');
+                svg.appendChild(rect);
+                const host = document.createElement('div');
+                host.appendChild(svg);
+                const math = document.createElementNS(MATH, 'math');
+                const plain = document.createElementNS(null, 'widget');
+                const prefixed = document.createElementNS(XML, 'xml:item');
+                host.insertAdjacentHTML('beforeend', '<svg><path id="parsed-svg"/></svg>');
+                const parsed = host.querySelector('#parsed-svg');
+                function errorName(run) {
+                    try { run(); return 'none'; } catch (error) { return error.name; }
+                }
+                return [
+                    svg.namespaceURI === SVG,
+                    svg.localName === 'svg', svg.tagName === 'svg', svg.prefix === null,
+                    svg instanceof SVGElement, svg instanceof SVGSVGElement,
+                    !(svg instanceof HTMLElement),
+                    rect instanceof SVGRectElement,
+                    Object.prototype.toString.call(rect) === '[object SVGRectElement]',
+                    host.querySelector('.react-stockcharts-crosshair-cursor') === rect,
+                    math.namespaceURI === MATH, math instanceof MathMLElement,
+                    plain.namespaceURI === null, plain.constructor === Element,
+                    prefixed.prefix === 'xml', prefixed.localName === 'item',
+                    prefixed.tagName === 'xml:item', prefixed.nodeName === 'xml:item',
+                    parsed instanceof SVGPathElement,
+                    errorName(() => document.createElementNS()),
+                    errorName(() => document.createElementNS(null, '')),
+                    errorName(() => document.createElementNS(null, 'p:item')),
+                    errorName(() => document.createElementNS(SVG, 'xml:item')),
+                    errorName(() => document.createElementNS(SVG, 'xmlns')),
+                    errorName(() => document.createElementNS(XMLNS, 'item'))
+                ].join(',');
+            })()"#,
+        );
+        assert_eq!(
+            actual,
+            "true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,TypeError,InvalidCharacterError,NamespaceError,NamespaceError,NamespaceError,NamespaceError"
+        );
     }
 
     #[test]
@@ -6843,6 +7886,42 @@ mod tests {
     }
 
     #[test]
+    fn fetch_preparation_has_no_cumulative_request_cliff() {
+        // Fetch Standard §5.6 creates a request and invokes Fetch for every valid call. Earlier
+        // activity in the same Document is not a network error and cannot make a later call fail.
+        // This deliberately crosses the former 256-request cutoff without performing network I/O.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, _task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+
+        for index in 0..320 {
+            let (_, _, request) = prepare_host_request(
+                &mut state,
+                &format!("/api/{index}"),
+                String::from("GET"),
+                None,
+                Vec::new(),
+            )
+            .unwrap_or_else(|| panic!("valid request {index} was denied by historical activity"));
+            assert_eq!(request.url.path(), format!("/api/{index}"));
+        }
+        assert_eq!(
+            state
+                .network
+                .as_ref()
+                .map(|network| network.fetched.load(std::sync::atomic::Ordering::Relaxed)),
+            Some(320)
+        );
+    }
+
+    #[test]
     fn fetch_completion_is_a_networking_task_with_byte_exact_body() {
         // Fetch §5.6 creates the promise before fetching in parallel; Fetch §2 queues response
         // processing on the networking task source; HTML §8.1.7.3 then performs one microtask
@@ -6924,6 +8003,81 @@ mod tests {
                 .and_then(|state| state.network.as_ref())
                 .map(|network| network.pending_fetches.len()),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn iframe_fetch_reactions_run_with_their_relevant_window() {
+        // ECMA-262 NewPromiseReactionJob associates a job with its handler's Realm. HTML
+        // HostEnqueuePromiseJob then prepares that Realm's settings object before running the
+        // job. An async continuation created by a child Window must consequently observe the
+        // child Document after its fetch completes, even though the networking task is selected
+        // while no child script is synchronously on the stack.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let response_url = page.join("api").unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        cache.seed(
+            response_url.to_string(),
+            200,
+            String::from("text/plain"),
+            b"ready".to_vec(),
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, DEFAULT_URL);
+
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<body><script>' +
+                    '(async function () {' +
+                    'const response = await fetch("/api");' +
+                    'const bytes = Array.from(new Uint8Array(await response.clone().arrayBuffer())).join(",");' +
+                    'const text = await response.text();' +
+                    'globalThis.fetchBodyResult = [response instanceof Response, text, bytes].join("|");' +
+                    'const marker = document.createElement("div");' +
+                    'marker.id = "child-ready";' +
+                    'document.body.appendChild(marker);' +
+                    '})()' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                globalThis.fetchFrame = frame;
+            "##,
+            "iframe fetch setup",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        let task = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await })
+            .expect("iframe fetch completes")
+            .expect("network task channel remains open");
+        dispatch_host_task(&mut engine, task).unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "(() => { const marker = fetchFrame.contentDocument.querySelector('#child-ready'); return String(marker.parentNode === fetchFrame.contentDocument.body) + '|' + String(marker.parentNode === document.body); })()",
+            ),
+            "true|false"
+        );
+        assert_eq!(
+            string_value(&mut engine, "fetchFrame.contentWindow.fetchBodyResult"),
+            "true|ready|114,101,97,100,121",
+            "Fetch response objects and body bytes belong to the initiating Window Realm"
         );
     }
 
@@ -7533,6 +8687,96 @@ mod tests {
     }
 
     #[test]
+    fn iframe_stylesheet_and_load_tasks_run_in_their_relevant_realms() {
+        // HTML §8.1.7.2 queues asynchronous element work against the
+        // element's relevant global, and the iframe load-event steps run only
+        // after the child Window's load task. A stylesheet fetched for a
+        // child Document must consequently settle the child listener registry
+        // before the owner-Document iframe element fires load.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let stylesheet_url = page.join("frame.css").unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        cache.seed_with_headers(
+            stylesheet_url.to_string(),
+            200,
+            String::from("text/css"),
+            vec![(String::from("content-type"), String::from("text/css"))],
+            b"#realm-style-target { display: grid; }".to_vec(),
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, DEFAULT_URL);
+
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                globalThis.frameLifecycleOrder = [];
+                const frame = document.createElement("iframe");
+                frame.onload = function () { frameLifecycleOrder.push("frame"); };
+                frame.srcdoc = '<head><link id="child-style" rel="stylesheet" href="/frame.css"></head>' +
+                    '<body><div id="realm-style-target"></div><script>' +
+                    'document.getElementById("child-style").addEventListener("load", function () {' +
+                    'parent.frameLifecycleOrder.push("style:" + getComputedStyle(' +
+                    'document.getElementById("realm-style-target")).display);' +
+                    '});' +
+                    'window.addEventListener("load", function () {' +
+                    'parent.frameLifecycleOrder.push("window");' +
+                    '});' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                globalThis.stylesheetFrame = frame;
+            "##,
+            "iframe stylesheet Realm task setup",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        let task = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await })
+            .expect("iframe stylesheet completes")
+            .expect("resource task channel remains open");
+        dispatch_host_task(&mut engine, task).unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        for _ in 0..8 {
+            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                .map(|value| engine.ctx().to_boolean(&value))
+                .unwrap_or(false);
+            if !has_task {
+                break;
+            }
+            assert!(
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+            );
+            run_microtask_checkpoint(&mut engine);
+        }
+        let errors = string_value(&mut engine, "__trust.takeErrors()");
+        let logs = string_value(&mut engine, "__trust.takeLogs()");
+        assert_eq!(
+            string_value(&mut engine, "frameLifecycleOrder.join('|')"),
+            "style:grid|window|frame",
+            "errors={errors}; logs={logs}"
+        );
+        assert_eq!(
+            string_value(&mut engine, "stylesheetFrame.contentDocument.readyState",),
+            "complete"
+        );
+        assert_eq!(errors, "");
+    }
+
+    #[test]
     fn top_level_await_delays_module_load_completion() {
         // HTML §4.12.1: running a module script waits for its evaluation promise. In particular,
         // top-level await must delay both the script element's load event and the document's load
@@ -7932,6 +9176,44 @@ mod tests {
     }
 
     #[test]
+    fn detached_node_listeners_remain_observable_without_staying_render_roots() {
+        // DOM removal does not erase a Node's event listener list: retained
+        // detached nodes still dispatch, and reinsertion restores them to the
+        // rendered event-target census. The host registry must hold detached
+        // targets weakly so it does not become their only lifetime owner.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const button = document.createElement("button");
+            body.appendChild(button);
+            let hits = 0;
+            button.addEventListener("click", () => hits++);
+            const id = button.__id;
+            button.remove();
+            button.click();
+            const detachedIsRendered = __trust.clickables().indexOf(id) >= 0;
+            body.appendChild(button);
+            const reinsertedIsRendered = __trust.clickables().indexOf(id) >= 0;
+            button.click();
+            globalThis.detachedListenerResult = [
+                hits, detachedIsRendered, reinsertedIsRendered
+            ].join("|");
+            "##,
+            "detached event-listener retention",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "detachedListenerResult"),
+            "2|false|true"
+        );
+    }
+
+    #[test]
     fn css_style_declaration_rejects_unitless_nonzero_lengths() {
         // CSSOM §6.7.1 + CSS Values 4 §6: assigning a JS number to a length
         // property stringifies it, but the resulting nonzero <number> is not a
@@ -8075,6 +9357,262 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "geometryResult"),
             "true|false|grid|100px 140px|240|80|true|30|25|https://example.com/large.png|false|true|true|child|https://example.com/child"
+        );
+    }
+
+    #[test]
+    fn top_level_iframe_rect_reuses_container_document_geometry_only() {
+        // CSSOM View §6 reports the iframe element's border box from its container Document.
+        // HTML §7.3.1.3 makes the iframe's active content Document distinct, so changing that
+        // child tree cannot change the already-laid-out embedding box. A mutation of the iframe
+        // itself still invalidates and recomputes the box.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            body.innerHTML = `<iframe id="frame" style="width:300px;height:150px"
+                srcdoc="<div id='child'>one</div>"></iframe>`;
+            globalThis.frameWidthBefore =
+                document.getElementById("frame").getBoundingClientRect().width;
+            "##,
+            "initial iframe geometry",
+        )
+        .unwrap();
+        let (dom, cache) = {
+            let state = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .expect("platform HostState remains installed");
+            (state.dom.clone(), state.geom_cache.clone())
+        };
+        assert_eq!(cache.borrow().epoch, dom.borrow().epoch());
+
+        eval(
+            &mut engine,
+            r##"
+            globalThis.detachedForFrameRect = document.createElement("section");
+            detachedForFrameRect.innerHTML = "<strong>detached</strong>";
+            globalThis.frameWidthAfterDetached =
+                document.getElementById("frame").getBoundingClientRect().width;
+            "##,
+            "detached mutation and container rect read",
+        )
+        .unwrap();
+        assert!(
+            cache.borrow().epoch < dom.borrow().epoch(),
+            "a disconnected subtree has no box and cannot invalidate the frame"
+        );
+        eval(
+            &mut engine,
+            r##"
+            document.body.appendChild(detachedForFrameRect);
+            globalThis.frameWidthAfterDetachedInsertion =
+                document.getElementById("frame").getBoundingClientRect().width;
+            "##,
+            "connected insertion and container rect read",
+        )
+        .unwrap();
+        assert_eq!(
+            cache.borrow().epoch,
+            dom.borrow().epoch(),
+            "inserting the subtree into the container Document forces layout"
+        );
+
+        eval(
+            &mut engine,
+            r##"
+            const frameAfterChildMutation = document.getElementById("frame");
+            frameAfterChildMutation.contentDocument.querySelector("#child").textContent = "two";
+            "##,
+            "child Document mutation",
+        )
+        .unwrap();
+        let child_changes = dom
+            .borrow_mut()
+            .take_geometry_dirty_targets()
+            .expect("child Document mutation remains attributed");
+        let child_change_scopes = {
+            let dom = dom.borrow();
+            child_changes
+                .iter()
+                .map(|(node, kind)| {
+                    (
+                        *node,
+                        *kind,
+                        dom.tag_name(*node).map(str::to_string),
+                        dom.frame_owner(*node),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            child_change_scopes.iter().all(|(_, kind, tag, owner)| {
+                owner.is_some()
+                    || (*kind == crate::dom::DirtyKind::Content
+                        && matches!(tag.as_deref(), Some("iframe" | "frame")))
+            }),
+            "child mutation escaped its nested Document: {child_change_scopes:?}"
+        );
+        eval(
+            &mut engine,
+            r##"
+            const frameAfterSecondChildMutation = document.getElementById("frame");
+            frameAfterSecondChildMutation.contentDocument.querySelector("#child").textContent = "three";
+            globalThis.frameWidthAfterChild =
+                frameAfterSecondChildMutation.getBoundingClientRect().width;
+            "##,
+            "second child Document mutation and container rect read",
+        )
+        .unwrap();
+        assert!(
+            cache.borrow().epoch < dom.borrow().epoch(),
+            "child Document mutation reused the container Document box map"
+        );
+        assert!(cache.borrow().top_document_valid);
+
+        eval(
+            &mut engine,
+            r##"
+            const frameAfterContainerMutation = document.getElementById("frame");
+            frameAfterContainerMutation.style.width = "410px";
+            globalThis.frameWidthAfterContainer =
+                frameAfterContainerMutation.getBoundingClientRect().width;
+            "##,
+            "container Document mutation and iframe rect read",
+        )
+        .unwrap();
+        assert_eq!(cache.borrow().epoch, dom.borrow().epoch());
+        assert_eq!(string_value(&mut engine, "frameWidthBefore"), "300");
+        assert_eq!(string_value(&mut engine, "frameWidthAfterChild"), "300");
+        assert_eq!(string_value(&mut engine, "frameWidthAfterContainer"), "410");
+    }
+
+    #[test]
+    fn computed_width_and_height_are_rendered_used_values() {
+        // CSSOM §9 resolved values: width/height use laid-out values whenever
+        // the property applies and the element generates a box. Keep the CSS
+        // property box distinct from CSSOM View's border-box rectangle so both
+        // content-box and border-box sizing serialize correctly. Stockcharts'
+        // fitWidth HOC depends on the first `width:auto` case at mount time.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            html.style.cssText = "margin:0;padding:0";
+            body.style.cssText = "margin:0;padding:0";
+            body.innerHTML = `
+                <div id="auto"><span>fit</span></div>
+                <div id="content" style="width:100px;height:20px;padding:10px;border:2px solid"></div>
+                <div id="border" style="box-sizing:border-box;width:100px;height:40px;padding:10px;border:2px solid"></div>
+                <div id="basis" style="width:400px"><div id="percent" style="width:50%;height:10px"></div></div>
+                <span id="inline" style="width:75px">inline</span>
+                <div id="hidden" style="display:none;width:50%"></div>`;
+            const auto = document.getElementById("auto");
+            const content = document.getElementById("content");
+            const border = document.getElementById("border");
+            const percent = document.getElementById("percent");
+            const inline = document.getElementById("inline");
+            const hidden = document.getElementById("hidden");
+            globalThis.resolvedSizeResult = [
+                getComputedStyle(auto).width,
+                getComputedStyle(content).width, content.getBoundingClientRect().width,
+                getComputedStyle(content).height, content.getBoundingClientRect().height,
+                getComputedStyle(border).width, border.getBoundingClientRect().width,
+                getComputedStyle(border).height, border.getBoundingClientRect().height,
+                getComputedStyle(percent).width,
+                getComputedStyle(inline).width,
+                getComputedStyle(hidden).width
+            ].join("|");
+            "##,
+            "CSSOM used width and height",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "resolvedSizeResult"),
+            "640px|100px|124|20px|44|100px|100|40px|40|200px|75px|50%"
+        );
+    }
+
+    #[test]
+    fn computed_font_size_is_an_absolute_length() {
+        // CSSOM §9 exposes the computed value for font-size. CSS Fonts
+        // §2.5 defines that computed value as an absolute length, including
+        // when the specified value is the initial `medium`, a percentage, or
+        // a font-relative length.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const initial = getComputedStyle(html).fontSize;
+            html.style.fontSize = "62.5%";
+            body.innerHTML = `<div id="child" style="font-size:1.5em">text</div>`;
+            globalThis.computedFontSizeResult = [
+                initial,
+                getComputedStyle(html).fontSize,
+                getComputedStyle(document.getElementById("child")).fontSize
+            ].join("|");
+            "##,
+            "CSSOM computed font-size",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "computedFontSizeResult"),
+            "16px|10px|15px"
+        );
+    }
+
+    #[test]
+    fn shadow_host_percentage_width_uses_its_containing_block_content_box() {
+        // CSS 2.2 §10.3.3 solves an auto-width normal-flow block from its containing block after
+        // subtracting padding. CSS Sizing §5 then resolves a child's 100% width against that
+        // content box, including when the child is a custom-element host styled through :host.
+        // CSSOM View reports the resulting padding-box width through clientWidth.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            html.style.cssText = "margin:0;padding:0";
+            body.style.cssText = "margin:0;padding:0";
+
+            const pane = document.createElement("x-chart-pane");
+            pane.style.cssText = "display:block;width:768px";
+            body.appendChild(pane);
+            const paneShadow = pane.attachShadow({ mode: "open" });
+            paneShadow.innerHTML = '<style>' +
+                '.main{padding-right:20rem;height:288px}' +
+                '.main > *{width:100%;height:100%}' +
+                '</style><div class="main"><x-time-chart></x-time-chart></div>';
+            const chart = paneShadow.querySelector("x-time-chart");
+            chart.attachShadow({ mode: "open" }).innerHTML =
+                '<style>:host{display:block !important;position:relative !important}</style>';
+            globalThis.shadowHostPercentageWidthResult = [
+                getComputedStyle(chart).display,
+                getComputedStyle(chart).width,
+                chart.getBoundingClientRect().width,
+                chart.clientWidth
+            ].join("|");
+            "##,
+            "shadow host percentage width",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "shadowHostPercentageWidthResult"),
+            "block|448px|448|448"
         );
     }
 
@@ -8226,6 +9764,624 @@ mod tests {
     }
 
     #[test]
+    fn cache_storage_follows_query_vary_and_deleted_cache_lifetime_algorithms() {
+        // Service Workers §5.4–§5.5: Cache matching excludes fragments, honors
+        // queries and Vary by default, returns fresh Response objects, and a
+        // deleted name does not invalidate an already-referenced Cache object.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            globalThis.cacheStorageResult = "pending";
+            (async function () {
+                const sameObject = caches === caches;
+                const cache = await caches.open("conformance");
+                const stored = new Response("hello", {
+                    headers: { "content-type": "text/plain", "vary": "accept-language" }
+                });
+                await cache.put(new Request("https://example.com/item?q=1#original", {
+                    headers: { "accept-language": "en" }
+                }), stored);
+
+                const hit = await cache.match(new Request("https://example.com/item?q=1#other", {
+                    headers: { "accept-language": "en" }
+                }));
+                const miss = await cache.match(new Request("https://example.com/item?q=1", {
+                    headers: { "accept-language": "fr" }
+                }));
+                const ignored = await cache.match(new Request("https://example.com/item?q=2", {
+                    headers: { "accept-language": "fr" }
+                }), { ignoreSearch: true, ignoreVary: true });
+                const keys = await cache.keys();
+                const namesBefore = await caches.keys();
+                const removedName = await caches.delete("conformance");
+                const retained = await cache.match(new Request("https://example.com/item?q=1", {
+                    headers: { "accept-language": "en" }
+                }));
+                const replacement = await caches.open("conformance");
+                const replacementMiss = await replacement.match("https://example.com/item?q=1");
+                const firstDelete = await cache.delete("https://example.com/item?q=1", {
+                    ignoreVary: true
+                });
+                const secondDelete = await cache.delete("https://example.com/item?q=1", {
+                    ignoreVary: true
+                });
+
+                cacheStorageResult = [
+                    typeof Cache, typeof CacheStorage,
+                    cache instanceof Cache, sameObject,
+                    await hit.text(), miss === undefined,
+                    await ignored.text(), keys.length,
+                    keys[0].url.endsWith("#original"),
+                    namesBefore.join(","), removedName,
+                    await retained.text(), replacementMiss === undefined,
+                    firstDelete, secondDelete, stored.bodyUsed
+                ].join("|");
+            })().catch(function (error) {
+                cacheStorageResult = "ERROR:" + error.name + ":" + error.message +
+                    (error.stack ? "\n" + error.stack : "");
+            });
+            "##,
+            "CacheStorage conformance",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "cacheStorageResult"),
+            "function|function|true|true|hello|true|hello|1|true|conformance|true|hello|true|true|false|true"
+        );
+    }
+
+    #[test]
+    fn dataset_exposes_live_enumerable_dom_string_map_properties() {
+        // WHATWG HTML §3.2.6.6: DOMStringMap's supported property names are
+        // derived from the current data-* attribute list, preserve that order,
+        // and are enumerable own named properties. GitLab enumerates dataset
+        // before parsing its JSON-valued programmingLanguages boot attribute.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const element = document.createElement("div");
+            element.setAttribute("data-programming-languages", '[{"id":30,"name":"C"}]');
+            element.setAttribute("data-user-id", "17");
+            const dataset = element.dataset;
+            const copied = Object.assign({}, dataset);
+            const parsed = JSON.parse(copied.programmingLanguages);
+            const firstKeys = Object.keys(dataset).join(",");
+            const descriptor = Object.getOwnPropertyDescriptor(dataset, "userId");
+            element.setAttribute("data-later-value", "live");
+            dataset.fooBar = 42;
+            const reflected = element.getAttribute("data-foo-bar");
+            delete dataset.userId;
+            let invalidName = "";
+            try { dataset["bad-name"] = "x"; } catch (error) { invalidName = error.name; }
+            let symbolValue = "";
+            try { dataset.symbol = Symbol("x"); } catch (error) { symbolValue = error.name; }
+            globalThis.datasetEnumerationResult = [
+                dataset instanceof DOMStringMap,
+                firstKeys,
+                parsed[0].name,
+                descriptor.enumerable,
+                descriptor.configurable,
+                descriptor.writable,
+                dataset.laterValue,
+                Object.keys(dataset).join(","),
+                reflected,
+                element.hasAttribute("data-user-id"),
+                typeof dataset.toString,
+                invalidName,
+                symbolValue
+            ].join("|");
+            "##,
+            "DOMStringMap supported named properties",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "datasetEnumerationResult"),
+            "true|programmingLanguages,userId|C|true|true|true|live|programmingLanguages,laterValue,fooBar|42|false|function|SyntaxError|TypeError"
+        );
+    }
+
+    #[test]
+    fn indexed_db_orders_upgrade_requests_transactions_and_cursor_iteration() {
+        // Indexed Database 3 §§2.7.1, 4.1, 4.3–4.5, 4.9, and 5.1/5.6/5.7:
+        // an open request upgrades before succeeding; transaction requests and
+        // cursor continuations complete in insertion order; request callbacks
+        // reactivate their transaction; and stored values are structured
+        // clones rather than aliases to author objects.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            globalThis.indexedDbResult = "pending";
+            const idbLog = [];
+            const open = indexedDB.open("trust-indexed-db-conformance", 1);
+            let pendingThrows = false;
+            try { void open.result; }
+            catch (error) { pendingThrows = error.name === "InvalidStateError"; }
+
+            open.onupgradeneeded = function (event) {
+                idbLog.push("upgrade:" + event.oldVersion + ":" + event.newVersion + ":" +
+                    (event.target === open) + ":" + (open.transaction.mode === "versionchange"));
+                const store = open.result.createObjectStore("items");
+                const original = { nested: { value: 1 }, bytes: new Uint8Array([3, 4]) };
+                store.put(original, "b");
+                original.nested.value = 88;
+                original.bytes[0] = 9;
+                store.put({ nested: { value: 2 } }, "a");
+                open.transaction.oncomplete = function () { idbLog.push("upgrade-complete"); };
+            };
+            open.onerror = function () {
+                indexedDbResult = "OPEN-ERROR:" + open.error.name + ":" + open.error.message;
+            };
+            open.onsuccess = function () {
+                idbLog.push("open-success:" + open.result.objectStoreNames.contains("items"));
+                const db = open.result;
+                const transaction = db.transaction("items", "readonly", { durability: "relaxed" });
+                const store = transaction.objectStore("items");
+                const first = store.get("b");
+                first.onsuccess = function (event) {
+                    const sameResultObject = first.result === first.result;
+                    idbLog.push("get:" + first.result.nested.value + ":" + first.result.bytes[0] +
+                        ":" + sameResultObject + ":" + (event.target === first));
+                    first.result.nested.value = 99;
+                    const again = store.get("b");
+                    again.onsuccess = function () { idbLog.push("again:" + again.result.nested.value); };
+                };
+                const keys = store.getAllKeys();
+                keys.onsuccess = function () { idbLog.push("keys:" + keys.result.join(",")); };
+                const cursorRequest = store.openCursor();
+                cursorRequest.onsuccess = function () {
+                    const cursor = cursorRequest.result;
+                    if (cursor) {
+                        idbLog.push("cursor:" + cursor.key + ":" + cursor.value.nested.value);
+                        cursor.continue();
+                    } else idbLog.push("cursor:end");
+                };
+                transaction.oncomplete = function () {
+                    let inactive = false;
+                    try { store.get("a"); }
+                    catch (error) { inactive = error.name === "TransactionInactiveError"; }
+                    idbLog.push("read-complete:" + inactive);
+                    db.close();
+                    const remove = indexedDB.deleteDatabase("trust-indexed-db-conformance");
+                    remove.onsuccess = function (event) {
+                        idbLog.push("delete:" + event.oldVersion + ":" + event.newVersion);
+                        indexedDbResult = pendingThrows + "|" + idbLog.join("|");
+                    };
+                };
+            };
+            "##,
+            "IndexedDB transaction algorithms",
+        )
+        .unwrap();
+
+        for _ in 0..128 {
+            run_microtask_checkpoint(&mut engine);
+            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                .map(|value| engine.ctx().to_boolean(&value))
+                .unwrap_or(false);
+            if !has_task {
+                break;
+            }
+            assert!(
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+            );
+        }
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "indexedDbResult"),
+            "true|upgrade:0:1:true:true|upgrade-complete|open-success:true|get:1:3:true:true|keys:a,b|cursor:a:2|again:1|cursor:b:1|cursor:end|read-complete:true|delete:1:null"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+    }
+
+    #[test]
+    fn indexed_db_request_events_follow_parent_path_and_cancellation_rules() {
+        // Indexed Database 3 §§2.7.1, 2.8, and 5.9–5.10, together with
+        // WHATWG DOM §2.9: a request's event parent is its transaction, whose
+        // parent is the database connection. Error events capture and bubble
+        // over that path, reactivate the transaction for every listener, and
+        // a canceled error allows later requests to complete. Success events
+        // traverse the capture path but do not bubble.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            globalThis.indexedDbEventResult = "pending";
+            const eventLog = [];
+            const open = indexedDB.open("trust-indexed-db-event-conformance", 1);
+            open.onupgradeneeded = function () {
+                const store = open.result.createObjectStore("items");
+                store.createIndex("code", "code", { unique: true });
+                store.put({ code: "one", value: 1 }, 1);
+            };
+            open.onerror = function () {
+                indexedDbEventResult = "OPEN-ERROR:" + open.error.name;
+            };
+            open.onsuccess = function () {
+                const db = open.result;
+                const transaction = db.transaction("items", "readwrite");
+                const store = transaction.objectStore("items");
+                let duplicate;
+                let recovery;
+                let unexpectedSuccessBubble = 0;
+                function record(label, event, current, target) {
+                    const path = event.composedPath();
+                    eventLog.push(label + ":" + event.eventPhase + ":" +
+                        (event.target === target) + ":" +
+                        (event.currentTarget === current) + ":" + event.isTrusted + ":" +
+                        (path.length === 3 && path[0] === target &&
+                            path[1] === transaction && path[2] === db));
+                }
+
+                db.addEventListener("error", function (event) {
+                    record("db-error-capture", event, db, duplicate);
+                }, true);
+                transaction.addEventListener("error", function (event) {
+                    record("transaction-error-capture", event, transaction, duplicate);
+                }, true);
+                transaction.addEventListener("error", function (event) {
+                    record("transaction-error-bubble", event, transaction, duplicate);
+                });
+                db.addEventListener("error", function (event) {
+                    record("db-error-bubble", event, db, duplicate);
+                    event.preventDefault();
+                });
+                transaction.addEventListener("success", function () {
+                    unexpectedSuccessBubble++;
+                });
+                db.addEventListener("success", function () {
+                    unexpectedSuccessBubble++;
+                });
+
+                duplicate = store.put({ code: "one", value: 2 }, 2);
+                duplicate.onerror = function (event) {
+                    record("request-error", event, duplicate, duplicate);
+                    eventLog.push("error:" + duplicate.error.name);
+                    // Request event dispatch makes the transaction active, so
+                    // this recovery request must be accepted from the handler.
+                    recovery = store.get(1);
+                    db.addEventListener("success", function (successEvent) {
+                        if (successEvent.target === recovery)
+                            record("db-success-capture", successEvent, db, recovery);
+                    }, true);
+                    transaction.addEventListener("success", function (successEvent) {
+                        if (successEvent.target === recovery)
+                            record("transaction-success-capture", successEvent,
+                                transaction, recovery);
+                    }, true);
+                    recovery.onsuccess = function (successEvent) {
+                        record("request-success", successEvent, recovery, recovery);
+                        eventLog.push("recovery:" + recovery.result.code);
+                    };
+                };
+                transaction.onabort = function () {
+                    indexedDbEventResult = "UNEXPECTED-ABORT:" + transaction.error.name;
+                };
+                transaction.oncomplete = function (event) {
+                    eventLog.push("complete:" + event.eventPhase + ":" +
+                        event.isTrusted + ":" + unexpectedSuccessBubble);
+                    db.close();
+                    const remove = indexedDB.deleteDatabase(
+                        "trust-indexed-db-event-conformance");
+                    remove.onsuccess = function () {
+                        indexedDbEventResult = eventLog.join("|");
+                    };
+                };
+            };
+            "##,
+            "IndexedDB request event propagation algorithms",
+        )
+        .unwrap();
+
+        for _ in 0..192 {
+            run_microtask_checkpoint(&mut engine);
+            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                .map(|value| engine.ctx().to_boolean(&value))
+                .unwrap_or(false);
+            if !has_task {
+                break;
+            }
+            assert!(
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+            );
+        }
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "indexedDbEventResult"),
+            "db-error-capture:1:true:true:true:true|transaction-error-capture:1:true:true:true:true|request-error:2:true:true:true:true|error:ConstraintError|transaction-error-bubble:3:true:true:true:true|db-error-bubble:3:true:true:true:true|db-success-capture:1:true:true:true:true|transaction-success-capture:1:true:true:true:true|request-success:2:true:true:true:true|recovery:one|complete:2:true:0"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+    }
+
+    #[test]
+    fn indexed_db_listener_exception_aborts_with_abort_error() {
+        // Indexed Database 3 §§5.9–5.10 and WHATWG DOM §2.9 "inner invoke":
+        // the dispatch algorithm reports listener exceptions through its
+        // IndexedDB-only legacy output flag. That flag aborts the transaction
+        // with AbortError, even when the request itself succeeded.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            globalThis.indexedDbListenerExceptionResult = "pending";
+            const exceptionLog = [];
+            const open = indexedDB.open(
+                "trust-indexed-db-listener-exception-conformance", 1);
+            open.onupgradeneeded = function () {
+                const store = open.result.createObjectStore("items");
+                store.put({ value: 1 }, 1);
+            };
+            open.onsuccess = function () {
+                const db = open.result;
+                const transaction = db.transaction("items");
+                const request = transaction.objectStore("items").get(1);
+                transaction.oncomplete = function () {
+                    indexedDbListenerExceptionResult = "UNEXPECTED-COMPLETE";
+                };
+                transaction.onabort = function (event) {
+                    exceptionLog.push("transaction-abort:" + event.eventPhase + ":" +
+                        (event.target === transaction) + ":" +
+                        (event.currentTarget === transaction) + ":" + event.isTrusted + ":" +
+                        transaction.error.name);
+                    db.close();
+                    const remove = indexedDB.deleteDatabase(
+                        "trust-indexed-db-listener-exception-conformance");
+                    remove.onsuccess = function () {
+                        exceptionLog.push("delete");
+                        indexedDbListenerExceptionResult = exceptionLog.join("|");
+                    };
+                };
+                db.addEventListener("abort", function (event) {
+                    exceptionLog.push("database-abort:" + event.eventPhase + ":" +
+                        (event.target === transaction) + ":" +
+                        (event.currentTarget === db) + ":" + event.isTrusted + ":" +
+                        transaction.error.name);
+                });
+                request.onsuccess = function () {
+                    throw new Error("idb-listener-boom");
+                };
+            };
+            open.onerror = function () {
+                indexedDbListenerExceptionResult = "OPEN-ERROR:" + open.error.name;
+            };
+            "##,
+            "IndexedDB listener exception abort algorithm",
+        )
+        .unwrap();
+
+        for _ in 0..160 {
+            run_microtask_checkpoint(&mut engine);
+            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                .map(|value| engine.ctx().to_boolean(&value))
+                .unwrap_or(false);
+            if !has_task {
+                break;
+            }
+            assert!(
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+            );
+        }
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "indexedDbListenerExceptionResult"),
+            "transaction-abort:2:true:true:true:AbortError|database-abort:3:true:true:true:AbortError|delete"
+        );
+        assert!(
+            string_value(&mut engine, "__trust.takeErrors()")
+                .contains("success handler: idb-listener-boom")
+        );
+    }
+
+    #[test]
+    fn indexed_db_connection_queue_resumes_after_close_pending_transaction() {
+        // Indexed Database 3 §§2.8.2 and 5.1–5.3: open/delete operations for
+        // one storage key and name are serialized. An upgrade sends
+        // versionchange, reports blocked while an old close-pending connection
+        // still has a live transaction, and resumes only when that connection
+        // is actually closed.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            globalThis.indexedDbConnectionQueueResult = "pending";
+            const connectionLog = [];
+            const name = "trust-indexed-db-connection-queue-conformance";
+            const first = indexedDB.open(name, 1);
+            first.onupgradeneeded = function () {
+                first.result.createObjectStore("items");
+            };
+            first.onsuccess = function () {
+                const firstDb = first.result;
+                connectionLog.push("first-success:" + firstDb.version);
+                const hold = firstDb.transaction("items", "readwrite");
+                hold.objectStore("items").put("held", 1);
+                hold.oncomplete = function () { connectionLog.push("hold-complete"); };
+                firstDb.onversionchange = function (event) {
+                    connectionLog.push("versionchange:" + event.oldVersion + ":" +
+                        event.newVersion + ":" + event.isTrusted);
+                    // close() marks the connection close-pending immediately,
+                    // but it remains open until `hold` finishes.
+                    firstDb.close();
+                };
+
+                const second = indexedDB.open(name, 2);
+                second.onblocked = function (event) {
+                    connectionLog.push("blocked:" + event.oldVersion + ":" +
+                        event.newVersion + ":" + event.isTrusted);
+                };
+                second.onupgradeneeded = function (event) {
+                    connectionLog.push("upgrade:" + event.oldVersion + ":" +
+                        event.newVersion);
+                    second.result.createObjectStore("new-store");
+                };
+                second.onsuccess = function () {
+                    connectionLog.push("second-success:" + second.result.version);
+                    second.result.close();
+                };
+                second.onerror = function () {
+                    indexedDbConnectionQueueResult = "SECOND-ERROR:" + second.error.name;
+                };
+
+                // This request is queued behind the blocked upgrade and must
+                // observe/delete version 2, not race version 1.
+                const remove = indexedDB.deleteDatabase(name);
+                remove.onsuccess = function (event) {
+                    connectionLog.push("delete:" + event.oldVersion + ":" +
+                        event.newVersion + ":" + event.isTrusted);
+                    indexedDbConnectionQueueResult = connectionLog.join("|");
+                };
+                remove.onerror = function () {
+                    indexedDbConnectionQueueResult = "DELETE-ERROR:" + remove.error.name;
+                };
+            };
+            first.onerror = function () {
+                indexedDbConnectionQueueResult = "FIRST-ERROR:" + first.error.name;
+            };
+            "##,
+            "IndexedDB connection queue and close blocking algorithms",
+        )
+        .unwrap();
+
+        for _ in 0..256 {
+            run_microtask_checkpoint(&mut engine);
+            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                .map(|value| engine.ctx().to_boolean(&value))
+                .unwrap_or(false);
+            if !has_task {
+                break;
+            }
+            assert!(
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+            );
+        }
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "indexedDbConnectionQueueResult"),
+            "first-success:1|versionchange:1:2:true|blocked:1:2:true|hold-complete|upgrade:1:2|second-success:2|delete:2:null:true"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+    }
+
+    #[test]
+    fn indexed_db_indexes_follow_secondary_order_multi_entry_and_unique_constraints() {
+        // Indexed Database 3 §§4.6, 6.1, 6.3, and 6.7: index rows are sorted
+        // by index key then primary key; multiEntry flattens only the outer
+        // array and removes duplicates; unique directions select one primary
+        // row per index key; and a failed unique write rolls back that request.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            globalThis.indexedDbIndexResult = "pending";
+            const indexLog = [];
+            const open = indexedDB.open("trust-indexed-db-index-conformance", 1);
+            open.onupgradeneeded = function () {
+                const store = open.result.createObjectStore("items");
+                store.createIndex("category", "category");
+                store.createIndex("tags", "tags", { multiEntry: true });
+                store.createIndex("code", "code", { unique: true });
+                store.put({ category: "x", tags: ["a", "b", "a"], code: "one" }, 1);
+                store.put({ category: "x", tags: ["b", "c"], code: "two" }, 2);
+                store.put({ category: "y", tags: ["c"], code: "three" }, 3);
+            };
+            open.onerror = function () {
+                indexedDbIndexResult = "OPEN-ERROR:" + open.error.name;
+            };
+            open.onsuccess = function () {
+                const db = open.result;
+                const read = db.transaction("items");
+                const store = read.objectStore("items");
+                const category = store.index("category");
+                const tags = store.index("tags");
+                const first = category.get("x");
+                first.onsuccess = () => indexLog.push("first:" + first.result.code);
+                const firstKey = category.getKey("x");
+                firstKey.onsuccess = () => indexLog.push("first-key:" + firstKey.result);
+                const keys = category.getAllKeys("x");
+                keys.onsuccess = () => indexLog.push("keys:" + keys.result.join(","));
+                const tagKeys = tags.getAllKeys("b");
+                tagKeys.onsuccess = () => indexLog.push("tags:" + tagKeys.result.join(","));
+                const count = tags.count(IDBKeyRange.bound("b", "c"));
+                count.onsuccess = () => indexLog.push("count:" + count.result);
+                const cursorKeys = [];
+                const cursorRequest = category.openCursor();
+                cursorRequest.onsuccess = function () {
+                    const cursor = cursorRequest.result;
+                    if (cursor) {
+                        cursorKeys.push(cursor.key + "/" + cursor.primaryKey);
+                        cursor.continue();
+                    } else indexLog.push("cursor:" + cursorKeys.join(","));
+                };
+                const uniqueKeys = [];
+                const uniqueRequest = category.openKeyCursor(null, "nextunique");
+                uniqueRequest.onsuccess = function () {
+                    const cursor = uniqueRequest.result;
+                    if (cursor) {
+                        uniqueKeys.push(cursor.key + "/" + cursor.primaryKey);
+                        cursor.continue();
+                    } else indexLog.push("unique:" + uniqueKeys.join(","));
+                };
+                read.oncomplete = function () {
+                    const write = db.transaction("items", "readwrite");
+                    const writable = write.objectStore("items");
+                    const duplicate = writable.put({ category: "z", tags: [], code: "one" }, 4);
+                    duplicate.onerror = function (event) {
+                        indexLog.push("constraint:" + duplicate.error.name);
+                        event.preventDefault();
+                        const absent = writable.get(4);
+                        absent.onsuccess = () => indexLog.push("rollback:" + (absent.result === undefined));
+                    };
+                    write.oncomplete = function () {
+                        db.close();
+                        const remove = indexedDB.deleteDatabase("trust-indexed-db-index-conformance");
+                        remove.onsuccess = function () {
+                            indexedDbIndexResult = indexLog.join("|");
+                        };
+                    };
+                };
+            };
+            "##,
+            "IndexedDB index algorithms",
+        )
+        .unwrap();
+
+        for _ in 0..192 {
+            run_microtask_checkpoint(&mut engine);
+            let has_task = engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                .map(|value| engine.ctx().to_boolean(&value))
+                .unwrap_or(false);
+            if !has_task {
+                break;
+            }
+            assert!(
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+            );
+        }
+        run_microtask_checkpoint(&mut engine);
+
+        let errors = string_value(&mut engine, "__trust.takeErrors()");
+        assert_eq!(
+            string_value(&mut engine, "indexedDbIndexResult"),
+            "first:one|first-key:1|keys:1,2|tags:1,2|count:4|unique:x/1,y/3|cursor:x/1,x/2,y/3|constraint:ConstraintError|rollback:true",
+            "errors={errors}"
+        );
+        assert_eq!(errors, "");
+    }
+
+    #[test]
     fn minimal_boundary_boots_the_real_prelude() {
         let mut engine = platform_engine();
         let node_type = eval_value(&mut engine, "document.nodeType", "node type").unwrap();
@@ -8275,6 +10431,686 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "dynamicBaseUriResult"),
             "https://example.com/dynamic/|https://example.com/dynamic/|https://example.com/dynamic/bundle.js"
+        );
+    }
+
+    #[test]
+    fn iframe_src_is_always_resolved_against_its_node_document() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // HTML §4.8.5's shared iframe-attribute processing steps parse `src`
+        // relative to the iframe element's node Document. A callback running
+        // with the child Window's settings object must not reinterpret the
+        // embedding element's relative URL against the child Document and
+        // accidentally navigate the child a second time.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            runtime.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            for _ in 0..2 {
+                let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+                else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let target = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_owned();
+                request_tx.send(target.clone()).unwrap();
+                let body = if target == "/speedometer/resources/angular/index.html" {
+                    r#"<html><head><base href="child-assets/"></head><body id="original"><script>
+                        Promise.resolve().then(function () {
+                            document.body.setAttribute("data-bases", [
+                                frameElement.baseURI,
+                                frameElement.ownerDocument.baseURI,
+                                document.body.baseURI
+                            ].join("|"));
+                            frameElement.contentDocument;
+                        });
+                    </script></body></html>"#
+                } else {
+                    r#"<body id="wrong-base-replacement"></body>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let page = url::Url::parse(&format!("http://{address}/speedometer/index.html")).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, _task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, page.as_str());
+
+        eval(
+            &mut engine,
+            r#"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.setAttribute("src", "resources/angular/index.html");
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                globalThis.relativeFrame = frame;
+            "#,
+            "relative iframe src setup",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "relativeFrame.contentDocument.body.id"),
+            "original"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "relativeFrame.contentDocument.body.getAttribute('data-bases')"
+            ),
+            format!(
+                "http://{address}/speedometer/index.html|http://{address}/speedometer/index.html|http://{address}/speedometer/resources/angular/child-assets/"
+            )
+        );
+        assert_eq!(
+            request_rx.try_iter().collect::<Vec<_>>(),
+            vec![String::from("/speedometer/resources/angular/index.html")]
+        );
+    }
+
+    #[test]
+    fn iframe_cross_document_navigation_replaces_the_active_window_event_target() {
+        // HTML §7.2.3 gives a browsing context a stable WindowProxy whose
+        // [[Window]] changes on ordinary cross-document navigation. Event
+        // listeners and event-handler IDL attributes belong to that Window;
+        // they must not survive when a benchmark reuses one iframe element for
+        // a different application Document.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<body><script>' +
+                    'window.addEventListener("probe", function () {' +
+                    'document.body.setAttribute("data-old-listener", "yes"); });' +
+                    'window.onload = function () {};' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+
+                frame.srcdoc = '<body><script>' +
+                    'const inheritedOnload = window.onload !== null;' +
+                    'window.addEventListener("probe", function () {' +
+                    'document.body.setAttribute("data-new-listener", "yes"); });' +
+                    'window.dispatchEvent(new Event("probe"));' +
+                    'document.body.setAttribute("data-result", [' +
+                    'inheritedOnload,' +
+                    'document.body.getAttribute("data-old-listener"),' +
+                    'document.body.getAttribute("data-new-listener")].join("|"));' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                globalThis.reusedFrame = frame;
+            "##,
+            "iframe Window replacement",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "reusedFrame.contentDocument.body.getAttribute('data-result')"
+            ),
+            "false||yes"
+        );
+    }
+
+    #[test]
+    fn bytecode_repeated_iframe_navigation_keeps_the_active_property_key_sound() {
+        // A megamorphic property cache must not use a chunk-owned string address
+        // as its sole key. Each navigation destroys the child bytecode chunk, so
+        // the allocator may reuse that address for a different property name.
+        // Keep this stress case in the bytecode tier: the reference interpreter
+        // does not exercise the cache and therefore cannot protect this path.
+        let mut engine = platform_engine();
+        engine.set_tier(Tier::Bytecode);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                body.appendChild(frame);
+                let navigations = 0;
+                function navigateAgain() {
+                    frame.srcdoc = '<body><script>' +
+                        'requestAnimationFrame(function () { document.body.dataset.ready = "yes"; });' +
+                        '<\/script></body>';
+                    __trust.hydrateFrames();
+                    navigations++;
+                    if (navigations < 120) requestAnimationFrame(navigateAgain);
+                    else frame.contentDocument.body.dataset.done = String(navigations);
+                }
+                requestAnimationFrame(navigateAgain);
+                globalThis.repeatedNavigationFrame = frame;
+            "##,
+            "bytecode repeated iframe navigation setup",
+        )
+        .unwrap();
+
+        for _ in 0..300 {
+            let deadline = call_trust_method(&mut engine, "nextDeadline", &[]);
+            let Some(deadline) = deadline.as_num_opt() else {
+                break;
+            };
+            call_trust_method(&mut engine, "tickTo", &[Value::Num(deadline)]);
+            if string_value(
+                &mut engine,
+                "String(repeatedNavigationFrame.contentDocument.body.dataset.done)",
+            ) == "120"
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(repeatedNavigationFrame.contentDocument.body.dataset.done)",
+            ),
+            "120"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+    }
+
+    #[test]
+    fn iframe_cross_document_navigation_creates_a_fresh_custom_element_registry() {
+        // HTML §4.13.4: Window.customElements returns its associated
+        // Document's registry, and every replacement Window/Document is
+        // created with a new registry. The same name therefore can be defined
+        // by two successive applications, while a duplicate in either one
+        // still throws NotSupportedError.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<body><x-navigation-registry></x-navigation-registry><script>' +
+                    'class FirstDefinition extends HTMLElement {' +
+                    'connectedCallback() { this.setAttribute("data-definition", "first"); }}' +
+                    'customElements.define("x-navigation-registry", FirstDefinition);' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                const firstRegistry = frame.contentWindow.customElements;
+                const firstConstructor = firstRegistry.get("x-navigation-registry");
+
+                frame.srcdoc = '<body><x-navigation-registry></x-navigation-registry><script>' +
+                    'class SecondDefinition extends HTMLElement {' +
+                    'connectedCallback() { this.setAttribute("data-definition", "second"); }}' +
+                    'customElements.define("x-navigation-registry", SecondDefinition);' +
+                    'try {' +
+                    'customElements.define("x-navigation-registry", class extends HTMLElement {});' +
+                    '} catch (error) { document.body.setAttribute("data-duplicate-error", error.name); }' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                const secondRegistry = frame.contentWindow.customElements;
+                const secondConstructor = secondRegistry.get("x-navigation-registry");
+                const element = frame.contentDocument.querySelector("x-navigation-registry");
+                globalThis.customElementRegistryNavigationResult = [
+                    firstRegistry !== secondRegistry,
+                    firstRegistry.get("x-navigation-registry") === firstConstructor,
+                    secondConstructor !== firstConstructor,
+                    element.getAttribute("data-definition"),
+                    frame.contentDocument.body.getAttribute("data-duplicate-error"),
+                    typeof firstConstructor,
+                    firstConstructor && firstConstructor.name,
+                    typeof secondConstructor,
+                    secondConstructor && secondConstructor.name
+                ].join("|");
+            "##,
+            "iframe custom-element registry replacement",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "customElementRegistryNavigationResult"),
+            "true|true|true|second|NotSupportedError|function|FirstDefinition|function|SecondDefinition"
+        );
+    }
+
+    #[test]
+    fn replacing_an_iframe_element_creates_a_fresh_custom_element_registry() {
+        // HTML §4.8.5 iframe removing steps destroy the old child navigable;
+        // inserting a different iframe creates a new child navigable. Its
+        // initial Window and the Window created for its first application
+        // Document therefore cannot inherit the removed iframe's registry.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+
+                const firstFrame = document.createElement("iframe");
+                firstFrame.srcdoc = '<body><x-recreated-frame></x-recreated-frame><script>' +
+                    'class FirstFrameDefinition extends HTMLElement {' +
+                    'connectedCallback() { this.setAttribute("data-definition", "first"); }}' +
+                    'customElements.define("x-recreated-frame", FirstFrameDefinition);' +
+                    '<\/script></body>';
+                body.appendChild(firstFrame);
+                __trust.hydrateFrames();
+                const firstRegistry = firstFrame.contentWindow.customElements;
+                const firstElement = firstFrame.contentDocument.querySelector("x-recreated-frame");
+                const firstDefinition = firstElement.getAttribute("data-definition");
+                body.removeChild(firstFrame);
+
+                const secondFrame = document.createElement("iframe");
+                secondFrame.srcdoc = '<body><x-recreated-frame></x-recreated-frame><script>' +
+                    'class SecondFrameDefinition extends HTMLElement {' +
+                    'connectedCallback() { this.setAttribute("data-definition", "second"); }}' +
+                    'customElements.define("x-recreated-frame", SecondFrameDefinition);' +
+                    '<\/script></body>';
+                body.insertBefore(secondFrame, body.firstChild);
+                __trust.hydrateFrames();
+                const secondRegistry = secondFrame.contentWindow.customElements;
+                const secondElement = secondFrame.contentDocument.querySelector("x-recreated-frame");
+                globalThis.recreatedIframeRegistryResult = [
+                    firstDefinition,
+                    firstRegistry !== secondRegistry,
+                    firstRegistry.get("x-recreated-frame").name,
+                    secondRegistry.get("x-recreated-frame").name,
+                    secondElement.getAttribute("data-definition")
+                ].join("|");
+            "##,
+            "recreated iframe custom-element registry",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "recreatedIframeRegistryResult"),
+            "first|true|FirstFrameDefinition|SecondFrameDefinition|second"
+        );
+    }
+
+    #[test]
+    fn iframe_initial_about_blank_has_a_realm_and_reuses_its_window_once() {
+        // HTML §7.3.2.1 creates the child browsing context's Realm, Window,
+        // environment settings object, and populated initial about:blank
+        // Document during iframe post-connection steps. HTML §7.5.1 then
+        // reuses that Window for the first same-origin navigation while
+        // replacing its Document.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                let initialLoadCount = 0;
+                frame.onload = function () { initialLoadCount++; };
+                const detachedWindowIsNull = frame.contentWindow === null;
+                const detachedDocumentIsNull = frame.contentDocument === null;
+                body.appendChild(frame);
+
+                const initialWindow = frame.contentWindow;
+                const initialDocument = frame.contentDocument;
+                initialWindow.initialNavigationMarker = "preserved";
+
+                frame.setAttribute("srcdoc", '<body><script>' +
+                    'document.body.setAttribute("data-marker", initialNavigationMarker);' +
+                    '<\/script></body>');
+                __trust.hydrateFrames();
+
+                globalThis.initialAboutBlankRealmResult = [
+                    detachedWindowIsNull,
+                    detachedDocumentIsNull,
+                    initialLoadCount,
+                    initialWindow !== window,
+                    initialWindow.Array.prototype !== Array.prototype,
+                    initialDocument !== document,
+                    initialDocument.defaultView === initialWindow,
+                    frame.contentWindow === initialWindow,
+                    frame.contentDocument !== initialDocument,
+                    frame.contentDocument.body.getAttribute("data-marker")
+                ].join("|");
+            "##,
+            "iframe initial about:blank Realm",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "initialAboutBlankRealmResult"),
+            "true|true|1|true|true|true|true|true|true|preserved"
+        );
+    }
+
+    #[test]
+    fn iframe_windows_do_not_share_writable_platform_globals_across_navigation() {
+        // HTML §7.5.1 creates a new Realm and Window for an ordinary
+        // cross-document navigation. Writable Window properties patched by
+        // one application (Zone.js wraps timers and observer constructors)
+        // therefore cannot replace the next application's platform globals or
+        // the embedding top Window's globals.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                const topMutationObserver = MutationObserver;
+                const topSetTimeout = setTimeout;
+
+                frame.srcdoc = '<body><script>' +
+                    'window.MutationObserver = function PatchedObserver() {};' +
+                    'window.setTimeout = function patchedTimeout() { return 919; };' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                const patchedMutationObserver = frame.contentWindow.MutationObserver;
+                const patchedSetTimeout = frame.contentWindow.setTimeout;
+
+                frame.srcdoc = '<body><script>' +
+                    'const observer = new MutationObserver(function () {});' +
+                    'document.body.setAttribute("data-observe-type", typeof observer.observe);' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                globalThis.windowPlatformGlobalNavigationResult = [
+                    frame.contentWindow.MutationObserver !== patchedMutationObserver,
+                    frame.contentWindow.setTimeout !== patchedSetTimeout,
+                    frame.contentDocument.body.getAttribute("data-observe-type"),
+                    MutationObserver === topMutationObserver,
+                    setTimeout === topSetTimeout
+                ].join("|");
+            "##,
+            "iframe Window platform-global replacement",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "windowPlatformGlobalNavigationResult"),
+            "true|true|function|true|true"
+        );
+    }
+
+    #[test]
+    fn iframe_navigation_replaces_intrinsics_and_platform_prototypes() {
+        // ECMA-262 §9.3 gives every Realm its own intrinsics, and HTML §7.5.1
+        // creates a new Window Realm for a replacement Document. Zone.js is a
+        // useful conformance shape: it patches both an ECMAScript intrinsic
+        // and EventTarget.prototype with closures that resolve its Window
+        // global. A later application must observe neither patch.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<body><script>' +
+                    'window.Zone = { marker: "first-zone" };' +
+                    'Array.prototype.zoneArrayPatch = Zone.marker;' +
+                    'EventTarget.prototype.zoneProbe = function () { return Zone.marker; };' +
+                    'document.body.setAttribute("data-probe", new EventTarget().zoneProbe());' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                const firstWindow = frame.contentWindow;
+                const firstEventTarget = firstWindow.EventTarget;
+                const firstArrayPrototype = firstWindow.Array.prototype;
+                const firstProbe = frame.contentDocument.body.getAttribute("data-probe");
+
+                frame.srcdoc = '<body><script>' +
+                    'document.body.setAttribute("data-isolation", [' +
+                    'typeof Zone, ' +
+                    'String("zoneArrayPatch" in Array.prototype), ' +
+                    'String("zoneProbe" in EventTarget.prototype)' +
+                    '].join("|"));' +
+                    'console.error("child-realm-log");' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                const secondWindow = frame.contentWindow;
+                globalThis.windowRealmIntrinsicNavigationResult = [
+                    firstProbe,
+                    secondWindow !== firstWindow,
+                    secondWindow.EventTarget !== firstEventTarget,
+                    secondWindow.Array.prototype !== firstArrayPrototype,
+                    frame.contentDocument.body.getAttribute("data-isolation"),
+                    typeof Zone,
+                    String("zoneArrayPatch" in Array.prototype),
+                    String("zoneProbe" in EventTarget.prototype)
+                ].join("|");
+            "##,
+            "iframe Realm intrinsic replacement",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "windowRealmIntrinsicNavigationResult"),
+            "first-zone|true|true|true|undefined|false|false|undefined|false|false"
+        );
+        assert_eq!(
+            string_value(&mut engine, "__trust.takeLogs()"),
+            "error: child-realm-log"
+        );
+    }
+
+    #[test]
+    fn iframe_windows_do_not_share_author_global_properties_across_navigation() {
+        // HTML §7.5.1 creates a new Realm and Window for an ordinary
+        // cross-document navigation. Author-created Window properties belong
+        // to that Window: they are neither parent globals nor properties of
+        // the replacement Window behind the stable WindowProxy.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+
+                frame.srcdoc = '<body><script>' +
+                    'window.applicationOwnedGlobal = { documentName: "first" };' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                const firstValue = frame.contentWindow.applicationOwnedGlobal.documentName;
+                const leakedToParent = "applicationOwnedGlobal" in window;
+
+                frame.srcdoc = '<body><script>' +
+                    'document.body.setAttribute("data-inherited", ' +
+                    'String("applicationOwnedGlobal" in window));' +
+                    'window.applicationOwnedGlobal = { documentName: "second" };' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                globalThis.windowAuthorGlobalNavigationResult = [
+                    firstValue,
+                    leakedToParent,
+                    frame.contentDocument.body.getAttribute("data-inherited"),
+                    frame.contentWindow.applicationOwnedGlobal.documentName,
+                    "applicationOwnedGlobal" in window
+                ].join("|");
+            "##,
+            "iframe Window author-global replacement",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "windowAuthorGlobalNavigationResult"),
+            "first|false|false|second|false"
+        );
+    }
+
+    #[test]
+    fn iframe_cross_document_navigation_discards_old_animation_frame_callbacks() {
+        // HTML §8.12 stores each Window's animation-frame callback map on
+        // that Window's associated Document. Replacing the active Window and
+        // Document must make callbacks queued by the old application
+        // unreachable; they cannot run against the replacement Document.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<body><script>' +
+                    'requestAnimationFrame(function () {' +
+                    'document.body.setAttribute("data-old-frame", "yes"); });' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+
+                frame.srcdoc = '<body><script>' +
+                    'requestAnimationFrame(function () {' +
+                    'document.body.setAttribute("data-new-frame", "yes"); });' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                globalThis.animationFrameNavigation = frame;
+                __trust.tickTo(__trust.now() + 20);
+            "##,
+            "iframe animation-frame navigation isolation",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[animationFrameNavigation.contentDocument.body.getAttribute('data-old-frame'), animationFrameNavigation.contentDocument.body.getAttribute('data-new-frame')].join('|')"
+            ),
+            "|yes"
+        );
+    }
+
+    #[test]
+    fn iframe_navigation_during_animation_frame_does_not_run_replacement_callback_early() {
+        // HTML §8.12 snapshots the keys of each target Document's callback
+        // map. Handles are only unique within that map: replacing an iframe's
+        // Document during another target's callback can reuse handle 1, but the
+        // replacement callback was not in the old map snapshot and must wait
+        // for the next rendering opportunity.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+
+                requestAnimationFrame(function () {
+                    frame.srcdoc = '<body><script>' +
+                        'requestAnimationFrame(function () {' +
+                        'document.body.setAttribute("data-replacement-frame", "yes"); });' +
+                        '<\/script></body>';
+                    __trust.hydrateFrames();
+                });
+
+                frame.srcdoc = '<body><script>' +
+                    'requestAnimationFrame(function () {' +
+                    'document.body.setAttribute("data-stale-frame", "yes"); });' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+                globalThis.animationFrameCollisionNavigation = frame;
+
+                __trust.tickTo(__trust.now() + 20);
+                globalThis.replacementFrameAfterFirstOpportunity =
+                    frame.contentDocument.body.getAttribute("data-replacement-frame");
+                __trust.tickTo(__trust.now() + 20);
+            "##,
+            "iframe animation-frame handle collision during navigation",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[replacementFrameAfterFirstOpportunity, animationFrameCollisionNavigation.contentDocument.body.getAttribute('data-stale-frame'), animationFrameCollisionNavigation.contentDocument.body.getAttribute('data-replacement-frame')].join('|')"
+            ),
+            "||yes"
+        );
+    }
+
+    #[test]
+    fn iframe_cross_document_navigation_discards_old_timers() {
+        // HTML §8.7 gives every WindowOrWorkerGlobalScope its own initially
+        // empty timer-ID map. A replacement Window therefore neither runs the
+        // old Document's timeout/interval tasks nor continues its ID sequence.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<body><script>' +
+                    'setTimeout(function () {' +
+                    'document.body.setAttribute("data-old-timeout", "yes"); }, 10);' +
+                    'setInterval(function () {' +
+                    'document.body.setAttribute("data-old-interval", "yes"); }, 10);' +
+                    '<\/script></body>';
+                body.appendChild(frame);
+                __trust.hydrateFrames();
+
+                frame.srcdoc = '<body><script>' +
+                    'const id = setTimeout(function () {' +
+                    'document.body.setAttribute("data-new-timeout", "yes"); }, 10);' +
+                    'document.body.setAttribute("data-new-id", id);' +
+                    '<\/script></body>';
+                __trust.hydrateFrames();
+                globalThis.timerNavigation = frame;
+                const deadline = __trust.now() + 20;
+                for (let i = 0; i < 4; i++) __trust.tickTo(deadline);
+            "##,
+            "iframe timer navigation isolation",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[timerNavigation.contentDocument.body.getAttribute('data-old-timeout'), timerNavigation.contentDocument.body.getAttribute('data-old-interval'), timerNavigation.contentDocument.body.getAttribute('data-new-timeout'), timerNavigation.contentDocument.body.getAttribute('data-new-id')].join('|')"
+            ),
+            "||yes|1"
         );
     }
 
@@ -8350,6 +11186,405 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "frameWriteResult"),
             "contentW|after|contentW|true"
+        );
+    }
+
+    #[test]
+    fn iframe_documents_expose_and_dispatch_global_event_handler_idl_attributes() {
+        // WHATWG HTML §8.1.8.2: GlobalEventHandlers is included by
+        // HTMLElement, Document, and Window. A nested Document must expose the
+        // same oninput IDL attribute as the top-level Document; React uses this
+        // exact standards probe to select the modern input-event path.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<input id="field"><script>' +
+                'let documentHits = 0, windowHits = 0;' +
+                'document.oninput = function () { documentHits++; };' +
+                'window.oninput = function () { windowHits++; };' +
+                'let hashHits = 0;' +
+                'window.onhashchange = function childHashHandler() {' +
+                'document.body.setAttribute("data-hash-handler", String(++hashHits));' +
+                '};' +
+                'window.callHashHandlerAfterNavigation = function () {' +
+                'location.hash = "#child-route";' +
+                'const handler = window.onhashchange;' +
+                'document.body.setAttribute("data-hash-type", typeof handler);' +
+                'handler();' +
+                '};' +
+                'document.dispatchEvent(new Event("input", { bubbles: true }));' +
+                'document.body.setAttribute("data-result", [' +
+                '"oninput" in document, "oninput" in window,' +
+                '"oninput" in document.getElementById("field"),' +
+                'documentHits, windowHits].join("|"));' +
+                '<\/script>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            const childHashHandler = frame.contentWindow.onhashchange;
+            if (typeof childHashHandler === "function") childHashHandler();
+            frame.contentWindow.callHashHandlerAfterNavigation();
+            globalThis.frameEventHandlerResult =
+                [frame.contentDocument.body.getAttribute("data-result"),
+                 typeof childHashHandler,
+                 childHashHandler && childHashHandler.name,
+                 frame.contentDocument.body.getAttribute("data-hash-handler"),
+                 frame.contentDocument.body.getAttribute("data-hash-type")].join("|");
+            "##,
+            "iframe GlobalEventHandlers",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameEventHandlerResult"),
+            "true|true|true|1|1|function|childHashHandler|3|function"
+        );
+    }
+
+    #[test]
+    fn iframe_element_events_use_the_child_document_and_window_path() {
+        // DOM §2.9 dispatches through the target's own tree. HTML gives a
+        // Document its associated Window as event parent, while an iframe's
+        // content Document is never a descendant of the embedding element.
+        // React delegates clicks to the child Document, so this boundary is
+        // observable even when the iframe nodes share TRust's paint arena.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            globalThis.topDocumentClickHits = 0;
+            globalThis.topWindowClickHits = 0;
+            document.addEventListener("click", function () { topDocumentClickHits++; });
+            window.addEventListener("click", function () { topWindowClickHits++; });
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<button id="target">go</button><script>' +
+                'let targetHits = 0, childDocumentHits = 0, childWindowHits = 0;' +
+                'document.getElementById("target").addEventListener("click", function () { targetHits++; });' +
+                'document.addEventListener("click", function () { childDocumentHits++; });' +
+                'window.addEventListener("click", function () { childWindowHits++; });' +
+                'document.getElementById("target").click();' +
+                'document.body.setAttribute("data-result", [' +
+                'targetHits, childDocumentHits, childWindowHits].join("|"));' +
+                '<\/script>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            globalThis.frameElementEventPathResult = [
+                frame.contentDocument.body.getAttribute("data-result"),
+                topDocumentClickHits, topWindowClickHits
+            ].join("|");
+            "##,
+            "iframe element event path",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameElementEventPathResult"),
+            "1|1|1|0|0"
+        );
+    }
+
+    #[test]
+    fn iframe_classic_scripts_share_their_global_lexical_environment() {
+        // HTML §8.1.4.4 runs a classic script through ECMA-262
+        // ScriptEvaluation. Each Script Record uses its Realm's [[GlobalEnv]]
+        // for both environments, so a function from an earlier script can
+        // resolve a top-level lexical declared by a later script. Speedometer's
+        // Perf Dashboard does this when mockAPIs() reads `const RemoteAPI`
+        // from its subsequently loaded bundle.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<body><script>' +
+                'function readLaterFrameLexical() {' +
+                'document.body.setAttribute("data-result", LaterFrameLexical.value);' +
+                '}' +
+                '<\/script><script>' +
+                'const LaterFrameLexical = { value: "visible" };' +
+                'readLaterFrameLexical();' +
+                '<\/script></body>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            globalThis.frameGlobalLexicalResult =
+                frame.contentDocument.body.getAttribute("data-result");
+            "##,
+            "iframe classic ScriptEvaluation",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "String(frameGlobalLexicalResult)"),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn iframe_animation_frame_override_is_scoped_to_its_window() {
+        // HTML §8.12 associates AnimationFrameProvider state with a target
+        // object, and HTML §7.2 gives every browsing context its own Window
+        // behind a stable WindowProxy. A child may replace its writable rAF
+        // method without replacing the parent's method; later calls through
+        // contentWindow must still enter the child Window.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const topRequestAnimationFrame = requestAnimationFrame;
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<body><script>' +
+                'requestAnimationFrame = function (callback) {' +
+                'callback(123); return 77; };' +
+                'function callChildRAF() {' +
+                'return requestAnimationFrame(function (timestamp) {' +
+                'document.body.setAttribute("data-timestamp", timestamp); });' +
+                '}' +
+                '<\/script></body>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            const parentPreservedBefore = requestAnimationFrame === topRequestAnimationFrame;
+            const childHandle = frame.contentWindow.callChildRAF();
+            globalThis.frameAnimationOverrideResult = [
+                parentPreservedBefore,
+                requestAnimationFrame === topRequestAnimationFrame,
+                childHandle,
+                frame.contentDocument.body.getAttribute("data-timestamp")
+            ].join("|");
+            "##,
+            "iframe AnimationFrameProvider isolation",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameAnimationOverrideResult"),
+            "true|true|77|123"
+        );
+    }
+
+    #[test]
+    fn iframe_documents_create_filtered_tree_walkers_and_node_iterators() {
+        // DOM §4.5 and §6: every Document creates traversal objects retaining
+        // the supplied root, whatToShow mask, and filter. Lit creates a
+        // TreeWalker from its benchmark iframe's Document while stamping
+        // template parts, so the nested-document surface is observable.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<main><section><span>A</span><!--marker--><span>B</span></section></main>' +
+                '<scr' + 'ipt>' +
+                'const root = document.body;' +
+                'const filter = { acceptNode(node) {' +
+                'return node.localName === "span" ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP; }};' +
+                'const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter);' +
+                'const walked = []; let node; while ((node = walker.nextNode())) walked.push(node.textContent);' +
+                'const iterator = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT,' +
+                'node => node.localName === "span" ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT);' +
+                'const iterated = []; while ((node = iterator.nextNode())) iterated.push(node.textContent);' +
+                'const previous = iterator.previousNode();' +
+                'root.setAttribute("data-result", [' +
+                'walker.root === root, walker.whatToShow === NodeFilter.SHOW_ELEMENT,' +
+                'walker.filter === filter, walked.join(","), iterated.join(","),' +
+                'previous && previous.textContent, iterator.pointerBeforeReferenceNode].join("|"));' +
+                '</scr' + 'ipt>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            globalThis.frameTraversalResult =
+                frame.contentDocument.body.getAttribute("data-result");
+            "##,
+            "iframe Document traversal",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameTraversalResult"),
+            "true|true|true|A,B|A,B|B|true"
+        );
+    }
+
+    #[test]
+    fn document_point_queries_follow_paint_order_and_nested_document_scope() {
+        // CSSOM View §5: hit-test boxes in topmost-first paint order, exclude
+        // boxes that are not pointer targets, keep iframe Documents scoped to
+        // their own viewport, and append the relevant root element last.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const head = document.createElement("head");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(head); html.appendChild(body);
+            const style = document.createElement("style");
+            style.textContent = `
+                html, body { margin: 0; padding: 0; }
+                #under, #over, #ignored { position: absolute; left: 10px; top: 10px; width: 80px; height: 60px; }
+                #under { z-index: 1; }
+                #over { z-index: 2; }
+                #ignored { z-index: 3; pointer-events: none; }
+                iframe { position: absolute; left: 120px; top: 10px; width: 160px; height: 90px; border: 0; }
+            `;
+            head.appendChild(style);
+            for (const id of ["under", "over", "ignored"]) {
+                const node = document.createElement("div"); node.id = id; body.appendChild(node);
+            }
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<style>html,body{margin:0;width:100%;height:100%}#child{width:100%;height:100%}</style><div id="child"></div>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+
+            const top = document.elementsFromPoint(20, 20);
+            const frameRect = frame.getBoundingClientRect();
+            const parentAtFrame = document.elementFromPoint(frameRect.left + 10, frameRect.top + 10);
+            const childDoc = frame.contentDocument;
+            const child = childDoc.elementsFromPoint(10, 10);
+            let missingThrows = false, infinityThrows = false;
+            try { document.elementFromPoint(1); } catch (error) { missingThrows = error instanceof TypeError; }
+            try { document.elementFromPoint(Infinity, 1); } catch (error) { infinityThrows = error instanceof TypeError; }
+            globalThis.pointQueryResult = [
+                top[0] && top[0].id, top.some(node => node.id === "ignored"),
+                top[top.length - 1] === document.documentElement,
+                parentAtFrame === frame,
+                child[0] && child[0].id,
+                child[child.length - 1] === childDoc.documentElement,
+                document.elementFromPoint(-1, 0) === null,
+                document.elementsFromPoint(0, -1).length,
+                missingThrows, infinityThrows
+            ].join("|");
+            "##,
+            "CSSOM View point queries",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "pointQueryResult"),
+            "over|false|true|true|child|true|true|0|true|true"
+        );
+    }
+
+    #[test]
+    fn offset_parent_stays_within_its_document_and_follows_containing_blocks() {
+        // CSSOM View §7 and CSS Positioned Layout §2.1: offsetParent walks the
+        // element's own flat tree, returns null for roots/body/fixed elements
+        // without a fixed containing block, and selects the nearest ancestor
+        // establishing the applicable positioning containing block.  In
+        // particular, an iframe Document must not cross into its owner page or
+        // cycle back into its body during CodeMirror's clipping-ancestor walk.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<style>html,body{margin:0}#positioned{position:relative;border:3px solid black}' +
+                '#absolute{position:absolute;left:7px;top:9px}#fixed{position:fixed}' +
+                '#hidden{display:none}</style><main id="static"><div id="positioned">' +
+                '<span id="absolute">absolute</span><span id="fixed">fixed</span>' +
+                '<span id="hidden">hidden</span></div></main>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+
+            const childDocument = frame.contentDocument;
+            const staticNode = childDocument.getElementById("static");
+            const positioned = childDocument.getElementById("positioned");
+            const absolute = childDocument.getElementById("absolute");
+            const fixed = childDocument.getElementById("fixed");
+            const hidden = childDocument.getElementById("hidden");
+            let ancestor = absolute, steps = 0;
+            while (ancestor && ancestor !== childDocument.body && steps++ < 12) {
+                const style = getComputedStyle(ancestor);
+                ancestor = style.position === "absolute" || style.position === "fixed"
+                    ? ancestor.offsetParent : ancestor.parentNode;
+            }
+            globalThis.offsetParentResult = [
+                absolute.ownerDocument === childDocument,
+                childDocument.documentElement.ownerDocument === childDocument,
+                frame.ownerDocument === document,
+                staticNode.offsetParent === childDocument.body,
+                absolute.offsetParent === positioned,
+                fixed.offsetParent === null,
+                hidden.offsetParent === null,
+                childDocument.body.offsetParent === null,
+                childDocument.documentElement.offsetParent === null,
+                ancestor === childDocument.body && steps < 12,
+                Number.isInteger(absolute.offsetTop),
+                Number.isInteger(absolute.offsetLeft),
+                childDocument.body.offsetTop === 0,
+                childDocument.body.offsetLeft === 0
+            ].join("|");
+            "##,
+            "CSSOM View offset parent",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "offsetParentResult"),
+            "true|true|true|true|true|true|true|true|true|true|true|true|true|true"
+        );
+    }
+
+    #[test]
+    fn inner_html_descendants_are_queryable_synchronously_after_insertion() {
+        // HTML §13.3 appends text in script-data/raw-text parents literally
+        // during fragment serialization; normal text is escaped. DOM §4.2.6
+        // querySelectorAll then returns the static result of scope-matching at
+        // call time. Backbone/Underscore stores item markup in precisely this
+        // `<script type="text/template">` shape.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            const list = document.createElement("ul");
+            document.appendChild(html); html.appendChild(body); body.appendChild(list);
+            const source = '<div class="view"><input class="toggle"><button class="destroy"></button></div>';
+            const template = document.createElement("script");
+            template.setAttribute("type", "text/template");
+            template.textContent = source;
+            body.appendChild(template);
+            for (let i = 0; i < 100; i++) {
+                const item = document.createElement("li");
+                item.innerHTML = template.innerHTML;
+                list.appendChild(item);
+            }
+            const normal = document.createElement("div");
+            normal.textContent = "<b>&";
+            const hidden = document.createElement("aside");
+            hidden.hidden = true; hidden.textContent = "kept"; body.appendChild(hidden);
+            const host = document.createElement("x-serialization-host");
+            host.innerHTML = '<i class="light">light</i>';
+            host.attachShadow({ mode: "open" }).innerHTML = '<b class="shadow">shadow</b>';
+            body.appendChild(host);
+            globalThis.synchronousQueryResult = [
+                template.innerHTML === source,
+                template.outerHTML.includes(source),
+                normal.innerHTML === "&lt;b&gt;&amp;",
+                hidden.outerHTML.includes("kept"),
+                host.outerHTML.includes('class="light"') && !host.outerHTML.includes('class="shadow"'),
+                document.querySelectorAll("li").length,
+                document.querySelectorAll(".toggle").length,
+                document.querySelectorAll(".destroy").length
+            ].join("|");
+            "#,
+            "synchronous innerHTML query",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "synchronousQueryResult"),
+            "true|true|true|true|true|100|100|100"
         );
     }
 
@@ -8506,11 +11741,10 @@ mod tests {
     }
 
     #[test]
-    fn observer_initial_update_fallbacks_are_coalesced_per_api() {
-        // Pending initial observations request a rendering opportunity, not
-        // one timer task per target. The resident actor retains a timer as a
-        // fallback for a late observe() that otherwise dirtied no rendering,
-        // but a large registry must still create only one IO and one RO timer.
+    fn observer_initial_updates_request_rendering_without_timer_tasks() {
+        // Resize Observer §3.4 and Intersection Observer §3.2.4 integrate with
+        // HTML's update-the-rendering algorithm. Registering even a large set
+        // requests one host rendering opportunity and queues no timer tasks.
         let mut engine = platform_engine();
         eval(
             &mut engine,
@@ -8523,19 +11757,219 @@ mod tests {
                 ro.observe(target);
             }
             globalThis.observerQueuesBefore = __trust.taskQueueState();
+            globalThis.observerRenderingBefore = __trust.hasRenderingUpdate();
             __trust.updateResizes();
             __trust.updateIntersections();
             globalThis.observerQueuesAfter = __trust.taskQueueState();
+            globalThis.observerRenderingAfter = __trust.hasRenderingUpdate();
             "#,
             "observer initial update coalescing",
         )
         .unwrap();
 
         let before = string_value(&mut engine, "observerQueuesBefore");
-        assert!(before.contains("timers=2(once=2,interval=0)"), "{before}");
+        assert!(before.contains("timers=0(once=0,interval=0)"), "{before}");
+        assert_eq!(
+            string_value(&mut engine, "String(observerRenderingBefore)"),
+            "true"
+        );
         let after = string_value(&mut engine, "observerQueuesAfter");
         assert!(after.contains("timers=0(once=0,interval=0)"), "{after}");
         assert!(after.contains("intersection=1"), "{after}");
+        assert_eq!(
+            string_value(&mut engine, "String(observerRenderingAfter)"),
+            "false"
+        );
+    }
+
+    #[test]
+    fn detached_node_wrapper_cache_does_not_root_unreachable_wrappers() {
+        // Web IDL wrapper identity applies while a platform object remains
+        // observable. ECMA-262 WeakRef preserves same-job identity without a
+        // strong cache edge, and native FinalizationRegistry cleanup removes
+        // dead id entries after collection. A DOM churn workload must not
+        // retain every transient wrapper for the lifetime of the page.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.keptWrapper = document.createElement("div");
+            (function () {
+                for (let i = 0; i < 2048; i++) document.createElement("span");
+            })();
+            globalThis.detachedQueryRoot = document.createElement("div");
+            detachedQueryRoot.innerHTML = "<i></i>".repeat(2048);
+            (function () {
+                detachedQueryRoot.querySelectorAll("i");
+            })();
+            globalThis.wrapperCacheBefore = __trust.nodeWrapperCacheState().join(",");
+            "#,
+            "detached wrapper churn",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        let before = string_value(&mut engine, "wrapperCacheBefore")
+            .split_once(',')
+            .unwrap()
+            .0
+            .parse::<usize>()
+            .unwrap();
+        let after = string_value(&mut engine, "__trust.nodeWrapperCacheState().join(',')")
+            .split_once(',')
+            .unwrap()
+            .0
+            .parse::<usize>()
+            .unwrap();
+
+        assert!(before >= 2048, "cache did not observe the churn: {before}");
+        assert!(
+            after < before / 4,
+            "unreachable wrappers remained rooted: before={before}, after={after}"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(keptWrapper === keptWrapper && document === document)"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn inner_html_replace_all_preserves_detached_wrapper_identity_and_listeners() {
+        // HTML "innerHTML" runs DOM "replace all". Removing a subtree changes
+        // connectedness, but it does not discard its platform-object identity,
+        // event listeners, light-tree relationships, or attached shadow tree.
+        // Keep this observable contract pinned while the binding batches its
+        // internal wrapper-retention bookkeeping for bulk replacements.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const replaceAllMount = document.createElement("main");
+            document.appendChild(replaceAllMount);
+            replaceAllMount.innerHTML = "<section><button>old</button><x-host></x-host></section>";
+            const replaceAllOldRoot = replaceAllMount.firstChild;
+            const replaceAllOldButton = replaceAllOldRoot.querySelector("button");
+            const replaceAllShadowHost = replaceAllOldRoot.querySelector("x-host");
+            const replaceAllShadow = replaceAllShadowHost.attachShadow({ mode: "open" });
+            replaceAllShadow.innerHTML = "<button>shadow</button>";
+            const replaceAllShadowButton = replaceAllShadow.firstChild;
+            let replaceAllLightClicks = 0;
+            let replaceAllShadowClicks = 0;
+            replaceAllOldButton.addEventListener("click", () => replaceAllLightClicks++);
+            replaceAllShadowButton.addEventListener("click", () => replaceAllShadowClicks++);
+
+            replaceAllMount.innerHTML = "<p>new</p>";
+            replaceAllOldButton.dispatchEvent(new Event("click"));
+            replaceAllShadowButton.dispatchEvent(new Event("click"));
+            const replaceAllDetachedResult = [
+                replaceAllOldRoot.isConnected,
+                replaceAllOldRoot.firstChild === replaceAllOldButton,
+                replaceAllShadowHost.shadowRoot === replaceAllShadow,
+                replaceAllShadow.firstChild === replaceAllShadowButton,
+                replaceAllLightClicks,
+                replaceAllShadowClicks
+            ].join("|");
+
+            replaceAllMount.appendChild(replaceAllOldRoot);
+            const replaceAllReinsertedResult = [
+                replaceAllOldRoot.isConnected,
+                replaceAllMount.lastChild === replaceAllOldRoot,
+                replaceAllOldRoot.querySelector("button") === replaceAllOldButton,
+                replaceAllShadowHost.shadowRoot.firstChild === replaceAllShadowButton
+            ].join("|");
+
+            const replaceAllDetachedMount = document.createElement("div");
+            replaceAllDetachedMount.innerHTML = "<button>detached</button>";
+            const replaceAllAlwaysDetachedButton = replaceAllDetachedMount.firstChild;
+            let replaceAllDetachedClicks = 0;
+            replaceAllAlwaysDetachedButton.addEventListener("click", () => replaceAllDetachedClicks++);
+            replaceAllDetachedMount.innerHTML = "";
+            replaceAllAlwaysDetachedButton.dispatchEvent(new Event("click"));
+            "#,
+            "innerHTML replace-all wrapper retention",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "replaceAllDetachedResult"),
+            "false|true|true|true|1|1"
+        );
+        assert_eq!(
+            string_value(&mut engine, "replaceAllReinsertedResult"),
+            "true|true|true|true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(replaceAllDetachedClicks)"),
+            "1"
+        );
+    }
+
+    #[test]
+    fn connected_custom_element_wrapper_retains_identity_and_shadow_state_across_gc() {
+        // Web IDL interface conversion returns the JavaScript object
+        // representing the same platform object. DOM §4.2.2 also makes a
+        // shadow root persistently attached to its host. A connected native
+        // node therefore has to keep the wrapper carrying our custom-element
+        // state alive even when page code temporarily holds no strong handle.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            customElements.define("x-retained-state", class extends HTMLElement {
+                constructor() {
+                    super();
+                    this.answer = 42;
+                    this.attachShadow({ mode: "open" }).innerHTML = "<b>kept</b>";
+                }
+            });
+            const wrapperRetentionMount = document.createElement("main");
+            document.appendChild(wrapperRetentionMount);
+            wrapperRetentionMount.innerHTML = "<span>selected</span>";
+            (function () {
+                const selected = wrapperRetentionMount.querySelectorAll("span")[0];
+                selected.selectorState = 17;
+                globalThis.connectedSelectorWeak = new WeakRef(selected);
+            })();
+            (function () {
+                const element = document.createElement("x-retained-state");
+                wrapperRetentionMount.appendChild(element);
+                globalThis.connectedWrapperWeak = new WeakRef(element);
+            })();
+            "#,
+            "connected wrapper retention setup",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(function () {
+                    const element = document.querySelector("x-retained-state");
+                    return [
+                        element === connectedWrapperWeak.deref(),
+                        element.answer,
+                        element.shadowRoot && element.shadowRoot.textContent,
+                        wrapperRetentionMount.querySelectorAll("span")[0]
+                            === connectedSelectorWeak.deref(),
+                        wrapperRetentionMount.querySelectorAll("span")[0].selectorState
+                    ].join("|");
+                })()"#,
+            ),
+            "true|42|kept|true|17"
+        );
     }
 
     #[test]
@@ -8642,6 +12076,149 @@ mod tests {
             .expect("spawn timer-depth test thread")
             .join()
             .expect("timer-depth test thread");
+    }
+
+    #[test]
+    fn failed_timer_diagnostic_identifies_the_scheduled_handler() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            setTimeout(function telegramDiagnosticFixture() {
+                throw new ReferenceError("fixture failure");
+            }, 0);
+            "#,
+            "timer diagnostic setup",
+        )
+        .unwrap();
+        let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+        let ran = match dispatched {
+            Ok(ran) => ran,
+            Err(error) => panic!(
+                "{}",
+                describe_eval_error(&mut engine, error, "timer diagnostic task")
+            ),
+        };
+        assert!(ran);
+        let errors = string_value(&mut engine, "__trust.takeErrors()");
+        assert!(errors.contains("timer: fixture failure"), "{errors}");
+        assert!(
+            errors.contains("Timer handler: function telegramDiagnosticFixture"),
+            "{errors}"
+        );
+    }
+
+    #[test]
+    fn nested_frame_timer_restores_top_document_base_url() {
+        // HTML §8.7 queues a timer for the WindowOrWorkerGlobalScope on which it was
+        // created. Invoking a child-frame timer must not change the top Document's
+        // base URL: HTML §2.4.3 derives each Document's base independently from that
+        // Document's first <base href>, or from that Document's own fallback URL.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<base href="https://child.example/frame/">' +
+                '<script>setTimeout(function () {' +
+                'topFrameTimerBase = document.baseURI;' +
+                'document.body.setAttribute("data-timer-base", document.baseURI);' +
+                'document.body.setAttribute("data-timer-global", String(window.topFrameTimerBase));' +
+                '}, 0)<\/script>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            globalThis.topBaseBeforeFrameTimer = document.baseURI;
+            "#,
+            "nested frame timer setup",
+        )
+        .unwrap();
+
+        let dispatched = dispatch_timer_task_to(&mut engine, 1000.0);
+        let ran = match dispatched {
+            Ok(ran) => ran,
+            Err(error) => panic!(
+                "{}",
+                describe_eval_error(&mut engine, error, "nested frame timer task")
+            ),
+        };
+        assert!(ran);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "__trust.__activeFrame ? String(__trust.__activeFrame.__id) : 'top'",
+            ),
+            "top"
+        );
+        assert_eq!(
+            string_value(&mut engine, "topBaseBeforeFrameTimer"),
+            "https://example.com/"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.querySelector('iframe').contentDocument.body.getAttribute('data-timer-base')",
+            ),
+            "https://child.example/frame/"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.querySelector('iframe').contentDocument.body.getAttribute('data-timer-global')",
+            ),
+            "https://child.example/frame/"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.querySelector('iframe').contentWindow.topFrameTimerBase",
+            ),
+            "https://child.example/frame/"
+        );
+        assert_eq!(
+            string_value(&mut engine, "'topFrameTimerBase' in globalThis"),
+            "false"
+        );
+        assert_eq!(
+            string_value(&mut engine, "document.baseURI"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn performance_now_retains_sub_millisecond_monotonic_resolution() {
+        // High Resolution Time §§7.1 requires performance.now() to use the
+        // relevant global's monotonic clock. Do not route it through Date's
+        // integral millisecond time value: sufficiently fast measured work
+        // would then have a browser-visible duration of zero.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            let previous = performance.now();
+            let minimumPositiveDelta = Infinity;
+            let monotonic = true;
+            for (let i = 0; i < 2048; i++) {
+                const current = performance.now();
+                if (current < previous) monotonic = false;
+                const delta = current - previous;
+                if (delta > 0 && delta < minimumPositiveDelta)
+                    minimumPositiveDelta = delta;
+                previous = current;
+            }
+            globalThis.highResolutionClockResult =
+                monotonic && minimumPositiveDelta > 0 && minimumPositiveDelta < 1;
+            "#,
+            "high resolution monotonic clock",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "String(highResolutionClockResult)"),
+            "true"
+        );
     }
 
     #[test]
