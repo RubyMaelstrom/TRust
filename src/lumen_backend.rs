@@ -320,6 +320,15 @@ impl HostState {
     }
 }
 
+impl lumen::embed::RetainedExternalMemory for HostState {
+    fn retained_external_memory(
+        &self,
+        visit: &mut dyn FnMut(lumen::embed::RetainedExternalAllocation),
+    ) {
+        lumen::embed::RetainedExternalMemory::retained_external_memory(&self.wasm, visit);
+    }
+}
+
 struct RealmClock {
     epoch_ms: Cell<f64>,
     anchored_at: Cell<Instant>,
@@ -483,7 +492,7 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     engine.set_wall_clock(move || engine_clock.now_ms());
     let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
     state.configure_module_loading(&mut engine);
-    engine.ctx().op_state().put(state);
+    engine.ctx().op_state().put_external_memory(state);
     install_host_boundary(&mut engine);
 
     eval(
@@ -1321,7 +1330,7 @@ mod desktop {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
-        engine.ctx().op_state().put(state);
+        engine.ctx().op_state().put_external_memory(state);
         install_host_boundary(&mut engine);
 
         // HTML NavigatorID: navigator.userAgent exposes the environment settings object's default
@@ -5246,7 +5255,7 @@ fn run_lumen_worker(
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
     state.configure_module_loading(&mut engine);
-    engine.ctx().op_state().put(state);
+    engine.ctx().op_state().put_external_memory(state);
     install_lumen_worker_boundary(&mut engine);
 
     let worker_type = if launch.kind == LumenWorkerKind::Module {
@@ -7523,7 +7532,7 @@ mod tests {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
-        engine.ctx().op_state().put(state);
+        engine.ctx().op_state().put_external_memory(state);
         install_host_boundary(&mut engine);
         eval(
             &mut engine,
@@ -7931,6 +7940,19 @@ mod tests {
             string_value(&mut engine, "wasmResult"),
             "true|true|8|11|37|46|1|0|2|0|true|1|true|true|true|true|true|true|true|-2|9|true|true|true|true|function,function,global,memory,table;memory,table,global,function,function,function,function,function,function,global;1,2,3"
         );
+        let reported_memories = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| {
+                let mut allocations = Vec::new();
+                lumen::embed::RetainedExternalMemory::retained_external_memory(
+                    state,
+                    &mut |allocation| allocations.push(allocation),
+                );
+                allocations.len()
+            })
+            .unwrap_or(0);
+        assert!(reported_memories >= 2);
     }
 
     #[test]

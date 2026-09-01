@@ -8,7 +8,7 @@
 //! storage through an unsafe raw ArrayBuffer while preserving the specified observable behavior.
 
 use super::HostState;
-use lumen::embed::{Ctx, Value};
+use lumen::embed::{Ctx, RetainedExternalAllocation, RetainedExternalMemory, Value};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -23,6 +23,26 @@ impl PageWasm {
         Self {
             state: Rc::new(RefCell::new(None)),
             buffers: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+}
+
+impl RetainedExternalMemory for PageWasm {
+    fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
+        let owner_identity = Rc::as_ptr(&self.state) as usize;
+        let Ok(state) = self.state.try_borrow() else {
+            return;
+        };
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        for (index, slot) in state.memories.iter().enumerate() {
+            visit(RetainedExternalAllocation::wasm_memory(
+                "trust.wasmi.memory",
+                owner_identity,
+                index as u64,
+                slot.memory.data(&state.store).len(),
+            ));
         }
     }
 }
