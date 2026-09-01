@@ -9405,6 +9405,83 @@ mod tests {
     }
 
     #[test]
+    fn checkbox_and_radio_click_activation_follows_dom_and_html_ordering() {
+        // WHATWG DOM §2.9 runs legacy-pre-activation before click listeners and
+        // canceled activation after a prevented click. HTML §4.10.5 defines
+        // checkbox/radio state changes plus the subsequent input/change events.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.indeterminate = true;
+            body.appendChild(box);
+            const boxEvents = [];
+            box.addEventListener("click", () => {
+                boxEvents.push(`click:${box.checked}:${box.indeterminate}`);
+                box.click(); // The click-in-progress flag suppresses recursion.
+            });
+            box.addEventListener("input", event => boxEvents.push(`input:${box.checked}:${event.composed}`));
+            box.addEventListener("change", () => boxEvents.push(`change:${box.checked}`));
+            box.click();
+
+            const canceled = document.createElement("input");
+            canceled.type = "checkbox";
+            canceled.checked = true;
+            canceled.indeterminate = true;
+            body.appendChild(canceled);
+            const canceledEvents = [];
+            canceled.addEventListener("click", event => {
+                canceledEvents.push(`click:${canceled.checked}:${canceled.indeterminate}`);
+                event.preventDefault();
+            });
+            canceled.addEventListener("input", () => canceledEvents.push("input"));
+            canceled.addEventListener("change", () => canceledEvents.push("change"));
+            canceled.click();
+
+            const first = document.createElement("input");
+            const second = document.createElement("input");
+            first.type = second.type = "radio";
+            first.name = second.name = "group";
+            first.checked = true;
+            body.appendChild(first); body.appendChild(second);
+            const radioEvents = [];
+            second.addEventListener("click", () => radioEvents.push(`click:${first.checked}:${second.checked}`));
+            second.addEventListener("input", () => radioEvents.push("input"));
+            second.addEventListener("change", () => radioEvents.push("change"));
+            second.click();
+
+            const disabled = document.createElement("input");
+            disabled.type = "checkbox";
+            disabled.disabled = true;
+            body.appendChild(disabled);
+            let disabledClicks = 0;
+            disabled.addEventListener("click", () => disabledClicks++);
+            disabled.click();
+
+            globalThis.inputClickActivationResult = [
+                boxEvents.join(","), box.checked, box.indeterminate,
+                canceledEvents.join(","), canceled.checked, canceled.indeterminate,
+                radioEvents.join(","), first.checked, second.checked,
+                disabledClicks, disabled.checked
+            ].join("|");
+            "##,
+            "input click activation",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "inputClickActivationResult"),
+            "click:true:false,input:true:true,change:true|true|false|click:false:false|true|true|click:false:true,input,change|false|true|0|false"
+        );
+    }
+
+    #[test]
     fn css_style_declaration_rejects_unitless_nonzero_lengths() {
         // CSSOM §6.7.1 + CSS Values 4 §6: assigning a JS number to a length
         // property stringifies it, but the resulting nonzero <number> is not a
