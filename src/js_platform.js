@@ -1995,6 +1995,59 @@
             ? createTrustedEvent(PointerEvent, "click", init)
             : new PointerEvent("click", init);
     }
+    // DOM §2.9 runs an input's legacy-pre-activation behavior before click
+    // listeners, then either its activation behavior or its canceled behavior.
+    // HTML §4.10.5 requires checkbox/radio listeners to observe the tentative
+    // checkedness, with cancellation restoring the complete prior state.
+    function radioGroupFor(input) {
+        const name = input.getAttribute("name");
+        if (!name) return [input];
+        const root = input.getRootNode();
+        const owner = formOwner(input);
+        return Array.from(root.querySelectorAll("input")).filter(candidate =>
+            candidate !== input
+            && String(candidate.type || "").toLowerCase() === "radio"
+            && candidate.getAttribute("name") === name
+            && formOwner(candidate) === owner
+        ).concat(input);
+    }
+    function inputLegacyPreActivation(input) {
+        if (!input || input.localName !== "input") return null;
+        const type = String(input.type || "").toLowerCase();
+        if (type === "checkbox") {
+            const state = {
+                type, input,
+                checked: input.checked,
+                indeterminate: input.indeterminate,
+            };
+            input.checked = !state.checked;
+            input.indeterminate = false;
+            return state;
+        }
+        if (type === "radio") {
+            const previous = radioGroupFor(input).find(candidate => candidate.checked) || null;
+            input.checked = true;
+            return { type, input, previous };
+        }
+        return null;
+    }
+    function cancelInputActivation(state) {
+        if (!state) return;
+        if (state.type === "checkbox") {
+            state.input.checked = state.checked;
+            state.input.indeterminate = state.indeterminate;
+            return;
+        }
+        const group = radioGroupFor(state.input);
+        if (state.previous && group.indexOf(state.previous) >= 0) state.previous.checked = true;
+        else state.input.checked = false;
+    }
+    function finishInputActivation(state) {
+        if (!state || !state.input.isConnected) return false;
+        dispatch(state.input, new Event("input", { bubbles: true, composed: true }), false);
+        dispatch(state.input, new Event("change", { bubbles: true }), false);
+        return true;
+    }
     function activateClick(t, record, trusted) {
         if (record) {
             trust.lastClickSubmit = null;
@@ -2006,9 +2059,15 @@
         // focusing steps. HTMLElement.click() is synthetic and deliberately
         // does not focus; the actor's trusted terminal click does.
         if (trusted && elementCanFocus(t)) focusElement(t, { preventScroll: true });
+        if (isActuallyDisabled(t)) return false;
+        const inputActivation = inputLegacyPreActivation(t);
         const ev = syntheticClickEvent(!!trusted);
         dispatch(t, ev, false);
-        if (ev.defaultPrevented) return true;
+        if (ev.defaultPrevented) {
+            cancelInputActivation(inputActivation);
+            return true;
+        }
+        if (finishInputActivation(inputActivation)) return false;
         if (record) pendingClickHyperlink = hyperlink;
         // HTML §4.11.2: the first <summary> child of a <details> element has
         // activation behavior that toggles the parent's boolean `open`
@@ -2242,8 +2301,11 @@
     }
     function listedFormControls(form) {
         if (!form || !g.document) return [];
-        return g.document
-            .querySelectorAll("button,fieldset,input,object,output,select,textarea")
+        // DOM §4.2.10.1 gives NodeList indexed getters plus iterable methods,
+        // not Array.prototype.filter. Convert explicitly before applying the
+        // HTML form-owner predicate.
+        return Array.from(g.document
+            .querySelectorAll("button,fieldset,input,object,output,select,textarea"))
             .filter(function (el) {
                 // input[type=image] is form-associated but expressly excluded
                 // from HTMLFormElement.elements.
@@ -3781,7 +3843,12 @@
         // event (bubbles to React's delegated root listener) + run activation.
         // Was a no-op, so any programmatic click (consent "Accept" buttons,
         // framework-driven toggles, auto-clickers) silently did nothing.
-        click() { try { activateClick(this, false, false); } catch (e) {} }
+        click() {
+            if (this.__trustClickInProgress || isActuallyDisabled(this)) return;
+            this.__trustClickInProgress = true;
+            try { activateClick(this, false, false); } catch (e) {}
+            finally { this.__trustClickInProgress = false; }
+        }
         focus(options) { focusElement(this, options || {}); }
         blur() { blurElement(this); }
         get tabIndex() {
@@ -4274,7 +4341,17 @@
         get value() { const v = this.getAttribute("value"); return v === null ? "" : v; }
         set value(v) { this.setAttribute("value", String(v)); }
         get checked() { return this.hasAttribute("checked"); }
-        set checked(v) { if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked"); }
+        set checked(v) {
+            v = !!v;
+            if (v && String(this.type || "").toLowerCase() === "radio") {
+                for (const candidate of radioGroupFor(this)) {
+                    if (candidate !== this && candidate.checked) candidate.removeAttribute("checked");
+                }
+            }
+            if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked");
+        }
+        get indeterminate() { return !!this.__trustIndeterminate; }
+        set indeterminate(v) { this.__trustIndeterminate = !!v; }
         get type() { const t = this.getAttribute("type"); return t === null ? "text" : t.toLowerCase(); }
         set type(v) { this.setAttribute("type", String(v)); }
     }
