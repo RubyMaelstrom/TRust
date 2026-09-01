@@ -395,10 +395,24 @@ impl RetainedMemory for HostState {
             next_window_context,
         );
 
-        // The arena and its CSS caches are a large nested ownership graph. Keep this visible as
-        // unavailable until the dedicated Dom walker lands; never substitute a misleading zero.
-        let _ = dom;
-        visitor.unavailable();
+        match dom.try_borrow() {
+            Ok(dom_value) => {
+                let (retained_bytes, opaque, unavailable) = dom_value.retained_memory();
+                report_rc_payload(
+                    visitor,
+                    "trust.dom-arena",
+                    dom,
+                    std::mem::size_of_val(dom.as_ref()).saturating_add(retained_bytes),
+                );
+                if opaque {
+                    visitor.opaque_storage();
+                }
+                for _ in 0..unavailable {
+                    visitor.unavailable();
+                }
+            }
+            Err(_) => visitor.unavailable(),
+        }
 
         report_rc_payload(
             visitor,
@@ -7871,8 +7885,7 @@ mod tests {
         assert_eq!(probe.values.len(), 1);
         assert_eq!(probe.values[0].as_num_opt(), Some(19.0));
         assert!(probe.opaque >= 1);
-        // The dedicated DOM graph walker is the sole remaining owner in an otherwise empty state.
-        assert_eq!(probe.unavailable, 1);
+        assert_eq!(probe.unavailable, 0);
     }
 
     fn platform_engine() -> lumen::Engine {

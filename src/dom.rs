@@ -456,6 +456,277 @@ impl Default for Dom {
 }
 
 impl Dom {
+    /// Requested payload retained below the arena's inline `Dom` value.
+    ///
+    /// The boolean marks standard-library/external container layouts whose public API exposes
+    /// entries and capacities but not complete bucket/control-byte allocation details. The final
+    /// count is the number of genuinely unavailable nested owners. This method deliberately has
+    /// no JavaScript-engine dependency so the Lumen and Boa comparison builds share one inventory.
+    pub(crate) fn retained_memory(&self) -> (usize, bool, usize) {
+        // This pattern is a compile-time ownership tripwire: no `..` means a new field must be
+        // classified before the crate builds.
+        let Dom {
+            nodes,
+            shadow_roots,
+            shadow_hosts,
+            dirty,
+            epoch,
+            geometry_dirty_nodes,
+            geometry_dirty_attributed,
+            style_epoch,
+            adopted_styles,
+            external_sheets,
+            style_cache,
+            computed_cache,
+            custom_prop_cache,
+            matched_cache,
+            cascaded_cache,
+            hidden_cache,
+            font_cache,
+            decoration_cache,
+            serialization_cache,
+            viewport_px,
+            device_pixel_ratio,
+            scroll_state,
+            scroll_changes,
+            doc_url,
+            dirty_nodes,
+            dirty_attributed,
+            hover_hosts,
+            hover_hits_complete,
+            paint_patch_hosts,
+            render_clickables,
+            render_live,
+            hover_chain,
+            popover_open,
+            popover_order,
+        } = self;
+        let _ = (
+            dirty,
+            epoch,
+            geometry_dirty_attributed,
+            style_epoch,
+            viewport_px,
+            device_pixel_ratio,
+            dirty_attributed,
+            hover_hits_complete,
+            render_live,
+        );
+
+        let mut bytes = nodes.capacity().saturating_mul(std::mem::size_of::<Node>());
+        let mut opaque = false;
+        let mut unavailable = 0usize;
+        for node in nodes {
+            match &node.data {
+                NodeData::Comment(text) | NodeData::Text(text) => {
+                    bytes = bytes.saturating_add(text.capacity());
+                }
+                NodeData::Element { attrs, .. } => {
+                    bytes = bytes.saturating_add(
+                        attrs
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Attribute>()),
+                    );
+                    for attr in attrs {
+                        if attr.value.is_shared() {
+                            // Tendril exposes sharedness but not the backing identity/capacity.
+                            // Treat that private allocation layout like HashMap control bytes: a
+                            // documented lower bound, never a duplicated length-based estimate.
+                            opaque = true;
+                        } else if attr.value.len32() > 8 {
+                            bytes = bytes.saturating_add(attr.value.len());
+                            opaque = true;
+                        }
+                    }
+                }
+                NodeData::Document | NodeData::Fragment | NodeData::Doctype => {}
+            }
+        }
+
+        macro_rules! fixed_map {
+            ($map:expr, $entry:ty) => {{
+                if $map.capacity() != 0 {
+                    opaque = true;
+                }
+                bytes = bytes.saturating_add(
+                    $map.capacity()
+                        .saturating_mul(std::mem::size_of::<$entry>()),
+                );
+            }};
+        }
+        macro_rules! fixed_set {
+            ($set:expr, $entry:ty) => {{
+                if $set.capacity() != 0 {
+                    opaque = true;
+                }
+                bytes = bytes.saturating_add(
+                    $set.capacity()
+                        .saturating_mul(std::mem::size_of::<$entry>()),
+                );
+            }};
+        }
+
+        fixed_map!(shadow_roots, (NodeId, NodeId));
+        fixed_map!(shadow_hosts, (NodeId, NodeId));
+        fixed_map!(geometry_dirty_nodes, (NodeId, DirtyKind));
+        fixed_map!(adopted_styles, (NodeId, String));
+        for text in adopted_styles.values() {
+            bytes = bytes.saturating_add(text.capacity());
+        }
+        fixed_map!(external_sheets, (NodeId, String));
+        for text in external_sheets.values() {
+            bytes = bytes.saturating_add(text.capacity());
+        }
+
+        match style_cache.try_borrow() {
+            Ok(cache) => {
+                if let Some((_epoch, index)) = cache.as_ref() {
+                    bytes = bytes.saturating_add(std::mem::size_of_val(index.as_ref()));
+                    // Parsed selector/rule/keyframe ownership is the remaining dedicated DOM
+                    // sub-walker. Count its root now without claiming complete nested coverage.
+                    unavailable = unavailable.saturating_add(1);
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
+        match computed_cache.try_borrow() {
+            Ok(cache) => {
+                let (_epoch, cache) = &*cache;
+                fixed_map!(cache, ((NodeId, usize), Option<String>));
+                for value in cache.values().flatten() {
+                    bytes = bytes.saturating_add(value.capacity());
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+        match custom_prop_cache.try_borrow() {
+            Ok(cache) => {
+                let (_epoch, cache) = &*cache;
+                fixed_map!(cache, (NodeId, FxHashMap<String, Option<String>>));
+                for values in cache.values() {
+                    fixed_map!(values, (String, Option<String>));
+                    for (name, value) in values {
+                        bytes = bytes.saturating_add(name.capacity());
+                        if let Some(value) = value {
+                            bytes = bytes.saturating_add(value.capacity());
+                        }
+                    }
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
+        let mut rc_vectors = std::collections::HashSet::new();
+        match matched_cache.try_borrow() {
+            Ok(cache) => {
+                bytes =
+                    bytes.saturating_add(cache.slots.capacity().saturating_mul(
+                        std::mem::size_of::<(u64, Option<std::rc::Rc<Vec<u32>>>)>(),
+                    ));
+                for (_stamp, value) in &cache.slots {
+                    if let Some(value) = value {
+                        let identity = std::rc::Rc::as_ptr(value) as usize;
+                        if rc_vectors.insert(identity) {
+                            bytes = bytes
+                                .saturating_add(std::mem::size_of::<Vec<u32>>())
+                                .saturating_add(
+                                    value.capacity().saturating_mul(std::mem::size_of::<u32>()),
+                                );
+                        }
+                    }
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
+        let mut cascaded_maps = std::collections::HashSet::new();
+        match cascaded_cache.try_borrow() {
+            Ok(cache) => {
+                bytes = bytes.saturating_add(cache.slots.capacity().saturating_mul(
+                    std::mem::size_of::<(u64, Option<std::rc::Rc<CascadedMaps>>)>(),
+                ));
+                for (_stamp, value) in &cache.slots {
+                    let Some(value) = value else { continue };
+                    let identity = std::rc::Rc::as_ptr(value) as usize;
+                    if !cascaded_maps.insert(identity) {
+                        continue;
+                    }
+                    bytes = bytes.saturating_add(std::mem::size_of::<CascadedMaps>());
+                    for map in [&value.elem, &value.before, &value.after] {
+                        fixed_map!(map, (String, String));
+                        for (name, value) in map {
+                            bytes = bytes
+                                .saturating_add(name.capacity())
+                                .saturating_add(value.capacity());
+                        }
+                    }
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
+        macro_rules! node_cache {
+            ($cache:expr, $value:ty) => {
+                match $cache.try_borrow() {
+                    Ok(cache) => {
+                        bytes = bytes.saturating_add(
+                            cache
+                                .slots
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(u64, Option<$value>)>()),
+                        );
+                    }
+                    Err(_) => unavailable = unavailable.saturating_add(1),
+                }
+            };
+        }
+        node_cache!(hidden_cache, bool);
+        node_cache!(font_cache, f32);
+        node_cache!(decoration_cache, (bool, bool));
+
+        match serialization_cache.try_borrow() {
+            Ok(cache) => {
+                let (_epoch, cache) = &*cache;
+                fixed_map!(cache, ((NodeId, u8), String));
+                for value in cache.values() {
+                    bytes = bytes.saturating_add(value.capacity());
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
+        fixed_map!(scroll_state, (NodeId, ScrollBox));
+        bytes = bytes.saturating_add(
+            scroll_changes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(NodeId, f64, f64)>()),
+        );
+        if let Some(url) = doc_url
+            && !url.as_str().is_empty()
+        {
+            bytes = bytes.saturating_add(url.as_str().len());
+            opaque = true;
+        }
+        bytes = bytes.saturating_add(
+            dirty_nodes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(NodeId, DirtyKind)>()),
+        );
+        fixed_set!(hover_hosts, NodeId);
+        fixed_set!(paint_patch_hosts, NodeId);
+        fixed_set!(render_clickables, NodeId);
+        fixed_set!(hover_chain, NodeId);
+        fixed_set!(popover_open, NodeId);
+        bytes = bytes.saturating_add(
+            popover_order
+                .capacity()
+                .saturating_mul(std::mem::size_of::<NodeId>()),
+        );
+
+        (bytes, opaque, unavailable)
+    }
+
     pub fn new() -> Self {
         let mut dom = Dom {
             nodes: Vec::new(),
@@ -11957,6 +12228,29 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_memory_inventory_tracks_arena_payload_and_cache_availability() {
+        let empty = Dom::new();
+        let (empty_bytes, _empty_opaque, empty_unavailable) = empty.retained_memory();
+        assert_eq!(empty_unavailable, 0);
+
+        let dom = Dom::parse_document("<body><p>retained payload text</p></body>");
+        let (document_bytes, _document_opaque, document_unavailable) = dom.retained_memory();
+        assert!(document_bytes > empty_bytes);
+        assert_eq!(document_unavailable, 0);
+
+        let styled = Dom::parse_document(
+            "<head><style>p{color:red}</style></head><body><p id=x>x</p></body>",
+        );
+        let paragraph = styled.get_by_id("x").expect("fixture paragraph");
+        assert_eq!(
+            styled.computed_value(paragraph, "color").as_deref(),
+            Some("red")
+        );
+        let (_bytes, _opaque, unavailable) = styled.retained_memory();
+        assert!(unavailable >= 1, "parsed StyleIndex graph remains explicit");
+    }
 
     #[test]
     fn selector_parse_memo_returns_identical_parses() {
