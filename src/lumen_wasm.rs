@@ -8,7 +8,10 @@
 //! storage through an unsafe raw ArrayBuffer while preserving the specified observable behavior.
 
 use super::HostState;
-use lumen::embed::{Ctx, RetainedExternalAllocation, RetainedExternalMemory, Value};
+use lumen::embed::{
+    Ctx, HostRetainedMemoryVisitor, RetainedExternalAllocation, RetainedExternalMemory,
+    RetainedManagedAllocation, Value,
+};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -24,6 +27,83 @@ impl PageWasm {
             state: Rc::new(RefCell::new(None)),
             buffers: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    pub(super) fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
+        let mut state_bytes = std::mem::size_of_val(self.state.as_ref());
+        match self.state.try_borrow() {
+            Ok(state) => {
+                if let Some(state) = state.as_ref() {
+                    state_bytes = state_bytes
+                        .saturating_add(
+                            state
+                                .modules
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<wasmi::Module>()),
+                        )
+                        .saturating_add(
+                            state
+                                .instances
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<wasmi::Instance>()),
+                        )
+                        .saturating_add(
+                            state
+                                .funcs
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<wasmi::Func>()),
+                        )
+                        .saturating_add(
+                            state
+                                .globals
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<wasmi::Global>()),
+                        )
+                        .saturating_add(
+                            state
+                                .memories
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<MemorySlot>()),
+                        )
+                        .saturating_add(
+                            state
+                                .tables
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<wasmi::Table>()),
+                        );
+                    // Wasmi's Engine/Store and compiled Module internals are private allocator
+                    // graphs. Their visible handle/vector payload is retained above, while this
+                    // marker prevents active Wasm state from claiming complete host metadata.
+                    visitor.unavailable();
+                }
+            }
+            Err(_) => visitor.unavailable(),
+        }
+        visitor.allocation(RetainedManagedAllocation::rc(
+            "trust.wasmi-state",
+            &self.state,
+            state_bytes,
+        ));
+
+        let mut buffers_bytes = std::mem::size_of_val(self.buffers.as_ref());
+        match self.buffers.try_borrow() {
+            Ok(buffers) => {
+                buffers_bytes = buffers_bytes.saturating_add(
+                    buffers
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Option<Value>>()),
+                );
+                for value in buffers.iter().flatten() {
+                    visitor.value(value);
+                }
+            }
+            Err(_) => visitor.unavailable(),
+        }
+        visitor.allocation(RetainedManagedAllocation::rc(
+            "trust.wasmi-buffer-handles",
+            &self.buffers,
+            buffers_bytes,
+        ));
     }
 }
 

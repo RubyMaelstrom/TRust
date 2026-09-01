@@ -6,7 +6,10 @@
 
 use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
-use lumen::embed::{Ctx, EvalError, NativeFn, Value};
+use lumen::embed::{
+    Ctx, EvalError, HostRetainedMemoryVisitor, NativeFn, RetainedManagedAllocation, RetainedMemory,
+    Value,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
@@ -320,6 +323,308 @@ impl HostState {
     }
 }
 
+fn report_rc_payload<T>(
+    visitor: &mut dyn HostRetainedMemoryVisitor,
+    domain: &'static str,
+    owner: &Rc<T>,
+    requested_bytes: usize,
+) {
+    visitor.allocation(RetainedManagedAllocation::rc(
+        domain,
+        owner,
+        requested_bytes,
+    ));
+}
+
+fn report_arc_payload<T>(
+    visitor: &mut dyn HostRetainedMemoryVisitor,
+    domain: &'static str,
+    owner: &Arc<T>,
+    requested_bytes: usize,
+) {
+    visitor.allocation(RetainedManagedAllocation::new(
+        domain,
+        Arc::as_ptr(owner) as usize,
+        requested_bytes,
+    ));
+}
+
+fn url_requested_bytes(url: &url::Url, visitor: &mut dyn HostRetainedMemoryVisitor) -> usize {
+    if !url.as_str().is_empty() {
+        // `url` exposes length but not its backing String capacity. The serialized bytes are a
+        // safe requested-payload lower bound; the opaque marker keeps the category honest.
+        visitor.opaque_storage();
+    }
+    url.as_str().len()
+}
+
+impl RetainedMemory for HostState {
+    fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
+        // Exhaustive by construction: adding an owning HostState field is a compile error until
+        // it receives an explicit classification here. ECMA-262 Agents aggregate every Realm's
+        // host-defined roots; the Lumen visitor deduplicates the identities emitted below across
+        // the root realm and its ShadowRealms.
+        let HostState {
+            dom,
+            clock,
+            base,
+            storage,
+            blobs,
+            viewport,
+            device_pixel_ratio,
+            geom_cache,
+            hit_testing_active,
+            images,
+            task_events,
+            pending_resources,
+            pending_dynamic_modules,
+            network,
+            websockets,
+            workers,
+            worker_self,
+            wasm,
+            next_window_context,
+            window_realms,
+        } = self;
+
+        let _ = (
+            viewport,
+            device_pixel_ratio,
+            hit_testing_active,
+            pending_resources,
+            next_window_context,
+        );
+
+        // The arena and its CSS caches are a large nested ownership graph. Keep this visible as
+        // unavailable until the dedicated Dom walker lands; never substitute a misleading zero.
+        let _ = dom;
+        visitor.unavailable();
+
+        report_rc_payload(
+            visitor,
+            "trust.realm-clock",
+            clock,
+            std::mem::size_of_val(clock.as_ref()),
+        );
+
+        let base_bytes = url_requested_bytes(base, visitor);
+        if base_bytes != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.host-base-url",
+                base.as_str().as_ptr() as usize,
+                base_bytes,
+            ));
+        }
+
+        if let Ok(storage) = storage.lock() {
+            let mut bytes = std::mem::size_of_val(self.storage.as_ref()).saturating_add(
+                storage.capacity().saturating_mul(std::mem::size_of::<(
+                    String,
+                    std::collections::HashMap<String, String>,
+                )>()),
+            );
+            if storage.capacity() != 0 {
+                visitor.opaque_storage();
+            }
+            for (origin, entries) in storage.iter() {
+                bytes = bytes.saturating_add(origin.capacity()).saturating_add(
+                    entries
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(String, String)>()),
+                );
+                if entries.capacity() != 0 {
+                    visitor.opaque_storage();
+                }
+                for (key, value) in entries {
+                    bytes = bytes
+                        .saturating_add(key.capacity())
+                        .saturating_add(value.capacity());
+                }
+            }
+            report_arc_payload(visitor, "trust.web-storage", &self.storage, bytes);
+        } else {
+            visitor.unavailable();
+        }
+
+        if let Ok(blobs) = blobs.lock() {
+            let mut bytes = std::mem::size_of_val(self.blobs.as_ref()).saturating_add(
+                blobs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, (Vec<u8>, String))>()),
+            );
+            if blobs.capacity() != 0 {
+                visitor.opaque_storage();
+            }
+            for (url, (data, media_type)) in blobs.iter() {
+                bytes = bytes
+                    .saturating_add(url.capacity())
+                    .saturating_add(data.capacity())
+                    .saturating_add(media_type.capacity());
+            }
+            report_arc_payload(visitor, "trust.blob-url-map", &self.blobs, bytes);
+        } else {
+            visitor.unavailable();
+        }
+
+        if let Ok(cache) = geom_cache.try_borrow() {
+            let mut bytes = std::mem::size_of_val(geom_cache.as_ref())
+                .saturating_add(cache.boxes.capacity().saturating_mul(std::mem::size_of::<(
+                    crate::dom::NodeId,
+                    crate::layout2::PxRect,
+                )>()))
+                .saturating_add(cache.tracks.capacity().saturating_mul(std::mem::size_of::<(
+                    crate::dom::NodeId,
+                    (Vec<f32>, Vec<f32>),
+                )>()))
+                .saturating_add(cache.scrolling_areas.capacity().saturating_mul(
+                    std::mem::size_of::<(crate::dom::NodeId, crate::layout2::PxRect)>(),
+                ));
+            for (columns, rows) in cache.tracks.values() {
+                bytes = bytes
+                    .saturating_add(columns.capacity() * std::mem::size_of::<f32>())
+                    .saturating_add(rows.capacity() * std::mem::size_of::<f32>());
+            }
+            if cache.boxes.capacity() != 0
+                || cache.tracks.capacity() != 0
+                || cache.scrolling_areas.capacity() != 0
+            {
+                visitor.opaque_storage();
+            }
+            if cache.paint.is_some() {
+                // PagePaint contains nested strings, vectors, and image requests. It receives its
+                // own exhaustive walker in the next browser-owned payload slice.
+                visitor.unavailable();
+            }
+            report_rc_payload(visitor, "trust.geometry-cache", geom_cache, bytes);
+        } else {
+            visitor.unavailable();
+        }
+
+        if let Ok(images) = images.try_borrow() {
+            let mut bytes = std::mem::size_of_val(self.images.as_ref()).saturating_add(
+                images
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, (u32, u32))>()),
+            );
+            if images.capacity() != 0 {
+                visitor.opaque_storage();
+            }
+            for url in images.keys() {
+                bytes = bytes.saturating_add(url.capacity());
+            }
+            report_rc_payload(visitor, "trust.image-size-map", &self.images, bytes);
+        } else {
+            visitor.unavailable();
+        }
+
+        if task_events.is_some() {
+            // Tokio owns the queue allocation and does not expose its capacity or queued payload.
+            visitor.opaque_storage();
+        }
+        report_arc_payload(
+            visitor,
+            "trust.pending-dynamic-module-count",
+            pending_dynamic_modules,
+            std::mem::size_of_val(pending_dynamic_modules.as_ref()),
+        );
+
+        if let Some(network) = network {
+            let bytes = network
+                .pending_fetches
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(usize, LumenPendingFetch)>());
+            if network.pending_fetches.capacity() != 0 {
+                visitor.opaque_storage();
+            }
+            for pending in network.pending_fetches.values() {
+                visitor.value(&pending.resolve);
+            }
+            report_arc_payload(
+                visitor,
+                "trust.network-fetch-count",
+                &network.fetched,
+                std::mem::size_of_val(network.fetched.as_ref()),
+            );
+            // The Tokio runtime and PageCache are session/runtime owners shared outside this
+            // Agent. Their handles are inline in HostState and are not attributed as Agent-owned
+            // allocations.
+            let _ = (&network.handle, &network.cache);
+            if bytes != 0 {
+                visitor.allocation(RetainedManagedAllocation::new(
+                    "trust.network-metadata",
+                    network as *const LumenNetwork as usize,
+                    bytes,
+                ));
+            }
+        }
+
+        if let Some(websockets) = websockets {
+            let bytes = url_requested_bytes(&websockets.page, visitor).saturating_add(
+                websockets
+                    .sockets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(
+                        usize,
+                        tokio::sync::mpsc::Sender<crate::ws::WsOut>,
+                    )>()),
+            );
+            if websockets.sockets.capacity() != 0 || !websockets.sockets.is_empty() {
+                visitor.opaque_storage();
+            }
+            let _ = (&websockets.handle, &websockets.tasks, &websockets.events);
+            if bytes != 0 {
+                visitor.allocation(RetainedManagedAllocation::new(
+                    "trust.websocket-metadata",
+                    websockets as *const LumenWebSockets as usize,
+                    bytes,
+                ));
+            }
+        }
+
+        if let Some(workers) = workers {
+            let bytes = url_requested_bytes(&workers.page, visitor).saturating_add(
+                workers
+                    .workers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, LumenWorkerHandle)>()),
+            );
+            if workers.workers.capacity() != 0 || !workers.workers.is_empty() {
+                visitor.opaque_storage();
+            }
+            let _ = (&workers.handle, &workers.tasks, &workers.events);
+            if bytes != 0 {
+                visitor.allocation(RetainedManagedAllocation::new(
+                    "trust.worker-metadata",
+                    workers as *const LumenPageWorkers as usize,
+                    bytes,
+                ));
+            }
+        }
+
+        if worker_self.is_some() {
+            // The sender retains a Tokio queue whose storage is intentionally an opaque lower
+            // bound. Its inline handle and scalar worker id/state are already in HostState.
+            visitor.opaque_storage();
+        }
+
+        wasm.scan_retained_memory(visitor);
+
+        if window_realms.capacity() != 0 {
+            visitor.opaque_storage();
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.window-realm-table",
+                window_realms as *const HashMap<u64, Value> as usize,
+                window_realms
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u64, Value)>()),
+            ));
+        }
+        for value in window_realms.values() {
+            visitor.value(value);
+        }
+    }
+}
+
 impl lumen::embed::RetainedExternalMemory for HostState {
     fn retained_external_memory(
         &self,
@@ -492,7 +797,10 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     engine.set_wall_clock(move || engine_clock.now_ms());
     let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
     state.configure_module_loading(&mut engine);
-    engine.ctx().op_state().put_external_memory(state);
+    engine
+        .ctx()
+        .op_state()
+        .put_retained_memory_with_external_memory(state);
     install_host_boundary(&mut engine);
 
     eval(
@@ -1330,7 +1638,10 @@ mod desktop {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
-        engine.ctx().op_state().put_external_memory(state);
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(state);
         install_host_boundary(&mut engine);
 
         // HTML NavigatorID: navigator.userAgent exposes the environment settings object's default
@@ -5255,7 +5566,10 @@ fn run_lumen_worker(
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
     state.configure_module_loading(&mut engine);
-    engine.ctx().op_state().put_external_memory(state);
+    engine
+        .ctx()
+        .op_state()
+        .put_retained_memory_with_external_memory(state);
     install_lumen_worker_boundary(&mut engine);
 
     let worker_type = if launch.kind == LumenWorkerKind::Module {
@@ -7517,6 +7831,50 @@ fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct HostRetainedProbe {
+        allocations: usize,
+        values: Vec<Value>,
+        opaque: usize,
+        unavailable: usize,
+    }
+
+    impl HostRetainedMemoryVisitor for HostRetainedProbe {
+        fn allocation(&mut self, _allocation: RetainedManagedAllocation) {
+            self.allocations += 1;
+        }
+
+        fn value(&mut self, value: &Value) {
+            self.values.push(value.clone());
+        }
+
+        fn opaque_storage(&mut self) {
+            self.opaque += 1;
+        }
+
+        fn unavailable(&mut self) {
+            self.unavailable += 1;
+        }
+    }
+
+    #[test]
+    fn host_state_retained_inventory_is_exhaustive_and_keeps_value_roots() {
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.window_realms.insert(7, Value::Num(19.0));
+        let mut probe = HostRetainedProbe::default();
+        state.scan_retained_memory(&mut probe);
+
+        assert!(probe.allocations >= 8);
+        assert_eq!(probe.values.len(), 1);
+        assert_eq!(probe.values[0].as_num_opt(), Some(19.0));
+        assert!(probe.opaque >= 1);
+        // The dedicated DOM graph walker is the sole remaining owner in an otherwise empty state.
+        assert_eq!(probe.unavailable, 1);
+    }
+
     fn platform_engine() -> lumen::Engine {
         let clock = Rc::new(RealmClock::new());
         configured_engine(
@@ -7532,7 +7890,10 @@ mod tests {
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
-        engine.ctx().op_state().put_external_memory(state);
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(state);
         install_host_boundary(&mut engine);
         eval(
             &mut engine,
