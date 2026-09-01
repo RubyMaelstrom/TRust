@@ -249,6 +249,199 @@ impl PagePaint {
             || has(&self.fixed_primitives)
             || self.top_layer.iter().any(|entry| has(&entry.primitives))
     }
+
+    pub(crate) fn retained_memory(&self) -> (usize, bool) {
+        let PagePaint {
+            width,
+            height,
+            background,
+            lines,
+            primitives,
+            fixed_under_primitives,
+            fixed_primitives,
+            fixed_interleaved,
+            top_layer,
+            image_requests,
+            scroll_containers,
+            sticky_constraints,
+        } = self;
+        let _ = (width, height, background, fixed_interleaved);
+        let mut bytes = lines
+            .capacity()
+            .saturating_mul(std::mem::size_of::<PaintLine>())
+            .saturating_add(
+                primitives
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Primitive>()),
+            )
+            .saturating_add(
+                fixed_under_primitives
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Primitive>()),
+            )
+            .saturating_add(
+                fixed_primitives
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Primitive>()),
+            )
+            .saturating_add(
+                top_layer
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TopLayerEntry>()),
+            )
+            .saturating_add(
+                image_requests
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ImageRequest>()),
+            )
+            .saturating_add(
+                scroll_containers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScrollContainer>()),
+            )
+            .saturating_add(
+                sticky_constraints
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<StickyConstraint>()),
+            );
+        let mut opaque = false;
+        for commands in [primitives, fixed_under_primitives, fixed_primitives] {
+            for command in commands {
+                let (retained, command_opaque) = command.retained_memory();
+                bytes = bytes.saturating_add(retained);
+                opaque |= command_opaque;
+            }
+        }
+        for entry in top_layer {
+            let TopLayerEntry { fixed, primitives } = entry;
+            let _ = fixed;
+            bytes = bytes.saturating_add(primitives.capacity() * std::mem::size_of::<Primitive>());
+            for command in primitives {
+                let (retained, command_opaque) = command.retained_memory();
+                bytes = bytes.saturating_add(retained);
+                opaque |= command_opaque;
+            }
+        }
+        for request in image_requests {
+            bytes = bytes.saturating_add(request.source.capacity());
+        }
+        (bytes, opaque)
+    }
+}
+
+impl PaintShape {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            PaintShape::Path(elements) => elements.capacity() * std::mem::size_of::<PathElement>(),
+            PaintShape::Rect(_) | PaintShape::RoundedRect { .. } => 0,
+        }
+    }
+}
+
+impl PaintBrush {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            PaintBrush::LinearGradient { stops, .. } | PaintBrush::RadialGradient { stops, .. } => {
+                stops.capacity() * std::mem::size_of::<GradientStop>()
+            }
+            PaintBrush::Solid(_) => 0,
+        }
+    }
+}
+
+impl DisplayCommand {
+    fn retained_memory(&self) -> (usize, bool) {
+        let mut opaque = false;
+        let bytes = match self {
+            DisplayCommand::Fill { shape, brush } => shape
+                .retained_bytes()
+                .saturating_add(brush.retained_bytes()),
+            DisplayCommand::Stroke {
+                shape,
+                brush,
+                style,
+            } => shape
+                .retained_bytes()
+                .saturating_add(brush.retained_bytes())
+                .saturating_add(style.dash.capacity() * std::mem::size_of::<f32>()),
+            DisplayCommand::PushClip(shape) | DisplayCommand::Shadow { shape, .. } => {
+                shape.retained_bytes()
+            }
+            DisplayCommand::BeginCssAnimation(scope) => {
+                let mut bytes =
+                    scope.animations.capacity() * std::mem::size_of::<CssPaintAnimation>();
+                for animation in &scope.animations {
+                    bytes = bytes
+                        .saturating_add(animation.name.capacity())
+                        .saturating_add(animation.direction.capacity())
+                        .saturating_add(animation.fill_mode.capacity())
+                        .saturating_add(animation.timing_function.capacity())
+                        .saturating_add(
+                            animation.position.capacity()
+                                * std::mem::size_of::<CssAnimationPoint>(),
+                        )
+                        .saturating_add(
+                            animation.transform.capacity()
+                                * std::mem::size_of::<CssAnimationPoint>(),
+                        );
+                }
+                bytes
+            }
+            DisplayCommand::HitRegion(region) => {
+                let mut bytes = region.cursor.as_ref().map_or(0, String::capacity);
+                if let Some(link) = &region.link {
+                    let (link_bytes, link_opaque) = link.retained_memory();
+                    bytes = bytes.saturating_add(link_bytes);
+                    opaque |= link_opaque;
+                }
+                bytes
+            }
+            DisplayCommand::FillPolygon { points, .. } => {
+                points.capacity() * std::mem::size_of::<CssPoint>()
+            }
+            DisplayCommand::GlyphRun {
+                shaped,
+                shadows,
+                link,
+                ..
+            } => {
+                let mut bytes = shaped
+                    .retained_bytes()
+                    .saturating_add(shadows.capacity() * std::mem::size_of::<TextShadowPaint>());
+                if let Some(link) = link {
+                    let (link_bytes, link_opaque) = link.retained_memory();
+                    bytes = bytes.saturating_add(link_bytes);
+                    opaque |= link_opaque;
+                }
+                bytes
+            }
+            DisplayCommand::Image { link, .. } => {
+                if let Some(link) = link {
+                    let (bytes, link_opaque) = link.retained_memory();
+                    opaque |= link_opaque;
+                    bytes
+                } else {
+                    0
+                }
+            }
+            DisplayCommand::PopClip
+            | DisplayCommand::PushTransform(_)
+            | DisplayCommand::PopTransform
+            | DisplayCommand::PushLayer(_)
+            | DisplayCommand::PopLayer
+            | DisplayCommand::BeginSticky(_)
+            | DisplayCommand::EndSticky
+            | DisplayCommand::BeginScroll(_)
+            | DisplayCommand::EndScroll
+            | DisplayCommand::BeginFixed
+            | DisplayCommand::EndFixed
+            | DisplayCommand::EndCssAnimation
+            | DisplayCommand::BeginMarquee(_)
+            | DisplayCommand::EndMarquee
+            | DisplayCommand::FillRect { .. } => 0,
+        };
+        (bytes, opaque)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2732,6 +2925,40 @@ mod tests {
             viewport: CssSize::new(800.0, 600.0),
             page_revision: 0,
         }
+    }
+
+    #[test]
+    fn retained_page_paint_inventory_covers_nested_command_payloads() {
+        let mut paint = PagePaint::default();
+        paint.primitives.push(DisplayCommand::FillPolygon {
+            points: vec![CssPoint::new(1.0, 2.0), CssPoint::new(3.0, 4.0)],
+            color: PaintColor::Foreground,
+        });
+        paint.primitives.push(DisplayCommand::HitRegion(HitRegion {
+            rect: CssRect::default(),
+            node: 1,
+            actor: Some(1),
+            link: Some(Link::JsClick {
+                node: 1,
+                href: String::from("/retained-target"),
+            }),
+            cursor: Some(String::from("pointer")),
+        }));
+        paint.image_requests.push(ImageRequest {
+            handle: ImageHandle(1),
+            source: String::from("https://example.com/image.png"),
+        });
+
+        let (bytes, opaque) = paint.retained_memory();
+        assert!(bytes >= 2 * std::mem::size_of::<Primitive>());
+        assert!(!opaque);
+
+        if let DisplayCommand::HitRegion(region) = &mut paint.primitives[1] {
+            region.link = Some(Link::Http(
+                url::Url::parse("https://example.com/opaque-capacity").unwrap(),
+            ));
+        }
+        assert!(paint.retained_memory().1);
     }
 
     #[test]

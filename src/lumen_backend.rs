@@ -504,10 +504,12 @@ impl RetainedMemory for HostState {
             {
                 visitor.opaque_storage();
             }
-            if cache.paint.is_some() {
-                // PagePaint contains nested strings, vectors, and image requests. It receives its
-                // own exhaustive walker in the next browser-owned payload slice.
-                visitor.unavailable();
+            if let Some(paint) = &cache.paint {
+                let (paint_bytes, paint_opaque) = paint.retained_memory();
+                bytes = bytes.saturating_add(paint_bytes);
+                if paint_opaque {
+                    visitor.opaque_storage();
+                }
             }
             report_rc_payload(visitor, "trust.geometry-cache", geom_cache, bytes);
         } else {
@@ -8314,7 +8316,7 @@ mod tests {
             string_value(&mut engine, "wasmResult"),
             "true|true|8|11|37|46|1|0|2|0|true|1|true|true|true|true|true|true|true|-2|9|true|true|true|true|function,function,global,memory,table;memory,table,global,function,function,function,function,function,function,global;1,2,3"
         );
-        let reported_memories = engine
+        let (reported_memories, retained_unavailable, retained_opaque) = engine
             .ctx()
             .host_mut::<HostState>()
             .map(|state| {
@@ -8323,10 +8325,14 @@ mod tests {
                     state,
                     &mut |allocation| allocations.push(allocation),
                 );
-                allocations.len()
+                let mut retained = HostRetainedProbe::default();
+                state.scan_retained_memory(&mut retained);
+                (allocations.len(), retained.unavailable, retained.opaque)
             })
-            .unwrap_or(0);
+            .unwrap_or((0, usize::MAX, 0));
         assert!(reported_memories >= 2);
+        assert_eq!(retained_unavailable, 0);
+        assert!(retained_opaque >= 1);
     }
 
     #[test]

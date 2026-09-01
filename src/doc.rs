@@ -48,6 +48,30 @@ pub enum Link {
     External(String),
 }
 
+impl Link {
+    pub(crate) fn retained_memory(&self) -> (usize, bool) {
+        match self {
+            Link::Gopher(url) => (
+                url.host.capacity().saturating_add(url.selector.capacity()),
+                false,
+            ),
+            Link::Gemini(url) => (
+                url.host.capacity().saturating_add(url.path.capacity()),
+                false,
+            ),
+            Link::Http(url) | Link::Media(url) => (url.as_str().len(), !url.as_str().is_empty()),
+            Link::OneShot(url) => (
+                url.host.capacity().saturating_add(url.query.capacity()),
+                false,
+            ),
+            Link::Telnet { host, .. } => (host.capacity(), false),
+            Link::JsClick { href, .. } => (href.capacity(), false),
+            Link::External(url) => (url.capacity(), false),
+            Link::Form { .. } => (0, false),
+        }
+    }
+}
+
 impl fmt::Display for Link {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
