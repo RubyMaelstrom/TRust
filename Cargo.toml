@@ -34,6 +34,11 @@ name = "trust-lumen-spike"
 path = "src/bin/trust-lumen-spike.rs"
 required-features = ["lumen-spike"]
 
+[[bin]]
+name = "trust-browser-replay"
+path = "src/bin/trust-browser-replay.rs"
+required-features = ["lumen-backend"]
+
 [features]
 # `mimalloc` (default on) installs the mimalloc global allocator. Parse and
 # bytecode-compile of large JS bundles are dominated by millions of small
