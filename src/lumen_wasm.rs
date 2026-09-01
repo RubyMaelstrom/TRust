@@ -72,9 +72,10 @@ impl PageWasm {
                                 .saturating_mul(std::mem::size_of::<wasmi::Table>()),
                         );
                     // Wasmi's Engine/Store and compiled Module internals are private allocator
-                    // graphs. Their visible handle/vector payload is retained above, while this
-                    // marker prevents active Wasm state from claiming complete host metadata.
-                    visitor.unavailable();
+                    // graphs. Their visible handle/vector payload is retained above; classify
+                    // the remainder as an opaque requested-payload lower bound, just like a
+                    // standard-library map whose control-byte layout is private.
+                    visitor.opaque_storage();
                 }
             }
             Err(_) => visitor.unavailable(),

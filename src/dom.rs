@@ -581,10 +581,11 @@ impl Dom {
         match style_cache.try_borrow() {
             Ok(cache) => {
                 if let Some((_epoch, index)) = cache.as_ref() {
-                    bytes = bytes.saturating_add(std::mem::size_of_val(index.as_ref()));
-                    // Parsed selector/rule/keyframe ownership is the remaining dedicated DOM
-                    // sub-walker. Count its root now without claiming complete nested coverage.
-                    unavailable = unavailable.saturating_add(1);
+                    let (retained, index_opaque) = index.retained_memory();
+                    bytes = bytes
+                        .saturating_add(std::mem::size_of_val(index.as_ref()))
+                        .saturating_add(retained);
+                    opaque |= index_opaque;
                 }
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
@@ -10171,6 +10172,287 @@ struct StyleIndex {
     boxless_content_may_escape: bool,
 }
 
+impl Complex {
+    fn retained_bytes(&self) -> usize {
+        self.0
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Combinator, Compound)>())
+            .saturating_add(
+                self.0
+                    .iter()
+                    .map(|(_, compound)| compound.retained_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+}
+
+impl Compound {
+    fn retained_bytes(&self) -> usize {
+        let Compound {
+            tag,
+            id,
+            classes,
+            attrs,
+            nots,
+            selects,
+            has,
+            hover,
+            popover_open,
+            never,
+            never_unknown,
+            structural,
+            states,
+            scope,
+            root,
+            host,
+            host_inner,
+            slotted,
+            pseudo,
+            pseudos,
+        } = self;
+        let _ = (
+            hover,
+            popover_open,
+            never,
+            never_unknown,
+            scope,
+            root,
+            host,
+            pseudo,
+            pseudos,
+        );
+        let mut bytes = tag
+            .as_ref()
+            .map_or(0, String::capacity)
+            .saturating_add(id.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                classes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                classes
+                    .iter()
+                    .map(String::capacity)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                attrs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<AttrSel>()),
+            );
+        for attr in attrs {
+            bytes = bytes
+                .saturating_add(attr.name.capacity())
+                .saturating_add(attr.value.as_ref().map_or(0, String::capacity));
+            let _ = (&attr.op, attr.ci);
+        }
+        bytes = bytes.saturating_add(nots.capacity() * std::mem::size_of::<Vec<Compound>>());
+        for group in nots {
+            bytes = bytes
+                .saturating_add(group.capacity() * std::mem::size_of::<Compound>())
+                .saturating_add(
+                    group
+                        .iter()
+                        .map(Compound::retained_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+        }
+        bytes =
+            bytes.saturating_add(selects.capacity() * std::mem::size_of::<(Vec<Complex>, bool)>());
+        for (group, _where) in selects {
+            bytes = bytes
+                .saturating_add(group.capacity() * std::mem::size_of::<Complex>())
+                .saturating_add(
+                    group
+                        .iter()
+                        .map(Complex::retained_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+        }
+        bytes = bytes.saturating_add(has.capacity() * std::mem::size_of::<Vec<HasArg>>());
+        for group in has {
+            bytes = bytes
+                .saturating_add(group.capacity() * std::mem::size_of::<HasArg>())
+                .saturating_add(
+                    group
+                        .iter()
+                        .map(|arg| {
+                            let _ = arg.sibling;
+                            arg.complex.retained_bytes()
+                        })
+                        .fold(0usize, usize::saturating_add),
+                );
+        }
+        bytes = bytes.saturating_add(structural.capacity() * std::mem::size_of::<Structural>());
+        for state in structural {
+            if let Structural::Nth {
+                nth,
+                of_type,
+                from_end,
+                of: Some(group),
+            } = state
+            {
+                let _ = (nth.a, nth.b, of_type, from_end);
+                bytes = bytes
+                    .saturating_add(group.capacity() * std::mem::size_of::<Complex>())
+                    .saturating_add(
+                        group
+                            .iter()
+                            .map(Complex::retained_bytes)
+                            .fold(0usize, usize::saturating_add),
+                    );
+            }
+        }
+        bytes = bytes.saturating_add(states.capacity() * std::mem::size_of::<StatePseudo>());
+        for state in states {
+            if let StatePseudo::Lang(ranges) = state {
+                bytes = bytes
+                    .saturating_add(ranges.capacity() * std::mem::size_of::<String>())
+                    .saturating_add(ranges.iter().map(String::capacity).sum::<usize>());
+            }
+        }
+        for boxed in [host_inner, slotted].into_iter().flatten() {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<Compound>())
+                .saturating_add(boxed.retained_bytes());
+        }
+        bytes
+    }
+}
+
+impl RuleBuckets {
+    fn retained_bytes(&self) -> usize {
+        let RuleBuckets {
+            by_id,
+            by_class,
+            by_tag,
+            universal,
+        } = self;
+        let mut bytes = universal.capacity() * std::mem::size_of::<u32>();
+        for map in [by_id, by_class, by_tag] {
+            bytes = bytes.saturating_add(
+                map.capacity()
+                    .saturating_mul(std::mem::size_of::<(String, Vec<u32>)>()),
+            );
+            for (key, indices) in map {
+                bytes = bytes
+                    .saturating_add(key.capacity())
+                    .saturating_add(indices.capacity() * std::mem::size_of::<u32>());
+            }
+        }
+        bytes
+    }
+}
+
+impl StyleIndex {
+    fn retained_memory(&self) -> (usize, bool) {
+        let StyleIndex {
+            scopes,
+            buckets,
+            slotted_rules,
+            keyframes,
+            has_opacity,
+            hover_probes,
+            hover_buckets,
+            boxless_content_may_escape,
+        } = self;
+        let _ = (has_opacity, boxless_content_may_escape);
+        let mut bytes = scopes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(NodeId, Vec<StyleRule>)>());
+        for rules in scopes.values() {
+            bytes = bytes.saturating_add(rules.capacity() * std::mem::size_of::<StyleRule>());
+            for rule in rules {
+                let StyleRule {
+                    selector,
+                    specificity,
+                    order,
+                    layer_normal,
+                    layer_important,
+                    decls,
+                } = rule;
+                let _ = (specificity, order, layer_normal, layer_important);
+                bytes = bytes
+                    .saturating_add(selector.retained_bytes())
+                    .saturating_add(
+                        decls
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(String, (bool, String))>()),
+                    );
+                for (name, (_important, value)) in decls {
+                    bytes = bytes
+                        .saturating_add(name.capacity())
+                        .saturating_add(value.capacity());
+                }
+            }
+        }
+        for map in [buckets, hover_buckets] {
+            bytes = bytes.saturating_add(
+                map.capacity()
+                    .saturating_mul(std::mem::size_of::<(NodeId, RuleBuckets)>()),
+            );
+            bytes = bytes.saturating_add(
+                map.values()
+                    .map(RuleBuckets::retained_bytes)
+                    .fold(0usize, usize::saturating_add),
+            );
+        }
+        bytes = bytes.saturating_add(
+            slotted_rules
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(NodeId, u32)>()),
+        );
+        bytes = bytes.saturating_add(
+            keyframes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, KeyframesRule)>()),
+        );
+        for (name, keyframes) in keyframes {
+            bytes = bytes.saturating_add(name.capacity()).saturating_add(
+                keyframes
+                    .properties
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, Vec<KeyframeValue>)>()),
+            );
+            for (property, values) in &keyframes.properties {
+                bytes = bytes.saturating_add(property.capacity()).saturating_add(
+                    values
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<KeyframeValue>()),
+                );
+                for value in values {
+                    let _ = value.offset;
+                    bytes = bytes.saturating_add(value.value.capacity());
+                }
+            }
+        }
+        bytes = bytes.saturating_add(
+            hover_probes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<HoverProbe>()),
+        );
+        for probe in hover_probes {
+            let HoverProbe {
+                tag,
+                id,
+                class,
+                any,
+            } = probe;
+            let _ = any;
+            bytes = bytes
+                .saturating_add(tag.as_ref().map_or(0, String::capacity))
+                .saturating_add(id.as_ref().map_or(0, String::capacity))
+                .saturating_add(class.as_ref().map_or(0, String::capacity));
+        }
+        let opaque = !scopes.is_empty()
+            || !buckets.is_empty()
+            || !keyframes.is_empty()
+            || !hover_buckets.is_empty();
+        (bytes, opaque)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct KeyframesRule {
     properties: FxHashMap<String, Vec<KeyframeValue>>,
@@ -12249,7 +12531,7 @@ mod tests {
             Some("red")
         );
         let (_bytes, _opaque, unavailable) = styled.retained_memory();
-        assert!(unavailable >= 1, "parsed StyleIndex graph remains explicit");
+        assert_eq!(unavailable, 0);
     }
 
     #[test]

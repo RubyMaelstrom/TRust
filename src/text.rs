@@ -161,6 +161,46 @@ pub struct ShapedText {
     pub clusters: Vec<Cluster>,
 }
 
+impl ShapedText {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let ShapedText {
+            text,
+            advance,
+            ascent,
+            descent,
+            leading,
+            line_height,
+            baseline,
+            underline,
+            strikethrough,
+            runs,
+            clusters,
+        } = self;
+        let _ = (
+            advance,
+            ascent,
+            descent,
+            leading,
+            line_height,
+            baseline,
+            underline,
+            strikethrough,
+        );
+        let mut bytes = text
+            .capacity()
+            .saturating_add(runs.capacity() * std::mem::size_of::<ShapedRun>())
+            .saturating_add(clusters.capacity() * std::mem::size_of::<Cluster>());
+        for run in runs {
+            // FontFace data belongs to the process font catalog and is shared across pages.
+            let _ = &run.font;
+            bytes = bytes
+                .saturating_add(run.normalized_coords.capacity() * std::mem::size_of::<i16>())
+                .saturating_add(run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>());
+        }
+        bytes
+    }
+}
+
 /// Geometry exposed by the frontend-neutral editor in CSS pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EditorRect {
