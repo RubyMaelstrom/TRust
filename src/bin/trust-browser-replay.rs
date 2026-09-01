@@ -12,16 +12,30 @@ struct Config {
     warmups: usize,
     samples: usize,
     fixtures: Vec<PathBuf>,
+    externals: Vec<(String, PathBuf)>,
+    sheets: Vec<(String, PathBuf)>,
 }
 
 fn usage() -> &'static str {
-    "usage: trust-browser-replay [--warmups N] [--samples N] FIXTURE.html [...]"
+    "usage: trust-browser-replay [--warmups N] [--samples N] [--external NAME=PATH] [--sheet NAME=PATH] FIXTURE.html [...]"
+}
+
+fn named_path(value: String, option: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("{option} requires NAME=PATH"))?;
+    if name.is_empty() || path.is_empty() {
+        return Err(format!("{option} requires nonempty NAME=PATH"));
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 fn parse_args() -> Result<Option<Config>, String> {
     let mut warmups = 1usize;
     let mut samples = 5usize;
     let mut fixtures = Vec::new();
+    let mut externals = Vec::new();
+    let mut sheets = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -40,6 +54,14 @@ fn parse_args() -> Result<Option<Config>, String> {
                     .parse()
                     .map_err(|_| "--samples must be a positive integer")?;
             }
+            "--external" => externals.push(named_path(
+                args.next().ok_or("--external requires NAME=PATH")?,
+                "--external",
+            )?),
+            "--sheet" => sheets.push(named_path(
+                args.next().ok_or("--sheet requires NAME=PATH")?,
+                "--sheet",
+            )?),
             _ if argument.starts_with('-') => {
                 return Err(format!("unknown option {argument:?}; try --help"));
             }
@@ -56,6 +78,8 @@ fn parse_args() -> Result<Option<Config>, String> {
         warmups,
         samples,
         fixtures,
+        externals,
+        sheets,
     }))
 }
 
@@ -97,6 +121,32 @@ fn run() -> Result<(serde_json::Value, bool), String> {
             source,
         ));
     }
+    let externals = config
+        .externals
+        .iter()
+        .map(|(name, path)| {
+            std::fs::read(path)
+                .map(|bytes| {
+                    let digest = sha256(&bytes);
+                    (
+                        name.clone(),
+                        path.clone(),
+                        digest,
+                        std::sync::Arc::new(bytes),
+                    )
+                })
+                .map_err(|error| format!("read external {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sheets = config
+        .sheets
+        .iter()
+        .map(|(name, path)| {
+            std::fs::read_to_string(path)
+                .map(|text| (name.clone(), path.clone(), sha256(text.as_bytes()), text))
+                .map_err(|error| format!("read sheet {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut results = Vec::new();
     let mut failure = None;
@@ -107,9 +157,17 @@ fn run() -> Result<(serde_json::Value, bool), String> {
                 let index = (round + offset) % fixtures.len();
                 let (id, path, source_sha256, source) = &fixtures[index];
                 let url = format!("https://replay.invalid/{id}.html");
+                let mut environment = trust::js::PageEnv::bare(&url);
+                environment.externals = externals
+                    .iter()
+                    .map(|(name, _, _, bytes)| (name.clone(), Some(bytes.clone())))
+                    .collect();
+                environment.sheets = sheets
+                    .iter()
+                    .map(|(name, _, _, text)| (name.clone(), text.clone()))
+                    .collect();
                 let started = Instant::now();
-                let (output, outcome) =
-                    trust::js::transform(source, &trust::js::PageEnv::bare(&url));
+                let (output, outcome) = trust::js::transform(source, &environment);
                 let wall_seconds = started.elapsed().as_secs_f64();
                 let checksum = replay_attribute(&output, "data-replay-checksum").map(str::to_owned);
                 let expected = replay_attribute(&output, "data-replay-expected").map(str::to_owned);
@@ -169,6 +227,16 @@ fn run() -> Result<(serde_json::Value, bool), String> {
                 "id": id,
                 "path": path,
                 "source_sha256": sha256,
+            })).collect::<Vec<_>>(),
+            "external_scripts": externals.iter().map(|(name, path, sha256, _)| json!({
+                "name": name,
+                "path": path,
+                "sha256": sha256,
+            })).collect::<Vec<_>>(),
+            "external_sheets": sheets.iter().map(|(name, path, sha256, _)| json!({
+                "name": name,
+                "path": path,
+                "sha256": sha256,
             })).collect::<Vec<_>>(),
             "samples": results,
             "error": failure,
