@@ -77,10 +77,54 @@ prompt commands (`open`, `post`, `reload`, `mode`, `send`, `set`, `toggle`, and
 | `--width N` | CSS viewport width in CSS pixels | `1024` |
 | `--height N` | CSS viewport height in CSS pixels | `768` |
 | `--timeout SECS` | Hard wall-clock limit for navigation/settling | `30` |
-| `--settle SECS` | Quiet period after the last page revision | `0.75` |
+| `--settle SECS` | Quiet-period fallback, used only on a page that never goes inert (see below) | `0.75` |
 | `--format text\|semantic` | Display-list text or accessibility tree output | `text` |
 | `--links` | Include link targets in text output | off |
 | `-h`, `--help` | Print usage | — |
+
+#### How `trust-headless` decides it is finished
+
+Waiting is the interesting part of a one-shot dump, and there are two very
+ different kinds of wait. The driver prefers the engine's own verdict, reached
+through `BrowserController::page_render_is_final`, and only falls back to a
+clock when the engine declines to answer:
+
+| Verdict | Meaning | Reached when |
+|---|---|---|
+| engine final | No further render can arrive for this document | The fetch committed with no resident actor (a script-free page, Gopher, Gemini, internal gemtext), **or** the actor classified the document inert and sent `PageEvt::Static`, **or** the fetch failed and no document committed |
+| quiet | The page stopped changing; not the same as finished | A live actor never went final and `--settle` elapsed since the last revision |
+| timeout | The dump is incomplete | `--timeout` expired before either of the above |
+
+Every run prints which one it got in its closing stderr line, so the
+difference between a verdict and a guess is never lost:
+
+```console
+$ trust-headless http://127.0.0.1:8199/plain.html 2>&1 | tail -1
+trust-headless: http://127.0.0.1:8199/plain.html · … · 1024x768 CSS px · the engine reports this render is final in 27ms (ok)
+$ trust-headless --settle 0 --timeout 10 http://127.0.0.1:8199/timers.html 2>&1 | tail -1
+trust-headless: http://127.0.0.1:8199/timers.html · … · 1024x768 CSS px · timed out after 10s without the engine calling it final in 10018ms (INCOMPLETE)
+```
+
+`--settle 0` disables the clock entirely and trusts the engine verdict alone; a
+page with a timer loop then waits for `--timeout`.
+
+The engine verdict is worth roughly an order of magnitude on documents that can
+reach it — a script-free page used to pay the whole settle window for no reason,
+and measured about 0.05 s instead of about 1.3 s. A failed or unparsable
+address likewise now returns in tens of milliseconds instead of idling out the
+timeout.
+
+One caveat deserves prominence because it decides most real-world behavior:
+`Static` requires *no* hover or scroll work, and its hover clause asks whether
+the page merely **styles** `a:hover` in a way that can change its render. So a
+page that only wants to recolor a link on hover keeps its actor resident
+forever, and `page_render_is_final` answers false even though nothing further is
+pending. Those clauses state why the engine must stay *reachable*, not why it
+must keep *painting*; a driver that wants to stop waiting is asking the painting
+question. Until the actor answers the two separately, hover-styled pages fall
+back to the quiet period — measured: script-free settles in tens of
+milliseconds, a page with a dead script and no hover styling in about 0.16 s,
+and one dead script plus `a:hover { color: red }` never.
 
 ### `trust-desktop`
 

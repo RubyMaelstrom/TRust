@@ -569,9 +569,20 @@ impl BrowserController {
     /// It stays false while a fetch is in flight and, crucially, for as long as
     /// the actor keeps a document alive for timers, workers, pending fetches,
     /// hover, or scroll work — a page with a timer loop is never reported final
-    /// just because it happens to be quiet right now. It is also false before
-    /// any navigation. `PageEvt::Settled` is deliberately not part of this: it
-    /// acknowledges one dispatch that changed no pixels, not page quiescence.
+    /// just because it happens to be quiet right now. It is false before any
+    /// navigation, and true after a failed one, because no render can arrive
+    /// from a document that never committed.
+    ///
+    /// The hover and scroll clauses deserve a warning: a page that merely styles
+    /// `a:hover` in a way that can change its render keeps the actor resident
+    /// forever, so on much of the web this never answers true even though no
+    /// further render is in fact pending. Those clauses say why the engine must
+    /// stay *reachable*, not why it must keep *painting*, and a caller that
+    /// wants to stop waiting is asking the painting question. Until the actor
+    /// answers the two separately, callers must keep a bounded fallback wait.
+    ///
+    /// `PageEvt::Settled` is deliberately not part of this: it acknowledges one
+    /// dispatch that changed no pixels, not page quiescence.
     pub fn page_render_is_final(&self) -> bool {
         self.render_is_final
     }
@@ -947,7 +958,9 @@ impl BrowserController {
             Ok((target, fallback_http)) => {
                 self.begin_fetch(target, fallback_http, intent);
             }
+            // Nothing was fetched, so nothing will ever render this address.
             Err(error) => {
+                self.render_is_final = true;
                 self.status = error;
             }
         }
@@ -2021,6 +2034,45 @@ mod tests {
         assert!(
             browser.page_render_is_final(),
             "a stopped document's fetch, actor, and refresh timer are all gone"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_address_leaves_nothing_to_wait_for() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+
+        assert!(browser.begin_address("not a valid address", NavigationIntent::New));
+        assert!(
+            browser.page_render_is_final(),
+            "an address that never became a fetch can never produce a render"
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_leaves_nothing_to_wait_for() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let generation = browser.generation;
+        browser.pending = Some(PendingNavigation {
+            generation,
+            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+
+        assert!(browser.finish_fetch(generation, Err(String::from("connection reset"))));
+        assert!(
+            browser.page_render_is_final(),
+            "a document that never committed cannot render again"
         );
     }
 
