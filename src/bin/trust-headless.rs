@@ -9,11 +9,16 @@
 //! initializes Ratatui, Crossterm, winit, or a terminal graphics protocol, so
 //! it runs with no TTY at all.
 //!
-//! Completion stays message-driven like the native frontends: the controller
-//! reports whether a navigation is in flight, and the resident actor keeps
-//! reporting revisions while timers, XHRs, and lazy content land. A headless
-//! driver therefore needs a settle rule instead of a load event. `--settle` is
-//! that quiet period and `--timeout` is the hard wall-clock bound.
+//! Completion is answered in two tiers. The engine knows exactly when it is
+//! done with a document: a fetch that commits without a resident actor can
+//! never render again, and an actor that classifies its document inert sends
+//! `PageEvt::Static` and retires itself. The controller's
+//! [`page_render_is_final`](trust::core::BrowserController::page_render_is_final)
+//! verdict, and the driver trusts it outright, so a script-free page stops the
+//! moment its render lands. Only a page that keeps its actor open — timers,
+//! workers, hover, in-flight fetches — can refuse to answer, and for that page
+//! `--settle` is a quiet-period fallback with the imprecision that implies.
+//! `--timeout` is the hard wall-clock bound either way.
 //!
 //! Geometry: layout and the CSSOM viewport are reported against the synthetic
 //! `--width`/`--height` viewport exactly as the desktop frontend reports them
@@ -47,6 +52,18 @@ enum Format {
     Semantic,
 }
 
+/// How the driver decided to stop waiting, reported on every run so the
+/// difference between an engine verdict and a clock guess stays visible.
+#[derive(PartialEq, Eq)]
+enum Settle {
+    /// The engine says no further render will arrive for this document.
+    Engine,
+    /// The page kept its actor open and merely stopped changing.
+    Quiet,
+    /// The caller's patience ran out.
+    Timeout,
+}
+
 struct Options {
     address: String,
     width: f32,
@@ -63,7 +80,8 @@ usage: trust-headless [options] URL
   --width N       CSS viewport width in CSS pixels (default 1024)
   --height N      CSS viewport height in CSS pixels (default 768)
   --timeout SECS  stop waiting after this long (default 30)
-  --settle SECS   stop once the page has been this long quiet (default 0.75)
+  --settle SECS   for a page that never goes inert, stop once it has been this
+                  long quiet (default 0.75; 0 waits for the engine verdict only)
   --format F      text (default) or semantic
   --links         also list every linked target found in the page
   -h, --help      show this message
@@ -189,6 +207,7 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut last_change = started;
     let mut revision = 0u64;
+    let mut settled = Settle::Timeout;
     loop {
         let outcome = controller.process_async_events();
         let snapshot = controller.snapshot();
@@ -199,13 +218,25 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
         }
         let elapsed = now - started;
         if elapsed >= options.timeout {
-            eprintln!(
-                "trust-headless: hit the {}s timeout before the page settled",
-                options.timeout.as_secs_f32()
-            );
             break;
         }
-        if !snapshot.loading && snapshot.page_revision > 0 && now - last_change >= options.settle {
+        // Prefer the engine's own verdict: a document is final once its fetch
+        // committed without an actor, or once that actor classified the document
+        // inert and retired itself. Nothing is guessed from a clock in that case,
+        // so a script-free page never pays the settle window.
+        if controller.page_render_is_final() {
+            settled = Settle::Engine;
+            break;
+        }
+        // A page that keeps its actor open (timers, workers, hover, fetches)
+        // never goes final, so fall back to a quiet period and accept that it
+        // only means "stopped changing", not "done".
+        if options.settle > Duration::ZERO
+            && !snapshot.loading
+            && snapshot.page_revision > 0
+            && now - last_change >= options.settle
+        {
+            settled = Settle::Quiet;
             break;
         }
         // Yield so the fetch, image, and actor tasks can run between drains.
@@ -262,12 +293,31 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let waited = started.elapsed();
+    let how = match settled {
+        Settle::Engine => String::from("the engine reports this render is final"),
+        Settle::Quiet => format!(
+            "quiet for {}s while the page kept its actor open",
+            options.settle.as_secs_f32()
+        ),
+        Settle::Timeout => format!(
+            "timed out after {}s without the engine calling it final",
+            options.timeout.as_secs_f32()
+        ),
+    };
     eprintln!(
-        "trust-headless: {} · {} · {}x{} CSS px",
+        "trust-headless: {} · {} · {}x{} CSS px · {} in {}ms ({})",
         page.address(),
         snapshot.status,
         options.width as u32,
-        options.height as u32
+        options.height as u32,
+        how,
+        waited.as_millis(),
+        if settled == Settle::Timeout {
+            "INCOMPLETE"
+        } else {
+            "ok"
+        }
     );
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
