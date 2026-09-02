@@ -39,6 +39,11 @@ name = "trust-browser-replay"
 path = "src/bin/trust-browser-replay.rs"
 required-features = ["lumen-backend"]
 
+[[bin]]
+name = "trust-headless"
+path = "src/bin/trust-headless.rs"
+required-features = ["lumen-backend"]
+
 [features]
 # `mimalloc` (default on) installs the mimalloc global allocator. Parse and
 # bytecode-compile of large JS bundles are dominated by millions of small
