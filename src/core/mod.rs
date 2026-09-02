@@ -459,6 +459,10 @@ pub struct BrowserController {
     declarative_refresh_task: Option<JoinHandle<()>>,
     live_task: Option<JoinHandle<()>>,
     live_page: Option<crate::js::PageHandle>,
+    /// Whether the current document's presentation is final: neither fetch nor
+    /// a resident actor will deliver another render for it. See
+    /// [`BrowserController::page_render_is_final`].
+    render_is_final: bool,
     pending_live_submit: Option<(crate::doc::Form, Option<usize>)>,
     /// Default-action results for keyboard events delivered to the resident
     /// page. Native frontends consume these after the actor runs `keydown`.
@@ -495,6 +499,7 @@ impl BrowserController {
             declarative_refresh_task: None,
             live_task: None,
             live_page: None,
+            render_is_final: false,
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
             pending_fragment: None,
@@ -544,6 +549,31 @@ impl BrowserController {
 
     pub fn page_is_live(&self) -> bool {
         self.live_page.is_some()
+    }
+
+    /// Whether the current presentation is final, so a caller can stop waiting
+    /// for renders without guessing from silence.
+    ///
+    /// This is the engine's own quiescence, not a wall-clock heuristic. It is
+    /// true in exactly these cases:
+    ///
+    /// * a document committed and got no resident actor at all (a script-free
+    ///   article, a Gopher menu, a Gemini capsule, an internal gemtext page,
+    ///   or a failed fetch) — its first render is its last;
+    /// * the resident actor classified the document as inert and sent
+    ///   [`PageEvt::Static`], which retires the actor.
+    ///
+    /// * navigation was stopped before a document committed; there is no page
+    ///   to wait for in that case;
+    ///
+    /// It stays false while a fetch is in flight and, crucially, for as long as
+    /// the actor keeps a document alive for timers, workers, pending fetches,
+    /// hover, or scroll work — a page with a timer loop is never reported final
+    /// just because it happens to be quiet right now. It is also false before
+    /// any navigation. `PageEvt::Settled` is deliberately not part of this: it
+    /// acknowledges one dispatch that changed no pixels, not page quiescence.
+    pub fn page_render_is_final(&self) -> bool {
+        self.render_is_final
     }
 
     /// Take the next resident-page keyboard default result. `true` means the
@@ -977,6 +1007,7 @@ impl BrowserController {
         self.external_address = None;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
+        self.render_is_final = false;
         self.status = format!("Fetching {target} …");
         self.pending = Some(PendingNavigation {
             generation,
@@ -1099,6 +1130,10 @@ impl BrowserController {
                 }
                 self.interaction.scroll = CssPoint::default();
                 self.interaction.nested_scroll.clear();
+                // A document that gets no resident actor is final the moment it
+                // commits; one that does becomes final only when the actor says
+                // so with `PageEvt::Static`.
+                self.render_is_final = live.is_none();
                 if let Some(live) = live {
                     self.attach_live_page(generation, live);
                     self.send_live(crate::js::PageCmd::Viewport(layout_viewport(self.viewport)));
@@ -1111,6 +1146,7 @@ impl BrowserController {
                 }
             }
             Err(error) => {
+                self.render_is_final = true;
                 self.status = format!("{} — {error}", pending.target);
             }
         }
@@ -1130,6 +1166,10 @@ impl BrowserController {
         self.drop_live_page();
         self.abort_declarative_refresh();
         self.generation = self.generation.wrapping_add(1);
+        // Nothing is left to render: the fetch task, the actor, and any
+        // scheduled refresh are all gone, so waiting on this document is
+        // pointless even though a partial render may well exist.
+        self.render_is_final = true;
         self.status = pending.map_or_else(
             || String::from("Stopped — page scripts killed."),
             |pending| format!("Stopped loading {} — page scripts killed.", pending.target),
@@ -1249,6 +1289,7 @@ impl BrowserController {
                     page.revision = page.revision.wrapping_add(1);
                     page.rendered_revision = page.revision;
                 }
+                self.render_is_final = false;
                 self.status = if outcome.errors.is_empty() {
                     String::from("Page updated · JS")
                 } else {
@@ -1274,6 +1315,7 @@ impl BrowserController {
                     page.rendered_revision = page.revision;
                 }
                 self.drop_live_page();
+                self.render_is_final = true;
                 self.status = if outcome.errors.is_empty() {
                     String::from("Page updated · JS")
                 } else {
@@ -1897,6 +1939,88 @@ mod tests {
         assert_eq!(
             response.body,
             b"<html><body><p>settled DOM</p></body></html>"
+        );
+    }
+
+    #[test]
+    fn a_static_actor_event_makes_the_render_final() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        });
+        assert!(!browser.page_render_is_final());
+
+        assert!(browser.handle_page_event(crate::js::PageEvt::Static {
+            html: String::from("<p>settled</p>"),
+            outcome: Default::default(),
+        }));
+        assert!(
+            browser.page_render_is_final(),
+            "the actor retired itself, so nothing further can arrive"
+        );
+    }
+
+    #[test]
+    fn a_document_that_gets_no_actor_is_final_as_it_commits() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+
+        // Internal gemtext never starts a resident actor, so its first render
+        // is its last; a driver must not have to guess that from a clock.
+        browser.begin_internal_gemtext(
+            Link::Http(url::Url::parse("about:help").unwrap()),
+            b"= Help\n".to_vec(),
+            NavigationIntent::New,
+        );
+        assert!(!browser.page_is_live());
+        assert!(browser.page_render_is_final());
+
+        // A navigation reopens the question for the new document. This runtime
+        // is never driven, so the fetch task is dropped before it can reach the
+        // network — a unit test must not probe a live site.
+        browser.begin_fetch(
+            Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            false,
+            NavigationIntent::New,
+        );
+        assert!(!browser.page_render_is_final());
+    }
+
+    #[test]
+    fn stopping_leaves_nothing_to_wait_for() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let generation = browser.generation;
+        browser.pending = Some(PendingNavigation {
+            generation,
+            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+
+        assert!(browser.stop());
+        assert!(
+            browser.page_render_is_final(),
+            "a stopped document's fetch, actor, and refresh timer are all gone"
         );
     }
 
