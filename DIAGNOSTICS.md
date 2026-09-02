@@ -1,0 +1,416 @@
+# TRust diagnostics and diagnostic inputs
+
+This is the central index for TRust's developer diagnostics. It consolidates
+the environment variables and command-line inputs that are otherwise described
+in module comments and ignored tests. It is an engineering aid, not part of the
+normal browser UI.
+
+The source remains authoritative when a diagnostic's output or defaults change.
+When adding or changing an input, update this file and the nearby source
+comment/example in the same change.
+
+## Conventions
+
+* Presence-only flags are enabled by setting the variable to any value. `=1` is
+  used in examples. They are disabled when unset.
+* Value inputs are normally parsed once at process or page-thread startup. Set
+  them before launching TRust or the test process; changing the environment
+  while it is running is not reliable.
+* Most site and bundle diagnostics are `#[ignore]` tests. They are intentionally
+  opt-in because they use a network, a local capture, or a large external
+  input. Run them from the repository root with `cargo test --release ...
+  -- --ignored --nocapture`.
+* Release binaries use Lumen by default. The `src/js.rs` diagnostics belong to
+  the explicit legacy Boa backend (`trust-boa`); they are not linked into the
+  normal Lumen binaries. HTTP, layout, terminal, and most frontend diagnostics
+  are shared unless noted otherwise.
+* Diagnostics print to stderr unless a variable explicitly names an output
+  file/directory. Use a local or authorized test endpoint; avoid repeatedly
+  probing public sites.
+
+## Quick-start commands
+
+Trace a normal Lumen page load and its network requests:
+
+```sh
+TRUST_NET_TRACE=1 TRUST_LUMEN_TRACE=1 target/release/trust https://example.test/
+```
+
+Trace terminal redraws, page events, layout, and image work:
+
+```sh
+TRUST_DIAG_FRAME=1 target/release/trust https://example.test/
+```
+
+Run the live browser-workload gate against a controlled page:
+
+```sh
+TRUST_BROWSER_GATE=https://example.test/ \
+  TRUST_BROWSER_GATE_EXPECT_HTML_CONTAINS='ready' \
+  cargo test --release browser_workload_gate -- --ignored --nocapture
+```
+
+Run the network diagnostic against a URL:
+
+```sh
+TRUST_NET_DIAG=https://example.test/ \
+  TRUST_DIAG_SETTLE=1 \
+  cargo test --release net_diag -- --ignored --nocapture
+```
+
+## Command-line inputs
+
+### `trust`
+
+The terminal browser accepts `trust [URL-or-host] [port]`. Its interactive
+prompt commands (`open`, `post`, `reload`, `mode`, `send`, `set`, `toggle`, and
+`status`) are documented in the [Driving it section of `README.md`](README.md).
+
+### `trust-headless`
+
+`trust-headless --help` is generated from the usage string in
+[`src/bin/trust-headless.rs`](src/bin/trust-headless.rs):
+
+| Input | Meaning | Default |
+|---|---|---:|
+| `URL` | Required initial navigation | — |
+| `--width N` | CSS viewport width in CSS pixels | `1024` |
+| `--height N` | CSS viewport height in CSS pixels | `768` |
+| `--timeout SECS` | Hard wall-clock limit for navigation/settling | `30` |
+| `--settle SECS` | Quiet period after the last page revision | `0.75` |
+| `--format text\|semantic` | Display-list text or accessibility tree output | `text` |
+| `--links` | Include link targets in text output | off |
+| `-h`, `--help` | Print usage | — |
+
+### `trust-desktop`
+
+`trust-desktop --help` accepts `[--renderer=auto|cpu|hybrid] [URL]`.
+`TRUST_DESKTOP_TRACE` and the desktop benchmark inputs are listed below.
+
+### Developer replay and spike binaries
+
+These binaries are opt-in targets and do not open the normal browser UI:
+
+| Binary and input | Meaning | Default |
+|---|---|---:|
+| `trust-browser-replay [--warmups N] [--samples N] [--external NAME=PATH] [--sheet NAME=PATH] FIXTURE.html [...]` | Deterministically replays one or more local HTML fixtures through the shared Lumen browser pipeline. `--external` and `--sheet` may be repeated to provide named local script/style resources. | warmups `1`, samples `5`; at least one fixture required |
+| `trust-lumen-spike [--tier interp\|bytecode\|jit] [--threshold N] [--benchmark PATH]` | Runs the synthetic Lumen/`js-engine-benchmark` harness and prints timing, GC, event-loop, and score data. Requires the `lumen-spike` Cargo feature. | tier `jit`, threshold `0`, benchmark `/usr/share/cry/benchmarks/js-engine-benchmark/run.js` |
+
+Both binaries support `-h`/`--help`. `trust-boa` and
+`trust-desktop-boa` are the same terminal/desktop inputs built with the
+explicit legacy Boa backend.
+
+## Live runtime diagnostics
+
+### Cross-frontend and terminal diagnostics
+
+| Input | Value | Effect and output |
+|---|---|---|
+| `TRUST_NET_TRACE` | presence flag | Adds timestamped request/subresource timing to stderr. The `net:` lines use one shared millisecond origin; DOM mutation and JavaScript phase markers may use the same timeline. |
+| `TRUST_DIAG_FRAME` | presence flag | Enables the terminal frame report (`DIAGFRAME`) and related page/layout reports (`DIAGGEOM`, `DIAGROUTE`, `DIAGRELAY`). It includes redraws, draw time, page-event work, full replacements, image relayout/render counts, load phases, scroll state, and cascade/layout costs. |
+| `TRUST_DIAG_PATCH` | presence flag | Adds timing output for incremental region/subtree layout patches. |
+| `TRUST_DIAG_SCROLL_BOXES` | presence flag | Makes the HTTP path use the one-shot transform for inner-scroll-box investigation instead of retaining a resident actor. Diagnostic-only; pair it with the current scroll/geometry output when investigating nested scrollers. |
+| `TRUST_NO_FRAME_SKIP` | presence flag | Disables the terminal's identical-frame suppression and restores the always-draw path. Useful for A/B measurements of redraw behavior. |
+| `TRUST_DUMP_RAW` | directory path | Writes each live serialized HTML render as `render_<timestamp-or-sequence>.html` for offline replay/diffing. The directory must already exist. Used by both the terminal app and shared browser controller. |
+| `TRUST_LAYOUT_TRACE` | presence flag | Prints graphical layout stage timing from `layout2::lay_out_graphical`. |
+| `TRUST_FRAG_DIAG` | presence flag | Dumps the resolved graphical fragment tree (tag, position, size, and clip). Used with `layout_dump` for layout/paint discrepancies. |
+| `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
+
+### Lumen diagnostics
+
+| Input | Value | Effect and output |
+|---|---|---|
+| `TRUST_LUMEN_TRACE` | presence flag | Logs Lumen script start/completion, JavaScript errors, console messages, and unhandled rejection details to stderr. |
+| `TRUST_LUMEN_TASK_TRACE` | presence flag | Emits a once-per-second resident page-actor task census: turns, commands, interactions, host/platform/timer/lifecycle work, render passes, updates, finishes, and queue state. |
+| `TRUST_LUMEN_PROBE` | JavaScript source | Evaluates the supplied expression/source in the resident page after a task and prints its value, throw, interruption, or parse error. This is a diagnostic probe, not page content. |
+
+### WebSocket diagnostics
+
+| Input | Value | Effect and output |
+|---|---|---|
+| `TRUST_WS_DIAG` | file path | Appends WebSocket handshake, open/close, error, and frame diagnostics to this file. A file is used because stderr can race task/process shutdown. |
+| `TRUST_WS_DIAG_CAP` | non-negative integer | Maximum payload bytes echoed per frame in the WebSocket diagnostic. Default: `300`. |
+
+## Network and browser-workload test inputs
+
+All tests in this section live in [`src/http.rs`](src/http.rs). The test name is
+the final argument in each example.
+
+### Common inputs
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_NET_DIAG` | absolute URL | Primary URL for `net_diag`, `diag_all_errors`, `form_fill_submit_diag`, `img_box_diag`, and `wpt_diag`. Required by those tests. |
+| `TRUST_NET_DIAG_OUT` | file path | Writes the newest or final post-JavaScript HTML snapshot to this file when supported by the diagnostic. |
+| `TRUST_DIAG_VP` | `WIDTHxHEIGHT` | Synthetic viewport in terminal cells for network diagnostics. Defaults vary by test: `80x24` (`net_diag`), `120x40` (`click_diag`), and `200x50` (`diag_all_errors`, `img_box_diag`, browser gate, and WPT). |
+| `TRUST_DIAG_COOKIE` | `name=value[; name2=value2]` | Seeds the process cookie jar before the cold fetch. This is useful for controlled authenticated/cookie-gated pages. |
+| `TRUST_DIAG_INJECT` | JavaScript file path | Inserts the file's source into a `<script>` at the beginning of `<head>` before page scripts run. |
+| `TRUST_DIAG_SETTLE` | presence flag | Drains post-shell live-page `Updated` events so SPA mounts and later errors are included. |
+| `TRUST_DIAG_DRAIN` | integer | Maximum number of settle events to drain when `TRUST_DIAG_SETTLE` is enabled. Default: `6`. |
+| `TRUST_DIAG_DRAIN_TO` | seconds | Timeout for each settle-event receive. Default: `20`. |
+
+### `net_diag`
+
+```sh
+TRUST_NET_DIAG=https://example.test/ \
+  cargo test --release net_diag -- --ignored --nocapture
+```
+
+The basic fetch/JavaScript diagnostic reports the response, JavaScript outcome,
+live/static classification, and a bounded initial or settled HTML snapshot.
+Add `TRUST_DIAG_SETTLE=1` for a live SPA's post-shell state. It also accepts
+`TRUST_DIAG_CLICK=<DOM-node-id>` to dispatch a click and
+`TRUST_DIAG_SCROLL=<count>` to send repeated bottom-directed scroll commands.
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_DIAG_CLICK` | numeric DOM node id | Dispatches a click through the resident actor, then reports navigation, updates, and errors. |
+| `TRUST_DIAG_SCROLL` | integer count | Sends that many scroll commands toward the document bottom. Invalid values fall back to `5`. |
+| `TRUST_DIAG_SCROLL_STEP` | floating-point CSS-pixel distance | Multiplier for each scroll step. Default: `100000`. |
+
+### `click_diag`
+
+```sh
+TRUST_CLICK_DIAG=https://example.test/ \
+  TRUST_CLICK_TEXT='Open' \
+  TRUST_CLICK_PROBE='id="dialog"' \
+  cargo test --release click_diag -- --ignored --nocapture
+```
+
+`TRUST_CLICK_DIAG` is the URL (distinct from `TRUST_DIAG_CLICK`, which is a
+node id). The harness finds an element by link text, clicks it through the live
+actor, and checks whether a probe substring disappears.
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_CLICK_DIAG` | absolute URL | Required target URL. |
+| `TRUST_CLICK_TEXT` | text substring | Link/click target text. Empty means no primary click. |
+| `TRUST_CLICK_PROBE` | HTML substring | Probe checked before/after the click. Default: `id="disclaimer"`. |
+| `TRUST_CLICK_WAIT` | seconds | Click/post-click wait. Default: `8`. |
+| `TRUST_CLICK_RETAIN` | HTML substring | Optional assertion that the post-click snapshot retains this marker. |
+| `TRUST_CLICK_FIND2` | HTML/tag substring | Optional second click target, resolved from the newest snapshot. |
+| `TRUST_SET_FIND` | HTML/tag substring | Optional editable element to locate before clicking. |
+| `TRUST_SET_VALUE` | text | Value sent to the element found by `TRUST_SET_FIND`. |
+| `TRUST_EVT2_DUMP` | directory path | Writes progressive second-click snapshots as `evt2-<n>.html`. |
+
+### `form_fill_submit_diag`
+
+```sh
+TRUST_NET_DIAG=https://example.test/login/ \
+  TRUST_FORM_SUBMIT_TEXT='Sign in' \
+  cargo test --release form_fill_submit_diag -- --ignored --nocapture
+```
+
+Loads a login-style page, fills the first text and password inputs, clicks the
+matching submit button, and reports enablement, events, errors, and final HTML.
+`TRUST_FORM_SUBMIT_TEXT` defaults to `ログイン`. `TRUST_NET_DIAG_OUT` may save
+the final snapshot.
+
+### `diag_all_errors`
+
+```sh
+TRUST_NET_DIAG=https://example.test/ \
+  TRUST_DIAG_VP=200x50 \
+  cargo test --release diag_all_errors -- --ignored --nocapture
+```
+
+Drains the full live settle and reports the accumulated unique JavaScript
+errors/stacks rather than only load-time errors. It accepts the common
+`TRUST_NET_DIAG`, `TRUST_DIAG_VP`, `TRUST_DIAG_SETTLE`, and
+`TRUST_NET_DIAG_OUT` inputs.
+
+### `browser_workload_gate`
+
+This is the strongest live-site acceptance harness. It checks actor
+responsiveness, optional named-control activation, fatal errors, HTML
+milestones, semantic-control disappearance, DOM size, and site-specific
+completion checks for YouTube, Twitch, Steam, and Speedometer.
+
+```sh
+TRUST_BROWSER_GATE=https://example.test/ \
+  TRUST_BROWSER_GATE_CLICK='Start' \
+  TRUST_BROWSER_GATE_EXPECT_HTML_CONTAINS='summary' \
+  TRUST_BROWSER_GATE_EXPECT_CONTROL_GONE='Start' \
+  cargo test --release browser_workload_gate -- --ignored --nocapture
+```
+
+| Input | Value | Default/effect |
+|---|---|---|
+| `TRUST_BROWSER_GATE` | absolute URL | Required page under test. |
+| `TRUST_BROWSER_GATE_SECONDS` | integer seconds | Initial/final milestone deadline. Default: `45`. |
+| `TRUST_BROWSER_GATE_CLICK` | accessible-name substring | Activates the first exposed activatable control whose accessible name contains this text. |
+| `TRUST_BROWSER_GATE_CLICK_SECONDS` | integer seconds | Deadline after the named click. Default: `20`. |
+| `TRUST_BROWSER_GATE_EXPECT_HTML_CONTAINS` | HTML substring | Required final HTML milestone; for interactive pages it is also the default initial milestone. |
+| `TRUST_BROWSER_GATE_EXPECT_INITIAL_HTML_CONTAINS` | HTML substring | Optional separate pre-click milestone. |
+| `TRUST_BROWSER_GATE_EXPECT_HTML_NOT_CONTAINS` | HTML substring | Forbidden final HTML milestone. |
+| `TRUST_BROWSER_GATE_EXPECT_CONTROL_GONE` | accessible-name substring | Asserts no matching activatable control remains after the click. |
+| `TRUST_BROWSER_GATE_EXPECT_NO_ERRORS` | presence flag | Requires zero collected JavaScript errors (otherwise errors are printed but do not automatically fail). |
+| `TRUST_BROWSER_GATE_MIN_NODES` | integer | Minimum DOM node count for non-special hosts; default `1`. YouTube/Twitch/Steam use built-in empty-shell floors. |
+| `TRUST_BROWSER_GATE_OUT` | file path | Saves the final serialized HTML snapshot. |
+| `TRUST_DIAG_VP` | `WIDTHxHEIGHT` | Gate viewport in terminal cells. Default: `200x50`. |
+
+### `img_box_diag`
+
+```sh
+TRUST_NET_DIAG=https://example.test/ \
+  TRUST_DIAG_VP=200x50 \
+  cargo test --release img_box_diag -- --ignored --nocapture
+```
+
+Drains the page, decodes real image resources, and reports rendered image boxes,
+CSS sizes, classes, and source tails. It accepts `TRUST_NET_DIAG`,
+`TRUST_DIAG_VP`, and `TRUST_NET_DIAG_OUT`.
+
+### `layout_dump`
+
+```sh
+TRUST_LAYOUT_FILE=/tmp/post-js.html \
+  TRUST_DIAG_VP=120x40 \
+  TRUST_LAYOUT_GREP=header \
+  cargo test --release layout_dump -- --ignored --nocapture
+```
+
+This is the offline layout/paint diagnostic. It requires a post-JavaScript HTML
+file and prints rows, regions, carousels, a DOM legend, and optional geometry.
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_LAYOUT_FILE` | HTML file path | Required input document. |
+| `TRUST_DIAG_VP` | `WIDTHxHEIGHT` | Terminal-cell viewport. Default: `80x0`. |
+| `TRUST_DIAG_URL` | absolute URL | Base URL for relative resources and the legend. Default: `https://store.steampowered.com/`. |
+| `TRUST_LAYOUT_GREP` | text | Restricts printed row/region output to lines containing this substring. |
+| `TRUST_LAYOUT_SPRITE` | SVG/text file path | Primes every external SVG sprite sheet referenced by `<use>` for offline replay. |
+| `TRUST_LAYOUT_IMG_CELL` | `WIDTHxHEIGHT` | Seeds every resolved `<img>` with a decoded size expressed in terminal cells. |
+| `TRUST_LAYOUT_IMG_ALPHA` | presence flag | Marks seeded images transparent for overlap-compositing replay. |
+| `TRUST_LAYOUT_MEASURE` | id/class substring | Prints CSSOM `getBoundingClientRect`-style geometry for matching elements. |
+| `TRUST_LAYOUT_NODES` | comma-separated node ids | Prints the DOM legend for each id and its ancestor chain; an optional leading `n` is accepted. |
+| `TRUST_FRAG_DIAG` | presence flag | Adds the resolved fragment tree to the diagnostic output. |
+
+### `wpt_diag`
+
+```sh
+TRUST_NET_DIAG=https://wpt.live/... \
+  cargo test --release wpt_diag -- --ignored --nocapture
+```
+
+Fetches a WPT testharness page, injects a completion callback, and reports each
+subtest's PASS/FAIL/TIMEOUT/NOTRUN status. It accepts `TRUST_NET_DIAG`,
+`TRUST_DIAG_VP` (default `200x50`), and `TRUST_NET_DIAG_OUT`.
+
+## JavaScript engine and bundle diagnostics (Boa backend)
+
+These inputs are defined in `src/js.rs`, which is compiled only when using the
+explicit Boa comparison features. They are useful for engine investigations but
+do not tune the normal Lumen release artifact.
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_DIAG_COMPUTE_SECS` | integer seconds | Extends the manual page compute budget for an exceptionally large Boa workload. Default is the normal `50`-second budget; minimum accepted value is `1`. |
+| `TRUST_JS_PHASE` | presence flag | Reports whole-load parse, compile, execute, measured JS CPU, and wall-time decomposition. |
+| `TRUST_FN_CENSUS` | presence flag | Reports compiled versus executed/never-called page functions for lazy-parse sizing. |
+| `TRUST_JS_PROFILE` | presence flag | Dumps and resets sampled VM hot leaf frames during page phases/interactions. |
+| `TRUST_JS_BENCH` | JavaScript file path | Required input for `engine_profile`; runs one classic bundle in a faithful page context. |
+| `TRUST_JS_BENCH_RUNS` | integer | Independent benchmark samples. First sample is discarded as cold. Default: `5`; minimum: `1`. |
+| `TRUST_JS_BENCH_SETTLE_SECS` | integer seconds | Manual benchmark settle timeout. Default: `300`; minimum: `1`. |
+| `TRUST_NO_OPT` | presence flag | For `engine_profile` only, disables Boa optimizer options and prints the A/B state. |
+| `TRUST_GC_FLOOR` | integer MiB | Boa GC threshold floor. Default: `1`. Values are clamped to at least one byte after conversion. |
+| `TRUST_GC_GROWTH` | integer percent | Normal GC threshold growth percentage. Default: `143`. |
+| `TRUST_GC_BIG_LIVE` | integer MiB | Live-size threshold at which the large-live-set growth policy applies. Default: `16`. |
+| `TRUST_GC_BIG_GROWTH` | integer percent | Threshold growth percentage above `TRUST_GC_BIG_LIVE`. Default: `400`. |
+| `TRUST_NO_GC_PERMGEN` | presence flag | Disables the Boa permanent-generation tenure optimization when set (`gc_permgen` is on by default). |
+| `TRUST_GC_PERM` | presence flag | `engine_profile` A/B knob that tenures the immortal platform graph for that benchmark run. |
+| `TRUST_NO_LAZY_PARSE` | presence flag | Disables Boa lazy parsing and lazy compilation. Lazy parsing is on by default. |
+| `TRUST_LAZY_MIN` | integer code points | Overrides the minimum function source size eligible for Boa lazy parsing/compilation. |
+| `TRUST_NO_PARALLEL_PARSE` | presence flag | Forces sequential external-script parsing instead of the parallel parse pool. |
+| `TRUST_NO_PRELUDE_CACHE` | presence flag | Forces the cold Boa prelude path instead of the cached prelude image. |
+| `TRUST_NO_CDN_CACHE` | presence flag | Disables the cross-page compiled external-script cache. |
+| `TRUST_NO_INCREMENTAL_LAYOUT` | presence flag | Test-only A/B switch that forces the full layout path. It is not a normal release runtime control. |
+| `TRUST_JS_DIAG` | HTML file path | Required input for `js_diag`; transforms a local HTML file and prints post-JavaScript HTML and the outcome. |
+| `TRUST_SCAN_AUDIT` | classic-script JavaScript file path | Required input for `scan_ident_audit`; compares lazy scanner identifier capture with the real parser over a bundle. |
+| `TRUST_REACT_DEV` | presence flag | `react_canary` loads development React/ReactDOM bundles instead of production minified bundles. |
+
+Example bundle diagnostics:
+
+```sh
+TRUST_JS_BENCH=/tmp/bundle.js TRUST_JS_BENCH_RUNS=5 \
+  cargo test --release engine_profile -- --ignored --nocapture
+
+TRUST_JS_DIAG=/tmp/page.html \
+  cargo test --release js_diag -- --ignored --nocapture
+
+TRUST_SCAN_AUDIT=/tmp/bundle.js \
+  cargo test --release scan_ident_audit -- --ignored --nocapture
+```
+
+## Desktop and layout benchmarks
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_DESKTOP_TRACE` | presence flag | Prints desktop frame-stage timings, including the live presentation path. |
+| `TRUST_DESKTOP_BENCH` | presence flag | Enables the ignored `desktop_pipeline_bench`; without it the test exits with a usage message. |
+| `TRUST_DESKTOP_BENCH_ITERATIONS` | positive integer | Number of iterations per desktop fixture. Default: `5`; values are clamped to at least `1`. |
+| `TRUST_LAYOUT2_BENCH` | — | Appears in the `p8_layout_bench` source example but is not read by the test. The Cargo test selector is the actual switch. |
+
+Run the fixture benchmarks with:
+
+```sh
+TRUST_DESKTOP_BENCH=1 TRUST_DESKTOP_BENCH_ITERATIONS=5 \
+  cargo test --release desktop_pipeline_bench -- --ignored --nocapture
+
+cargo test --release p8_layout_bench -- --ignored --nocapture
+```
+
+## Terminal-capture diagnostics
+
+`replay_ten_real_terminal_frames` replays a `script(1)` capture through the
+same VT parser used by the app:
+
+```sh
+TRUST_TTY_CAPTURE=/tmp/session.out \
+  TRUST_TTY_TIMING=/tmp/session.time \
+  TRUST_TTY_SIZE=130x20 \
+  cargo test --release replay_ten_real_terminal_frames -- --ignored --nocapture
+```
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_TTY_CAPTURE` | `script(1)` capture path | Required terminal byte stream. |
+| `TRUST_TTY_TIMING` | `script(1)` timing-log path | Required timing data; only `O` output records are replayed. |
+| `TRUST_TTY_SIZE` | `COLUMNSxROWS` | Parser viewport. Default: `130x20`. |
+
+## TLS and client-identity inputs
+
+These are operational inputs rather than performance diagnostics, but they are
+included here because they are part of TRust's `TRUST_*` environment surface.
+
+| Input | Value | Effect and default |
+|---|---|---|
+| `TRUST_KNOWN_HOSTS` | file path | Overrides the default `~/.config/trust/known_hosts` file used for TLS trust-on-first-use pins. |
+| `TRUST_IDENTITIES` | directory path | Overrides the default `~/.config/trust/identities` directory containing per-host client identity PEM files. |
+
+## Inputs that are not active controls
+
+Two names appear in historical comments or command examples but are not read as
+environment variables by the current source:
+
+* `TRUST_LAZY_PARSE` is an old name used in comments around the Boa lazy-parse
+  work. The active A/B control is `TRUST_NO_LAZY_PARSE`; setting
+  `TRUST_LAZY_PARSE` alone has no effect.
+* `TRUST_LAYOUT2_BENCH` is shown in the `p8_layout_bench` doc comment for
+  discoverability, but the test does not inspect it. Selecting the ignored test
+  by name is sufficient.
+
+Likewise, `TRUST_GC_*` in prose is a family label, not a wildcard parser. The
+active names are the four exact GC inputs listed above.
+
+## Adding a diagnostic
+
+When adding an input:
+
+1. Give presence-only flags and value inputs distinct names and define their
+   accepted syntax/default in the source comment.
+2. State whether the input is shared, Lumen-only, Boa-only, terminal-only,
+   desktop-only, or test-only.
+3. Include one copy-paste command for the test or executable path.
+4. Specify output destination and whether the input is read once or per use.
+5. Update this document and run `git diff --check`.

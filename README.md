@@ -91,6 +91,10 @@ document, dynamic DOM mutation, a decoded-image grid, and graphical Telnet
 redraw. See [`src/render`](src/render) for the backend boundary and comments on
 current Vello-specific limitations.
 
+Developer diagnostics, benchmark inputs, ignored live-site gates, and their
+environment-variable reference are collected in
+[`DIAGNOSTICS.md`](DIAGNOSTICS.md).
+
 ## Driving it
 
 **TAB** or **Ctrl+]** opens the `trust>` command prompt from anywhere; in line
