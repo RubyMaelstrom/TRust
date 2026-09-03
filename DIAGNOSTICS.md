@@ -126,6 +126,27 @@ back to the quiet period — measured: script-free settles in tens of
 milliseconds, a page with a dead script and no hover styling in about 0.16 s,
 and one dead script plus `a:hover { color: red }` never.
 
+Residency is not the same thing as cost, and the two are worth measuring
+separately before anyone tries to fix the first. Sampling `/proc` on the GB10
+workstation while the window-free driver held pages open:
+
+| question | measurement |
+|---|---|
+| does a resident page burn cycles? | no: `trust-page-lume` recorded **0.000 s** of CPU over 30 s idle. The ~0.6% that shows at all is shared Tokio pool housekeeping, present whether or not a page is resident |
+| does residency accumulate across navigation? | no: five chained `location.href` navigations, every page hover-styled so no actor retires, left **one** `trust-page-lume` thread |
+| does a resident page's memory grow? | no: flat at **200.4 MiB** at 5 s and at 45 s |
+| what does the live DOM plus realm actually cost? | the same page with its one `:hover` rule takes **133.7 MiB**, the same page without it **84.2 MiB**, and a 20 000-object author heap adds **6 MiB** on top |
+
+So residency is one parked thread and roughly 50 MiB, charged to the single
+page on screen — the terminal and `trust-desktop` each hold one
+`BrowserController`, and `drop_live_page()` reclaims it on the next fetch —
+which is a bill, not a leak. The interesting number in that table is the last
+one: a document with **no scripts at all** pays a script realm because the live
+page is spawned whenever `hover_css_affects_rendering()` is true, so one
+stylesheet rule is enough to buy a realm. Collapsing that would mean
+separating live selector state from the realm, and the risk surface of that
+change is hover itself; the reward is one page's worth of RAM.
+
 ### `trust-desktop`
 
 `trust-desktop --help` accepts `[--renderer=auto|cpu|hybrid] [URL]`.
