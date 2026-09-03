@@ -305,6 +305,9 @@ enum Payload {
     Gopher(Vec<u8>),
     Gemini(gemini::Response),
     Http(Box<http::Response>),
+    /// An attachment or unsupported top-level MIME type. The current document
+    /// remains active while the frontend presents Save / Open / Cancel.
+    Download(Box<http::Response>),
     /// A fetch redirected to a YouTube playback page. The redirect response is
     /// classified before page JavaScript/layout and delegated on the UI thread.
     Media(url::Url),
@@ -316,7 +319,7 @@ enum Payload {
 }
 
 async fn prepare_http_payload(
-    response: http::Response,
+    mut response: http::Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
     storage: crate::js::WebStorage,
@@ -327,6 +330,11 @@ async fn prepare_http_payload(
     if crate::media::is_youtube_video_url(&response.url) {
         return Payload::Media(response.url);
     }
+    let computed_type = crate::download::computed_mime_type(&response);
+    if crate::download::response_needs_download(&response, true) {
+        return Payload::Download(Box::new(response));
+    }
+    response.content_type = computed_type;
     // JS on: full transform. JS off: still bake the page's CSS so it lays out
     // per its own stylesheets.
     Payload::Http(Box::new(if js_on {
@@ -340,6 +348,17 @@ async fn prepare_http_payload(
 struct FetchMsg {
     target: Link,
     result: Result<Payload, String>,
+}
+
+pub(crate) struct FileDialog {
+    pub(crate) offer: crate::download::DownloadOffer,
+    pub(crate) selected: usize,
+}
+
+struct DownloadMsg {
+    path: std::path::PathBuf,
+    result: Result<u64, String>,
+    open: bool,
 }
 
 /// A fetched image shown full-panel over the browser. The raw bytes
@@ -790,6 +809,13 @@ pub struct App {
     fetch_task: Option<tokio::task::JoinHandle<()>>,
     /// In-flight image decode/encode, if any.
     img_rx: Option<mpsc::Receiver<ImgMsg>>,
+    /// A download prompt is presentation state only. Background transfers own
+    /// their bytes/tasks independently and survive this being dismissed.
+    pub(crate) file_dialog: Option<FileDialog>,
+    pub(crate) last_file_actions: [Option<ratatui::layout::Rect>; 3],
+    download_tx: mpsc::Sender<DownloadMsg>,
+    download_rx: mpsc::Receiver<DownloadMsg>,
+    downloads_in_flight: usize,
     /// Decoded page images (inline `<img>`), keyed by absolute URL.
     /// RAM-only, session-lifetime; survives re-layout/resize so a resize
     /// never refetches. Built by the parallel pipeline.
@@ -965,6 +991,7 @@ impl App {
         };
         let (enc_tx, enc_rx) = mpsc::channel(64);
         let (imgs_tx, imgs_rx) = mpsc::channel(64);
+        let (download_tx, download_rx) = mpsc::channel(16);
         Self {
             mode,
             // In memory only, like the entry histories.
@@ -1027,6 +1054,11 @@ impl App {
             fetch_rx: None,
             fetch_task: None,
             img_rx: None,
+            file_dialog: None,
+            last_file_actions: [None; 3],
+            download_tx,
+            download_rx,
+            downloads_in_flight: 0,
             image_cache: HashMap::new(),
             image_sizes: crate::layout2::ImageSizes::new(),
             image_alpha: std::collections::HashMap::new(),
@@ -1077,6 +1109,7 @@ impl App {
             || self.img_rx.is_some()
             || !self.imgs_in_flight.is_empty()
             || !self.image_encoding.is_empty()
+            || self.downloads_in_flight > 0
             || self.page_busy
     }
 
@@ -1280,6 +1313,7 @@ impl App {
                     Some(msg) => self.on_img(msg),
                     None => self.img_rx = None,
                 },
+                Some(msg) = self.download_rx.recv() => self.on_download(msg),
                 Some(msg) = self.imgs_rx.recv() => self.on_img_load(msg),
                 Some(msg) = self.enc_rx.recv() => self.on_enc(msg),
                 evt = recv_opt(&mut self.page_rx) => match evt {
@@ -1438,6 +1472,16 @@ impl App {
                 return;
             }
         }
+        if self.file_dialog.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(action) = self.last_file_actions.iter().position(|rect| {
+                    rect.is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()))
+                })
+            {
+                self.activate_file_action(action);
+            }
+            return;
+        }
         if self.viewer.is_some() {
             return; // nothing to scroll in the image viewer
         }
@@ -1497,6 +1541,9 @@ impl App {
 
     /// Open the command console (the same state Tab/Ctrl-] enters).
     fn open_command(&mut self) {
+        // UA bottom sheets never stack. Dismissing this view does not touch a
+        // transfer already moved into background ownership.
+        self.file_dialog = None;
         self.mode = Mode::Command;
         self.cert_for = None;
         self.select_menu = None;
@@ -1538,6 +1585,7 @@ impl App {
             self.cursor = 0;
         }
         self.find = None;
+        self.file_dialog = None;
         self.mode = match self.mode {
             Mode::Session | Mode::Search | Mode::Find => Mode::Command,
             Mode::Command => Mode::Session,
@@ -1630,9 +1678,36 @@ impl App {
         // already going straight to the remote.
         if key.code == KeyCode::Tab
             && key.modifiers.is_empty()
-            && !(self.mode == Mode::Session && self.char_mode())
+            && !(self.mode == Mode::Session && self.char_mode() && self.file_dialog.is_none())
         {
             self.toggle_command_mode();
+            return;
+        }
+
+        if self.mode == Mode::Session && self.file_dialog.is_some() {
+            match key.code {
+                KeyCode::Left | KeyCode::Up => {
+                    if let Some(dialog) = &mut self.file_dialog {
+                        dialog.selected = (dialog.selected + 2) % 3;
+                    }
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    if let Some(dialog) = &mut self.file_dialog {
+                        dialog.selected = (dialog.selected + 1) % 3;
+                    }
+                }
+                KeyCode::Enter => {
+                    let action = self
+                        .file_dialog
+                        .as_ref()
+                        .map_or(2, |dialog| dialog.selected);
+                    self.activate_file_action(action);
+                }
+                KeyCode::Char('s' | 'S') => self.activate_file_action(0),
+                KeyCode::Char('o' | 'O') => self.activate_file_action(1),
+                KeyCode::Char('c' | 'C') | KeyCode::Esc => self.activate_file_action(2),
+                _ => {}
+            }
             return;
         }
 
@@ -3472,6 +3547,16 @@ impl App {
             }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
             (Ok(Payload::Http(response)), _) => self.on_http_response(*response, width),
+            (Ok(Payload::Download(response)), _) => {
+                let referrer = self.http_referrer();
+                let offer = crate::download::DownloadOffer::from_response(*response, referrer);
+                self.status = format!("Cannot display {}.", offer.content_type);
+                self.notice = true;
+                self.mode = Mode::Session;
+                self.file_dialog = Some(FileDialog { offer, selected: 0 });
+                self.replace_nav = false;
+                self.nav_from_post = false;
+            }
             (Ok(Payload::Media(url)), _) => {
                 // No document consumed these one-shot navigation flags.
                 self.replace_nav = false;
@@ -3493,6 +3578,76 @@ impl App {
         // (image viewer, mpv, bot wall, a gemini input prompt) is spent —
         // navigate_to consumed the flag if it ran; anything left is stale.
         self.pending_travel = None;
+    }
+
+    fn activate_file_action(&mut self, action: usize) {
+        if action >= 2 {
+            self.file_dialog = None;
+            self.last_file_actions = [None; 3];
+            self.status = String::from("File action cancelled.");
+            self.notice = true;
+            return;
+        }
+        let Some(dialog) = self.file_dialog.take() else {
+            return;
+        };
+        self.last_file_actions = [None; 3];
+        let open = action == 1;
+        let destination = if open {
+            crate::download::open_destination(&dialog.offer.suggested_filename)
+        } else {
+            crate::download::save_destination(&dialog.offer.suggested_filename)
+        };
+        let destination = match destination {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Download failed: {error}");
+                self.notice = true;
+                return;
+            }
+        };
+        self.downloads_in_flight = self.downloads_in_flight.saturating_add(1);
+        self.status = format!(
+            "Downloading {} in background…",
+            dialog.offer.suggested_filename
+        );
+        self.notice = true;
+        let tx = self.download_tx.clone();
+        tokio::spawn(async move {
+            let result = crate::download::save(&dialog.offer, &destination).await;
+            let _ = tx
+                .send(DownloadMsg {
+                    path: destination,
+                    result,
+                    open,
+                })
+                .await;
+        });
+    }
+
+    fn on_download(&mut self, message: DownloadMsg) {
+        self.downloads_in_flight = self.downloads_in_flight.saturating_sub(1);
+        self.notice = true;
+        match message.result {
+            Ok(bytes) if message.open => match crate::download::open_external(&message.path) {
+                Ok(()) => {
+                    self.status = format!(
+                        "Opened {} ({}).",
+                        message.path.display(),
+                        crate::download::human_bytes(bytes)
+                    );
+                }
+                Err(error) => self.status = error,
+            },
+            Ok(bytes) => {
+                self.status = format!(
+                    "Saved {} ({}).",
+                    message.path.display(),
+                    crate::download::human_bytes(bytes)
+                );
+            }
+            Err(error) => self.status = format!("Download failed: {error}"),
+        }
     }
 
     /// Act on a gemini response by status class. 3x redirects were
@@ -3583,18 +3738,6 @@ impl App {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        // A followed link the server declares as audio/video plays in mpv,
-        // not the page view — we never download media bodies (read_response
-        // skips them, so what's here is empty). This is the general,
-        // content-type-driven catch-all behind the `is_playable_media_url`
-        // extension fast-path: an extensionless or oddly-named media stream
-        // still plays on click. Keep the page we came from rather than
-        // navigating into an empty doc.
-        if media.starts_with("audio/") || media.starts_with("video/") {
-            drop(live);
-            self.launch_mpv(response.url.to_string());
-            return;
-        }
         if response.body.is_empty() {
             self.status = format!(
                 "{}: HTTP {} (empty response)",
@@ -6561,15 +6704,12 @@ impl App {
     }
 
     fn browser_follow(&mut self) {
-        // Auto-route recognized video links straight to mpv, in EVERY view:
-        // YouTube in its various formats (people post these on gopher and
-        // gemini too — following one should play it, not try to render
-        // YouTube), and direct links to media mpv can play (a video/audio
-        // file, or the source behind a `<video>`/`<audio>` representation).
-        // Manual `v` covers any other web link. One resolve serves both
-        // checks (`selected_web_url` walks the doc and allocates).
+        // Concrete YouTube player pages remain an explicit media integration.
+        // Direct files must be fetched and classified from response metadata so
+        // unsupported media receives the same Save / Open / Cancel choice as
+        // every other top-level resource; extensions are not MIME metadata.
         if let Some(url) = self.selected_web_url()
-            && (crate::media::youtube_video_url(&url).is_some() || is_playable_media_url(&url))
+            && crate::media::youtube_video_url(&url).is_some()
         {
             self.launch_mpv(url);
             return;
@@ -7452,32 +7592,6 @@ fn ring_terminal_bell() {
     let _ = out.flush();
 }
 
-/// Whether a URL points at media mpv routinely plays directly — a video or
-/// audio file, or a streaming manifest. Extension-based (direct media files,
-/// which is what `<video>`/`<audio>` sources and direct media links almost
-/// always are); following such a link auto-launches mpv, like YouTube does.
-fn is_playable_media_url(url: &str) -> bool {
-    let Ok(u) = url::Url::parse(url) else {
-        return false;
-    };
-    if !matches!(u.scheme(), "http" | "https") {
-        return false;
-    }
-    let path = u.path().to_ascii_lowercase();
-    const EXTS: &[&str] = &[
-        // video
-        // (.ts is NOT here: on today's web it's a TypeScript source far more
-        // often than MPEG-TS — manual `v` still plays a real transport
-        // stream; .m2ts is unambiguous and stays.)
-        ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".mpg", ".mpeg", ".ogv",
-        ".m2ts", ".3gp", ".ogm", // adaptive-streaming manifests mpv plays
-        ".m3u8", ".mpd", // audio
-        ".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".mka",
-        ".weba", ".aiff", ".aif",
-    ];
-    EXTS.iter().any(|e| path.ends_with(e))
-}
-
 const SEND_USAGE: &str = "usage: send brk|ip|ao|ayt|ec|el|ga|nop|escape";
 
 /// The OSC 52 set-clipboard control string for `text` (base64 payload,
@@ -7740,6 +7854,57 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
 mod tests {
     use super::{HISTORY_CAP, History};
     use crate::doc::Link;
+
+    fn download_offer() -> crate::download::DownloadOffer {
+        crate::download::DownloadOffer {
+            url: url::Url::parse("https://example.test/report.pdf").unwrap(),
+            content_type: String::from("application/pdf"),
+            suggested_filename: String::from("report.pdf"),
+            content_length: Some(42),
+            body: b"%PDF-1.7".to_vec(),
+            referrer: None,
+            fetch_body: false,
+        }
+    }
+
+    #[test]
+    fn command_replaces_file_dialog_without_touching_background_downloads() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.file_dialog = Some(super::FileDialog {
+            offer: download_offer(),
+            selected: 0,
+        });
+        app.downloads_in_flight = 2;
+
+        app.open_command();
+
+        assert_eq!(app.mode, super::Mode::Command);
+        assert!(app.file_dialog.is_none());
+        assert_eq!(app.downloads_in_flight, 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_navigation_becomes_prompt_before_page_execution() {
+        let response = crate::http::Response {
+            url: url::Url::parse("https://example.test/report.pdf").unwrap(),
+            status: 200,
+            content_type: String::from("application/pdf"),
+            headers: vec![],
+            body: b"%PDF-1.7".to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        };
+        let payload =
+            super::prepare_http_payload(response, (80, 24), (8, 16), Default::default(), true)
+                .await;
+        assert!(matches!(payload, super::Payload::Download(_)));
+    }
 
     #[test]
     fn lazy_image_candidates_follow_viewport_and_keep_fixed_content_eager() {
@@ -11190,36 +11355,6 @@ mod tests {
             }
         }
         panic!("no item matched the predicate");
-    }
-
-    #[test]
-    fn playable_media_recognizer_covers_audio_and_video() {
-        use super::is_playable_media_url as m;
-        // Video, audio, and streaming manifests → mpv on follow:
-        assert!(m("https://v1.erome.com/8335/BRbvsH39/UDODP8WH_720p.mp4"));
-        assert!(m("https://cdn.example.com/clip.webm?token=abc"));
-        assert!(m("https://example.com/a/b/movie.MKV")); // case-insensitive
-        assert!(m("https://example.com/song.mp3"));
-        assert!(m("https://example.com/voice.opus"));
-        assert!(m("https://example.com/stream/index.m3u8"));
-        assert!(m("https://example.com/manifest.mpd"));
-        // An `.m4b` audiobook — the combined whole-book file archive.org links
-        // — must play on click like any other audio (regression: it was the
-        // one common audio extension missing from the list).
-        assert!(m(
-            "https://archive.org/download/blackcat0604_2605_librivox/BlackCatV6N4January1901_LibriVox.m4b"
-        ));
-        // Not media — normal navigation:
-        assert!(!m("https://example.com/page.html"));
-        assert!(!m("https://example.com/")); // no extension
-        assert!(!m("https://example.com/image.png"));
-        assert!(!m("mailto:x@y.z"));
-        assert!(!m("not a url"));
-        // `.ts` is TypeScript source on today's web far more often than
-        // MPEG-TS — dropped from auto-play (manual `v` still plays a real
-        // transport stream); `.m2ts` is unambiguous and stays.
-        assert!(!m("https://example.com/src/app.ts"));
-        assert!(m("https://example.com/cam/recording.m2ts"));
     }
 
     #[test]

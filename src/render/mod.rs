@@ -868,6 +868,9 @@ pub struct PagePaint {
 pub enum ControlId {
     Find,
     Command,
+    FileSave,
+    FileOpen,
+    FileCancel,
     VerticalRail,
     HorizontalRail,
     VerticalHeart,
@@ -884,12 +887,20 @@ pub struct EditorVisual {
 #[derive(Clone, Debug, Default)]
 pub struct ChromeModel {
     pub command: Option<EditorVisual>,
+    pub download: Option<DownloadVisual>,
     pub status: String,
     pub status_label: String,
     pub link_preview: String,
     pub find: Option<EditorVisual>,
     pub find_count: Option<(usize, usize)>,
     pub heart: HeartVisual,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DownloadVisual {
+    pub summary: String,
+    pub origin: String,
+    pub selected: usize,
 }
 
 /// Dynamic state for the two overlay heart scrollbars. Fractions are visual
@@ -2223,7 +2234,7 @@ pub fn desktop_chrome(
     _browser: &BrowserSnapshot,
     model: &ChromeModel,
 ) -> Scene {
-    let panel_height = if model.command.is_some() {
+    let panel_height = if model.command.is_some() || model.download.is_some() {
         COMMAND_PANEL_HEIGHT
     } else if model.find.is_some() {
         FIND_PANEL_HEIGHT
@@ -2258,12 +2269,121 @@ pub fn desktop_chrome(
 pub fn paint_desktop_overlay(scene: &mut Scene, _browser: &BrowserSnapshot, model: &ChromeModel) {
     if let Some(command) = &model.command {
         paint_command_panel(scene, command, model);
+    } else if let Some(download) = &model.download {
+        paint_download_panel(scene, download);
     } else if let Some(find) = &model.find {
         paint_find_panel(scene, find, model.find_count);
     } else {
         paint_browse_hints(scene, model);
     }
     paint_heart_scrollbars(scene, model.heart);
+}
+
+fn paint_download_panel(scene: &mut Scene, download: &DownloadVisual) {
+    let panel = CssRect::new(
+        0.0,
+        scene.content_viewport.y + scene.content_viewport.height,
+        scene.viewport.css.width,
+        COMMAND_PANEL_HEIGHT.min(scene.viewport.css.height),
+    );
+    scene.primitives.push(Primitive::FillRect {
+        rect: panel,
+        color: UI_BG,
+    });
+    let border_y = panel.y + 9.5;
+    scene.primitives.push(Primitive::Stroke {
+        shape: PaintShape::Path(vec![
+            PathElement::MoveTo(CssPoint::new(8.0, border_y)),
+            PathElement::LineTo(CssPoint::new(18.0, border_y)),
+            PathElement::MoveTo(CssPoint::new(88.0, border_y)),
+            PathElement::LineTo(CssPoint::new((panel.width - 8.0).max(88.0), border_y)),
+        ]),
+        brush: PaintBrush::Solid(UI_CYAN),
+        style: StrokeStyle::solid(1.0),
+    });
+    let plate = PaintShape::Path(vec![
+        PathElement::MoveTo(CssPoint::new(18.0, panel.y + 1.0)),
+        PathElement::LineTo(CssPoint::new(81.0, panel.y + 1.0)),
+        PathElement::LineTo(CssPoint::new(88.0, panel.y + 8.0)),
+        PathElement::LineTo(CssPoint::new(81.0, panel.y + 19.0)),
+        PathElement::LineTo(CssPoint::new(18.0, panel.y + 19.0)),
+        PathElement::Close,
+    ]);
+    scene.primitives.push(Primitive::Fill {
+        shape: plate,
+        brush: PaintBrush::Solid(UI_PINK),
+    });
+    paint_ui_text(
+        &mut scene.primitives,
+        "FILE",
+        CssPoint::new(29.0, panel.y + 2.5),
+        UI_BG,
+        48.0,
+        command_text_style(),
+    );
+    paint_ui_text(
+        &mut scene.primitives,
+        &download.summary,
+        CssPoint::new(20.0, panel.y + 31.0),
+        UI_CYAN,
+        (panel.width - 40.0).max(1.0),
+        command_text_style(),
+    );
+    paint_ui_text(
+        &mut scene.primitives,
+        &download.origin,
+        CssPoint::new(20.0, panel.y + 55.0),
+        UI_DIM,
+        (panel.width - 40.0).max(1.0),
+        command_text_style(),
+    );
+
+    let labels = ["SAVE", "OPEN", "CANCEL"];
+    let ids = [
+        ControlId::FileSave,
+        ControlId::FileOpen,
+        ControlId::FileCancel,
+    ];
+    let mut x = 20.0;
+    for (index, (label, id)) in labels.into_iter().zip(ids).enumerate() {
+        let width = if index == 2 { 88.0 } else { 76.0 };
+        let rect = CssRect::new(x, panel.y + 80.0, width, 27.0);
+        scene.controls.push(ControlRegion {
+            id,
+            rect,
+            enabled: true,
+        });
+        scene.primitives.push(Primitive::Stroke {
+            shape: PaintShape::Rect(rect),
+            brush: PaintBrush::Solid(if download.selected == index {
+                UI_PINK
+            } else {
+                UI_CYAN
+            }),
+            style: StrokeStyle::solid(if download.selected == index { 2.0 } else { 1.0 }),
+        });
+        paint_ui_text(
+            &mut scene.primitives,
+            label,
+            CssPoint::new(x + 12.0, panel.y + 84.0),
+            if download.selected == index {
+                UI_PINK
+            } else {
+                UI_CYAN
+            },
+            width - 20.0,
+            command_text_style(),
+        );
+        x += width + 12.0;
+    }
+    paint_ui_text(
+        &mut scene.primitives,
+        "←→ choose  ENTER activate  TAB command",
+        CssPoint::new((x + 8.0).min(panel.width - 250.0), panel.y + 85.0),
+        UI_AMBER,
+        (panel.width - x - 24.0).max(1.0),
+        command_text_style(),
+    );
 }
 
 /// Normalized scrollbar position over the actual scrollable range. A fixed-size
@@ -3246,6 +3366,30 @@ mod tests {
             scene.control_at(CssPoint::new(300.0, 600.0 - COMMAND_PANEL_HEIGHT + 30.0)),
             Some(ControlId::Command)
         );
+    }
+
+    #[test]
+    fn download_prompt_uses_command_height_and_exposes_three_actions() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
+        let model = ChromeModel {
+            download: Some(DownloadVisual {
+                summary: String::from("report.pdf · application/pdf · 4.0 KiB"),
+                origin: String::from("https://example.test"),
+                selected: 1,
+            }),
+            ..ChromeModel::default()
+        };
+        let mut scene = desktop_chrome(viewport, &snapshot(), &model);
+        assert_eq!(scene.content_viewport.height, 600.0 - COMMAND_PANEL_HEIGHT);
+        paint_desktop_overlay(&mut scene, &snapshot(), &model);
+        for control in [
+            ControlId::FileSave,
+            ControlId::FileOpen,
+            ControlId::FileCancel,
+        ] {
+            assert!(scene.controls.iter().any(|region| region.id == control));
+        }
     }
 
     #[test]

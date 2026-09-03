@@ -25,12 +25,12 @@ use trust::doc::{FieldKind, Link};
 use trust::render::vello_cpu::VelloCpuRenderer;
 use trust::render::vello_hybrid::{PresentOutcome, VelloHybridRenderer};
 use trust::render::{
-    ChromeModel, ControlId, CssRect, DisplayCommand, EditorVisual, HeartVisual, ImageHandle,
-    ImageResource, ImageStore, PageHit, PaintBrush, PaintColor, PaintShape, RasterBackend,
-    RendererKind, RendererPreference, Scene, SceneDamage, ScrollContainer, ScrollbarAxis,
-    StrokeStyle, TextSelection, desktop_chrome, desktop_heart_image_handle, horizontal_heart_track,
-    paint_desktop_overlay, paint_text_editor, raster_damage, scene_damage, scrollbar_fraction,
-    scrollbar_position, scrollbar_track_fraction, vertical_heart_track,
+    ChromeModel, ControlId, CssRect, DisplayCommand, DownloadVisual, EditorVisual, HeartVisual,
+    ImageHandle, ImageResource, ImageStore, PageHit, PaintBrush, PaintColor, PaintShape,
+    RasterBackend, RendererKind, RendererPreference, Scene, SceneDamage, ScrollContainer,
+    ScrollbarAxis, StrokeStyle, TextSelection, desktop_chrome, desktop_heart_image_handle,
+    horizontal_heart_track, paint_desktop_overlay, paint_text_editor, raster_damage, scene_damage,
+    scrollbar_fraction, scrollbar_position, scrollbar_track_fraction, vertical_heart_track,
 };
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
@@ -136,6 +136,11 @@ enum DesktopEvent {
     AnimationWake,
     Access(AccessEvent),
     Telnet(trust::telnet::Event),
+    DownloadFinished {
+        path: std::path::PathBuf,
+        result: Result<u64, String>,
+        open: bool,
+    },
 }
 
 #[derive(Default)]
@@ -601,6 +606,7 @@ impl From<AccessEvent> for DesktopEvent {
 enum FocusTarget {
     Page,
     Find,
+    Download,
     #[default]
     Command,
     Form {
@@ -1121,6 +1127,8 @@ struct DesktopApp {
     find: TextEditor,
     command: TextEditor,
     command_history: trust::command::History,
+    file_action_selected: usize,
+    downloads_in_flight: usize,
     form_editor: Option<TextEditor>,
     composing: bool,
     page_layout: Option<PageLayoutCache>,
@@ -1450,6 +1458,8 @@ impl DesktopApp {
             find: TextEditor::new("", &style, 500.0, false),
             command: TextEditor::new("", &style, 700.0, false),
             command_history: trust::command::History::default(),
+            file_action_selected: 0,
+            downloads_in_flight: 0,
             form_editor: None,
             composing: false,
             page_layout: None,
@@ -1688,6 +1698,7 @@ impl DesktopApp {
             || !self.image_loads.pending.is_empty()
             || !self.image_tasks.is_empty()
             || self.image_flush_scheduled
+            || self.downloads_in_flight > 0
     }
 
     fn schedule_chrome_tick(&mut self, fast: bool) {
@@ -1837,6 +1848,13 @@ impl DesktopApp {
         if outcome.loading_retired {
             self.retire_page_loading();
         }
+        // A download navigation retires the old page actor before its response
+        // is classified. If the user activates another page link while the
+        // prompt is visible, that navigation clears the offer synchronously;
+        // do not leave the desktop stuck in the download-only focus/viewport.
+        if self.focus == FocusTarget::Download && self.browser.download_offer().is_none() {
+            self.set_focus(FocusTarget::Page);
+        }
         if outcome.invalidated {
             self.request_redraw();
         }
@@ -1944,6 +1962,12 @@ impl DesktopApp {
     fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
         let outcome = self.browser.process_async_events();
         self.launch_external_media_requests();
+        if self.browser.download_offer().is_some()
+            && !matches!(self.focus, FocusTarget::Command | FocusTarget::Download)
+        {
+            self.file_action_selected = 0;
+            self.set_focus(FocusTarget::Download);
+        }
         if outcome.loading_retired {
             let had_pending_key = !self.pending_page_keys.is_empty();
             self.pending_page_keys.clear();
@@ -1951,6 +1975,9 @@ impl DesktopApp {
                 self.set_focus(FocusTarget::Page);
             }
             self.retire_page_loading();
+        }
+        if self.focus == FocusTarget::Download && self.browser.download_offer().is_none() {
+            self.set_focus(FocusTarget::Page);
         }
         self.apply_page_key_defaults();
         outcome
@@ -2023,7 +2050,7 @@ impl DesktopApp {
     }
 
     fn browser_viewport(&self) -> CssSize {
-        let panel = if self.focus == FocusTarget::Command {
+        let panel = if matches!(self.focus, FocusTarget::Command | FocusTarget::Download) {
             trust::render::COMMAND_PANEL_HEIGHT
         } else if self.focus == FocusTarget::Find {
             trust::render::FIND_PANEL_HEIGHT
@@ -2061,8 +2088,18 @@ impl DesktopApp {
             (self.focus == FocusTarget::Find).then(|| Self::editor_visual(&mut self.find, false));
         let command = (self.focus == FocusTarget::Command)
             .then(|| Self::editor_visual(&mut self.command, false));
+        let download = (self.focus == FocusTarget::Download)
+            .then(|| {
+                self.browser.download_offer().map(|offer| DownloadVisual {
+                    summary: offer.summary(),
+                    origin: offer.url.origin().ascii_serialization(),
+                    selected: self.file_action_selected,
+                })
+            })
+            .flatten();
         ChromeModel {
             command,
+            download,
             status: snapshot.status.clone(),
             status_label: self.status_label(snapshot),
             link_preview: self.link_preview.clone(),
@@ -2691,6 +2728,7 @@ impl DesktopApp {
         }
         let editable = match focus {
             FocusTarget::Find | FocusTarget::Command => true,
+            FocusTarget::Download => false,
             FocusTarget::Form { form, field } => self
                 .page_layout
                 .as_ref()
@@ -2719,6 +2757,9 @@ impl DesktopApp {
     }
 
     fn open_command(&mut self, replace_with_address: bool) {
+        if self.focus == FocusTarget::Download {
+            self.browser.dismiss_download_offer();
+        }
         if replace_with_address || self.command.text().is_empty() {
             let address = self.browser.snapshot().address;
             self.command.set_text(&address);
@@ -2728,13 +2769,88 @@ impl DesktopApp {
     }
 
     fn close_command(&mut self) {
+        self.set_focus(if self.browser.download_offer().is_some() {
+            FocusTarget::Download
+        } else {
+            FocusTarget::Page
+        });
+    }
+
+    fn activate_file_action(&mut self, action: usize) {
+        if action >= 2 {
+            self.browser.dismiss_download_offer();
+            self.browser.set_status("File action cancelled.");
+            self.set_focus(FocusTarget::Page);
+            return;
+        }
+        let Some(offer) = self.browser.take_download_offer() else {
+            self.set_focus(FocusTarget::Page);
+            return;
+        };
+        let open = action == 1;
+        let destination = if open {
+            trust::download::open_destination(&offer.suggested_filename)
+        } else {
+            trust::download::save_destination(&offer.suggested_filename)
+        };
+        let destination = match destination {
+            Ok(path) => path,
+            Err(error) => {
+                self.browser.set_status(format!("Download failed: {error}"));
+                self.set_focus(FocusTarget::Page);
+                return;
+            }
+        };
+        self.downloads_in_flight = self.downloads_in_flight.saturating_add(1);
+        self.browser.set_status(format!(
+            "Downloading {} in background…",
+            offer.suggested_filename
+        ));
         self.set_focus(FocusTarget::Page);
+        let proxy = self.event_proxy.clone();
+        self.runtime.spawn(async move {
+            let result = trust::download::save(&offer, &destination).await;
+            let _ = proxy.send_event(DesktopEvent::DownloadFinished {
+                path: destination,
+                result,
+                open,
+            });
+        });
+    }
+
+    fn finish_download(
+        &mut self,
+        path: std::path::PathBuf,
+        result: Result<u64, String>,
+        open: bool,
+    ) {
+        self.downloads_in_flight = self.downloads_in_flight.saturating_sub(1);
+        match result {
+            Ok(bytes) if open => match trust::download::open_external(&path) {
+                Ok(()) => self.browser.set_status(format!(
+                    "Opened {} ({}).",
+                    path.display(),
+                    trust::download::human_bytes(bytes)
+                )),
+                Err(error) => self.browser.set_status(error),
+            },
+            Ok(bytes) => self.browser.set_status(format!(
+                "Saved {} ({}).",
+                path.display(),
+                trust::download::human_bytes(bytes)
+            )),
+            Err(error) => self.browser.set_status(format!("Download failed: {error}")),
+        }
+        self.request_redraw();
     }
 
     fn activate_control(&mut self, control: ControlId) {
         match control {
             ControlId::Find => self.focus_chrome_editor(FocusTarget::Find, control),
             ControlId::Command => self.focus_chrome_editor(FocusTarget::Command, control),
+            ControlId::FileSave => self.activate_file_action(0),
+            ControlId::FileOpen => self.activate_file_action(1),
+            ControlId::FileCancel => self.activate_file_action(2),
             ControlId::VerticalRail
             | ControlId::HorizontalRail
             | ControlId::VerticalHeart
@@ -2802,6 +2918,7 @@ impl DesktopApp {
         match self.focus {
             FocusTarget::Find => Some(&mut self.find),
             FocusTarget::Command => Some(&mut self.command),
+            FocusTarget::Download => None,
             FocusTarget::Form { .. } => self.form_editor.as_mut(),
             FocusTarget::Page => self
                 .terminal
@@ -3110,6 +3227,7 @@ impl DesktopApp {
         if pressed && input.key == Key::Tab && !input.modifiers.control && !input.modifiers.meta {
             match self.focus {
                 FocusTarget::Command => self.close_command(),
+                FocusTarget::Download => self.open_command(false),
                 FocusTarget::Form { .. } => self.focus_next(input.modifiers.shift),
                 _ => self.open_command(false),
             }
@@ -3125,6 +3243,41 @@ impl DesktopApp {
                 self.open_command(false);
             }
             return;
+        }
+        if pressed && self.focus == FocusTarget::Download {
+            match &input.key {
+                Key::ArrowLeft | Key::ArrowUp => {
+                    self.file_action_selected = (self.file_action_selected + 2) % 3;
+                    self.request_redraw();
+                    return;
+                }
+                Key::ArrowRight | Key::ArrowDown => {
+                    self.file_action_selected = (self.file_action_selected + 1) % 3;
+                    self.request_redraw();
+                    return;
+                }
+                Key::Enter => {
+                    self.activate_file_action(self.file_action_selected);
+                    return;
+                }
+                Key::Character(text) if text.eq_ignore_ascii_case("s") => {
+                    self.activate_file_action(0);
+                    return;
+                }
+                Key::Character(text) if text.eq_ignore_ascii_case("o") => {
+                    self.activate_file_action(1);
+                    return;
+                }
+                Key::Character(text) if text.eq_ignore_ascii_case("c") => {
+                    self.activate_file_action(2);
+                    return;
+                }
+                Key::Escape => {
+                    self.activate_file_action(2);
+                    return;
+                }
+                _ => {}
+            }
         }
         // Escape is the browser stop key in every graphical browser mode. It
         // never dismisses COMMAND. `BrowserController::Stop` implements HTML
@@ -3362,6 +3515,7 @@ impl DesktopApp {
                     )
                 })
                 .unwrap_or_default(),
+            FocusTarget::Download => CssPoint::default(),
             FocusTarget::Form { form, field } => self
                 .page_layout
                 .as_ref()
@@ -4015,7 +4169,26 @@ impl DesktopApp {
     }
 
     fn activate_link(&mut self, link: Link) {
+        // HTML §6.5 activation behavior still applies to page links. The
+        // prompt is a browser chrome affordance, not a modal document dialog;
+        // keep the retained page usable when the user chooses another link.
+        if self.focus == FocusTarget::Download {
+            self.browser.dismiss_download_offer();
+            self.set_focus(FocusTarget::Page);
+        }
         match link {
+            Link::JsClick { href, .. } if !self.browser.page_is_live() => {
+                // Download prompts retire the resident actor while retaining
+                // the last complete page pixels. Listener-wrapped anchors
+                // still carry their real href, so progressive enhancement can
+                // follow that URL even though there is no actor left to click.
+                if let Some(target) = self.dead_page_href(&href) {
+                    self.activate_link(target);
+                } else {
+                    self.browser
+                        .set_status("This page link needs the page engine; reload to use it.");
+                }
+            }
             Link::Form { form, field } => self.activate_form_control(form, field),
             Link::Media(url) => {
                 let referrer = self
@@ -4042,6 +4215,17 @@ impl DesktopApp {
             }
             link => self.dispatch(UserAction::Activate(link)),
         }
+    }
+
+    fn dead_page_href(&self, href: &str) -> Option<Link> {
+        let base = self
+            .browser
+            .current_page()
+            .and_then(|page| match page.target() {
+                Link::Http(url) => Some(url),
+                _ => None,
+            })?;
+        resolve_dead_page_href(base, href)
     }
 
     fn activate_page_hit(&mut self, target: PageHit) {
@@ -4296,6 +4480,13 @@ impl DesktopApp {
         }
         let cursor = if self.heart_hover.is_some() {
             CursorIcon::Grab
+        } else if matches!(
+            self.scene
+                .as_ref()
+                .and_then(|scene| scene.control_at(point)),
+            Some(ControlId::FileSave | ControlId::FileOpen | ControlId::FileCancel)
+        ) {
+            CursorIcon::Pointer
         } else if matches!(
             self.scene
                 .as_ref()
@@ -4835,6 +5026,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                     self.request_redraw();
                 }
             }
+            DesktopEvent::DownloadFinished { path, result, open } => {
+                self.finish_download(path, result, open);
+            }
             DesktopEvent::ImageLoaded {
                 generation,
                 image_epoch,
@@ -5319,6 +5513,7 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
     let focus = match focus {
         FocusTarget::Find => ACCESS_FIND,
         FocusTarget::Command => ACCESS_COMMAND,
+        FocusTarget::Download => ACCESS_ROOT,
         FocusTarget::Form { form, field } => page
             .and_then(|page| {
                 page.document
@@ -5374,6 +5569,22 @@ fn page_hit_activation(hit: &PageHit, page_live: bool) -> Option<Link> {
             href: String::new(),
         })
     })
+}
+
+/// Resolve a listener-wrapped anchor after its page actor has been retired.
+/// The retained hit region still has the anchor's real href, so following that
+/// href preserves ordinary hyperlink navigation while script-only controls
+/// remain unavailable until the page is reloaded.
+fn resolve_dead_page_href(base: &url::Url, href: &str) -> Option<Link> {
+    let href = href.trim();
+    if href.is_empty() {
+        return None;
+    }
+    let target = url::Url::parse(href).or_else(|_| base.join(href)).ok()?;
+    trust::core::parse_navigation_target(target.as_str())
+        .map(|(target, _)| target)
+        .ok()
+        .or_else(|| Some(Link::External(target.to_string())))
 }
 
 /// Pointer Events "click, auxclick, and contextmenu events" dispatch requires
@@ -5890,6 +6101,24 @@ mod tests {
             })
         );
         assert_eq!(page_hit_activation(&target, false), target.link);
+    }
+
+    #[test]
+    fn retired_page_anchor_follows_its_href_without_the_js_actor() {
+        let base = url::Url::parse("https://archive.org/download/item/").unwrap();
+        assert_eq!(
+            resolve_dead_page_href(&base, "../details/item#files"),
+            Some(Link::Http(
+                url::Url::parse("https://archive.org/download/details/item#files").unwrap()
+            ))
+        );
+        assert_eq!(
+            resolve_dead_page_href(&base, "https://archive.org/download/item/file.pdf"),
+            Some(Link::Http(
+                url::Url::parse("https://archive.org/download/item/file.pdf").unwrap()
+            ))
+        );
+        assert_eq!(resolve_dead_page_href(&base, ""), None);
     }
 
     #[test]

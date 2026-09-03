@@ -37,16 +37,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // into, so its 3-row box is dropped and those rows go to the content
     // panel; everything folds into the single status line. The box returns
     // for command/search/line entry (and the char-mode strip).
-    let collapse_input =
-        app.mode == Mode::Session && (app.browser.is_some() || app.viewer.is_some());
+    let file_prompt = app.file_dialog.is_some();
+    let collapse_input = !file_prompt
+        && app.mode == Mode::Session
+        && (app.browser.is_some() || app.viewer.is_some());
     let (session_area, input_area, status_area) = if collapse_input {
         let [session_area, status_area] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
         (session_area, None, status_area)
     } else {
+        let input_height = if file_prompt { 4 } else { 3 };
         let [session_area, input_area, status_area] = Layout::vertical([
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .areas(frame.area());
@@ -157,10 +160,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     render_select_menu(frame, app, inner);
 
     if let Some(input_area) = input_area {
-        frame.render_widget(
-            input_box(app, input_area.width.saturating_sub(2)),
-            input_area,
-        );
+        if file_prompt {
+            render_file_dialog(frame, app, input_area);
+        } else {
+            app.last_file_actions = [None; 3];
+            frame.render_widget(
+                input_box(app, input_area.width.saturating_sub(2)),
+                input_area,
+            );
+        }
     }
     frame.render_widget(status_bar(app), status_area);
 
@@ -195,6 +203,48 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Paragraph::new(Span::styled(glyph, style)), area);
         }
     }
+}
+
+fn render_file_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(dialog) = &app.file_dialog else {
+        app.last_file_actions = [None; 3];
+        return;
+    };
+    let buttons = ["[ Save ]", "[ Open ]", "[ Cancel ]"];
+    let mut action_spans = Vec::new();
+    let mut x = area.x.saturating_add(2);
+    let y = area.y.saturating_add(2);
+    for (index, label) in buttons.iter().enumerate() {
+        let width = label.chars().count() as u16;
+        app.last_file_actions[index] = Some(Rect::new(x, y, width, 1));
+        let style = if dialog.selected == index {
+            Style::new()
+                .fg(theme::BG)
+                .bg(theme::PASTEL_GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme::PASTEL_GREEN)
+        };
+        action_spans.push(Span::styled(*label, style));
+        action_spans.push(Span::raw("  "));
+        x = x.saturating_add(width + 2);
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::PASTEL_GREEN))
+        .style(Style::new().bg(theme::BG))
+        .title(Line::styled(
+            " FILE ",
+            Style::new()
+                .fg(theme::BG)
+                .bg(theme::PASTEL_GREEN)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let summary = Line::styled(dialog.offer.summary(), Style::new().fg(theme::NEON_CYAN));
+    frame.render_widget(
+        Paragraph::new(vec![summary, Line::from(action_spans)]).block(block),
+        area,
+    );
 }
 
 /// Draw the open `<select>` dropdown as a bordered popup anchored to its
@@ -1177,22 +1227,32 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         (" LINK:DOWN ", theme::NEON_PINK)
     };
     let laid_out = app.browser.as_ref().map(|g| g.doc.laid_out());
-    let hint = match (app.mode, laid_out, app.char_mode()) {
-        (Mode::Session, _, _) if app.viewer.is_some() => "· ← Esc close · Tab cmds",
-        (Mode::Session, Some(true), _) => {
-            "· ↑↓←→ move · Enter follow · ⌫ back · Esc stop · Tab cmds"
+    let hint = if app.file_dialog.is_some() {
+        "· ←→ choose · Enter activate · S save · O open · Esc cancel · Tab COMMAND"
+    } else {
+        match (app.mode, laid_out, app.char_mode()) {
+            (Mode::Session, _, _) if app.viewer.is_some() => "· ← Esc close · Tab cmds",
+            (Mode::Session, Some(true), _) => {
+                "· ↑↓←→ move · Enter follow · ⌫ back · Esc stop · Tab cmds"
+            }
+            (Mode::Session, Some(false), _) => {
+                "· ↑↓ scroll · → follow · ← back · Esc stop · Tab cmds"
+            }
+            (Mode::Session, None, true) => "· keys go to remote · Tab/Ctrl-] cmds",
+            (Mode::Session, None, false) => "· Enter send · Tab/Esc cmds",
+            (Mode::Command, ..) => "· Enter run · Esc/Tab back · help · open <url>/close/quit",
+            (Mode::Search, ..) if app.masked_input => {
+                "· Enter send · Esc cancel · typing is hidden"
+            }
+            (Mode::Search, ..) if app.cert_for.is_some() => {
+                "· Enter mints the identity · Esc cancel"
+            }
+            (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
+                "· Enter set · Esc cancel"
+            }
+            (Mode::Search, ..) => "· Enter search · Esc cancel",
+            (Mode::Find, ..) => "· Enter/↓ next · Shift-Enter/↑ prev · Esc close",
         }
-        (Mode::Session, Some(false), _) => "· ↑↓ scroll · → follow · ← back · Esc stop · Tab cmds",
-        (Mode::Session, None, true) => "· keys go to remote · Tab/Ctrl-] cmds",
-        (Mode::Session, None, false) => "· Enter send · Tab/Esc cmds",
-        (Mode::Command, ..) => "· Enter run · Esc/Tab back · help · open <url>/close/quit",
-        (Mode::Search, ..) if app.masked_input => "· Enter send · Esc cancel · typing is hidden",
-        (Mode::Search, ..) if app.cert_for.is_some() => "· Enter mints the identity · Esc cancel",
-        (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
-            "· Enter set · Esc cancel"
-        }
-        (Mode::Search, ..) => "· Enter search · Esc cancel",
-        (Mode::Find, ..) => "· Enter/↓ next · Shift-Enter/↑ prev · Esc close",
     };
     let mut spans = vec![Span::styled(
         label,
