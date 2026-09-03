@@ -76,8 +76,9 @@ prompt commands (`open`, `post`, `reload`, `mode`, `send`, `set`, `toggle`, and
 | `URL` | Required initial navigation | — |
 | `--width N` | CSS viewport width in CSS pixels | `1024` |
 | `--height N` | CSS viewport height in CSS pixels | `768` |
-| `--timeout SECS` | Hard wall-clock limit for navigation/settling | `30` |
+| `--timeout SECS` | Hard wall-clock limit for navigation/settling | `10` |
 | `--settle SECS` | Quiet-period fallback, used only on a page that never goes inert (see below) | `0.75` |
+| `--max-chars N` | Character budget for page text (`unlimited` for the whole page) | `8000` |
 | `--format text\|semantic` | Display-list text or accessibility tree output | `text` |
 | `--links` | Include link targets in text output | off |
 | `-h`, `--help` | Print usage | — |
@@ -106,7 +107,36 @@ trust-headless: http://127.0.0.1:8199/timers.html · … · 1024x768 CSS px · t
 ```
 
 `--settle 0` disables the clock entirely and trusts the engine verdict alone; a
-page with a timer loop then waits for `--timeout`.
+page with a timer loop then waits for `--timeout`. The default `--timeout` is 10 s
+because a dozen real pages settled between 0.4 s and 4.4 s measured here, and a
+page that never goes quiet should fail in 10 s rather than in half a minute.
+
+The middle field of that line is what the protocol answered — `HTTP 404
+(text/html)`, `Gemini 200 text/gemini`, `1024 bytes` — taken from the fetched
+document, not from the controller's status. The two are different things: the
+controller's status becomes a resident script actor's own note the moment it
+repaints, so a server's verdict disappears behind `Page updated · JS` in any
+page that runs script. Measured after that change: a wrong-cased GitHub repo
+reports `HTTP 404 (text/html)` in 3.0 s, plain text reports `HTTP 200
+(text/plain)`, and Python's own error page reports `HTTP 404 (text/plain)`.
+
+The closing line is prose for a human; the **exit status** is the machine-readable
+answer, and it separates "the fetch worked" from "the dump is the whole story":
+
+| Exit | Meaning |
+|---:|---|
+| `0` | Complete dump. A page answering 404 or 500 is a complete dump: the fetch succeeded, and what the server said is in the line above for the caller to judge |
+| `1` | No page loaded — DNS failure, refused connection, unparsable address |
+| `2` | Bad command line |
+| `3` | Text was dumped but the page never went quiet or final before `--timeout`, so what was printed is as-of-timeout, not the whole page |
+
+Page text is bounded: `--max-chars` defaults to 8000 characters, because an
+8000-character budget is the size a fetch tool is expected to hand back and
+`text/plain` documents have no natural limit — RFC 2616 arrives as 422,102
+characters. A budget never ends the text mid-line when a line broke in the last
+quarter of it, and the closing line says `text capped at 8000 of 422102
+characters` when the budget bit. `--links` output is not counted against the
+budget; ask for it explicitly and it arrives in full.
 
 The engine verdict is worth roughly an order of magnitude on documents that can
 reach it — a script-free page used to pay the whole settle window for no reason,
