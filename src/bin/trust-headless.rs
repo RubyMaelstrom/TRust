@@ -29,9 +29,11 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+use url::Url;
+
 use trust::accessibility::SemanticTree;
-use trust::core::{BrowserController, CssSize, UserAction};
-use trust::doc::Doc;
+use trust::core::{BrowserController, BrowserPage, CssSize, FetchedDocument, UserAction};
+use trust::doc::{Doc, Link};
 use trust::render::{DisplayCommand, PagePaint};
 
 /// One positioned text run lifted out of the display list.
@@ -248,6 +250,10 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
         return Err(format!("no page loaded: {}", snapshot.status).into());
     };
 
+    // Relative `href` values are resolved against the address that answered,
+    // exactly as a click resolves them.
+    let base = document_base(page);
+
     // A line-model protocol document has no layout product; fall back to the
     // protocol-neutral Doc the desktop adapter parses for it.
     let rendered = page.rendered_page();
@@ -262,7 +268,7 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
             semantic_text(&rendered.semantics, &mut links)
         }
         (Some(rendered), _) => {
-            let runs = collect_runs(&rendered.layout.paint);
+            let runs = collect_runs(&rendered.layout.paint, base.as_ref());
             if options.list_links {
                 links_of(&runs, &mut links);
             }
@@ -342,22 +348,22 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
 /// part of one page's readable content, so all of them contribute. Transform
 /// scopes (scroll, sticky, fixed, animated) carry the document-space offset
 /// into the run's own origin, which is all a text dump needs.
-fn collect_runs(paint: &PagePaint) -> Vec<Run> {
+fn collect_runs(paint: &PagePaint, base: Option<&Url>) -> Vec<Run> {
     let mut runs = Vec::new();
     for layer in [
         &paint.primitives,
         &paint.fixed_under_primitives,
         &paint.fixed_primitives,
     ] {
-        gather(layer, &mut runs);
+        gather(layer, &mut runs, base);
     }
     for entry in &paint.top_layer {
-        gather(&entry.primitives, &mut runs);
+        gather(&entry.primitives, &mut runs, base);
     }
     runs
 }
 
-fn gather(commands: &[DisplayCommand], runs: &mut Vec<Run>) {
+fn gather(commands: &[DisplayCommand], runs: &mut Vec<Run>, base: Option<&Url>) {
     for command in commands {
         if let DisplayCommand::GlyphRun {
             origin,
@@ -376,7 +382,7 @@ fn gather(commands: &[DisplayCommand], runs: &mut Vec<Run>) {
                 width: shaped.advance,
                 height: (shaped.ascent + shaped.descent).max(1.0),
                 text,
-                link: link.as_ref().map(ToString::to_string),
+                link: link.as_ref().and_then(|link| reported_link(link, base)),
             });
         }
     }
@@ -390,45 +396,168 @@ fn gather(commands: &[DisplayCommand], runs: &mut Vec<Run>) {
 /// a space, which is what keeps hyphenated inline styling from splitting words
 /// while still separating table cells and columns. A vertical gap of more than
 /// one-and-a-half lines becomes the blank line between paragraphs.
-fn lines_of_runs(runs: &[Run]) -> Vec<String> {
-    let mut sorted = runs.iter().collect::<Vec<_>>();
-    sorted.sort_by(|a, b| {
-        a.y.partial_cmp(&b.y)
+/// Word spaces measured across real pages are about a fifth of a line, and
+/// gaps between unrelated boxes on the same visual line are three line-heights
+/// or more. Anything past a line and a half is therefore not a word space but a
+/// column or an unconnected widget, and boxes that overlap by more than a fifth
+/// of a line are not adjacent text at all. Ratios are used rather than fixed
+/// pixels so the rule holds at any font size or device pixel ratio.
+const COLUMN_GAP_LINES: f32 = 1.5;
+const OVERLAPPING_LINES: f32 = -0.2;
+
+impl Run {
+    fn bottom(&self) -> f32 {
+        self.y + self.height
+    }
+}
+
+/// Group runs into the visual lines they were painted on.
+///
+/// Runs must not simply be sorted by `y`. A heading whose second fragment sits
+/// a few pixels above the first (docs.python.org's `dataclasses — Data Classes`,
+/// 149.3 against 152.3) sorts first, and then every run to its left is measured
+/// as though it continued rightward from the fragment: a negative gap, no space,
+/// and the fragments of one heading arrive as `— Data Classesdataclasses`. So
+/// runs are collected into lines by how much their vertical bands overlap, and
+/// each line is read left to right on its own.
+fn visual_lines<'a>(runs: &[&'a Run]) -> Vec<Vec<&'a Run>> {
+    let mut ordered = runs.to_vec();
+    ordered.sort_by(|a, b| {
+        let center_a = a.y + a.height / 2.0;
+        let center_b = b.y + b.height / 2.0;
+        center_a
+            .partial_cmp(&center_b)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_y = f32::NAN;
-    let mut current_right = f32::NAN;
-
-    for run in sorted {
-        let same_line = !current_y.is_nan() && (run.y - current_y).abs() <= run.height * 0.45;
-        if same_line {
-            // Only join with a space when the shaper left a visible gap; an
-            // adjacent inline-styled fragment must not gain one.
-            if !current.is_empty() && run.x - current_right > 0.5 {
-                current.push(' ');
-            }
-        } else {
-            if !current_y.is_nan() {
-                // The gap being measured is between the row just completed and
-                // the row starting now, so the break has to follow the row.
-                if !current.is_empty() {
-                    lines.push(std::mem::take(&mut current));
-                }
-                if run.y - current_y > run.height * 1.6 {
-                    lines.push(String::new());
-                }
-            }
-            current_y = run.y;
+    let mut lines: Vec<Vec<&Run>> = Vec::new();
+    let mut line: Vec<&Run> = Vec::new();
+    // The band a line is measured against stays the band of the run that
+    // opened it; letting it grow to the union of its members lets one tall run
+    // reach down into the next line and merge them.
+    let mut band = (f32::NAN, f32::NAN);
+    for run in ordered {
+        if line.is_empty() {
+            band = (run.y, run.bottom());
+            line.push(run);
+            continue;
         }
-        current.push_str(&run.text);
-        current_right = run.x + run.width;
+        let overlap = band.1.min(run.bottom()) - band.0.max(run.y);
+        if overlap >= run.height.min(band.1 - band.0) * 0.5 {
+            line.push(run);
+        } else {
+            lines.push(std::mem::take(&mut line));
+            band = (run.y, run.bottom());
+            line.push(run);
+        }
     }
-    if !current.is_empty() {
-        lines.push(current);
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Group runs into the blocks they were painted in.
+///
+/// The display list is already in the order the page drew its content, which for
+/// in-flow content is document order, and geometry alone cannot separate an
+/// article line from the sidebar entry beside it: a heading in one column sits in
+/// the vertical band of a line in the other, so any reading order built from
+/// coordinates alone interleaves them. A run continues the block being built when
+/// it is on the same line, or below the previous line and still inside the same
+/// column; otherwise it opens a new block.
+fn painted_blocks<'a>(runs: &[&'a Run]) -> Vec<Vec<&'a Run>> {
+    let mut blocks: Vec<Vec<&Run>> = Vec::new();
+    let mut block: Vec<&Run> = Vec::new();
+    let mut last_band = (f32::NAN, f32::NAN);
+    let mut column = (f32::NAN, f32::NAN);
+    for run in runs {
+        if block.is_empty() {
+            block.push(run);
+            last_band = (run.y, run.bottom());
+            column = (run.x, run.x + run.width);
+            continue;
+        }
+        // Reaching the same band is not enough: a Wikipedia infobox title sits
+        // in the vertical band of the article line beside it, and letting that
+        // merge the two drops the infobox into the middle of a paragraph. A
+        // block is text that is actually next to other text in it.
+        let on_the_last_line = last_band.1.min(run.bottom()) - last_band.0.max(run.y)
+            >= run.height.min(last_band.1 - last_band.0) * 0.5
+            && run.x + run.width >= column.0 - run.height
+            && run.x <= column.1 + run.height * COLUMN_GAP_LINES;
+        let continues_down = run.y > last_band.0
+            && run.y - last_band.1 < run.height
+            && run.x + run.width > column.0
+            && run.x < column.1;
+        if on_the_last_line || continues_down {
+            block.push(run);
+            if !on_the_last_line {
+                last_band = (run.y, run.bottom());
+            }
+            column.0 = column.0.min(run.x);
+            column.1 = column.1.max(run.x + run.width);
+        } else {
+            blocks.push(std::mem::take(&mut block));
+            block.push(run);
+            last_band = (run.y, run.bottom());
+            column = (run.x, run.x + run.width);
+        }
+    }
+    if !block.is_empty() {
+        blocks.push(block);
+    }
+    blocks
+}
+
+fn lines_of_runs(runs: &[Run]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut previous_y = f32::NAN;
+
+    let ordered = painted_blocks(&runs.iter().collect::<Vec<_>>())
+        .into_iter()
+        .flat_map(|block| visual_lines(&block))
+        .collect::<Vec<Vec<_>>>();
+
+    for mut line in ordered {
+        let Some(first) = line.first().copied() else {
+            continue;
+        };
+        // A break between paragraphs is a property of where the line sits, so
+        // it is measured before the line is read, and always follows the line
+        // that came before it.
+        if !previous_y.is_nan() && first.y - previous_y > first.height * 1.6 {
+            lines.push(String::new());
+        }
+        previous_y = first.y;
+
+        // A visual line is read left to right whatever order the page drew it
+        // in, which is the only reordering done here: the blocks themselves
+        // stay in the order the page painted them.
+        line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        let mut row = String::new();
+        let mut right = f32::NAN;
+        for run in line {
+            if row.is_empty() {
+                row.push_str(&run.text);
+                right = run.x + run.width;
+                continue;
+            }
+            let gap = run.x - right;
+            if gap > run.height * COLUMN_GAP_LINES || gap < run.height * OVERLAPPING_LINES {
+                // Either a gap no word space explains (a second column or an
+                // unconnected widget on the same line) or boxes that would
+                // collide if read as one sentence.
+                lines.push(std::mem::take(&mut row));
+            } else if gap > 0.5 {
+                row.push(' ');
+            }
+            row.push_str(&run.text);
+            right = right.max(run.x + run.width);
+        }
+        if !row.is_empty() {
+            lines.push(row);
+        }
     }
 
     finish_lines(lines)
@@ -454,6 +583,45 @@ fn finish_lines(lines: Vec<String>) -> Vec<String> {
         out.pop();
     }
     out
+}
+
+/// The address that actually answered, after redirects: what a relative
+/// `href` resolves against. Everything except a fetched HTTP document already
+/// prints its own complete address.
+fn document_base(page: &BrowserPage) -> Option<Url> {
+    match &page.document {
+        FetchedDocument::Http(response) => Some(response.url.clone()),
+        _ => Url::parse(&page.address()).ok(),
+    }
+}
+
+/// A link worth printing. A button or form control has no address to report,
+/// and `Link::JsClick` carries the *raw* attribute, which is a relative
+/// reference on almost every page: `/foo` on one host and `../bar.html` in one
+/// directory are useless to a caller that has to guess where it was reading
+/// from, so they are resolved against the document here exactly as a click
+/// would resolve them.
+fn reported_link(link: &Link, base: Option<&Url>) -> Option<String> {
+    match link {
+        Link::JsClick { href, .. } if href.trim().is_empty() => None,
+        Link::JsClick { href, .. } => Some(resolve_reference(base, href.trim())),
+        Link::Form { .. } => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn resolve_reference(base: Option<&Url>, href: &str) -> String {
+    // Already absolute, including `mailto:` and friends: leave the author's
+    // spelling alone.
+    if Url::parse(href).is_ok() {
+        return href.to_string();
+    }
+    base.and_then(|base| base.join(href).ok())
+        .map(|resolved| resolved.to_string())
+        // A reference the base cannot resolve (`javascript:…`, a bare `#` with
+        // no URL to anchor) is still what the author wrote, so report it as
+        // written rather than dropping the link.
+        .unwrap_or_else(|| href.to_string())
 }
 
 fn links_of(runs: &[Run], out: &mut Vec<String>) {
@@ -499,14 +667,21 @@ fn semantic_text(tree: &SemanticTree, links: &mut Vec<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Run, finish_lines, lines_of_runs};
+    use super::{Run, finish_lines, lines_of_runs, reported_link, resolve_reference};
+
+    use trust::doc::Link;
+    use url::Url;
 
     fn run(x: f32, y: f32, width: f32, text: &str) -> Run {
+        sized_run(x, y, width, 20.0, text)
+    }
+
+    fn sized_run(x: f32, y: f32, width: f32, height: f32, text: &str) -> Run {
         Run {
             y,
             x,
             width,
-            height: 20.0,
+            height,
             text: text.to_string(),
             link: None,
         }
@@ -525,8 +700,18 @@ mod tests {
 
     #[test]
     fn separated_runs_join_with_one_space() {
-        let lines = lines_of_runs(&[run(0.0, 0.0, 40.0, "Total"), run(180.0, 0.0, 20.0, "42")]);
+        let lines = lines_of_runs(&[run(0.0, 0.0, 40.0, "Total"), run(50.0, 0.0, 20.0, "42")]);
         assert_eq!(lines, vec!["Total 42".to_string()]);
+    }
+
+    #[test]
+    fn a_gap_no_word_space_explains_starts_a_new_line_instead() {
+        // This used to assert "Total 42" for the pair below. A gap of seven
+        // line-heights is not a space in front of a number, it is the space
+        // between two unrelated boxes on one visual line, and joining them is
+        // how one column of a page ended up inside another's sentence.
+        let lines = lines_of_runs(&[run(0.0, 0.0, 40.0, "Total"), run(180.0, 0.0, 20.0, "42")]);
+        assert_eq!(lines, vec!["Total".to_string(), "42".to_string()]);
     }
 
     #[test]
@@ -575,6 +760,160 @@ mod tests {
         assert_eq!(
             kept,
             vec!["  Body".to_string(), String::new(), "Next".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_heading_fragment_sitting_above_the_rest_still_reads_left_to_right() {
+        // docs.python.org/3/library/dataclasses.html, as painted: the h1's
+        // classifier sits 3px above the word it classifies. Sorting by y would
+        // emit it first and append the word with no gap to measure.
+        let lines = lines_of_runs(&[
+            sized_run(504.7, 149.3, 220.5, 38.4, "\u{2014} Data Classes"),
+            sized_run(292.2, 152.3, 204.5, 35.9, "dataclasses"),
+        ]);
+        assert_eq!(lines, vec!["dataclasses \u{2014} Data Classes".to_string()]);
+    }
+
+    #[test]
+    fn text_ordered_by_x_is_not_reordered_into_the_wrong_line() {
+        // A classifier above and to the right, then two lines that start well
+        // to its left: sorting runs by x alone would put the short indented
+        // lines before the classifier they follow, and the paragraph would
+        // arrive with its tail first.
+        let heading = Run {
+            y: 152.3,
+            x: 44.0,
+            width: 90.0,
+            height: 38.4,
+            text: "dataclasses".into(),
+            link: None,
+        };
+        let a = Run {
+            y: 175.0,
+            x: 516.5,
+            width: 115.7,
+            height: 19.2,
+            text: "— Data Classes".into(),
+            link: None,
+        };
+        let b = Run {
+            y: 194.2,
+            x: 44.0,
+            width: 200.0,
+            height: 19.2,
+            text: "or a variable that already".into(),
+            link: None,
+        };
+        let c = Run {
+            y: 213.4,
+            x: 56.0,
+            width: 180.0,
+            height: 19.2,
+            text: "existed".into(),
+            link: None,
+        };
+        assert_eq!(
+            lines_of_runs(&[heading, a, b, c]),
+            vec![
+                "dataclasses".to_string(),
+                "— Data Classes".to_string(),
+                "or a variable that already".to_string(),
+                "existed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sidebar_label_and_the_text_beside_it_do_not_become_one_sentence() {
+        // Same page: the contents entry ends at x=218.0 and "Source code:" does
+        // not start until x=291.2, a gap of 4.6 line-heights. Nothing about
+        // those boxes reads as one sentence.
+        let lines = lines_of_runs(&[
+            sized_run(37.0, 211.1, 85.2, 15.0, "dataclasses"),
+            sized_run(126.1, 210.1, 91.9, 16.0, "\u{2014} Data Classes"),
+            sized_run(291.2, 213.8, 92.9, 19.2, "Source code:"),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "dataclasses \u{2014} Data Classes".to_string(),
+                "Source code:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn boxes_that_overlap_are_not_read_as_adjacent_words() {
+        // keras.rstudio.com paints a screen-reader-only label on top of the
+        // logo, sharing a baseline.
+        let lines = lines_of_runs(&[
+            sized_run(0.0, 0.0, 100.0, 20.0, "keras3"),
+            sized_run(60.0, 0.0, 80.0, 20.0, "keras3 1.5.1"),
+        ]);
+        assert_eq!(
+            lines,
+            vec!["keras3".to_string(), "keras3 1.5.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn relative_references_resolve_against_the_address_that_answered() {
+        let base = Url::parse("https://docs.python.org/3/library/dataclasses.html").unwrap();
+        assert_eq!(
+            resolve_reference(Some(&base), "../bugs.html"),
+            "https://docs.python.org/3/bugs.html"
+        );
+        assert_eq!(
+            resolve_reference(Some(&base), "#mutable-default-values"),
+            "https://docs.python.org/3/library/dataclasses.html#mutable-default-values"
+        );
+        assert_eq!(
+            resolve_reference(Some(&base), "/3/search.html"),
+            "https://docs.python.org/3/search.html"
+        );
+        // Already absolute, and schemes with no base to resolve against.
+        assert_eq!(
+            resolve_reference(Some(&base), "mailto:ruby@example.com"),
+            "mailto:ruby@example.com"
+        );
+        assert_eq!(
+            resolve_reference(None, "../bugs.html"),
+            "../bugs.html".to_string()
+        );
+        // Something no resolver can mean anything by is reported as written.
+        assert_eq!(
+            resolve_reference(Some(&base), "javascript:void(0)"),
+            "javascript:void(0)".to_string()
+        );
+    }
+
+    #[test]
+    fn a_button_reports_no_link_and_a_js_anchor_reports_its_resolved_href() {
+        let base = Url::parse("https://example.com/blog/post.html").unwrap();
+        assert_eq!(
+            reported_link(
+                &Link::JsClick {
+                    node: 7,
+                    href: String::new(),
+                },
+                Some(&base),
+            ),
+            None
+        );
+        assert_eq!(
+            reported_link(&Link::Form { form: 0, field: 1 }, Some(&base),),
+            None
+        );
+        assert_eq!(
+            reported_link(
+                &Link::JsClick {
+                    node: 7,
+                    href: "/comments/".to_string(),
+                },
+                Some(&base),
+            ),
+            Some("https://example.com/comments/".to_string())
         );
     }
 }
