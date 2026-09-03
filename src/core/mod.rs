@@ -394,6 +394,10 @@ enum CoreEvent {
         generation: u64,
         url: url::Url,
     },
+    Download {
+        generation: u64,
+        response: Box<http::Response>,
+    },
     Page {
         generation: u64,
         event: crate::js::PageEvt,
@@ -407,6 +411,7 @@ enum CoreEvent {
 enum InteractiveFetch {
     Document(FetchedDocument),
     ExternalMedia(url::Url),
+    Download(Box<http::Response>),
 }
 
 /// Read-only state used by graphical chrome.
@@ -469,6 +474,7 @@ pub struct BrowserController {
     page_key_defaults: VecDeque<bool>,
     pending_fragment: Option<String>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
+    download_offer: Option<crate::download::DownloadOffer>,
     storage: crate::js::WebStorage,
     external_address: Option<String>,
     generation: u64,
@@ -504,6 +510,7 @@ impl BrowserController {
             page_key_defaults: VecDeque::new(),
             pending_fragment: None,
             external_media: VecDeque::new(),
+            download_offer: None,
             storage: Default::default(),
             external_address: None,
             generation: 0,
@@ -545,6 +552,22 @@ impl BrowserController {
     /// with navigation so typed, clicked, redirected, and scripted URLs agree.
     pub fn take_external_media(&mut self) -> Option<(url::Url, Option<url::Url>)> {
         self.external_media.pop_front()
+    }
+
+    pub fn download_offer(&self) -> Option<&crate::download::DownloadOffer> {
+        self.download_offer.as_ref()
+    }
+
+    pub fn take_download_offer(&mut self) -> Option<crate::download::DownloadOffer> {
+        self.download_offer.take()
+    }
+
+    pub fn dismiss_download_offer(&mut self) -> bool {
+        let dismissed = self.download_offer.take().is_some();
+        if dismissed {
+            self.invalidation.request_redraw();
+        }
+        dismissed
     }
 
     pub fn page_is_live(&self) -> bool {
@@ -926,6 +949,12 @@ impl BrowserController {
                 CoreEvent::ExternalMedia { generation, url } => {
                     changed |= self.finish_external_media(generation, url);
                 }
+                CoreEvent::Download {
+                    generation,
+                    response,
+                } => {
+                    changed |= self.finish_download(generation, *response);
+                }
                 CoreEvent::Page { generation, event } => {
                     if generation == self.generation {
                         changed |= self.handle_page_event(event);
@@ -1018,6 +1047,7 @@ impl BrowserController {
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
+        self.download_offer = None;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.render_is_final = false;
@@ -1086,6 +1116,25 @@ impl BrowserController {
         };
         self.task = None;
         self.queue_external_media(url);
+        true
+    }
+
+    fn finish_download(&mut self, generation: u64, response: http::Response) -> bool {
+        let Some(_pending) = self
+            .pending
+            .take_if(|pending| pending.generation == generation)
+        else {
+            return false;
+        };
+        self.task = None;
+        let referrer = self.current.as_ref().and_then(|page| match &page.target {
+            Link::Http(url) => Some(url.clone()),
+            _ => None,
+        });
+        let offer = crate::download::DownloadOffer::from_response(response, referrer);
+        self.status = format!("Cannot display {}.", offer.content_type);
+        self.download_offer = Some(offer);
+        self.render_is_final = self.live_page.is_none();
         true
     }
 
@@ -1590,6 +1639,19 @@ async fn fetch_protocol_interactive(
         if crate::media::is_youtube_video_url(&response.url) {
             return Ok(InteractiveFetch::ExternalMedia(response.url));
         }
+        let computed_type = crate::download::computed_mime_type(&response);
+        if crate::download::response_needs_download(&response, true) {
+            return Ok(InteractiveFetch::Download(Box::new(response)));
+        }
+        if computed_type
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().starts_with("image/"))
+        {
+            response = crate::http::image_navigation_response(response, &computed_type);
+        } else {
+            response.content_type = computed_type;
+        }
         // The legacy API accepts a terminal viewport and cell size. A one-pixel
         // cell is the explicit desktop adapter, so the actor's CSSOM viewport
         // is exactly the desktop's CSS-pixel viewport and never device pixels.
@@ -1622,6 +1684,10 @@ fn interactive_fetch_event(generation: u64, result: Result<InteractiveFetch, Str
             result: Ok(document),
         },
         Ok(InteractiveFetch::ExternalMedia(url)) => CoreEvent::ExternalMedia { generation, url },
+        Ok(InteractiveFetch::Download(response)) => CoreEvent::Download {
+            generation,
+            response,
+        },
         Err(error) => CoreEvent::FetchFinished {
             generation,
             result: Err(error),
@@ -1884,6 +1950,58 @@ mod tests {
         assert_eq!(pending.intent, NavigationIntent::Replace);
         assert!(browser.back.is_empty(), "the source is not added twice");
         browser.task.take().unwrap().abort();
+    }
+
+    #[test]
+    fn unsupported_download_offer_leaves_the_desktop_document_committed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let current = Link::External(String::from("about:help"));
+        browser.current = Some(BrowserPage {
+            target: current.clone(),
+            fallback_http: false,
+            document: FetchedDocument::Internal(b"current page".to_vec()),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        });
+        browser.generation = 7;
+        browser.pending = Some(PendingNavigation {
+            generation: 7,
+            target: Link::Http(url::Url::parse("https://example.test/report.pdf").unwrap()),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+
+        assert!(browser.finish_download(
+            7,
+            crate::http::Response {
+                url: url::Url::parse("https://example.test/report.pdf").unwrap(),
+                status: 200,
+                content_type: String::from("application/pdf"),
+                headers: vec![("content-length".into(), "9".into())],
+                body: b"%PDF-1.7".to_vec(),
+                rendered: None,
+                js: None,
+                blobs: None,
+                live: None,
+                declarative_refresh: None,
+                challenge: None,
+                from_post: false,
+            },
+        ));
+
+        assert_eq!(browser.current.as_ref().unwrap().target, current);
+        assert_eq!(
+            browser.download_offer().unwrap().suggested_filename,
+            "report.pdf"
+        );
+        assert!(browser.pending.is_none());
     }
 
     #[test]

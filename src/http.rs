@@ -351,7 +351,7 @@ pub fn render_html_for_environment(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if !matches!(media.as_str(), "" | "text/html" | "application/xhtml+xml") {
+    if !matches!(media.as_str(), "text/html" | "application/xhtml+xml") {
         return None;
     }
     let html = decode_body(&response.content_type, &response.body);
@@ -369,6 +369,30 @@ pub fn render_html_for_environment(
         seed,
         images,
     ))
+}
+
+/// Turn a supported top-level image response into the same kind of media
+/// document that HTML navigation creates for a supported image type. Desktop
+/// has no separate image-viewer surface, so the image is embedded in a tiny
+/// synthetic HTML document and then goes through the canonical DOM/layout and
+/// image scheduler. The original response URL remains the document URL.
+pub fn image_navigation_response(mut response: Response, mime: &str) -> Response {
+    let essence = mime.split(';').next().unwrap_or("image/*").trim();
+    let data_url = format!(
+        "data:{essence};base64,{}",
+        crate::img::base64_encode(&response.body)
+    );
+    response.content_type = String::from("text/html; charset=utf-8");
+    response.body = format!(
+        "<!doctype html><meta charset=utf-8><style>html,body{{margin:0}}img{{display:block;max-width:100%;height:auto}}</style><img src=\"{data_url}\">"
+    )
+    .into_bytes();
+    response.rendered = None;
+    response.js = None;
+    response.blobs = None;
+    response.live = None;
+    response.declarative_refresh = None;
+    response
 }
 
 /// The terminal frontend's deliberately small adapter over the shared pixel
@@ -1174,6 +1198,26 @@ async fn dial(scheme: &str, host: &str, port: u16) -> Result<BufReader<Conn>, St
     Ok(BufReader::new(conn))
 }
 
+/// Fresh connection for the bounded streaming download path. Downloads never
+/// enter the keep-alive pool because their body is written directly to disk.
+pub(crate) async fn download_connection(url: &Url) -> Result<BufReader<Conn>, String> {
+    let host = url.host_str().ok_or("download URL has no host")?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    dial(url.scheme(), host, port).await
+}
+
+pub(crate) fn download_cookies(url: &Url) -> String {
+    cookies_for_request(url)
+}
+
+pub(crate) fn download_store_cookie(url: &Url, line: &str) {
+    store_cookie(url, line, false);
+}
+
+pub(crate) fn download_referrer(source: &Url, target: &Url) -> Option<String> {
+    referrer_for(source, target)
+}
+
 async fn fetch_once(request: &Request) -> Result<Response, String> {
     let url = &request.url;
     let host = url.host_str().ok_or("URL has no host")?.to_string();
@@ -1260,10 +1304,10 @@ fn finish_response(
             from_post: false,
         });
     }
-    let content_type = headers
-        .get("content-type")
-        .cloned()
-        .unwrap_or_else(|| String::from("text/html"));
+    // RFC 9110 §8.3 and MIME Sniffing §5: an absent Content-Type is unknown,
+    // not HTML. Top-level navigation computes its type from the bounded
+    // resource header before deciding whether to render or download.
+    let content_type = headers.get("content-type").cloned().unwrap_or_default();
     let mut header_pairs: Vec<(String, String)> = headers
         .iter()
         .filter(|(k, _)| *k != "set-cookie")
@@ -1429,7 +1473,16 @@ async fn exchange(
     }
     io.flush().await.map_err(|e| e.to_string())?;
 
-    read_response(io, request.method.eq_ignore_ascii_case("HEAD")).await
+    let navigation_get = request.method.eq_ignore_ascii_case("GET")
+        && request
+            .fetch_metadata
+            .is_some_and(|metadata| metadata.destination == "document");
+    read_response_with_policy(
+        io,
+        request.method.eq_ignore_ascii_case("HEAD"),
+        navigation_get,
+    )
+    .await
 }
 
 /// One CRLF-terminated line, sans terminator. Err on EOF-before-line.
@@ -1458,9 +1511,18 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(io: &mut R) -> Result<Str
 /// Read one response off the stream: status line, headers, then a body
 /// delimited by Content-Length, chunked encoding, or (last resort)
 /// EOF. Returns (status, headers, body, reusable).
+#[cfg(test)]
 async fn read_response<R: AsyncRead + Unpin>(
     io: &mut BufReader<R>,
     is_head: bool,
+) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    read_response_with_policy(io, is_head, false).await
+}
+
+async fn read_response_with_policy<R: AsyncRead + Unpin>(
+    io: &mut BufReader<R>,
+    is_head: bool,
+    navigation_get: bool,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
     let status_line = read_line(io).await?;
     let http11 = status_line.starts_with("HTTP/1.1");
@@ -1507,13 +1569,19 @@ async fn read_response<R: AsyncRead + Unpin>(
         return Ok((status, headers, Vec::new(), reusable, set_cookies));
     }
 
-    // TRust never plays video/audio — video is mpv's job (the `v` key /
-    // YouTube auto-route). Downloading media bodies is pure waste: they're
-    // large and a real budget sink (YouTube prefetches feed-tile video
-    // previews via fetch() this way, which starves the actual page render).
-    // Skip the body entirely so a page falls back to its static poster /
-    // thumbnail. The unread body means this socket can't be pooled. General
-    // policy, not a site rule — any video/audio response anywhere is dropped.
+    // WHATWG HTML "loading a document": an attachment or a type for which
+    // TRust has no internal presentation must not be consumed as a document.
+    // Stop after headers for GET navigations; Save/Open owns a separate bounded
+    // streaming transfer, so large PDFs/media never enter the 16 MiB page heap.
+    if navigation_get && navigation_headers_need_download(&headers) {
+        return Ok((status, headers, Vec::new(), false, set_cookies));
+    }
+
+    // Media subresources are not presentation documents. Top-level media
+    // navigations have already returned above for the Save/Open prompt;
+    // downloading background media bodies here would only consume the page
+    // memory budget (sites commonly prefetch video previews). Skip the body so
+    // the page falls back to its poster. The unread socket cannot be pooled.
     if headers.get("content-type").is_some_and(|c| {
         let c = c.trim_start().to_ascii_lowercase();
         c.starts_with("video/") || c.starts_with("audio/")
@@ -1548,6 +1616,19 @@ async fn read_response<R: AsyncRead + Unpin>(
     // Undo any (unsolicited) Content-Encoding now the body is fully framed.
     let body = decode_content_encoding(&headers, body);
     Ok((status, headers, body, reusable, set_cookies))
+}
+
+fn navigation_headers_need_download(headers: &Headers) -> bool {
+    if let Some(value) = headers.get("content-disposition") {
+        let disposition = value.split(';').next().unwrap_or("").trim();
+        if !disposition.is_empty() && !disposition.eq_ignore_ascii_case("inline") {
+            return true;
+        }
+    }
+    let Some(content_type) = headers.get("content-type") else {
+        return false;
+    };
+    !crate::download::mime_is_renderable(content_type, true)
 }
 
 /// Decode a chunked body (RFC 9112 §7.1) incrementally. The bool says
@@ -1874,7 +1955,7 @@ pub async fn execute_js_for_device(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if !(media.is_empty() || media == "text/html" || media == "application/xhtml+xml") {
+    if !(media == "text/html" || media == "application/xhtml+xml") {
         return response;
     }
     let html = decode_body(&response.content_type, &response.body);
@@ -2836,7 +2917,7 @@ async fn css_only_for_device(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if !(media.is_empty() || media == "text/html" || media == "application/xhtml+xml") {
+    if !(media == "text/html" || media == "application/xhtml+xml") {
         return response;
     }
     let html = decode_body(&response.content_type, &response.body);
@@ -3182,8 +3263,7 @@ async fn prefetch_frame_documents(
                     .unwrap_or("")
                     .trim()
                     .to_ascii_lowercase();
-                let is_html =
-                    media.is_empty() || media == "text/html" || media == "application/xhtml+xml";
+                let is_html = media == "text/html" || media == "application/xhtml+xml";
                 (resp.status >= 200 && resp.status < 300 && is_html)
                     .then(|| (url, decode_body(&resp.content_type, &resp.body)))
             }))
@@ -3552,7 +3632,7 @@ pub fn parse_seeded(
     let mut hover_ids = std::collections::HashMap::new();
     let mut anchor_rows = std::collections::HashMap::new();
     let mut composites = std::collections::HashMap::new();
-    let lines = if media.is_empty() || media == "text/html" || media == "application/xhtml+xml" {
+    let lines = if media == "text/html" || media == "application/xhtml+xml" {
         let html = decode_body(content_type, body);
         // The HTTP renderer: our own arena DOM laid out into rows of
         // positioned items (multi-link rows, real CSS, live form
@@ -3638,7 +3718,7 @@ pub fn parse_seeded(
         hover_ids = collect_hover_ids(&dom);
         anchor_rows = found_anchors;
         Vec::new()
-    } else if media.starts_with("text/") {
+    } else if crate::download::mime_is_renderable(&media, false) {
         crate::doc::wrap_plain(&decode_body(content_type, body), width)
     } else {
         vec![DocLine {
@@ -4459,6 +4539,32 @@ mod tests {
             from_post: false,
         }
     }
+
+    #[test]
+    fn supported_image_navigation_uses_the_graphical_image_document_path() {
+        let response = Response {
+            url: Url::parse("https://example.test/photo.png").unwrap(),
+            status: 200,
+            content_type: String::from("image/png"),
+            headers: Vec::new(),
+            body: b"\x89PNG\r\n\x1a\n".to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        };
+        let response = image_navigation_response(response, "image/png");
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(
+            String::from_utf8(response.body)
+                .unwrap()
+                .contains("data:image/png;base64,iVBORw0KGgo=")
+        );
+    }
+
     #[test]
     fn declarative_refresh_parser_follows_the_html_algorithm() {
         assert_eq!(
@@ -10989,6 +11095,22 @@ customElements.define('lit-counter', LitCounter);
             !reusable,
             "missing terminator: keep the data, drop the conn"
         );
+    }
+
+    #[tokio::test]
+    async fn navigation_defers_unsupported_body_before_page_memory_cap() {
+        let raw: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 999999999\r\n\r\n%PDF";
+        let (status, headers, body, reusable, _) =
+            read_response_with_policy(&mut BufReader::new(raw), false, true)
+                .await
+                .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-type"], "application/pdf");
+        assert!(
+            body.is_empty(),
+            "the file body belongs to the download task"
+        );
+        assert!(!reusable, "the deliberately unread response is not pooled");
     }
 
     #[tokio::test]

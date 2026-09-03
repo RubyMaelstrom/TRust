@@ -58,6 +58,9 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
             )
         }
         (FetchedDocument::Http(response), Link::Http(url)) => {
+            if !crate::download::mime_is_renderable(&response.content_type, false) {
+                return None;
+            }
             let text = String::from_utf8_lossy(&response.body);
             Doc::from_lines(
                 Link::Http(url.clone()),
