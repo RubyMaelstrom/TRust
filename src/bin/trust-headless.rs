@@ -20,6 +20,13 @@
 //! `--settle` is a quiet-period fallback with the imprecision that implies.
 //! `--timeout` is the hard wall-clock bound either way.
 //!
+//! Two more things a caller needs are reported rather than assumed. The closing
+//! line carries what the protocol answered — `HTTP 404 (text/html)` — because a
+//! dump of an error page is worthless if it cannot be told from a dump of the
+//! page that was asked for; the page's own status note is the wrong source, since
+//! a resident script actor replaces it the moment it repaints. And the text is
+//! capped at `--max-chars` characters, because a page of plain text is unbounded.
+//!
 //! Geometry: layout and the CSSOM viewport are reported against the synthetic
 //! `--width`/`--height` viewport exactly as the desktop frontend reports them
 //! against its window. The terminal cell model does not exist here, so the
@@ -74,6 +81,7 @@ struct Options {
     settle: Duration,
     format: Format,
     list_links: bool,
+    max_chars: usize,
 }
 
 const USAGE: &str = "\
@@ -81,22 +89,30 @@ usage: trust-headless [options] URL
 
   --width N       CSS viewport width in CSS pixels (default 1024)
   --height N      CSS viewport height in CSS pixels (default 768)
-  --timeout SECS  stop waiting after this long (default 30)
+  --timeout SECS  stop waiting after this long (default 10)
   --settle SECS   for a page that never goes inert, stop once it has been this
                   long quiet (default 0.75; 0 waits for the engine verdict only)
+  --max-chars N   print at most N characters of page text (default 8000;
+                  unlimited keeps the whole page)
   --format F      text (default) or semantic
   --links         also list every linked target found in the page
   -h, --help      show this message
+
+Exit status: 0 when the dump is complete, 1 when no page loaded, 2 on a bad
+command line, 3 when text was dumped but the page never stopped changing. A
+page that answers 404 or 500 still exits 0: the fetch worked, and what the
+server said is in the closing line for the caller to decide about.
 ";
 
 fn parse_args() -> Result<Option<Options>, String> {
     let mut address: Option<String> = None;
     let mut width = 1024.0f32;
     let mut height = 768.0f32;
-    let mut timeout = 30.0f32;
+    let mut timeout = 10.0f32;
     let mut settle = 0.75f32;
     let mut format = Format::Text;
     let mut list_links = false;
+    let mut max_chars = 8000usize;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -118,6 +134,15 @@ fn parse_args() -> Result<Option<Options>, String> {
                 };
             }
             "--links" => list_links = true,
+            "--max-chars" => {
+                let raw = string("--max-chars", &mut args)?;
+                max_chars = match raw.as_str() {
+                    "unlimited" => 0,
+                    _ => raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("--max-chars needs a count, got {raw}"))?,
+                };
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option {other} (try --help)"));
             }
@@ -137,6 +162,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         settle: Duration::from_secs_f32(settle.max(0.0)),
         format,
         list_links,
+        max_chars,
     }))
 }
 
@@ -172,20 +198,26 @@ fn main() {
         }
     };
 
-    let failure = match try_run(options) {
-        Ok(()) => None,
-        Err(error) => Some(error.to_string()),
+    let outcome = match try_run(options) {
+        Ok(complete) => Ok(complete),
+        Err(error) => Err(error.to_string()),
     };
     // Navigation boundaries are where the allocator's arenas get their largest
     // one-off reclaim, and this process exits after exactly one of them.
     trust::release_allocator_memory();
-    if let Some(error) = failure {
-        eprintln!("trust-headless: {error}");
-        std::process::exit(1);
+    match outcome {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(3),
+        Err(error) => {
+            eprintln!("trust-headless: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn try_run(options: Options) -> Result<(), Box<dyn Error>> {
+/// One page, dumped: returns whether the text is a complete picture of the page
+/// as opposed to whatever it looked like when `--timeout` expired.
+fn try_run(options: Options) -> Result<bool, Box<dyn Error>> {
     // Multi-thread like the desktop frontend: the controller spawns fetch,
     // image, and resident-actor work on this handle and reports back over its
     // channel, so the pump loop must let those tasks advance.
@@ -197,7 +229,7 @@ fn try_run(options: Options) -> Result<(), Box<dyn Error>> {
 }
 
 /// Drive one navigation to a settled page and print it.
-async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
+async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> {
     let mut controller = BrowserController::new(
         tokio::runtime::Handle::current(),
         || {},
@@ -300,6 +332,15 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
     };
 
     let waited = started.elapsed();
+    // What the protocol answered is a fact about the document, and the
+    // controller's status is not it: the status set when a fetch commits is
+    // replaced by a resident actor's own note as soon as it repaints, so a
+    // server's 404 vanishes behind "Page updated". A caller reading this dump
+    // needs to know whether the page it asked for is the page it got.
+    let verdict = describe_fetch(&page.document);
+    let full = body.chars().count();
+    let body = cap_to_chars(body, options.max_chars);
+    let capped = body.chars().count() != full;
     let how = match settled {
         Settle::Engine => String::from("the engine reports this render is final"),
         Settle::Quiet => format!(
@@ -312,9 +353,17 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
         ),
     };
     eprintln!(
-        "trust-headless: {} · {} · {}x{} CSS px · {} in {}ms ({})",
+        "trust-headless: {} · {}{} · {}x{} CSS px · {} in {}ms ({})",
         page.address(),
-        snapshot.status,
+        verdict,
+        if capped {
+            format!(
+                " · text capped at {} of {full} characters",
+                options.max_chars
+            )
+        } else {
+            String::new()
+        },
         options.width as u32,
         options.height as u32,
         how,
@@ -339,7 +388,52 @@ async fn navigate_and_settle(options: &Options) -> Result<(), Box<dyn Error>> {
         }
     }
     let _ = out.flush();
-    Ok(())
+    Ok(settled != Settle::Timeout)
+}
+
+/// What the protocol said about a fetched document, in the same words the
+/// terminal frontend puts in its status line (`core::fetched_status`) minus the
+/// address, which this driver prints separately. The two copies are worth
+/// keeping in step by hand rather than exporting a helper from the shared
+/// controller for one driver's status line.
+fn describe_fetch(document: &FetchedDocument) -> String {
+    match document {
+        FetchedDocument::Http(response) => {
+            let media = response.content_type.split(';').next().unwrap_or("").trim();
+            format!("HTTP {} ({media})", response.status)
+        }
+        FetchedDocument::Gemini(response) => {
+            format!("Gemini {} {}", response.status, response.meta)
+        }
+        FetchedDocument::Gopher(bytes) | FetchedDocument::OneShot(bytes) => {
+            format!("{} bytes", bytes.len())
+        }
+        // The driver prints the address of an in-process document anyway.
+        FetchedDocument::Internal(_) => String::from("in-process document"),
+    }
+}
+
+/// Trim text to a character budget without ending in the middle of a line when
+/// a line ended recently anyway: give back whatever follows the last line break
+/// in the final quarter of the budget, so a reader is not handed half a
+/// sentence and nothing to tell them so.
+fn cap_to_chars(text: String, max_chars: usize) -> String {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return text;
+    }
+    let kept: String = text.chars().take(max_chars).collect();
+    let earliest_useful = max_chars - max_chars / 4;
+    let mut cut = None;
+    // Only a break in the last quarter of the budget is worth losing text for.
+    for (char_index, (byte_offset, ch)) in kept.char_indices().enumerate() {
+        if ch == '\n' && char_index >= earliest_useful {
+            cut = Some(byte_offset);
+        }
+    }
+    match cut {
+        Some(byte_offset) if byte_offset > 0 => kept[..byte_offset].to_string(),
+        _ => kept,
+    }
 }
 
 /// Lift every positioned glyph run out of the renderer-neutral display list.
@@ -667,7 +761,59 @@ fn semantic_text(tree: &SemanticTree, links: &mut Vec<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Run, finish_lines, lines_of_runs, reported_link, resolve_reference};
+    use super::{
+        Run, cap_to_chars, describe_fetch, finish_lines, lines_of_runs, reported_link,
+        resolve_reference,
+    };
+    use trust::core::FetchedDocument;
+
+    #[test]
+    fn a_document_reports_the_verdict_its_protocol_gave() {
+        // The status a resident script actor writes over the controller's says
+        // nothing about whether the server answered 404, so the driver reads the
+        // verdict from the document itself.
+        let missing = FetchedDocument::Http(Box::new(trust::http::Response {
+            url: Url::parse("https://example.com/gone").unwrap(),
+            status: 404,
+            content_type: String::from("text/html; charset=utf-8"),
+            headers: Vec::new(),
+            body: b"<p>gone</p>".to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        }));
+        assert_eq!(describe_fetch(&missing), "HTTP 404 (text/html)");
+        assert_eq!(
+            describe_fetch(&FetchedDocument::Gopher(vec![0u8; 7])),
+            "7 bytes"
+        );
+    }
+
+    #[test]
+    fn text_over_its_budget_ends_on_a_line_and_under_it_is_untouched() {
+        let budget = 20;
+        assert_eq!(cap_to_chars(String::new(), 0), String::new());
+        let unlimited = "x".repeat(budget * 4);
+        assert_eq!(cap_to_chars(unlimited.clone(), 0), unlimited);
+        let short = "one\ntwo".to_string();
+        assert_eq!(cap_to_chars(short.clone(), budget), short);
+        // One break, but 16 characters into a 20-character budget: the quarter
+        // worth giving back starts at 15, so the break at 16 is the last one
+        // close enough to the end, and the tail after it is dropped rather than
+        // reported as a line.
+        let break_near_end = format!("{}\n{}", "a".repeat(16), "b".repeat(9));
+        assert_eq!(cap_to_chars(break_near_end, budget), "a".repeat(16));
+        // A break only at the very start is too expensive to reach for.
+        let break_at_front = format!("\n{}", "c".repeat(40));
+        assert_eq!(
+            cap_to_chars(break_at_front, budget),
+            "\n".to_string() + &"c".repeat(19)
+        );
+    }
 
     use trust::doc::Link;
     use url::Url;
