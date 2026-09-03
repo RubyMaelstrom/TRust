@@ -147,6 +147,52 @@ stylesheet rule is enough to buy a realm. Collapsing that would mean
 separating live selector state from the realm, and the risk surface of that
 change is hover itself; the reward is one page's worth of RAM.
 
+#### How `trust-headless` reads a page
+
+Text output is built from the display list, so it reports what was painted and
+nothing else: text hidden behind a collapsed section, or behind `display:none`,
+never appears. Reading it needs two decisions, and getting either wrong mangles
+prose.
+
+Runs are grouped into blocks in the order the page drew them, which for in-flow
+content is document order, and each visual line inside a block is read left to
+right. Sorting runs by `y` alone does not work. docs.python.org paints the
+classifier of its heading 3 px above the word it classifies (`— Data Classes` at
+`y=149.3` against `dataclasses` at `152.3`), so the classifier sorts first,
+every run to its left is measured as though it continued rightward from there,
+the gap comes out negative, and the heading arrives as
+`— Data Classesdataclasses`. Reordering *within* a line and never across lines
+fixes it without inventing a reading order for the page as a whole.
+
+Two ratios decide where a visual line ends, both measured against the line
+height rather than fixed pixels so they hold at any font size or device pixel
+ratio. Word spaces on real pages come out around **0.2** line-heights; gaps
+between unrelated boxes on one line around **3** or more.
+
+| gap between boxes | read as |
+|---|---|
+| within half a pixel | the same text, no separator |
+| up to `COLUMN_GAP_LINES` (1.5 line-heights) | a word space |
+| wider than that | a separate line: a second column or an unconnected widget |
+| boxes overlapping by more than a fifth of a line | separate lines, never one sentence |
+
+The last row exists because keras.rstudio.com paints a screen-reader-only label
+on the logo at the same baseline, which previously read as one word.
+
+`--links` reports every link target the page painted, resolved to an absolute
+address against the address that actually answered — `/comments/` on
+`example.com/blog/post.html` is reported as `https://example.com/comments/`, and
+a fragment as `https://docs.python.org/3/library/dataclasses.html#mutable-default-values`,
+because a caller that has to guess where it was reading from cannot use either.
+Buttons and form controls report nothing, since they have no address.
+
+Two limits are worth stating. Relative references resolve against the document
+URL, not a `<base href>` override: the engine keeps that resolution to itself, and
+inventing a second implementation in a driver is how the two drift apart. And
+`--format semantic` reports no link targets at all, because the accessibility tree
+records a `value` only for form fields; links in that format would need the
+engine to carry `href` into `SemanticNode`, not a driver-side guess from geometry.
+
 ### `trust-desktop`
 
 `trust-desktop --help` accepts `[--renderer=auto|cpu|hybrid] [URL]`.
