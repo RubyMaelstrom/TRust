@@ -4191,11 +4191,13 @@ impl Dom {
             std::collections::HashMap::new();
         for id in self.composed_descendants(DOCUMENT) {
             let css: Cow<str> = match self.tag_name(id) {
-                Some("style") => Cow::Owned(self.text_content(id)),
-                Some("link") => match self.external_sheets.get(&id) {
-                    Some(css) => Cow::Borrowed(css.as_str()),
-                    None => continue,
-                },
+                Some("style") if self.style_sheet_applies(id) => Cow::Owned(self.text_content(id)),
+                Some("link") if self.style_sheet_applies(id) => {
+                    match self.external_sheets.get(&id) {
+                        Some(css) => Cow::Borrowed(css.as_str()),
+                        None => continue,
+                    }
+                }
                 _ => continue,
             };
             let scope = self.tree_scope(id);
@@ -4388,6 +4390,25 @@ impl Dom {
         let is_sheet = words.clone().any(|w| w.eq_ignore_ascii_case("stylesheet"));
         let is_alternate = words.any(|w| w.eq_ignore_ascii_case("alternate"));
         is_sheet && !is_alternate && self.attr(id, "disabled").is_none()
+    }
+
+    /// Whether an author stylesheet's `media` condition applies to this
+    /// document's current output environment. HTML's stylesheet-link and
+    /// `style` processing both gate the sheet on the media attribute before
+    /// its rules enter the cascade; the same media-query evaluator is used by
+    /// `matchMedia()` and `@media` blocks so all three agree. The fetched text
+    /// remains cached while inactive, allowing a later media/viewport change
+    /// to activate it without another network request.
+    fn style_sheet_applies(&self, id: NodeId) -> bool {
+        let eligible = match self.tag_name(id) {
+            Some("style") => true,
+            Some("link") => self.is_stylesheet_link(id),
+            _ => false,
+        };
+        eligible
+            && self
+                .attr(id, "media")
+                .is_none_or(|media| media.trim().is_empty() || self.media_matches(media))
     }
 
     /// Raw hrefs of external stylesheets, document order, so the fetch
@@ -13607,6 +13628,40 @@ mod tests {
         assert_eq!(dom.stylesheet_links(), vec![String::from("/a.css")]);
         dom.attach_external_sheets(&[(String::from("/a.css"), String::from(".x{display:none}"))]);
         assert!(!dom.serialize(DOCUMENT).contains("linked hide"));
+    }
+
+    #[test]
+    fn stylesheet_media_attribute_gates_the_cascade_and_reacts_to_changes() {
+        // HTML stylesheet processing applies a link/style sheet only when its
+        // media list matches the output device. Keep the fetched body cached
+        // while inactive: changing `media` must be able to activate it without
+        // a second fetch (HTML §4.2.4, CSS Media Queries §3).
+        let mut dom = Dom::parse_document(
+            "<head>\
+             <link id=print rel=stylesheet href='/print.css' media=print>\
+             <link id=screen rel=stylesheet href='/screen.css' media=screen>\
+             </head><body><div id=target class=theater>reader</div></body>",
+        );
+        dom.set_viewport_px(800.0, 600.0);
+        dom.attach_external_sheets(&[
+            (
+                String::from("/print.css"),
+                String::from(".theater{display:none !important}"),
+            ),
+            (
+                String::from("/screen.css"),
+                String::from(".theater{display:block}"),
+            ),
+        ]);
+        let target = dom.get_by_id("target").unwrap();
+        assert_eq!(dom.computed_display(target).as_deref(), Some("block"));
+
+        let print = dom.get_by_id("print").unwrap();
+        dom.set_attr(print, "media", "screen");
+        assert_eq!(dom.computed_display(target).as_deref(), Some("none"));
+
+        dom.set_attr(print, "media", "print");
+        assert_eq!(dom.computed_display(target).as_deref(), Some("block"));
     }
 
     #[test]

@@ -485,6 +485,24 @@ pub struct BrowserController {
     interaction: InteractionState,
     live_regions: Vec<usize>,
     live_boundaries: Vec<usize>,
+    /// Most recent page-script outcome, for headless diagnostics: error text,
+    /// captured console output, module skips, panic flag, and fetch count.
+    last_js_outcome: Option<crate::js::Outcome>,
+}
+
+fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
+    match event {
+        crate::js::PageEvt::Updated { .. } => "Updated",
+        crate::js::PageEvt::Patched { .. } => "Patched",
+        crate::js::PageEvt::Static { .. } => "Static",
+        crate::js::PageEvt::Navigate(_) => "Navigate",
+        crate::js::PageEvt::Replace(_) => "Replace",
+        crate::js::PageEvt::HistoryUpdate { .. } => "HistoryUpdate",
+        crate::js::PageEvt::ScrollToFragment(_) => "ScrollToFragment",
+        crate::js::PageEvt::Trouble(_) => "Trouble",
+        crate::js::PageEvt::Settled => "Settled",
+        _ => "Other",
+    }
 }
 
 impl BrowserController {
@@ -521,6 +539,7 @@ impl BrowserController {
             interaction: InteractionState::default(),
             live_regions: Vec::new(),
             live_boundaries: Vec::new(),
+            last_js_outcome: None,
         }
     }
 
@@ -606,6 +625,13 @@ impl BrowserController {
     ///
     /// `PageEvt::Settled` is deliberately not part of this: it acknowledges one
     /// dispatch that changed no pixels, not page quiescence.
+    /// Most recent page-script outcome (errors, console output, panic flag):
+    /// surfaced by `trust-headless --js-diagnostics` for headless debugging of
+    /// pages whose scripts misbehave; `None` before the first render event.
+    pub fn last_js_outcome(&self) -> Option<&crate::js::Outcome> {
+        self.last_js_outcome.as_ref()
+    }
+
     pub fn page_render_is_final(&self) -> bool {
         self.render_is_final
     }
@@ -1328,9 +1354,13 @@ impl BrowserController {
     }
 
     fn handle_page_event(&mut self, event: crate::js::PageEvt) -> bool {
+        if std::env::var_os("TRUST_TRACE_PAGE_EVENTS").is_some() {
+            eprintln!("[trace-event] {}", event_variant_name(&event));
+        }
         use crate::js::PageEvt;
         match event {
             PageEvt::Updated { html, mut outcome } => {
+                self.last_js_outcome = Some(outcome.clone());
                 // The native frontends do not pass through `App`, so mirror its
                 // gated live-render diagnostic here. Keeping this at the shared
                 // controller boundary captures the exact authoritative HTML
@@ -1360,6 +1390,7 @@ impl BrowserController {
                 true
             }
             PageEvt::Static { html, mut outcome } => {
+                self.last_js_outcome = Some(outcome.clone());
                 if let Some(page) = &mut self.current {
                     // The actor has classified this document as inert and is
                     // about to exit.  Preserve its settled serialization as
@@ -1389,6 +1420,7 @@ impl BrowserController {
                 patches,
                 mut outcome,
             } => {
+                self.last_js_outcome = Some(outcome.clone());
                 let _ = patches;
                 if let Some(page) = &mut self.current {
                     if let Some(rendered) = outcome.rendered.take() {

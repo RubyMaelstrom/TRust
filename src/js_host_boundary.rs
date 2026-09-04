@@ -86,6 +86,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__storage_len", 1),
     ("__blob_mirror", 3),
     ("__crypto_sha256_digest", 1),
+    ("__crypto_aes_ctr", 4),
     ("__compression_encode", 2),
     ("__text_encode", 1),
     ("__dom_popover", 2),

@@ -2947,6 +2947,7 @@ const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
     ("__storage_len", 1, sys_storage_len),
     ("__blob_mirror", 3, sys_blob_mirror),
     ("__crypto_sha256_digest", 1, sys_crypto_sha256_digest),
+    ("__crypto_aes_ctr", 4, sys_crypto_aes_ctr),
     ("__compression_encode", 2, sys_compression_encode),
     ("__text_encode", 1, sys_text_encode),
     ("__dom_popover", 2, sys_dom_popover),
@@ -4681,6 +4682,27 @@ fn sys_crypto_sha256_digest(_: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     let block = boa_engine::object::builtins::AlignedVec::from_iter(0, digest.iter().copied());
     let output = boa_engine::object::builtins::JsArrayBuffer::from_byte_block(block, ctx)?;
     Ok(JsPromise::resolve(JsValue::from(output), ctx).into())
+}
+
+/// `__crypto_aes_ctr(key, counter, length, data)` — the native byte operation
+/// behind the shared Web Crypto AES-CTR prelude. Web Cryptography Level 2
+/// §27.7 defines identical encrypt/decrypt counter-mode operations.
+fn sys_crypto_aes_ctr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let key = arg_buffer_source_bytes(args, 0, ctx).unwrap_or_default();
+    let counter = arg_buffer_source_bytes(args, 1, ctx).unwrap_or_default();
+    let length = args
+        .get(2)
+        .and_then(|value| value.as_number())
+        .filter(|value| value.is_finite() && value.fract() == 0.0)
+        .and_then(|value| u8::try_from(value as i64).ok())
+        .unwrap_or(0);
+    let input = arg_buffer_source_bytes(args, 3, ctx).unwrap_or_default();
+    let output = crate::crypto::aes_ctr_crypt(&key, &counter, length, &input).ok_or_else(|| {
+        boa_engine::JsNativeError::error().with_message("Invalid AES-CTR parameters")
+    })?;
+    let block = boa_engine::object::builtins::AlignedVec::from_iter(0, output);
+    let buffer = boa_engine::object::builtins::JsArrayBuffer::from_byte_block(block, ctx)?;
+    Ok(JsPromise::resolve(JsValue::from(buffer), ctx).into())
 }
 
 /// `__compression_encode(format, bufferSource)` — the Compression Streams

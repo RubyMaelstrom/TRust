@@ -1575,6 +1575,15 @@ impl DesktopApp {
         self.decoded_images_pending_layout = false;
     }
 
+    fn current_page_blobs(&self) -> Option<trust::js::BlobMap> {
+        self.browser
+            .current_page()
+            .and_then(|page| match &page.document {
+                FetchedDocument::Http(response) => response.blobs.clone(),
+                _ => None,
+            })
+    }
+
     /// Stop all unfinished work owned by the displayed document while keeping
     /// its completed layout and decoded pixels available as a frozen snapshot.
     /// HTML §7.5.11's abort-a-document algorithm cancels document fetches and
@@ -1601,13 +1610,21 @@ impl DesktopApp {
 
     fn pump_image_loads(&mut self, generation: u64, image_epoch: u64, page: &url::Url) {
         let slots = IMAGE_FETCH_CONCURRENCY.saturating_sub(self.image_tasks.len());
+        let blobs = self.current_page_blobs();
         for request in self.image_loads.take_ready(slots) {
             let proxy = self.event_proxy.clone();
             let page = page.clone();
             let source = request.source.clone();
             let handle = request.handle;
+            let blobs = blobs.clone();
             let task = self.runtime.spawn(async move {
-                let result = match trust::http::fetch_graphical_image(&page, &source).await {
+                let result = match trust::http::fetch_graphical_image(
+                    &page,
+                    &source,
+                    blobs.as_ref(),
+                )
+                .await
+                {
                     Ok(bytes) => {
                         let decode_source = source.clone();
                         tokio::task::spawn_blocking(move || {
