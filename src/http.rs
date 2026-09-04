@@ -444,15 +444,21 @@ pub fn adapt_rendered_terminal(
     }
 }
 
-pub async fn fetch_graphical_image(page: &Url, source: &str) -> Result<Vec<u8>, String> {
+pub async fn fetch_graphical_image(
+    page: &Url,
+    source: &str,
+    blobs: Option<&crate::js::BlobMap>,
+) -> Result<Vec<u8>, String> {
     if source.starts_with("data:") {
         return crate::img::decode_data_url(source)
             .ok_or_else(|| String::from("invalid data image URL"));
     }
     if source.starts_with("blob:") {
-        return Err(String::from(
-            "blob image is not present in the static page mirror",
-        ));
+        let key = source.split('#').next().unwrap_or(source);
+        return blobs
+            .and_then(|mirror| mirror.lock().ok())
+            .and_then(|mirror| mirror.get(key).map(|(bytes, _)| bytes.clone()))
+            .ok_or_else(|| String::from("blob image is not present in the page mirror"));
     }
     let url = Url::parse(source).map_err(|error| format!("invalid image URL: {error}"))?;
     if !subresource_allowed(page, &url) {
@@ -4563,6 +4569,25 @@ mod tests {
                 .unwrap()
                 .contains("data:image/png;base64,iVBORw0KGgo=")
         );
+    }
+
+    #[tokio::test]
+    async fn graphical_image_fetch_resolves_blob_from_the_page_mirror() {
+        let page = Url::parse("https://example.test/login").unwrap();
+        let blob_url = "blob:https://example.test/qr-code";
+        let blobs = crate::js::BlobMap::default();
+        blobs.lock().unwrap().insert(
+            blob_url.to_owned(),
+            (vec![0, 1, 2, 255], "image/png".to_owned()),
+        );
+
+        assert_eq!(
+            fetch_graphical_image(&page, &format!("{blob_url}#fragment"), Some(&blobs))
+                .await
+                .unwrap(),
+            vec![0, 1, 2, 255]
+        );
+        assert!(fetch_graphical_image(&page, blob_url, None).await.is_err());
     }
 
     #[test]

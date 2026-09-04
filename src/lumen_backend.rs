@@ -829,7 +829,7 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     )?;
 
     let prelude_started = Instant::now();
-    eval(&mut engine, crate::js::PRELUDE, "TRust platform prelude")?;
+    eval(&mut engine, platform_prelude(), "TRust platform prelude")?;
     let prelude_time = prelude_started.elapsed();
     eval(
         &mut engine,
@@ -896,6 +896,22 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
 }
 
 #[cfg(feature = "lumen-backend")]
+/// The platform prelude, overridable for rapid iteration: `TRUST_PRELUDE_FILE` replaces the
+/// embedded prelude with a file's contents (read once). Editing js_platform.js then needs no
+/// rebuild — the next page load picks the new file up. Release builds ship the embedded const.
+fn platform_prelude() -> &'static str {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var_os("TRUST_PRELUDE_FILE")
+                .map(|path| std::fs::read_to_string(path).ok())
+                .unwrap_or(None)
+        })
+        .as_deref()
+        .unwrap_or(crate::js::PRELUDE)
+}
+
 mod desktop {
     use super::*;
     use crate::js::{FormSubmission, Outcome, PageCmd, PageEnv, PageEvt, PageHandle, PageHover};
@@ -1671,7 +1687,7 @@ mod desktop {
         // the route from location.pathname, so seeding the realm with `base`
         // collapses every such navigation to the base path.
         let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
+            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {} }};",
             json_string(response_url.as_str()),
             json_string(crate::locale::LANGUAGE),
             json_string(crate::locale::LANGUAGES[0]),
@@ -1684,12 +1700,13 @@ mod desktop {
                 .unwrap_or(8),
             crate::http::GLOBAL_PRIVACY_CONTROL,
             lumen_potentially_trustworthy(&response_url),
+            std::env::var_os("TRUST_TRACE_FRAMES").is_some(),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
             return Err(outcome);
         }
-        if let Err(error) = eval(&mut engine, crate::js::PRELUDE, "TRust platform prelude") {
+        if let Err(error) = eval(&mut engine, platform_prelude(), "TRust platform prelude") {
             outcome.errors.push(error);
             return Err(outcome);
         }
@@ -2556,6 +2573,16 @@ mod desktop {
                 if changed {
                     page.render_environment_dirty = true;
                     prepare_unbounded_task(interrupt);
+                    // HTML §4.8.4 / §8.1.7: the frontend's decoded-resource
+                    // completion makes the selected image request complete;
+                    // only then queue its non-bubbling `load` event as a later
+                    // task. BookReader removes BRpageloading from this event.
+                    let _ = call_trust(
+                        page,
+                        "scanImageLoadsWhenReady",
+                        &[],
+                        "decoded image load scan",
+                    );
                     let _ = call_trust(page, "updateIntersections", &[], "image geometry");
                     checkpoint(page, "image geometry");
                     finish_task(page, events)
@@ -3117,6 +3144,68 @@ mod desktop {
                 clicked.is_ok(),
                 "click render preceded its mandatory microtask checkpoint"
             );
+        }
+
+        #[tokio::test]
+        async fn decoded_image_completion_updates_complete_and_delivers_load() {
+            // WHATWG HTML §4.8.4 makes `complete` reflect the current image
+            // request, while the successful request's `load` event is queued
+            // separately from the task that learned the resource was ready.
+            // This is the BookReader regression: its page container remains
+            // BRpageloading until this event removes that class.
+            let html = r#"<!doctype html><html><body>
+                <button id="keep">keep actor resident</button>
+                <img id="picture" src="/page.jpg">
+                <output id="result">initial</output>
+                <script>
+                    const picture = document.getElementById("picture");
+                    const result = document.getElementById("result");
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    picture.addEventListener("load", () => {
+                        result.textContent = "loaded:" + picture.complete;
+                    });
+                    result.textContent = "initial:" + picture.complete;
+                </script>
+            </body></html>"#;
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+
+            let first = tokio::time::timeout(Duration::from_secs(30), events.recv())
+                .await
+                .expect("initial image fixture render timed out")
+                .expect("Lumen actor closed before image fixture render");
+            let PageEvt::Updated { html, .. } = first else {
+                panic!("expected an interactive image fixture, got {first:?}");
+            };
+            assert!(
+                html.contains("initial:false"),
+                "image started incomplete: {html}"
+            );
+
+            handle
+                .cmds
+                .send(PageCmd::ImageSizes(vec![(
+                    String::from("https://example.com/page.jpg"),
+                    (640, 480),
+                )]))
+                .await
+                .expect("image completion command accepted");
+            let loaded = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("loaded:true") => {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("image completion fixture failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before image load event"),
+                    }
+                }
+            })
+            .await
+            .expect("decoded image load event timed out");
+            assert!(loaded.contains("loaded:true"), "{loaded}");
         }
 
         #[tokio::test]
@@ -4087,6 +4176,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_len", 1, host_storage_len),
     ("__blob_mirror", 3, host_blob_mirror),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
+    ("__crypto_aes_ctr", 4, host_crypto_aes_ctr),
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
     ("__dom_popover", 2, host_dom_popover),
@@ -4250,6 +4340,14 @@ fn prepare_host_request(
 }
 
 fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
+    if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+        eprintln!(
+            "[fetch-trace] result status={} type={} len={}",
+            response.status,
+            response.content_type.split(';').next().unwrap_or(""),
+            response.body.len()
+        );
+    }
     Some((
         response.status,
         response.content_type,
@@ -4259,6 +4357,14 @@ fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
 }
 
 fn lumen_cached_result(response: &crate::http::CachedResp) -> LumenFetchResult {
+    if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+        eprintln!(
+            "[fetch-trace] cached status={} type={} len={}",
+            response.status,
+            response.content_type.split(';').next().unwrap_or(""),
+            response.body.len()
+        );
+    }
     Some((
         response.status,
         response.content_type.clone(),
@@ -4296,6 +4402,9 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
 /// application runtime while only this page thread waits, avoiding a nested Tokio `block_on`.
 fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (target, method, body, headers) = host_fetch_args(ctx, args);
+    if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+        eprintln!("[fetch-trace] sync {method} {target}");
+    }
     let work = ctx
         .host_mut::<HostState>()
         .and_then(|state| prepare_host_request(state, &target, method, body, headers));
@@ -4322,6 +4431,9 @@ enum AsyncFetchSource {
 /// is invoked later when the browser selects the networking task.
 fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (target, method, body, headers) = host_fetch_args(ctx, args);
+    if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+        eprintln!("[fetch-trace] async {method} {target}");
+    }
     let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
     let context = ctx.host_job_context();
 
@@ -4693,6 +4805,7 @@ fn spawn_resource_fetch(
         return false;
     };
     let shared = cache.peek(&request.url);
+    let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
     cache.spawn(&handle, async move {
         let result = match shared {
             Some(shared) => shared.await.ok().map(|response| {
@@ -4712,6 +4825,16 @@ fn spawn_resource_fetch(
                 )
             }),
         };
+        if trace_fetch {
+            match &result {
+                Some((status, ctype, body, _)) => eprintln!(
+                    "[fetch-trace] resource-done url={name} status={status} type={} len={}",
+                    ctype.split(';').next().unwrap_or(""),
+                    body.len()
+                ),
+                None => eprintln!("[fetch-trace] resource-done url={name} FAILED"),
+            }
+        }
         let _ = events.send(LumenHostTask::ResourceDone {
             context,
             node_id,
@@ -4802,6 +4925,9 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         )
     };
     let src = host_resource_url(ctx, node_id, src);
+    if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+        eprintln!("[fetch-trace] injected script src={src:?} module={module} node={node_id}");
+    }
 
     if let Some(src) = src {
         if src.trim_start().starts_with("data:") {
@@ -4826,6 +4952,12 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             prepare_host_request(state, &src, String::from("GET"), None, Vec::new())
                 .map(|(_, _, request)| request)
         });
+        if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+            eprintln!(
+                "[fetch-trace] injected request prepared={}",
+                request.is_some()
+            );
+        }
         let kind = if module {
             LumenResourceKind::ModuleScript
         } else {
@@ -5202,6 +5334,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             1,
             host_crypto_sha256_digest as NativeFn,
         ),
+        ("__crypto_aes_ctr", 4, host_crypto_aes_ctr as NativeFn),
         (
             "__compression_encode",
             2,
@@ -7446,23 +7579,36 @@ fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     )
 }
 
-/// HTML §4.8.4 `complete`: omitted/empty sources are complete. Until the frontend's resource
-/// availability state is injected into this backend, synchronously available data URLs are the
-/// selected requests that can be proven completely available.
+/// HTML §4.8.4 `complete`: omitted/empty sources are complete, as are current
+/// requests whose resource fetch/decode has completed. The terminal frontend
+/// injects decoded image sizes through `PageCmd::ImageSizes`; that map is the
+/// page actor's resource-availability state and is shared with layout so a
+/// script cannot observe a different image state from the one being painted.
 fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (base, viewport, density) = host_layout_environment(ctx);
-    let dom = host_dom(ctx);
-    let dom = dom.borrow();
-    let Some(id) = host_arg_node(&dom, args, 0) else {
+    let source = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(id) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Bool(false));
+        };
+        let src = dom.attr(id, "src").unwrap_or("").trim();
+        let srcset = dom.attr(id, "srcset").unwrap_or("").trim();
+        if src.is_empty() && srcset.is_empty() {
+            return Ok(Value::Bool(true));
+        }
+        crate::responsive_image::select(&dom, id, &base, viewport, density)
+            .map(|selected| selected.source)
+    };
+    let Some(source) = source else {
         return Ok(Value::Bool(false));
     };
-    let src = dom.attr(id, "src").unwrap_or("").trim();
-    let srcset = dom.attr(id, "srcset").unwrap_or("").trim();
-    if src.is_empty() && srcset.is_empty() {
-        return Ok(Value::Bool(true));
-    }
-    let complete = crate::responsive_image::select(&dom, id, &base, viewport, density)
-        .is_some_and(|selected| selected.source.starts_with("data:"));
+    // Data URLs are consumed synchronously by the platform. Other URLs become
+    // complete only after the frontend has decoded the selected source.
+    let complete = source.starts_with("data:")
+        || ctx
+            .host_mut::<HostState>()
+            .is_some_and(|state| state.images.borrow().contains_key(&source));
     Ok(Value::Bool(complete))
 }
 
@@ -7735,6 +7881,36 @@ fn host_crypto_sha256_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         .unwrap_or_default();
     let digest = sha2::Sha256::digest(input);
     let view = ctx.make_uint8array(&digest)?;
+    let buffer = ctx.member_get(&view, "buffer")?;
+    host_resolved_promise(ctx, buffer)
+}
+
+/// Web Cryptography Level 2 §27.7: AES-CTR's decrypt operation is the same
+/// counter-mode XOR as encrypt. The prelude performs algorithm normalization;
+/// this host keeps the raw key and copied BufferSource bytes out of the JS
+/// interpreter while returning a realm-local ArrayBuffer Promise result.
+fn host_crypto_aes_ctr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let key = args
+        .first()
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+        .ok_or_else(|| ctx.make_error("DataError", "AES key is not a BufferSource"))?;
+    let counter = args
+        .get(1)
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+        .ok_or_else(|| ctx.make_error("OperationError", "AES-CTR counter is not a BufferSource"))?;
+    let counter_bits = args
+        .get(2)
+        .and_then(Value::as_num_opt)
+        .filter(|value| value.is_finite() && value.fract() == 0.0)
+        .and_then(|value| u8::try_from(value as i64).ok())
+        .ok_or_else(|| ctx.make_error("OperationError", "Invalid AES-CTR counter length"))?;
+    let input = args
+        .get(3)
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+        .ok_or_else(|| ctx.make_error("TypeError", "AES-CTR data is not a BufferSource"))?;
+    let output = crate::crypto::aes_ctr_crypt(&key, &counter, counter_bits, &input)
+        .ok_or_else(|| ctx.make_error("OperationError", "Invalid AES-CTR parameters"))?;
+    let view = ctx.make_uint8array(&output)?;
     let buffer = ctx.member_get(&view, "buffer")?;
     host_resolved_promise(ctx, buffer)
 }
@@ -8026,7 +8202,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 116, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 117, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -8037,7 +8213,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 116);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 117);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -10430,6 +10606,43 @@ mod tests {
         assert_eq!(
             blobs.lock().unwrap().get(&blob_url).cloned(),
             Some((vec![0, 128, 255], "application/x-lumen-port".to_owned()))
+        );
+    }
+
+    #[test]
+    fn web_crypto_aes_ctr_import_and_decrypt_matches_standard_vector() {
+        // Web Cryptography Level 2 §27.7: AES-CTR uses a 16-byte counter,
+        // increments its rightmost counter bits as a big-endian integer, and
+        // exposes raw 128/192/256-bit keys through importKey().
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const fromHex = value => new Uint8Array(value.match(/../g).map(pair => parseInt(pair, 16)));
+            const toHex = value => Array.from(new Uint8Array(value))
+                .map(byte => byte.toString(16).padStart(2, "0")).join("");
+            globalThis.aesCtrResult = "pending";
+            crypto.subtle.importKey(
+                "raw",
+                fromHex("2b7e151628aed2a6abf7158809cf4f3c"),
+                "AES-CTR",
+                false,
+                ["decrypt"]
+            ).then(key => crypto.subtle.decrypt(
+                { name: "AES-CTR", counter: fromHex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"), length: 128 },
+                key,
+                fromHex("874d6191b620e3261bef6864990db6ce")
+            )).then(value => { aesCtrResult = toHex(value); })
+              .catch(error => { aesCtrResult = "ERROR:" + error.name + ":" + error.message; });
+            "##,
+            "Web Crypto AES-CTR",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "aesCtrResult"),
+            "6bc1bee22e409f96e93d7e117393172a"
         );
     }
 

@@ -300,6 +300,9 @@
         return [W.size, live, CONNECTED_W.size];
     };
 
+    const TRACE_FRAME = !!(cfg.frameTrace || false);
+    function ftrace(msg) { if (TRACE_FRAME) (typeof console !== "undefined" && console.log)("FT " + msg); }
+
     // A <script> element runs when it is FIRST inserted into the document
     // (HTML "prepare a script") — the universal SDK-loader idiom
     // `document.body.appendChild(scriptEl)` (reCAPTCHA, lazy analytics, embeds).
@@ -1338,6 +1341,44 @@
         }, 0);
         return pending.length;
     };
+    // The Lumen page actor receives image completion from the frontend only
+    // after the shared image pipeline has fetched and decoded the resource.
+    // HTML §4.8.4 exposes that state through `complete`, and the successful
+    // request's `load` event is delivered as a later task. Keep this separate
+    // from the legacy optimistic scan above: Boa's one-shot compatibility path
+    // has no frontend decode result to inject, while Lumen must not announce a
+    // network image before its bytes are available.
+    trust.__imgReadyDelivered = new Map();
+    trust.scanImageLoadsWhenReady = function () {
+        let imgs;
+        try { imgs = g.document.querySelectorAll("img"); } catch (e) { return 0; }
+        const pending = [];
+        for (let i = 0; i < imgs.length; i++) {
+            const im = imgs[i];
+            const id = im.__id;
+            if (typeof id !== "number") continue;
+            let complete = false;
+            try { complete = !!im.complete; } catch (e) {}
+            if (!complete) continue;
+            const source = String(im.currentSrc || im.getAttribute("src") || "");
+            if (!source) continue;
+            const previous = trust.__imgReadyDelivered.get(id);
+            if (previous === source) continue;
+            const m = LS.get(im);
+            const listening =
+                (m && m.get("load") && m.get("load").length) || typeof im.onload === "function";
+            // Mark the request delivered even when nobody listens. A listener
+            // attached after the resource event has run must not receive a
+            // second, synthetic notification.
+            trust.__imgReadyDelivered.set(id, source);
+            if (!listening) continue;
+            pending.push(im);
+        }
+        if (pending.length) setTimeout(function () {
+            for (const im of pending) { try { dispatch(im, new Event("load"), false); } catch (e) {} }
+        }, 0);
+        return pending.length;
+    };
     // --- iframe processing: HTML "process the iframe attributes" ----------
     // An <iframe>/<frame> renders its nested document INLINE (the serializer
     // rewrites the frame + its realized content into a <div data-trust-frame>;
@@ -1508,6 +1549,7 @@
         return childWindow;
     }
     function loadFrameMarkup(frame, markup, base, frameUrl, generation) {
+        ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
         const initialWindow = frame.__trustInitialAboutBlank
             ? frame.__contentRealmWindow : null;
         const reuseInitialWindow = !!(initialWindow && initialWindow.__trust &&
@@ -1558,6 +1600,7 @@
     }
 
     function finishParsedFrameLoad(frame, generation) {
+        ftrace("finishParsedFrameLoad frame=" + frame.__id);
         // A cross-document navigation creates a new Document object. All
         // access paths within this navigation must subsequently return that
         // same object (Web IDL interface identity / Window.document).
@@ -1724,10 +1767,12 @@
         }
         if (!/^https?:/i.test(url)) { frame.__loadedSrc = undefined; return; }
         if (frameAncestorHasUrl(frame, url)) return; // circular-navigation guard
+        ftrace("processIframeAttributes https src=" + url);
         frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
         const generation = beginFrameLoad(frame);
         let r;
         try { r = __http_fetch(url, "GET", null, null, null); } catch (e) { r = null; }
+        ftrace("frame fetch -> " + (r ? r[0] + " " + r[1] + " len=" + String(r[2] || "").length : "null"));
         if (!r) { fireFrameLoad(frame, generation); return; }
         const status = r[0] | 0;
         const ctype = String(r[1] || "").toLowerCase();
@@ -1745,6 +1790,7 @@
     function hydrateFramesIn(root) {
         let frames;
         try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
+        ftrace("hydrate in " + (root && root.localName ? root.localName : "doc") + " frames=" + frames.length);
         for (let i = 0; i < frames.length; i++) {
             try {
                 const src = frames[i].getAttribute("src");
@@ -1783,9 +1829,10 @@
             }
             const previousGeneration = frame.__trustLoadGeneration || 0;
             try {
+                ftrace("queueFrameNavigation task -> processIframeAttributes src=" + frame.getAttribute("src") + " connected=" + frame.isConnected);
                 processIframeAttributes(frame);
                 loadFrameStyles(frame);
-            } catch (e) {}
+            } catch (e) { ftrace("queueFrameNavigation task threw " + ((e && e.message) || e)); }
             // A successful navigation retires from queueFrameElementLoad,
             // after the child Window and iframe load-event tasks. If the
             // attributes changed before this task ran, no load task exists;
@@ -1800,6 +1847,7 @@
     function queueFrameNavigationsIn(root) {
         let frames;
         try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
+        ftrace("queueFrameNavigationsIn root=" + (root && root.localName || "doc") + " frames=" + frames.length);
         for (let i = 0; i < frames.length; i++) {
             const src = frames[i].getAttribute("src");
             const blank = frames[i].getAttribute("srcdoc") === null &&
@@ -1823,6 +1871,7 @@
     // hydrateFrames() synchronously and settle all queued tasks before
     // serializing.
     trust.queueInitialFrameNavigations = function () {
+        ftrace("queueInitialFrameNavigations");
         queueFrameNavigationsIn(g.document);
     };
     // Lazy realization when a script reads a frame's contentDocument before the
@@ -6113,6 +6162,7 @@
             let scripts;
             try { scripts = frameDocument(frame).querySelectorAll("script"); }
             catch (e) { parserDone(); allDone(); return; }
+            ftrace("runFrameScripts found=" + scripts.length);
             const orderedModules = [];
             const asyncModules = [];
             for (const script of scripts) {
@@ -7351,7 +7401,7 @@
     reflectOn(["HTMLIFrameElement"], "srcdoc", reflectStrDesc);
     reflectOn(["HTMLImageElement", "HTMLSourceElement"], "srcset", reflectStrDesc);
     reflectOn(["HTMLImageElement", "HTMLSourceElement"], "sizes", reflectStrDesc);
-    reflectOn(["HTMLSourceElement"], "media", reflectStrDesc);
+    reflectOn(["HTMLLinkElement", "HTMLSourceElement", "HTMLStyleElement"], "media", reflectStrDesc);
     reflectOn(["HTMLImageElement"], "loading", reflectStrDesc);
     // SVG element interface zoo (all extend SVGElement). SvelteKit's link
     // handler branches on `e instanceof SVGAElement` to read `href.baseVal`
@@ -8797,14 +8847,16 @@
     };
 
     /*__CRYPTO_BEGIN__*/
-    // --- crypto: getRandomValues + randomUUID + subtle.digest ---
+    // --- crypto: getRandomValues + randomUUID + subtle.digest + AES-CTR ---
     // No CSPRNG here (text browser, no entropy source): random values
     // are Math.random-derived — fine for request ids / cache keys, NOT
     // real cryptography. subtle.digest IS a true SHA so libraries that
     // hash before they fetch work (archive.org's collection search gates
-    // its tile fetch on a SHA-1 request-uid — without this the grid
-    // stays empty). Only digest is implemented; the rest of SubtleCrypto
-    // stays an honest remainder.
+    // its tile fetch on a SHA-1 request-uid — without this the grid stays
+    // empty. AES-CTR is also implemented because protected document viewers
+    // use the standard importKey/decrypt pair to turn a fetched protected
+    // image into a Blob URL. The key material stays in this closure and only
+    // copied bytes cross the native crypto seam.
     const __cryptoBytes = (d) => {
         if (d instanceof ArrayBuffer) return new Uint8Array(d.slice(0));
         if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
@@ -8953,6 +9005,54 @@
         for (let i = 0; i < 6; i++) { o.setUint32(i * 8, Number((h[i] >> 32n) & 0xffffffffn)); o.setUint32(i * 8 + 4, Number(h[i] & 0xffffffffn)); }
         return out;
     }
+    const __cryptoKeyStore = [];
+    const __cryptoKeyToken = {};
+    const __cryptoError = (name, message) => {
+        const error = new Error(message);
+        error.name = name;
+        return error;
+    };
+    const __cryptoAlgorithmName = (algorithm) => String(
+        typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || ""
+    ).toUpperCase();
+    class CryptoKey {
+        constructor(token, slot) {
+            if (token !== __cryptoKeyToken) throw new TypeError("Illegal constructor");
+            Object.defineProperty(this, "__trustCryptoSlot", {
+                configurable: false, enumerable: false, writable: false, value: slot,
+            });
+        }
+        get type() { return "secret"; }
+        get extractable() { return !!__cryptoKeyStore[this.__trustCryptoSlot][2]; }
+        get algorithm() {
+            return { name: "AES-CTR", length: __cryptoKeyStore[this.__trustCryptoSlot][1] * 8 };
+        }
+        get usages() { return __cryptoKeyStore[this.__trustCryptoSlot][3].slice(); }
+    }
+    const __cryptoKeyBytes = (key) => {
+        if (!(key instanceof CryptoKey)) return null;
+        const entry = __cryptoKeyStore[key.__trustCryptoSlot];
+        return entry ? entry[0] : null;
+    };
+    const __cryptoAesOperation = (algorithm, key, data, usage) => {
+        try {
+            if (__cryptoAlgorithmName(algorithm) !== "AES-CTR") {
+                return Promise.reject(__cryptoError("NotSupportedError", "Unsupported AES algorithm"));
+            }
+            const raw = __cryptoKeyBytes(key);
+            if (!raw || key.usages.indexOf(usage) < 0) {
+                return Promise.reject(__cryptoError("InvalidAccessError", "Key usage is not permitted"));
+            }
+            const counter = __cryptoBytes(algorithm && algorithm.counter);
+            const length = Number(algorithm && algorithm.length);
+            if (counter.length !== 16 || !Number.isInteger(length) || length < 1 || length > 128) {
+                return Promise.reject(__cryptoError("OperationError", "Invalid AES-CTR counter"));
+            }
+            return __crypto_aes_ctr(raw, counter, length, __cryptoBytes(data));
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    };
     g.crypto = {
         getRandomValues(a) {
             if (a && a.length !== undefined) for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 0x100000000);
@@ -8974,8 +9074,37 @@
                 if (name === "SHA-512") return Promise.resolve(__sha512(bytes).buffer);
                 return Promise.reject(new Error("Unsupported digest algorithm: " + name));
             },
+            importKey(format, keyData, algorithm, extractable, usages) {
+                try {
+                    if (String(format).toLowerCase() !== "raw"
+                        || __cryptoAlgorithmName(algorithm) !== "AES-CTR") {
+                        return Promise.reject(__cryptoError("NotSupportedError", "Unsupported AES key format or algorithm"));
+                    }
+                    const requested = Array.isArray(usages) ? usages.map(String) : [];
+                    const allowed = ["encrypt", "decrypt", "wrapKey", "unwrapKey"];
+                    if (requested.some((usage) => allowed.indexOf(usage) < 0)) {
+                        return Promise.reject(__cryptoError("SyntaxError", "Invalid AES key usage"));
+                    }
+                    const bytes = __cryptoBytes(keyData);
+                    if (bytes.length !== 16 && bytes.length !== 24 && bytes.length !== 32) {
+                        return Promise.reject(__cryptoError("DataError", "AES key must be 128, 192, or 256 bits"));
+                    }
+                    const slot = __cryptoKeyStore.length;
+                    __cryptoKeyStore.push([bytes, bytes.length, !!extractable, requested]);
+                    return Promise.resolve(new CryptoKey(__cryptoKeyToken, slot));
+                } catch (error) {
+                    return Promise.reject(error);
+                }
+            },
+            encrypt(algorithm, key, data) {
+                return __cryptoAesOperation(algorithm, key, data, "encrypt");
+            },
+            decrypt(algorithm, key, data) {
+                return __cryptoAesOperation(algorithm, key, data, "decrypt");
+            },
         },
     };
+    g.CryptoKey = CryptoKey;
     /*__CRYPTO_END__*/
 
     // DOMException — a real constructor (extends Error). core-js's

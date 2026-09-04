@@ -81,6 +81,7 @@ prompt commands (`open`, `post`, `reload`, `mode`, `send`, `set`, `toggle`, and
 | `--max-chars N` | Character budget for page text (`unlimited` for the whole page) | `8000` |
 | `--format text\|semantic` | Display-list text or accessibility tree output | `text` |
 | `--links` | Include link targets in text output | off |
+| `--js-diagnostics` | Print the last page-script outcome to stderr: JS errors, captured console lines, panic flag, skipped modules, and page fetch count (`[js-errors]`/`[js-console]`/`[js-outcome]` blocks) | off |
 | `-h`, `--help` | Print usage | — |
 
 #### How `trust-headless` decides it is finished
@@ -256,6 +257,7 @@ explicit legacy Boa backend.
 | `TRUST_LAYOUT_TRACE` | presence flag | Prints graphical layout stage timing from `layout2::lay_out_graphical`. |
 | `TRUST_FRAG_DIAG` | presence flag | Dumps the resolved graphical fragment tree (tag, position, size, and clip). Used with `layout_dump` for layout/paint discrepancies. |
 | `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
+| `TRUST_TRACE_PAGE_EVENTS` | presence flag | Prints a `[trace-event] <variant>` line to stderr for every page event the shared controller handles (`Updated`, `Static`, `Patched`, `Trouble`, navigation/settle events). Useful for proving which render path a page reached and in what order. |
 
 ### Lumen diagnostics
 
@@ -264,6 +266,9 @@ explicit legacy Boa backend.
 | `TRUST_LUMEN_TRACE` | presence flag | Logs Lumen script start/completion, JavaScript errors, console messages, and unhandled rejection details to stderr. |
 | `TRUST_LUMEN_TASK_TRACE` | presence flag | Emits a once-per-second resident page-actor task census: turns, commands, interactions, host/platform/timer/lifecycle work, render passes, updates, finishes, and queue state. |
 | `TRUST_LUMEN_PROBE` | JavaScript source | Evaluates the supplied expression/source in the resident page after a task and prints its value, throw, interruption, or parse error. This is a diagnostic probe, not page content. |
+| `TRUST_PRELUDE_FILE` | file path | Replaces the embedded platform prelude (`js_platform.js`) with the given file's contents for the process, read once on first use. Intended for rapid iteration on prelude code: edit `src/js_platform.js`, set this to that path, and the *next page load* picks the change up — no rebuild or relink is needed. The override is read in the Lumen backend at prelude evaluation time, independently of `__trust_cfg`. Release/shipped builds keep the embedded prelude; leave this unset. An unreadable path falls back to the embedded prelude. |
+| `TRUST_TRACE_FRAMES` | presence flag | Requests the prelude's gated frame-flow trace, emitted as `FT ...` console lines (`log: FT …` under `--js-diagnostics`): frame hydration sweeps (root + frame count), `processIframeAttributes` src and fetch outcome, queue-task dispatch, `loadFrameMarkup` entry (url + markup size), `finishParsedFrameLoad`, and `runFrameScripts` found-script counts. The trace flag travels through `__trust_cfg.frameTrace`, so it also works for worker/standalone contexts where the prelude reads the cfg. |
+| `TRUST_TRACE_FETCH` | presence flag | Logs every page fetch to stderr as `[fetch-trace] sync|async <METHOD> <url>`, followed by `[fetch-trace] result status=<N> type=<TYPE> len=<N>` when the response resolves through the unbuffered result path. Pair with `TRUST_LUMEN_TRACE` and `--js-diagnostics` to reconstruct a page's script/fetch timeline. |
 
 ### WebSocket diagnostics
 

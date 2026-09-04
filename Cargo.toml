@@ -69,6 +69,7 @@ lumen-spike = ["lumen-backend"]
 [dependencies]
 accesskit = "0.24.1"
 accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
+aes = "0.8.4"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 boa_engine = { version = "0.21", features = ["annex-b"], optional = true }
 # Legacy Boa-only dependency for its lazy-parse control surface

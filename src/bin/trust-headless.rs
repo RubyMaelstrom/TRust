@@ -82,6 +82,7 @@ struct Options {
     format: Format,
     list_links: bool,
     max_chars: usize,
+    js_diagnostics: bool,
 }
 
 const USAGE: &str = "\
@@ -96,6 +97,8 @@ usage: trust-headless [options] URL
                   unlimited keeps the whole page)
   --format F      text (default) or semantic
   --links         also list every linked target found in the page
+  --js-diagnostics  print the last page-script outcome: JS errors, console
+                  output, module skips, panic flag, and fetch count
   -h, --help      show this message
 
 Exit status: 0 when the dump is complete, 1 when no page loaded, 2 on a bad
@@ -113,6 +116,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut format = Format::Text;
     let mut list_links = false;
     let mut max_chars = 8000usize;
+    let mut js_diagnostics = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -134,6 +138,7 @@ fn parse_args() -> Result<Option<Options>, String> {
                 };
             }
             "--links" => list_links = true,
+            "--js-diagnostics" => js_diagnostics = true,
             "--max-chars" => {
                 let raw = string("--max-chars", &mut args)?;
                 max_chars = match raw.as_str() {
@@ -163,6 +168,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         format,
         list_links,
         max_chars,
+        js_diagnostics,
     }))
 }
 
@@ -385,6 +391,29 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         let _ = out.write_all(b"\n--- links ---\n");
         for link in links {
             let _ = writeln!(out, "{link}");
+        }
+    }
+    if options.js_diagnostics {
+        match controller.last_js_outcome() {
+            Some(outcome) => {
+                if !outcome.errors.is_empty() {
+                    eprintln!("[js-errors] {} error(s):", outcome.errors.len());
+                    for error in &outcome.errors {
+                        eprintln!("  {error}");
+                    }
+                }
+                if !outcome.console.is_empty() {
+                    eprintln!("[js-console] {} line(s):", outcome.console.len());
+                    for line in &outcome.console {
+                        eprintln!("  {line}");
+                    }
+                }
+                eprintln!(
+                    "[js-outcome] panicked={} modules_skipped={} fetches={}",
+                    outcome.panicked, outcome.modules_skipped, outcome.fetches
+                );
+            }
+            None => eprintln!("[js-outcome] none (page ran no script render event)"),
         }
     }
     let _ = out.flush();
