@@ -91,6 +91,12 @@ struct Builder<'a, 't> {
     /// inherited from outside a transformed stacking context must be pushed
     /// before that transform and retained for the context's descendants.
     hard_clips: Vec<CssRect>,
+    /// Scrollports already emitted around the current paint subtree. Scroll
+    /// clipping is in the scroll container's coordinate system, so a
+    /// descendant stacking-context transform must be nested inside these
+    /// clips rather than wrapping them. Keeping the active prefix lets the
+    /// ordinary fragment painter add only newly-entered scrollports.
+    scroll_nodes: Vec<NodeId>,
 }
 
 impl<'a, 't> Builder<'a, 't> {
@@ -129,6 +135,7 @@ impl<'a, 't> Builder<'a, 't> {
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
             hard_clips: Vec::new(),
+            scroll_nodes: Vec::new(),
         };
         this.collect_legacy_clips(root);
         this.collect_scroll_containers(root);
@@ -319,7 +326,23 @@ impl<'a, 't> Builder<'a, 't> {
             current = self.dom.parent_flat(id);
         }
         chain.reverse();
-        for container in &chain {
+        let common = self
+            .scroll_nodes
+            .iter()
+            .zip(&chain)
+            .take_while(|(active, requested)| **active == requested.node)
+            .count();
+        // Paint traversal is properly nested: a caller can only request the
+        // active ancestor chain or extend it. If a future paint path violates
+        // that invariant, retain the complete requested chain instead of
+        // dropping an outer clip; the normal pop below restores the active
+        // prefix after the nested scope.
+        let common = if common == self.scroll_nodes.len() {
+            common
+        } else {
+            0
+        };
+        for container in &chain[common..] {
             self.commands
                 .push(DisplayCommand::PushClip(PaintShape::Rect(
                     container.viewport,
@@ -327,13 +350,16 @@ impl<'a, 't> Builder<'a, 't> {
             self.commands
                 .push(DisplayCommand::BeginScroll(container.node));
         }
-        chain.len()
+        self.scroll_nodes
+            .extend(chain[common..].iter().map(|container| container.node));
+        chain.len() - common
     }
 
     fn pop_scroll_ancestors(&mut self, count: usize) {
         for _ in 0..count {
             self.commands.push(DisplayCommand::EndScroll);
             self.commands.push(DisplayCommand::PopClip);
+            self.scroll_nodes.pop();
         }
     }
 
@@ -661,6 +687,12 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     let boundary_start = builder.commands.len();
     let boundary_line_start = builder.lines.len();
     let boundary = graphical_boundary(fragment, builder);
+    // CSS Overflow 3 §2.3 and CSS Transforms 1 §3: a scrollport is the
+    // viewport through which a transformed descendant is seen. Emit the
+    // ancestor scrollport before this stacking context's transform, so the
+    // scrollport remains fixed in its own coordinate system instead of being
+    // scaled/translated along with the page layer.
+    let scroll_depth = builder.push_scroll_ancestors(fragment.node);
     let sticky = builder
         .sticky_constraints
         .iter()
@@ -739,6 +771,7 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     if sticky.is_some() {
         builder.commands.push(DisplayCommand::EndSticky);
     }
+    builder.pop_scroll_ancestors(scroll_depth);
     if let Some((actor, node, rect)) = boundary {
         builder.boundaries.push(super::GraphicalBoundary {
             actor,
