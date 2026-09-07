@@ -112,10 +112,19 @@ pub(crate) fn size(
     // Responsive images size from the selected resource, never the `src`
     // fallback that HTML suppresses when a width-descriptor source set is
     // active.
-    let svg_ratio = url
-        .and_then(crate::img::svg_url_ratio_only)
-        .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
-        .filter(|&r| r > 0.0);
+    // CSS Images 3 #default-sizing: two definite dimensions determine the
+    // box without consulting the intrinsic ratio. In particular, do not
+    // repeatedly decode/parse a potentially large data-URL SVG when neither
+    // axis can use its metadata. Min/max still clamp those axes below, and
+    // object-fit still receives the decoded natural size independently.
+    // Test the resolved dimensions: an indefinite percentage remains auto.
+    let svg_ratio = if spec_w.is_none() || spec_h.is_none() {
+        url.and_then(crate::img::svg_url_ratio_only)
+            .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
+            .filter(|&r| r > 0.0)
+    } else {
+        None
+    };
     let ratio_only = (spec_w.is_none() && spec_h.is_none() && cb_w.is_some())
         .then_some(svg_ratio)
         .flatten();
@@ -332,6 +341,98 @@ pub(crate) fn parse_ratio(value: &str) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn svg_size(
+        attributes: &str,
+        natural: Option<(f32, f32)>,
+        cb_w: Option<f32>,
+        cb_h: Option<f32>,
+    ) -> (Replaced, usize) {
+        let dom = Dom::parse_document(&format!("<!doctype html><img id='sized' {attributes}>"));
+        let node = dom.get_by_id("sized").unwrap();
+        let before = crate::img::SVG_URL_RATIO_READS.get();
+        let result = size(
+            &dom,
+            node,
+            ImageInput {
+                dimension_source: node,
+                natural,
+                url: Some("data:image/svg+xml,%3Csvg%20viewBox='0%200%20300%20100'/%3E"),
+            },
+            cb_w,
+            cb_h,
+            Vp {
+                w: 960.0,
+                h: 1024.0,
+            },
+        )
+        .unwrap();
+        (result, crate::img::SVG_URL_RATIO_READS.get() - before)
+    }
+
+    #[test]
+    fn definite_svg_dimensions_skip_intrinsic_metadata() {
+        for attributes in [
+            "style='width:240px;height:120px'",
+            "width='240' height='120'",
+            "style='width:50%;height:50%'",
+        ] {
+            let (result, reads) = svg_size(attributes, None, Some(480.0), Some(240.0));
+            assert_eq!((result.box_w, result.box_h), (240.0, 120.0));
+            assert_eq!(reads, 0, "{attributes}");
+        }
+    }
+
+    #[test]
+    fn definite_svg_dimensions_keep_min_max_and_object_fit() {
+        let (result, reads) = svg_size(
+            "style='width:240px;height:120px;max-width:180px;min-height:150px;object-fit:contain'",
+            Some((320.0, 160.0)),
+            Some(480.0),
+            Some(240.0),
+        );
+        assert_eq!((result.box_w, result.box_h), (180.0, 150.0));
+        // Fitting uses the supplied natural dimensions, not URL metadata.
+        assert_eq!((result.paint_w, result.paint_h), (180.0, 90.0));
+        assert_eq!((result.off_x, result.off_y), (0.0, 30.0));
+        assert!(!result.crop);
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn auto_svg_axis_still_reads_exact_intrinsic_ratio() {
+        for (style, expected) in [
+            ("width:240px;height:auto", (240.0, 80.0)),
+            ("width:auto;height:120px", (360.0, 120.0)),
+            ("width:auto;height:auto", (480.0, 160.0)),
+        ] {
+            // Raster fallback deliberately differs from the exact SVG ratio.
+            let (result, reads) = svg_size(
+                &format!("style='{style}'"),
+                Some((152.0, 144.0)),
+                Some(480.0),
+                Some(240.0),
+            );
+            assert_eq!((result.box_w, result.box_h), expected, "{style}");
+            assert_eq!(reads, 1, "{style}");
+        }
+    }
+
+    #[test]
+    fn indefinite_svg_percentage_still_reads_intrinsic_ratio() {
+        let (result, reads) = svg_size("style='width:240px;height:50%'", None, Some(480.0), None);
+        assert_eq!((result.box_w, result.box_h), (240.0, 80.0));
+        assert_eq!(reads, 1);
+        // An authored auto overrides an HTML presentational height hint.
+        let (result, reads) = svg_size(
+            "width='240' height='120' style='height:auto'",
+            None,
+            Some(480.0),
+            Some(240.0),
+        );
+        assert_eq!((result.box_w, result.box_h), (240.0, 80.0));
+        assert_eq!(reads, 1);
+    }
 
     #[test]
     fn constraint_table_preserves_ratio() {
