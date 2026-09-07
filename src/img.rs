@@ -929,7 +929,14 @@ pub(crate) fn svg_url_ratio_only(src: &str) -> Option<f32> {
     if src.len() < 14 || !src.as_bytes()[..14].eq_ignore_ascii_case(b"data:image/svg") {
         return None;
     }
+    #[cfg(test)]
+    SVG_URL_RATIO_READS.set(SVG_URL_RATIO_READS.get() + 1);
     svg_bytes_ratio_only(&decode_data_url(src)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SVG_URL_RATIO_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Process-global cache of EXTERNAL image URLs whose SVG is ratio-only (a
