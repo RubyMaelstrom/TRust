@@ -1220,13 +1220,6 @@ impl InlineStyle {
         s
     }
 
-    /// The sticky `opacity:0` chain alone (a suppressed OUT-OF-FLOW box is
-    /// skipped entirely — no paint, no scrollable extent; `visibility` stays
-    /// re-clearable and lays as a ghost).
-    pub fn opacity_suppressed(&self) -> bool {
-        self.opacity_chain
-    }
-
     pub fn text_style(&self) -> crate::text::TextStyle {
         crate::text::TextStyle {
             family: self.font_family.clone(),

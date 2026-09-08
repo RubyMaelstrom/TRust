@@ -19,7 +19,7 @@ in a sibling checkout. The current integration checkout is laid out as:
 
 ```text
 Code/
-├── Lumen/   # TRust integration branch, currently fc3d289
+├── Lumen/   # tested engine revision: 8b456e1c3d544111af3dae058becef11f8ce6bb9
 └── TRust/
 ```
 

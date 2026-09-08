@@ -3083,19 +3083,6 @@ impl Dom {
         true
     }
 
-    /// Whether `id` or one of its DOM descendants carries native hyperlink
-    /// activation semantics and remains eligible for point hit testing. This
-    /// lets layout retain an otherwise paint-suppressed out-of-flow subtree
-    /// only when discarding it would also discard a real interaction surface.
-    pub fn subtree_has_point_hit_target(&self, id: NodeId) -> bool {
-        (self.tag_name(id) == Some("a")
-            && self.attr(id, "href").is_some()
-            && self.point_hit_testable(id))
-            || self
-                .child_iter(id)
-                .any(|child| self.subtree_has_point_hit_target(child))
-    }
-
     /// Whether an element reserves height (`vertical`) or width via positive
     /// padding on that axis — the responsive-image "intrinsic ratio" idiom
     /// (`padding-bottom:56.25%` on a `height:0` box). A non-zero/`auto`/unknown

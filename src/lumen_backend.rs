@@ -8494,6 +8494,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transparent_positioned_carousel_slides_keep_cssom_geometry() {
+        // CSS Color 4 #transparency is a post-layout group operation;
+        // CSSOM View #dom-htmlelement-offsetwidth/#dom-htmlelement-offsetheight
+        // measure boxes regardless of opacity or pointer eligibility.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<style>
+            body { margin:0 } #carousel { position:relative;width:240px }
+            .slide { position:absolute;top:0;left:0;width:100%;opacity:0;pointer-events:none }
+            .slide > div { height:80px } .slide.active { position:relative;opacity:1;pointer-events:auto }
+            #fixed { position:fixed;top:100px;left:10px;width:70px;height:30px;opacity:0;pointer-events:none }
+            #parent { opacity:0 } #child { position:absolute;width:60px;height:40px }
+            #none { display:none }
+            </style><div id=carousel><div class='slide active'><div>first</div></div>
+            <div class=slide><div>second</div></div><div class=slide><div>third</div></div></div>
+            <div id=fixed></div><div id=parent><div id=child></div></div><div id=none class=slide></div>"#,
+        )));
+        let mut engine = configured_engine(
+            HostState::new(dom, Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(&mut engine, r#"
+            JSON.stringify(Array.from(document.querySelectorAll('#carousel .slide')).map(
+                el => [el.offsetWidth,el.offsetHeight,el.getBoundingClientRect().width,el.offsetParent.id]))
+        "#),
+            r#"[[240,80,240,"carousel"],[240,80,240,"carousel"],[240,80,240,"carousel"]]"#
+        );
+        assert_eq!(
+            string_value(&mut engine, r#"
+            JSON.stringify(['fixed','child','none'].map(id => {
+                const el=document.getElementById(id); return [el.offsetWidth,el.offsetHeight];
+            }))
+        "#),
+            "[[70,30],[60,40],[0,0]]"
+        );
+        // The arrow algorithm uses dimensions to skip display:none slides.
+        // Unlike a dot's direct index selection, it cannot advance if the
+        // transparent candidates were incorrectly removed from layout.
+        assert_eq!(
+            string_value(&mut engine, r#"
+            (() => {
+                const slides=Array.from(document.querySelectorAll('#carousel .slide'));
+                let index=0;
+                const advance=delta => {
+                    let searched=0;
+                    do { index=(index+delta+slides.length)%slides.length; }
+                    while (!(slides[index].offsetWidth || slides[index].offsetHeight) && ++searched<slides.length);
+                    for(let i=0;i<slides.length;i++)slides[i].className=i===index?'slide active':'slide';
+                    return index;
+                };
+                return [advance(1),advance(1),advance(1),advance(-1)].join(',');
+            })()
+        "#),
+            "1,2,0,2"
+        );
+    }
+
+    #[test]
     fn retained_layout_geometry_hit_testing_and_paint_share_one_transaction() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<style>

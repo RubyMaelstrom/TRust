@@ -5871,9 +5871,9 @@ mod tests {
     }
 
     #[test]
-    fn opacity_zero_abspos_contributes_nothing() {
+    fn opacity_zero_abspos_group_does_not_erase_terminal_content() {
         let out = lay(
-            r#"<body style="margin:0"><p style="margin:0">cap</p><div style="opacity:0;position:absolute;left:0;top:0">ghost</div></body>"#,
+            r#"<body style="margin:0"><p style="margin:0">cap</p><div id="transparent" style="opacity:0;position:absolute;left:0;top:0;width:80px;height:32px;background:red"><div style="background:blue">ghost</div></div></body>"#,
             80,
         );
         assert!(
@@ -5884,6 +5884,11 @@ mod tests {
             "a paint-suppressed out-of-flow box emits no cells at all"
         );
         assert_eq!(out.rows.iter().filter(|r| !r.items.is_empty()).count(), 1);
+        assert_eq!(
+            row_text(&out.rows[0]),
+            "cap",
+            "transparent descendants must not erase underlying paint"
+        );
     }
 
     #[test]

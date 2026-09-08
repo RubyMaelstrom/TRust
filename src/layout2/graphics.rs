@@ -1338,7 +1338,13 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
     let style_node = style.map(PaintStyle::node).unwrap_or(fragment.node);
     let scroll_depth = builder.push_scroll_ancestors(style_node);
-    let fragment_clip = builder.ancestor_clip(style_node, fragment.clip);
+    // Anonymous lines acquire their scroll scope per piece below. Their
+    // inherited clip is in content coordinates too: establishing it here,
+    // before BeginScroll, would leave it at the card's unscrolled position.
+    let anonymous_line = fragment.node == NO_NODE && matches!(fragment.kind, FragKind::Line(_));
+    let fragment_clip = (!anonymous_line)
+        .then(|| builder.ancestor_clip(style_node, fragment.clip))
+        .flatten();
     let pushed_fragment_clip = fragment_clip.is_some_and(|clip| builder.push_hard_clip(clip));
     // A descendant block's background, border, outline, and hit region are
     // part of the marquee contents just as its text and replaced images are.
@@ -1503,11 +1509,20 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             // the generating DOM node. Use that node for the scrollport chain
             // so inline text/replaced content inside a shadow tree receives
             // the same clip and scroll transform as element fragments.
-            let piece_scroll_depth = if fragment.node == NO_NODE {
+            let piece_scroll_depth = if anonymous_line {
                 builder.push_scroll_content_chain(node)
             } else {
                 0
             };
+            // CSS Overflow 3 #scrolling: move a descendant's own overflow
+            // clip with the descendant, through the stationary scrollport.
+            // Scope the whole piece, including its hit region, after the
+            // scroll transform; a hover-created stacking context must not
+            // change which pixels/links survive clipping.
+            let piece_clip = anonymous_line
+                .then(|| builder.ancestor_clip(node, fragment.clip))
+                .flatten()
+                .is_some_and(|clip| builder.push_hard_clip(clip));
             let form_piece = matches!(piece.item.kind, super::ItemKind::Form);
             let piece_rect = form_piece
                 .then(|| {
@@ -1679,6 +1694,9 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         }),
                     );
                 }
+            }
+            if piece_clip {
+                builder.pop_hard_clip();
             }
             builder.pop_scroll_ancestors(piece_scroll_depth);
         }

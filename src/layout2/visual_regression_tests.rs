@@ -10,6 +10,173 @@ fn by_id(dom: &Dom, id: &str) -> NodeId {
 }
 
 #[test]
+fn carousel_inline_paint_and_hits_survive_retained_scroll_and_hover() {
+    // CSS Overflow 3 #scrolling and CSS Transforms 1 #transform-rendering:
+    // scrolling moves contents through a stationary scrollport. A card's
+    // own overflow clip moves with that card, with or without a hover layer.
+    let card = r#"<div class=card><a href='/card'><img width=60 height=40
+        src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='40'%3E%3Cpath fill='red' d='M0 0h60v40H0z'/%3E%3C/svg%3E">TEXT</a>
+        <b></b></div>"#;
+    let html = format!(
+        "<style>body{{margin:0;background:white}}#carousel{{display:flex;position:relative;
+         width:100px;height:100px;overflow-x:auto;overflow-y:hidden}}
+         .card{{position:relative;flex:0 0 100px;height:100px;overflow:hidden;background:#eee}}
+         .card:hover{{z-index:2}}a{{color:blue;font:16px monospace}}
+         b{{position:absolute;top:80px;left:0;width:20px;height:20px;background:lime}}</style>
+         <div id=carousel>{card}{card}{card}</div>"
+    );
+    let mut dom = Dom::parse_document(&html);
+    let carousel = by_id(&dom, "carousel");
+    let cards = dom.children(carousel);
+    let base = Url::parse("https://example.test/").unwrap();
+    let viewport = CssSize::new(140., 120.);
+    let layout = |dom: &Dom| {
+        lay_out_graphical(
+            dom,
+            &base,
+            Viewport::new(140., 120.),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+    };
+    let mut page = layout(&dom).paint;
+    let mut hit_scene = headless::scene_for_dom(
+        &dom,
+        &base,
+        viewport,
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        ImageStore::default(),
+    );
+    let first = headless::render_paint(&page, viewport).unwrap();
+    let red = first
+        .pixels
+        .chunks_exact(4)
+        .filter(|p| p[0] > 200 && p[1] < 20 && p[2] < 20)
+        .count();
+    let blue = first
+        .pixels
+        .chunks_exact(4)
+        .filter(|p| p[2] > 100 && p[0] < 100 && p[1] < 100)
+        .count();
+    assert!(
+        red > 1500 && blue > 30,
+        "fixture must paint image and text: {red}, {blue}"
+    );
+    let passes = layout_pass_count();
+    for offset in [100., 200., 100., 0.] {
+        page.scroll_containers
+            .iter_mut()
+            .find(|c| c.node == carousel)
+            .unwrap()
+            .offset
+            .x = offset;
+        let frame = headless::render_paint(&page, viewport).unwrap();
+        let difference = headless::compare_rgba(&first, &frame, 0).unwrap();
+        assert_eq!(
+            difference.fraction_over_tolerance, 0.,
+            "retained scroll to {offset} must preserve all card pixels: {difference:?}"
+        );
+        hit_scene.primitives.clear();
+        hit_scene.append_page(&page, CssPoint::default());
+        let hit = hit_scene
+            .page_hit_at(CssPoint::new(20., 20.))
+            .expect("scrolled image link");
+        assert_eq!(
+            hit.node,
+            dom.children(dom.children(cards[(offset / 100.) as usize])[0])[0]
+        );
+        assert!(hit.link.is_some());
+        assert!(
+            hit_scene.page_hit_at(CssPoint::new(120., 20.)).is_none(),
+            "link outside the scrollport must remain clipped"
+        );
+    }
+    assert_eq!(
+        layout_pass_count(),
+        passes,
+        "scroll-only pixels and hits reuse layout"
+    );
+    // A fresh paint after entering/leaving :hover must match retained scrolling.
+    dom.set_scroll_pos(carousel, 0., 100., true);
+    for hovered in [Some(cards[1]), None] {
+        dom.set_hover_chain(hovered);
+        let frame = headless::render_paint(&layout(&dom).paint, viewport).unwrap();
+        let difference = headless::compare_rgba(&first, &frame, 0).unwrap();
+        assert_eq!(
+            difference.fraction_over_tolerance, 0.,
+            "hover={hovered:?} must not reveal or hide content: {difference:?}"
+        );
+    }
+}
+
+#[test]
+fn carousel_inline_clips_follow_nested_scroll_coordinates() {
+    for direction in ["row", "column"] {
+        for clip_style in [
+            "overflow:hidden",
+            "overflow:hidden;border-radius:12px",
+            "overflow-x:clip;overflow-y:visible",
+        ] {
+            let card = "<div class=card><a href='/item'>SCROLLED TEXT</a><div style='height:40px;background:red'></div></div>";
+            let dom = Dom::parse_document(&format!(
+                "<style>body{{margin:0;background:white}}#outer{{width:100px;height:100px;overflow:auto;transform:translate(10px,10px)}}
+                 #carousel{{width:100px;height:100px;display:flex;flex-direction:{direction};overflow:auto}}
+                 .card{{position:relative;flex:none;width:100px;height:100px;background:#eee;{clip_style}}}
+                 a{{font:16px monospace;color:blue}}</style>
+                 <div id=outer><div style='height:60px'></div><div id=carousel>{card}{card}{card}</div></div>"
+            ));
+            let outer = by_id(&dom, "outer");
+            let carousel = by_id(&dom, "carousel");
+            let mut page = lay_out_graphical(
+                &dom,
+                &Url::parse("https://example.test/").unwrap(),
+                Viewport::new(140., 140.),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .paint;
+            page.scroll_containers
+                .iter_mut()
+                .find(|c| c.node == outer)
+                .unwrap()
+                .offset
+                .y = 60.;
+            let first = headless::render_paint(&page, CssSize::new(140., 140.)).unwrap();
+            assert!(
+                first
+                    .pixels
+                    .chunks_exact(4)
+                    .filter(|p| p[2] > 100 && p[0] < 100 && p[1] < 100)
+                    .count()
+                    > 30
+            );
+            for offset in [100., 200., 0.] {
+                let scroll = page
+                    .scroll_containers
+                    .iter_mut()
+                    .find(|c| c.node == carousel)
+                    .unwrap();
+                if direction == "row" {
+                    scroll.offset.x = offset;
+                } else {
+                    scroll.offset.y = offset;
+                }
+                let frame = headless::render_paint(&page, CssSize::new(140., 140.)).unwrap();
+                let difference = headless::compare_rgba(&first, &frame, 0).unwrap();
+                assert_eq!(
+                    difference.fraction_over_tolerance, 0.,
+                    "{direction}, {clip_style}, {offset}: {difference:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn contenteditable_keeps_ordinary_css_paint() {
     let dom = Dom::parse_document(
         "<style>body{margin:0;background:lime}div{width:120px;height:60px}</style><div contenteditable=true></div>",
