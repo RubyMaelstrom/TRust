@@ -58,6 +58,10 @@ pub(crate) fn size(
         natural,
         url,
     } = image;
+    let natural = dom
+        .canvas_size(node)
+        .map(|(w, h)| (w as f32, h as f32))
+        .or(natural);
     let u = Units::of(dom, node);
     let css = |prop: &str, basis: Option<f32>| {
         dom.computed_value_resolved(node, prop)
@@ -131,7 +135,18 @@ pub(crate) fn size(
     // Prefer the exact viewBox ratio for a ratio-only image. A decoder may
     // supply a rasterized fallback size whose ratio differs slightly from the
     // vector's author-provided viewBox.
-    let ratio = svg_ratio.or_else(|| ratio_of(dom, node, dimension_source, natural));
+    // SVG 2 §8.12: an inline SVG retains its exact viewBox ratio when only
+    // one CSS dimension is definite. Baking that dimension into the image
+    // resource must not hide the ratio before asynchronous raster decoding.
+    let inline_svg_ratio = (dom.tag_name(node) == Some("svg"))
+        .then(|| {
+            dom.attr(node, "viewBox")
+                .and_then(crate::img::view_box_ratio)
+        })
+        .flatten();
+    let ratio = svg_ratio
+        .or(inline_svg_ratio)
+        .or_else(|| ratio_of(dom, node, dimension_source, natural));
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
     // own last resort for a ratio-less axis.
@@ -202,7 +217,12 @@ pub(crate) fn size(
         }
         _ => (w0.clamp(min_w, max_w), h0.clamp(min_h, max_h)),
     };
-    let (box_w, box_h) = (box_w.max(1.0), box_h.max(1.0));
+    let minimum = if dom.canvas_size(node).is_some() {
+        0.0
+    } else {
+        1.0
+    };
+    let (box_w, box_h) = (box_w.max(minimum), box_h.max(minimum));
 
     // object-fit (css-images-3 §5.5). Meaningful only with a natural size to
     // map; a reserved-but-undecoded box paints blank regardless. `none` maps

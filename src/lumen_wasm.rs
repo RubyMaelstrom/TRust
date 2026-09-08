@@ -13,7 +13,29 @@ use lumen::embed::{
     RetainedManagedAllocation, Value,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static WASM_CALL_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static EXTERNREF_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn externref_allocations() -> usize {
+    EXTERNREF_ALLOCATIONS.with(Cell::get)
+}
+
+macro_rules! wasm_trace {
+    ($message:expr) => {
+        if std::env::var_os("TRUST_WASM_TRACE").is_some() {
+            eprintln!("wasm: {}", $message);
+        }
+    };
+}
 
 #[derive(Clone)]
 pub(super) struct PageWasm {
@@ -34,43 +56,49 @@ impl PageWasm {
         match self.state.try_borrow() {
             Ok(state) => {
                 if let Some(state) = state.as_ref() {
-                    state_bytes = state_bytes
-                        .saturating_add(
-                            state
-                                .modules
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<wasmi::Module>()),
-                        )
-                        .saturating_add(
-                            state
-                                .instances
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<wasmi::Instance>()),
-                        )
-                        .saturating_add(
-                            state
-                                .funcs
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<wasmi::Func>()),
-                        )
-                        .saturating_add(
-                            state
-                                .globals
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<wasmi::Global>()),
-                        )
-                        .saturating_add(
-                            state
-                                .memories
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<MemorySlot>()),
-                        )
-                        .saturating_add(
-                            state
-                                .tables
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<wasmi::Table>()),
-                        );
+                    state_bytes =
+                        state_bytes
+                            .saturating_add(
+                                state
+                                    .modules
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<wasmi::Module>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .instances
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<wasmi::Instance>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .funcs
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<wasmi::Func>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .globals
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<wasmi::Global>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .memories
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<MemorySlot>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .tables
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<wasmi::Table>()),
+                            )
+                            .saturating_add(
+                                state.store.data().externrefs.capacity().saturating_mul(
+                                    std::mem::size_of::<(usize, wasmi::ExternRef)>(),
+                                ),
+                            );
                     // Wasmi's Engine/Store and compiled Module internals are private allocator
                     // graphs. Their visible handle/vector payload is retained above; classify
                     // the remainder as an opaque requested-payload lower bound, just like a
@@ -137,9 +165,17 @@ struct MemorySlot {
     wasm_version: u64,
 }
 
+#[derive(Default)]
+struct StoreData {
+    // JS API §5.6: repeated ToWebAssemblyValue conversions of the same host
+    // value reuse its address. Keep this in Store data so re-entrant Caller
+    // paths use the same cache without borrowing the active Store again.
+    externrefs: HashMap<usize, wasmi::ExternRef>,
+}
+
 struct WasmState {
     engine: wasmi::Engine,
-    store: wasmi::Store<()>,
+    store: wasmi::Store<StoreData>,
     modules: Vec<wasmi::Module>,
     instances: Vec<wasmi::Instance>,
     funcs: Vec<wasmi::Func>,
@@ -151,7 +187,7 @@ struct WasmState {
 impl WasmState {
     fn new() -> Self {
         let engine = wasmi::Engine::default();
-        let store = wasmi::Store::new(&engine, ());
+        let store = wasmi::Store::new(&engine, StoreData::default());
         Self {
             engine,
             store,
@@ -206,6 +242,10 @@ impl WasmState {
             js_version: 0,
             wasm_version: value.data_version(&self.store),
         });
+        wasm_trace!(format!(
+            "memory register id={index} pages={pages} bytes={}",
+            pages.saturating_mul(65_536)
+        ));
         index
     }
 
@@ -384,7 +424,7 @@ fn prepare_value(ctx: &mut Ctx, value: &Value, ty: wasmi::ValType) -> Result<Pre
     }
 }
 
-fn build_ref<C: wasmi::AsContextMut<Data = ()>>(
+fn build_ref<C: wasmi::AsContextMut<Data = StoreData>>(
     funcs: &[wasmi::Func],
     context: &mut C,
     value: RefArg,
@@ -397,9 +437,20 @@ fn build_ref<C: wasmi::AsContextMut<Data = ()>>(
             .copied()
             .map(|function| wasmi::Val::FuncRef(wasmi::Ref::Val(function)))
             .ok_or(()),
-        RefArg::Extern(id) => Ok(wasmi::Val::ExternRef(wasmi::Ref::Val(
-            wasmi::ExternRef::new(context, id),
-        ))),
+        RefArg::Extern(id) => {
+            if let Some(reference) = context.as_context().data().externrefs.get(&id) {
+                return Ok(wasmi::Val::ExternRef(wasmi::Ref::Val(*reference)));
+            }
+            #[cfg(test)]
+            EXTERNREF_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            let reference = wasmi::ExternRef::new(&mut *context, id);
+            context
+                .as_context_mut()
+                .data_mut()
+                .externrefs
+                .insert(id, reference);
+            Ok(wasmi::Val::ExternRef(wasmi::Ref::Val(reference)))
+        }
     }
 }
 
@@ -416,7 +467,7 @@ enum OutputToken {
     Extern(usize),
 }
 
-fn extract_output<C: wasmi::AsContext<Data = ()>>(
+fn extract_output<C: wasmi::AsContext<Data = StoreData>>(
     state: &mut WasmState,
     context: &C,
     value: &wasmi::Val,
@@ -460,7 +511,7 @@ fn resolve_output(ctx: &mut Ctx, value: OutputToken) -> Result<Value, Value> {
 thread_local! {
     static ACTIVE_CTX: Cell<*mut Ctx> = const { Cell::new(std::ptr::null_mut()) };
     static ACTIVE_STATE: Cell<*mut WasmState> = const { Cell::new(std::ptr::null_mut()) };
-    static ACTIVE_CALLER: Cell<*mut wasmi::Caller<'static, ()>> =
+    static ACTIVE_CALLER: Cell<*mut wasmi::Caller<'static, StoreData>> =
         const { Cell::new(std::ptr::null_mut()) };
     static PENDING_THROW: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
@@ -495,16 +546,17 @@ impl Drop for StateGuard {
     }
 }
 
-struct CallerGuard(*mut wasmi::Caller<'static, ()>);
+struct CallerGuard(*mut wasmi::Caller<'static, StoreData>);
 
 impl CallerGuard {
-    fn set(caller: &mut wasmi::Caller<'_, ()>) -> Self {
+    fn set(caller: &mut wasmi::Caller<'_, StoreData>) -> Self {
         // SAFETY: the pointer remains thread-local and is restored before this synchronous host
         // callback returns. The erased lifetime is never exposed outside these helpers.
         let pointer = unsafe {
-            std::mem::transmute::<*mut wasmi::Caller<'_, ()>, *mut wasmi::Caller<'static, ()>>(
-                std::ptr::from_mut(caller),
-            )
+            std::mem::transmute::<
+                *mut wasmi::Caller<'_, StoreData>,
+                *mut wasmi::Caller<'static, StoreData>,
+            >(std::ptr::from_mut(caller))
         };
         Self(ACTIVE_CALLER.with(|slot| slot.replace(pointer)))
     }
@@ -529,7 +581,7 @@ fn with_active_state<R>(operation: impl FnOnce(&mut WasmState) -> R) -> Option<R
 }
 
 fn with_active_caller<R>(
-    operation: impl FnOnce(&mut wasmi::Caller<'static, ()>) -> R,
+    operation: impl FnOnce(&mut wasmi::Caller<'static, StoreData>) -> R,
 ) -> Option<R> {
     ACTIVE_CALLER.with(|slot| {
         let pointer = slot.get();
@@ -615,11 +667,17 @@ fn sync_store_from_buffers(ctx: &mut Ctx, state: &mut WasmState, buffers: &[Opti
 
 fn sync_buffers_from_store(ctx: &mut Ctx, state: &mut WasmState, buffers: &mut [Option<Value>]) {
     for index in 0..state.memories.len() {
-        let slot = &mut state.memories[index];
+        let Some(slot) = state.memories.get_mut(index) else {
+            continue;
+        };
         let memory = slot.memory;
         let pages = memory.size(&state.store);
         let dirty_ranges = memory.take_dirty_ranges(&mut state.store);
         if pages != slot.buffer_pages {
+            wasm_trace!(format!(
+                "memory internal grow id={index} old_pages={} new_pages={pages}",
+                slot.buffer_pages
+            ));
             slot.buffer_pages = pages;
             slot.wasm_version = memory.data_version(&state.store);
             if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
@@ -664,11 +722,17 @@ fn sync_active_buffers_to_js(ctx: &mut Ctx) {
     let _ = with_active_caller(|caller| {
         let _ = with_active_state(|state| {
             for index in 0..state.memories.len() {
-                let slot = &mut state.memories[index];
+                let Some(slot) = state.memories.get_mut(index) else {
+                    continue;
+                };
                 let memory = slot.memory;
                 let pages = memory.size(&*caller);
                 let dirty_ranges = memory.take_dirty_ranges(&mut *caller);
                 if pages != slot.buffer_pages {
+                    wasm_trace!(format!(
+                        "memory active grow id={index} old_pages={} new_pages={pages}",
+                        slot.buffer_pages
+                    ));
                     slot.buffer_pages = pages;
                     slot.wasm_version = memory.data_version(&*caller);
                     if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
@@ -790,10 +854,7 @@ fn import_results(
             Ok(())
         }
         _ => {
-            let global = ctx.global_this();
-            let array = ctx.member_get(&global, "Array")?;
-            let from = ctx.member_get(&array, "from")?;
-            let values = ctx.invoke(from, array, &[returned])?;
+            let values = call_global(ctx, "__wasm_import_results", &[returned])?;
             let length = ctx
                 .member_get(&values, "length")?
                 .as_num_opt()
@@ -825,7 +886,7 @@ fn import_results(
     }
 }
 
-fn make_import_func<C: wasmi::AsContextMut<Data = ()>>(
+fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
     context: &mut C,
     ty: wasmi::FuncType,
     token: u32,
@@ -882,6 +943,14 @@ fn make_import_func<C: wasmi::AsContextMut<Data = ()>>(
             ],
         )
         .and_then(|returned| import_results(ctx, returned, &result_types, output));
+        if let Err(error) = &result {
+            // Inspect only engine-owned Error data, never [[Get]] or toString.
+            // The diagnostic is bounded and cannot run author code or alter the throw (§7).
+            wasm_trace!(format!(
+                "import error token={token} index={index} params={params:?} error={:?}",
+                ctx.error_diagnostic(error)
+            ));
+        }
         sync_active_buffers_to_wasm(ctx);
         match result {
             Ok(()) => Ok(()),
@@ -954,6 +1023,8 @@ pub(super) fn host_compile(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
             ));
         }
     };
+    let import_count = module.imports().count();
+    let export_count = module.exports().count();
     let id = match page.state.try_borrow_mut() {
         Ok(mut state) => {
             let state = state.get_or_insert_with(WasmState::new);
@@ -968,6 +1039,10 @@ pub(super) fn host_compile(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         })
         .ok_or_else(|| type_error(ctx, "WebAssembly is unavailable"))?,
     };
+    wasm_trace!(format!(
+        "compile id={id} imports={import_count} exports={export_count} bytes={}",
+        bytes.len()
+    ));
     Ok(Value::Num(id as f64))
 }
 
@@ -1362,6 +1437,26 @@ pub(super) fn host_instantiate(
     };
     let import_types: Vec<wasmi::ExternType> =
         module.imports().map(|import| import.ty().clone()).collect();
+    wasm_trace!(format!(
+        "instantiate module={} token={} imports={}",
+        module_id.unwrap_or(usize::MAX),
+        token,
+        import_types.len()
+    ));
+    if std::env::var_os("TRUST_WASM_TRACE").is_some() {
+        let mut function_index = 0;
+        for import in module.imports() {
+            if matches!(import.ty(), wasmi::ExternType::Func(_)) {
+                wasm_trace!(format!(
+                    "import fn={} {}.{}",
+                    function_index,
+                    import.module(),
+                    import.name()
+                ));
+                function_index += 1;
+            }
+        }
+    }
     let bindings = match parse_imports(ctx, args.get(2), &import_types) {
         Ok(bindings) => bindings,
         Err((kind, message)) => return Ok(wasm_err(ctx, kind, message)),
@@ -1390,8 +1485,14 @@ pub(super) fn host_instantiate(
         return Err(error);
     }
     Ok(match result {
-        Ok(id) => wasm_ok(ctx, Value::Num(id as f64)),
-        Err((kind, message)) => wasm_err(ctx, kind, message),
+        Ok(id) => {
+            wasm_trace!(format!("instantiate ok id={id}"));
+            wasm_ok(ctx, Value::Num(id as f64))
+        }
+        Err((kind, message)) => {
+            wasm_trace!(format!("instantiate error kind={kind} message={message}"));
+            wasm_err(ctx, kind, message)
+        }
     })
 }
 
@@ -1430,6 +1531,15 @@ pub(super) fn host_instance_exports(
             })
             .unwrap_or_default(),
     };
+    wasm_trace!(format!(
+        "exports instance={} module={} descriptors={:?}",
+        instance_id.unwrap_or(usize::MAX),
+        module_id.unwrap_or(usize::MAX),
+        descriptors
+            .iter()
+            .map(|(name, kind)| format!("{name}:{kind}"))
+            .collect::<Vec<_>>()
+    ));
     let mut output = Vec::new();
     match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {
@@ -1579,6 +1689,22 @@ pub(super) fn host_call_export(
             "WebAssembly: call to an unknown exported function",
         ));
     };
+    let trace_enabled = std::env::var_os("TRUST_WASM_TRACE").is_some();
+    let call_number = if trace_enabled {
+        WASM_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    let trace_call = trace_enabled && (call_number < 64 || call_number % 1000 == 0);
+    if trace_call {
+        wasm_trace!(format!(
+            "call #{} func={} params={:?} results={:?}",
+            call_number + 1,
+            function_id.unwrap_or(usize::MAX),
+            parameters,
+            results
+        ));
+    }
     if parameters
         .iter()
         .chain(&results)
@@ -1621,9 +1747,12 @@ pub(super) fn host_call_export(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 function.call(&mut state.store, &inputs, &mut outputs)
             }));
+            // JS API §§4.1, 5.6: publish the updated store before throwing. A trap
+            // does not roll back writes or memory.grow (including buffer detachment).
+            sync_buffers_from_store(ctx, state, &mut page.buffers.borrow_mut());
             let tokens = match result {
                 Ok(Ok(())) => {
-                    let store = &state.store as *const wasmi::Store<()>;
+                    let store = &state.store as *const wasmi::Store<StoreData>;
                     outputs
                         .iter()
                         .map(|value| {
@@ -1636,7 +1765,6 @@ pub(super) fn host_call_export(
                 Ok(Err(error)) => return Err((error_kind(&error), error.to_string())),
                 Err(_) => return Err(("Runtime", "WebAssembly trap".to_string())),
             };
-            sync_buffers_from_store(ctx, state, &mut page.buffers.borrow_mut());
             Ok(tokens)
         })(),
         Err(_) => (|| -> Result<Vec<OutputToken>, (&'static str, String)> {
@@ -1673,6 +1801,9 @@ pub(super) fn host_call_export(
                 "Runtime",
                 "WebAssembly: unavailable re-entrant store".to_string(),
             ))?;
+            // The enclosing JS import may catch a nested trap and inspect Memory.buffer
+            // immediately, before returning to the outer Wasm activation.
+            sync_active_buffers_to_js(ctx);
             match invoked {
                 Ok(Ok(())) => {
                     let mut tokens = Vec::with_capacity(outputs.len());
@@ -1687,7 +1818,6 @@ pub(super) fn host_call_export(
                         ))?;
                         tokens.push(token);
                     }
-                    sync_active_buffers_to_js(ctx);
                     Ok(tokens)
                 }
                 Ok(Err(error)) => Err((error_kind(&error), error.to_string())),
@@ -1701,7 +1831,15 @@ pub(super) fn host_call_export(
     }
     let tokens = match call {
         Ok(tokens) => tokens,
-        Err((kind, message)) => return Ok(wasm_err(ctx, kind, message)),
+        Err((kind, message)) => {
+            if trace_call {
+                wasm_trace!(format!(
+                    "call #{} error kind={kind} message={message}",
+                    call_number + 1
+                ));
+            }
+            return Ok(wasm_err(ctx, kind, message));
+        }
     };
     let mut values = Vec::with_capacity(tokens.len());
     for token in tokens {
@@ -1777,7 +1915,7 @@ pub(super) fn host_global_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
                 .copied()
                 .map(|global| {
                     let value = global.get(&state.store);
-                    let store = &state.store as *const wasmi::Store<()>;
+                    let store = &state.store as *const wasmi::Store<StoreData>;
                     // SAFETY: see host_call_export's result extraction.
                     extract_output(state, unsafe { &*store }, &value)
                 })
@@ -1908,6 +2046,9 @@ pub(super) fn host_memory_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
                 .ok_or_else(|| range_error(ctx, "WebAssembly is unavailable"))?
         }
     };
+    wasm_trace!(format!(
+        "memory new id={id} initial_pages={initial} max={maximum:?}"
+    ));
     Ok(Value::Num(id as f64))
 }
 
@@ -1963,8 +2104,9 @@ pub(super) fn host_memory_grow(
                     let result = memory.grow(&mut state.store, delta as u64);
                     if result.is_ok()
                         && let Some(id) = id
+                        && let Some(slot) = state.memories.get_mut(id)
                     {
-                        state.memories[id].buffer_pages = memory.size(&state.store);
+                        slot.buffer_pages = memory.size(&state.store);
                     }
                     result
                 })
@@ -1978,7 +2120,9 @@ pub(super) fn host_memory_grow(
                 {
                     let pages = with_active_caller(|caller| memory.size(&*caller)).unwrap_or(0);
                     let _ = with_active_state(|state| {
-                        state.memories[id].buffer_pages = pages;
+                        if let Some(slot) = state.memories.get_mut(id) {
+                            slot.buffer_pages = pages;
+                        }
                     });
                 }
                 result
@@ -1987,6 +2131,10 @@ pub(super) fn host_memory_grow(
     };
     match result {
         Some(Ok(old)) => {
+            wasm_trace!(format!(
+                "memory grow id={} delta={delta} old_pages={old}",
+                id.unwrap_or(usize::MAX)
+            ));
             if let Some(id) = id {
                 detach_buffer(ctx, &mut page.buffers.borrow_mut(), id);
             }
@@ -2051,8 +2199,14 @@ pub(super) fn host_memory_buffer(
                 return Ok(Value::Undefined);
             };
             let pages = memory.size(&state.store);
-            if pages != state.memories[id].buffer_pages {
-                state.memories[id].buffer_pages = pages;
+            if state
+                .memories
+                .get(id)
+                .is_some_and(|slot| pages != slot.buffer_pages)
+            {
+                if let Some(slot) = state.memories.get_mut(id) {
+                    slot.buffer_pages = pages;
+                }
                 detach_buffer(ctx, &mut page.buffers.borrow_mut(), id);
             }
             memory.data(&state.store).to_vec()
@@ -2066,8 +2220,13 @@ pub(super) fn host_memory_buffer(
             };
             let pages = with_active_caller(|caller| memory.size(&*caller)).unwrap_or(0);
             let changed = with_active_state(|state| {
-                let changed = state.memories[id].buffer_pages != pages;
-                state.memories[id].buffer_pages = pages;
+                let changed = state
+                    .memories
+                    .get(id)
+                    .is_some_and(|slot| slot.buffer_pages != pages);
+                if let Some(slot) = state.memories.get_mut(id) {
+                    slot.buffer_pages = pages;
+                }
                 changed
             })
             .unwrap_or(false);
@@ -2077,6 +2236,7 @@ pub(super) fn host_memory_buffer(
             bytes
         }
     };
+    wasm_trace!(format!("memory buffer id={id} bytes={}", bytes.len()));
     if let Some(buffer) = page
         .buffers
         .borrow()
@@ -2212,7 +2372,7 @@ pub(super) fn host_table_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
                 .and_then(|id| state.tables.get(id))
                 .and_then(|table| table.get(&state.store, index as u64));
             value.map(|value| {
-                let store = &state.store as *const wasmi::Store<()>;
+                let store = &state.store as *const wasmi::Store<StoreData>;
                 // SAFETY: immutable extraction only.
                 extract_output(state, unsafe { &*store }, &value)
             })

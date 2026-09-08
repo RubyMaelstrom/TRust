@@ -668,6 +668,7 @@ struct DesktopPageAdapter {
     base: url::Url,
     forms: Vec<trust::doc::Form>,
     controls: trust::layout2::ControlMap,
+    rich_editors: HashMap<usize, trust::layout2::RichEditorPresentation>,
     lazy_image_handles: HashSet<ImageHandle>,
     parents: HashMap<usize, usize>,
     fragment_y: HashMap<String, f32>,
@@ -685,6 +686,7 @@ impl DesktopPageAdapter {
                 base,
                 forms: rendered.forms,
                 controls: rendered.controls,
+                rich_editors: rendered.rich_editors,
                 lazy_image_handles: rendered.lazy_image_handles,
                 parents: rendered.parents,
                 fragment_y: rendered.fragment_y,
@@ -2436,6 +2438,11 @@ impl DesktopApp {
             ));
         }
         buffer.copy_from_slice(pixels);
+        // Honor the same Wayland frame-pacing contract as the GPU presenter.
+        // Do not arm a callback on an unchanged/skipped frame with no commit.
+        if let Some(window) = &self.window {
+            window.pre_present_notify();
+        }
         buffer
             .present()
             .map(|()| true)
@@ -2694,6 +2701,19 @@ impl DesktopApp {
             bounds.width as f32,
             bounds.height.max(26.0) as f32,
         );
+        if let Some(presentation) = cache.document.rich_editors.get(&node) {
+            if let Some(editor) = &mut self.form_editor {
+                editor.set_width(presentation.width);
+                let visual = Self::editor_visual(editor, false);
+                trust::render::paint_rich_editor_overlay(
+                    &mut scene.primitives,
+                    &visual,
+                    rect,
+                    presentation,
+                );
+            }
+            return;
+        }
         if let Some(editor) = &mut self.form_editor {
             let password = cache
                 .document
@@ -3944,6 +3964,10 @@ impl DesktopApp {
     }
 
     fn focus_form(&mut self, form: usize, field: usize) {
+        if self.focus == (FocusTarget::Form { form, field }) && self.form_editor.is_some() {
+            return;
+        }
+        self.finish_text_edit();
         let Some(control) = self
             .page_layout
             .as_ref()
@@ -3953,11 +3977,21 @@ impl DesktopApp {
         else {
             return;
         };
+        self.dispatch(UserAction::PageFocus {
+            actor: control.live_node,
+        });
+        let presentation = self.page_layout.as_ref().and_then(|page| {
+            page.document.controls.iter().find_map(|(node, indices)| {
+                (*indices == (form, field))
+                    .then(|| page.document.rich_editors.get(node))
+                    .flatten()
+            })
+        });
         self.form_editor = match control.kind {
             FieldKind::Text | FieldKind::Password | FieldKind::Textarea => Some(TextEditor::new(
                 &control.value,
-                &TextStyle::default(),
-                360.0,
+                &presentation.map_or_else(TextStyle::default, |p| p.style.clone()),
+                presentation.map_or(360.0, |p| p.width),
                 control.kind == FieldKind::Textarea,
             )),
             _ => None,
@@ -4021,10 +4055,15 @@ impl DesktopApp {
                 }
                 let bounds = page.layout.boxes.get(node)?;
                 let scene = self.scene.as_ref()?;
+                let inset = page
+                    .document
+                    .rich_editors
+                    .get(node)
+                    .map_or(CssPoint::new(6.0, 5.0), |p| p.origin);
                 Some(CssPoint::new(
-                    scene.content_viewport.x + bounds.left as f32
+                    scene.content_viewport.x + bounds.left as f32 + inset.x
                         - self.browser.interaction().scroll.x,
-                    scene.content_viewport.y + bounds.top as f32
+                    scene.content_viewport.y + bounds.top as f32 + inset.y
                         - self.browser.interaction().scroll.y,
                 ))
             })
@@ -4033,8 +4072,8 @@ impl DesktopApp {
             let point = self.pointer;
             if let Some(editor) = &mut self.form_editor {
                 editor.move_to_point(
-                    (point.x - origin.x - 6.0).max(0.0),
-                    (point.y - origin.y - 5.0).max(0.0),
+                    (point.x - origin.x).max(0.0),
+                    (point.y - origin.y).max(0.0),
                     false,
                 );
             }
@@ -4706,6 +4745,24 @@ impl DesktopApp {
             .as_ref()
             .and_then(|scene| scene.page_hit_at(self.pointer))
             .filter(|hit| hit.link.is_some() || hit.actor.is_some());
+        let clicked_form = self
+            .pressed_hit
+            .as_ref()
+            .and_then(|hit| self.form_target_for_hit(hit));
+        let keeps_editor = matches!(self.focus, FocusTarget::Form { form, field }
+            if clicked_form == Some((form, field)));
+        if !keeps_editor {
+            // All page hits can end editing, including plain DOM text with an
+            // actor but no activation behavior. Commit before blur handlers or
+            // the following click can read/submit the field's value.
+            self.finish_text_edit();
+            self.form_editor = None;
+            self.keyboard_target = None;
+            self.set_focus(FocusTarget::Page);
+        }
+        self.dispatch(UserAction::PageFocus {
+            actor: self.pressed_hit.as_ref().and_then(|hit| hit.actor),
+        });
         if self.pressed_hit.is_some() {
             return;
         }
@@ -4722,9 +4779,6 @@ impl DesktopApp {
         } else {
             self.selection = None;
         }
-        self.keyboard_target = None;
-        self.finish_text_edit();
-        self.set_focus(FocusTarget::Page);
     }
 
     fn handle_scroll(&mut self, delta: MouseScrollDelta) {

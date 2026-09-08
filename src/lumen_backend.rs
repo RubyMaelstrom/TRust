@@ -1,8 +1,8 @@
 //! Production Lumen JavaScript backend and its synthetic benchmark harness.
 //!
-//! The resident actor shares TRust's platform prelude, DOM arena, and integer-handle host boundary
-//! with the legacy Boa implementation. Both engine adapters are checked against the same
-//! engine-neutral registry so host names and JavaScript-visible function lengths cannot drift.
+//! The resident actor owns TRust's platform prelude, DOM arena, and integer-handle host boundary.
+//! Bindings are checked against the canonical registry so host names and JavaScript-visible
+//! function lengths cannot drift.
 
 use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
@@ -17,6 +17,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "canvas_host.rs"]
+mod canvas_host;
 #[path = "lumen_wasm.rs"]
 mod lumen_wasm;
 
@@ -28,10 +30,13 @@ const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
 
 struct LumenGeomCache {
     epoch: u64,
+    presentation_epoch: u64,
+    paint_epoch: u64,
     boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     paint: Option<crate::render::PagePaint>,
+    fragments: Option<std::sync::Arc<crate::layout2::LayoutFragments>>,
     /// The cached boxes belonging to the container Document remain valid. A nested Document may
     /// have advanced the arena-wide epoch without affecting these boxes (HTML §7.3.1.3).
     top_document_valid: bool,
@@ -41,10 +46,13 @@ impl LumenGeomCache {
     fn empty() -> Self {
         Self {
             epoch: u64::MAX,
+            presentation_epoch: u64::MAX,
+            paint_epoch: u64::MAX,
             boxes: Default::default(),
             tracks: Default::default(),
             scrolling_areas: Default::default(),
             paint: None,
+            fragments: None,
             top_document_valid: false,
         }
     }
@@ -190,7 +198,6 @@ struct HostState {
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
-    hit_testing_active: Cell<bool>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
     pending_resources: usize,
@@ -202,6 +209,10 @@ struct HostState {
     wasm: lumen_wasm::PageWasm,
     next_window_context: u64,
     window_realms: HashMap<u64, Value>,
+    /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
+    /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
+    image_data_slots: Option<Value>,
+    window_message_slots: Option<Value>,
 }
 
 impl HostState {
@@ -220,7 +231,6 @@ impl HostState {
             viewport: Cell::new(DEFAULT_VIEWPORT),
             device_pixel_ratio: Cell::new(1.0),
             geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
-            hit_testing_active: Cell::new(false),
             images: Default::default(),
             task_events: None,
             pending_resources: 0,
@@ -232,6 +242,8 @@ impl HostState {
             wasm: lumen_wasm::PageWasm::new(),
             next_window_context: 1,
             window_realms: HashMap::new(),
+            image_data_slots: None,
+            window_message_slots: None,
         }
     }
 
@@ -373,7 +385,6 @@ impl RetainedMemory for HostState {
             viewport,
             device_pixel_ratio,
             geom_cache,
-            hit_testing_active,
             images,
             task_events,
             pending_resources,
@@ -385,12 +396,13 @@ impl RetainedMemory for HostState {
             wasm,
             next_window_context,
             window_realms,
+            image_data_slots,
+            window_message_slots,
         } = self;
 
         let _ = (
             viewport,
             device_pixel_ratio,
-            hit_testing_active,
             pending_resources,
             next_window_context,
         );
@@ -510,6 +522,16 @@ impl RetainedMemory for HostState {
                 if paint_opaque {
                     visitor.opaque_storage();
                 }
+            }
+            if let Some(fragments) = &cache.fragments {
+                report_arc_payload(
+                    visitor,
+                    "trust.layout-fragments",
+                    fragments,
+                    fragments.retained_bytes(),
+                );
+                // Retained shaping/link payloads have opaque shared storage.
+                visitor.opaque_storage();
             }
             report_rc_payload(visitor, "trust.geometry-cache", geom_cache, bytes);
         } else {
@@ -636,6 +658,12 @@ impl RetainedMemory for HostState {
             ));
         }
         for value in window_realms.values() {
+            visitor.value(value);
+        }
+        if let Some(value) = image_data_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = window_message_slots {
             visitor.value(value);
         }
     }
@@ -895,7 +923,6 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     })
 }
 
-#[cfg(feature = "lumen-backend")]
 /// The platform prelude, overridable for rapid iteration: `TRUST_PRELUDE_FILE` replaces the
 /// embedded prelude with a file's contents (read once). Editing js_platform.js then needs no
 /// rebuild — the next page load picks the new file up. Release builds ship the embedded const.
@@ -2230,9 +2257,36 @@ mod desktop {
                 )
             })
             .unwrap_or((DEFAULT_VIEWPORT, 1.0, Default::default()));
+        let geometry = ensure_host_geom_cache(page.engine.ctx(), "render");
         let rendered = {
             let dom = page.dom.borrow();
-            crate::http::render_arena(&dom, &page.base, viewport, ratio, None, &images)
+            crate::http::render_arena_with_layout(
+                &dom,
+                &page.base,
+                viewport,
+                ratio,
+                None,
+                |forms, controls| {
+                    let cached = geometry.borrow();
+                    if let Some(fragments) = &cached.fragments {
+                        crate::layout2::paint_retained_layout(
+                            &dom,
+                            &page.base,
+                            controls,
+                            &images,
+                            fragments.clone(),
+                            cached.boxes.clone(),
+                            cached.tracks.clone(),
+                        )
+                    } else {
+                        // No root or an unresolved placeholder: preserve the
+                        // complete borrowed-layout fallback, never omit paint.
+                        crate::layout2::lay_out_graphical(
+                            &dom, &page.base, viewport, forms, controls, &images,
+                        )
+                    }
+                },
+            )
         };
         let html = if cfg!(test) || std::env::var_os("TRUST_DUMP_RAW").is_some() {
             page.dom.borrow().serialize_live(DOCUMENT, &clickable)
@@ -2336,6 +2390,19 @@ mod desktop {
         interrupt: &Arc<lumen::RuntimeInterrupt>,
     ) -> bool {
         match command {
+            PageCmd::Focus(node) => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "focusPage",
+                    &[node.map_or(Value::Null, |node| Value::Num(node as f64))],
+                    "page focus",
+                );
+                checkpoint(page, "page focus");
+                // Focus has no frontend busy/settle request of its own. Its
+                // notification must not acknowledge a queued edit or click.
+                finish_task_with_ack(page, events, false)
+            }
             PageCmd::Click(node) => {
                 prepare_interaction(page, interrupt);
                 let prevented = call_trust(page, "click", &[Value::Num(node as f64)], "click")
@@ -3076,6 +3143,92 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn actor_page_focus_commits_input_before_blur_and_checkpoints_handlers() {
+            let html = r#"<input id="field" value="old"><p id="result">waiting</p><script>
+                const field = document.getElementById('field');
+                field.focus();
+                field.addEventListener('blur', () => {
+                    const result = document.getElementById('result');
+                    result.textContent = field.value + ':' + (document.activeElement === document.body);
+                    queueMicrotask(() => result.setAttribute('data-checkpoint', 'done'));
+                });
+            </script>"#;
+            let field = Dom::parse_document(html).get_by_id("field").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { .. }) => break,
+                        Some(PageEvt::Trouble(errors)) => panic!("initial page failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed"),
+                    }
+                }
+                handle
+                    .try_send_user(PageCmd::SetValue {
+                        node: field,
+                        value: "saved draft".to_string(),
+                        checked: None,
+                    })
+                    .unwrap();
+                handle.try_send_user(PageCmd::Focus(None)).unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. })
+                            if html.contains("data-checkpoint=\"done\"") =>
+                        {
+                            assert!(html.contains("saved draft:true"), "{html}");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("blur failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before blur update"),
+                    }
+                }
+            })
+            .await
+            .expect("blur/checkpoint was not presented");
+        }
+
+        #[tokio::test]
+        async fn actor_emits_replace_for_a_same_url_location_request() {
+            let html = r#"<button id="reload">Reload</button><script>
+                document.getElementById('reload').onclick = () => location.replace(location.href);
+            </script>"#;
+            let target = Dom::parse_document(html).get_by_id("reload").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { .. }) => break,
+                        Some(PageEvt::Trouble(errors)) => panic!("initial page failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed"),
+                    }
+                }
+                handle.try_send_navigation_click(target).unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Replace(url)) => {
+                            assert_eq!(url, DEFAULT_URL);
+                            break;
+                        }
+                        Some(PageEvt::Navigate(url)) => {
+                            panic!("replacement became a history push: {url}")
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("same-URL navigation failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("page closed"),
+                    }
+                }
+            })
+            .await
+            .expect("same-URL navigation was silently discarded");
+        }
 
         #[tokio::test]
         async fn actor_separates_lifecycle_tasks_and_checkpoints_click_microtasks() {
@@ -4066,15 +4219,16 @@ mod desktop {
     }
 }
 
-#[cfg(feature = "lumen-backend")]
 pub(crate) use desktop::spawn_page;
-#[cfg(feature = "lumen-backend")]
 pub(crate) use desktop::transform;
 
 /// Lumen's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
-/// compare every entry with `js::HOST_FUNCTIONS`, while the table itself remains the single source
-/// used to install functions into each new realm.
+/// compare every entry with `js_host_boundary::HOST_BOUNDARY_SIGNATURES`, while the table remains
+/// the single source used to install functions into each new realm.
 const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
+    ("__image_data_slots", 1, host_image_data_slots),
+    ("__window_message_binding", 2, host_window_message_binding),
+    ("__canvas_2d", 4, canvas_host::call),
     ("__dom_create_element", 1, host_create_element),
     ("__dom_create_element_ns", 3, host_create_element_ns),
     ("__dom_create_text", 1, host_create_text),
@@ -4135,11 +4289,12 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__css_supports_selector", 1, host_css_supports_selector),
     ("__dom_template_content", 1, host_template_content),
     ("__http_fetch", 5, host_http_fetch),
+    ("__http_navigate", 3, host_http_navigate),
     ("__http_fetch_async", 5, host_http_fetch_async),
     ("__dom_run_injected_script", 1, host_run_injected_script),
     ("__dom_run_classic_script", 3, host_run_classic_script),
     ("__dom_allocate_job_context", 0, host_allocate_job_context),
-    ("__dom_create_window_realm", 8, host_create_window_realm),
+    ("__dom_create_window_realm", 9, host_create_window_realm),
     ("__dom_set_job_context", 1, host_set_job_context),
     ("__dom_release_job_context", 1, host_release_job_context),
     (
@@ -4176,6 +4331,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_len", 1, host_storage_len),
     ("__blob_mirror", 3, host_blob_mirror),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
+    ("__crypto_digest", 2, host_crypto_digest),
+    ("__crypto_random_bytes", 1, host_crypto_random_bytes),
+    ("__crypto_hmac", 4, host_crypto_hmac),
     ("__crypto_aes_ctr", 4, host_crypto_aes_ctr),
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
@@ -4218,6 +4376,72 @@ fn install_host_boundary(engine: &mut lumen::Engine) {
     }
 }
 
+fn host_image_data_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    // Called only while installing the prelude, which immediately deletes this global hook.
+    // The first Realm supplies a pristine native WeakMap; later Realms reuse that private map.
+    let candidate = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(ctx
+        .host_mut::<HostState>()
+        .expect("ImageData bindings require a HostState")
+        .image_data_slots
+        .get_or_insert(candidate)
+        .clone())
+}
+
+struct WindowMessageOperation(Value);
+
+impl lumen::embed::NativeCallableRetained for WindowMessageOperation {
+    fn scan_retained_memory(&self, visitor: &mut dyn lumen::embed::NativeRetainedMemoryVisitor) {
+        visitor.value(&self.0);
+        visitor.allocation(lumen::embed::RetainedManagedAllocation::new(
+            "trust.window-message-operation",
+            self as *const Self as usize,
+            std::mem::size_of::<Self>(),
+        ));
+    }
+}
+
+/// A native Window operation observes its script caller BEFORE entering the
+/// self-hosted implementation in the receiver's Realm. Otherwise parent.postMessage
+/// incorrectly reports the parent's origin/source for a message sent by its child.
+fn host_window_message_binding(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let candidate = args.first().cloned().unwrap_or(Value::Undefined);
+    let slots = ctx
+        .host_mut::<HostState>()
+        .expect("Window bindings require HostState")
+        .window_message_slots
+        .get_or_insert(candidate)
+        .clone();
+    let operation = Rc::new(WindowMessageOperation(
+        args.get(1).cloned().unwrap_or(Value::Undefined),
+    ));
+    let retained = operation.clone();
+    let post = ctx.new_native_fn_with_retained_memory(
+        "postMessage",
+        1,
+        Rc::new(move |ctx, this, args| {
+            let source = ctx.script_caller_global();
+            let target = if matches!(this, Value::Null | Value::Undefined) {
+                ctx.global_this()
+            } else {
+                this
+            };
+            let arguments = ctx.make_array(args.to_vec());
+            ctx.invoke(
+                operation.0.clone(),
+                Value::Undefined,
+                &[target, source, arguments],
+            )
+        }),
+        retained,
+    );
+    Ok(ctx.make_array(vec![slots, post]))
+}
+
 fn lumen_registry_matches_canonical_boundary() -> bool {
     let canonical: std::collections::HashMap<_, _> =
         crate::js::host_boundary_signatures().collect();
@@ -4256,8 +4480,9 @@ fn host_ids_array(ctx: &Ctx, ids: Vec<usize>) -> Value {
     ctx.make_array(ids.into_iter().map(|id| Value::Num(id as f64)).collect())
 }
 
-/// Fetch Standard §2.2.1 method normalization plus the byte-string request-body and header
-/// transport contract shared with the platform prelude.
+/// Fetch Standard §2.2.1 method normalization plus the byte-string request-body,
+/// header, mode, and credentials transport contract shared with the platform
+/// prelude.
 #[allow(clippy::type_complexity)]
 fn host_fetch_args(
     ctx: &mut Ctx,
@@ -4267,6 +4492,7 @@ fn host_fetch_args(
     String,
     Option<(String, Vec<u8>)>,
     Vec<(String, String)>,
+    Option<(crate::http::RequestMode, crate::http::CredentialsMode)>,
 ) {
     let target = host_arg_string(ctx, args, 0);
     let mut method: String = host_arg_string(ctx, args, 1)
@@ -4301,7 +4527,20 @@ fn host_fetch_args(
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
         .map(|_| crate::js::parse_header_blob(&host_arg_string(ctx, args, 4)))
         .unwrap_or_default();
-    (target, method, body, headers)
+    let policy = args.get(5).map(|_| {
+        let mode = match host_arg_string(ctx, args, 5).to_ascii_lowercase().as_str() {
+            "no-cors" => crate::http::RequestMode::NoCors,
+            "same-origin" => crate::http::RequestMode::SameOrigin,
+            _ => crate::http::RequestMode::Cors,
+        };
+        let credentials = match host_arg_string(ctx, args, 6).to_ascii_lowercase().as_str() {
+            "omit" => crate::http::CredentialsMode::Omit,
+            "include" => crate::http::CredentialsMode::Include,
+            _ => crate::http::CredentialsMode::SameOrigin,
+        };
+        (mode, credentials)
+    });
+    (target, method, body, headers, policy)
 }
 
 fn prepare_host_request(
@@ -4310,6 +4549,7 @@ fn prepare_host_request(
     method: String,
     body: Option<(String, Vec<u8>)>,
     headers: Vec<(String, String)>,
+    fetch_policy: Option<(crate::http::RequestMode, crate::http::CredentialsMode)>,
 ) -> Option<(
     tokio::runtime::Handle,
     Arc<crate::http::PageCache>,
@@ -4323,6 +4563,12 @@ fn prepare_host_request(
     {
         return None;
     }
+    if fetch_policy.as_ref().is_some_and(|(mode, _)| {
+        *mode == crate::http::RequestMode::SameOrigin
+            && !crate::http::same_origin_for_host(&page, &resolved)
+    }) {
+        return None;
+    }
     // Fetch Standard §5.6 invokes Fetch for every successfully constructed request. A count of
     // earlier page requests is neither a network error nor a specified rejection condition.
     network
@@ -4334,6 +4580,11 @@ fn prepare_host_request(
         body,
         headers,
         fetch_metadata: None,
+        fetch_policy: fetch_policy.map(|(mode, credentials)| crate::http::FetchPolicy {
+            origin: page.clone(),
+            mode,
+            credentials,
+        }),
     };
     crate::http::set_referrer(&mut request, &page);
     Some((network.handle.clone(), network.cache.clone(), request))
@@ -4401,24 +4652,70 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
 /// XMLHttpRequest's synchronous flag uses HTML's pause semantics. The network future runs on the
 /// application runtime while only this page thread waits, avoiding a nested Tokio `block_on`.
 fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let (target, method, body, headers) = host_fetch_args(ctx, args);
+    let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!("[fetch-trace] sync {method} {target}");
     }
     let work = ctx
         .host_mut::<HostState>()
-        .and_then(|state| prepare_host_request(state, &target, method, body, headers));
+        .and_then(|state| prepare_host_request(state, &target, method, body, headers, policy));
     let result = match work {
         Some((handle, cache, request)) => {
             let (sender, receiver) = std::sync::mpsc::channel();
             cache.spawn(&handle, async move {
-                let _ = sender.send(crate::http::fetch(&request).await.ok());
+                let _ = sender.send(crate::http::fetch_script(&request).await.ok());
             });
             receiver.recv().ok().flatten().and_then(lumen_fetch_result)
         }
         None => None,
     };
     Ok(host_fetch_result_value(ctx, result))
+}
+
+/// HTML's Document-creation steps retain the navigation request's final
+/// referrer. Keep it alongside Fetch's final URL, not a guessed parent URL.
+fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use crate::referrer_policy::ReferrerPolicy;
+    let target = host_arg_string(ctx, args, 0);
+    let source = url::Url::parse(&host_arg_string(ctx, args, 1)).ok();
+    let policy = ReferrerPolicy::parse(&host_arg_string(ctx, args, 2)).unwrap_or_default();
+    let work = ctx.host_mut::<HostState>().and_then(|state| {
+        prepare_host_request(state, &target, "GET".into(), None, Vec::new(), None)
+    });
+    let details = match work {
+        Some((handle, cache, mut request)) => {
+            request
+                .headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
+            if let Some(referrer) =
+                source.and_then(|source| policy.determine(&source, &request.url))
+            {
+                request
+                    .headers
+                    .push(("Referer".into(), referrer.to_string()));
+            }
+            let (sender, receiver) = std::sync::mpsc::channel();
+            cache.spawn(&handle, async move {
+                let _ = sender.send(
+                    crate::http::fetch_with_metadata(&request, policy)
+                        .await
+                        .ok(),
+                );
+            });
+            receiver.recv().ok().flatten()
+        }
+        None => None,
+    };
+    let Some(details) = details else {
+        return Ok(Value::Null);
+    };
+    let final_url = details.response.url.to_string();
+    let referrer = details.referrer;
+    let result = lumen_fetch_result(details.response);
+    let result = host_fetch_result_value(ctx, result);
+    ctx.member_set(&result, "5", Value::from_string(final_url))?;
+    ctx.member_set(&result, "6", Value::from_string(referrer))?;
+    Ok(result)
 }
 
 enum AsyncFetchSource {
@@ -4430,7 +4727,7 @@ enum AsyncFetchSource {
 /// data crosses the runtime channel; the resolving function remains rooted in the page realm and
 /// is invoked later when the browser selects the networking task.
 fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let (target, method, body, headers) = host_fetch_args(ctx, args);
+    let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!("[fetch-trace] async {method} {target}");
     }
@@ -4442,15 +4739,30 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
             return Ok(promise);
         };
-        let cached = state.network.as_ref().and_then(|network| {
-            (method == "GET" && body.is_none())
-                .then(|| state.base.join(&target).ok())
-                .flatten()
-                .and_then(|url| network.cache.peek(&url))
-        });
+        // Script Fetch requests carry mode/credentials and therefore need the
+        // response CORS/opaque filtering below. The generic page cache stores
+        // only wire bytes, so bypass it here rather than accidentally exposing
+        // an unfiltered cached cross-origin response. Browser-owned resource
+        // fetches continue to use the cache through `spawn_resource_fetch`.
+        let cache_safe_for_policy = policy.is_none()
+            || state
+                .base
+                .join(&target)
+                .ok()
+                .is_some_and(|url| crate::http::same_origin_for_host(&state.base, &url));
+        let cached = if cache_safe_for_policy {
+            state.network.as_ref().and_then(|network| {
+                (method.eq_ignore_ascii_case("GET") && body.is_none())
+                    .then(|| state.base.join(&target).ok())
+                    .flatten()
+                    .and_then(|url| network.cache.peek(&url))
+            })
+        } else {
+            None
+        };
         let source = match cached {
             Some(shared) => Some(AsyncFetchSource::Cached(shared)),
-            None => prepare_host_request(state, &target, method, body, headers)
+            None => prepare_host_request(state, &target, method, body, headers, policy)
                 .map(|(_, _, request)| AsyncFetchSource::Request(Box::new(request))),
         };
         let events = state.task_events.clone();
@@ -4487,7 +4799,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 .await
                 .ok()
                 .and_then(|response| lumen_cached_result(&response)),
-            AsyncFetchSource::Request(request) => crate::http::fetch(&request)
+            AsyncFetchSource::Request(request) => crate::http::fetch_script(&request)
                 .await
                 .ok()
                 .and_then(lumen_fetch_result),
@@ -4570,6 +4882,14 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         .and_then(Value::as_num_opt)
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(0.0);
+    let referrer = if args
+        .get(8)
+        .is_some_and(|value| matches!(value, Value::Str(_)))
+    {
+        host_arg_string(ctx, args, 8)
+    } else {
+        String::new()
+    };
     let snapshot = platform_prelude_snapshot().map_err(|error| {
         ctx.make_error(
             "SyntaxError",
@@ -4612,6 +4932,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             }
         }
         realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
+        realm_ctx.member_set(&config, "referrer", Value::from_string(referrer.clone()))?;
         realm_ctx.member_set(&config, "frameId", Value::Num(frame_id as f64))?;
         realm_ctx.member_set(&config, "hostSettingsContext", Value::Num(context as f64))?;
         realm_ctx.member_set(&config, "frameElement", frame_element.clone())?;
@@ -4949,7 +5270,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             return Ok(Value::Undefined);
         }
         let request = ctx.host_mut::<HostState>().and_then(|state| {
-            prepare_host_request(state, &src, String::from("GET"), None, Vec::new())
+            prepare_host_request(state, &src, String::from("GET"), None, Vec::new(), None)
                 .map(|(_, _, request)| request)
         });
         if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
@@ -5046,7 +5367,7 @@ fn host_load_injected_stylesheet(
         return Ok(Value::Undefined);
     }
     let request = ctx.host_mut::<HostState>().and_then(|state| {
-        prepare_host_request(state, &href, String::from("GET"), None, Vec::new())
+        prepare_host_request(state, &href, String::from("GET"), None, Vec::new(), None)
             .map(|(_, _, request)| request)
     });
     match request {
@@ -5319,6 +5640,7 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 }
 
 fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
+    engine.define_global("__image_data_slots", 1, host_image_data_slots);
     // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
     // shared worker prelude can reach, including its independent per-agent
     // WebAssembly store.
@@ -5335,6 +5657,13 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             host_crypto_sha256_digest as NativeFn,
         ),
         ("__crypto_aes_ctr", 4, host_crypto_aes_ctr as NativeFn),
+        ("__crypto_digest", 2, host_crypto_digest as NativeFn),
+        (
+            "__crypto_random_bytes",
+            1,
+            host_crypto_random_bytes as NativeFn,
+        ),
+        ("__crypto_hmac", 4, host_crypto_hmac as NativeFn),
         (
             "__compression_encode",
             2,
@@ -5899,7 +6228,9 @@ fn module_dependency_loader(
     };
     crate::http::module_script_response_allowed(response.status, &response.content_type).then(
         || {
-            speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
+            if cache.claim_module_import_scan(&resolved) {
+                speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
+            }
             (
                 resolved.to_string(),
                 crate::http::decode_body(&response.content_type, &response.body),
@@ -6707,8 +7038,7 @@ fn host_dom_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value,
 }
 
 /// Install Lumen's native Web IDL indexed-property internal methods on a freshly-created
-/// platform object. Boa returns `false` from the same canonical boundary and uses the portable
-/// JavaScript Proxy implementation instead.
+/// platform object.
 fn host_install_readonly_indexed(
     ctx: &mut Ctx,
     _this: Value,
@@ -7340,11 +7670,11 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
     )
 }
 
-/// Keep the geometry used by CSSOM View reads on the same epoch-keyed layout pass as the other
-/// JavaScript adapter. The resulting rectangles remain floating-point CSS pixels; terminal
-/// quantization is still confined to `layout2::paint`.
+/// One current fragment transaction for CSSOM, observers and rendering. DOM,
+/// resources/viewport (explicit invalidation), and activation metadata all
+/// participate in freshness. Paint is a later, independently lazy consumer.
 fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {
-    let (dom_handle, base, viewport, cache, images, hit_testing_active) = {
+    let (dom_handle, base, viewport, cache, images) = {
         let state = ctx
             .host_mut::<HostState>()
             .expect("HostState installed before any Lumen host call");
@@ -7354,44 +7684,30 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
             state.viewport.get(),
             state.geom_cache.clone(),
             state.images.clone(),
-            state.hit_testing_active.get(),
         )
     };
     let dom = dom_handle.borrow();
     let epoch = dom.epoch();
     let mut cached = cache.borrow_mut();
-    let rebuilt = cached.epoch != epoch;
+    let rebuilt =
+        cached.epoch != epoch || cached.presentation_epoch != dom.layout_presentation_epoch();
     if rebuilt {
         let measure_started = std::env::var_os("TRUST_DIAG_FRAME")
             .is_some()
             .then(Instant::now);
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
-        let (boxes, tracks, scrolling_areas, paint) = if hit_testing_active {
-            let (boxes, tracks, scrolling_areas, paint) =
-                crate::layout2::measure_cssom_with_paint_css(
-                    &dom,
-                    &base,
-                    viewport,
-                    &forms,
-                    &controls,
-                    &images.borrow(),
-                );
-            (boxes, tracks, scrolling_areas, Some(paint))
-        } else {
-            let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
-                &dom,
-                &base,
-                viewport,
-                &forms,
-                &controls,
-                &images.borrow(),
-            );
-            (boxes, tracks, scrolling_areas, None)
-        };
+        let measured = crate::layout2::measure_retained_layout(
+            &dom,
+            &base,
+            viewport,
+            &forms,
+            &controls,
+            &images.borrow(),
+        );
         if let Some(measure_started) = measure_started {
             let cascade = crate::dom::take_casc_diag();
             eprintln!(
-                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{}ms css_parse={}ms rules={}",
+                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{}ms css_parse={}ms rules={} passes={} query_updates={} selector_reuse={} tree={}ms flow={}ms item_reuse={} intrinsic_reuse={} tree_reuse={} tree_build={}",
                 dom.node_count(),
                 measure_started.elapsed().as_millis(),
                 cascade.cascaded_us / 1000,
@@ -7400,13 +7716,24 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
                 cascade.matched_us / 1000,
                 cascade.style_index_us / 1000,
                 cascade.rules,
+                measured.work.passes,
+                measured.work.query_updates,
+                cascade.selector_cache_hits,
+                measured.work.tree.as_millis(),
+                measured.work.flow.as_millis(),
+                measured.work.item_hits,
+                measured.work.intrinsic_hits,
+                measured.work.tree_hits,
+                measured.work.tree_builds,
             );
         }
-        cached.boxes = boxes;
-        cached.tracks = tracks;
-        cached.scrolling_areas = scrolling_areas;
-        cached.paint = paint;
+        cached.boxes = measured.boxes;
+        cached.tracks = measured.tracks;
+        cached.scrolling_areas = measured.scrolling_areas;
+        cached.fragments = measured.fragments;
+        cached.paint = None;
         cached.epoch = epoch;
+        cached.presentation_epoch = dom.layout_presentation_epoch();
         cached.top_document_valid = true;
     }
     drop(cached);
@@ -7416,6 +7743,41 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
         // document-scope classification window from an empty invalidation log.
         let _ = dom_handle.borrow_mut().take_geometry_dirty_targets();
     }
+    cache
+}
+
+fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
+    let cache = ensure_host_geom_cache(ctx, "elements-from-point");
+    let (dom, base, viewport, images) = {
+        let state = ctx.host_mut::<HostState>().expect("HostState installed");
+        (
+            state.dom.clone(),
+            state.base.clone(),
+            state.viewport.get(),
+            state.images.clone(),
+        )
+    };
+    let dom = dom.borrow();
+    {
+        let cached = cache.borrow();
+        if cached.paint.is_some() && cached.paint_epoch == dom.layout_paint_epoch() {
+            drop(cached);
+            return cache;
+        }
+    }
+    let images = images.borrow();
+    let mut cached = cache.borrow_mut();
+    cached.paint = Some(if let Some(fragments) = &cached.fragments {
+        crate::layout2::paint_retained_hit_test(&dom, &base, &images, fragments)
+    } else {
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        crate::layout2::measure_cssom_with_paint_css(
+            &dom, &base, viewport, &forms, &controls, &images,
+        )
+        .3
+    });
+    cached.paint_epoch = dom.layout_paint_epoch();
+    drop(cached);
     cache
 }
 
@@ -7434,16 +7796,12 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     let scroll_x = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
     let scroll_y = args.get(4).and_then(Value::as_num_opt).unwrap_or(0.0) as f32;
 
-    let viewport = {
-        let state = ctx
-            .host_mut::<HostState>()
-            .expect("HostState installed before any Lumen host call");
-        if !state.hit_testing_active.replace(true) || state.geom_cache.borrow().paint.is_none() {
-            state.geom_cache.borrow_mut().epoch = u64::MAX;
-        }
-        state.viewport.get()
-    };
-    let cache = ensure_host_geom_cache(ctx, "elements-from-point");
+    let viewport = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed")
+        .viewport
+        .get();
+    let cache = ensure_host_hit_test_cache(ctx);
     let cached = cache.borrow();
     let Some(paint) = cached.paint.as_ref() else {
         return Ok(ctx.make_array(Vec::new()));
@@ -7491,6 +7849,17 @@ fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Op
     let cached = cache.borrow();
     let (column_tracks, row_tracks) = cached.tracks.get(&id)?;
     let tracks = if columns { column_tracks } else { row_tracks };
+    if !columns {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        if dom.is_row_subgrid_item(id) {
+            return Some(crate::layout2::serialize_subgrid_rows(
+                &dom.computed_value_resolved(id, "grid-template-rows")
+                    .unwrap_or_default(),
+                tracks.len(),
+            ));
+        }
+    }
     if tracks.is_empty() {
         return None;
     }
@@ -7524,6 +7893,12 @@ fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<
 /// layout pass; all other properties come from the canonical DOM cascade.
 fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 1);
+    // CSS Conditional 5 §5.4: query results participate in the same style
+    // change event. Even a non-geometric getter (color/display) can depend
+    // on an ancestor's newly changed size, so flush layout before exposing it.
+    if host_dom(ctx).borrow().has_container_queries() {
+        let _ = ensure_host_geom_cache(ctx, "computed-container-query");
+    }
     if (name == "width" || name == "height")
         && let Some(value) = host_resolved_box_size(ctx, args, name == "width")
     {
@@ -7620,19 +7995,30 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         .expect("HostState installed before any Lumen host call")
         .geom_cache
         .clone();
-    let (id, epoch, top_level_frame) = {
+    let (id, epoch, presentation_epoch, top_level_frame) = {
         let dom = dom_handle.borrow();
         let id = host_arg_node(&dom, args, 0);
         let top_level_frame = id.is_some_and(|id| {
             matches!(dom.tag_name(id), Some("iframe" | "frame")) && dom.frame_owner(id).is_none()
         });
-        (id, dom.epoch(), top_level_frame)
+        (
+            id,
+            dom.epoch(),
+            dom.layout_presentation_epoch(),
+            top_level_frame,
+        )
     };
-    let (cached_epoch, top_document_valid) = {
+    let (cached_epoch, cached_presentation_epoch, top_document_valid) = {
         let cached = cache.borrow();
-        (cached.epoch, cached.top_document_valid)
+        (
+            cached.epoch,
+            cached.presentation_epoch,
+            cached.top_document_valid,
+        )
     };
-    let reuse_cached = if cached_epoch == epoch {
+    let reuse_cached = if cached_presentation_epoch != presentation_epoch {
+        false
+    } else if cached_epoch == epoch {
         true
     } else if cached_epoch != u64::MAX && top_document_valid && top_level_frame {
         // HTML §7.3.1.3 makes an iframe's content navigable own a distinct active Document.
@@ -7729,7 +8115,7 @@ fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 }
 
 /// HTML's iframe processing installs a parsed nested document and resolves its URLs at the frame
-/// boundary. `Dom::install_frame_document` is shared by both engine adapters.
+/// boundary through the canonical `Dom::install_frame_document` operation.
 fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let html = host_arg_string(ctx, args, 1);
     let base = host_arg_string(ctx, args, 2);
@@ -7885,6 +8271,90 @@ fn host_crypto_sha256_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     host_resolved_promise(ctx, buffer)
 }
 
+/// Native SHA family: do not run SHA-384/512's rounds as interpreted BigInts.
+fn host_crypto_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use sha2::Digest as _;
+    let name = host_arg_string(ctx, args, 0);
+    let input = args
+        .get(1)
+        .and_then(|v| ctx.buffer_source_bytes(v, false))
+        .ok_or_else(|| ctx.make_error("TypeError", "Digest data is not a BufferSource"))?;
+    let bytes = match name.as_str() {
+        "SHA-1" => sha1::Sha1::digest(&input).to_vec(),
+        "SHA-256" => sha2::Sha256::digest(&input).to_vec(),
+        "SHA-384" => sha2::Sha384::digest(&input).to_vec(),
+        "SHA-512" => sha2::Sha512::digest(&input).to_vec(),
+        _ => return Err(ctx.make_error("NotSupportedError", "Unsupported digest")),
+    };
+    let view = ctx.make_uint8array(&bytes)?;
+    let buffer = ctx.member_get(&view, "buffer")?;
+    host_resolved_promise(ctx, buffer)
+}
+
+/// Web Crypto #Crypto-method-getRandomValues / #hmac-operations-generate-key.
+/// OS entropy, never Math.random. The API layer validates the receiving view.
+fn host_crypto_random_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let length = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .filter(|n| n.is_finite() && n.fract() == 0. && (0. ..=16_777_216.).contains(n))
+        .ok_or_else(|| {
+            ctx.make_error(
+                "OperationError",
+                "Random allocation exceeds implementation limit",
+            )
+        })? as usize;
+    let mut bytes = vec![0; length];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| ctx.make_error("OperationError", "OS random source failed"))?;
+    ctx.make_uint8array(&bytes)
+}
+
+/// Web Crypto #hmac-operations-sign / #hmac-operations-verify. RustCrypto
+/// verifies the complete MAC in constant time; JS never compares secret tags.
+fn host_crypto_hmac(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let name = host_arg_string(ctx, args, 0);
+    let key = args
+        .get(1)
+        .and_then(|v| ctx.buffer_source_bytes(v, false))
+        .ok_or_else(|| ctx.make_error("TypeError", "HMAC key is not a BufferSource"))?;
+    let data = args
+        .get(2)
+        .and_then(|v| ctx.buffer_source_bytes(v, false))
+        .ok_or_else(|| ctx.make_error("TypeError", "HMAC data is not a BufferSource"))?;
+    let signature =
+        match args.get(3).filter(|v| !matches!(v, Value::Undefined)) {
+            Some(value) => Some(ctx.buffer_source_bytes(value, false).ok_or_else(|| {
+                ctx.make_error("TypeError", "HMAC signature is not a BufferSource")
+            })?),
+            None => None,
+        };
+    macro_rules! mac {
+        ($hash:ty) => {{
+            let mut mac = Hmac::<$hash>::new_from_slice(&key).expect("HMAC accepts any key size");
+            mac.update(&data);
+            if let Some(signature) = &signature {
+                return host_resolved_promise(
+                    ctx,
+                    Value::Bool(mac.verify_slice(signature).is_ok()),
+                );
+            }
+            mac.finalize().into_bytes().to_vec()
+        }};
+    }
+    let bytes = match name.as_str() {
+        "SHA-1" => mac!(sha1::Sha1),
+        "SHA-256" => mac!(sha2::Sha256),
+        "SHA-384" => mac!(sha2::Sha384),
+        "SHA-512" => mac!(sha2::Sha512),
+        _ => return Err(ctx.make_error("NotSupportedError", "Unsupported HMAC hash")),
+    };
+    let view = ctx.make_uint8array(&bytes)?;
+    let buffer = ctx.member_get(&view, "buffer")?;
+    host_resolved_promise(ctx, buffer)
+}
+
 /// Web Cryptography Level 2 §27.7: AES-CTR's decrypt operation is the same
 /// counter-mode XOR as encrypt. The prelude performs algorithm normalization;
 /// this host keeps the raw key and copied BufferSource bytes out of the JS
@@ -8023,6 +8493,180 @@ fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn retained_layout_geometry_hit_testing_and_paint_share_one_transaction() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<style>
+            body { margin:0 } #box { width:120px; height:60px; background:red }
+        </style><a id="box" href="/next" style="display:block">next</a>"#,
+        )));
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        let start = crate::layout2::layout_pass_count();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('box').getBoundingClientRect().width)"
+            ),
+            "120"
+        );
+        let cache = ensure_host_geom_cache(engine.ctx(), "test-repeat");
+        assert_eq!(crate::layout2::layout_pass_count(), start + 1);
+        assert!(
+            cache.borrow().paint.is_none(),
+            "geometry alone must not build a display list"
+        );
+        let fragments = cache.borrow().fragments.clone().unwrap();
+        assert_eq!(
+            string_value(&mut engine, "document.elementFromPoint(10, 10).id"),
+            "box"
+        );
+        assert_eq!(
+            crate::layout2::layout_pass_count(),
+            start + 1,
+            "first hit test must reuse measurement"
+        );
+        assert!(cache.borrow().paint.is_some());
+        let base = url::Url::parse(DEFAULT_URL).unwrap();
+        let painted = {
+            let cached = cache.borrow();
+            crate::layout2::paint_retained_layout(
+                &dom.borrow(),
+                &base,
+                &Default::default(),
+                &Default::default(),
+                fragments.clone(),
+                cached.boxes.clone(),
+                cached.tracks.clone(),
+            )
+        };
+        assert_eq!(
+            crate::layout2::layout_pass_count(),
+            start + 1,
+            "rendering must reuse measurement too"
+        );
+        let full = crate::layout2::lay_out_graphical(
+            &dom.borrow(),
+            &base,
+            DEFAULT_VIEWPORT,
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(painted.presentation_eq(&full));
+        let before_write = crate::layout2::layout_pass_count();
+        eval(
+            &mut engine,
+            "document.getElementById('box').style.width='175px'",
+            "layout-affecting write",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('box').getBoundingClientRect().width)"
+            ),
+            "175"
+        );
+        assert_eq!(crate::layout2::layout_pass_count(), before_write + 1);
+        assert!(
+            cache.borrow().paint.is_none(),
+            "a new geometry transaction drops the old hit-test paint"
+        );
+        assert!(!Arc::ptr_eq(
+            &fragments,
+            cache.borrow().fragments.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn retained_layout_invalidates_activation_and_resource_inputs_without_dom_writes() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<body><a id="link" href="/next">next</a><img id="image" src="/image.png"></body>"#,
+        )));
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        let cache = ensure_host_geom_cache(engine.ctx(), "initial");
+        let initial = cache.borrow().fragments.clone().unwrap();
+        let epoch = dom.borrow().epoch();
+        let link = dom.borrow().get_by_id("link").unwrap();
+        dom.borrow_mut()
+            .set_render_clickables([link].into_iter().collect(), true);
+        assert_eq!(
+            dom.borrow().epoch(),
+            epoch,
+            "presentation metadata is not a DOM mutation"
+        );
+        ensure_host_geom_cache(engine.ctx(), "activation");
+        assert!(!Arc::ptr_eq(
+            &initial,
+            cache.borrow().fragments.as_ref().unwrap()
+        ));
+        let activated = cache.borrow().fragments.clone().unwrap();
+        dom.borrow_mut()
+            .set_render_clickables([link].into_iter().collect(), true);
+        ensure_host_geom_cache(engine.ctx(), "same-activation");
+        assert!(Arc::ptr_eq(
+            &activated,
+            cache.borrow().fragments.as_ref().unwrap()
+        ));
+        {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            state
+                .images
+                .borrow_mut()
+                .insert("https://example.com/image.png".into(), (320, 180));
+            state.geom_cache.borrow_mut().epoch = u64::MAX;
+        }
+        ensure_host_geom_cache(engine.ctx(), "image-size");
+        assert!(!Arc::ptr_eq(
+            &activated,
+            cache.borrow().fragments.as_ref().unwrap()
+        ));
+        let image = dom.borrow().get_by_id("image").unwrap();
+        assert_eq!(cache.borrow().boxes[&image].width, 320.);
+        assert_eq!(cache.borrow().boxes[&image].height, 180.);
+        assert_eq!(dom.borrow().epoch(), epoch);
+    }
+
+    #[test]
+    fn retained_layout_scroll_updates_hit_testing_without_reflow() {
+        // CSSOM View §5: hit testing applies the current scroll transforms;
+        // scrolling itself does not change the underlying flow geometry.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<style>
+            body { margin:0 } #scroller { width:100px; height:40px; overflow:auto }
+            #first, #second { height:40px }
+        </style><div id="scroller"><div id="first">first</div><div id="second">second</div></div>"#,
+        )));
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(&mut engine, "document.elementFromPoint(10,10).id"),
+            "first"
+        );
+        let passes = crate::layout2::layout_pass_count();
+        let epoch = dom.borrow().epoch();
+        let scroller = dom.borrow().get_by_id("scroller").unwrap();
+        dom.borrow_mut().set_scroll_pos(scroller, 40., 0., true);
+        assert_eq!(dom.borrow().epoch(), epoch);
+        assert_eq!(
+            string_value(&mut engine, "document.elementFromPoint(10,10).id"),
+            "second"
+        );
+        assert_eq!(
+            crate::layout2::layout_pass_count(),
+            passes,
+            "scroll must refresh hit-test paint, not relayout"
+        );
+    }
+
     #[derive(Default)]
     struct HostRetainedProbe {
         allocations: usize,
@@ -8074,7 +8718,294 @@ mod tests {
         )
     }
 
+    #[test]
+    fn native_page_focus_blurs_to_viewport_without_losing_text_or_touching_selection() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<body><input id=field value=kept><p id=outside>Outside</p></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const field = document.getElementById('field');
+                const outside = document.getElementById('outside');
+                const events = [];
+                for (const type of ['blur', 'focusout']) field.addEventListener(type, e => {
+                    events.push([e.type, e.relatedTarget === null, e.bubbles,
+                        e.isTrusted, document.activeElement === document.body].join(':'));
+                });
+                let touchedSelection = false;
+                const originalGetSelection = getSelection;
+                globalThis.getSelection = () => {
+                    touchedSelection = true;
+                    return originalGetSelection();
+                };
+                __trust.focusPage(field.__id);
+                __trust.focusPage(outside.__id);
+                __trust.focusPage(null);
+                [document.activeElement === document.body, field.value,
+                    !touchedSelection, events.join(',')].join('|');
+            "#
+            ),
+            "true|kept|true|blur:true:false:true:true,focusout:true:true:true:true"
+        );
+    }
+
+    #[test]
+    fn native_page_focus_resolves_editor_and_button_descendants() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<body><div id=editor contenteditable><p id=text>draft</p></div>\
+                     <button id=button><span id=icon>Send</span></button>\
+                     <div id=outside contenteditable=false>Outside</div></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const editor = document.getElementById('editor');
+                const text = document.getElementById('text');
+                const button = document.getElementById('button');
+                const events = [];
+                editor.addEventListener('blur', e => events.push('blur:' + e.relatedTarget.id));
+                button.addEventListener('focus', e => events.push('focus:' + e.relatedTarget.id));
+                __trust.focusPage(editor.__id);
+                __trust.focusPage(text.__id);
+                const stayed = document.activeElement === editor && events.length === 0;
+                button.click();
+                const syntheticKeptFocus = document.activeElement === editor;
+                __trust.focusPage(document.getElementById('icon').__id);
+                const transferred = document.activeElement === button;
+                __trust.focusPage(document.getElementById('outside').__id);
+                [stayed, syntheticKeptFocus, transferred, events.join(','),
+                    document.activeElement === document.body, editor.textContent].join('|');
+            "#
+            ),
+            "true|true|true|blur:button,focus:editor|true|draft"
+        );
+    }
+
+    #[test]
+    fn scroll_snap_accepts_real_node_lists_for_setters_and_methods() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            document.body.innerHTML = '<div id="carousel" style="display:flex;width:100px;overflow:auto;scroll-snap-type:x mandatory">' +
+                '<div style="flex:0 0 100px;height:20px;scroll-snap-align:start"></div>'.repeat(4) + '</div>';
+            const carousel = document.getElementById('carousel');
+            const positions = [carousel.querySelectorAll('*') instanceof NodeList, typeof carousel.querySelectorAll('*').slice];
+            carousel.scrollLeft = 99; positions.push(carousel.scrollLeft);
+            carousel.scrollBy({left:99}); positions.push(carousel.scrollLeft);
+            carousel.scrollTo({left:0}); positions.push(carousel.scrollLeft);
+            positions.join('|');
+        "#
+            ),
+            "true|undefined|100|200|0"
+        );
+    }
+
+    #[test]
+    fn required_radio_validity_accepts_real_node_lists() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            document.body.innerHTML = '<form><input id="a" type="radio" name="choice" required><input id="b" type="radio" name="choice"></form>';
+            const a = document.getElementById('a'), b = document.getElementById('b');
+            const before = a.validity.valueMissing;
+            b.checked = true;
+            [before, a.validity.valueMissing].join('|');
+        "#
+            ),
+            "true|false"
+        );
+    }
+
+    #[test]
+    #[ignore = "offline diagnostic; set TRUST_CAPTURE_SCRIPT_DOCUMENT"]
+    fn captured_classic_script_error_diagnostic() {
+        let html = std::fs::read_to_string(std::env::var("TRUST_CAPTURE_SCRIPT_DOCUMENT").unwrap())
+            .unwrap();
+        let mut dom = Dom::parse_document(&html);
+        dom.set_viewport_px(1100.0, 824.0);
+        let scripts = dom.scripts();
+        let mut engine = configured_engine(
+            HostState::new(Rc::new(RefCell::new(dom)), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        for (index, (src, source, ty, _node)) in scripts.into_iter().enumerate() {
+            if src.is_some()
+                || ty.as_deref().is_some_and(|ty| {
+                    !matches!(ty, "" | "text/javascript" | "application/javascript")
+                })
+            {
+                continue;
+            }
+            match engine.eval_value_interruptible(&source) {
+                Ok(Err(EvalError::Throw(error))) => {
+                    let stack = engine
+                        .ctx()
+                        .get_member(&error, "stack")
+                        .unwrap_or(Value::Undefined);
+                    eprintln!(
+                        "script {index}: {}\n{}",
+                        value_string(&mut engine, &error),
+                        value_string(&mut engine, &stack)
+                    );
+                }
+                Ok(Ok(_)) => eprintln!("script {index}: completed"),
+                Ok(Err(error)) => eprintln!(
+                    "script {index}: {}",
+                    describe_eval_error(&mut engine, error, "diagnostic")
+                ),
+                Err(error) => eprintln!(
+                    "script {index}: parse error {}:{}",
+                    error.line, error.message
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn image_data_constructor_and_structured_clone_conformance() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/image_data.mjs")),
+                "image-data-ok"
+            );
+            assert_eq!(
+                string_value(&mut engine, "typeof __image_data_slots"),
+                "undefined"
+            );
+        }
+    }
+
+    #[test]
+    fn image_data_worker_interface_and_clone() {
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(&mut engine, crate::js::worker_prelude(), "worker prelude").unwrap();
+        assert_eq!(
+            string_value(&mut engine, include_str!("fixtures/image_data.mjs")),
+            "image-data-ok"
+        );
+    }
+
+    #[test]
+    fn console_clear_is_callable_in_window_and_worker() {
+        for worker in [false, true] {
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            let prelude = if worker {
+                crate::js::worker_prelude()
+            } else {
+                crate::js::PRELUDE
+            };
+            eval(&mut engine, prelude, "console prelude").unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"
+                const clear = console.clear;
+                const result = clear.call(null, { toString() { throw new Error("Unused argument"); } });
+                [clear.name, clear.length, typeof result].join("|")
+            "##
+                ),
+                "clear|0|undefined"
+            );
+        }
+    }
+
+    #[test]
+    fn image_data_cross_realm_brand_clone_and_gc() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html"), body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<body><script>globalThis.foreignImage = new ImageData(2, 1);' +
+                'foreignImage.data[0] = 127;<\/script></body>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            globalThis.savedImage = frame.contentWindow.foreignImage;
+            globalThis.foreignImageData = frame.contentWindow.ImageData;
+            if (!savedImage) throw new Error("Frame did not create ImageData");
+        "##,
+            "ImageData cross-realm setup",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            engine.ctx().collect_garbage_for_host();
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r##"
+            (function () {
+                const get = Object.getOwnPropertyDescriptor(ImageData.prototype, "data").get;
+                const foreignGet = Object.getOwnPropertyDescriptor(foreignImageData.prototype, "width").get;
+                if (get.call(savedImage)[0] !== 127 || foreignGet.call(new ImageData(3, 1)) !== 3)
+                    throw new Error("Cross-realm internal slots lost");
+                const clone = structuredClone({ image: savedImage, data: get.call(savedImage) });
+                if (!(clone.image instanceof ImageData) || clone.image instanceof foreignImageData ||
+                    clone.image.data !== clone.data || clone.data[0] !== 127 || clone.image.width !== 2)
+                    throw new Error("Cross-realm clone failed");
+                return "cross-realm-image-data-ok";
+            })()
+        "##
+            ),
+            "cross-realm-image-data-ok"
+        );
+    }
+
     fn configured_engine(state: HostState, url: &str) -> lumen::Engine {
+        let mut engine = configured_engine_before_prelude(state, url);
+        eval(&mut engine, crate::js::PRELUDE, "prelude").unwrap();
+        engine
+    }
+
+    fn configured_engine_before_prelude(state: HostState, url: &str) -> lumen::Engine {
         let mut engine = lumen::Engine::new();
         engine.set_tier(Tier::Interp);
         let clock = state.clock.clone();
@@ -8092,8 +9023,84 @@ mod tests {
             "configuration",
         )
         .unwrap();
-        eval(&mut engine, crate::js::PRELUDE, "prelude").unwrap();
         engine
+    }
+
+    #[test]
+    fn platform_prelude_preserves_native_language_builtins() {
+        // ECMA-402 §§8, 11, 16, 20: the platform must preserve the engine's Intl
+        // constructors and locale-sensitive Number/Date methods. ECMA-262 §26.2
+        // supplies FinalizationRegistry, including its native GC cleanup hooks.
+        // https://tc39.es/ecma402/#intl-object
+        // https://tc39.es/ecma262/multipage/managing-memory.html#sec-finalization-registry-objects
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            eval(
+                &mut engine,
+                r#"
+                globalThis.languageBuiltins = () => [
+                    Intl, Intl.NumberFormat, Intl.DateTimeFormat, Intl.Collator,
+                    Intl.DisplayNames, Intl.PluralRules, Intl.RelativeTimeFormat,
+                    Intl.Locale, Intl.Segmenter, Intl.ListFormat, Intl.DurationFormat,
+                    Intl.getCanonicalLocales, Intl.supportedValuesOf,
+                    Number.prototype.toLocaleString, Date.prototype.toLocaleString,
+                    Date.prototype.toLocaleDateString, Date.prototype.toLocaleTimeString,
+                    FinalizationRegistry, FinalizationRegistry.prototype.register,
+                    FinalizationRegistry.prototype.unregister
+                ];
+                globalThis.nativeLanguageBuiltins = languageBuiltins();
+                "#,
+                "capture native language builtins",
+            )
+            .unwrap();
+            eval(&mut engine, crate::js::PRELUDE, "prelude").unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "languageBuiltins().every((value, index) => value === nativeLanguageBuiltins[index])"
+                ),
+                "true",
+                "prelude replaced native language builtins in {tier:?}"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"[
+                        new Intl.NumberFormat(), new Intl.DateTimeFormat(),
+                        new Intl.Collator(), new Intl.PluralRules(),
+                        new Intl.RelativeTimeFormat(), new Intl.ListFormat(),
+                        new Intl.DurationFormat(), new Intl.Segmenter(),
+                        new Intl.DisplayNames(undefined, {type: "language"}),
+                        new Intl.NumberFormat("zxx")
+                    ].every(formatter => formatter.resolvedOptions().locale === "en-US")"#
+                ),
+                "true",
+                "all native Intl defaults must prefer US English in {tier:?}"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"[
+                    Intl.NumberFormat.supportedLocalesOf(["de-DE", "fr-FR"]).join(","),
+                    new Intl.NumberFormat("de-DE").format(1234.5),
+                    (1234.5).toLocaleString("de-DE"),
+                    new Intl.DateTimeFormat("en-US", {timeZone: "UTC", year: "numeric"})
+                        .formatToParts(new Date(0)).find(part => part.type === "year").value,
+                    typeof Intl.ListFormat, typeof Intl.DurationFormat,
+                    Object.prototype.toString.call(new FinalizationRegistry(() => {}))
+                ].join("|")"#
+                ),
+                "de-DE,fr-FR|1.234,5|1.234,5|1970|function|function|[object FinalizationRegistry]",
+                "native locale/cleanup surface in {tier:?}"
+            );
+        }
     }
 
     fn run_microtask_checkpoint(engine: &mut lumen::Engine) {
@@ -8202,7 +9209,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 117, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 124, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -8213,13 +9220,280 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 117);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 124);
 
-        let mut engine = platform_engine();
+        // Check bootstrap-only capabilities before the prelude consumes/removes them.
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
+    }
+
+    #[test]
+    fn window_post_message_sender_origin_clone_and_receiver_realm() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/window_messages.mjs"),
+                "Window postMessage",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref text) if text.as_ref() == "window-messages-ok"),
+                "{tier:?}"
+            );
+            engine.ctx().collect_garbage_for_host();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                var afterGc = false;
+                addEventListener('message', event => { if(event.data === 'after-gc') afterGc = true; });
+                postMessage('after-gc');
+                while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+                String(afterGc)
+            "#
+                ),
+                "true"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_native_pixels_and_drawing_state_conformance() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_pixels.mjs"),
+                "canvas pixels",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref text) if text.as_ref() == "canvas-pixels-ok"),
+                "{tier:?}"
+            );
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_paths_images.mjs"),
+                "canvas paths and images",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref text) if text.as_ref() == "canvas-paths-images-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iframe_document_referrer_is_a_snapshot_of_the_navigation_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let origin = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let page = format!("{origin}parent?q=1#fragment");
+        let server = runtime.spawn(async move {
+            let mut requests=Vec::new();
+            for _ in 0..3 {
+                let (mut stream,_) = listener.accept().await.unwrap();
+                let mut bytes=Vec::new();let mut buffer=[0;2048];
+                while !bytes.windows(4).any(|w|w==b"\r\n\r\n") {let n=stream.read(&mut buffer).await.unwrap();assert_ne!(n,0);bytes.extend_from_slice(&buffer[..n]);}
+                requests.push(String::from_utf8(bytes).unwrap());
+                let html="<!doctype html><html><head></head><body>child</body></html>";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",html.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::parse_document(
+                "<!doctype html><html><head></head><body></body></html>",
+            ))),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            url::Url::parse(&page).unwrap(),
+            runtime.handle().clone(),
+            cache.clone(),
+            tx,
+        );
+        let mut engine = configured_engine(state, &page);
+        let result = string_value(
+            &mut engine,
+            &format!(
+                r#"(()=>{{
+            const results=[];
+            for(const policy of ['', 'origin','no-referrer']) {{
+                const f=document.createElement('iframe');document.body.appendChild(f);
+                const initial=f.contentDocument;
+                if(initial.referrer!==document.URL)throw Error('initial blank creator referrer');
+                f.referrerPolicy=policy;f.src={origin:?}+'child?policy='+policy;
+                const doc=f.contentDocument;
+                if(doc===initial || initial.referrer!==document.URL)throw Error('old Document metadata changed');
+                results.push(doc.referrer);
+            }}
+            return results.join('|');
+        }})()"#
+            ),
+        );
+        assert_eq!(result, format!("{origin}parent?q=1|{origin}|"));
+        let requests = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(requests[0].contains(&format!("Referer: {origin}parent?q=1\r\n")));
+        assert!(requests[1].contains(&format!("Referer: {origin}\r\n")));
+        assert!(!requests[2].to_ascii_lowercase().contains("referer:"));
+        cache.cancel();
+    }
+
+    #[test]
+    fn canvas_image_origin_clean_includes_redirects_and_survives_base_changes() {
+        use futures::FutureExt as _;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse("https://canvas.example/document").unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::parse_document(
+                "<!doctype html><html><head></head><body></body></html>",
+            ))),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(page.clone(), runtime.handle().clone(), cache.clone(), tx);
+        let mut engine = configured_engine(state, page.as_str());
+        let png = string_value(
+            &mut engine,
+            "(()=>{const c=document.createElement('canvas');c.width=2;c.height=2;const x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,2,2);return c.toDataURL();})()",
+        );
+        let bytes = crate::img::decode_data_url(&png).unwrap();
+        for (name, urls) in [
+            ("same", vec!["https://canvas.example/same"]),
+            ("cross", vec!["https://other.example/cross"]),
+            (
+                "redirect",
+                vec![
+                    "https://canvas.example/redirect",
+                    "https://other.example/hop",
+                    "https://canvas.example/final",
+                ],
+            ),
+            ("unknown", vec![]),
+        ] {
+            let url = if name == "cross" {
+                "https://other.example/cross".to_string()
+            } else {
+                format!("https://canvas.example/{name}")
+            };
+            let response = Arc::new(crate::http::CachedResp {
+                status: 200,
+                content_type: "image/png".into(),
+                headers: Vec::new(),
+                body: bytes.clone(),
+                url_list: urls
+                    .into_iter()
+                    .map(|u| url::Url::parse(u).unwrap())
+                    .collect(),
+            });
+            let fetch = futures::future::ready(Ok(response)).boxed().shared();
+            assert!(fetch.clone().now_or_never().is_some());
+            cache.seed_pending(url, fetch);
+        }
+        let result = string_value(
+            &mut engine,
+            r#"(()=>{
+            function check(v,m){if(!v)throw Error(m);}
+            function security(f){try{f();}catch(e){check(e.name==='SecurityError','wrong error '+e);return;}throw Error('taint missing');}
+            for(const name of ['same','cross','redirect','unknown']) {
+                const c=document.createElement('canvas');c.width=2;c.height=2;const x=c.getContext('2d');
+                const img=new Image();img.src=(name==='cross'?'https://other.example/':'https://canvas.example/')+name;
+                x.drawImage(img,0,0);
+                if(name==='same'){check(x.getImageData(0,0,1,1).data[0]===255,'same-origin pixels');continue;}
+                security(()=>x.getImageData(0,0,1,1));security(()=>c.toDataURL());
+                const copy=document.createElement('canvas'), y=copy.getContext('2d');y.drawImage(c,0,0);security(()=>copy.toDataURL());
+                x.clearRect(0,0,2,2);security(()=>c.toDataURL());
+                c.width=2;check(x.getImageData(0,0,1,1).data[3]===0,'resize restores clean bitmap');
+            }
+            const base=document.createElement('base');base.href='https://other.example/';document.head.appendChild(base);
+            const c=document.createElement('canvas'),x=c.getContext('2d'),img=new Image();img.src='https://other.example/cross';x.drawImage(img,0,0);security(()=>c.toDataURL());
+            return 'canvas-origin-clean-ok';
+        })()"#,
+        );
+        assert_eq!(result, "canvas-origin-clean-ok");
+        cache.cancel();
+    }
+
+    #[test]
+    fn canvas_bitmap_reaches_canonical_layout_and_pixel_renderer() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><html><head></head><body></body></html>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(&mut engine,r#"
+            document.body.innerHTML = '<canvas id="raster" width="64" height="48" style="position:absolute;left:0;top:0;width:64px;height:48px"></canvas>';
+            const c = document.getElementById('raster'), context = c.getContext('2d');
+            context.fillStyle='#ff0000'; context.fillRect(0,0,32,48);
+            context.fillStyle='#00ff00'; context.fillRect(32,0,32,48);
+        "#,"canvas presentation setup").unwrap();
+        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let base = url::Url::parse(DEFAULT_URL).unwrap();
+        let dom = dom.borrow();
+        let page = crate::http::render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(128., 96.),
+            1.,
+            None,
+            &Default::default(),
+        );
+        assert!(
+            page.image_urls
+                .iter()
+                .any(|url| url.starts_with("data:image/png;base64,")),
+            "terminal image discovery"
+        );
+        let frame = crate::render::headless::render_paint(
+            &page.layout.paint,
+            crate::core::CssSize::new(128., 96.),
+        )
+        .unwrap();
+        let pixel = |x: usize, y: usize| &frame.pixels[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4];
+        assert_eq!(pixel(10, 20), &[255, 0, 0, 255]);
+        assert_eq!(pixel(50, 20), &[0, 255, 0, 255]);
     }
 
     #[test]
@@ -8512,6 +9786,47 @@ mod tests {
     }
 
     #[test]
+    fn webassembly_large_import_array_keeps_late_bindings() {
+        // hCaptcha currently instantiates a module with 168 consecutive function imports. Keep
+        // this boundary-sized fixture here so Array construction/push fast paths cannot silently
+        // drop a late binding and turn a later callback into a null-property TypeError.
+        let import_count = 168;
+        let imports = (0..import_count)
+            .map(|index| format!("(import \"env\" \"f{index}\" (func $f{index}))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let module_wat = format!("(module {imports} (func (export \"call\") call $f162))");
+        let module = wat::parse_str(module_wat).unwrap();
+        let mut engine = platform_engine();
+        engine.set_tier(Tier::Bytecode);
+        let fixture = engine
+            .ctx()
+            .make_uint8array(&module)
+            .unwrap_or_else(|_| panic!("make large import wasm fixture"));
+        let global = engine.global_this();
+        engine
+            .ctx()
+            .member_set(&global, "largeImportFixture", fixture)
+            .unwrap_or_else(|_| panic!("install large import wasm fixture"));
+        eval(
+            &mut engine,
+            r#"
+                const largeImportModule = new WebAssembly.Module(largeImportFixture);
+                const largeImportNamespace = {};
+                for (let i = 0; i < 168; ++i)
+                    largeImportNamespace['f' + i] = function () { return undefined; };
+                const largeImportInstance = new WebAssembly.Instance(
+                    largeImportModule, { env: largeImportNamespace });
+                largeImportInstance.exports.call();
+                globalThis.largeImportResult = 'ok';
+            "#,
+            "large WebAssembly import fixture",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "largeImportResult"), "ok");
+    }
+
+    #[test]
     fn webassembly_legacy_tagged_exceptions_unwind_to_the_matching_catch() {
         // Legacy WebAssembly exception handling: a throw transfers control to the nearest
         // enclosing matching catch and preserves the tag payload on the Wasm operand stack.
@@ -8561,6 +9876,607 @@ mod tests {
         assert_eq!(string_value(&mut engine, "exceptionResult"), "42|true");
     }
 
+    fn install_wasm_test_fixture(engine: &mut lumen::Engine, source: &str) {
+        let bytes = wat::parse_str(source).unwrap();
+        let fixture = engine
+            .ctx()
+            .make_uint8array(&bytes)
+            .unwrap_or_else(|_| panic!("make WASM test fixture"));
+        let global = engine.global_this();
+        engine
+            .ctx()
+            .member_set(&global, "wasmFixture", fixture)
+            .unwrap_or_else(|_| panic!("install WASM test fixture"));
+    }
+
+    fn collect_wasm_test_garbage(engine: &mut lumen::Engine) {
+        // Clear kept objects, collect, deliver finalizers, then collect their held values.
+        // Compare heap counts at the same completed host boundary in every test batch.
+        for _ in 0..3 {
+            run_microtask_checkpoint(engine);
+            engine.ctx().collect_garbage_for_host();
+        }
+    }
+
+    #[test]
+    fn webassembly_table_retains_function_identity_across_gc() {
+        // JS API §§4.2, 5.4, 5.6: a table-reachable address still identifies the same
+        // Exported Function, including author properties and its parameter count.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(
+            &mut engine,
+            r#"
+            (module (func (export "increment") (param i32) (result i32)
+                local.get 0 i32.const 1 i32.add))
+        "#,
+        );
+        eval(
+            &mut engine,
+            r#"
+            let retainedTable = new WebAssembly.Table({ element: 'anyfunc', initial: 1 });
+            (() => {
+                const instance = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture));
+                instance.exports.increment.marker = 'original wrapper';
+                retainedTable.set(0, instance.exports.increment);
+            })();
+        "#,
+            "table-only WASM reference",
+        )
+        .unwrap();
+        collect_wasm_test_garbage(&mut engine);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "retainedTable.get(0).marker + ':' + retainedTable.get(0).length"
+            ),
+            "original wrapper:1"
+        );
+        eval(
+            &mut engine,
+            "const retainedFunction = retainedTable.get(0); retainedTable = null;",
+            "function outlives table",
+        )
+        .unwrap();
+        collect_wasm_test_garbage(&mut engine);
+        assert_eq!(string_value(&mut engine, "retainedFunction(41)"), "42");
+    }
+
+    #[test]
+    fn webassembly_failed_start_preserves_escaped_imports() {
+        // JS API instantiation + core start execution do not roll back table effects.
+        // A function installed before start traps may still call its JS imports later.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(
+            &mut engine,
+            r#"
+            (module
+                (import "env" "answer" (func $answer (result i32)))
+                (import "env" "table" (table 1 funcref))
+                (func $escaped (result i32) call $answer)
+                (elem (i32.const 0) $escaped)
+                (func $start unreachable)
+                (start $start))
+        "#,
+        );
+        eval(
+            &mut engine,
+            r#"
+            const escapedTable = new WebAssembly.Table({ element: 'anyfunc', initial: 1 });
+            let startTrapped = false;
+            try {
+                new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                    env: { table: escapedTable, answer() { return 42; } }
+                });
+            } catch (error) { startTrapped = error instanceof WebAssembly.RuntimeError; }
+        "#,
+            "failed start with escaped function",
+        )
+        .unwrap();
+        collect_wasm_test_garbage(&mut engine);
+        assert_eq!(string_value(&mut engine, "startTrapped"), "true");
+        assert_eq!(string_value(&mut engine, "escapedTable.get(0)()"), "42");
+    }
+
+    #[test]
+    fn webassembly_traps_publish_memory_effects() {
+        // JS API §4.1 and §5.6 call steps 8–10: update the store before reporting
+        // the trap, including when a host callback re-enters a Wasm export.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (import "env" "reenter" (func $reenter))
+                    (import "env" "boom" (func $boom))
+                    (memory (export "memory") 1 3)
+                    (func (export "writeTrap") (param i32)
+                        i32.const 0 local.get 0 i32.store8 unreachable)
+                    (func (export "read") (result i32) i32.const 0 i32.load8_u)
+                    (func (export "growTrap")
+                        i32.const 1 memory.grow drop
+                        i32.const 65536 i32.const 77 i32.store8 unreachable)
+                    (func (export "bridge") (result i32)
+                        call $reenter i32.const 0 i32.load8_u)
+                    (func (export "callBoom")
+                        i32.const 0 i32.const 93 i32.store8 call $boom))
+            "#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                let exports;
+                let bytes;
+                let nestedObserved = -1;
+                let boomObserved = -1;
+                let exceptionInspections = 0;
+                const sentinel = {
+                    toString() { exceptionInspections++; return 'sentinel'; },
+                    get stack() { exceptionInspections++; return 'sentinel stack'; }
+                };
+                exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), { env: {
+                    reenter() {
+                        try { exports.writeTrap(61); }
+                        catch (e) { if (!(e instanceof WebAssembly.RuntimeError)) throw e; }
+                        nestedObserved = bytes[0];
+                        bytes[1] = 5;
+                    },
+                    boom() { boomObserved = bytes[0]; bytes[2] = 7; throw sentinel; }
+                }}).exports;
+                bytes = new Uint8Array(exports.memory.buffer);
+                let trapped = false;
+                try { exports.writeTrap(42); }
+                catch (e) { trapped = e instanceof WebAssembly.RuntimeError; }
+                const visibleAfterTrap = bytes[0];
+                bytes[1] = 9;
+                const preservedOnReentry = exports.read();
+                const nestedResult = exports.bridge();
+                let sameException = false;
+                try { exports.callBoom(); } catch (e) { sameException = e === sentinel; }
+                const hostEffects = [boomObserved, bytes[0], bytes[2]].join(':');
+                const oldBuffer = bytes.buffer;
+                try { exports.growTrap(); }
+                catch (e) { if (!(e instanceof WebAssembly.RuntimeError)) throw e; }
+                const detachedAfterTrap = oldBuffer.byteLength;
+                const grown = new Uint8Array(exports.memory.buffer);
+                globalThis.trapMemoryResult = [trapped, visibleAfterTrap, preservedOnReentry,
+                    nestedObserved, nestedResult, sameException, hostEffects, detachedAfterTrap,
+                    grown.length, grown[65536], exceptionInspections].join('|');
+            "#,
+                "memory effects on exceptional WASM exits",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "trapMemoryResult"),
+                "true|42|42|61|61|true|93:93:7|0|131072|77|0",
+                "tier {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_trap_then_recursive_microtask_recovers() {
+        // The Neocities failure crosses these boundaries: a Wasm failure completes, then
+        // later JS recursively calls itself. Stack exhaustion must unwind through the job
+        // without losing Wasm state or preventing later DOM work/microtasks.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let state = HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><body></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            );
+            let mut engine = configured_engine(state, DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"(module
+                    (memory (export "memory") 1)
+                    (func (export "trap")
+                        i32.const 0 i32.const 42 i32.store8 unreachable))"#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                const exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports;
+                let trapCaught = false;
+                let stackCaught = false;
+                let depth = 0;
+                function stackProbe() { depth++; stackProbe(); }
+                Promise.resolve().then(() => exports.trap()).catch(error => {
+                    trapCaught = error instanceof WebAssembly.RuntimeError;
+                }).then(() => {
+                    try { stackProbe(); }
+                    catch (error) { stackCaught = error instanceof RangeError; }
+                    document.body.setAttribute('data-stack-recovered', String(stackCaught));
+                }).then(() => {
+                    globalThis.recoveryResult = [trapCaught, stackCaught, depth > 0,
+                        new Uint8Array(exports.memory.buffer)[0],
+                        document.body.getAttribute('data-stack-recovered')].join('|');
+                }).catch(error => { globalThis.recoveryResult = 'unexpected: ' + error; });
+                "#,
+                "Wasm failure followed by recursive microtask",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "recoveryResult"),
+                "true|true|true|42|true",
+                "tier {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_errors_reach_relocated_large_js_catches() {
+        // JS API §5.6 and ECMA-262 14.15.3: imported JS exceptions retain identity,
+        // native traps become RuntimeErrors, and both enter the correct JS catch.
+        // This body exceeds ARM64's conditional-branch range without executing padding.
+        let padding = "value = object.value;\n".repeat(1000);
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"(module
+                    (import "env" "fail" (func $fail))
+                    (func (export "imported") call $fail)
+                    (func (export "trap") unreachable))"#,
+            );
+            eval(
+                &mut engine,
+                &format!(
+                    "const sentinel = {{marker: 42}};
+                     const exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture),
+                         {{env: {{fail() {{throw sentinel;}}}}}}).exports;
+                     function largeCatch(flag, object, invoke) {{
+                         var value = 0;
+                         try {{ invoke(); }} catch (early) {{
+                             value = early === sentinel ? 1 :
+                                 early instanceof WebAssembly.RuntimeError ? 2 : -100;
+                         }}
+                         if (flag) {{ {padding} }}
+                         try {{ invoke(); }} catch (late) {{
+                             return value + (late === sentinel ? 10 :
+                                 late instanceof WebAssembly.RuntimeError ? 20 : -100);
+                         }}
+                         return -1000;
+                     }}
+                     globalThis.largeCatchResult = [];
+                     for (var n = 0; n < 4; n++) {{
+                         largeCatchResult.push(largeCatch(false, {{}}, exports.imported));
+                         largeCatchResult.push(largeCatch(false, {{}}, exports.trap));
+                     }}
+                     Promise.resolve().then(() => largeCatchResult.push('microtask-ok'));"
+                ),
+                "WASM errors in large relocated JS catches",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "largeCatchResult.join('|')"),
+                "11|22|11|22|11|22|11|22|microtask-ok",
+                "tier {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_import_can_read_nested_document_referrer() {
+        // HTML §3.1 defines an initially empty string document referrer; §3.1.4
+        // exposes it on every Document, including nested browsing contexts.
+        // A wasm-bindgen-style string import must not receive undefined here.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let clock = Rc::new(RealmClock::new());
+            let state = HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><body></body>",
+                ))),
+                clock,
+            );
+            let mut engine = configured_engine(state, DEFAULT_URL);
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                  (import "env" "length" (func $length (result i32)))
+                  (func (export "read") (result i32) call $length))
+            "#,
+            );
+            eval(&mut engine, r#"
+                const frame = document.createElement('iframe');
+                document.body.appendChild(frame);
+                const childDocument = frame.contentDocument;
+                const instance = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                    env: { length() { return childDocument.referrer.length; } }
+                });
+                let read = false;
+                try { read = instance.exports.read() === childDocument.referrer.length; } catch (e) {}
+                let readonly = false;
+                try { (function () { 'use strict'; childDocument.referrer = 'forged'; })(); }
+                catch (e) { readonly = e instanceof TypeError; }
+                globalThis.nestedReferrerResult = [typeof childDocument.referrer, read, readonly].join('|');
+            "#, "nested Document referrer WASM import").unwrap();
+            assert_eq!(
+                string_value(&mut engine, "nestedReferrerResult"),
+                "string|true|true",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_import_call_does_not_read_apply() {
+        // JS API §5.6: Call(func, undefined, arguments), not Get(func, "apply").
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                  (import "env" "f" (func $f (param i32) (result i32)))
+                  (func (export "call") (param i32) (result i32)
+                    local.get 0 call $f))
+            "#,
+            );
+            eval(&mut engine, r#"
+                const module = new WebAssembly.Module(wasmFixture);
+                let applyReads = 0;
+                let receiver;
+                function callback(x) { 'use strict'; receiver = this; return x + 1; }
+                Object.defineProperty(callback, 'apply', { get() {
+                    ++applyReads; throw new Error('must not read callback.apply');
+                }});
+                const instance = new WebAssembly.Instance(module, { env: { f: callback } });
+                let answer;
+                try { answer = instance.exports.call(41); } catch (e) { answer = 'threw'; }
+                globalThis.importCallResult = [answer, applyReads, receiver === undefined].join('|');
+            "#, "WASM internal Call").unwrap();
+            assert_eq!(
+                string_value(&mut engine, "importCallResult"),
+                "42|0|true",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_multi_value_import_requires_iterator() {
+        // JS API §5.6 uses GetMethod(@@iterator), IteratorToList, then arity checking
+        // and conversion. Neither array-like fallback nor author Array.from is involved.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                  (import "env" "pair" (func $pair (result i32 i32)))
+                  (func (export "call") (result i32 i32) call $pair))
+            "#,
+            );
+            eval(&mut engine, r#"
+                let returned = { 0: 19, 1: 23, length: 2 };
+                const instance = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture),
+                    { env: { pair() { return returned; } } });
+                let arrayLikeRejected = false;
+                try { instance.exports.call(); } catch (e) { arrayLikeRejected = e instanceof TypeError; }
+                const events = [];
+                const a = { valueOf() { events.push('a'); return 19; } };
+                const b = { valueOf() { events.push('b'); return 23; } };
+                returned = { get [Symbol.iterator]() {
+                    events.push('iterator');
+                    return function () {
+                        let i = 0;
+                        return { get next() {
+                            events.push('next');
+                            return function () {
+                                events.push('step' + i);
+                                return i < 2 ? { value: i++ === 0 ? a : b, done: false } : { done: true };
+                            };
+                        }};
+                    };
+                }};
+                const originalFrom = Array.from;
+                Array.from = function () { throw new Error('must not call author Array.from'); };
+                let answer;
+                try { answer = instance.exports.call().join(','); } catch (e) { answer = 'threw'; }
+                finally { Array.from = originalFrom; }
+                globalThis.multiImportResult = [arrayLikeRejected, answer, events.join(',')].join('|');
+            "#, "WASM multi-value IteratorToList").unwrap();
+            assert_eq!(
+                string_value(&mut engine, "multiImportResult"),
+                "true|19,23|iterator,next,step0,step1,step2,a,b",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_repeated_externrefs_reuse_host_addresses() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                  (import "env" "echo" (func $echo (param externref) (result externref)))
+                  (func (export "identity") (param externref) (result externref) local.get 0)
+                  (func (export "callback") (param externref) (result externref)
+                    local.get 0 call $echo))
+            "#,
+            );
+            eval(&mut engine, r#"
+                const values = [undefined, 42, 0, -0, NaN, 42n, Symbol('ref'), 'ref', {}, function () {}];
+                const table = new WebAssembly.Table({ element: 'externref', initial: 1 });
+                const global = new WebAssembly.Global({ value: 'externref', mutable: true });
+                const instance = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                    env: { echo(value) {
+                        table.set(0, value);
+                        table.grow(0, value);
+                        global.value = value;
+                        return instance.exports.identity(value);
+                    }}
+                });
+                function checkRefs() {
+                    for (const value of values) {
+                        if (!Object.is(instance.exports.identity(value), value) ||
+                            !Object.is(instance.exports.callback(value), value) ||
+                            !Object.is(table.get(0), value) || !Object.is(global.value, value))
+                            throw new Error('externref identity lost');
+                    }
+                }
+                checkRefs();
+            "#, "WASM externref warmup").unwrap();
+            let before = lumen_wasm::externref_allocations();
+            eval(
+                &mut engine,
+                "for (let i = 0; i < 128; ++i) checkRefs();",
+                "repeat WASM externrefs",
+            )
+            .unwrap();
+            let after = lumen_wasm::externref_allocations();
+            assert_eq!(
+                after, before,
+                "{tier:?}: repeated existing values allocated new native externrefs"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_exported_functions_are_not_constructors() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (func (export "f") (param i32 i32 i32) (result i32) i32.const 7))
+            "#,
+            );
+            eval(&mut engine, r#"
+                const f = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports.f;
+                let rejected = false;
+                try { new f(); } catch (e) { rejected = e instanceof TypeError; }
+                globalThis.exportShape = [rejected, Object.hasOwn(f, 'prototype'), f.length, f()].join('|');
+            "#, "WASM exported function shape").unwrap();
+            assert_eq!(
+                string_value(&mut engine, "exportShape"),
+                "true|false|3|7",
+                "{tier:?}"
+            );
+        }
+    }
+
+    fn check_wasm_trap_retention(fresh_instance: bool, asynchronous: bool) {
+        // Separate settled async-job retention from fresh-instance/cache retention. This is
+        // a synthetic bounded diagnostic, not a reproduction of the live Neocities failure.
+        let mut engine = platform_engine();
+        engine.set_tier(Tier::Bytecode);
+        let module = wat::parse_str(
+            r#"
+            (module
+              (func (export "trap")
+                unreachable))
+            "#,
+        )
+        .unwrap();
+        let fixture = engine
+            .ctx()
+            .make_uint8array(&module)
+            .unwrap_or_else(|_| panic!("make async wasm fixture"));
+        let global = engine.global_this();
+        engine
+            .ctx()
+            .member_set(&global, "asyncTrapFixture", fixture)
+            .unwrap_or_else(|_| panic!("install async wasm fixture"));
+        engine
+            .ctx()
+            .member_set(&global, "freshTrapInstance", Value::Bool(fresh_instance))
+            .unwrap_or_else(|_| panic!("install instance mode"));
+        engine
+            .ctx()
+            .member_set(&global, "asynchronousTrap", Value::Bool(asynchronous))
+            .unwrap_or_else(|_| panic!("install job mode"));
+        eval(
+            &mut engine,
+            r#"
+            const asyncTrapModule = new WebAssembly.Module(asyncTrapFixture);
+            const sharedTrapInstance = new WebAssembly.Instance(asyncTrapModule);
+            function invokeTrap() {
+                try {
+                    (freshTrapInstance ? new WebAssembly.Instance(asyncTrapModule) :
+                        sharedTrapInstance).exports.trap();
+                    return false;
+                } catch (error) {
+                    return (error instanceof WebAssembly.RuntimeError ? 'runtime:' : 'other:') +
+                        error.name + ':' + error.message;
+                }
+            }
+            async function invokeAsyncTrap() { await 0; return invokeTrap(); }
+            const trapOperation = asynchronousTrap ? invokeAsyncTrap : invokeTrap;
+            globalThis.asyncTrapResults = [];
+            for (let i = 0; i < 256; ++i)
+                Promise.resolve(trapOperation()).then(value => asyncTrapResults.push(value));
+            "#,
+            "async WASM trap setup",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "asyncTrapResults.length + ':' + asyncTrapResults.every(value => value.indexOf('runtime:RuntimeError:') === 0)"
+            ),
+            "256:true"
+        );
+        engine
+            .ctx()
+            .member_set(&global, "asyncTrapResults", Value::Null)
+            .unwrap_or_else(|_| panic!("release async trap results"));
+        collect_wasm_test_garbage(&mut engine);
+        let before = engine.ctx().live_object_count();
+
+        for _ in 0..8 {
+            eval(
+                &mut engine,
+                "for (let i = 0; i < 256; ++i) trapOperation();",
+                "repeat async WASM traps",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+        }
+        let settled = engine.ctx().live_object_count();
+        eprintln!(
+            "WASM retention: fresh_instance={fresh_instance} async={asynchronous} baseline={before} final={settled}"
+        );
+        assert!(
+            settled < before + 512,
+            "WASM operations retained objects: fresh_instance={fresh_instance} async={asynchronous} baseline {before}, final {settled}"
+        );
+    }
+
+    #[test]
+    fn completed_async_wasm_traps_do_not_accumulate() {
+        check_wasm_trap_retention(false, true);
+    }
+
+    #[test]
+    fn fresh_async_wasm_instances_do_not_accumulate() {
+        check_wasm_trap_retention(true, true);
+    }
+
+    #[test]
+    fn fresh_sync_wasm_instances_do_not_accumulate() {
+        check_wasm_trap_retention(true, false);
+    }
+
     #[test]
     fn fetch_preparation_has_no_cumulative_request_cliff() {
         // Fetch Standard §5.6 creates a request and invokes Fetch for every valid call. Earlier
@@ -8584,6 +10500,7 @@ mod tests {
                 String::from("GET"),
                 None,
                 Vec::new(),
+                None,
             )
             .unwrap_or_else(|| panic!("valid request {index} was denied by historical activity"));
             assert_eq!(request.url.path(), format!("/api/{index}"));
@@ -10143,6 +12060,46 @@ mod tests {
     }
 
     #[test]
+    fn input_accept_reflects_raw_content_attribute_before_submission() {
+        // HTML #dom-input-accept and #reflect; Web IDL #js-DOMString.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const input = document.createElement('input');
+            input.type = 'file';
+            const results = [input.accept === '', !('accept' in document.createElement('div'))];
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'accept');
+            results.push(descriptor.enumerable && descriptor.configurable && !input.hasOwnProperty('accept'));
+            for (const receiver of [null, document.createElement('div'), Object.create(HTMLInputElement.prototype), new Proxy(input,{})]) {
+                try { descriptor.get.call(receiver); results.push(false); } catch(e) { results.push(e instanceof TypeError); }
+                try { descriptor.set.call(receiver, 'image/*'); results.push(false); } catch(e) { results.push(e instanceof TypeError); }
+            }
+            input.setAttribute('accept', 'image/*, IMAGE/PNG, .JpG');
+            results.push(input.accept === 'image/*, IMAGE/PNG, .JpG');
+            input.accept = 'image/*,image/png';
+            results.push(input.getAttribute('accept') === 'image/*,image/png');
+            // The upload-capability read runs on the message submission path.
+            results.push(input.accept.split(',').every(type => type.startsWith('image/')));
+            input.removeAttribute('accept');
+            results.push(input.accept === '');
+            input.accept = null;
+            results.push(input.accept === 'null');
+            input.accept = undefined;
+            results.push(input.accept === 'undefined');
+            input.accept = { [Symbol.toPrimitive](hint) { return hint; } };
+            results.push(input.accept === 'string');
+            try { input.accept = Symbol('invalid'); results.push(false); }
+            catch (e) { results.push(e instanceof TypeError && input.accept === 'string'); }
+            globalThis.acceptReflectionResult = results.every(Boolean);
+        "#,
+            "input accept reflection",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "acceptReflectionResult"), "true");
+    }
+
+    #[test]
     fn geometry_media_images_and_frames_use_canonical_platform_state() {
         // CSSOM §7.2/§9, CSSOM View §§4/6, and HTML §§4.8.4/4.8.5. The assertions enter through
         // the shared prelude so wrapper behavior and the Lumen host calls are covered together.
@@ -10387,6 +12344,27 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_flushes_container_queries_after_ancestor_resize() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const html=document.createElement('html'),body=document.createElement('body');
+            document.appendChild(html);html.appendChild(body);
+            body.innerHTML='<style>#box{container-type:inline-size;width:800px}.child{display:block}@container (width>500px){.child{display:flex}}</style><div id="box"><div class="child" id="child"></div></div>';
+            const box=document.getElementById('box'),child=document.getElementById('child');
+            const result=[getComputedStyle(child).display];
+            box.style.width='200px';result.push(getComputedStyle(child).display);
+            box.style.width='700px';result.push(getComputedStyle(child).display);
+            result.join('|')
+        "#
+            ),
+            "flex|block|flex"
+        );
+    }
+
+    #[test]
     fn computed_font_size_is_an_absolute_length() {
         // CSSOM §9 exposes the computed value for font-size. CSS Fonts
         // §2.5 defines that computed value as an absolute length, including
@@ -10415,6 +12393,25 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "computedFontSizeResult"),
             "16px|10px|15px"
+        );
+    }
+
+    #[test]
+    fn computed_line_height_and_padding_support_editor_line_measurement() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.appendChild(html);html.appendChild(body);
+            html.style.fontSize='16px';
+            body.innerHTML='<div id="editor" contenteditable style="line-height:1.625rem;padding-bottom:calc(.25rem * 4)"><p style="margin:0">hello</p></div>';
+            const editor=document.getElementById('editor'), s=getComputedStyle(editor);
+            globalThis.editorLineMeasurement=[s.lineHeight,s.paddingBottom,
+                editor.getBoundingClientRect().height,
+                parseFloat(s.lineHeight)+parseFloat(s.paddingBottom)].join('|');
+        "#, "CSSOM editor line measurement").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "editorLineMeasurement"),
+            "26px|16px|42|42"
         );
     }
 
@@ -10606,6 +12603,108 @@ mod tests {
         assert_eq!(
             blobs.lock().unwrap().get(&blob_url).cloned(),
             Some((vec![0, 128, 255], "application/x-lumen-port".to_owned()))
+        );
+    }
+
+    #[test]
+    fn web_crypto_hmac_vectors_key_permissions_and_native_digests() {
+        // Web Crypto #hmac-operations, RFC 4231 §4.2. A wrong MAC must fail,
+        // metadata cannot grant new usages, and key input/export bytes copy.
+        let mut engine = platform_engine();
+        eval(&mut engine,r#"
+        globalThis.cryptoResult='pending';
+        (async()=>{
+            const hex=b=>Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('');
+            const results=[];
+            for(const hash of ['SHA-256','SHA-384','SHA-512']) {
+                const source=new Uint8Array(22).fill(11);
+                const key=await crypto.subtle.importKey('raw',source.subarray(1,21),{name:'hmac',hash},true,['verify','sign','sign']);
+                source.fill(0);
+                const data=new TextEncoder().encode('Hi There');
+                const signed=await crypto.subtle.sign('HMAC',key,data);
+                results.push(hex(signed));
+                results.push(await crypto.subtle.verify('HMAC',key,signed,data));
+                new Uint8Array(signed)[0]^=1;
+                results.push(await crypto.subtle.verify('HMAC',key,signed,data));
+                const jwk=await crypto.subtle.exportKey('jwk',key);
+                const copy=await crypto.subtle.importKey('jwk',jwk,{name:'HMAC',hash},true,['sign']);
+                results.push(hex(await crypto.subtle.sign('HMAC',copy,data))===results[results.length-3]);
+                const raw=await crypto.subtle.exportKey('raw',key);new Uint8Array(raw).fill(0);
+                results.push(new Uint8Array(await crypto.subtle.exportKey('raw',key))[0]===11);
+                copy.algorithm.name='AES-CTR';copy.algorithm.hash.name='SHA-1';
+                results.push((await crypto.subtle.sign('HMAC',copy,data)).byteLength===signed.byteLength);
+                try{await crypto.subtle.verify('HMAC',copy,signed,data);results.push('bad permission')}catch(e){results.push(e.name)}
+            }
+            for(const hash of ['SHA-1','SHA-256','SHA-384','SHA-512']) {
+                const bytes=new TextEncoder().encode('!abc?');
+                results.push(hex(await crypto.subtle.digest(hash,new DataView(bytes.buffer,1,3))));
+            }
+            const generated=await crypto.subtle.generateKey({name:'HMAC',hash:{name:'SHA-512'}},true,['sign','verify']);
+            const jwk=await crypto.subtle.exportKey('jwk',generated);
+            results.push([generated.type,generated.algorithm.length,jwk.alg,jwk.kty,jwk.ext,jwk.key_ops.join(',')].join(':'));
+            const protectedKey=await crypto.subtle.generateKey({name:'HMAC',hash:'SHA-256'},false,['sign']);
+            try{await crypto.subtle.exportKey('raw',protectedKey);results.push('bad export')}catch(e){results.push(e.name)}
+            for(const fn of [()=>crypto.subtle.generateKey({name:'HMAC',hash:'SHA-256'},true,[]),
+                ()=>crypto.subtle.generateKey({name:'HMAC',hash:'SHA-256',length:0},true,['sign']),
+                ()=>crypto.subtle.importKey('jwk',{...jwk,alg:'HS256'},{name:'HMAC',hash:'SHA-512'},true,['sign']),
+                ()=>crypto.subtle.digest('SHA-512',{})]) {
+                try{await fn();results.push('bad validation')}catch(e){results.push(e.name)}
+            }
+            cryptoResult=JSON.stringify(results);
+        })().catch(e=>cryptoResult='ERROR:'+e.stack);
+        "#,"HMAC and native digests").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        let actual = string_value(&mut engine, "cryptoResult");
+        let got: Vec<serde_json::Value> =
+            serde_json::from_str(&actual).unwrap_or_else(|e| panic!("{e}: {actual}"));
+        for (index,expected) in [
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6",
+            "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+        ].into_iter().enumerate() {
+            assert_eq!(got[index*7],expected);
+            assert_eq!(serde_json::Value::from(got[index*7+1..index*7+7].to_vec()),serde_json::json!([true,false,true,true,true,"InvalidAccessError"]));
+        }
+        for (index,expected) in [
+            "a9993e364706816aba3e25717850c26c9cd0d89d",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        ].into_iter().enumerate(){assert_eq!(got[21+index],expected);}
+        assert_eq!(
+            serde_json::Value::from(got[25..].to_vec()),
+            serde_json::json!([
+                "secret:1024:HS512:oct:true:sign,verify",
+                "InvalidAccessError",
+                "SyntaxError",
+                "OperationError",
+                "DataError",
+                "TypeError"
+            ])
+        );
+    }
+
+    #[test]
+    fn web_crypto_random_views_use_os_entropy_and_preserve_bounds() {
+        let mut engine = platform_engine();
+        eval(&mut engine,r#"
+            Math.random=()=>{throw Error('insecure random path')};
+            const bytes=new Uint8Array(40).fill(123),view=new Uint16Array(bytes.buffer,4,16);
+            const same=crypto.getRandomValues(view)===view;
+            const bounds=bytes.slice(0,4).every(x=>x===123)&&bytes.slice(36).every(x=>x===123);
+            const changed=bytes.slice(4,36).some(x=>x!==123);
+            const errors=[];
+            for(const value of [new Float32Array(4),new DataView(new ArrayBuffer(8)),[],new Uint8Array(65537)]) {
+                try{crypto.getRandomValues(value);errors.push('missing error')}catch(e){errors.push(e.name)}
+            }
+            const wide=new BigUint64Array(3);crypto.getRandomValues(wide);
+            const uuid=crypto.randomUUID();
+            globalThis.randomResult=[same,bounds,changed,wide.some(x=>x!==0n),
+                /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid),...errors].join('|');
+        "#,"secure random views").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "randomResult"),
+            "true|true|true|true|true|TypeMismatchError|TypeMismatchError|TypeMismatchError|QuotaExceededError"
         );
     }
 
@@ -12582,6 +14681,54 @@ mod tests {
     }
 
     #[test]
+    fn location_same_url_navigation_is_not_a_fragment_noop() {
+        // WHATWG HTML: navigate-fragid-step, navigate-convert-to-replace,
+        // dom-location-hash. The target fragment must be non-null to avoid a
+        // cross-document navigation; only hash's setter suppresses repeats.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            globalThis.navigationCases = [];
+            function record(fn) {
+                __trust.navigation = null; __trust.navigationReplace = false;
+                __trust.scrollFragment = null;
+                fn();
+                navigationCases.push([__trust.navigation,__trust.navigationReplace,__trust.scrollFragment]);
+            }
+            record(()=>location.replace(location.href));
+            record(()=>location.assign(location.href));
+            record(()=>{location.href=location.href});
+            record(()=>{location.pathname=location.pathname});
+            record(()=>location.assign('#chapter'));
+            record(()=>location.assign(location.href));
+            record(()=>{location.hash='#chapter'});
+            record(()=>{location.hash=''});
+            record(()=>{location.hash=''});
+            record(()=>location.assign('https://example.com/'));
+            record(()=>location.assign('/different'));
+        "#, "same-URL navigation").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "JSON.stringify(navigationCases)"),
+            r#"[["https://example.com/",true,null],["https://example.com/",true,null],["https://example.com/",true,null],["https://example.com/",true,null],[null,false,"chapter"],[null,false,"chapter"],[null,false,null],[null,false,""],[null,false,null],["https://example.com/",false,null],["https://example.com/different",false,null]]"#
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"JSON.stringify(['assign','replace'].map(k=>{
+            try { location[k](); return 'missed'; } catch(e) { return e.name; }
+        }))"#
+            ),
+            r#"["TypeError","TypeError"]"#
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(()=>{try{location.assign('http://[');return 'missed'}catch(e){return e.name}})()"#
+            ),
+            "SyntaxError"
+        );
+    }
+
+    #[test]
     fn intersection_observer_records_then_notifies_on_its_task_source() {
         // Intersection Observer §§3.2.4–3.2.6: the rendering update queues
         // entries and one IntersectionObserver task; it does not synchronously
@@ -12721,6 +14868,78 @@ mod tests {
             ),
             "true"
         );
+    }
+
+    #[test]
+    fn computed_style_exposes_inherited_custom_properties_to_script() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html = document.createElement('html');
+            document.append(html);
+            html.append(document.createElement('head'), document.createElement('body'));
+            const sheet = document.createElement('style');
+            sheet.textContent = '.theme {--base: red; --paint: var(--base)}';
+            document.head.append(sheet);
+            const parent = document.createElement('div');
+            parent.className = 'theme';
+            const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+            parent.append(svg);
+            document.body.append(parent);
+            const style = getComputedStyle(svg);
+            if (style.getPropertyValue('--paint') !== 'red') throw Error('inherited theme');
+            svg.style.setProperty('--base','blue');
+            if (style.getPropertyValue('--paint') !== 'red') throw Error('inherited computed value');
+            parent.style.setProperty('--base','green');
+            if (style.getPropertyValue('--paint') !== 'green') throw Error('live inherited value');
+        "#, "computed custom property inheritance").unwrap();
+    }
+
+    #[test]
+    fn text_content_string_replace_all_preserves_dom_identity_and_empty_children() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            function check(condition, message) { if (!condition) throw Error(message); }
+            const empty = document.createElement('div');
+            empty.textContent = '';
+            check(empty.childNodes.length === 0 && empty.firstChild === null,
+                'empty string must not insert an empty Text node');
+            // Reduced Vega renderer initialization: reuse or create an SVG child.
+            const first = empty.childNodes[0];
+            check(!first || first.tagName.toLowerCase() === 'svg', 'renderer sees only its elements');
+            for (const parent of [document.createElement('div'), document.createDocumentFragment(),
+                    document.createElementNS('http://www.w3.org/2000/svg', 'g')]) {
+                parent.textContent = 'same';
+                const old = parent.firstChild;
+                let records;
+                const observer = new MutationObserver(() => {});
+                observer.observe(parent, {childList:true});
+                parent.textContent = 'same';
+                const replacement = parent.firstChild;
+                records = observer.takeRecords();
+                check(replacement !== old && old.parentNode === null && replacement.data === 'same',
+                    'equal text still replaces the child identity');
+                check(records.length === 1 && records[0].removedNodes[0] === old &&
+                    records[0].addedNodes[0] === replacement, 'replacement mutation record');
+                parent.textContent = null;
+                records = observer.takeRecords();
+                check(parent.childNodes.length === 0 && records.length === 1 &&
+                    records[0].addedNodes.length === 0 && records[0].removedNodes[0] === replacement,
+                    'clearing removes children without adding a text node');
+                parent.textContent = '';
+                check(observer.takeRecords().length === 0, 'clearing an empty parent is not a mutation');
+                observer.disconnect();
+            }
+            for (const node of [document.createTextNode('text'), document.createComment('comment')]) {
+                const parent = document.createElement('div'); parent.append(node);
+                node.textContent = '';
+                check(parent.firstChild === node && node.data === '' && node.childNodes.length === 0,
+                    'CharacterData changes data without replacing the node');
+            }
+            const root = document.firstChild;
+            document.textContent = 'not document content';
+            check(document.textContent === null && document.firstChild === root,
+                'Document textContent is null and setting it does nothing');
+        "#, "DOM textContent string replace all").unwrap();
     }
 
     #[test]

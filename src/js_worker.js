@@ -201,7 +201,8 @@
 
     // --- console: a worker's console isn't surfaced; no-op (never throws) ---
     var noop = function () {};
-    g.console = { log: noop, info: noop, warn: noop, error: noop, debug: noop, trace: noop, dir: noop, assert: noop, group: noop, groupCollapsed: noop, groupEnd: noop, table: noop, count: noop, time: noop, timeEnd: noop };
+    // Console §clear: no visible action when the environment has no clearable console.
+    g.console = { log: noop, info: noop, warn: noop, error: noop, debug: noop, trace: noop, dir: noop, clear() {}, assert: noop, group: noop, groupCollapsed: noop, groupEnd: noop, table: noop, count: noop, time: noop, timeEnd: noop };
 
     // --- location (WorkerLocation) ---
     var lp = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "/", "", "", "", "", ""];

@@ -56,11 +56,14 @@ type TerminalPageMedia = (Link, Option<(String, f32, f32)>);
 pub(crate) struct TerminalPaintModel {
     nodes: Vec<TerminalNodePaint>,
     links: HashMap<NodeId, Link>,
+    has_editing_hosts: bool,
     page_media: Option<TerminalPageMedia>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct TerminalNodePaint {
+    parent: Option<NodeId>,
+    clip_path: Option<super::clip_path::Inset>,
     tag: Option<String>,
     id: Option<String>,
     anchor_name: Option<String>,
@@ -86,10 +89,11 @@ struct TerminalNodePaint {
     scroll_top: Option<f32>,
     scroll_left: Option<f32>,
     outline: Outline,
+    editing_barrier: bool,
 }
 
 impl TerminalPaintModel {
-    pub(crate) fn from_dom(dom: &Dom, base: &url::Url) -> Self {
+    pub(crate) fn from_dom(dom: &Dom, base: &url::Url, controls: &super::ControlMap) -> Self {
         let mut links = HashMap::new();
         let mut nodes = Vec::with_capacity(dom.node_count());
         for node in 0..dom.node_count() {
@@ -104,7 +108,13 @@ impl TerminalPaintModel {
             let tag = dom.tag_name(node).map(str::to_string);
             let point_hit = dom.point_hit_testable(node);
             if point_hit {
-                if dom.render_clickable(node) {
+                if dom.is_contenteditable_host(node)
+                    && let Some(&(form, field)) = controls.get(&node)
+                {
+                    // An editing host retains authored paint, but its whole
+                    // box still activates the terminal's native editor.
+                    links.insert(node, Link::Form { form, field });
+                } else if dom.render_clickable(node) {
                     links.insert(
                         node,
                         Link::JsClick {
@@ -151,6 +161,17 @@ impl TerminalPaintModel {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             nodes.push(TerminalNodePaint {
+                parent: dom.parent_flat(node),
+                clip_path: dom
+                    .computed_value_resolved(node, "clip-path")
+                    .and_then(|value| {
+                        let (w, h) = dom.viewport_px();
+                        super::clip_path::Inset::parse(
+                            &value,
+                            super::Units::of(dom, node),
+                            super::value::Vp { w, h },
+                        )
+                    }),
                 tag,
                 id: dom
                     .attr(node, "id")
@@ -204,6 +225,9 @@ impl TerminalPaintModel {
                             .flatten()
                     }),
                 outline: outline_of(dom, node, super::Units::of(dom, node)),
+                editing_barrier: dom
+                    .attr(node, "contenteditable")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("false")),
             });
         }
         while nodes
@@ -214,6 +238,7 @@ impl TerminalPaintModel {
         }
         Self {
             nodes,
+            has_editing_hosts: links.values().any(|link| matches!(link, Link::Form { .. })),
             links,
             page_media: None,
         }
@@ -225,6 +250,25 @@ impl TerminalPaintModel {
                 .nodes
                 .get(node)
                 .is_some_and(|paint| paint.horizontal_item)
+    }
+
+    /// Preserve editing activation across block descendants / generated
+    /// placeholders. A non-editable island stops that inheritance. This only
+    /// changes terminal interaction metadata, never the authored CSS paint.
+    fn editing_link(&self, mut node: NodeId) -> Option<Link> {
+        if !self.has_editing_hosts {
+            return None;
+        }
+        loop {
+            let paint = self.nodes.get(node)?;
+            if paint.editing_barrier {
+                return None;
+            }
+            if let Some(link @ Link::Form { .. }) = self.links.get(&node) {
+                return Some(link.clone());
+            }
+            node = paint.parent?;
+        }
     }
 
     fn independent_band(&self, node: NodeId) -> bool {
@@ -354,6 +398,44 @@ pub(crate) fn paint(
     // compositor groups only overlaps where an upper image is transparent.
     alpha: &HashMap<String, bool>,
 ) -> PaintOut {
+    // Masking affects paint, not canonical layout/DOM geometry. Apply inset
+    // bounds only to this terminal adapter's fragment copy, before extracting
+    // independent scroll buffers, so a closed drawer cannot leak via one.
+    // The terminal adapter uses inset bounding rectangles (rounded corners
+    // remain an approximation); desktop paint/hits retain the exact shape.
+    let mut clipped_fixed;
+    let mut clipped_top;
+    let has_insets = dom.nodes.iter().any(|node| node.clip_path.is_some());
+    let original_bottom = if has_insets {
+        root.max_bottom()
+    } else {
+        flow_bottom
+    };
+    let (fixed, top_layer) = if has_insets {
+        let mut bounds = HashMap::new();
+        collect_inset_bounds(dom, root, &mut bounds);
+        for fragment in fixed {
+            collect_inset_bounds(dom, fragment, &mut bounds);
+        }
+        for top in top_layer {
+            collect_inset_bounds(dom, &top.fragment, &mut bounds);
+        }
+        apply_inset_bounds(dom, root, &bounds, None, None);
+        clipped_fixed = fixed.to_vec();
+        for fragment in &mut clipped_fixed {
+            apply_inset_bounds(dom, fragment, &bounds, None, None);
+        }
+        clipped_top = top_layer.to_vec();
+        for top in &mut clipped_top {
+            // CSS Position 4: top-layer paint escapes DOM-ancestor clips.
+            let boundary = top.fragment.node;
+            apply_inset_bounds(dom, &mut top.fragment, &bounds, None, Some(boundary));
+        }
+        (clipped_fixed.as_slice(), clipped_top.as_slice())
+    } else {
+        (fixed, top_layer)
+    };
+    let flow_bottom = flow_bottom.max(original_bottom);
     let cols = viewport.0;
     let links = &dom.links;
     // The overlap-composite side-table, filled by every `composite` call below
@@ -520,6 +602,60 @@ pub(crate) fn paint(
         scroll_clips,
         carousels,
         composites,
+    }
+}
+
+fn collect_inset_bounds(
+    dom: &TerminalPaintModel,
+    fragment: &Frag<'_>,
+    out: &mut HashMap<NodeId, Clip>,
+) {
+    if let Some(inset) = dom
+        .node(fragment.node)
+        .and_then(|node| node.clip_path.as_ref())
+        && let Some(shape) = inset.shape(crate::render::CssRect::new(
+            fragment.x, fragment.y, fragment.w, fragment.h,
+        ))
+    {
+        let rect = match shape {
+            crate::render::PaintShape::Rect(rect)
+            | crate::render::PaintShape::RoundedRect { rect, .. } => rect,
+            crate::render::PaintShape::Path(_) => unreachable!("inset shape"),
+        };
+        out.insert(
+            fragment.node,
+            Clip {
+                x0: rect.x,
+                y0: rect.y,
+                x1: rect.x + rect.width,
+                y1: rect.y + rect.height,
+            },
+        );
+    }
+    for child in &fragment.children {
+        collect_inset_bounds(dom, child, out);
+    }
+}
+
+fn apply_inset_bounds(
+    dom: &TerminalPaintModel,
+    fragment: &mut Frag<'_>,
+    bounds: &HashMap<NodeId, Clip>,
+    inherited: Option<Clip>,
+    boundary: Option<NodeId>,
+) {
+    let mut mask = inherited;
+    let mut node = (fragment.node != NO_NODE).then_some(fragment.node);
+    while let Some(id) = node {
+        mask = Clip::intersect(mask, bounds.get(&id).copied());
+        if Some(id) == boundary {
+            break;
+        }
+        node = dom.node(id).and_then(|node| node.parent);
+    }
+    fragment.clip = Clip::intersect(fragment.clip, mask);
+    for child in &mut fragment.children {
+        apply_inset_bounds(dom, child, bounds, mask, boundary);
     }
 }
 
@@ -793,11 +929,12 @@ pub(crate) type RegionBuffer = (Vec<Row>, Vec<Carousel>, Vec<(usize, u16, u16)>)
 pub(crate) fn region_buffer(
     dom: &Dom,
     base: &url::Url,
+    controls: &super::ControlMap,
     root: &mut Frag<'_>,
     cw: f32,
     ch: f32,
 ) -> RegionBuffer {
-    let model = TerminalPaintModel::from_dom(dom, base);
+    let model = TerminalPaintModel::from_dom(dom, base, controls);
     let mut scroll_clips = Vec::new();
     // v1 region-patch cut: the incremental region re-lay does NOT alpha-composite
     // transparent image overlaps (empty alpha ⇒ no grouping) — such overlaps in a
@@ -1529,6 +1666,27 @@ fn terminal_piece_text_with_space(piece: &super::inline::Piece) -> String {
     text
 }
 
+/// Splitting a text run at a paint-style boundary must not manufacture a
+/// whitespace cell. Keep contiguous canonical glyph runs adjacent in the
+/// terminal too; real CSS gaps, replaced boxes, and baseline shifts retain
+/// their independently quantized positions.
+fn abuts_previous_text(pieces: &[super::inline::Piece], index: usize) -> bool {
+    let Some(previous) = index.checked_sub(1).map(|i| &pieces[i]) else {
+        return false;
+    };
+    let piece = &pieces[index];
+    !piece.space_before
+        && [previous, piece].iter().all(|p| {
+            p.shaped.is_some()
+                && p.item.image.is_none()
+                && p.item.terminal_text.is_none()
+                && !p.item.text.is_empty()
+        })
+        && (piece.x + piece.paint_x - previous.x - previous.paint_x - previous.paint_width).abs()
+            < 0.01
+        && (piece.y - previous.y).abs() < 0.01
+}
+
 /// Resolve horizontal CSS clipping while the canonical shaped geometry is
 /// still available. CSS Overflow 3 §5.1 clips glyph painting and permits a
 /// character to be partially visible. A terminal cannot paint part of a
@@ -1645,7 +1803,7 @@ fn terminal_line_extent(
     let mut span = 1i64;
     let mut pen = start_col;
     let mut restore_soft_gap = joins_previous;
-    for piece in &line_fragment.pieces {
+    for (index, piece) in line_fragment.pieces.iter().enumerate() {
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
         if piece.space_before
             && piece.item.image.is_none()
@@ -1672,7 +1830,11 @@ fn terminal_line_extent(
             || terminal_piece_width(piece, cell_w, cell_h),
             display_width,
         );
-        let mut col = preferred.max(pen);
+        let mut col = if abuts_previous_text(&line_fragment.pieces, index) {
+            pen
+        } else {
+            preferred.max(pen)
+        };
         while remaining > 0 {
             if col >= right {
                 rows += 1;
@@ -1744,7 +1906,7 @@ fn terminal_line_span(
         let mut row_offset = 0i64;
         let mut span = 1i64;
         let mut pen = continuation_col;
-        for piece in &line_fragment.pieces {
+        for (index, piece) in line_fragment.pieces.iter().enumerate() {
             let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
             let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
             if piece.space_before
@@ -1753,7 +1915,11 @@ fn terminal_line_span(
             {
                 preferred -= 1;
             }
-            let col = preferred.max(pen);
+            let col = if abuts_previous_text(&line_fragment.pieces, index) {
+                pen
+            } else {
+                preferred.max(pen)
+            };
             if columns > 0 && col > continuation_col && col + width > columns as i64 {
                 row_offset += 1;
                 pen = continuation_col;
@@ -1768,7 +1934,7 @@ fn terminal_line_span(
     let mut row_offset = 0i64;
     let mut span = 1i64;
     let mut pen = continuation_col;
-    for piece in &line_fragment.pieces {
+    for (index, piece) in line_fragment.pieces.iter().enumerate() {
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
         if piece.space_before
             && piece.item.image.is_none()
@@ -1783,7 +1949,9 @@ fn terminal_line_span(
             || terminal_piece_width(piece, cell_w, cell_h),
             display_width,
         );
-        let mut col = if row_offset > 0 {
+        let mut col = if abuts_previous_text(&line_fragment.pieces, index) {
+            pen
+        } else if row_offset > 0 {
             continuation_col
         } else {
             preferred.max(pen)
@@ -1997,7 +2165,7 @@ fn inflow_bgs(
         if c.paint.sc || c.paint.positioned || c.paint.float {
             continue;
         }
-        if matches!(c.kind, FragKind::Block) {
+        if matches!(c.kind, FragKind::Block | FragKind::TableCell(_)) {
             hit_op(c, ops, cw, ch, ox, oy, links);
             fill_op(dom, c, ops, cw, ch, ox, oy);
         }
@@ -2030,7 +2198,7 @@ fn inflow_content(
             previous_line = None;
             continue;
         }
-        if !matches!(c.kind, FragKind::Block) {
+        if !matches!(c.kind, FragKind::Block | FragKind::TableCell(_)) {
             hit_op(c, ops, cw, ch, ox, oy, links);
         }
         if let FragKind::Line(line) = &c.kind {
@@ -2061,7 +2229,7 @@ fn inflow_content(
             if !placement.joins_previous {
                 row_pens.clear();
             }
-            for p in &line.pieces {
+            for (index, p) in line.pieces.iter().enumerate() {
                 let canonical_text_origin = c.x + p.x;
                 let text_clip_resolved = p.item.image.is_none()
                     && p.item.terminal_text.is_none()
@@ -2108,6 +2276,11 @@ fn inflow_content(
                     invisible: p.item.invisible,
                     terminal_band: placement.band,
                 };
+                if matches!(item.link, None | Some(Link::JsClick { .. }))
+                    && let Some(link) = dom.editing_link(item.node)
+                {
+                    item.link = Some(link);
+                }
                 quantize_item(&mut item, p, cw, ch);
                 if p.space_before
                     && text_x_offset <= 0.01
@@ -2149,6 +2322,12 @@ fn inflow_content(
                 };
                 let mut row = placement.row + baseline_offset + (p.paint_y / ch).round() as i64;
                 let mut preferred_col = ((item_x - ox) / cw).round() as i64;
+                if text_x_offset <= 0.01
+                    && abuts_previous_text(&line.pieces, index)
+                    && let Some(&pen) = row_pens.get(&row)
+                {
+                    preferred_col = pen;
+                }
                 if item.image.is_none()
                     && !item.text.is_empty()
                     && placement.reflow_right.is_none()
@@ -3177,7 +3356,7 @@ fn composite(
         // represents it. A media element is different: its small textual
         // caption represents the WHOLE generated video box, including the
         // custom controls that paint over it, so retain that box surface.
-        let represented = !matches!(hit.link, Link::Media(_))
+        let represented = !matches!(hit.link, Link::Media(_) | Link::Form { .. })
             && rows
                 .iter()
                 .enumerate()

@@ -1,8 +1,9 @@
 //! Browser-wide language preferences.
 //!
-//! Keep the HTTP preference list, HTML `NavigatorLanguage` surface, and
-//! ECMA-402 default locale sourced from this one definition so network and
-//! script-visible language negotiation cannot drift apart.
+//! TRust deliberately advertises US English regardless of the host's language,
+//! region, or geographic location. These are build defaults, not OS-derived
+//! preferences. Lumen's native ECMA-402 default is also en-US; the integration
+//! test below keeps it aligned with HTTP and NavigatorLanguage.
 
 /// The user's most-preferred language (WHATWG HTML, NavigatorLanguage).
 pub(crate) const LANGUAGE: &str = "en-US";
@@ -26,5 +27,31 @@ mod tests {
 
         assert_eq!(http_languages, LANGUAGES);
         assert_eq!(LANGUAGES.first().copied(), Some(LANGUAGE));
+    }
+
+    #[test]
+    fn page_language_and_native_intl_default_to_us_english() {
+        // HTML NavigatorLanguage and ECMA-402 §6.2.3 DefaultLocale describe user
+        // preferences, not the Document's language or the machine's location.
+        // Also run this test in a subprocess with German LANG/LC_ALL/LANGUAGE.
+        let html = r#"<!doctype html><html lang="de"><body><output id="locale"></output>
+            <script>
+                document.getElementById("locale").textContent = [
+                    navigator.language, navigator.languages.join(","),
+                    new Intl.NumberFormat().resolvedOptions().locale,
+                    new Intl.DateTimeFormat().resolvedOptions().locale,
+                    new Intl.NumberFormat().format(1234.5),
+                    (1234.5).toLocaleString(),
+                    new Intl.DisplayNames(undefined, {type: "language"}).of("de")
+                ].join("|");
+            </script></body></html>"#;
+        let (rendered, outcome) =
+            crate::js::transform(html, &crate::js::PageEnv::bare("https://example.de/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(
+            rendered.contains(">en-US|en-US,en|en-US|en-US|1,234.5|1,234.5|German</output>"),
+            "{rendered}"
+        );
     }
 }

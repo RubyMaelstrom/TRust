@@ -10,14 +10,13 @@
 //! places the cells with vertical alignment (§17.5.4).
 //!
 //! Everything is f32 CSS px; only the terminal adapter quantizes the resulting
-//! fragments. A cell's own `background` fills because a
-//! cell is a real fragment; row/row-group backgrounds don't (they generate no
-//! fragment — documented deferral).
+//! fragments. Cell fragments retain their row and row-group background
+//! positioning rectangles for CSS 2.2 §17.5.1's layered painting model.
 
 use crate::dom::NodeId;
 use crate::layout2::{Units, css_length_px};
 
-use super::flow::{Flow, Frag};
+use super::flow::{Flow, Frag, FragKind};
 use super::intrinsic::IMode;
 use super::style::{Align2, InlineStyle, LEFT, RIGHT};
 use super::tree::{ColSpec, TableBox, declared_track_width};
@@ -29,6 +28,7 @@ pub(super) struct TableCols {
     pub widths: Vec<f32>,
     /// Horizontal border-spacing between columns (px).
     pub bs: f32,
+    pub bs_y: f32,
     /// The table's used content width (px): `Σ widths + bs·(ncols−1)`.
     pub table_w: f32,
 }
@@ -48,15 +48,16 @@ impl Flow<'_> {
         inl: &InlineStyle,
     ) -> TableCols {
         let ncols = tb.ncols;
-        let bs = self.table_border_spacing(table_node);
+        let (bs, bs_y) = self.table_border_spacing(table_node);
         if ncols == 0 {
             return TableCols {
                 widths: Vec::new(),
                 bs,
+                bs_y,
                 table_w: 0.0,
             };
         }
-        let spacing = bs * (ncols - 1) as f32;
+        let spacing = bs * (ncols + 1) as f32;
         // Space available to the columns' content (the band, less spacing).
         let avail = (avail_w - spacing).max(1.0);
         let cellpad = self.table_cellpadding(table_node);
@@ -72,6 +73,7 @@ impl Flow<'_> {
             return TableCols {
                 widths: fixed_columns(&col_w, ncols, avail),
                 bs,
+                bs_y,
                 // `avail` already == the definite content width − spacing.
                 table_w: avail + spacing,
             };
@@ -137,6 +139,7 @@ impl Flow<'_> {
         TableCols {
             widths: target,
             bs,
+            bs_y,
             table_w,
         }
     }
@@ -164,9 +167,10 @@ impl Flow<'_> {
             return (Vec::new(), 0.0);
         }
         let bs = cols.bs;
+        let bs_y = cols.bs_y;
         // Column left edges (with inter-column spacing).
         let mut col_x = vec![0.0f32; ncols];
-        let mut acc = 0.0;
+        let mut acc = bs;
         for (c, x) in col_x.iter_mut().enumerate() {
             *x = acc;
             acc += cols.widths.get(c).copied().unwrap_or(1.0) + bs;
@@ -240,26 +244,60 @@ impl Flow<'_> {
             }
             let need = l.frag.h + 2.0 * l.pv;
             let have: f32 =
-                row_h[cell.row..end].iter().sum::<f32>() + bs * (end - cell.row - 1) as f32;
+                row_h[cell.row..end].iter().sum::<f32>() + bs_y * (end - cell.row - 1) as f32;
             if need > have {
                 row_h[end - 1] += need - have;
             }
         }
         let mut row_y = vec![0.0f32; nrows];
-        let mut acc = 0.0;
+        let mut acc = bs_y;
         for r in 0..nrows {
             row_y[r] = acc;
-            acc += row_h[r] + bs;
+            acc += row_h[r] + bs_y;
         }
-        let table_h = (acc - bs).max(0.0);
+        let table_h = acc.max(0.0);
+
+        // CSS 2.2 §17.5.1: row backgrounds extend through cells originating
+        // in that row (including rowspans), but their image positioning area
+        // remains the ordinary row rectangle. Separate-border gaps retain
+        // the TABLE background. Row-group layers precede row layers.
+        // https://www.w3.org/TR/CSS22/tables.html#table-layers
+        let mut group_rows = std::collections::HashMap::<NodeId, (usize, usize)>::new();
+        let cell_rows: Vec<_> = tb
+            .cells
+            .iter()
+            .map(|cell| {
+                let row = self
+                    .dom
+                    .parent_flat(cell.b.node)
+                    .filter(|&n| self.dom.effective_display(n).as_deref() == Some("table-row"));
+                let group = row.and_then(|r| self.dom.parent_flat(r)).filter(|&n| {
+                    matches!(
+                        self.dom.effective_display(n).as_deref(),
+                        Some("table-row-group" | "table-header-group" | "table-footer-group")
+                    )
+                });
+                if let Some(group) = group {
+                    let end = (cell.row + cell.rowspan).min(nrows);
+                    group_rows
+                        .entry(group)
+                        .and_modify(|span| {
+                            span.0 = span.0.min(cell.row);
+                            span.1 = span.1.max(end);
+                        })
+                        .or_insert((cell.row, end));
+                }
+                (row, group)
+            })
+            .collect();
 
         // Place each cell at its column/row origin, vertically aligned in its
         // (possibly taller) row band per `vertical-align`/`valign`.
         let mut frags: Vec<Frag<'t>> = Vec::with_capacity(laid.len());
-        for (cell, mut l) in tb.cells.iter().zip(laid) {
+        for ((cell, mut l), (row, group)) in tb.cells.iter().zip(laid).zip(cell_rows) {
             let end = (cell.row + cell.rowspan).min(nrows);
             let span_h = row_h[cell.row..end].iter().sum::<f32>()
-                + bs * (end.saturating_sub(cell.row + 1)) as f32;
+                + bs_y * (end.saturating_sub(cell.row + 1)) as f32;
             let cell_outer_h = l.frag.h + 2.0 * l.pv;
             let dy_valign = self.cell_valign_offset(cell.b.node, cell_outer_h, span_h);
             // §9.4.3 relative offset / transform translation — a cell's CB for
@@ -267,10 +305,44 @@ impl Flow<'_> {
             let (rx, ry) =
                 self.paint_offset(&cell.b.style, l.cell_w, Some(span_h), l.frag.w, l.frag.h);
             let x = content_x + col_x[cell.col] + l.ph + rx;
-            let y = content_top + row_y[cell.row] + dy_valign + l.pv + ry;
+            let y = content_top + row_y[cell.row] + l.pv + ry;
+            // Vertical alignment moves content, not the cell's background
+            // and border. Every cell occupies its full resolved row span.
+            for child in &mut l.frag.children {
+                Flow::offset_frag(child, 0.0, dy_valign);
+            }
+            l.frag.h = (span_h - 2.0 * l.pv).max(l.frag.h);
+            let mut layers = Vec::new();
+            if let Some(group) = group {
+                let (first, end) = group_rows[&group];
+                let h = row_y[end - 1] + row_h[end - 1] - row_y[first];
+                layers.push((
+                    group,
+                    [
+                        content_x + bs - x,
+                        content_top + row_y[first] - y,
+                        cols.table_w - 2.0 * bs,
+                        h,
+                    ],
+                ));
+            }
+            if let Some(row) = row {
+                layers.push((
+                    row,
+                    [
+                        content_x + bs - x,
+                        content_top + row_y[cell.row] - y,
+                        cols.table_w - 2.0 * bs,
+                        row_h[cell.row],
+                    ],
+                ));
+            }
+            if !layers.is_empty() {
+                l.frag.kind = FragKind::TableCell(Box::new(layers));
+            }
             Flow::offset_frag(&mut l.frag, x, y);
             for (n, ay) in l.anchors {
-                anchors.push((n, ay + y));
+                anchors.push((n, ay + y + dy_valign));
             }
             frags.push(l.frag);
         }
@@ -357,14 +429,14 @@ impl Flow<'_> {
         if ncols == 0 {
             return 0.0;
         }
-        let bs = self.table_border_spacing(table_node);
+        let (bs, _) = self.table_border_spacing(table_node);
         let cellpad = self.table_cellpadding(table_node);
         let (col_min, col_max, _) = self.table_col_metrics(tb, bs, cellpad, None, 0.0, inl);
         let cols = match mode {
             IMode::Min => col_min,
             IMode::Max => col_max,
         };
-        cols.iter().sum::<f32>() + bs * (ncols - 1) as f32
+        cols.iter().sum::<f32>() + bs * (ncols + 1) as f32
     }
 
     /// A cell's min-content and max-content OUTER (border-box) widths (px):
@@ -418,24 +490,38 @@ impl Flow<'_> {
     /// Horizontal border-spacing (px): CSS `border-spacing` if set, else the
     /// HTML `cellspacing` attribute (HTML §15.3.13 maps it to `border-spacing`).
     /// Default 0; content/cellpadding still separates columns.
-    /// Read through the author cascade (`computed_style`); `border-spacing`
-    /// isn't a registry-tracked property.
-    fn table_border_spacing(&self, table: NodeId) -> f32 {
+    /// CSS 2.2 §17.6.1: one length sets both axes, two set horizontal and
+    /// vertical. Spacing includes the outside edges and does not participate
+    /// in the collapsed border model. Read inherited values from the cascade.
+    fn table_border_spacing(&self, table: NodeId) -> (f32, f32) {
+        if self
+            .dom
+            .computed_value_resolved(table, "border-collapse")
+            .as_deref()
+            == Some("collapse")
+        {
+            return (0.0, 0.0);
+        }
         let raw = self
             .dom
-            .computed_style(table, "border-spacing")
+            .computed_value_resolved(table, "border-spacing")
             .or_else(|| {
                 self.dom
                     .attr(table, "cellspacing")
                     .map(|s| s.trim().to_string())
             });
-        let Some(raw) = raw else { return 0.0 };
-        let first = raw.split_whitespace().next().unwrap_or("0");
+        let Some(raw) = raw else { return (0.0, 0.0) };
+        let mut parts = raw.split_whitespace();
+        let first = parts.next().unwrap_or("0");
+        let second = parts.next().unwrap_or(first);
         let u = Units::of(self.dom, table);
-        css_length_px(first, u)
-            .or_else(|| first.parse::<f32>().ok())
-            .unwrap_or(0.0)
-            .max(0.0)
+        let length = |value: &str| {
+            css_length_px(value, u)
+                .or_else(|| value.parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .max(0.0)
+        };
+        (length(first), length(second))
     }
 
     /// Vertical offset of a cell within its (possibly taller) row band (CSS

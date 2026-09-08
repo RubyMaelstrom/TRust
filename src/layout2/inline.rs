@@ -122,6 +122,7 @@ pub(crate) struct InlineItem {
     /// Keeping `node == NO_NODE` preserves the interaction/selection contract
     /// without making graphical paint query the DOM with the sentinel.
     pub style_node: NodeId,
+    pub pseudo: Option<(NodeId, crate::dom::PseudoEl)>,
     pub node: NodeId,
     pub link: Option<Link>,
     pub crop: bool,
@@ -130,6 +131,30 @@ pub(crate) struct InlineItem {
 }
 
 impl Piece {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.item.text.capacity()
+            + [
+                &self.item.terminal_text,
+                &self.item.graphical_image,
+                &self.item.image,
+            ]
+            .into_iter()
+            .map(|value| value.as_ref().map_or(0, String::capacity))
+            .sum::<usize>()
+            + self
+                .item
+                .link
+                .as_ref()
+                .map_or(0, |link| link.retained_memory().0)
+            + self
+                .shaped
+                .as_ref()
+                .map_or(0, crate::text::ShapedText::retained_bytes)
+            + self.text_style.as_ref().map_or(0, |style| {
+                style.family.capacity() + style.language.as_ref().map_or(0, String::capacity)
+            })
+    }
+
     /// An atomic piece with an explicit box (a replaced flex item laid at
     /// an imposed size), with an independent object-fit paint rectangle.
     pub(crate) fn boxed(
@@ -429,32 +454,52 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 
     /// Place the k-th inline float met (§9.5.1): pull it aside into the float
-    /// context and shorten the current + subsequent line boxes. A LEADING float
-    /// (empty current line) places at the current line's top and re-shortens
-    /// this line; a float met AFTER content on the line can't sit above that
-    /// content (rule 6), and reflowing the already-placed content is a v1 cut,
-    /// so it starts the NEXT line's band instead.
+    /// context and shorten the current + subsequent line boxes. CSS 2.2 §9.5
+    /// explicitly keeps a float encountered after inline content on the same
+    /// line when its margin box fits the remaining space. Earlier inline boxes
+    /// move to the other side of a left float; a right float shortens their band.
+    /// https://www.w3.org/TR/CSS22/visuren.html#floats
     fn place_float(&mut self) {
         let idx = self.float_next;
         self.float_next += 1;
         let leading = self.pen <= self.line_start;
         let line_y = self.content_top_y + self.laid_h;
-        let top_min = if leading {
-            line_y
-        } else {
-            line_y + crate::dom::FONT_SIZE_INITIAL * 1.2
-        };
         let cb_l = self.content_left_x;
         let cb_r = self.content_left_x + self.cb_w_px;
+        let line_height = self
+            .cur
+            .iter()
+            .map(|piece| piece.box_height)
+            .fold(self.strut.line_height, f32::max);
         let (Some(fc), Some(fb)) = (self.fc.as_deref_mut(), self.float_boxes.get(idx).copied())
         else {
             return;
+        };
+        let fits_current = leading || super::css_px_fits(fb.mw, self.line_right - self.pen);
+        let top_min = if fits_current {
+            line_y
+        } else {
+            line_y + line_height
         };
         let (x, y) = fc.place(fb, top_min, cb_l, cb_r);
         self.placements.push(FloatPlace { index: idx, x, y });
         if leading {
             // The current (empty) line's edges just moved — re-query the band.
             self.begin_line();
+        } else if fits_current && y < line_y + line_height {
+            let (left, right) = fc.band(line_y, line_height);
+            let next_left = (cb_l.max(left) - cb_l).clamp(0.0, self.cap);
+            let next_right = (cb_r.min(right) - cb_l).clamp(next_left, self.cap);
+            let shift = next_left - self.line_left;
+            for piece in &mut self.cur {
+                piece.x += shift;
+            }
+            // Atomic-inline placeholders are in `cur` until flush_line, so
+            // their eventual fragment placements receive the same translation.
+            self.pen += shift;
+            self.line_start += shift;
+            self.line_left = next_left;
+            self.line_right = next_right;
         }
     }
 
@@ -473,7 +518,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// control atom, but its text/icon items still need the same `Link::Form`
     /// target that the terminal form interaction path uses for submission.
     fn form_context(&self, node: NodeId, parent: &InlineStyle) -> InlineStyle {
-        let mut context = if node == NO_NODE {
+        let mut context = if node == NO_NODE || parent.pseudo.is_some() {
             parent.clone()
         } else {
             InlineStyle::derive(self.dom, node, parent, self.base)
@@ -549,7 +594,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // their inherited text context is the originating element's
                 // surrounding context and their own box model is in `style`.
                 let inner = if *node == crate::layout2::NO_NODE {
-                    ctx.clone()
+                    ctx.with_pseudo(style.pseudo)
                 } else {
                     self.form_context(*node, ctx)
                 };
@@ -557,7 +602,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.marks.push((*node, self.lines.len()));
                 }
                 self.pending_gap_px += self.edge_px(style, LEFT);
-                for k in kids {
+                for k in kids.iter() {
                     self.walk(k, &inner);
                 }
                 self.pending_gap_px += self.edge_px(style, RIGHT);
@@ -659,6 +704,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 image: Some(source.to_string()),
                 emph: Emphasis::default(),
                 style_node: ctx.node,
+                pseudo: ctx.pseudo,
                 node: NO_NODE,
                 link: None,
                 crop: false,
@@ -763,7 +809,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         ..break_style
                     },
                 );
-                if normal_cut == 0 || normal_cut == rest.len() {
+                // A legal punctuation break may itself be beyond the line's
+                // remaining width ("significantly—Median"). It must not let
+                // emergency wrapping split the word before that opportunity;
+                // the preceding space still supplies an acceptable break.
+                if normal_cut == 0
+                    || normal_cut == rest.len()
+                    || !super::css_px_fits(
+                        crate::text::shape(&rest[..normal_cut], &ctx.text_style()).advance,
+                        avail,
+                    )
+                {
                     self.soft_break();
                     spaced = false;
                     continue;
@@ -880,6 +936,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             && last.item.kind == ctx.kind
             && last.item.emph == ctx.emph
             && last.item.node == ctx.node
+            && last.item.pseudo == ctx.pseudo
             && last.item.link == ctx.link
             && last.item.invisible == ctx.invisible
             && last.stretch == ctx.ws.collapses_spaces()
@@ -925,6 +982,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 image: None,
                 emph: ctx.emph,
                 style_node: ctx.node,
+                pseudo: ctx.pseudo,
                 node: ctx.node,
                 link: ctx.link.clone(),
                 crop: false,
@@ -1001,6 +1059,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         image: None,
                         emph: Emphasis::default(),
                         style_node: a.node,
+                        pseudo: None,
                         node: a.node,
                         link: Some(Link::Form {
                             form: *form,
@@ -1083,6 +1142,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 image: None,
                 emph: Emphasis::default(),
                 style_node: a.node,
+                pseudo: None,
                 node: a.node,
                 link: Some(Link::Form {
                     form: *form,
@@ -1175,6 +1235,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         .map(str::to_string),
                     emph: Emphasis::default(),
                     style_node: node,
+                    pseudo: None,
                     node,
                     link,
                     crop: r.crop,
@@ -1299,6 +1360,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     image: Some(poster),
                     emph: Emphasis::default(),
                     style_node: node,
+                    pseudo: None,
                     node,
                     link: link.clone(),
                     crop: false,
@@ -1415,6 +1477,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 image: None,
                 emph: Emphasis::default(),
                 style_node: node,
+                pseudo: None,
                 node,
                 link: None,
                 crop: false,

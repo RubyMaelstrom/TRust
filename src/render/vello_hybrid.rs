@@ -451,6 +451,14 @@ impl VelloHybridRenderer {
                 self.render_to_view(&hybrid_scene, &view, &mut encoder)?;
             }
             self.queue.submit([encoder.finish()]);
+            // wl_surface.frame paces subsequent winit redraws. A completely
+            // obscured Wayland surface may receive no frame callbacks; without
+            // this notification we keep entering present on the UI thread,
+            // where a FIFO Vulkan presenter can wait indefinitely for exposure.
+            // Notify only after acquiring/rendering a frame we will present.
+            if let Some(window) = &self.window {
+                window.pre_present_notify();
+            }
             self.queue.present(texture);
             if self.surface_copy_dst {
                 self.retained_window_valid = true;
@@ -1019,11 +1027,10 @@ impl VelloHybridRenderer {
                     false
                 };
             if !updated_in_place {
-                // Keep the old allocation occupied until the replacement has
-                // been allocated, so its queued clear cannot target a reused
-                // atlas slot. Animated formats retain one canvas size and take
-                // the in-place path above; this is the general size-change
-                // fallback.
+                // Animated formats retain one canvas size and take the
+                // in-place path above; this is the general size-change
+                // fallback. Atlas uploads, copies and clears share the same
+                // encoder order, including when later images reuse this slot.
                 stale = self.images.remove(&handle);
             }
         }
@@ -1439,6 +1446,128 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_bitmap_glyphs_render_without_fallback_or_atlas_growth() {
+        use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
+        let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+            eprintln!("Bitmap-glyph GPU regression not exercised: no Hybrid adapter");
+            return;
+        };
+        let mut scene = Scene {
+            viewport: ViewportMetrics::from_physical(PhysicalSize::new(180, 180), ScaleFactor::default()),
+            primitives: Vec::new(),
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 180.0, 180.0),
+            image_store: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::new(180.0, 180.0),
+        };
+        // Include sizes beyond the experimental glyph cache's limit. These
+        // must still render via ordinary image uploads, not panic to CPU.
+        for size in [48.0, 128.0, 320.0] {
+            let shaped = crate::text::shape("👍", &crate::text::TextStyle {
+                family: "Noto Color Emoji".into(), size, ..Default::default()
+            });
+            scene.primitives = vec![DisplayCommand::GlyphRun {
+                origin: CssPoint::new(4.0, 4.0), shaped,
+                color: PaintColor::Rgba(0, 0, 0, 255),
+                decoration: crate::render::TextDecorationPaint {
+                    color: PaintColor::Rgba(0, 0, 0, 255), style: DecorationStyle::Solid,
+                },
+                shadows: Vec::new(), clip: None, node: 0, link: None,
+            }];
+            for _ in 0..20 {
+                let frame = hybrid.render_rgba(&scene).expect("bitmap glyph stays on Hybrid");
+                let colored = frame.pixels.chunks_exact(4).filter(|p| {
+                    p[3] > 0 && p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 50
+                }).count();
+                assert!(colored > 100, "missing color bitmap at {size}px: {colored}");
+                assert_eq!(hybrid.renderer.atlas_texture().size().depth_or_array_layers, 1,
+                    "temporary glyph images must release their atlas allocations");
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_atlas_growth_preserves_upload_order_and_row_padding() {
+        use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
+        use crate::render::ImageStore;
+
+        let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless())
+        else {
+            eprintln!("Atlas-growth pixel regression not exercised: no Hybrid adapter");
+            return;
+        };
+        // Both already-aligned and padded CPU rows. A deliberately small
+        // atlas forces growth without allocating a production-sized page.
+        for width in [64, 65] {
+            let mut settings = vello_hybrid::RenderSettings::default();
+            settings.memory_settings.image_atlas_config.atlas_size = (96, 128);
+            (hybrid.renderer, hybrid.resources) = vello_hybrid::Renderer::new_with(
+                &hybrid.device,
+                &RenderTargetConfig {
+                    format: hybrid.format,
+                    width: 64,
+                    height: 32,
+                },
+                settings,
+            );
+            hybrid.images.clear();
+            let store = ImageStore::default();
+            let image = |rgba: [u8; 4]| ImageResource {
+                width,
+                height: 96,
+                rgba: Arc::from(rgba.repeat(width as usize * 96)),
+                has_alpha: false,
+            };
+            let first = ImageHandle::for_source("test:atlas-first");
+            let second = ImageHandle::for_source("test:atlas-second");
+            let command = |handle, x| DisplayCommand::Image {
+                rect: CssRect::new(x, 0.0, 32.0, 32.0),
+                handle,
+                source_rect: None,
+                fit: ImageFit::Fill,
+                sampling: ImageSampling::Nearest,
+                clip: None,
+                node: 0,
+                link: None,
+            };
+            let mut scene = Scene {
+                viewport: ViewportMetrics::from_physical(
+                    PhysicalSize::new(64, 32),
+                    ScaleFactor::default(),
+                ),
+                primitives: vec![command(first, 0.0)],
+                controls: Vec::new(),
+                content_viewport: CssRect::new(0.0, 0.0, 64.0, 32.0),
+                image_store: store.clone(),
+                page_scroll_containers: Vec::new(),
+                page_size: CssSize::new(64.0, 32.0),
+            };
+            store.insert(first, image([255, 0, 0, 255]));
+            hybrid.render_rgba(&scene).unwrap();
+            store.insert(second, image([0, 255, 0, 255]));
+            store.insert(first, image([0, 0, 255, 255]));
+            // New allocation grows/copies the atlas before an update to an
+            // existing allocation. The copy must not overwrite that update.
+            scene.primitives = vec![command(second, 32.0), command(first, 0.0)];
+            let frame = hybrid.render_rgba(&scene).unwrap();
+            assert!(hybrid.renderer.atlas_texture().size().depth_or_array_layers >= 2);
+            for y in [1, 16, 30] {
+                assert_eq!(
+                    &frame.pixels[(y * 64 + 16) * 4..][..4],
+                    &[0, 0, 255, 255],
+                    "old allocation updated after growth, row width {width}, y={y}"
+                );
+                assert_eq!(
+                    &frame.pixels[(y * 64 + 48) * 4..][..4],
+                    &[0, 255, 0, 255],
+                    "new allocation after growth, row width {width}, y={y}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn surface_format_prefers_non_srgb_reference_channels() {

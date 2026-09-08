@@ -179,13 +179,29 @@ async fn run_session(
     // Split so the read future borrows the read half while a control/outbound
     // write borrows the write half — no aliasing across the `select!`.
     let (mut rd, mut wr) = tokio::io::split(io);
+    // Decode frames on a dedicated task. Recreating a `read_exact` future in
+    // this writer/read `select!` can discard bytes already consumed when a
+    // send wins the race (Tokio documents `read_exact` as cancellation-
+    // unsafe). The reader owns its decoder state until a complete frame is
+    // available, then forwards bounded messages to this task.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Result<(bool, u8, Vec<u8>), String>>(16);
+    let reader = tokio::spawn(async move {
+        loop {
+            let result = read_frame(&mut rd).await;
+            let failed = result.is_err();
+            if frame_tx.send(result).await.is_err() || failed {
+                break;
+            }
+        }
+    });
     let mut frag: Vec<u8> = Vec::new();
     let mut frag_op: u8 = 0;
     let mut closing = false;
     let mut closed_reported = false;
     loop {
         tokio::select! {
-            frame = read_frame(&mut rd) => {
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else { break; };
                 let (fin, opcode, payload) = match frame {
                     Ok(f) => f,
                     Err(e) => {
@@ -295,6 +311,7 @@ async fn run_session(
             }
         }
     }
+    reader.abort();
     if !closed_reported {
         let _ = events
             .send((

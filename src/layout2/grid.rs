@@ -12,8 +12,9 @@
 //! the sizing functions themselves are rebuilt on `Len` so everything
 //! resolves in px space against real used widths, never pre-quantized
 //! cells. Named LINES are dropped by that tokenizer (documented — named
-//! AREAS are supported and cover the common authoring pattern); subgrid
-//! and baseline shims are out of scope for this phase.
+//! AREAS are supported and cover the common authoring pattern). Row subgrids
+//! share track sizing and placement with their parent (css-grid-2 §9).
+//! Column subgrids, named-line matching and baseline shims remain separate work.
 
 use std::ops::Range;
 
@@ -25,7 +26,7 @@ use super::flow::{Flow, Frag};
 use super::intrinsic::IMode;
 use super::style::InlineStyle;
 use super::style::{BOTTOM, LEFT, RIGHT, TOP};
-use super::tree::BoxNode;
+use super::tree::{BoxNode, Content, SharedBox};
 use super::value::{Len, Vp, split_args, substitute_var_fallbacks};
 
 /// One track sizing function pair per §11.2: `minmax()` splits, `<flex>`
@@ -621,10 +622,206 @@ fn parse_areas(value: &str) -> Option<(AreaMap, usize, usize)> {
 // ------------------------------------------------------------- §11 sizing
 
 /// An item's contribution to the tracks it spans in one axis.
+#[derive(Clone)]
 struct Contrib {
     tracks: Range<usize>,
+    /// §11.5's minimum contribution, distinct from min-content when the
+    /// item can shrink (e.g. min-width:0 or scrollable overflow).
+    minimum: f32,
     min: f32,
     max: f32,
+}
+
+/// Per-transaction parent constraints, never retained across layouts. A subgrid
+/// is NOT an independent formatting context (#subgrid-items): its descendants'
+/// contributions travel up, and the resulting track positions travel down.
+#[derive(Default)]
+pub(super) struct SubgridRows {
+    inputs: std::collections::HashMap<NodeId, RowInput>,
+    contributions: std::collections::HashMap<NodeId, Vec<Contrib>>,
+}
+
+impl SubgridRows {
+    pub(super) fn active(&self) -> bool {
+        !self.inputs.is_empty()
+    }
+    pub(super) fn contains(&self, node: NodeId) -> bool {
+        self.inputs.contains_key(&node)
+    }
+}
+
+#[derive(Clone)]
+struct RowInput {
+    tracks: Vec<Track>,
+    // None during intrinsic measurement; exact parent positions on final layout.
+    positions: Option<Vec<f32>>,
+    gap: f32,
+    start_edge: f32,
+    end_edge: f32,
+}
+
+impl RowInput {
+    fn export(&self, mut items: Vec<Contrib>, gap: f32) -> Vec<Contrib> {
+        let n = self.tracks.len();
+        let difference = (gap - self.gap) / 2.0;
+        // #subgrid-margins and #subgrid-gaps: accumulate edge decorations and
+        // half the gutter difference as an extra layer of item margin.
+        for item in &mut items {
+            let before = if item.tracks.start == 0 {
+                self.start_edge
+            } else {
+                difference
+            };
+            let after = if item.tracks.end == n {
+                self.end_edge
+            } else {
+                difference
+            };
+            item.minimum += before + after;
+            item.min += before + after;
+            item.max += before + after;
+        }
+        // #subgrid-edge-placeholders: decorations still contribute when empty
+        // tracks separate an occupied track from the subgrid's edge.
+        for start in [true, false] {
+            let Some(edge) = items
+                .iter()
+                .map(|c| if start { c.tracks.start } else { c.tracks.end })
+                .reduce(|a, b| if start { a.min(b) } else { a.max(b) })
+            else {
+                continue;
+            };
+            if (start && edge == 0) || (!start && edge == n) {
+                continue;
+            }
+            let extra = if start {
+                self.start_edge
+            } else {
+                self.end_edge
+            } - difference;
+            let placeholders: Vec<_> = items
+                .iter()
+                .filter(|c| {
+                    if start {
+                        c.tracks.start == edge
+                    } else {
+                        c.tracks.end == edge
+                    }
+                })
+                .map(|c| Contrib {
+                    tracks: if start {
+                        0..c.tracks.end
+                    } else {
+                        c.tracks.start..n
+                    },
+                    minimum: c.minimum + extra,
+                    min: c.min + extra,
+                    max: c.max + extra,
+                })
+                .collect();
+            items.extend(placeholders);
+        }
+        if items.is_empty() && n > 0 {
+            items.push(Contrib {
+                tracks: 0..n,
+                minimum: self.start_edge + self.end_edge,
+                min: self.start_edge + self.end_edge,
+                max: self.start_edge + self.end_edge,
+            });
+        }
+        items
+    }
+
+    fn resolved(&self, gap: f32) -> Option<(Vec<Track>, Vec<f32>)> {
+        let positions = self.positions.as_ref()?;
+        let mut tracks = self.tracks.clone();
+        let mut local = Vec::with_capacity(tracks.len());
+        let difference = (gap - self.gap) / 2.0;
+        let n = tracks.len();
+        for (i, track) in tracks.iter_mut().enumerate() {
+            let start = if i == 0 {
+                0.0
+            } else {
+                positions[i] - self.start_edge + difference
+            };
+            let end = positions[i] + track.base
+                - self.start_edge
+                - if i + 1 == n {
+                    self.end_edge
+                } else {
+                    difference
+                };
+            local.push(start);
+            track.base = (end - start).max(0.0);
+        }
+        Some((tracks, local))
+    }
+}
+
+/// CSS Grid 2 #resolved-track-list-subgrid: serialize local line names, not
+/// inherited pixel sizes. Empty trailing name sets expose the used span.
+pub(crate) fn serialize_subgrid_rows(value: &str, tracks: usize) -> String {
+    fn names(value: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut rest = value;
+        while let Some(start) = rest.find('[') {
+            let tail = &rest[start + 1..];
+            let Some(end) = tail.find(']') else { break };
+            result.push(format!(
+                "[{}]",
+                tail[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
+            rest = &tail[end + 1..];
+        }
+        result
+    }
+    let mut parts: Vec<(usize, bool, Vec<String>)> = Vec::new();
+    let mut rest = value.strip_prefix("subgrid").unwrap_or("").trim();
+    while !rest.is_empty() {
+        if rest.starts_with('[') {
+            let Some(end) = rest.find(']') else { break };
+            parts.push((1, false, names(&rest[..end + 1])));
+            rest = rest[end + 1..].trim_start();
+        } else if let Some(tail) = rest.strip_prefix("repeat(") {
+            let Some(end) = tail.find(')') else { break };
+            let Some((count, list)) = tail[..end].split_once(',') else {
+                break;
+            };
+            let auto = count.trim() == "auto-fill";
+            let count = if auto {
+                0
+            } else {
+                count.trim().parse::<usize>().unwrap_or(0).min(1000)
+            };
+            parts.push((count, auto, names(list)));
+            rest = tail[end + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    let lines = tracks + 1;
+    let fixed = parts
+        .iter()
+        .filter(|(_, auto, _)| !*auto)
+        .map(|(n, _, v)| n * v.len())
+        .sum::<usize>();
+    let mut result = Vec::new();
+    for (count, auto, list) in parts {
+        let count = if auto && !list.is_empty() {
+            lines.saturating_sub(fixed) / list.len()
+        } else {
+            count
+        };
+        for _ in 0..count {
+            result.extend(list.iter().cloned());
+            if result.len() >= lines {
+                break;
+            }
+        }
+    }
+    result.truncate(lines);
+    result.resize(lines, "[]".to_owned());
+    format!("subgrid {}", result.join(" "))
 }
 
 /// The §11 track sizing algorithm for one axis. `avail` is the definite
@@ -700,7 +897,8 @@ fn size_tracks(
                     continue;
                 }
                 match &t.size.min {
-                    TrackFn::MinContent | TrackFn::Auto => t.base = t.base.max(c.min),
+                    TrackFn::Auto => t.base = t.base.max(c.minimum),
+                    TrackFn::MinContent => t.base = t.base.max(c.min),
                     TrackFn::MaxContent => t.base = t.base.max(c.max),
                     _ => {}
                 }
@@ -747,37 +945,51 @@ fn size_tracks(
     // INTRINSIC min track sizing function. So a `minmax(0, 1fr)` track — whose
     // minimum is a fixed `0` — is treated as inflexible here: its base stays
     // 0 and §11.7 sizes it from the (definite) free space, letting the item's
-    // own `max-width` shrink it to fit. Contrast bare `1fr` = `minmax(auto,
-    // 1fr)`, whose `auto` minimum IS intrinsic, so a large spanning item grows
-    // its base and (correctly) overflows.
+    // own `max-width` shrink it to fit. Bare `1fr` = `minmax(auto, 1fr)` can
+    // instead grow to an explicit item minimum. A multi-track flexible span
+    // has a zero automatic item minimum (§6.6), not its min-content size.
     let fr_items: Vec<&Contrib> = items
         .iter()
         .filter(|c| crosses_fr(&c.tracks, tracks))
         .collect();
-    let growable = |t: &Track| matches!(t.size.max, TrackFn::Fr(_)) && t.size.min.is_intrinsic();
-    for c in fr_items {
-        // Tracks that don't grow here (fixed tracks, and flexible tracks with
-        // a fixed minimum) count as fixed at their current base size.
-        let others: f32 = tracks[c.tracks.clone()]
-            .iter()
-            .filter(|t| !growable(t))
-            .map(|t| t.base)
-            .sum();
-        let space = (c.min - others - span_gaps(&c.tracks, tracks)).max(0.0);
-        let factors: f32 = tracks[c.tracks.clone()]
-            .iter()
-            .filter(|t| growable(t))
-            .filter_map(|t| match t.size.max {
-                TrackFn::Fr(f) => Some(f),
-                _ => None,
-            })
-            .sum();
-        let denom = factors.max(1.0);
-        for t in tracks[c.tracks.clone()].iter_mut() {
-            if growable(t)
-                && let TrackFn::Fr(f) = t.size.max
-            {
-                t.base = t.base.max(space * (f / denom));
+    for phase in 0..3 {
+        let growable = |t: &Track| {
+            matches!(t.size.max, TrackFn::Fr(_))
+                && match phase {
+                    0 => t.size.min.is_intrinsic(),
+                    1 => matches!(t.size.min, TrackFn::MinContent | TrackFn::MaxContent),
+                    _ => matches!(t.size.min, TrackFn::MaxContent),
+                }
+        };
+        for c in &fr_items {
+            // Tracks that don't grow here (fixed tracks, and flexible tracks with
+            // a fixed minimum) count as fixed at their current base size.
+            let others: f32 = tracks[c.tracks.clone()]
+                .iter()
+                .filter(|t| !growable(t))
+                .map(|t| t.base)
+                .sum();
+            let contribution = match phase {
+                0 => c.minimum,
+                1 => c.min,
+                _ => c.max,
+            };
+            let space = (contribution - others - span_gaps(&c.tracks, tracks)).max(0.0);
+            let factors: f32 = tracks[c.tracks.clone()]
+                .iter()
+                .filter(|t| growable(t))
+                .filter_map(|t| match t.size.max {
+                    TrackFn::Fr(f) => Some(f),
+                    _ => None,
+                })
+                .sum();
+            let denom = factors.max(1.0);
+            for t in tracks[c.tracks.clone()].iter_mut() {
+                if growable(t)
+                    && let TrackFn::Fr(f) = t.size.max
+                {
+                    t.base = t.base.max(space * (f / denom));
+                }
             }
         }
     }
@@ -790,6 +1002,14 @@ fn size_tracks(
 
     // §11.6 maximize: distribute positive free space equally to bases,
     // freezing at growth limits.
+    if track_avail.is_none() {
+        // An auto-sized axis is sized under a max-content constraint; maximize
+        // with infinite free space (§11.6) up to the growth limits. A
+        // scrollable item's zero auto minimum must not collapse auto rows.
+        for t in tracks.iter_mut() {
+            t.base = t.limit;
+        }
+    }
     if let Some(av) = track_avail {
         let mut free = av - tracks.iter().map(|t| t.base).sum::<f32>();
         if free > 0.0 {
@@ -828,15 +1048,25 @@ fn size_tracks(
                 }
             }
             None => {
-                // Indefinite free space: each flexible track's base / factor.
-                tracks
+                // CSS Grid 2 #algo-flex-tracks: with indefinite free space,
+                // BOTH track bases and spanning items' max-content sizes
+                // determine the flex fraction. A multi-track item's automatic
+                // minimum can be zero; using only bases collapses its flexible
+                // rows even when they contain visible content.
+                let from_bases = tracks
                     .iter()
                     .filter_map(|t| match t.size.max {
                         TrackFn::Fr(f) if f > 1.0 => Some(t.base / f),
                         TrackFn::Fr(_) => Some(t.base),
                         _ => None,
                     })
-                    .fold(0.0f32, f32::max)
+                    .fold(0.0f32, f32::max);
+                fr_items.iter().fold(from_bases, |fraction, item| {
+                    fraction.max(find_fr_size(
+                        &tracks[item.tracks.clone()],
+                        (item.max - span_gaps(&item.tracks, tracks)).max(0.0),
+                    ))
+                })
             }
         };
         for t in tracks.iter_mut() {
@@ -878,11 +1108,16 @@ fn distribute_group(
     limits: bool,
 ) {
     let mut planned: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-    // Two passes per §11.5: min-content contributions, then max-content.
-    for use_max in [false, true] {
+    // §11.5: minimum, min-content, then max-content contributions grow
+    // bases. Growth limits only use the two content contributions.
+    for phase in if limits { 1..3 } else { 0..3 } {
         planned.clear();
         for c in group {
-            let contribution = if use_max { c.max } else { c.min };
+            let contribution = match phase {
+                0 => c.minimum,
+                1 => c.min,
+                _ => c.max,
+            };
             let affected: Vec<usize> = c
                 .tracks
                 .clone()
@@ -892,9 +1127,15 @@ fn distribute_group(
                     }
                     if limits {
                         tracks[i].size.max.is_intrinsic()
-                    } else if use_max {
+                            && (phase == 1 || !matches!(tracks[i].size.max, TrackFn::MinContent))
+                    } else if phase == 2 {
                         // The max-content pass only affects max-content mins.
                         matches!(tracks[i].size.min, TrackFn::MaxContent)
+                    } else if phase == 1 {
+                        matches!(
+                            tracks[i].size.min,
+                            TrackFn::MinContent | TrackFn::MaxContent
+                        )
                     } else {
                         tracks[i].size.min.is_intrinsic()
                     }
@@ -1084,6 +1325,62 @@ fn self_align(own: Option<&str>, items_default: super::flex::AlignItem) -> super
 }
 
 impl Flow<'_> {
+    /// CSS Grid 2 §6.6 / §12.5: auto tracks use the item's *minimum*
+    /// contribution, not necessarily its min-content contribution. The
+    /// latter remains available for explicit min-/max-content track functions.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_minimum_contribution(
+        &self,
+        item: &BoxNode,
+        spanned: &[Track],
+        column: bool,
+        min_content: f32,
+        max_content: f32,
+        bp: f32,
+        margins: f32,
+    ) -> f32 {
+        let s = &item.style;
+        let (preferred, minimum) = if column {
+            (&s.width, &s.min_width)
+        } else {
+            (&s.height, &s.min_height)
+        };
+        // A definite preferred size contributes even on a scroll container.
+        // Percentages are cyclic while determining the grid area's size.
+        if preferred.resolve(None).is_some()
+            || matches!(
+                preferred,
+                Len::MinContent | Len::MaxContent | Len::FitContent
+            )
+        {
+            return min_content;
+        }
+        match minimum {
+            Len::Auto => {
+                let content_based = !self.scroll_container(item.node)
+                    && spanned.iter().any(|t| matches!(t.size.min, TrackFn::Auto))
+                    && !(spanned.len() > 1
+                        && spanned.iter().any(|t| matches!(t.size.max, TrackFn::Fr(_))));
+                if content_based {
+                    min_content
+                } else {
+                    bp + margins
+                }
+            }
+            Len::MinContent => min_content,
+            Len::MaxContent => max_content,
+            Len::FitContent => min_content,
+            length => {
+                let size = length.resolve(Some(0.0)).unwrap_or(0.0).max(0.0);
+                if s.border_box {
+                    size.max(bp) + margins
+                } else {
+                    size + bp + margins
+                }
+            }
+        }
+    }
+
     /// Lay a grid container's items (css-grid-1): placement → column
     /// sizing (§11) → item layout at real track widths → row sizing (§11 in
     /// the block axis, contributions = laid heights) → §10.4/§10.5 track
@@ -1092,7 +1389,7 @@ impl Flow<'_> {
     pub(super) fn grid_content<'t>(
         &self,
         b: &'t BoxNode,
-        items: &'t [BoxNode],
+        items: &'t [SharedBox],
         content_x: f32,
         content_top: f32,
         content_w: f32,
@@ -1104,6 +1401,7 @@ impl Flow<'_> {
         let node = b.node;
         let u = Units::of(self.dom, node);
         let cv = |p: &str| self.dom.computed_value_resolved(node, p);
+        let inherited = self.subgrid_rows.borrow().inputs.get(&node).cloned();
 
         // Gaps: `gap` = <row-gap> <column-gap>; longhands win.
         let (short_row, short_col) = {
@@ -1121,7 +1419,15 @@ impl Flow<'_> {
                 .max(0.0)
         };
         let gap_col = parse_gap(cv("column-gap"), short_col, Some(content_w));
-        let gap_row = parse_gap(cv("row-gap"), short_row, def_ch);
+        let row_gap_value = cv("row-gap").or(short_row);
+        let gap_row = if row_gap_value
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty() || v.trim() == "normal")
+        {
+            inherited.as_ref().map_or(0.0, |r| r.gap)
+        } else {
+            parse_gap(row_gap_value, None, def_ch)
+        };
 
         // Named areas + explicit templates.
         let areas = cv("grid-template-areas").as_deref().and_then(parse_areas);
@@ -1134,14 +1440,20 @@ impl Flow<'_> {
             .as_deref()
             .and_then(|v| parse_template(v, u, self.vp, Some(content_w), gap_col))
             .unwrap_or_default();
-        let mut rows: Vec<Track> = cv("grid-template-rows")
-            .as_deref()
-            .and_then(|v| parse_template(v, u, self.vp, def_ch, gap_row))
-            .unwrap_or_default();
+        let mut rows: Vec<Track> =
+            inherited
+                .as_ref()
+                .map(|r| r.tracks.clone())
+                .unwrap_or_else(|| {
+                    cv("grid-template-rows")
+                        .as_deref()
+                        .and_then(|v| parse_template(v, u, self.vp, def_ch, gap_row))
+                        .unwrap_or_default()
+                });
         while cols.len() < area_cols_n {
             cols.push(Track::new(auto_ts(), false));
         }
-        while rows.len() < area_rows_n {
+        while inherited.is_none() && rows.len() < area_rows_n {
             rows.push(Track::new(auto_ts(), false));
         }
         let explicit_cols = cols.len();
@@ -1156,7 +1468,7 @@ impl Flow<'_> {
         // §8.5 note: order-modified document order.
         let mut idx: Vec<usize> = (0..items.len()).collect();
         idx.sort_by_key(|&i| self.order_of(items[i].node));
-        let ordered: Vec<&'t BoxNode> = idx.iter().map(|&i| &items[i]).collect();
+        let ordered: Vec<&'t BoxNode> = idx.iter().map(|&i| items[i].as_ref()).collect();
 
         // Per-item grid lines: grid-area, overridden by grid-row/column
         // shorthands, overridden by the *-start/*-end longhands.
@@ -1245,7 +1557,15 @@ impl Flow<'_> {
         } else {
             explicit_rows
         };
-        let placed = auto_place(placements, minor_tracks.max(1), row_flow, dense);
+        let mut placed = auto_place(placements, minor_tracks.max(1), row_flow, dense);
+        if inherited.is_some() {
+            // #subgrid-implicit: placement is resolved normally, then clamped
+            // to the inherited explicit grid. No implicit subgrid rows exist.
+            for p in &mut placed {
+                p.rows.start = p.rows.start.min(explicit_rows - 1);
+                p.rows.end = p.rows.end.min(explicit_rows).max(p.rows.start + 1);
+            }
+        }
 
         // Implicit tracks from grid-auto-columns/rows (a list cycles).
         let auto_list = |prop: &str| -> Vec<TrackSize> {
@@ -1293,10 +1613,30 @@ impl Flow<'_> {
         let col_contribs: Vec<Contrib> = ordered
             .iter()
             .zip(&placed)
-            .map(|(it, p)| Contrib {
-                tracks: p.cols.clone(),
-                min: self.contribution(it, IMode::Min, inl),
-                max: self.contribution(it, IMode::Max, inl),
+            .map(|(it, p)| {
+                let min = self.contribution(it, IMode::Min, inl);
+                let max = self.contribution(it, IMode::Max, inl);
+                let s = &it.style;
+                let bp = s.border[LEFT]
+                    + s.border[RIGHT]
+                    + self.pad(s, LEFT, 0.0)
+                    + self.pad(s, RIGHT, 0.0);
+                let margins = s.margin[LEFT].resolve(Some(0.0)).unwrap_or(0.0)
+                    + s.margin[RIGHT].resolve(Some(0.0)).unwrap_or(0.0);
+                Contrib {
+                    tracks: p.cols.clone(),
+                    minimum: self.grid_minimum_contribution(
+                        it,
+                        &cols[p.cols.clone()],
+                        true,
+                        min,
+                        max,
+                        bp,
+                        margins,
+                    ),
+                    min,
+                    max,
+                }
             })
             .collect();
         let jc = cv("justify-content");
@@ -1355,6 +1695,8 @@ impl Flow<'_> {
             area_w: f32,
             /// The item's cross (height) property is auto — stretch applies.
             cross_auto: bool,
+            subgrid: Option<RowInput>,
+            row_contributions: Option<Vec<Contrib>>,
         }
         let mut gitems: Vec<GItem<'t>> = Vec::with_capacity(ordered.len());
         for (it, p) in ordered.iter().zip(&placed) {
@@ -1396,8 +1738,34 @@ impl Flow<'_> {
                     avail_c.max(minc).min(maxc)
                 }
             };
-            let def_h = s.height.resolve(def_ch).map(|v| v.max(0.0));
+            let subgrid = (matches!(it.content, Content::Grid(_))
+                && self.dom.is_row_subgrid_item(it.node))
+            .then(|| RowInput {
+                tracks: rows[p.rows.clone()].to_vec(),
+                positions: None,
+                gap: gap_row,
+                start_edge: m[TOP] + s.border[TOP] + self.pad(s, TOP, area_w),
+                end_edge: m[BOTTOM] + s.border[BOTTOM] + self.pad(s, BOTTOM, area_w),
+            });
+            if let Some(input) = &subgrid {
+                self.subgrid_rows
+                    .borrow_mut()
+                    .inputs
+                    .insert(it.node, input.clone());
+            }
+            let def_h = if subgrid.is_some() {
+                None
+            } else {
+                s.height.resolve(def_ch).map(|v| v.max(0.0))
+            };
             let (frag, anc) = self.item_frag(it, w.max(0.0), area_w, def_h, inl);
+            let row_contributions = if subgrid.is_some() {
+                let mut state = self.subgrid_rows.borrow_mut();
+                state.inputs.remove(&it.node);
+                state.contributions.remove(&it.node)
+            } else {
+                None
+            };
             // Horizontal placement within the area (css-align self-alignment;
             // auto margins win over the alignment keyword).
             let extra = area_w - (frag.w + m[LEFT] + m[RIGHT]);
@@ -1407,13 +1775,19 @@ impl Flow<'_> {
                 border_x: area_x + shift + m[LEFT],
                 content_w: w.max(0.0),
                 bp_cross,
-                cross_auto: matches!(s.height, Len::Auto),
+                cross_auto: subgrid.is_some() || matches!(s.height, Len::Auto),
                 area_w,
                 frag,
                 anchors: anc,
                 m,
                 auto,
-                align: self_align(icv("align-self").as_deref(), align_items),
+                align: if subgrid.is_some() {
+                    AlignItem::Stretch
+                } else {
+                    self_align(icv("align-self").as_deref(), align_items)
+                },
+                subgrid,
+                row_contributions,
             });
         }
 
@@ -1421,24 +1795,66 @@ impl Flow<'_> {
         let row_contribs: Vec<Contrib> = gitems
             .iter()
             .zip(&placed)
-            .map(|(g, p)| {
+            .flat_map(|(g, p)| {
+                if let Some(contributions) = &g.row_contributions {
+                    return contributions
+                        .iter()
+                        .map(|c| Contrib {
+                            tracks: c.tracks.start + p.rows.start..c.tracks.end + p.rows.start,
+                            minimum: c.minimum,
+                            min: c.min,
+                            max: c.max,
+                        })
+                        .collect::<Vec<_>>();
+                }
                 let h = g.frag.h + g.m[TOP] + g.m[BOTTOM];
-                Contrib {
+                vec![Contrib {
                     tracks: p.rows.clone(),
+                    minimum: self.grid_minimum_contribution(
+                        g.it,
+                        &rows[p.rows.clone()],
+                        false,
+                        h,
+                        h,
+                        g.bp_cross,
+                        g.m[TOP] + g.m[BOTTOM],
+                    ),
                     min: h,
                     max: h,
-                }
+                }]
             })
             .collect();
         let ac = cv("align-content");
-        size_tracks(
-            &mut rows,
-            &row_contribs,
-            def_ch,
-            gap_row,
-            dist_stretches(ac.as_deref()),
-        );
-        let row_y = positions(&rows, gap_row, def_ch, dist_of(ac.as_deref()));
+        if let Some(input) = &inherited {
+            self.subgrid_rows
+                .borrow_mut()
+                .contributions
+                .insert(node, input.export(row_contribs.clone(), gap_row));
+        }
+        let row_y = if let Some((inherited_tracks, positions)) =
+            inherited.as_ref().and_then(|r| r.resolved(gap_row))
+        {
+            rows = inherited_tracks;
+            positions
+        } else {
+            size_tracks(
+                &mut rows,
+                &row_contribs,
+                def_ch,
+                gap_row,
+                dist_stretches(ac.as_deref()),
+            );
+            positions(
+                &rows,
+                gap_row,
+                def_ch,
+                if inherited.is_some() {
+                    Justify::Start
+                } else {
+                    dist_of(ac.as_deref())
+                },
+            )
+        };
 
         // Record the USED track sizes for the CSSOM resolved value that
         // `getComputedStyle(grid-template-columns/-rows)` reports (§ CSS Grid
@@ -1459,7 +1875,12 @@ impl Flow<'_> {
             let area_y = row_y[p.rows.start];
             let last = p.rows.end - 1;
             let area_h = (row_y[last] + rows[last].base - area_y).max(0.0);
-            if g.align == AlignItem::Stretch && g.cross_auto && !g.auto[TOP] && !g.auto[BOTTOM] {
+            if g.subgrid.is_some()
+                || (g.align == AlignItem::Stretch
+                    && g.cross_auto
+                    && !g.auto[TOP]
+                    && !g.auto[BOTTOM])
+            {
                 // CSS Grid §11.6/Box Alignment §6.2: stretch changes the
                 // grid item's used size. Relayout with that now-definite
                 // content-box height so percentage-height descendants see
@@ -1467,8 +1888,29 @@ impl Flow<'_> {
                 // leaves their backgrounds and hit regions at the old
                 // intrinsic height.
                 let stretched = (area_h - g.m[TOP] - g.m[BOTTOM] - g.bp_cross).max(0.0);
+                if let Some(input) = &g.subgrid {
+                    let mut input = input.clone();
+                    input.tracks = rows[p.rows.clone()].to_vec();
+                    input.positions =
+                        Some(row_y[p.rows.clone()].iter().map(|y| y - area_y).collect());
+                    // Content distribution can enlarge the parent's effective
+                    // gutters. Normal subgrid gutters follow these used gaps.
+                    if p.rows.len() > 1 {
+                        input.gap =
+                            row_y[p.rows.start + 1] - row_y[p.rows.start] - rows[p.rows.start].base;
+                    }
+                    self.subgrid_rows
+                        .borrow_mut()
+                        .inputs
+                        .insert(g.it.node, input);
+                }
                 let (frag, anchors) =
                     self.item_frag(g.it, g.content_w, g.area_w, Some(stretched), inl);
+                if g.subgrid.is_some() {
+                    let mut state = self.subgrid_rows.borrow_mut();
+                    state.inputs.remove(&g.it.node);
+                    state.contributions.remove(&g.it.node);
+                }
                 g.frag = frag;
                 g.anchors = anchors;
             }
@@ -1488,8 +1930,14 @@ impl Flow<'_> {
             frags.push(frag);
         }
         let live_rows = rows.iter().filter(|t| !t.collapsed).count();
-        let content_h =
-            rows.iter().map(|t| t.base).sum::<f32>() + gap_row * live_rows.saturating_sub(1) as f32;
+        let content_h = if inherited.as_ref().is_some_and(|r| r.positions.is_some()) {
+            row_y
+                .last()
+                .zip(rows.last())
+                .map_or(0.0, |(y, t)| y + t.base)
+        } else {
+            rows.iter().map(|t| t.base).sum::<f32>() + gap_row * live_rows.saturating_sub(1) as f32
+        };
         (frags, content_h.max(0.0))
     }
 }
@@ -1498,6 +1946,311 @@ impl Flow<'_> {
 mod tests {
     use super::*;
     use crate::layout2::Units;
+
+    #[test]
+    fn indefinite_flexible_tracks_use_spanning_max_content() {
+        let u = Units {
+            fs: 16.0,
+            root: 16.0,
+            ch: 8.0,
+        };
+        let vp = Vp { w: 800.0, h: 600.0 };
+        for (template, gap, expected) in [
+            ("auto auto 1fr", 0.0, vec![0.0, 0.0, 180.0]),
+            (
+                "40px minmax(0, 1fr) minmax(0, 2fr)",
+                10.0,
+                vec![40.0, 40.0, 80.0],
+            ),
+        ] {
+            let mut tracks = parse_template(template, u, vp, None, gap).unwrap();
+            size_tracks(
+                &mut tracks,
+                &[Contrib {
+                    tracks: 0..3,
+                    minimum: 0.0,
+                    min: 180.0,
+                    max: 180.0,
+                }],
+                None,
+                gap,
+                true,
+            );
+            for (track, expected) in tracks.iter().zip(expected) {
+                assert!(
+                    (track.base - expected).abs() < 0.01,
+                    "{template}: {} != {expected}",
+                    track.base
+                );
+            }
+        }
+    }
+
+    fn measured_grid(html: &str) -> (crate::dom::Dom, crate::layout2::GraphicalLayout) {
+        let dom = crate::dom::Dom::parse_document(html);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &url::Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800.0, 600.0),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        (dom, layout)
+    }
+
+    #[test]
+    fn row_subgrid_cards_stack_narrow_and_share_rows_wide() {
+        for columns in ["400px", "200px 200px"] {
+            let (dom, layout) = measured_grid(&format!(
+                "<style>body{{margin:0}}#outer{{display:grid;grid-template-columns:{columns};grid-template-rows:auto auto 1fr}}
+                .card{{display:grid;grid-row:span 3;grid-template-rows:subgrid}}
+                </style><div id=outer>
+                <div id=a class=card><div></div><div id=ah style='height:40px'></div><div id=ab style='height:100px'></div></div>
+                <div id=b class=card><div></div><div id=bh style='height:80px'></div><div id=bb style='height:60px'></div></div></div>"
+            ));
+            let r = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+            let rows = &layout.grid_tracks[&dom.get_by_id("outer").unwrap()].1;
+            if columns == "400px" {
+                assert_eq!(rows, &[0.0, 40.0, 100.0, 0.0, 80.0, 60.0]);
+                assert_eq!(r("a").height, 140.0);
+                assert_eq!(r("b").top, 140.0);
+                assert_eq!(r("outer").height, 280.0);
+            } else {
+                assert_eq!(rows, &[0.0, 80.0, 100.0]);
+                assert_eq!(r("a").height, 180.0);
+                assert_eq!(r("b").height, 180.0);
+                assert_eq!(r("ab").top, r("bb").top);
+                assert_eq!(r("bb").top, 80.0);
+            }
+        }
+    }
+
+    #[test]
+    fn row_subgrid_serializes_used_local_line_names() {
+        for (value, expected) in [
+            ("subgrid", "subgrid [] [] [] [] []"),
+            (
+                "subgrid [a] repeat(auto-fill, [b]) [c]",
+                "subgrid [a] [b] [b] [b] [c]",
+            ),
+            (
+                "subgrid [a] [a] [a] [a] repeat(auto-fill, [b]) [c] [c]",
+                "subgrid [a] [a] [a] [a] [c]",
+            ),
+            ("subgrid [] [a]", "subgrid [] [a] [] [] []"),
+            (
+                "subgrid [a] repeat(2,[b c]) [d] [e] [f]",
+                "subgrid [a] [b c] [b c] [d] [e]",
+            ),
+        ] {
+            assert_eq!(serialize_subgrid_rows(value, 4), expected);
+        }
+    }
+
+    #[test]
+    fn row_subgrid_cache_rechecks_inherited_tracks_at_equal_outer_sizes() {
+        let mut dom=crate::dom::Dom::parse_document(
+            "<style>body{margin:0}#outer{display:grid;grid-template-columns:200px;grid-template-rows:40px 60px}
+            #sub{display:grid;grid-row:span 2;grid-template-rows:subgrid}</style>
+            <div id=outer><div id=sub><div id=a></div><div id=b></div></div></div>"
+        );
+        let measure = |dom: &crate::dom::Dom| {
+            crate::layout2::lay_out_graphical(
+                dom,
+                &url::Url::parse("https://example.test/").unwrap(),
+                crate::layout2::Viewport::new(800.0, 600.0),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            )
+        };
+        let outer = dom.get_by_id("outer").unwrap();
+        let sub = dom.get_by_id("sub").unwrap();
+        assert!(!dom.establishes_independent_formatting_context(sub));
+        for (template, second_y) in [
+            ("40px 60px", 40.0),
+            ("70px 30px", 70.0),
+            ("20px 80px", 20.0),
+        ] {
+            let _ = measure(&dom);
+            dom.set_attr(outer, "style", &format!("grid-template-rows:{template}"));
+            let warm = measure(&dom);
+            assert_eq!(warm.boxes[&dom.get_by_id("b").unwrap()].top, second_y);
+            dom.force_cold_style_layout_for_test();
+            let cold = measure(&dom);
+            assert_eq!(warm.boxes, cold.boxes);
+            assert_eq!(warm.grid_tracks, cold.grid_tracks);
+            assert!(warm.presentation_eq(&cold));
+            dom.layout_cache.borrow_mut().cold = false;
+        }
+    }
+
+    #[test]
+    fn row_subgrid_nested_contributions_and_final_constraints() {
+        let (dom,layout)=measured_grid(
+            "<style>body{margin:0}#outer{display:grid;grid-template-rows:auto auto;grid-template-columns:200px 200px;gap:10px}
+            .sub{display:grid;grid-row:span 2;grid-template-rows:subgrid;align-self:end;height:1px;align-content:end}
+            </style><div id=outer><div id=middle class=sub><div id=inner class=sub>
+            <div id=a style='height:40px'></div><div id=b style='height:60px'></div></div></div>
+            <div class=sub><div style='height:90px'></div><div style='height:20px'></div></div></div>"
+        );
+        let r = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("outer").unwrap()].1,
+            vec![90.0, 60.0]
+        );
+        assert_eq!(r("middle").height, 160.0);
+        assert_eq!(r("inner").height, 160.0);
+        assert_eq!(r("a").top, 0.0);
+        assert_eq!(r("b").top, 100.0);
+    }
+
+    #[test]
+    fn row_subgrid_edges_and_different_gutters() {
+        let (dom,layout)=measured_grid(
+            "<style>body{margin:0}#outer{display:grid;width:200px;grid-template-rows:100px 150px;row-gap:50px}
+            #sub{display:grid;grid-row:span 2;grid-template-rows:subgrid;row-gap:0;padding-top:10px;padding-bottom:20px}
+            </style><div id=outer><div id=sub><div id=a></div><div id=b></div></div></div>"
+        );
+        let r = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(r("sub").height, 300.0);
+        assert_eq!(r("a").top, 10.0);
+        assert_eq!(r("a").height, 115.0);
+        assert_eq!(r("b").top, 125.0);
+        assert_eq!(r("b").height, 155.0);
+    }
+
+    #[test]
+    fn row_subgrid_clamps_implicit_placement_and_keeps_negative_lines_local() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}#outer{display:grid;grid-template-rows:10px 40px 60px}
+            #sub{display:grid;grid-row:2/4;grid-template-rows:subgrid}
+            </style><div id=outer><div id=sub><div id=a style='grid-row:8/span 2'></div>
+            <div id=b style='grid-row:-2/-1'></div></div></div>",
+        );
+        let r = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(r("sub").top, 10.0);
+        assert_eq!(r("a").top, 50.0);
+        assert_eq!(r("b").top, 50.0);
+        assert_eq!(r("a").height, 60.0);
+        assert_eq!(
+            layout.grid_tracks[&dom.get_by_id("sub").unwrap()].1.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn row_subgrid_requires_parent_grid_and_no_layout_containment() {
+        for parent in ["display:block", "display:grid"] {
+            let (dom,layout)=measured_grid(&format!(
+                "<style>body{{margin:0}}#outer{{{parent};grid-template-rows:10px 10px}}
+                #sub{{display:grid;grid-row:span 2;grid-template-rows:subgrid;contain:layout}}
+                </style><div id=outer><div id=sub><div id=a style='height:40px'></div><div id=b style='height:60px'></div></div></div>"
+            ));
+            let rows = &layout.grid_tracks[&dom.get_by_id("sub").unwrap()].1;
+            assert_eq!(
+                rows,
+                &[40.0, 60.0],
+                "{parent}; contain={:?}",
+                dom.computed_value_resolved(dom.get_by_id("sub").unwrap(), "contain")
+            );
+        }
+    }
+
+    #[test]
+    fn grid_automatic_minimum_distinguishes_scrollable_overflow_from_clip() {
+        // CSS Grid 2 §6.6 and Overflow 3 §3: hidden is scrollable (even
+        // without scrollbars), clip is not. Explicit min-content tracks
+        // still size to the content rather than the item's auto minimum.
+        for (overflow, track, expected) in [
+            ("hidden", "auto", 300.0),
+            ("auto", "auto", 300.0),
+            ("scroll", "auto", 300.0),
+            ("visible", "auto", 900.0),
+            ("clip", "auto", 900.0),
+            ("hidden", "min-content", 900.0),
+        ] {
+            let (dom, layout) = measured_grid(&format!(
+                "<style>body{{margin:0}}#grid{{display:grid;width:300px;grid-template-columns:{track}}}
+                #item{{overflow:{overflow}}}</style>
+                <div id=grid><div id=item><div style='width:900px;height:40px'></div></div></div>"
+            ));
+            let columns = &layout.grid_tracks[&dom.get_by_id("grid").unwrap()].0;
+            assert!(
+                (columns[0] - expected).abs() < 0.1,
+                "{overflow}/{track}: {columns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_implicit_column_keeps_nested_carousel_inside_its_panel() {
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}*{box-sizing:border-box}
+            #grid{display:grid;width:320px;height:200px;grid-template-rows:repeat(2,minmax(0,1fr))}
+            section{display:flex;flex-direction:column;overflow:hidden;border:1px solid;min-height:0}
+            .wrapper{display:flex;flex-direction:column;padding:0 10px;min-height:0;flex:1}
+            .carousel{display:flex;overflow-x:auto;overflow-y:hidden;gap:10px}
+            .card{flex:0 0 200px;min-width:200px;height:60px}</style>
+            <div id=grid><section id=panel><div class=wrapper><div id=carousel class=carousel>
+            <div class=card></div><div class=card></div><div id=last class=card></div>
+            </div></div></section><section></section></div>"
+        );
+        let rect = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!(
+            (rect("panel").width - 320.0).abs() < 0.1,
+            "{:?}",
+            rect("panel")
+        );
+        assert!(
+            (rect("carousel").width - 298.0).abs() < 0.1,
+            "{:?}",
+            rect("carousel")
+        );
+        assert!(rect("last").left > rect("carousel").left + rect("carousel").width);
+    }
+
+    #[test]
+    fn grid_minimum_contribution_honors_explicit_minimum_and_definite_width() {
+        for (sizing, expected) in [
+            ("min-width:0", 300.0),
+            ("min-width:400px", 400.0),
+            ("overflow:hidden;width:500px", 500.0),
+            ("overflow:hidden;width:100%", 300.0),
+            ("overflow:hidden;padding:20px;border:2px solid", 300.0),
+        ] {
+            let (dom, layout) = measured_grid(&format!(
+                "<style>body{{margin:0}}#grid{{display:grid;width:300px}}
+                #item{{{sizing}}}</style><div id=grid><div id=item>
+                <div style='width:900px;height:40px'></div></div></div>"
+            ));
+            let columns = &layout.grid_tracks[&dom.get_by_id("grid").unwrap()].0;
+            assert!((columns[0] - expected).abs() < 0.1, "{sizing}: {columns:?}");
+        }
+    }
+
+    #[test]
+    fn grid_multi_track_flexible_span_has_zero_automatic_minimum() {
+        let (dom, layout) = measured_grid(
+            "<div id=grid style='display:grid;width:300px;grid-template-columns:1fr 1fr'>
+             <div style='grid-column:span 2'><div style='width:900px;height:40px'></div></div></div>"
+        );
+        let columns = &layout.grid_tracks[&dom.get_by_id("grid").unwrap()].0;
+        assert_eq!(columns, &[150.0, 150.0]);
+    }
+
+    #[test]
+    fn grid_automatic_row_minimum_allows_hidden_content_to_shrink() {
+        for (overflow, expected) in [("hidden", 100.0), ("visible", 500.0)] {
+            let (dom, layout) = measured_grid(&format!(
+                "<div id=grid style='display:grid;width:300px;height:100px'>
+                 <div style='overflow:{overflow}'><div style='height:500px'></div></div></div>"
+            ));
+            let rows = &layout.grid_tracks[&dom.get_by_id("grid").unwrap()].1;
+            assert!((rows[0] - expected).abs() < 0.1, "{overflow}: {rows:?}");
+        }
+    }
 
     fn u() -> Units {
         Units::default()
@@ -1575,6 +2328,7 @@ mod tests {
         let mut t = tpl("1fr 1fr", 300.0, 0.0);
         let items = [Contrib {
             tracks: 0..1,
+            minimum: 250.0,
             min: 250.0,
             max: 250.0,
         }];
@@ -1589,11 +2343,13 @@ mod tests {
         let items = [
             Contrib {
                 tracks: 0..1,
+                minimum: 80.0,
                 min: 80.0,
                 max: 80.0,
             },
             Contrib {
                 tracks: 1..2,
+                minimum: 120.0,
                 min: 120.0,
                 max: 120.0,
             },
@@ -1610,11 +2366,13 @@ mod tests {
         let items = [
             Contrib {
                 tracks: 0..1,
+                minimum: 50.0,
                 min: 50.0,
                 max: 50.0,
             },
             Contrib {
                 tracks: 0..2,
+                minimum: 300.0,
                 min: 300.0,
                 max: 300.0,
             },
@@ -1635,6 +2393,7 @@ mod tests {
         let mut t = tpl("repeat(12, minmax(0, 1fr))", 1200.0, 0.0);
         let items = [Contrib {
             tracks: 0..7,
+            minimum: 2264.0,
             min: 2264.0, // a 283-cell image's min-content contribution
             max: 2264.0,
         }];
@@ -1652,13 +2411,14 @@ mod tests {
     }
 
     #[test]
-    fn bare_fr_span_overflows_via_auto_minimum() {
-        // Contrast: bare `1fr` = `minmax(auto, 1fr)`. The `auto` minimum IS
-        // intrinsic, so the same spanning item DOES grow the base sizes and the
-        // grid (correctly, per spec) overflows to hold the item's min-content.
+    fn bare_fr_span_accommodates_an_explicit_item_minimum() {
+        // Bare `1fr` = `minmax(auto, 1fr)` has an intrinsic track minimum.
+        // An explicit item minimum may grow those bases even though an item's
+        // automatic minimum would be zero for this multi-track flexible span.
         let mut t = tpl("repeat(12, 1fr)", 1200.0, 0.0);
         let items = [Contrib {
             tracks: 0..7,
+            minimum: 2264.0,
             min: 2264.0,
             max: 2264.0,
         }];

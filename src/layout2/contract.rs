@@ -197,6 +197,10 @@ impl Default for Units {
 impl Units {
     /// The resolution context for `id` in `dom`.
     pub(crate) fn of(dom: &Dom, id: NodeId) -> Units {
+        dom.cached_font_units(id, || Self::uncached(dom, id))
+    }
+
+    fn uncached(dom: &Dom, id: NodeId) -> Units {
         let fs = dom.font_px(id);
         let family = dom
             .computed_value_resolved(id, "font-family")
@@ -1505,12 +1509,15 @@ pub(crate) fn css_is_italic(value: &str) -> bool {
 /// Context-dependent values (`%`/`vw`/`calc()`/`auto`) return `None` here;
 /// `value.rs` resolves them with the containing block and layout viewport.
 pub(crate) fn css_length_px(value: &str, u: Units) -> Option<f32> {
-    let v = value.trim();
-    let split = v
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
-        .unwrap_or(v.len());
-    let n: f32 = v[..split].parse().ok()?;
-    Some(match v[split..].trim() {
+    let (n, unit) = css_number_prefix(value.trim())?;
+    let lower;
+    let unit = if unit.bytes().any(|b| b.is_ascii_uppercase()) {
+        lower = unit.to_ascii_lowercase();
+        lower.as_str()
+    } else {
+        unit
+    };
+    Some(match unit {
         "em" => n * u.fs,
         "rem" => n * u.root,
         "px" | "" => n,
@@ -1519,13 +1526,74 @@ pub(crate) fn css_length_px(value: &str, u: Units) -> Option<f32> {
         "in" => n * 96.0,
         "cm" => n * 96.0 / 2.54,
         "mm" => n * 96.0 / 25.4,
-        "q" | "Q" => n * 96.0 / 101.6,
+        "q" => n * 96.0 / 101.6,
         // One glyph advance per count (see above).
         "ch" => n * u.ch,
         // x-height: the spec's no-metrics fallback, half the em.
         "ex" => n * 0.5 * u.fs,
         _ => return None,
     })
+}
+
+/// CSS Syntax 3 §4.3.9/§4.3.12: consume one number, leaving its unit.
+/// An exponent needs a digit after the optional sign: the `e` in `2em`
+/// belongs to the unit, whereas `2e2px` is a 200px dimension. A decimal
+/// point likewise requires a following digit (`1.px` is not a dimension).
+pub(crate) fn css_number_prefix(value: &str) -> Option<(f32, &str)> {
+    let bytes = value.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let digit_start = i;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+        i += 2;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    if i == digit_start {
+        return None;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        let mut end = i + 1;
+        if matches!(bytes.get(end), Some(b'+' | b'-')) {
+            end += 1;
+        }
+        if bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            i = end;
+        }
+    }
+    Some((value[..i].parse().ok()?, &value[i..]))
+}
+
+#[test]
+fn css_dimensions_consume_exponents_without_eating_font_units() {
+    let u = Units {
+        fs: 20.,
+        root: 16.,
+        ch: 10.,
+    };
+    for (value, expected) in [
+        ("1e2px", 100.),
+        ("+.5E+2PX", 50.),
+        ("2em", 40.),
+        ("1e-1rem", 1.6),
+        ("-2E1px", -20.),
+        (".5ex", 5.),
+    ] {
+        assert!(
+            (css_length_px(value, u).unwrap() - expected).abs() < 0.0001,
+            "{value}"
+        );
+    }
+    for value in ["1e+px", "1.px", "+px", ".px", "--1px", "1 px"] {
+        assert!(css_length_px(value, u).is_none(), "{value}");
+    }
 }
 
 /// Split a `grid-template-*` value into its whitespace-separated track tokens,

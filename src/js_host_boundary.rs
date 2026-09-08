@@ -1,6 +1,9 @@
 //! Canonical engine-neutral TRust JavaScript host-boundary signatures.
 
 pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
+    ("__image_data_slots", 1),
+    ("__window_message_binding", 2),
+    ("__canvas_2d", 4),
     ("__dom_create_element", 1),
     ("__dom_create_element_ns", 3),
     ("__dom_create_text", 1),
@@ -66,11 +69,12 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__css_supports_selector", 1),
     ("__dom_template_content", 1),
     ("__http_fetch", 5),
+    ("__http_navigate", 3),
     ("__http_fetch_async", 5),
     ("__dom_run_injected_script", 1),
     ("__dom_run_classic_script", 3),
     ("__dom_allocate_job_context", 0),
-    ("__dom_create_window_realm", 8),
+    ("__dom_create_window_realm", 9),
     ("__dom_set_job_context", 1),
     ("__dom_release_job_context", 1),
     ("__dom_load_injected_stylesheet", 1),
@@ -86,6 +90,9 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__storage_len", 1),
     ("__blob_mirror", 3),
     ("__crypto_sha256_digest", 1),
+    ("__crypto_digest", 2),
+    ("__crypto_random_bytes", 1),
+    ("__crypto_hmac", 4),
     ("__crypto_aes_ctr", 4),
     ("__compression_encode", 2),
     ("__text_encode", 1),

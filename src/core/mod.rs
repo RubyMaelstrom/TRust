@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::mpsc;
 
 use tokio::runtime::Handle;
@@ -14,6 +15,8 @@ use tokio::task::JoinHandle;
 
 use crate::doc::Link;
 use crate::{gemini, gopher, http, oneshot};
+
+mod events;
 
 /// A position in logical/CSS pixels relative to the content viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -237,6 +240,11 @@ pub enum UserAction {
         actor: Option<usize>,
         position: CssPoint,
     },
+    /// Move native page focus, including clicking non-interactive content.
+    /// This is distinct from the window's system-focus notification above.
+    PageFocus {
+        actor: Option<usize>,
+    },
     /// User-edited value/checkedness for a live form control.
     SetFormValue {
         actor: Option<usize>,
@@ -454,8 +462,8 @@ pub struct ActionOutcome {
 pub struct BrowserController {
     runtime: Handle,
     invalidation: InvalidationHandle,
-    tx: mpsc::Sender<CoreEvent>,
-    rx: mpsc::Receiver<CoreEvent>,
+    tx: events::Sender,
+    rx: events::Receiver,
     current: Option<BrowserPage>,
     back: Vec<HistoryEntry>,
     forward: Vec<HistoryEntry>,
@@ -507,12 +515,13 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
 
 impl BrowserController {
     pub fn new(runtime: Handle, wake: impl WakeSink + 'static, viewport: CssSize) -> Self {
-        let (tx, rx) = mpsc::channel();
+        let invalidation = InvalidationHandle {
+            wake: Arc::new(wake),
+        };
+        let (tx, rx) = events::channel(invalidation.clone());
         Self {
             runtime,
-            invalidation: InvalidationHandle {
-                wake: Arc::new(wake),
-            },
+            invalidation,
             tx,
             rx,
             current: None,
@@ -905,6 +914,10 @@ impl BrowserController {
                 }
                 false
             }
+            UserAction::PageFocus { actor } => {
+                self.send_user(crate::js::PageCmd::Focus(actor));
+                false
+            }
             UserAction::SetFormValue {
                 actor,
                 value,
@@ -967,7 +980,7 @@ impl BrowserController {
     pub fn process_async_events(&mut self) -> ActionOutcome {
         let generation_before = self.generation;
         let mut changed = false;
-        while let Ok(event) = self.rx.try_recv() {
+        while let Some(event) = self.rx.pop() {
             match event {
                 CoreEvent::FetchFinished { generation, result } => {
                     changed |= self.finish_fetch(generation, result);
@@ -1085,7 +1098,6 @@ impl BrowserController {
             intent,
         });
         let tx = self.tx.clone();
-        let invalidation = self.invalidation.clone();
         let viewport = self.viewport;
         let device_pixel_ratio = self.device_pixel_ratio;
         let storage = self.storage.clone();
@@ -1101,9 +1113,7 @@ impl BrowserController {
             )
             .await;
             let event = interactive_fetch_event(generation, result);
-            if tx.send(event).is_ok() {
-                invalidation.request_redraw();
-            }
+            let _ = tx.send(event).await;
         }));
     }
 
@@ -1277,18 +1287,14 @@ impl BrowserController {
     fn schedule_declarative_refresh(&mut self, generation: u64, refresh: http::DeclarativeRefresh) {
         self.abort_declarative_refresh();
         let tx = self.tx.clone();
-        let invalidation = self.invalidation.clone();
         self.declarative_refresh_task = Some(self.runtime.spawn(async move {
             tokio::time::sleep(refresh.delay).await;
-            if tx
+            let _ = tx
                 .send(CoreEvent::DeclarativeRefresh {
                     generation,
                     url: refresh.url,
                 })
-                .is_ok()
-            {
-                invalidation.request_redraw();
-            }
+                .await;
         }));
     }
 
@@ -1324,13 +1330,15 @@ impl BrowserController {
     fn attach_live_page(&mut self, generation: u64, mut live: http::LivePage) {
         self.live_page = Some(live.handle);
         let tx = self.tx.clone();
-        let invalidation = self.invalidation.clone();
         self.live_task = Some(self.runtime.spawn(async move {
             while let Some(event) = live.events.recv().await {
-                if tx.send(CoreEvent::Page { generation, event }).is_err() {
+                if tx
+                    .send(CoreEvent::Page { generation, event })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
-                invalidation.request_redraw();
             }
         }));
     }
@@ -1574,7 +1582,6 @@ impl BrowserController {
             intent: NavigationIntent::New,
         });
         let tx = self.tx.clone();
-        let invalidation = self.invalidation.clone();
         let viewport = self.viewport;
         let device_pixel_ratio = self.device_pixel_ratio;
         let storage = self.storage.clone();
@@ -1590,9 +1597,7 @@ impl BrowserController {
             )
             .await;
             let event = interactive_fetch_event(generation, result);
-            if tx.send(event).is_ok() {
-                invalidation.request_redraw();
-            }
+            let _ = tx.send(event).await;
         }));
     }
 }
@@ -1652,6 +1657,7 @@ async fn fetch_protocol_interactive(
                 )),
                 headers: Vec::new(),
                 fetch_metadata: None,
+                fetch_policy: None,
             };
             if let Some(referrer) = referrer {
                 http::set_referrer(&mut request, referrer);
@@ -2398,7 +2404,7 @@ mod tests {
         let url = url::Url::parse("https://www.youtube.com/watch?v=redirect123").unwrap();
         let event =
             interactive_fetch_event(generation, Ok(InteractiveFetch::ExternalMedia(url.clone())));
-        browser.tx.send(event).unwrap();
+        runtime.block_on(browser.tx.send(event)).unwrap();
         let outcome = browser.process_async_events();
 
         assert!(outcome.invalidated);

@@ -39,24 +39,111 @@
 //! always-correct full-relayout path.
 
 mod boundary;
+pub(crate) mod clip_path;
 mod contract;
 mod flex;
 mod float;
 mod flow;
 mod graphics;
 mod grid;
+pub(crate) use grid::serialize_subgrid_rows;
 mod inline;
 mod intrinsic;
 mod measure;
+mod memo;
 // The legacy Row/Item output is now explicitly a terminal compatibility
 // adapter. Its source filename is retained to keep this refactor reviewable.
 mod replaced;
+mod session;
 mod style;
 mod table;
 #[path = "paint.rs"]
 mod terminal;
 mod tree;
+mod tree_cache;
 mod value;
+
+pub(crate) use memo::LayoutCache;
+pub(crate) use tree_cache::BoxTreeCache;
+
+pub(crate) fn container_query_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
+    let (w, h) = dom.viewport_px();
+    value::Len::parse(text, Units::of(dom, node), Vp { w, h })?.resolve(None)
+}
+
+pub(crate) fn line_height_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
+    let (w, h) = dom.viewport_px();
+    let units = Units::of(dom, node);
+    value::Len::parse(text, units, Vp { w, h })?
+        .resolve(Some(units.fs))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+pub(crate) fn absolute_css_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
+    let (w, h) = dom.viewport_px();
+    value::Len::parse(text, Units::of(dom, node), Vp { w, h })?
+        .resolve(None)
+        .filter(|value| value.is_finite())
+}
+
+#[cfg(test)]
+pub(crate) use session::layout_pass_count;
+pub(crate) use session::{LayoutFragments, LayoutWork};
+
+/// Validate SVG sizing presentation values without consulting an element's
+/// font/cascade (which would recurse while constructing its cascade map).
+pub(crate) fn svg_dimension_hint(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Ok(number) = value.parse::<f32>() {
+        return (number.is_finite() && number >= 0.).then(|| format!("{number}px"));
+    }
+    let units = Units {
+        fs: 16.,
+        root: 16.,
+        ch: 8.,
+    };
+    match Len::parse(value, units, Vp { w: 100., h: 100. })? {
+        Len::Auto => Some("auto".into()),
+        Len::Val(node)
+            if node
+                .resolve(Some(100.))
+                .is_some_and(|n| n.is_finite() && n >= 0.) =>
+        {
+            Some(value.into())
+        }
+        _ => None,
+    }
+}
+
+/// SVG 2 §8.12: only definite CSS lengths supply intrinsic dimensions.
+/// Resolve math/font/viewport units without treating percentages as intrinsic.
+pub(crate) fn svg_resource_dimension(
+    value: &str,
+    units: Units,
+    viewport: (f32, f32),
+) -> Option<String> {
+    let length = Len::parse(
+        value,
+        units,
+        Vp {
+            w: viewport.0,
+            h: viewport.1,
+        },
+    )?;
+    if !value.contains('%')
+        && let Some(px) = length
+            .resolve(None)
+            .filter(|px| px.is_finite() && *px >= 0.)
+    {
+        return Some(px.to_string());
+    }
+    // Do not leave an overridden definite XML attribute behind when CSS
+    // supplies auto/percentage/intrinsic sizing instead.
+    Some("auto".into())
+}
+
+#[cfg(test)]
+mod visual_regression_tests;
 
 use std::collections::HashMap;
 
@@ -202,13 +289,16 @@ pub struct GraphicalLayout {
 
 #[derive(Clone, Debug)]
 struct GraphicalPaintCache {
-    root: flow::Frag<'static>,
-    fixed: Vec<flow::Frag<'static>>,
-    top_layer: Vec<flow::TopFrag<'static>>,
-    flow_bottom: f32,
-    viewport: Viewport,
-    anchors: Vec<(NodeId, f32)>,
+    fragments: std::sync::Arc<LayoutFragments>,
     terminal: terminal::TerminalPaintModel,
+}
+
+impl std::ops::Deref for GraphicalPaintCache {
+    type Target = LayoutFragments;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fragments
+    }
 }
 
 /// The single shared CSS-pixel layout product. The historical name remains as
@@ -216,6 +306,62 @@ struct GraphicalPaintCache {
 /// `paint` directly, and the terminal frontend invokes [`adapt_terminal`] on
 /// the retained CSS-pixel fragments. Neither frontend reparses HTML.
 pub type PixelLayout = GraphicalLayout;
+
+/// Resolved editing-overlay facts from the canonical layout. An editing host
+/// is not a native widget (CSS UI 4 #appearance-switching): its authored text
+/// and surface remain in the page display list when it receives focus.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RichEditorPresentation {
+    pub style: crate::text::TextStyle,
+    pub caret_color: crate::render::PaintColor,
+    pub origin: crate::core::CssPoint,
+    pub width: f32,
+}
+
+pub(crate) fn rich_editor_presentation(
+    dom: &Dom,
+    base: &Url,
+    layout: &GraphicalLayout,
+    node: NodeId,
+) -> Option<RichEditorPresentation> {
+    use flow::{Frag, FragKind};
+    fn find<'a>(f: &'a Frag<'static>, node: NodeId) -> Option<&'a Frag<'static>> {
+        if f.node == node {
+            return Some(f);
+        }
+        f.children.iter().find_map(|f| find(f, node))
+    }
+    fn first_line<'a>(f: &'a Frag<'static>, parent: NodeId) -> Option<(&'a Frag<'static>, NodeId)> {
+        if matches!(f.kind, FragKind::Line(_)) {
+            return Some((f, parent));
+        }
+        let parent = if f.node == NO_NODE { parent } else { f.node };
+        f.children.iter().find_map(|f| first_line(f, parent))
+    }
+    if !dom.is_contenteditable_host(node) {
+        return None;
+    }
+    let cache = layout.paint_cache.as_ref()?;
+    let host = find(&cache.root, node)
+        .or_else(|| cache.fixed.iter().find_map(|f| find(f, node)))
+        .or_else(|| cache.top_layer.iter().find_map(|f| find(&f.fragment, node)))?;
+    let (line, style_node) = first_line(host, node).unwrap_or((host, node));
+    let style =
+        style::InlineStyle::derive(dom, style_node, &style::InlineStyle::root(), base).text_style();
+    let color = dom
+        .computed_value_resolved(style_node, "caret-color")
+        .filter(|v| !matches!(v.trim(), "auto" | "currentcolor" | "currentColor"))
+        .or_else(|| dom.computed_value_resolved(style_node, "color"))
+        .as_deref()
+        .and_then(crate::render::PaintColor::parse_css)
+        .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+    Some(RichEditorPresentation {
+        style,
+        caret_color: color,
+        origin: crate::core::CssPoint::new(line.x - host.x, line.y - host.y),
+        width: host.content_size.map_or(host.w, |s| s[0]),
+    })
+}
 
 impl GraphicalLayout {
     pub(crate) fn presentation_eq(&self, other: &Self) -> bool {
@@ -284,24 +430,7 @@ fn graphical_paint_cache(
     terminal: terminal::TerminalPaintModel,
 ) -> Option<GraphicalPaintCache> {
     Some(GraphicalPaintCache {
-        root: flow::retain_for_paint(root)?,
-        fixed: fixed
-            .iter()
-            .map(flow::retain_for_paint)
-            .collect::<Option<Vec<_>>>()?,
-        top_layer: top_layer
-            .iter()
-            .map(|top| {
-                Some(flow::TopFrag {
-                    fragment: flow::retain_for_paint(&top.fragment)?,
-                    fixed: top.fixed,
-                    order: top.order,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?,
-        flow_bottom,
-        viewport,
-        anchors: anchors.to_vec(),
+        fragments: LayoutFragments::retain(root, fixed, top_layer, flow_bottom, viewport, anchors)?,
         terminal,
     })
 }
@@ -316,6 +445,7 @@ pub fn repaint_graphical(
     layout: &mut GraphicalLayout,
     dom: &Dom,
     base: &Url,
+    controls: &ControlMap,
     images: &ImageSizes,
 ) -> bool {
     let Some(cache) = &layout.paint_cache else {
@@ -336,7 +466,7 @@ pub fn repaint_graphical(
     layout.patch_boundaries = patch_boundaries;
     layout.boundaries = boundaries;
     if let Some(cache) = &mut layout.paint_cache {
-        cache.terminal = terminal::TerminalPaintModel::from_dom(dom, base);
+        cache.terminal = terminal::TerminalPaintModel::from_dom(dom, base, controls);
         cache.terminal.capture_page_media(dom, base, images);
     }
     true
@@ -360,90 +490,135 @@ pub fn lay_out_graphical(
 ) -> GraphicalLayout {
     let trace = std::env::var_os("TRUST_LAYOUT_TRACE").is_some();
     let started = std::time::Instant::now();
-    let vp = Vp {
-        w: viewport.width,
-        h: viewport.height,
-    };
-    let Some(root) = tree::build(dom, base, controls, forms, vp) else {
-        return GraphicalLayout {
-            paint: crate::render::PagePaint {
-                width: viewport.width,
-                height: 0.0,
-                background: None,
-                lines: Vec::new(),
-                primitives: Vec::new(),
-                fixed_under_primitives: Vec::new(),
-                fixed_primitives: Vec::new(),
-                fixed_interleaved: false,
-                top_layer: Vec::new(),
-                image_requests: Vec::new(),
-                scroll_containers: Vec::new(),
-                sticky_constraints: Vec::new(),
-            },
-            boxes: HashMap::new(),
-            grid_tracks: HashMap::new(),
-            patch_boundaries: Vec::new(),
-            paint_boundaries: Vec::new(),
-            boundaries: Vec::new(),
-            paint_cache: None,
+    session::with_layout(dom, base, viewport, forms, controls, images, |layout| {
+        let Some(layout) = layout else {
+            return empty_graphical_layout(viewport);
         };
-    };
-    let tree_done = started.elapsed();
-    let flow = Flow {
-        dom,
-        base,
-        forms,
-        images,
-        vp,
-        imemo: Default::default(),
-        grid_tracks: Default::default(),
-    };
-    let (frag, flow_bottom, anchors, fixed, top_layer) = flow.layout(&root);
-    let flow_done = started.elapsed();
-    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
-    let measure_done = started.elapsed();
+        let measure_started = std::time::Instant::now();
+        let (boxes, _) = measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+        let measure_elapsed = measure_started.elapsed();
+        let (paint, patch_boundaries, boundaries) = graphics::paint(
+            dom,
+            base,
+            images,
+            &layout.root,
+            &layout.fixed,
+            &layout.top_layer,
+            layout.flow_bottom,
+            viewport.width,
+            viewport.height,
+        );
+        let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
+        let mut terminal_model = terminal::TerminalPaintModel::from_dom(dom, base, controls);
+        terminal_model.capture_page_media(dom, base, images);
+        let paint_cache = graphical_paint_cache(
+            &layout.root,
+            &layout.fixed,
+            &layout.top_layer,
+            layout.flow_bottom,
+            viewport,
+            &layout.anchors,
+            terminal_model,
+        );
+        if trace {
+            eprintln!(
+                "layout: tree={:?} flow={:?} measure={:?} paint={:?} total={:?} passes={} query_updates={}",
+                layout.work.tree,
+                layout.work.flow,
+                measure_elapsed,
+                measure_started.elapsed().saturating_sub(measure_elapsed),
+                started.elapsed(),
+                layout.work.passes,
+                layout.work.query_updates,
+            );
+        }
+        GraphicalLayout {
+            paint,
+            boxes,
+            grid_tracks: layout.tracks,
+            patch_boundaries,
+            paint_boundaries,
+            boundaries,
+            paint_cache,
+        }
+    })
+}
+
+fn empty_graphical_layout(viewport: Viewport) -> GraphicalLayout {
+    GraphicalLayout {
+        paint: crate::render::PagePaint {
+            width: viewport.width,
+            ..Default::default()
+        },
+        boxes: HashMap::new(),
+        grid_tracks: HashMap::new(),
+        patch_boundaries: Vec::new(),
+        paint_boundaries: Vec::new(),
+        boundaries: Vec::new(),
+        paint_cache: None,
+    }
+}
+
+/// Paint an already-current geometry transaction. The caller must validate
+/// the DOM, resource, viewport and activation-metadata inputs before reuse.
+/// This never constructs boxes, shapes text, or runs flow layout.
+pub(crate) fn paint_retained_layout(
+    dom: &Dom,
+    base: &Url,
+    controls: &ControlMap,
+    images: &ImageSizes,
+    fragments: std::sync::Arc<LayoutFragments>,
+    boxes: HashMap<NodeId, PxRect>,
+    grid_tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+) -> GraphicalLayout {
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
         images,
-        &frag,
-        &fixed,
-        &top_layer,
-        flow_bottom,
-        vp.w,
-        vp.h,
+        &fragments.root,
+        &fragments.fixed,
+        &fragments.top_layer,
+        fragments.flow_bottom,
+        fragments.viewport.width,
+        fragments.viewport.height,
     );
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
-    let mut terminal_model = terminal::TerminalPaintModel::from_dom(dom, base);
-    terminal_model.capture_page_media(dom, base, images);
-    let paint_cache = graphical_paint_cache(
-        &frag,
-        &fixed,
-        &top_layer,
-        flow_bottom,
-        viewport,
-        &anchors,
-        terminal_model,
-    );
-    if trace {
-        eprintln!(
-            "layout: tree={:?} flow={:?} measure={:?} paint={:?} total={:?}",
-            tree_done,
-            flow_done.saturating_sub(tree_done),
-            measure_done.saturating_sub(flow_done),
-            started.elapsed().saturating_sub(measure_done),
-            started.elapsed(),
-        );
-    }
+    let mut terminal = terminal::TerminalPaintModel::from_dom(dom, base, controls);
+    terminal.capture_page_media(dom, base, images);
     GraphicalLayout {
         paint,
         boxes,
-        grid_tracks: flow.grid_tracks.into_inner(),
+        grid_tracks,
         patch_boundaries,
         paint_boundaries,
         boundaries,
-        paint_cache,
+        paint_cache: Some(GraphicalPaintCache {
+            fragments,
+            terminal,
+        }),
     }
+}
+
+/// CSSOM hit testing needs paint order and clipping, but does not need a
+/// terminal adapter or a second layout after a preceding rectangle read.
+pub(crate) fn paint_retained_hit_test(
+    dom: &Dom,
+    base: &Url,
+    images: &ImageSizes,
+    fragments: &LayoutFragments,
+) -> crate::render::PagePaint {
+    graphics::paint(
+        dom,
+        base,
+        images,
+        &fragments.root,
+        &fragments.fixed,
+        &fragments.top_layer,
+        fragments.flow_bottom,
+        fragments.viewport.width,
+        fragments.viewport.height,
+    )
+    .0
 }
 
 /// Quantize one already-laid CSS-pixel page into the terminal compatibility
@@ -524,6 +699,9 @@ pub fn lay_graphical_subtree(
     controls: &ControlMap,
     images: &ImageSizes,
 ) -> Option<GraphicalLayout> {
+    if dom.has_container_queries() {
+        return None;
+    }
     let vp = Vp {
         w: rect.width.max(1.0),
         h: viewport.height,
@@ -536,8 +714,10 @@ pub fn lay_graphical_subtree(
         forms,
         images,
         vp,
+        reuse: false,
         imemo: Default::default(),
         grid_tracks: Default::default(),
+        subgrid_rows: Default::default(),
     };
     let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
     Flow::offset_frag(&mut frag, rect.x, rect.y);
@@ -571,7 +751,7 @@ pub fn lay_graphical_subtree(
         flow_bottom,
         Viewport::new(viewport.width, viewport.height),
         &anchors,
-        terminal::TerminalPaintModel::from_dom(dom, base),
+        terminal::TerminalPaintModel::from_dom(dom, base, controls),
     );
     Some(GraphicalLayout {
         paint,
@@ -715,25 +895,58 @@ pub fn measure_boxes_css(
     HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     HashMap<NodeId, PxRect>,
 ) {
-    let vp = Vp {
-        w: viewport.width,
-        h: viewport.height,
-    };
-    let Some(root) = tree::build(dom, base, controls, forms, vp) else {
-        return (HashMap::new(), HashMap::new(), HashMap::new());
-    };
-    let flow = Flow {
-        dom,
-        base,
-        forms,
-        images,
-        vp,
-        imemo: Default::default(),
-        grid_tracks: Default::default(),
-    };
-    let (frag, _flow_bottom, _anchors, fixed, top_layer) = flow.layout(&root);
-    let (boxes, scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
-    (boxes, flow.grid_tracks.into_inner(), scrolling_areas)
+    session::with_layout(dom, base, viewport, forms, controls, images, |layout| {
+        let Some(layout) = layout else {
+            return (HashMap::new(), HashMap::new(), HashMap::new());
+        };
+        let (boxes, scrolling_areas) =
+            measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+        (boxes, layout.tracks, scrolling_areas)
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct RetainedMeasurement {
+    pub boxes: HashMap<NodeId, PxRect>,
+    pub tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+    pub scrolling_areas: HashMap<NodeId, PxRect>,
+    pub fragments: Option<std::sync::Arc<LayoutFragments>>,
+    pub work: LayoutWork,
+}
+
+/// Measure once and keep the fragment tree for the next paint/hit-test
+/// consumer. Unretainable trees still return complete geometry; painting
+/// takes the ordinary borrowed full-layout fallback in that exceptional case.
+pub(crate) fn measure_retained_layout(
+    dom: &Dom,
+    base: &Url,
+    viewport: Viewport,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+) -> RetainedMeasurement {
+    session::with_layout(dom, base, viewport, forms, controls, images, |layout| {
+        let Some(layout) = layout else {
+            return RetainedMeasurement::default();
+        };
+        let (boxes, scrolling_areas) =
+            measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+        let fragments = LayoutFragments::retain(
+            &layout.root,
+            &layout.fixed,
+            &layout.top_layer,
+            layout.flow_bottom,
+            viewport,
+            &layout.anchors,
+        );
+        RetainedMeasurement {
+            boxes,
+            tracks: layout.tracks,
+            scrolling_areas,
+            fragments,
+            work: layout.work,
+        }
+    })
 }
 
 /// CSSOM View layout plus the paint-ordered hit-test display list.
@@ -757,44 +970,33 @@ pub fn measure_cssom_with_paint_css(
     HashMap<NodeId, PxRect>,
     crate::render::PagePaint,
 ) {
-    let vp = Vp {
-        w: viewport.width,
-        h: viewport.height,
-    };
-    let Some(root) = tree::build(dom, base, controls, forms, vp) else {
-        return (
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            crate::render::PagePaint {
-                width: viewport.width,
-                ..Default::default()
-            },
+    session::with_layout(dom, base, viewport, forms, controls, images, |layout| {
+        let Some(layout) = layout else {
+            return (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                crate::render::PagePaint {
+                    width: viewport.width,
+                    ..Default::default()
+                },
+            );
+        };
+        let (boxes, scrolling_areas) =
+            measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+        let (paint, _, _) = graphics::paint(
+            dom,
+            base,
+            images,
+            &layout.root,
+            &layout.fixed,
+            &layout.top_layer,
+            layout.flow_bottom,
+            viewport.width,
+            viewport.height,
         );
-    };
-    let flow = Flow {
-        dom,
-        base,
-        forms,
-        images,
-        vp,
-        imemo: Default::default(),
-        grid_tracks: Default::default(),
-    };
-    let (frag, flow_bottom, _anchors, fixed, top_layer) = flow.layout(&root);
-    let (boxes, scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
-    let (paint, _patch_boundaries, _boundaries) = graphics::paint(
-        dom,
-        base,
-        images,
-        &frag,
-        &fixed,
-        &top_layer,
-        flow_bottom,
-        vp.w,
-        vp.h,
-    );
-    (boxes, flow.grid_tracks.into_inner(), scrolling_areas, paint)
+        (boxes, layout.tracks, scrolling_areas, paint)
+    })
 }
 
 /// Lay one INLINE relayout-boundary subtree (a block-filling IFC box, NOT a
@@ -850,8 +1052,10 @@ pub fn lay_subtree_fragment(
         forms: &[],
         images,
         vp,
+        reuse: false,
         imemo: Default::default(),
         grid_tracks: Default::default(),
+        subgrid_rows: Default::default(),
     };
     let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
     // A standalone patch still quantizes at the full document's original
@@ -873,7 +1077,7 @@ pub fn lay_subtree_fragment(
     // v1 subtree-patch cut: an inline boundary re-lay does NOT alpha-composite
     // transparent image overlaps (empty alpha ⇒ no grouping); they reappear on
     // the next full render, matching the region-patch v1 cut.
-    let terminal_model = terminal::TerminalPaintModel::from_dom(dom, base);
+    let terminal_model = terminal::TerminalPaintModel::from_dom(dom, base, controls);
     let mut out = terminal::paint(
         &terminal_model,
         &mut frag,
@@ -959,11 +1163,13 @@ pub fn lay_region_fragment(
         forms: &[],
         images,
         vp,
+        reuse: false,
         imemo: Default::default(),
         grid_tracks: Default::default(),
+        subgrid_rows: Default::default(),
     };
     let (mut frag, _flow_bottom, _anchors, _fixed, _top_layer) = flow.layout(&root);
-    terminal::region_buffer(dom, base, &mut frag, cell_w, cell_h)
+    terminal::region_buffer(dom, base, controls, &mut frag, cell_w, cell_h)
 }
 
 /// The page-level media affordance: a page that declares itself a video page
@@ -1656,6 +1862,41 @@ mod tests {
             })
             .collect();
         assert_eq!(first_line.trim_end(), "alpha");
+    }
+
+    #[test]
+    fn overflow_wrap_prefers_space_when_the_next_punctuation_break_does_not_fit() {
+        // CSS Text 3 §5.5: a later UAX #14 opportunity within the next word
+        // does not justify an earlier arbitrary split if the preceding space
+        // can break the line. Reduced from chart headings with an em dash.
+        let style = crate::text::TextStyle::default();
+        let width = crate::text::shape("significantly—", &style).advance + 0.1;
+        for overflow in ["break-word", "anywhere"] {
+            for whitespace in ["normal", "pre-line"] {
+                let layout = lay_graphical(
+                    &format!(
+                        "<body style='margin:0'><p style='margin:0;overflow-wrap:{overflow};white-space:{whitespace}'>agents significantly—Median</p></body>"
+                    ),
+                    width,
+                    &HashMap::new(),
+                );
+                let first = &layout.paint.lines[0].rect;
+                let text: String = layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                            if origin.y >= first.y && origin.y < first.y + first.height =>
+                        {
+                            Some(shaped.text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text.trim_end(), "agents", "{overflow} / {whitespace}");
+            }
+        }
     }
 
     #[test]
@@ -3858,6 +4099,27 @@ mod tests {
             (0, 6),
             "the second box sits to the right, not stacked below"
         );
+    }
+
+    #[test]
+    fn atomic_inline_boxes_honor_height_constraints() {
+        for display in ["inline-block", "inline-flex", "inline-grid"] {
+            for (constraint, expected) in [
+                ("min-height:44px", 44.),
+                ("height:10px;min-height:44px;max-height:30px", 44.),
+                ("height:100px;max-height:44px", 44.),
+            ] {
+                let html = format!(
+                    "<style>body{{margin:0}}#b{{display:{display};box-sizing:border-box;width:120px;padding:4px;border:1px solid;{constraint}}}</style><div><button id=b>Log in</button></div>"
+                );
+                let (dom, boxes) = measure(&html, 100, 40);
+                let b = rect(&dom, &boxes, "b");
+                assert!(
+                    (b.height - expected).abs() < 0.01,
+                    "{display}, {constraint}: {b:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7053,6 +7315,7 @@ mod tests {
             &dom,
             &base,
             &HashMap::new(),
+            &HashMap::new(),
         ));
         let full = lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
         assert_eq!(retained.boxes, original_boxes);
@@ -7121,6 +7384,7 @@ mod tests {
             &mut retained,
             &dom,
             &base,
+            &HashMap::new(),
             &HashMap::new(),
         ));
         let full = lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
@@ -8862,6 +9126,44 @@ mod tests {
                 .any(|i| !i.text.trim().is_empty() && i.col == 0)
         });
         assert!(below, "text returns to full width below the 3-row float");
+    }
+
+    #[test]
+    fn trailing_float_shares_current_line_and_shifts_preceding_inline_content() {
+        // CSS 2.2 §9.5's explicit <p>a<span style="float:right">b</span></p>
+        // example. Exercise both sides, including an atomic inline predecessor.
+        for (side, expected_text_x, expected_float_x) in
+            [("right", 0.0, 240.0), ("left", 60.0, 0.0)]
+        {
+            let html = format!(
+                "<style>body{{margin:0;font-size:16px;line-height:24px}}p{{margin:0}}span{{float:{side};width:60px;height:24px}}</style><p>label<span>badge</span></p>"
+            );
+            let layout = lay_graphical(&html, 300.0, &ImageSizes::new());
+            let (text_x, text_y, _) = graphical_text(&layout, "label");
+            let (float_x, float_y, _) = graphical_text(&layout, "badge");
+            assert!(
+                (text_y - float_y).abs() < 0.1,
+                "{side}: float shares the line"
+            );
+            assert!(
+                (text_x - expected_text_x).abs() < 0.1,
+                "{side}: text x={text_x}"
+            );
+            assert!(
+                (float_x - expected_float_x).abs() < 0.1,
+                "{side}: float x={float_x}"
+            );
+        }
+        let layout = lay_graphical(
+            "<body style='margin:0'><b style='display:inline-block;width:80px'>atomic</b><i style='float:left;width:60px'>float</i>after</body>",
+            300.0,
+            &ImageSizes::new(),
+        );
+        let (x, _, _) = graphical_text(&layout, "atomic");
+        assert!(
+            (x - 60.0).abs() < 0.1,
+            "atomic inline moves with the shortened line"
+        );
     }
 
     #[test]

@@ -874,7 +874,7 @@ fn svg_length_px(value: &str) -> Option<f32> {
     (px.is_finite() && px > 0.0).then_some(px)
 }
 
-fn view_box_ratio(value: &str) -> Option<f32> {
+pub(crate) fn view_box_ratio(value: &str) -> Option<f32> {
     let values: Vec<f32> = value
         .split(|c: char| c == ',' || c.is_ascii_whitespace())
         .filter(|v| !v.is_empty())
@@ -950,20 +950,33 @@ static SVG_RATIO_ONLY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, f32>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+// SVG 2 #SizingSVGInCSS: natural aspect ratio is a sizing input separate
+// from decoded pixel dimensions. Revalidation can change it without changing
+// those dimensions, so retained layout needs its own metadata revision.
+static SVG_INTRINSIC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn svg_intrinsic_epoch() -> u64 {
+    SVG_INTRINSIC_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Refresh the external-resource metadata after a successful decode. A URL
 /// can be revalidated to different bytes, so a now-dimensioned SVG or raster
 /// image must also clear an older ratio-only entry for the same URL.
 pub(crate) fn record_svg_intrinsic_metadata(url: &str, bytes: &[u8]) {
-    let ratio = svg_bytes_ratio_only(bytes);
+    let ratio = svg_bytes_ratio_only(bytes).filter(|ratio| ratio.is_finite() && *ratio > 0.0);
     let mut ratios = SVG_RATIO_ONLY.lock().unwrap();
+    if ratios.get(url).copied() == ratio {
+        return;
+    }
     match ratio {
-        Some(ratio) if ratio.is_finite() && ratio > 0.0 => {
+        Some(ratio) => {
             ratios.insert(url.to_string(), ratio);
         }
         _ => {
             ratios.remove(url);
         }
     }
+    SVG_INTRINSIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The recorded ratio-only ratio for a decoded external image URL, if any.
