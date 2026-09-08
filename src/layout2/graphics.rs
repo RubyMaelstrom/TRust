@@ -25,7 +25,7 @@ use super::ImageSizes;
 use super::NO_NODE;
 use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
-use super::style::{Outline, OutlineStyle, outline_of};
+use super::style::{Outline, OutlineStyle, Pos, outline_of};
 use super::value::{Len, Vp};
 
 /// Computed-style source used by graphical box decoration. Generated boxes
@@ -60,6 +60,14 @@ impl PaintStyle {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ClipAncestry {
+    position: Pos,
+    absolute_cb: bool,
+    fixed_cb: bool,
+    top_layer: bool,
+}
+
 struct Builder<'a, 't> {
     dom: &'a Dom,
     base: &'a Url,
@@ -85,6 +93,13 @@ struct Builder<'a, 't> {
     /// the fragment geometry, so the paint adapter carries them down the flat
     /// ancestor chain for every descendant command.
     legacy_clips: HashMap<NodeId, CssRect>,
+    /// Blockified replaced elements have a principal border box separate
+    /// from their anonymous content line. Keep its used geometry for radii.
+    replaced_border_boxes: HashMap<NodeId, CssRect>,
+    /// Overflow clips round the padding edge, independently of whether the
+    /// box exposes a user scrolling mechanism (hidden/clip do not).
+    rounded_overflow_clips: HashMap<NodeId, PaintShape>,
+    clip_ancestry: HashMap<NodeId, ClipAncestry>,
     patch_boundaries: Vec<super::GraphicalPatchBoundary>,
     boundaries: Vec<super::GraphicalBoundary>,
     /// Absolute overflow clips already active in the display list. A clip
@@ -96,7 +111,7 @@ struct Builder<'a, 't> {
     /// descendant stacking-context transform must be nested inside these
     /// clips rather than wrapping them. Keeping the active prefix lets the
     /// ordinary fragment painter add only newly-entered scrollports.
-    scroll_nodes: Vec<NodeId>,
+    scroll_nodes: Vec<(NodeId, bool)>,
 }
 
 impl<'a, 't> Builder<'a, 't> {
@@ -132,6 +147,9 @@ impl<'a, 't> Builder<'a, 't> {
             sticky_constraints: Vec::new(),
             marquee_scopes: HashMap::new(),
             legacy_clips: HashMap::new(),
+            replaced_border_boxes: HashMap::new(),
+            rounded_overflow_clips: HashMap::new(),
+            clip_ancestry: HashMap::new(),
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
             hard_clips: Vec::new(),
@@ -168,13 +186,30 @@ impl<'a, 't> Builder<'a, 't> {
     /// clip and sampled translation. The marquee element's own box paint uses
     /// the ordinary command path, so borders/backgrounds never move.
     fn push_marquee_content(&mut self, node: NodeId, command: DisplayCommand) {
-        let Some(scope) = self.marquee_scope(node, true) else {
-            self.commands.push(command);
-            return;
-        };
-        self.push_marquee_scope(scope);
+        self.push_clipped_marquee_content(node, command, None);
+    }
+
+    fn push_clipped_marquee_content(
+        &mut self,
+        node: NodeId,
+        command: DisplayCommand,
+        clip: Option<PaintShape>,
+    ) {
+        let scope = self.marquee_scope(node, true);
+        if let Some(scope) = scope.clone() {
+            self.push_marquee_scope(scope);
+        }
+        let clipped = clip.is_some();
+        if let Some(shape) = clip {
+            self.commands.push(DisplayCommand::PushClip(shape));
+        }
         self.commands.push(command);
-        self.pop_marquee_scope();
+        if clipped {
+            self.commands.push(DisplayCommand::PopClip);
+        }
+        if scope.is_some() {
+            self.pop_marquee_scope();
+        }
     }
 
     fn marquee_scope(&self, node: NodeId, include_node: bool) -> Option<MarqueeScope> {
@@ -235,7 +270,39 @@ impl<'a, 't> Builder<'a, 't> {
 
     fn collect_legacy_clips(&mut self, fragment: &Frag<'_>) {
         if fragment.node != NO_NODE
+            && matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_))
+        {
+            let node = fragment.node;
+            if fragment.paint.cb_abs || fragment.paint.cb_fixed || self.dom.is_popover_showing(node)
+            {
+                self.clip_ancestry.insert(
+                    node,
+                    ClipAncestry {
+                        position: Pos::of(self.dom, node),
+                        absolute_cb: fragment.paint.cb_abs,
+                        fixed_cb: fragment.paint.cb_fixed,
+                        top_layer: self.dom.is_popover_showing(node),
+                    },
+                );
+            }
+            if let Some(shape) = rounded_overflow_clip(self.dom, fragment) {
+                self.rounded_overflow_clips.insert(node, shape);
+            }
+        }
+        if fragment.node != NO_NODE
             && matches!(fragment.kind, FragKind::Block)
+            && matches!(
+                self.dom.tag_name(fragment.node),
+                Some("img" | "svg" | "canvas" | "video")
+            )
+        {
+            self.replaced_border_boxes.insert(
+                fragment.node,
+                CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
+            );
+        }
+        if fragment.node != NO_NODE
+            && matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_))
             && let Some(rect) = legacy_clip_rect(
                 self.dom,
                 fragment.node,
@@ -303,6 +370,24 @@ impl<'a, 't> Builder<'a, 't> {
             return 0;
         }
         let mut chain = Vec::new();
+        let mut waiting_for_cb = if include_node {
+            None
+        } else {
+            self.clip_ancestry
+                .get(&node)
+                .and_then(|context| match context.position {
+                    Pos::Absolute | Pos::Fixed => Some(context.position),
+                    _ => None,
+                })
+        };
+        if self
+            .clip_ancestry
+            .get(&node)
+            .is_some_and(|context| context.top_layer)
+            && !include_node
+        {
+            return 0;
+        }
         // CSS Overflow 3 §2.3 clips the contents of a scroll container to
         // its scrollport.  A shadow tree is attached to the light tree through
         // its host (DOM §4.2.2), so paint ancestry must cross that boundary:
@@ -314,14 +399,37 @@ impl<'a, 't> Builder<'a, 't> {
             self.dom.parent_flat(node)
         };
         while let Some(id) = current {
-            if !matches!(self.dom.tag_name(id), Some("html" | "body"))
-                && let Some(container) = self
+            let context = self.clip_ancestry.get(&id);
+            if context.is_some_and(|context| match waiting_for_cb {
+                Some(Pos::Absolute) => context.absolute_cb,
+                Some(Pos::Fixed) => context.fixed_cb,
+                _ => false,
+            }) {
+                waiting_for_cb = None;
+            }
+            if waiting_for_cb.is_none() && !matches!(self.dom.tag_name(id), Some("html" | "body")) {
+                let container = self
                     .scroll_containers
                     .iter()
-                    .find(|container| container.node == id)
-                    .cloned()
-            {
-                chain.push(container);
+                    .find(|container| container.node == id);
+                let shape =
+                    self.rounded_overflow_clips.get(&id).cloned().or_else(|| {
+                        container.map(|container| PaintShape::Rect(container.viewport))
+                    });
+                if let Some(shape) = shape {
+                    chain.push((id, shape, container.is_some()));
+                }
+                // CSS Overflow 3 §2 and Position 3 §2.1: clipping follows
+                // the containing-block chain. A positioned descendant skips
+                // intervening boxes that do not establish its containing block.
+                if let Some(context) = context {
+                    if context.top_layer {
+                        break;
+                    }
+                    if matches!(context.position, Pos::Absolute | Pos::Fixed) {
+                        waiting_for_cb = Some(context.position);
+                    }
+                }
             }
             current = self.dom.parent_flat(id);
         }
@@ -330,7 +438,7 @@ impl<'a, 't> Builder<'a, 't> {
             .scroll_nodes
             .iter()
             .zip(&chain)
-            .take_while(|(active, requested)| **active == requested.node)
+            .take_while(|(active, requested)| active.0 == requested.0)
             .count();
         // Paint traversal is properly nested: a caller can only request the
         // active ancestor chain or extend it. If a future paint path violates
@@ -342,24 +450,26 @@ impl<'a, 't> Builder<'a, 't> {
         } else {
             0
         };
-        for container in &chain[common..] {
-            self.commands
-                .push(DisplayCommand::PushClip(PaintShape::Rect(
-                    container.viewport,
-                )));
-            self.commands
-                .push(DisplayCommand::BeginScroll(container.node));
+        for (node, shape, scroll) in &chain[common..] {
+            self.commands.push(DisplayCommand::PushClip(shape.clone()));
+            if *scroll {
+                self.commands.push(DisplayCommand::BeginScroll(*node));
+            }
         }
-        self.scroll_nodes
-            .extend(chain[common..].iter().map(|container| container.node));
+        self.scroll_nodes.extend(
+            chain[common..]
+                .iter()
+                .map(|(node, _, scroll)| (*node, *scroll)),
+        );
         chain.len() - common
     }
 
     fn pop_scroll_ancestors(&mut self, count: usize) {
         for _ in 0..count {
-            self.commands.push(DisplayCommand::EndScroll);
+            if self.scroll_nodes.pop().is_some_and(|(_, scroll)| scroll) {
+                self.commands.push(DisplayCommand::EndScroll);
+            }
             self.commands.push(DisplayCommand::PopClip);
-            self.scroll_nodes.pop();
         }
     }
 
@@ -433,7 +543,11 @@ impl<'a, 't> Builder<'a, 't> {
         }
     }
 
-    fn collect_sticky(&mut self, fragment: &Frag<'_>) {
+    fn collect_sticky(&mut self, fragment: &Frag<'t>) {
+        self.collect_sticky_in(fragment, &mut Vec::new());
+    }
+
+    fn collect_sticky_in<'f>(&mut self, fragment: &'f Frag<'t>, ancestors: &mut Vec<&'f Frag<'t>>) {
         if fragment.node != NO_NODE
             && matches!(
                 self.dom
@@ -451,21 +565,115 @@ impl<'a, 't> Builder<'a, 't> {
                 }
                 parent = self.dom.parent_flat(node);
             }
+            let vp = Vp {
+                w: self.viewport_w,
+                h: self.viewport_h,
+            };
+            let scrollport = container
+                .and_then(|node| self.scroll_containers.iter().find(|s| s.node == node))
+                .map(|s| s.viewport)
+                .unwrap_or(CssRect::new(0., 0., vp.w, vp.h));
+            let units = Units::of(self.dom, fragment.node);
+            // Static/relative/sticky boxes use the formatting-context content
+            // box, not the nearest scrollport, as their containing block.
+            let mut blocks = ancestors
+                .iter()
+                .rev()
+                .copied()
+                .filter(|f| matches!(f.kind, FragKind::Block | FragKind::TableCell(_)));
+            let cb = if let Some(parent) = blocks.next() {
+                let basis = blocks
+                    .next()
+                    .map(|f| f.content_size.map_or(f.w, |s| s[0]))
+                    .unwrap_or(vp.w);
+                let padding = padding_box_with_style(parent);
+                let pad = PaintStyle::of(parent)
+                    .map(|style| {
+                        let units = Units::of(self.dom, style.node());
+                        ["top", "right", "bottom", "left"].map(|side| {
+                            style
+                                .value(self.dom, &format!("padding-{side}"))
+                                .as_deref()
+                                .and_then(|s| Len::parse(s, units, vp))
+                                .and_then(|n| n.resolve(Some(basis)))
+                                .unwrap_or(0.)
+                                .max(0.)
+                        })
+                    })
+                    .unwrap_or([0.; 4]);
+                let size = parent.content_size.unwrap_or([
+                    (padding.width - pad[1] - pad[3]).max(0.),
+                    (padding.height - pad[0] - pad[2]).max(0.),
+                ]);
+                CssRect::new(padding.x + pad[3], padding.y + pad[0], size[0], size[1])
+            } else {
+                CssRect::new(0., 0., vp.w, vp.h)
+            };
+            let margin = ["top", "right", "bottom", "left"].map(|side| {
+                self.dom
+                    .computed_value_resolved(fragment.node, &format!("margin-{side}"))
+                    .as_deref()
+                    .and_then(|s| Len::parse(s, units, vp))
+                    .and_then(|n| n.resolve(Some(cb.width)))
+                    .unwrap_or(0.)
+            });
+            let distance = [
+                fragment.y - cb.y,
+                cb.x + cb.width - fragment.x - fragment.w,
+                cb.y + cb.height - fragment.y - fragment.h,
+                fragment.x - cb.x,
+            ];
+            let position_margin: [f32; 4] =
+                std::array::from_fn(|i| margin[i].min(distance[i] - margin[i]));
+            let vertical = self
+                .dom
+                .computed_value_resolved(fragment.node, "writing-mode")
+                .unwrap_or_default();
+            let rtl = self
+                .dom
+                .computed_value_resolved(fragment.node, "direction")
+                .as_deref()
+                == Some("rtl");
             self.sticky_constraints.push(StickyConstraint {
                 node: fragment.node,
                 rect: CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
                 container,
+                movement: [
+                    position_margin[0] - distance[0],
+                    distance[1] - position_margin[1],
+                    distance[2] - position_margin[2],
+                    position_margin[3] - distance[3],
+                ],
+                reverse: [
+                    if vertical.starts_with("vertical") {
+                        vertical == "vertical-rl"
+                    } else {
+                        rtl
+                    },
+                    vertical.starts_with("vertical") && rtl,
+                ],
+                // CSS Position 3 §3.4: insets are lengths/percentages relative
+                // to the scrollport, not a px-only decoration shorthand.
                 insets: ["top", "right", "bottom", "left"].map(|side| {
                     self.dom
                         .computed_value_resolved(fragment.node, side)
                         .as_deref()
-                        .and_then(px)
+                        .and_then(|s| Len::parse(s, units, vp))
+                        .and_then(|n| {
+                            n.resolve(Some(if matches!(side, "top" | "bottom") {
+                                scrollport.height
+                            } else {
+                                scrollport.width
+                            }))
+                        })
                 }),
             });
         }
+        ancestors.push(fragment);
         for child in &fragment.children {
-            self.collect_sticky(child);
+            self.collect_sticky_in(child, ancestors);
         }
+        ancestors.pop();
     }
 
     fn collect_marquees(&mut self, fragment: &Frag<'_>) {
@@ -726,6 +934,30 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     } else {
         false
     };
+    // CSS Masking 1 §5: clip the complete stacking context, including its
+    // own background, scrolling contents, and hit regions. Keep zero-area
+    // clips active; they are how closed drawers suppress all their paint.
+    let shape_clip = PaintStyle::of(fragment)
+        .and_then(|style| {
+            style.value(builder.dom, "clip-path").and_then(|value| {
+                super::clip_path::Inset::parse(
+                    &value,
+                    Units::of(builder.dom, style.node()),
+                    super::value::Vp {
+                        w: builder.viewport_w,
+                        h: builder.viewport_h,
+                    },
+                )
+            })
+        })
+        .and_then(|inset| {
+            inset.shape(CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h))
+        });
+    if let Some(shape) = &shape_clip {
+        builder
+            .commands
+            .push(DisplayCommand::PushClip(shape.clone()));
+    }
     let layered = push_layer(fragment, builder);
     paint_fragment(fragment, builder);
     let mut negative = Vec::new();
@@ -758,6 +990,9 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
     if layered {
         builder.commands.push(DisplayCommand::PopLayer);
+    }
+    if shape_clip.is_some() {
+        builder.commands.push(DisplayCommand::PopClip);
     }
     if transformed {
         builder.commands.push(DisplayCommand::PopTransform);
@@ -1019,7 +1254,7 @@ fn inflow_backgrounds(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         if child.paint.sc || child.paint.positioned || child.paint.float {
             continue;
         }
-        if matches!(child.kind, FragKind::Block) {
+        if matches!(child.kind, FragKind::Block | FragKind::TableCell(_)) {
             paint_fragment(child, builder);
         }
         inflow_backgrounds(child, builder);
@@ -1031,7 +1266,7 @@ fn inflow_content(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         if child.paint.sc || child.paint.positioned || child.paint.float {
             continue;
         }
-        if !matches!(child.kind, FragKind::Block) {
+        if !matches!(child.kind, FragKind::Block | FragKind::TableCell(_)) {
             paint_fragment(child, builder);
         }
         inflow_content(child, builder);
@@ -1109,13 +1344,44 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     // part of the marquee contents just as its text and replaced images are.
     // Wrap the complete fragment paint while excluding the marquee's own
     // principal box, whose viewport border/background stays stationary.
-    let marquee_scope = matches!(fragment.kind, FragKind::Block)
+    let marquee_scope = matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_))
         .then(|| builder.marquee_scope(fragment.node, false))
         .flatten();
     if let Some(scope) = marquee_scope.clone() {
         builder.push_marquee_scope(scope);
     }
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    if let FragKind::TableCell(layers) = &fragment.kind {
+        // CSS 2.2 §17.5.1: row-group, row, then cell. Paint only inside
+        // occupied cell rectangles, leaving border-spacing transparent.
+        let shape = PaintShape::Rect(rect);
+        for (node, area) in layers.iter() {
+            let style = PaintStyle::Element(*node);
+            if matches!(
+                style.value(builder.dom, "visibility").as_deref(),
+                Some("hidden" | "collapse")
+            ) {
+                continue;
+            }
+            if let Some(color) = background_color_for_style(builder.dom, style)
+                && !color.is_transparent()
+            {
+                builder.commands.push(DisplayCommand::Fill {
+                    shape: shape.clone(),
+                    brush: PaintBrush::Solid(color),
+                });
+            }
+            let origin = CssRect::new(fragment.x + area[0], fragment.y + area[1], area[2], area[3]);
+            paint_background_images_for_style(
+                fragment,
+                style,
+                shape.clone(),
+                builder,
+                Some(rect),
+                Some(origin),
+            );
+        }
+    }
     if let Some(style) = style.filter(|_| fragment.w > 0.0 && fragment.h > 0.0) {
         let radii = border_radii(builder.dom, style, rect);
         let shape = rounded_shape(rect, radii);
@@ -1157,16 +1423,62 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             paint_nested_document_canvas(fragment, builder);
         }
         paint_borders(fragment, radii, builder);
-        // Generated boxes participate in originating-element hit testing via
-        // their painted descendants/ancestor region; NO_NODE is never a DOM
-        // address and must not be queried directly.
-        if fragment.node != NO_NODE && builder.dom.point_hit_testable(fragment.node) {
+        // CSS Pseudo 4 §4.1 generates a real box even for content:"". Its hit
+        // target is the originating element, including when positioned outside
+        // that element's principal box (the stretched-link card pattern).
+        // Resolve inherited eligibility on the pseudo itself: pointer-events:auto
+        // can override pointer-events:none on the originating element.
+        let node = style.node();
+        let hit_testable = match style {
+            PaintStyle::Element(node) => builder.dom.point_hit_testable(node),
+            PaintStyle::Pseudo(..) => {
+                let mut suppressed =
+                    style.value(builder.dom, "visibility").as_deref() == Some("force-hidden");
+                let mut ancestor = Some(node);
+                while let Some(id) = ancestor {
+                    suppressed |= builder.dom.attr(id, "inert").is_some()
+                        || builder
+                            .dom
+                            .computed_value_resolved(id, "visibility")
+                            .as_deref()
+                            == Some("force-hidden");
+                    ancestor = builder.dom.parent_composed(id);
+                }
+                !suppressed
+                    && style.value(builder.dom, "pointer-events").as_deref() != Some("none")
+                    && style.value(builder.dom, "interactivity").as_deref() != Some("inert")
+            }
+        };
+        if hit_testable {
+            let link = if matches!(style, PaintStyle::Pseudo(..)) {
+                let mut current = Some(node);
+                let mut link = None;
+                while let Some(id) = current {
+                    if builder.dom.tag_name(id) == Some("a")
+                        && let Some(href) = builder.dom.attr(id, "href")
+                    {
+                        link = Some(if builder.dom.render_clickable(id) {
+                            crate::doc::Link::JsClick {
+                                node: id,
+                                href: href.to_string(),
+                            }
+                        } else {
+                            crate::http::resolve(builder.base, href)
+                        });
+                        break;
+                    }
+                    current = builder.dom.parent_composed(id);
+                }
+                link
+            } else {
+                None
+            };
             builder.commands.push(DisplayCommand::HitRegion(HitRegion {
                 rect,
-                node: fragment.node,
-                actor: interaction_actor(builder.dom, fragment.node),
-                link: None,
-                cursor: cursor_value(builder.dom, fragment.node),
+                node,
+                actor: interaction_actor(builder.dom, node),
+                link,
+                cursor: style.value(builder.dom, "cursor"),
             }));
         }
     }
@@ -1236,7 +1548,14 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     fragment.x + piece.x + piece.paint_x,
                     fragment.y + piece.y + piece.paint_y,
                 );
-                let color = text_color(builder.dom, style_node, piece.item.link.is_some());
+                let color = match piece.item.pseudo {
+                    Some((node, pseudo)) => text_color_for_style(
+                        builder.dom,
+                        PaintStyle::Pseudo(node, pseudo),
+                        piece.item.link.is_some(),
+                    ),
+                    None => text_color(builder.dom, style_node, piece.item.link.is_some()),
+                };
                 let mut shaped = shaped.clone();
                 if style_node != NO_NODE {
                     let (underline, strikethrough) = builder.dom.text_decoration(style_node);
@@ -1292,7 +1611,26 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     piece.paint_width,
                     piece.paint_height,
                 );
-                builder.push_marquee_content(
+                // CSS Backgrounds 3 §4.2/§4.3: replaced pixels clip to the
+                // curved CONTENT edge, independent of overflow. Object-fit's
+                // painted rectangle may be smaller than this content box.
+                let content = CssRect::new(
+                    fragment.x + piece.x,
+                    fragment.y + piece.y,
+                    piece.box_width,
+                    piece.box_height,
+                );
+                let border = builder
+                    .replaced_border_boxes
+                    .get(&node)
+                    .copied()
+                    .unwrap_or(content);
+                let radii = (style_node != NO_NODE)
+                    .then(|| border_radii(builder.dom, PaintStyle::Element(style_node), border));
+                let content_clip = radii
+                    .filter(|r| r.corners.iter().any(|&(x, y)| x > 0. && y > 0.))
+                    .map(|r| rounded_shape(content, inset_radii(r, border, content)));
+                builder.push_clipped_marquee_content(
                     node,
                     DisplayCommand::Image {
                         rect,
@@ -1327,6 +1665,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         node,
                         link: piece.item.link.clone(),
                     },
+                    content_clip,
                 );
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
                     builder.push_marquee_content(
@@ -1447,6 +1786,7 @@ fn paint_atomic_control_box(
         h: rect.height,
         border: style.border,
         css_size: None,
+        content_size: None,
         paint: Default::default(),
         clip: parent.clip,
         kind: FragKind::Block,
@@ -1512,8 +1852,10 @@ fn paint_native_control_surface(
             && !builder
                 .dom
                 .attr(node, "type")
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
-        || builder.dom.is_contenteditable_host(node);
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")));
+    // CSS UI 4 #appearance-switching: only host-language widgets have a
+    // native surface. Making an ordinary div editable does not turn its
+    // CSS box into an input/textarea with a UA background and border.
     if !is_control
         || is_checkable
         || builder
@@ -1917,7 +2259,7 @@ fn paint_background_images_for_style(
         if layer.eq_ignore_ascii_case("none") || layer.is_empty() {
             continue;
         }
-        if let Some(brush) = parse_gradient(layer, border_box) {
+        if let Some(brush) = parse_gradient(layer, positioning_override.unwrap_or(border_box)) {
             builder.commands.push(DisplayCommand::Fill {
                 shape: shape.clone(),
                 brush,
@@ -2431,7 +2773,45 @@ fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
     stroke
 }
 
+fn rounded_overflow_clip(dom: &Dom, fragment: &Frag<'_>) -> Option<PaintShape> {
+    if matches!(dom.tag_name(fragment.node), Some("html" | "body")) {
+        return None;
+    }
+    let style = PaintStyle::Element(fragment.node);
+    let shorthand = style.value(dom, "overflow").unwrap_or_default();
+    let mut parts = shorthand.split_whitespace();
+    let sx = parts.next().unwrap_or("visible");
+    let sy = parts.next().unwrap_or(sx);
+    let x = style.value(dom, "overflow-x");
+    let y = style.value(dom, "overflow-y");
+    let mut x = x.as_deref().unwrap_or(sx).trim();
+    let mut y = y.as_deref().unwrap_or(sy).trim();
+    let scrollable = |value| matches!(value, "hidden" | "auto" | "scroll" | "overlay");
+    // CSS Overflow 3 §3.1: visible computes to auto opposite a scrollable
+    // axis. clip/visible, in contrast, explicitly has no rounded clip.
+    if x == "visible" && scrollable(y) {
+        x = "auto";
+    }
+    if y == "visible" && scrollable(x) {
+        y = "auto";
+    }
+    if !(scrollable(x) && scrollable(y) || x == "clip" && y == "clip") {
+        return None;
+    }
+    let border = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let radii = border_radii(dom, style, border);
+    if !radii.corners.iter().any(|&(x, y)| x > 0. && y > 0.) {
+        return None;
+    }
+    // CSS Backgrounds 3 §4.2/§4.3: overflow rounds the padding edge,
+    // unlike a replaced element's own content-edge clip.
+    let padding = padding_box(fragment);
+    Some(rounded_shape(padding, inset_radii(radii, border, padding)))
+}
+
 fn border_radii(dom: &Dom, style: PaintStyle, rect: CssRect) -> CornerRadii {
+    let mut units = None;
+    let (w, h) = dom.viewport_px();
     let names = [
         "border-top-left-radius",
         "border-top-right-radius",
@@ -2444,31 +2824,67 @@ fn border_radii(dom: &Dom, style: PaintStyle, rect: CssRect) -> CornerRadii {
             continue;
         };
         let parts = split_ws(&value);
-        let x = radius(parts[0], rect.width).unwrap_or(0.0);
-        let y = parts
-            .get(1)
-            .and_then(|v| radius(v, rect.height))
-            .unwrap_or(x);
-        corners[index] = (x.max(0.0), y.max(0.0));
+        let Some(first) = parts.first() else {
+            continue;
+        };
+        let units = *units.get_or_insert_with(|| Units::of(dom, style.node()));
+        let radius = |text: &str, basis| Len::parse(text, units, Vp { w, h })?.resolve(Some(basis));
+        let x = radius(first, rect.width).unwrap_or(0.0);
+        // A single percentage is copied as a value, not as its used horizontal
+        // length. The vertical percentage basis is the border-box height.
+        let y = radius(parts.get(1).unwrap_or(first), rect.height).unwrap_or(0.0);
+        corners[index] = (x.max(0.0).min(f32::MAX), y.max(0.0).min(f32::MAX));
     }
-    // CSS Backgrounds §5.5: proportionally reduce overlapping radii.
+    // CSS Backgrounds §5.5: proportionally reduce overlapping radii. CSS
+    // Values 4 permits calc(infinity * 1px), clamped to our finite f32 limit.
+    // Sum and scale in f64: adding two valid large f32 radii can otherwise
+    // overflow, produce a zero factor, and turn a round pill into a square.
     let sums = [
-        (corners[0].0 + corners[1].0, rect.width),
-        (corners[3].0 + corners[2].0, rect.width),
-        (corners[0].1 + corners[3].1, rect.height),
-        (corners[1].1 + corners[2].1, rect.height),
+        (
+            f64::from(corners[0].0) + f64::from(corners[1].0),
+            rect.width,
+        ),
+        (
+            f64::from(corners[3].0) + f64::from(corners[2].0),
+            rect.width,
+        ),
+        (
+            f64::from(corners[0].1) + f64::from(corners[3].1),
+            rect.height,
+        ),
+        (
+            f64::from(corners[1].1) + f64::from(corners[2].1),
+            rect.height,
+        ),
     ];
     let factor = sums
         .into_iter()
         .filter(|(sum, _)| *sum > 0.0)
-        .map(|(sum, side)| side / sum)
-        .fold(1.0f32, f32::min)
+        .map(|(sum, side)| f64::from(side) / sum)
+        .fold(1.0f64, f64::min)
         .min(1.0);
     for corner in &mut corners {
-        corner.0 *= factor;
-        corner.1 *= factor;
+        corner.0 = (f64::from(corner.0) * factor) as f32;
+        corner.1 = (f64::from(corner.1) * factor) as f32;
     }
     CornerRadii { corners }
+}
+
+fn inset_radii(mut radii: CornerRadii, outer: CssRect, inner: CssRect) -> CornerRadii {
+    let left = (inner.x - outer.x).max(0.);
+    let top = (inner.y - outer.y).max(0.);
+    let right = (outer.x + outer.width - inner.x - inner.width).max(0.);
+    let bottom = (outer.y + outer.height - inner.y - inner.height).max(0.);
+    for (corner, (x, y)) in
+        radii
+            .corners
+            .iter_mut()
+            .zip([(left, top), (right, top), (right, bottom), (left, bottom)])
+    {
+        corner.0 = (corner.0 - x).max(0.);
+        corner.1 = (corner.1 - y).max(0.);
+    }
+    radii
 }
 
 fn rounded_shape(rect: CssRect, radii: CornerRadii) -> PaintShape {
@@ -3018,15 +3434,6 @@ fn px(value: &str) -> Option<f32> {
         return Some(0.0);
     }
     value.strip_suffix("px")?.trim().parse().ok()
-}
-
-fn radius(value: &str, basis: f32) -> Option<f32> {
-    value
-        .trim()
-        .strip_suffix('%')
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .map(|v| v * basis / 100.0)
-        .or_else(|| px(value))
 }
 
 impl PaintColor {

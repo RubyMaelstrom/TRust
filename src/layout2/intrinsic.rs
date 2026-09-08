@@ -40,12 +40,28 @@ impl Flow<'_> {
     /// per element from the cascade, so element results are context-free
     /// and memoizable; anonymous boxes use the passed context).
     pub(crate) fn intrinsic_w(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
+        // CSS Containment 2 §3.1/§3.2: content cannot contribute to a size
+        // container's inline intrinsic size, otherwise queries form a cycle.
+        if b.style.size_container != 0 {
+            return 0.0;
+        }
         if b.node != NO_NODE
             && let Some(&hit) = self.imemo.borrow().get(&(b.node, mode == IMode::Min))
         {
             return hit;
         }
+        let request = super::memo::Request {
+            node: b, parent: inl, constraint: super::memo::Constraint::Intrinsic(mode == IMode::Min),
+        };
+        let reuse = self.reuse && b.node != NO_NODE;
+        if reuse && let Some(value) = self.dom.layout_cache.borrow_mut().intrinsic(&request) {
+            self.imemo.borrow_mut().insert((b.node, mode == IMode::Min), value);
+            return value;
+        }
         let v = self.intrinsic_w_inner(b, mode, inl);
+        if reuse {
+            self.dom.layout_cache.borrow_mut().store_intrinsic(&request, v);
+        }
         if b.node != NO_NODE {
             self.imemo
                 .borrow_mut()

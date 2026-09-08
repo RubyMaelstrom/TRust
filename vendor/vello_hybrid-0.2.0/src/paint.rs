@@ -6,7 +6,7 @@
 use crate::util::pack_u16_pair;
 use vello_common::TextureId;
 use vello_common::encode::{EncodedKind, EncodedPaint};
-use vello_common::paint::{ImageSource, Paint};
+use vello_common::paint::Paint;
 
 const COLOR_SOURCE_PAYLOAD: u32 = 0;
 pub(crate) const COLOR_SOURCE_LAYER: u32 = 1;
@@ -87,10 +87,9 @@ impl<'a> PaintResolver<'a> {
                 let encoded_paint = &self.encoded[paint_id];
 
                 let (paint_type, external_texture_id) = match encoded_paint {
-                    EncodedPaint::Image(encoded_image) => match &encoded_image.source {
-                        ImageSource::OpaqueId { .. } => (PAINT_TYPE_IMAGE, None),
-                        _ => unimplemented!("Unsupported image source"),
-                    },
+                    // Backends resolve both retained images and transient
+                    // pixmaps to atlas resources before packing strip paints.
+                    EncodedPaint::Image(_) => (PAINT_TYPE_IMAGE, None),
                     EncodedPaint::ExternalTexture(texture) => {
                         (PAINT_TYPE_IMAGE, Some(texture.texture_id))
                     }

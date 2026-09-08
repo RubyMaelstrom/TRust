@@ -250,6 +250,7 @@ impl PagePaint {
             || self.top_layer.iter().any(|entry| has(&entry.primitives))
     }
 
+    // The Lumen host visitor consumes this inventory.
     pub(crate) fn retained_memory(&self) -> (usize, bool) {
         let PagePaint {
             width,
@@ -656,6 +657,73 @@ pub struct StickyConstraint {
     pub container: Option<usize>,
     /// Computed top/right/bottom/left insets in CSS pixels when definite.
     pub insets: [Option<f32>; 4],
+    /// Allowed TRBL movement of the position box inside its containing block.
+    /// Distinct from the (possibly much larger) nearest scroll container.
+    pub movement: [f32; 4],
+    /// Whether the writing-mode end edge is the physical low edge (x/y).
+    pub reverse: [bool; 2],
+}
+
+impl StickyConstraint {
+    fn offset(&self, scroll: CssPoint, viewport: CssRect) -> CssPoint {
+        // CSS Position 3 §3.4: fit the border box in the sticky view rectangle,
+        // reducing the writing-mode end inset if necessary, then limit each
+        // inward shift so the position box does not escape its containing block.
+        let axis = |position: f32,
+                    size: f32,
+                    view_start: f32,
+                    view_size: f32,
+                    low: Option<f32>,
+                    high: Option<f32>,
+                    min: f32,
+                    max: f32,
+                    reverse: bool| {
+            if low.is_none() && high.is_none() {
+                return 0.;
+            }
+            let mut start = view_start + low.unwrap_or(0.);
+            let mut end = view_start + view_size - high.unwrap_or(0.);
+            if end - start < size {
+                if reverse {
+                    start = end - size;
+                } else {
+                    end = start + size;
+                }
+            }
+            let mut delta: f32 = 0.;
+            if low.is_some() && position < start {
+                delta = (start - position).min(max.max(0.));
+            }
+            if high.is_some() && position + size + delta > end {
+                delta = (end - position - size).max(min.min(0.));
+            }
+            delta
+        };
+        CssPoint::new(
+            axis(
+                self.rect.x,
+                self.rect.width,
+                scroll.x + viewport.x,
+                viewport.width,
+                self.insets[3],
+                self.insets[1],
+                self.movement[3],
+                self.movement[1],
+                self.reverse[0],
+            ),
+            axis(
+                self.rect.y,
+                self.rect.height,
+                scroll.y + viewport.y,
+                viewport.height,
+                self.insets[0],
+                self.insets[2],
+                self.movement[0],
+                self.movement[2],
+                self.reverse[1],
+            ),
+        )
+    }
 }
 
 /// Stable renderer-neutral display-list command. Commands are ordered and
@@ -1700,16 +1768,18 @@ impl Scene {
                         })
                         .unwrap_or((
                             viewport_scroll,
-                            CssRect::new(0.0, 0.0, page.width, page.height),
+                            CssRect::new(
+                                0.0,
+                                0.0,
+                                self.content_viewport.width,
+                                self.content_viewport.height,
+                            ),
                         ));
-                    let dx = constraint.insets[3]
-                        .map(|left| (scroll.x + viewport.x + left - constraint.rect.x).max(0.0))
-                        .unwrap_or(0.0);
-                    let dy = constraint.insets[0]
-                        .map(|top| (scroll.y + viewport.y + top - constraint.rect.y).max(0.0))
-                        .unwrap_or(0.0);
+                    let offset = constraint.offset(scroll, viewport);
                     self.primitives
-                        .push(Primitive::PushTransform(Affine2d::translate(dx, dy)));
+                        .push(Primitive::PushTransform(Affine2d::translate(
+                            offset.x, offset.y,
+                        )));
                 }
                 Primitive::EndSticky => self.primitives.push(Primitive::PopTransform),
                 Primitive::BeginScroll(node) => {
@@ -2151,7 +2221,37 @@ fn point_in_interaction_state(point: CssPoint, state: &InteractionState) -> bool
 
 fn shape_contains(shape: &PaintShape, point: CssPoint) -> bool {
     match shape {
-        PaintShape::Rect(rect) | PaintShape::RoundedRect { rect, .. } => rect.contains(point),
+        PaintShape::Rect(rect) => rect.contains(point),
+        PaintShape::RoundedRect { rect, radii } => {
+            if !rect.contains(point) {
+                return false;
+            }
+            for (i, &(rx, ry)) in radii.corners.iter().enumerate() {
+                if rx <= 0.0 || ry <= 0.0 {
+                    continue;
+                }
+                let right = i == 1 || i == 2;
+                let bottom = i >= 2;
+                let cx = if right {
+                    rect.x + rect.width - rx
+                } else {
+                    rect.x + rx
+                };
+                let cy = if bottom {
+                    rect.y + rect.height - ry
+                } else {
+                    rect.y + ry
+                };
+                if (if right { point.x > cx } else { point.x < cx })
+                    && (if bottom { point.y > cy } else { point.y < cy })
+                {
+                    let dx = (point.x - cx) / rx;
+                    let dy = (point.y - cy) / ry;
+                    return dx * dx + dy * dy <= 1.0;
+                }
+            }
+            true
+        }
         PaintShape::Path(elements) => {
             let mut min_x = f32::INFINITY;
             let mut max_x = f32::NEG_INFINITY;
@@ -2827,6 +2927,35 @@ fn paint_fallback_heart(primitives: &mut Vec<Primitive>, center: CssPoint, size:
     });
 }
 
+/// CSS UI 4 #the-insertion-caret: focus adds an insertion indicator, not a
+/// replacement native textbox. Canonical DOM paint already contains the rich
+/// text, generated placeholder, backgrounds, borders, and author focus rules.
+pub fn paint_rich_editor_overlay(
+    primitives: &mut Vec<Primitive>,
+    editor: &EditorVisual,
+    rect: CssRect,
+    presentation: &crate::layout2::RichEditorPresentation,
+) {
+    let origin = CssPoint::new(
+        rect.x + presentation.origin.x,
+        rect.y + presentation.origin.y,
+    );
+    primitives.push(Primitive::PushClip(PaintShape::Rect(rect)));
+    for selection in &editor.selection {
+        primitives.push(Primitive::FillRect {
+            rect: selection.translate(origin.x, origin.y),
+            color: PaintColor::Rgba(88, 148, 255, 90),
+        });
+    }
+    if let Some(caret) = editor.caret {
+        primitives.push(Primitive::FillRect {
+            rect: caret.translate(origin.x, origin.y),
+            color: presentation.caret_color,
+        });
+    }
+    primitives.push(Primitive::PopClip);
+}
+
 pub fn paint_text_editor(
     primitives: &mut Vec<Primitive>,
     editor: &EditorVisual,
@@ -3033,6 +3162,41 @@ impl RendererKind {
 mod tests {
     use super::*;
     use crate::core::{BrowserSnapshot, CssSize, ScaleFactor};
+
+    #[test]
+    fn sticky_view_rectangle_supports_both_edges_and_containing_limits() {
+        let mut sticky = StickyConstraint {
+            node: 1,
+            rect: CssRect::new(150., 150., 80., 80.),
+            container: None,
+            insets: [None, Some(10.), Some(20.), None],
+            movement: [-150., 400., 400., -150.],
+            reverse: [false, false],
+        };
+        let viewport = CssRect::new(0., 0., 200., 200.);
+        assert_eq!(
+            sticky.offset(CssPoint::default(), viewport),
+            CssPoint::new(-40., -50.)
+        );
+        sticky.insets = [Some(20.), None, None, Some(10.)];
+        sticky.movement[1] = 50.;
+        sticky.movement[2] = 60.;
+        assert_eq!(
+            sticky.offset(CssPoint::new(300., 300.), viewport),
+            CssPoint::new(50., 60.)
+        );
+        // A tall sticky box reduces its effective end inset rather than being
+        // pulled upward by a contradictory bottom constraint.
+        sticky.rect = CssRect::new(0., 0., 80., 300.);
+        sticky.insets = [Some(20.), None, Some(20.), None];
+        assert_eq!(sticky.offset(CssPoint::default(), viewport).y, 20.);
+        // Two auto insets disable that axis entirely.
+        sticky.insets = [None; 4];
+        assert_eq!(
+            sticky.offset(CssPoint::new(300., 300.), viewport),
+            CssPoint::default()
+        );
+    }
 
     fn snapshot() -> BrowserSnapshot {
         BrowserSnapshot {

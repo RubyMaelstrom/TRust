@@ -5,11 +5,6 @@
 //! while the permanent cross-frontend boundary lives in [`core`] and
 //! renderer-neutral display data lives in [`render`].
 
-#[cfg(all(feature = "lumen-backend", feature = "boa-backend"))]
-compile_error!("select exactly one JavaScript backend: lumen-backend or boa-backend");
-#[cfg(not(any(feature = "lumen-backend", feature = "boa-backend")))]
-compile_error!("a JavaScript backend is required: lumen-backend or boa-backend");
-
 // mimalloc as the global allocator (default-on `mimalloc` feature): ~17%
 // faster JS parse+compile, which are dominated by millions of tiny AST/
 // CodeBlock allocations. `--no-default-features` falls back to the system
@@ -30,8 +25,11 @@ pub fn release_allocator_memory() {
 
 pub mod accessibility;
 pub mod command;
+mod canvas;
+mod referrer_policy;
 pub mod core;
 mod crypto;
+pub mod embed;
 pub mod render;
 pub mod responsive_image;
 
@@ -47,15 +45,10 @@ pub mod gemini;
 pub mod gopher;
 pub mod http;
 pub mod img;
-#[cfg(feature = "boa-backend")]
-pub mod js;
-#[cfg(feature = "lumen-backend")]
-#[path = "js_lumen.rs"]
 pub mod js;
 mod js_host_boundary;
 pub mod layout2;
 mod locale;
-#[cfg(feature = "lumen-backend")]
 pub mod lumen_backend;
 pub mod media;
 pub mod oneshot;

@@ -20,10 +20,8 @@ comment/example in the same change.
   opt-in because they use a network, a local capture, or a large external
   input. Run them from the repository root with `cargo test --release ...
   -- --ignored --nocapture`.
-* Release binaries use Lumen by default. The `src/js.rs` diagnostics belong to
-  the explicit legacy Boa backend (`trust-boa`); they are not linked into the
-  normal Lumen binaries. HTTP, layout, terminal, and most frontend diagnostics
-  are shared unless noted otherwise.
+* Every build uses Lumen. HTTP, layout, and JavaScript diagnostics are shared
+  across frontends unless noted otherwise.
 * Diagnostics print to stderr unless a variable explicitly names an output
   file/directory. Use a local or authorized test endpoint; avoid repeatedly
   probing public sites.
@@ -180,6 +178,15 @@ change is hover itself; the reward is one page's worth of RAM.
 
 #### How `trust-headless` reads a page
 
+Image-driven initialization is not an acceptance gate covered by this driver.
+Unlike the terminal and desktop frontends, it currently has no image
+fetch/decode scheduler and does not send decoded intrinsic sizes back to the
+resident actor. An image's `load` handler can therefore remain pending even
+when the text dump exits successfully. Use the appropriate frontend to validate
+decoded images and image-dependent page behavior. The
+`decoded_image_completion_updates_complete_and_delivers_load` regression test
+covers the actor's completion/event boundary, not the headless decoder pipeline.
+
 Text output is built from the display list, so it reports what was painted and
 nothing else: text hidden behind a collapsed section, or behind `display:none`,
 never appears. Reading it needs two decisions, and getting either wrong mangles
@@ -238,9 +245,7 @@ These binaries are opt-in targets and do not open the normal browser UI:
 | `trust-browser-replay [--warmups N] [--samples N] [--external NAME=PATH] [--sheet NAME=PATH] FIXTURE.html [...]` | Deterministically replays one or more local HTML fixtures through the shared Lumen browser pipeline. `--external` and `--sheet` may be repeated to provide named local script/style resources. | warmups `1`, samples `5`; at least one fixture required |
 | `trust-lumen-spike [--tier interp\|bytecode\|jit] [--threshold N] [--benchmark PATH]` | Runs the synthetic Lumen/`js-engine-benchmark` harness and prints timing, GC, event-loop, and score data. Requires the `lumen-spike` Cargo feature. | tier `jit`, threshold `0`, benchmark `/usr/share/cry/benchmarks/js-engine-benchmark/run.js` |
 
-Both binaries support `-h`/`--help`. `trust-boa` and
-`trust-desktop-boa` are the same terminal/desktop inputs built with the
-explicit legacy Boa backend.
+Both binaries support `-h`/`--help`.
 
 ## Live runtime diagnostics
 
@@ -269,6 +274,96 @@ explicit legacy Boa backend.
 | `TRUST_PRELUDE_FILE` | file path | Replaces the embedded platform prelude (`js_platform.js`) with the given file's contents for the process, read once on first use. Intended for rapid iteration on prelude code: edit `src/js_platform.js`, set this to that path, and the *next page load* picks the change up — no rebuild or relink is needed. The override is read in the Lumen backend at prelude evaluation time, independently of `__trust_cfg`. Release/shipped builds keep the embedded prelude; leave this unset. An unreadable path falls back to the embedded prelude. |
 | `TRUST_TRACE_FRAMES` | presence flag | Requests the prelude's gated frame-flow trace, emitted as `FT ...` console lines (`log: FT …` under `--js-diagnostics`): frame hydration sweeps (root + frame count), `processIframeAttributes` src and fetch outcome, queue-task dispatch, `loadFrameMarkup` entry (url + markup size), `finishParsedFrameLoad`, and `runFrameScripts` found-script counts. The trace flag travels through `__trust_cfg.frameTrace`, so it also works for worker/standalone contexts where the prelude reads the cfg. |
 | `TRUST_TRACE_FETCH` | presence flag | Logs every page fetch to stderr as `[fetch-trace] sync|async <METHOD> <url>`, followed by `[fetch-trace] result status=<N> type=<TYPE> len=<N>` when the response resolves through the unbuffered result path. Pair with `TRUST_LUMEN_TRACE` and `--js-diagnostics` to reconstruct a page's script/fetch timeline. |
+
+### Archive SVG / Hybrid image-lifetime regression gate
+
+Run the pixel gates on a machine with a working Hybrid GPU adapter:
+
+```sh
+cargo test --lib -- --test-threads=1 --nocapture \
+  archive_svg_pixels_survive_hover_and_resource_key_changes \
+  hybrid_recycles_image_slots_without_erasing_replacement_pixels \
+  hybrid_atlas_growth_preserves_upload_order_and_row_padding \
+  hybrid_reuploads_reinserted_stable_image_handle_without_erasing_it
+```
+
+The Archive fixture contains the actual book/Wayback SVG geometry and compares
+GPU readback with the CPU renderer, including each image's own rectangle,
+after repeated hover and resource-key changes. The other gates cover recycled
+atlas slots, same-handle updates, atlas growth, and aligned/padded upload rows.
+An unavailable adapter means **not exercised**, not a visual pass; the new gates
+print that explicitly. SVG decoding and `trust-headless` text dumps alone do
+not cover the Hybrid GPU upload path.
+
+For release acceptance, load Archive.org in the actual release desktop using
+the normal Hybrid renderer, both with diagnostics unset and with
+`TRUST_DESKTOP_TRACE=1`. Check the Wayback logo and every top-bar icon after
+load and hover. Compare with installed production using matching conditions;
+trace overhead can expose timing-sensitive defects in production too. In the
+2026-09-05 failure, an encoded atlas clear/copy executed after a queue texture
+write and erased the new image. The fork now encodes Pixmap transfers with
+those clears/copies, following WebGPU's queue/command ordering. No SVG, JS,
+network or memory-limit workaround is involved.
+
+### Covered-window presentation / bounded controller handoff
+
+The native controller's actor bridge must not drain bounded actor output into
+an unbounded UI queue. `core::events` keeps at most 16 queued events and merges
+only adjacent, complete, diagnostic-free `Updated` snapshots with the same
+document generation and cumulative fetch count. A quiet paint stream therefore
+retains only its latest queued snapshot. Navigation, history, input results,
+patches, diagnostics, incomplete renders, and final/static events remain FIFO
+barriers; a full barrier queue applies asynchronous backpressure. Retired layouts
+are released outside the queue lock, and native wakes are coalesced at the
+empty-to-nonempty edge.
+
+Both CPU and Hybrid desktop presenters call winit's `pre_present_notify` just
+before an actual surface presentation. On Wayland this arms the compositor frame
+callback that paces redraws. Do not arm it for a skipped frame with no commit,
+and do not use keyboard focus as a substitute for window visibility.
+
+Focused gates:
+
+```sh
+cargo test --profile browser-check --lib core:: -- --test-threads=1
+cargo test --profile browser-check --bin trust-desktop -- --test-threads=1
+cargo test --profile browser-check --lib render:: -- --test-threads=1 --nocapture
+```
+
+The queue tests include 10,000 updates with a paused consumer, snapshot release,
+generation/barrier preservation, cumulative nonzero fetch counts, shutdown,
+multiple waiting producers, and cancellation. GPU readback tests are necessary
+for pixels but do not exercise native swapchain presentation. For that gate,
+use an **optimized release desktop**, verify the log selected the real Hybrid
+adapter, open ShowBuzz, and completely cover the window for at least 13 minutes.
+Record RSS with a process-specific memory guard; then uncover and check the
+current clock and working hit testing. Also test repeated cover/uncover,
+minimize/restore, resize, and a still-visible but unfocused window, plus a CPU
+control. The original failure reached multiple GiB while covered and immediately
+released most of it on exposure; a visually hidden window alone is not a pass.
+
+Standards basis: WHATWG HTML [update the rendering](https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering)
+and [event-loop processing model](https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model),
+local revision `e5071a20c8569d8a3ec02ed27dd01b948773f850` (2026-09-06 snapshot),
+and the installed Wayland `wl_surface.frame` contract. Coalescing presentation
+snapshots is not permission to discard JavaScript tasks or semantic events.
+
+### English-preference regression gate
+
+The normal build keeps HTTP language preferences, NavigatorLanguage, and native
+Intl defaults in US English regardless of the host environment. Exercise both
+the language contract and preservation of Lumen's native Intl/GC APIs with:
+
+```sh
+LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8 LANGUAGE=de_DE:de TZ=Europe/Berlin \
+  cargo test --lib -- --test-threads=1 locale::tests:: \
+    platform_prelude_preserves_native_language_builtins \
+    default_accept_language_reaches_the_wire
+```
+
+Repeat with `cargo test --no-default-features --lib` to check the system
+allocator build. These tests use a local fixture and loopback HTTP server;
+they do not contact public sites. Explicit locale requests remain supported.
 
 ### WebSocket diagnostics
 
@@ -443,51 +538,6 @@ Fetches a WPT testharness page, injects a completion callback, and reports each
 subtest's PASS/FAIL/TIMEOUT/NOTRUN status. It accepts `TRUST_NET_DIAG`,
 `TRUST_DIAG_VP` (default `200x50`), and `TRUST_NET_DIAG_OUT`.
 
-## JavaScript engine and bundle diagnostics (Boa backend)
-
-These inputs are defined in `src/js.rs`, which is compiled only when using the
-explicit Boa comparison features. They are useful for engine investigations but
-do not tune the normal Lumen release artifact.
-
-| Input | Value | Effect and default |
-|---|---|---|
-| `TRUST_DIAG_COMPUTE_SECS` | integer seconds | Extends the manual page compute budget for an exceptionally large Boa workload. Default is the normal `50`-second budget; minimum accepted value is `1`. |
-| `TRUST_JS_PHASE` | presence flag | Reports whole-load parse, compile, execute, measured JS CPU, and wall-time decomposition. |
-| `TRUST_FN_CENSUS` | presence flag | Reports compiled versus executed/never-called page functions for lazy-parse sizing. |
-| `TRUST_JS_PROFILE` | presence flag | Dumps and resets sampled VM hot leaf frames during page phases/interactions. |
-| `TRUST_JS_BENCH` | JavaScript file path | Required input for `engine_profile`; runs one classic bundle in a faithful page context. |
-| `TRUST_JS_BENCH_RUNS` | integer | Independent benchmark samples. First sample is discarded as cold. Default: `5`; minimum: `1`. |
-| `TRUST_JS_BENCH_SETTLE_SECS` | integer seconds | Manual benchmark settle timeout. Default: `300`; minimum: `1`. |
-| `TRUST_NO_OPT` | presence flag | For `engine_profile` only, disables Boa optimizer options and prints the A/B state. |
-| `TRUST_GC_FLOOR` | integer MiB | Boa GC threshold floor. Default: `1`. Values are clamped to at least one byte after conversion. |
-| `TRUST_GC_GROWTH` | integer percent | Normal GC threshold growth percentage. Default: `143`. |
-| `TRUST_GC_BIG_LIVE` | integer MiB | Live-size threshold at which the large-live-set growth policy applies. Default: `16`. |
-| `TRUST_GC_BIG_GROWTH` | integer percent | Threshold growth percentage above `TRUST_GC_BIG_LIVE`. Default: `400`. |
-| `TRUST_NO_GC_PERMGEN` | presence flag | Disables the Boa permanent-generation tenure optimization when set (`gc_permgen` is on by default). |
-| `TRUST_GC_PERM` | presence flag | `engine_profile` A/B knob that tenures the immortal platform graph for that benchmark run. |
-| `TRUST_NO_LAZY_PARSE` | presence flag | Disables Boa lazy parsing and lazy compilation. Lazy parsing is on by default. |
-| `TRUST_LAZY_MIN` | integer code points | Overrides the minimum function source size eligible for Boa lazy parsing/compilation. |
-| `TRUST_NO_PARALLEL_PARSE` | presence flag | Forces sequential external-script parsing instead of the parallel parse pool. |
-| `TRUST_NO_PRELUDE_CACHE` | presence flag | Forces the cold Boa prelude path instead of the cached prelude image. |
-| `TRUST_NO_CDN_CACHE` | presence flag | Disables the cross-page compiled external-script cache. |
-| `TRUST_NO_INCREMENTAL_LAYOUT` | presence flag | Test-only A/B switch that forces the full layout path. It is not a normal release runtime control. |
-| `TRUST_JS_DIAG` | HTML file path | Required input for `js_diag`; transforms a local HTML file and prints post-JavaScript HTML and the outcome. |
-| `TRUST_SCAN_AUDIT` | classic-script JavaScript file path | Required input for `scan_ident_audit`; compares lazy scanner identifier capture with the real parser over a bundle. |
-| `TRUST_REACT_DEV` | presence flag | `react_canary` loads development React/ReactDOM bundles instead of production minified bundles. |
-
-Example bundle diagnostics:
-
-```sh
-TRUST_JS_BENCH=/tmp/bundle.js TRUST_JS_BENCH_RUNS=5 \
-  cargo test --release engine_profile -- --ignored --nocapture
-
-TRUST_JS_DIAG=/tmp/page.html \
-  cargo test --release js_diag -- --ignored --nocapture
-
-TRUST_SCAN_AUDIT=/tmp/bundle.js \
-  cargo test --release scan_ident_audit -- --ignored --nocapture
-```
-
 ## Desktop and layout benchmarks
 
 | Input | Value | Effect and default |
@@ -536,18 +586,9 @@ included here because they are part of TRust's `TRUST_*` environment surface.
 
 ## Inputs that are not active controls
 
-Two names appear in historical comments or command examples but are not read as
-environment variables by the current source:
-
-* `TRUST_LAZY_PARSE` is an old name used in comments around the Boa lazy-parse
-  work. The active A/B control is `TRUST_NO_LAZY_PARSE`; setting
-  `TRUST_LAZY_PARSE` alone has no effect.
-* `TRUST_LAYOUT2_BENCH` is shown in the `p8_layout_bench` doc comment for
-  discoverability, but the test does not inspect it. Selecting the ignored test
-  by name is sufficient.
-
-Likewise, `TRUST_GC_*` in prose is a family label, not a wildcard parser. The
-active names are the four exact GC inputs listed above.
+`TRUST_LAYOUT2_BENCH` is shown in the `p8_layout_bench` doc comment for
+discoverability, but the test does not inspect it. Selecting the ignored test
+by name is sufficient.
 
 ## Adding a diagnostic
 
@@ -555,7 +596,7 @@ When adding an input:
 
 1. Give presence-only flags and value inputs distinct names and define their
    accepted syntax/default in the source comment.
-2. State whether the input is shared, Lumen-only, Boa-only, terminal-only,
+2. State whether the input is shared, engine-only, terminal-only,
    desktop-only, or test-only.
 3. Include one copy-paste command for the test or executable path.
 4. Specify output destination and whether the input is read once or per use.

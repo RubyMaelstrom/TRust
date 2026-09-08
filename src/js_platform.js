@@ -7,6 +7,19 @@
     // boundary: Window.frameElement and the parent's element reference must
     // retain object identity for a same-origin child.
     const realmRootFrame = cfg.frameElement || null;
+    const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
+    const configuredReferrer = typeof cfg.referrer === "string" ? cfg.referrer : "";
+    const navigateDocument = g.__http_navigate;
+    delete g.__http_navigate;
+    const makeWindowMessageBinding = g.__window_message_binding;
+    delete g.__window_message_binding;
+    let windowMessageSlots;
+    const messageApply = Reflect.apply;
+    const messageWeakGet = WeakMap.prototype.get, messageWeakSet = WeakMap.prototype.set;
+    function windowMessageState(window) {
+        let state = messageApply(messageWeakGet, windowMessageSlots, [window]);
+        return state && state.resolve ? state.resolve() : state;
+    }
     const configuredAgentTimeOffset = Number(cfg.agentTimeOffset);
     const agentTimeOffset = Number.isFinite(configuredAgentTimeOffset) &&
         configuredAgentTimeOffset >= 0 ? configuredAgentTimeOffset : 0;
@@ -486,7 +499,7 @@
         if (tag === "audio" || tag === "video") return el.hasAttribute("controls");
         return tag === "button" || tag === "select" || tag === "textarea"
             || tag === "iframe" || tag === "summary"
-            || el.hasAttribute("contenteditable");
+            || ceHost(el);
     }
     function focusElement(el, options) {
         if (!elementCanFocus(el) || focusedArea === el) return;
@@ -513,6 +526,24 @@
         focusEvent(el, "blur", null, false);
         focusEvent(el, "focusout", null, true);
     }
+    // HTML §6.6.4 focusing/unfocusing steps: a native click outside a
+    // focusable area moves focus to the viewport, not to a fake body element.
+    // Resolve descendants (e.g. text inside an editor or a button's SVG) to
+    // their focusable ancestor. This host operation does not synthesize click
+    // activation, and deliberately leaves the document Selection intact
+    // (Selection API §6: clicking non-editable content must not empty it).
+    trust.focusPage = function (id) {
+        let target = id === null || id === undefined ? null : wrap(id);
+        for (; target; target = target.parentNode || target.host || null) {
+            if (target.nodeType !== 1) continue;
+            if (target === g.document.documentElement && parsedTabIndex(target) === null) break;
+            if (elementCanFocus(target)) {
+                focusElement(target, { preventScroll: true });
+                return;
+            }
+        }
+        blurElement(focusedArea);
+    };
     function baseHref() {
         if (baseHrefCache !== null) return baseHrefCache;
         const currentFrame = trust.__activeFrame || null;
@@ -781,8 +812,7 @@
         const t = String(type);
         const l = lsFor(target, t);
         if (lsFind(l, fn, o.capture) >= 0) return;
-        // A single Boa realm hosts the page and its inline-rendered nested
-        // documents. Remember the document whose global was current when the
+        // Remember the document whose global was current when the
         // listener was registered; dispatch restores that document before
         // invoking the callback.
         const entry = { fn: fn, capture: o.capture, once: o.once, removed: false,
@@ -1052,7 +1082,7 @@
         if (phase === 3 && capN === list.length) return;
         for (const entry of list.slice()) {
             if (entry.removed) continue;
-            // `window` is one Boa object for all scoped navigables, but HTML
+            // Scoped navigables may share this global object, but HTML
             // delivers a MessageEvent only to the Window whose postMessage
             // target was addressed. Without this filter, every child frame's
             // message listener also saw top-window traffic and reCAPTCHA
@@ -1305,48 +1335,10 @@
     trust.fire = function (target, type, bubble) {
         dispatch(target, new Event(type), bubble);
     };
-    // A headless DOM never decodes images, so the `load` event a real browser
-    // fires when an image fetch succeeds never happens here. The ubiquitous
-    // "reveal on load" idiom — an `<img>` painted at `opacity:0` (or hidden)
-    // until a `load` handler reveals it (lightGallery's lightbox, lazy-loaders,
-    // masonry, fade-in carousels) — then leaves the image invisible forever,
-    // and the layout drops an `opacity:0` image entirely. We DO fetch and show
-    // images in the layout/render pipeline, so optimistically firing `load` is
-    // the correct default. Only imgs something is actually waiting on (a `load`
-    // listener / `onload`) are fired, so an ordinary page pays nothing. The
-    // event is deferred to a macrotask: a library inserts the `<img>` and THEN
-    // binds its handler, so a browser fires `load` on the next turn, once the
-    // handler is registered — we match that. Returns the count newly scheduled
-    // so the actor can re-scan for images a load handler itself inserts
-    // (lightGallery preloads the adjacent slides).
-    trust.__imgLoaded = new Set();
-    trust.scanImageLoads = function () {
-        let imgs;
-        try { imgs = g.document.querySelectorAll("img"); } catch (e) { return 0; }
-        const pending = [];
-        for (let i = 0; i < imgs.length; i++) {
-            const im = imgs[i];
-            const id = im.__id;
-            if (typeof id !== "number" || trust.__imgLoaded.has(id)) continue;
-            if (!im.getAttribute("src")) continue;
-            const m = LS.get(im);
-            const listening =
-                (m && m.get("load") && m.get("load").length) || typeof im.onload === "function";
-            if (!listening) continue;
-            trust.__imgLoaded.add(id);
-            pending.push(im);
-        }
-        if (pending.length) setTimeout(function () {
-            for (const im of pending) { try { dispatch(im, new Event("load"), false); } catch (e) {} }
-        }, 0);
-        return pending.length;
-    };
     // The Lumen page actor receives image completion from the frontend only
     // after the shared image pipeline has fetched and decoded the resource.
     // HTML §4.8.4 exposes that state through `complete`, and the successful
-    // request's `load` event is delivered as a later task. Keep this separate
-    // from the legacy optimistic scan above: Boa's one-shot compatibility path
-    // has no frontend decode result to inject, while Lumen must not announce a
+    // request's `load` event is delivered as a later task. Do not announce a
     // network image before its bytes are available.
     trust.__imgReadyDelivered = new Map();
     trust.scanImageLoadsWhenReady = function () {
@@ -1508,7 +1500,8 @@
                 g,
                 g.top || g,
                 frame,
-                trust.now ? trust.now() : performance.now()
+                trust.now ? trust.now() : performance.now(),
+                frameReferrers.get(frame) || ""
             );
         } catch (e) {
             trust.errors.push("Window Realm: " + ((e && e.message) || e));
@@ -1527,6 +1520,8 @@
         // about:blank Document, with its own Window Realm, as part of creating
         // the iframe's child navigable. It exists before attribute navigation.
         frame.__frameUrl = "about:blank";
+        // HTML's initial about:blank creation copies the creator Document URL.
+        frameReferrers.set(frame, frame.ownerDocument.URL);
         frame.__trustReadyState = "complete";
         const replacedRoots = frame.childNodes;
         if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
@@ -1548,7 +1543,8 @@
         }
         return childWindow;
     }
-    function loadFrameMarkup(frame, markup, base, frameUrl, generation) {
+    function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "") {
+        frameReferrers.set(frame, referrer);
         ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
         const initialWindow = frame.__trustInitialAboutBlank
             ? frame.__contentRealmWindow : null;
@@ -1574,7 +1570,7 @@
         // cross-document navigations create a fresh Window and Realm.
         if (reuseInitialWindow) {
             try {
-                if (initialWindow.__trust.replaceInitialDocument(frame.__id, frameUrl)) {
+                if (initialWindow.__trust.replaceInitialDocument(frame.__id, frameUrl, referrer)) {
                     frame.__contentRealmWindow = initialWindow;
                     frame.__contentDoc = initialWindow.document;
                     initialWindow.__trust.finishParsedFrameLoad(frame.__id, generation);
@@ -1771,7 +1767,7 @@
         frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
         const generation = beginFrameLoad(frame);
         let r;
-        try { r = __http_fetch(url, "GET", null, null, null); } catch (e) { r = null; }
+        try { r = navigateDocument(url, frame.ownerDocument.URL, frame.referrerPolicy || ""); } catch (e) { r = null; }
         ftrace("frame fetch -> " + (r ? r[0] + " " + r[1] + " len=" + String(r[2] || "").length : "null"));
         if (!r) { fireFrameLoad(frame, generation); return; }
         const status = r[0] | 0;
@@ -1779,7 +1775,8 @@
         const isHtml = ctype === "" || ctype.indexOf("text/html") >= 0 ||
             ctype.indexOf("application/xhtml") >= 0;
         if (status >= 200 && status < 300 && isHtml) {
-            loadFrameMarkup(frame, r[2] || "", url, url, generation);
+            const finalURL = r[5] || url;
+            loadFrameMarkup(frame, r[2] || "", finalURL, finalURL, generation, r[6] || "");
         } else {
             fireFrameLoad(frame, generation);
         }
@@ -2378,7 +2375,7 @@
             } else if (type === "radio") {
                 const owner = formOwner(el);
                 const name = el.getAttribute("name") || "";
-                valueMissing = !g.document.querySelectorAll("input").some(function (radio) {
+                valueMissing = !Array.from(g.document.querySelectorAll("input")).some(function (radio) {
                     return String(radio.type).toLowerCase() === "radio"
                         && (radio.getAttribute("name") || "") === name
                         && formOwner(radio) === owner
@@ -2728,9 +2725,14 @@
         get previousSibling() { return wrap(__dom_prev(this.__id)); }
         get nextElementSibling() { let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
         get previousElementSibling() { let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
-        get textContent() { return __dom_text(this.__id); }
+        get textContent() {
+            const t = this.nodeType;
+            return t === 9 || t === 10 ? null : __dom_text(this.__id);
+        }
         set textContent(v) {
             v = v === null || v === undefined ? "" : String(v);
+            const t = this.nodeType;
+            if (t !== 1 && t !== 3 && t !== 8 && t !== 11) return;
             if (!MO.length) {
                 const removedRoots = __dom_children(this.__id);
                 for (let i = 0; i < removedRoots.length; i++)
@@ -2741,9 +2743,9 @@
                 slotQueueCheck(this);
                 return;
             }
-            const t = this.nodeType;
             if (t === 3 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
-            // On an element, textContent replaces all children with one text node.
+            // DOM string replace all: nonempty strings create a fresh Text node;
+            // empty strings remove the children without adding any node.
             const removed = this.childNodes;
             for (let i = 0; i < removed.length; i++)
                 destroyFrameNavigablesIn(removed[i]);
@@ -3607,10 +3609,7 @@
         // drop the `getAttribute` read cache), preserving live-list behavior
         // for existing references as required by the DOM Standard.
         get attributes() {
-            // Plain loop + snapshot values + `this`-based methods: NO
-            // closure capturing a block-scoped local invoked from a native
-            // callback (Boa trap #6 — `.map`/getters here aborted the page
-            // with a define-opcode OOB panic). Values snapshot per rebuild.
+            // Rebuild attribute values in place so existing list references stay live.
             let list = this.__attrMap;
             if (list && !this.__attrMapStale) return list;
             if (!list) {
@@ -4002,7 +4001,10 @@
             // standard composed-tree shape). `querySelectorAll` intentionally
             // does not pierce that boundary, so include each slot's flattened
             // assignments when collecting descendant snap areas.
-            const areas = descendants.slice();
+            // DOM querySelectorAll returns an iterable static NodeList, not
+            // an Array. Keep the platform's proper NodeList interface while
+            // making the private, appendable work list used by snap selection.
+            const areas = Array.from(descendants);
             for (const node of descendants) {
                 if (node.localName !== "slot" || typeof node.assignedElements !== "function") continue;
                 try { areas.push.apply(areas, node.assignedElements({ flatten: true })); }
@@ -4112,14 +4114,14 @@
             // `client*` must report 0, exactly as a browser does (the old
             // viewport-sized fallback lied: a display:none element measured as
             // the whole window). EXCEPTION: an embedded/replaced element the
-            // measurement pass deliberately SKIPs (`<svg>`/`<canvas>`/`<iframe>`/
+            // measurement pass deliberately SKIPs (`<svg>`/`<iframe>`/
             // `<object>`/`<math>`/`<embed>`) DOES have a real box in a browser —
             // our layout just can't compute it — so a chart/embed library
             // measuring one must still see a non-zero size; keep the viewport-box
             // hedge for those (only when connected — a detached one is still 0).
             const t = this.localName;
             if (this.isConnected &&
-                (t === "svg" || t === "canvas" || t === "iframe" ||
+                (t === "svg" || t === "iframe" ||
                  t === "object" || t === "math" || t === "embed")) {
                 return new DOMRect(0, 0, g.innerWidth, g.innerHeight);
             }
@@ -4301,38 +4303,277 @@
     }
     class HTMLAudioElement extends HTMLMediaElement {}
 
-    // <canvas> 2d context. We paint no raster, but sites use it to normalise CSS
-    // colours (Web Animations sets ctx.fillStyle and reads it back) and to
-    // measure text. A pass-through stub stores/echoes its properties and no-ops
-    // drawing — enough that the code doesn't throw, without pretending to paint.
-    class HTMLCanvasElement extends HTMLElement {
-        getContext(kind) {
-            if (String(kind) !== "2d") return null;
-            return this.__ctx2d || (this.__ctx2d = {
-                canvas: this,
-                fillStyle: "#000000", strokeStyle: "#000000",
-                font: "10px sans-serif", globalAlpha: 1, lineWidth: 1,
-                lineCap: "butt", lineJoin: "miter", textAlign: "start", textBaseline: "alphabetic",
-                save() {}, restore() {}, scale() {}, rotate() {}, translate() {},
-                transform() {}, setTransform() {}, resetTransform() {},
-                beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
-                bezierCurveTo() {}, quadraticCurveTo() {}, arc() {}, arcTo() {},
-                rect() {}, ellipse() {}, fill() {}, stroke() {}, clip() {},
-                clearRect() {}, fillRect() {}, strokeRect() {},
-                fillText() {}, strokeText() {}, drawImage() {},
-                measureText(t) { return { width: String(t).length * 6 }; },
-                getImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
-                putImageData() {}, createImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
-                createLinearGradient() { return { addColorStop() {} }; },
-                createRadialGradient() { return { addColorStop() {} }; },
-                createPattern() { return null; },
-                createConicGradient() { return { addColorStop() {} }; },
-                setLineDash() {}, getLineDash() { return []; },
-                isPointInPath() { return false; }, isPointInStroke() { return false; },
-                drawFocusIfNeeded() {},
-            });
+    // HTML canvas: the DOM owns the bitmap and native drawing state. JS performs
+    // Web IDL conversion before crossing the private, byte-oriented boundary.
+    const canvasNative = g.__canvas_2d;
+    const canvasRealmOrigin = (__url_parse(cfg.url, null) || [])[8] || "null";
+    delete g.__canvas_2d;
+    const canvasContexts = new WeakMap(), canvasOwners = new WeakMap(), canvasOptions = new WeakMap();
+    const canvasPaths = new WeakMap(), canvasJSON = JSON.stringify;
+    const canvasApply = Reflect.apply, canvasGet = WeakMap.prototype.get;
+    const canvasTypedProto = Object.getPrototypeOf(Uint8ClampedArray.prototype);
+    const canvasTypedBytes = Object.getOwnPropertyDescriptor(canvasTypedProto, "byteLength").get;
+    let canvasImageConstructor, canvasImageGetters;
+    function canvasOwner(context) {
+        const owner = canvasApply(canvasGet, canvasOwners, [context]);
+        if (!owner) throw new TypeError("Illegal CanvasRenderingContext2D invocation");
+        return owner;
+    }
+    function canvasCall(context, op, numbers, payload) {
+        return canvasNative(canvasOwner(context).__id, op, numbers || [], payload);
+    }
+    function canvasPathCommand(context, op, numbers) {
+        const path = canvasApply(canvasGet,canvasPaths,[context]);
+        if (path) { if (numbers.every(Number.isFinite)) path.push([op,numbers]); }
+        else canvasCall(context,op,numbers);
+    }
+    function canvasDrawingOwner(context) {
+        if (!canvasApply(canvasGet,canvasPaths,[context])) canvasOwner(context);
+    }
+    function canvasMatrix(a) {
+        if (a != null && typeof a !== "object" && typeof a !== "function") throw new TypeError("Expected a matrix dictionary");
+        const m = a || {}, values = {};
+        for (const key of ["a","b","c","d","e","f","m11","m12","m21","m22","m41","m42"]) {
+            const value = m[key]; values[key] = value === undefined ? undefined : +value;
         }
-        toDataURL() { return "data:,"; }
+        const n = [];
+        for (const [short,long,fallback] of [["a","m11",1],["b","m12",0],["c","m21",0],["d","m22",1],["e","m41",0],["f","m42",0]]) {
+            if (values[short] !== undefined && values[long] !== undefined && !Object.is(values[short],values[long]) && values[short] !== values[long])
+                throw new TypeError("Conflicting matrix aliases");
+            n.push(values[long] === undefined ? (values[short] === undefined ? fallback : values[short]) : values[long]);
+        }
+        return n;
+    }
+    class Path2D {
+        constructor(path = undefined) {
+            const source = canvasApply(canvasGet,canvasPaths,[path]);
+            canvasPaths.set(this,source ? [["add",source.slice(),[1,0,0,1,0,0]]] : path === undefined ? [] : [["svg",`${path}`]]);
+        }
+        addPath(path, transform = undefined) {
+            const target = canvasApply(canvasGet,canvasPaths,[this]);
+            const source = canvasApply(canvasGet,canvasPaths,[path]);
+            if (!target || !source) throw new TypeError("Illegal Path2D invocation");
+            const matrix = canvasMatrix(transform);
+            if (matrix.every(Number.isFinite)) target.push(["add",source.slice(),matrix]);
+        }
+    }
+    function canvasDrawPath(context,op,pathOrRule,rule) {
+        canvasOwner(context);
+        const path = canvasApply(canvasGet,canvasPaths,[pathOrRule]);
+        if (op === "stroke" && pathOrRule !== undefined && !path) throw new TypeError("Expected a Path2D");
+        const fillRule = op === "stroke" ? "nonzero" : `${path ? rule === undefined ? "nonzero" : rule : pathOrRule === undefined ? "nonzero" : pathOrRule}`;
+        if (fillRule !== "nonzero" && fillRule !== "evenodd") throw new TypeError("Invalid fill rule");
+        if (path) canvasCall(context,op+"Path",[+(fillRule === "evenodd")],canvasJSON(path));
+        else canvasCall(context,op,[],fillRule);
+    }
+    function canvasNumbers(args, count) {
+        if (args.length < count) throw new TypeError("Not enough canvas arguments");
+        const numbers = [];
+        for (let i = 0; i < count; i++) numbers.push(+args[i]);
+        return numbers;
+    }
+    function canvasImageState(image) {
+        const state = {};
+        for (const key of ["width", "height", "data", "colorSpace", "pixelFormat"])
+            state[key] = canvasApply(canvasImageGetters[key], image, []);
+        return state;
+    }
+    function canvasImageFormat(state) {
+        return [+(state.pixelFormat === "rgba-float16"),
+            state.colorSpace === "srgb-linear" ? 1 : state.colorSpace === "display-p3" ? 2 : state.colorSpace === "display-p3-linear" ? 3 : 0];
+    }
+    class CanvasRenderingContext2D {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get canvas() { return canvasOwner(this); }
+        getContextAttributes() {
+            canvasOwner(this);
+            const settings = canvasApply(canvasGet,canvasOptions,[this]);
+            return { alpha: settings.alpha, colorSpace: "srgb", colorType: "unorm8",
+                desynchronized: false, willReadFrequently: settings.willReadFrequently };
+        }
+        isContextLost() { return canvasCall(this, "lost"); }
+        save() { canvasCall(this, "save"); }
+        restore() { canvasCall(this, "restore"); }
+        reset() { canvasCall(this, "reset"); }
+        beginPath() { canvasCall(this, "beginPath"); }
+        closePath() { canvasDrawingOwner(this); canvasPathCommand(this,"closePath",[]); }
+        scale(x, y) { canvasOwner(this); const n = canvasNumbers(arguments, 2); canvasCall(this, "transform", [n[0],0,0,n[1],0,0]); }
+        translate(x, y) { canvasOwner(this); const n = canvasNumbers(arguments, 2); canvasCall(this, "transform", [1,0,0,1,n[0],n[1]]); }
+        rotate(angle) { canvasOwner(this); const n = canvasNumbers(arguments, 1), c = Math.cos(n[0]), s = Math.sin(n[0]); canvasCall(this, "transform", [c,s,-s,c,0,0]); }
+        transform(a,b,c,d,e,f) { canvasOwner(this); canvasCall(this,"transform",canvasNumbers(arguments,6)); }
+        setTransform(a,b,c,d,e,f) {
+            canvasOwner(this);
+            if (arguments.length > 1) { canvasCall(this,"setTransform",canvasNumbers(arguments,6)); return; }
+            canvasCall(this,"setTransform",canvasMatrix(a));
+        }
+        resetTransform() { canvasCall(this,"setTransform",[1,0,0,1,0,0]); }
+        arcTo(x1,y1,x2,y2,radius) {
+            canvasDrawingOwner(this); const n = canvasNumbers(arguments,5);
+            if (!n.every(Number.isFinite)) return;
+            canvasPathCommand(this,"arcTo",n);
+            if (n[4] < 0) throw new DOMException("Negative arc radius","IndexSizeError");
+        }
+        roundRect(x,y,w,h,radii = 0) {
+            canvasDrawingOwner(this); const n = canvasNumbers(arguments,4);
+            let values;
+            if (radii != null && (typeof radii === "object" || typeof radii === "function") && radii[Symbol.iterator] !== undefined)
+                values = Array.from(radii);
+            else values = [radii];
+            values = values.map(value => {
+                if (value != null && (typeof value === "object" || typeof value === "function")) {
+                    const px=value.x, py=value.y; void value.z; void value.w;
+                    return [px === undefined ? 0 : +px,py === undefined ? 0 : +py];
+                }
+                const radius=+value; return [radius,radius];
+            });
+            if (!n.every(Number.isFinite)) return;
+            if (values.length < 1 || values.length > 4) throw new RangeError("Invalid corner count");
+            for (const pair of values) { if (!pair.every(Number.isFinite)) return; if (pair[0]<0 || pair[1]<0) throw new RangeError("Negative corner radius"); }
+            const corners = [values[0],values[1] || values[0],values[2] || values[0],values[3] || values[1] || values[0]];
+            const [a,b,c,d] = corners;
+            const ratio = (size,sum) => sum === 0 ? Infinity : Math.abs(size)/sum;
+            const scale = Math.min(1,ratio(n[2],a[0]+b[0]),ratio(n[3],b[1]+c[1]),ratio(n[2],c[0]+d[0]),ratio(n[3],d[1]+a[1]));
+            for (const pair of corners) n.push(pair[0]*scale,pair[1]*scale);
+            canvasPathCommand(this,"roundRect",n);
+        }
+        arc(x,y,radius,start,end,counterclockwise = false) {
+            canvasDrawingOwner(this); const n = canvasNumbers(arguments,5);
+            if (!n.every(Number.isFinite)) return;
+            if (n[2] < 0) throw new DOMException("Negative arc radius", "IndexSizeError");
+            canvasPathCommand(this,"ellipse",[n[0],n[1],n[2],n[2],0,n[3],n[4],+!!counterclockwise]);
+        }
+        ellipse(x,y,rx,ry,rotation,start,end,counterclockwise = false) {
+            canvasDrawingOwner(this); const n = canvasNumbers(arguments,7);
+            if (!n.every(Number.isFinite)) return;
+            if (n[2] < 0 || n[3] < 0) throw new DOMException("Negative ellipse radius", "IndexSizeError");
+            n.push(+!!counterclockwise); canvasPathCommand(this,"ellipse",n);
+        }
+        fill(pathOrRule = undefined, rule = undefined) { canvasDrawPath(this,"fill",pathOrRule,rule); }
+        stroke(path = undefined) { canvasDrawPath(this,"stroke",path); }
+        clip(pathOrRule = undefined, rule = undefined) { canvasDrawPath(this,"clip",pathOrRule,rule); }
+        createImageData(sw, sh, settings = undefined) {
+            canvasOwner(this);
+            if (arguments.length === 1) {
+                const state = canvasImageState(sw);
+                return new canvasImageConstructor(state.width,state.height,{colorSpace:state.colorSpace,pixelFormat:state.pixelFormat});
+            }
+            if (arguments.length < 2) throw new TypeError("Not enough arguments");
+            sw = sw >> 0; sh = sh >> 0;
+            return new canvasImageConstructor(Math.abs(sw),Math.abs(sh),settings);
+        }
+        getImageData(sx,sy,sw,sh,settings = undefined) {
+            canvasOwner(this);
+            if (arguments.length < 4) throw new TypeError("Not enough arguments");
+            sx = sx >> 0; sy = sy >> 0; sw = sw >> 0; sh = sh >> 0;
+            const converted = canvasImageState(new canvasImageConstructor(1,1,settings));
+            if (sw === 0 || sh === 0) throw new DOMException("Empty image rectangle","IndexSizeError");
+            if (!canvasCall(this,"clean")) throw new DOMException("Canvas is not origin-clean","SecurityError");
+            const image = new canvasImageConstructor(Math.abs(sw),Math.abs(sh),{colorSpace:converted.colorSpace,pixelFormat:converted.pixelFormat});
+            if (sw < 0) sx += sw; if (sh < 0) sy += sh;
+            const state = canvasImageState(image);
+            canvasCall(this,"get",[sx,sy,state.width,state.height,...canvasImageFormat(state)],state.data);
+            return image;
+        }
+        putImageData(image,dx,dy,dirtyX,dirtyY,dirtyWidth,dirtyHeight) {
+            canvasOwner(this);
+            if (arguments.length < 3) throw new TypeError("Not enough arguments");
+            const state = canvasImageState(image);
+            dx = dx >> 0; dy = dy >> 0;
+            let dirty = [0,0,state.width,state.height];
+            if (arguments.length >= 7) dirty = [dirtyX >> 0,dirtyY >> 0,dirtyWidth >> 0,dirtyHeight >> 0];
+            if (canvasApply(canvasTypedBytes,state.data,[]) === 0) throw new DOMException("Detached ImageData", "InvalidStateError");
+            canvasCall(this,"put",[state.width,state.height,dx,dy,...dirty,...canvasImageFormat(state)],state.data);
+        }
+        drawImage(image,dx,dy) {
+            canvasOwner(this);
+            const count = arguments.length >= 9 ? 8 : arguments.length >= 5 ? 4 : 2;
+            if (!(image instanceof HTMLCanvasElement) && !(image instanceof HTMLImageElement)) throw new TypeError("Invalid canvas image source");
+            const n = canvasNumbers(Array.prototype.slice.call(arguments,1),count);
+            if (!n.every(Number.isFinite)) return;
+            if (image instanceof HTMLCanvasElement) {
+                const size = canvasNative(image.__id,"size",[]);
+                if (size[0] === 0 || size[1] === 0) throw new DOMException("Empty canvas image", "InvalidStateError");
+            }
+            n.unshift(image.__id); canvasCall(this,"draw",n);
+        }
+        // The pre-existing text/gradient/Path2D gaps are separate from native
+        // pixel storage; these entry points are completed alongside their paint paths.
+        measureText(t) { canvasOwner(this); return { width: String(t).length * 6 }; }
+        fillText() {} strokeText() {}
+        createLinearGradient() { return { addColorStop() {} }; }
+        createRadialGradient() { return { addColorStop() {} }; }
+        createConicGradient() { return { addColorStop() {} }; }
+        createPattern() { return null; }
+        setLineDash(segments) {
+            canvasOwner(this);
+            if (segments == null) throw new TypeError("Expected dash sequence");
+            const values = []; for (const segment of segments) values.push(+segment);
+            if (values.some(v=>!Number.isFinite(v)||v<0)) return;
+            canvasCall(this,"setDash",values.length % 2 ? values.concat(values) : values);
+        }
+        getLineDash() { return canvasCall(this,"getDash"); }
+        get lineDashOffset() { return canvasCall(this,"getDashOffset"); }
+        set lineDashOffset(value) { canvasOwner(this); canvasCall(this,"setDashOffset",[+value]); }
+        isPointInPath() { return false; } isPointInStroke() { return false; }
+        drawFocusIfNeeded() {}
+    }
+    for (const [name, count] of [["moveTo",2],["lineTo",2],["quadraticCurveTo",4],["bezierCurveTo",6],["rect",4],["fillRect",4],["strokeRect",4],["clearRect",4]]) {
+        const isPath = ["moveTo","lineTo","quadraticCurveTo","bezierCurveTo","rect"].includes(name);
+        const method = function(...args) {
+            if (isPath) { canvasDrawingOwner(this); canvasPathCommand(this,name,canvasNumbers(args,count)); }
+            else { canvasOwner(this); canvasCall(this,name,canvasNumbers(args,count)); }
+        };
+        Object.defineProperties(method,{name:{value:name},length:{value:count}});
+        Object.defineProperty(CanvasRenderingContext2D.prototype,name,{value:method,writable:true,configurable:true,enumerable:true});
+    }
+    for (const [name, suffix, conversion] of [["globalAlpha","Alpha","number"],["lineWidth","Width","number"],["miterLimit","Miter","number"],["lineCap","Cap","string"],["lineJoin","Join","string"],["globalCompositeOperation","Composite","string"],["imageSmoothingEnabled","Smoothing","boolean"]]) {
+        Object.defineProperty(CanvasRenderingContext2D.prototype,name,{configurable:true,enumerable:true,
+            get() { return canvasCall(this,"get"+suffix); },
+            set(value) { canvasOwner(this); if (conversion === "string") canvasCall(this,"set"+suffix,[],`${value}`);
+                else canvasCall(this,"set"+suffix,[conversion === "boolean" ? +!!value : +value]); },
+        });
+    }
+    for (const [name, index] of [["fillStyle",0],["strokeStyle",1]]) Object.defineProperty(CanvasRenderingContext2D.prototype,name,{
+        configurable:true,enumerable:true,get() { return canvasCall(this,"getStyle",[index]); },
+        set(value) { canvasOwner(this); if (typeof value === "string") canvasCall(this,"setStyle",[index],value); },
+    });
+    Object.defineProperty(CanvasRenderingContext2D.prototype,Symbol.toStringTag,{value:"CanvasRenderingContext2D",configurable:true});
+    g.CanvasRenderingContext2D = CanvasRenderingContext2D;
+    for (const name of ["moveTo","lineTo","quadraticCurveTo","bezierCurveTo","rect","closePath","arc","arcTo","ellipse","roundRect"])
+        Object.defineProperty(Path2D.prototype,name,Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype,name));
+    Object.defineProperty(Path2D.prototype,Symbol.toStringTag,{value:"Path2D",configurable:true});
+    g.Path2D = Path2D;
+    class HTMLCanvasElement extends HTMLElement {
+        get width() { return canvasNative(this.__id,"size",[])[0]; }
+        set width(value) { this.setAttribute("width",String(value >>> 0)); }
+        get height() { return canvasNative(this.__id,"size",[])[1]; }
+        set height(value) { this.setAttribute("height",String(value >>> 0)); }
+        getContext(kind, options = undefined) {
+            if (arguments.length < 1) throw new TypeError("Missing context kind");
+            if (`${kind}` !== "2d") return null;
+            const old = canvasApply(canvasGet,canvasContexts,[this]);
+            if (old) return old;
+            if (options != null && typeof options !== "object" && typeof options !== "function") throw new TypeError("Expected context settings");
+            options = options || {};
+            const alphaValue = options.alpha, alpha = alphaValue === undefined ? true : !!alphaValue;
+            const colorValue = options.colorSpace, color = colorValue === undefined ? "srgb" : `${colorValue}`;
+            if (!["srgb","srgb-linear","display-p3","display-p3-linear"].includes(color)) throw new TypeError("Invalid colorSpace");
+            const typeValue = options.colorType, type = typeValue === undefined ? "unorm8" : `${typeValue}`;
+            if (type !== "unorm8" && type !== "float16") throw new TypeError("Invalid colorType");
+            void options.desynchronized; const willReadFrequently = !!options.willReadFrequently;
+            // Do not claim a wide-gamut/float backing store when unavailable.
+            if (color !== "srgb" || type !== "unorm8") return null;
+            if (!canvasNative(this.__id,"init",[+alpha],canvasRealmOrigin)) return null;
+            const context = Object.create(CanvasRenderingContext2D.prototype);
+            canvasContexts.set(this,context); canvasOwners.set(context,this);
+            canvasOptions.set(context,{alpha,willReadFrequently});
+            return context;
+        }
+        toDataURL(type = "image/png", quality = undefined) {
+            `${type}`;
+            if (!canvasNative(this.__id,"clean",[])) throw new DOMException("Canvas is not origin-clean","SecurityError");
+            return canvasNative(this.__id,"url",[]);
+        }
     }
 
     // HTMLSelectElement: options is the <option> descendants (optgroups included,
@@ -4386,7 +4627,21 @@
     // HTMLInputElement: value reflects the `value` attribute (no dirty-value
     // tracking here); checked reflects `checked`; the `type` IDL attribute
     // defaults to "text" when absent (React's change-event plugin keys off it).
+    const inputElementBrand = new WeakSet();
     class HTMLInputElement extends HTMLElement {
+        constructor(id) { super(id); inputElementBrand.add(this); }
+        // HTML #dom-input-accept / #reflect: this is an unmodified reflected
+        // DOMString, not a parsed or normalized MIME filter. Even a missing
+        // attribute must return "", never undefined.
+        get accept() {
+            if (!inputElementBrand.has(this)) throw new TypeError("Illegal invocation");
+            return this.getAttribute("accept") || "";
+        }
+        set accept(v) {
+            if (!inputElementBrand.has(this)) throw new TypeError("Illegal invocation");
+            if (typeof v === "symbol") throw new TypeError("Cannot convert a Symbol to a DOMString");
+            this.setAttribute("accept", String(v));
+        }
         get value() { const v = this.getAttribute("value"); return v === null ? "" : v; }
         set value(v) { this.setAttribute("value", String(v)); }
         get checked() { return this.hasAttribute("checked"); }
@@ -4404,6 +4659,9 @@
         get type() { const t = this.getAttribute("type"); return t === null ? "text" : t.toLowerCase(); }
         set type(v) { this.setAttribute("type", String(v)); }
     }
+    Object.defineProperty(HTMLInputElement.prototype, "accept", {
+        ...Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "accept"), enumerable: true,
+    });
     // <textarea>.value is its raw text content (no `value` content attribute) —
     // the form-submit path and formSet read/write the same.
     class HTMLTextAreaElement extends HTMLElement {
@@ -4557,7 +4815,13 @@
     }
     // contentDocument/contentWindow (the nested browsing context) on <iframe>/
     // <frame>; installed below so both share one body.
-    class HTMLIFrameElement extends HTMLElement {}
+    class HTMLIFrameElement extends HTMLElement {
+        get referrerPolicy() {
+            const raw = (this.getAttribute("referrerpolicy") || "").toLowerCase();
+            return ["no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin", "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url"].includes(raw) ? raw : "";
+        }
+        set referrerPolicy(value) { this.setAttribute("referrerpolicy", `${value}`); }
+    }
     class HTMLFrameElement extends HTMLElement {}
     // <template>.content is the inert fragment its markup parses into (read-only).
     class HTMLTemplateElement extends HTMLElement {
@@ -5031,6 +5295,12 @@
                     // must keep the child's Document, Location, and scoped
                     // scheduling APIs active for the whole call.
                     const facade = this.__contentWin;
+                    messageApply(messageWeakSet, windowMessageSlots, [facade, {
+                        resolve() { return windowMessageState(frame.__contentRealmWindow); }
+                    }]);
+                    // Keep this as a native operation: a JavaScript forwarding
+                    // wrapper would itself become the apparent message sender.
+                    facade.postMessage = g.postMessage;
                     const callableWrappers = new WeakMap();
                     let proxy;
                     function scopedCallable(callable) {
@@ -5062,6 +5332,9 @@
                     });
                     proxy.self = proxy;
                     proxy.window = proxy;
+                    messageApply(messageWeakSet, windowMessageSlots, [proxy, {
+                        resolve() { return windowMessageState(frame.__contentRealmWindow); }
+                    }]);
                     this.__contentWin = proxy;
                 }
                 return this.__contentWin;
@@ -5241,16 +5514,9 @@
         get domain() { return this.__domain !== undefined ? this.__domain : g.location.hostname; }
         set domain(v) { this.__domain = String(v); }
         get defaultView() { return g; }
-        // `document.referrer` (HTML §3.1.5): the address of the page that linked
-        // here, or the EMPTY STRING for a direct navigation / when policy strips
-        // it. The spec contract is that it is ALWAYS a string — never undefined.
-        // TRust navigations don't thread a referrer into page JS, so we report
-        // "" (direct navigation — a valid, common value). Missing it entirely
-        // (undefined) broke connected-react-router: its reducer seeds initial
-        // state from `document.referrer`, so an undefined value made that slice
-        // reducer return undefined on INIT → Redux's "reducer returned undefined
-        // during initialization" (#12), which aborts the whole store + render.
-        get referrer() { return ""; }
+        // HTML Document creation: snapshot the final request referrer, or the
+        // empty default for a Document without navigation request metadata.
+        get referrer() { return documentReferrers.get(this) || ""; }
         get documentURI() { return g.location.href; }
         get URL() { return g.location.href; }
         get currentScript() { return wrap(trust.currentScript); }
@@ -5461,6 +5727,8 @@
     class FrameDocument {
         constructor(frameEl) {
             this.__frame = frameEl;
+            documentReferrers.set(this, frameEl === realmRootFrame
+                ? configuredReferrer : frameReferrers.get(frameEl) || "");
             // Nested documents share the native arena, so the iframe element
             // is their subtree root for host scans (custom-element upgrade,
             // wrapper retention, and similar document-scoped algorithms).
@@ -5500,6 +5768,7 @@
         get location() { return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location; }
         get URL() { return this.location.href; }
         get documentURI() { return this.location.href; }
+        get referrer() { return documentReferrers.get(this) || ""; }
         // Parent-side access must use this child document's base rather than
         // the currently active page scope.
         get baseURI() { return frameBaseURL(this.__frame); }
@@ -5599,9 +5868,9 @@
     }
 
     // A nested document has its own browsing-context global in HTML, and a
-    // cross-origin child still executes its own scripts. TRust keeps one Boa
-    // realm for the page actor, so emulate the per-navigable global with a
-    // short-lived execution scope. Parent script access remains protected by
+    // cross-origin child still executes its own scripts. Scoped navigables use
+    // a short-lived execution scope when a separate Window Realm is not active.
+    // Parent script access remains protected by
     // the restricted WindowProxy below: it exposes messaging and navigation,
     // but never the parent's document or arbitrary globals.
     let topFrameState = null;
@@ -5886,7 +6155,7 @@
         g.cancelAnimationFrame = methods.cancel;
     }
     // A WindowProxy's target is fixed by the browsing context it represents.
-    // The same Boa object is used for every scoped Window, so these facades
+    // Scoped Windows may share a global object, so these facades
     // preserve the important distinction for nested frames: `parent` targets
     // the immediate containing frame, while `top` targets the page window.
     function makeParentWindow(parentLocation, child, sameOrigin, targetFrame, topWindow) {
@@ -7450,18 +7719,6 @@
             return el;
         }
     };
-    // Path2D — the Canvas geometry container (a declared <canvas> path). We
-    // paint no raster, so it records nothing and no-ops its building methods,
-    // but it MUST exist and be constructable: code that does `new Path2D()` /
-    // `new Path2D(svgPath)` and feeds it to ctx.fill(path)/stroke(path)/clip(path)
-    // (which already ignore the arg) otherwise hits a ReferenceError on the bare
-    // global (Twitch's polyfills reference it unguarded).
-    g.Path2D = class Path2D {
-        constructor(_path) {}
-        addPath() {} closePath() {} moveTo() {} lineTo() {}
-        bezierCurveTo() {} quadraticCurveTo() {} arc() {} arcTo() {}
-        ellipse() {} rect() {} roundRect() {}
-    };
     // Blob/File — a standard data container. Sites construct Blobs (object
     // URLs, upload chunking, sanitizer/worker plumbing) and a bare `Blob`
     // reference (ReferenceError when absent) silently broke YouTube renderers.
@@ -7699,6 +7956,7 @@
     g.DOMTokenList = DOMTokenList;
     g.DOMStringMap = DOMStringMap;
     g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(0);
+    documentReferrers.set(g.document, configuredReferrer);
 
     // --- environment ---
     const L = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "", "", "", ""];
@@ -7722,12 +7980,18 @@
         dispatch(g, ev, false);
     };
     const navigateLoc = (u, hashOnly, replace) => {
-        if (u === undefined || u === null) return;
         const p = __url_parse(String(u), locState.href);
-        if (!p) return;
+        if (!p) throw new DOMException("Invalid navigation URL.", "SyntaxError");
         const old = locState.href;
+        // Only the hash setter suppresses an unchanged fragment (HTML
+        // §7.2.4, location.hash). href/assign/replace must still navigate.
+        if (hashOnly && p[7] === locState.hash) return;
         setLocParts(p);
-        if (withoutHash(old) === withoutHash(p[0])) {
+        // HTML navigate-fragid-step requires a NON-NULL target fragment.
+        // Equal fragmentless URLs are cross-document navigations, not no-ops:
+        // routers can deliberately suspend the old page until this completes.
+        // The serializer preserves a bare '#' even though Location.hash is ''.
+        if (p[0].includes("#") && withoutHash(old) === withoutHash(p[0])) {
             if (old !== p[0]) fireHashChange(old, p[0]);
             // Same document, only the fragment moved (or was re-set): HTML's
             // "navigate to a fragment" scrolls the indicated element into view.
@@ -7738,7 +8002,9 @@
             trust.scrollFragment = locState.hash ? locState.hash.slice(1) : "";
         } else if (!hashOnly) {
             trust.navigation = p[0];
-            trust.navigationReplace = !!replace;
+            // navigate-convert-to-replace: same-origin, equal-URL navigation
+            // with automatic history handling replaces the current entry.
+            trust.navigationReplace = !!replace || old === p[0];
         }
     };
     const updateLoc = (u) => {
@@ -7746,7 +8012,7 @@
         const p = __url_parse(String(u), locState.href);
         if (p) setLocParts(p);
     };
-    trust.replaceInitialDocument = function (frameId, url) {
+    trust.replaceInitialDocument = function (frameId, url, referrer = "") {
         if (!realmRootFrame || Number(frameId) !== realmRootFrame.__id)
             return false;
         // HTML §7.5.1's one Window-to-two-Documents exception: a first
@@ -7757,6 +8023,7 @@
             detachListenerTarget(realmRootFrame.__contentDoc);
         realmRootFrame.__contentDoc = new FrameDocument(realmRootFrame);
         g.document = realmRootFrame.__contentDoc;
+        documentReferrers.set(g.document, referrer);
         if (g.__trust_cfg) g.__trust_cfg.url = String(url);
         updateLoc(url);
         baseHrefCache = null;
@@ -7765,10 +8032,9 @@
     // HTML §Location component setters: copy the URL, apply the component with
     // the URL parser's state-override semantics (`__url_set` = the same WHATWG
     // setter the URL class uses), then Location-object navigate to the result.
-    // A value the parser refuses leaves the URL unchanged, and `navigateLoc`
-    // treats an unchanged href as a no-op (deliberate deviation: the spec
-    // re-navigates — a reload — even on a no-change set; a terminal browser
-    // has nothing to gain from that).
+    // A value the component parser refuses leaves the URL unchanged. A valid
+    // component assignment still invokes Location-object navigate, including
+    // a same-URL cross-document navigation when the URL has no fragment.
     const setLocPart = (which, v) => {
         const r = __url_set(locState.href, which, String(v));
         if (r) navigateLoc(r[0], false);
@@ -7795,10 +8061,10 @@
         get port() { return locState.port; }, set port(v) { setLocPart("port", v); },
         get pathname() { return locState.pathname; }, set pathname(v) { navigateLoc(locState.origin + String(v) + locState.search + locState.hash, false); },
         get search() { return locState.search; }, set search(v) { const q = String(v); navigateLoc(locState.origin + locState.pathname + (q && q[0] === "?" ? q : (q ? "?" + q : "")) + locState.hash, false); },
-        get hash() { return locState.hash; }, set hash(v) { const h = String(v); navigateLoc(withoutHash(locState.href) + (h && h[0] === "#" ? h : (h ? "#" + h : "")), true); },
+        get hash() { return locState.hash; }, set hash(v) { const h = String(v); navigateLoc(withoutHash(locState.href) + (h[0] === "#" ? h : "#" + h), true); },
         get origin() { return locState.origin; },
-        assign(u) { navigateLoc(u, false); },
-        replace(u) { navigateLoc(u, false, true); },
+        assign(u) { if (!arguments.length) throw new TypeError("Location.assign requires a URL"); navigateLoc(u, false); },
+        replace(u) { if (!arguments.length) throw new TypeError("Location.replace requires a URL"); navigateLoc(u, false, true); },
         reload() { trust.navigation = locState.href; trust.navigationReplace = false; },
         toString() { return locState.href; },
     };
@@ -8137,11 +8403,7 @@
     // `subtree`). The subtree match is the one Rust syscall `__dom_contains`
     // (not a JS parent walk — trap #9).
     //
-    // MO and each observer's registration list are PLAIN ARRAYS, deliberately
-    // NOT Boa Set/Map: a Map/Set `for…of` holds a `MapLock` whose GC finalizer
-    // re-borrows the backing map, and under the heavy allocation this hot loop
-    // does (a record object per mutation) a GC mid-iteration trips
-    // "Object already borrowed". Arrays have no such finalizer.
+    // MO and each observer's registration list are arrays in registration order.
     const MO = [];               // live observers (each with a per-observer record queue)
     const MO_EMPTY = Object.freeze([]); // shared empty addedNodes/removedNodes (frozen ⇒ safe to share)
     let moHasChildList = false;
@@ -8293,6 +8555,7 @@
     }
     function moChildBulk(target, removed, added) { // innerHTML / textContent / insertAdjacentHTML
         if (!MO.length || !moHasChildList) return;
+        if (!removed.length && !added.length) return;
         moNotify({ type: "childList", target, addedNodes: added, removedNodes: removed });
     }
     function moAttr(target, name, oldValue) {
@@ -8371,8 +8634,8 @@
     // at load — the old "whole document is the viewport" stub fired every target
     // fully-visible-once, which made an infinite scroller request endless tiles.
     // The trade (her call): below-fold lazy images load on scroll, not at load
-    // (browser behaviour; a rootMargin still pre-buffers). Registry `IO` is a
-    // PLAIN ARRAY, never a Boa Set/Map — same MapLock GC trap MO documents.
+    // (browser behaviour; a rootMargin still pre-buffers). Registry `IO` is an
+    // array in registration order.
     const IO = [];
     // Intersection Observer §3.2.4 gives notification its own task source.
     // The rendering update records threshold crossings; it must not invoke
@@ -8382,8 +8645,8 @@
     const ioNotify = [];
     let ioTaskQueued = false;
     let ioInitialUpdatePending = false;
-    // ResizeObserver registry — a PLAIN ARRAY (never a Boa Set/Map, the MapLock
-    // GC trap MO documents). ResizeObserver is EDGE-TRIGGERED like IO: a target's
+    // ResizeObserver registry, in registration order. ResizeObserver is
+    // EDGE-TRIGGERED like IO: a target's
     // callback fires whenever its observed (border-box) size changes across the
     // page's active life, delivered in the "update the rendering" step
     // (`trust.updateResizes`, driven by `run_layout_observers`). An active engine
@@ -8687,6 +8950,16 @@
         if (dm) { const l = dm.get("scroll"); if (l && l.length) return true; }
         return typeof g.onscroll === "function";
     };
+    // Opt-in actor probes can inspect observer bookkeeping without registering,
+    // delivering, or changing an observation. No work on the normal hot path.
+    trust.intersectionState = function () {
+        return { initial: ioInitialUpdatePending, taskQueued: ioTaskQueued,
+            tasks: intersectionTasks.length, notify: ioNotify.length,
+            observers: IO.map(o => ({rootMargin:o.rootMargin, root:o.root && o.root.__id,
+                pending:o.__queuedEntries.length, targets:o.__targets.map(t => ({
+                    node:t.el.__id, id:t.el.id, index:t.lastIndex, intersecting:t.lastIx
+                }))})) };
+    };
     g.ResizeObserver = class {
         constructor(cb) { this.__cb = cb; this.__targets = []; this.__windowState = activeWindowState(); }
         observe(el) {
@@ -8847,167 +9120,21 @@
     };
 
     /*__CRYPTO_BEGIN__*/
-    // --- crypto: getRandomValues + randomUUID + subtle.digest + AES-CTR ---
-    // No CSPRNG here (text browser, no entropy source): random values
-    // are Math.random-derived — fine for request ids / cache keys, NOT
-    // real cryptography. subtle.digest IS a true SHA so libraries that
-    // hash before they fetch work (archive.org's collection search gates
-    // its tile fetch on a SHA-1 request-uid — without this the grid stays
-    // empty. AES-CTR is also implemented because protected document viewers
-    // use the standard importKey/decrypt pair to turn a fetched protected
-    // image into a Blob URL. The key material stays in this closure and only
-    // copied bytes cross the native crypto seam.
+    // Web Crypto: native digests/HMAC/AES and OS-backed random bytes. Key
+    // material stays in weak, private slots (not a permanently rooted array).
+    const __nativeDigest = __crypto_digest;
+    const __nativeRandom = __crypto_random_bytes;
+    const __nativeHmac = __crypto_hmac;
+    const __nativeAes = __crypto_aes_ctr;
     const __cryptoBytes = (d) => {
         if (d instanceof ArrayBuffer) return new Uint8Array(d.slice(0));
         if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
-        return new Uint8Array(0);
+        throw new TypeError("Expected a BufferSource");
     };
-    // Keep the WebCrypto BufferSource as an ArrayBuffer across the host seam.
-    // The interpreted fallback algorithms still operate on Uint8Array values,
-    // but SHA-256 is the hot path for proof-of-work and must not encode/decode
-    // every input and digest through a JS string.
-    const __nativeSha256 = (data) => __crypto_sha256_digest(data);
-    const __shaPad = (bytes) => {
-        const ml = bytes.length * 8;
-        const total = (bytes.length + 1 + 8 + 63) & ~63;
-        const m = new Uint8Array(total);
-        m.set(bytes); m[bytes.length] = 0x80;
-        const dv = new DataView(m.buffer);
-        dv.setUint32(total - 8, Math.floor(ml / 0x100000000));
-        dv.setUint32(total - 4, ml >>> 0);
-        return { m, dv, total };
-    };
-    function __sha1(bytes) {
-        const { dv, total } = __shaPad(bytes);
-        let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
-        const w = new Uint32Array(80);
-        for (let off = 0; off < total; off += 64) {
-            for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
-            for (let i = 16; i < 80; i++) { const v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]; w[i] = (v << 1) | (v >>> 31); }
-            let a = h0, b = h1, c = h2, d = h3, e = h4;
-            for (let i = 0; i < 80; i++) {
-                let f, k;
-                if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
-                else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-                else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-                else { f = b ^ c ^ d; k = 0xCA62C1D6; }
-                const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) >>> 0;
-                e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
-            }
-            h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
-        }
-        const out = new Uint8Array(20), o = new DataView(out.buffer);
-        o.setUint32(0, h0); o.setUint32(4, h1); o.setUint32(8, h2); o.setUint32(12, h3); o.setUint32(16, h4);
-        return out;
-    }
-    const __SHA256_K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
-    function __sha256(bytes) {
-        const { dv, total } = __shaPad(bytes);
-        const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-        const w = new Uint32Array(64);
-        const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-        for (let off = 0; off < total; off += 64) {
-            for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
-            for (let i = 16; i < 64; i++) {
-                const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
-                const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
-                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
-            }
-            let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g2 = h[6], hh = h[7];
-            for (let i = 0; i < 64; i++) {
-                const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g2);
-                const t1 = (hh + S1 + ch + __SHA256_K[i] + w[i]) >>> 0;
-                const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), maj = (a & b) ^ (a & c) ^ (b & c);
-                const t2 = (S0 + maj) >>> 0;
-                hh = g2; g2 = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
-            }
-            h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
-            h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g2) >>> 0; h[7] = (h[7] + hh) >>> 0;
-        }
-        const out = new Uint8Array(32), o = new DataView(out.buffer);
-        for (let i = 0; i < 8; i++) o.setUint32(i * 4, h[i]);
-        return out;
-    }
-    // SHA-384/512 need 64-bit words JS lacks natively, so the core runs on
-    // BigInt (masked to 64 bits). digest() inputs are small (request uids,
-    // token hashes), so BigInt's cost is irrelevant; correctness is what
-    // matters. Block size 128B, 128-bit big-endian length field. ChatGPT's
-    // boot hashes with SHA-512; without it the reject aborted its init.
-    const __M64 = (1n << 64n) - 1n;
-    const __SHA512_K = [
-        0x428a2f98d728ae22n, 0x7137449123ef65cdn, 0xb5c0fbcfec4d3b2fn, 0xe9b5dba58189dbbcn,
-        0x3956c25bf348b538n, 0x59f111f1b605d019n, 0x923f82a4af194f9bn, 0xab1c5ed5da6d8118n,
-        0xd807aa98a3030242n, 0x12835b0145706fben, 0x243185be4ee4b28cn, 0x550c7dc3d5ffb4e2n,
-        0x72be5d74f27b896fn, 0x80deb1fe3b1696b1n, 0x9bdc06a725c71235n, 0xc19bf174cf692694n,
-        0xe49b69c19ef14ad2n, 0xefbe4786384f25e3n, 0x0fc19dc68b8cd5b5n, 0x240ca1cc77ac9c65n,
-        0x2de92c6f592b0275n, 0x4a7484aa6ea6e483n, 0x5cb0a9dcbd41fbd4n, 0x76f988da831153b5n,
-        0x983e5152ee66dfabn, 0xa831c66d2db43210n, 0xb00327c898fb213fn, 0xbf597fc7beef0ee4n,
-        0xc6e00bf33da88fc2n, 0xd5a79147930aa725n, 0x06ca6351e003826fn, 0x142929670a0e6e70n,
-        0x27b70a8546d22ffcn, 0x2e1b21385c26c926n, 0x4d2c6dfc5ac42aedn, 0x53380d139d95b3dfn,
-        0x650a73548baf63den, 0x766a0abb3c77b2a8n, 0x81c2c92e47edaee6n, 0x92722c851482353bn,
-        0xa2bfe8a14cf10364n, 0xa81a664bbc423001n, 0xc24b8b70d0f89791n, 0xc76c51a30654be30n,
-        0xd192e819d6ef5218n, 0xd69906245565a910n, 0xf40e35855771202an, 0x106aa07032bbd1b8n,
-        0x19a4c116b8d2d0c8n, 0x1e376c085141ab53n, 0x2748774cdf8eeb99n, 0x34b0bcb5e19b48a8n,
-        0x391c0cb3c5c95a63n, 0x4ed8aa4ae3418acbn, 0x5b9cca4f7763e373n, 0x682e6ff3d6b2b8a3n,
-        0x748f82ee5defb2fcn, 0x78a5636f43172f60n, 0x84c87814a1f0ab72n, 0x8cc702081a6439ecn,
-        0x90befffa23631e28n, 0xa4506cebde82bde9n, 0xbef9a3f7b2c67915n, 0xc67178f2e372532bn,
-        0xca273eceea26619cn, 0xd186b8c721c0c207n, 0xeada7dd6cde0eb1en, 0xf57d4f7fee6ed178n,
-        0x06f067aa72176fban, 0x0a637dc5a2c898a6n, 0x113f9804bef90daen, 0x1b710b35131c471bn,
-        0x28db77f523047d84n, 0x32caab7b40c72493n, 0x3c9ebe0a15c9bebcn, 0x431d67c49c100d4cn,
-        0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n,
-    ];
-    function __sha512core(bytes, h) {
-        const bl = bytes.length;
-        const total = (bl + 1 + 16 + 127) & ~127;
-        const m = new Uint8Array(total);
-        m.set(bytes); m[bl] = 0x80;
-        const dv = new DataView(m.buffer);
-        const ml = BigInt(bl) * 8n; // fits 64 bits for any realistic input; high half stays 0
-        dv.setUint32(total - 8, Number((ml >> 32n) & 0xffffffffn));
-        dv.setUint32(total - 4, Number(ml & 0xffffffffn));
-        const w = new Array(80);
-        const rotr = (x, n) => ((x >> n) | (x << (64n - n))) & __M64;
-        for (let off = 0; off < total; off += 128) {
-            for (let i = 0; i < 16; i++) {
-                w[i] = (BigInt(dv.getUint32(off + i * 8)) << 32n) | BigInt(dv.getUint32(off + i * 8 + 4));
-            }
-            for (let i = 16; i < 80; i++) {
-                const s0 = rotr(w[i - 15], 1n) ^ rotr(w[i - 15], 8n) ^ (w[i - 15] >> 7n);
-                const s1 = rotr(w[i - 2], 19n) ^ rotr(w[i - 2], 61n) ^ (w[i - 2] >> 6n);
-                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & __M64;
-            }
-            let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g2 = h[6], hh = h[7];
-            for (let i = 0; i < 80; i++) {
-                const S1 = rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n), ch = (e & f) ^ ((~e & __M64) & g2);
-                const t1 = (hh + S1 + ch + __SHA512_K[i] + w[i]) & __M64;
-                const S0 = rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n), maj = (a & b) ^ (a & c) ^ (b & c);
-                const t2 = (S0 + maj) & __M64;
-                hh = g2; g2 = f; f = e; e = (d + t1) & __M64; d = c; c = b; b = a; a = (t1 + t2) & __M64;
-            }
-            h[0] = (h[0] + a) & __M64; h[1] = (h[1] + b) & __M64; h[2] = (h[2] + c) & __M64; h[3] = (h[3] + d) & __M64;
-            h[4] = (h[4] + e) & __M64; h[5] = (h[5] + f) & __M64; h[6] = (h[6] + g2) & __M64; h[7] = (h[7] + hh) & __M64;
-        }
-        return h;
-    }
-    function __sha512(bytes) {
-        const h = __sha512core(bytes, [
-            0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
-            0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n]);
-        const out = new Uint8Array(64), o = new DataView(out.buffer);
-        for (let i = 0; i < 8; i++) { o.setUint32(i * 8, Number((h[i] >> 32n) & 0xffffffffn)); o.setUint32(i * 8 + 4, Number(h[i] & 0xffffffffn)); }
-        return out;
-    }
-    function __sha384(bytes) {
-        const h = __sha512core(bytes, [
-            0xcbbb9d5dc1059ed8n, 0x629a292a367cd507n, 0x9159015a3070dd17n, 0x152fecd8f70e5939n,
-            0x67332667ffc00b31n, 0x8eb44a8768581511n, 0xdb0c2e0d64f98fa7n, 0x47b5481dbefa4fa4n]);
-        const out = new Uint8Array(48), o = new DataView(out.buffer); // 384 bits = first 6 words
-        for (let i = 0; i < 6; i++) { o.setUint32(i * 8, Number((h[i] >> 32n) & 0xffffffffn)); o.setUint32(i * 8 + 4, Number(h[i] & 0xffffffffn)); }
-        return out;
-    }
-    const __cryptoKeyStore = [];
+    const __cryptoKeyStore = new WeakMap();
     const __cryptoKeyToken = {};
     const __cryptoError = (name, message) => {
+        if (typeof g.DOMException === "function") return new g.DOMException(message, name);
         const error = new Error(message);
         error.name = name;
         return error;
@@ -9018,21 +9145,25 @@
     class CryptoKey {
         constructor(token, slot) {
             if (token !== __cryptoKeyToken) throw new TypeError("Illegal constructor");
-            Object.defineProperty(this, "__trustCryptoSlot", {
-                configurable: false, enumerable: false, writable: false, value: slot,
-            });
+            __cryptoKeyStore.set(this, slot);
         }
-        get type() { return "secret"; }
-        get extractable() { return !!__cryptoKeyStore[this.__trustCryptoSlot][2]; }
+        get type() { __cryptoKeyEntry(this); return "secret"; }
+        get extractable() { return __cryptoKeyEntry(this).extractable; }
         get algorithm() {
-            return { name: "AES-CTR", length: __cryptoKeyStore[this.__trustCryptoSlot][1] * 8 };
+            const entry=__cryptoKeyEntry(this);
+            return entry.cachedAlgorithm ||= Object.assign({},entry.algorithm,
+                entry.algorithm.hash ? {hash:{name:entry.algorithm.hash.name}} : {});
         }
-        get usages() { return __cryptoKeyStore[this.__trustCryptoSlot][3].slice(); }
+        get usages() { const entry=__cryptoKeyEntry(this);return entry.cachedUsages ||= Object.freeze(entry.usages.slice()); }
+        get [Symbol.toStringTag]() { return "CryptoKey"; }
     }
+    const __cryptoKeyEntry = key => {
+        const entry=__cryptoKeyStore.get(key);
+        if(!entry)throw new TypeError("Expected a CryptoKey");
+        return entry;
+    };
     const __cryptoKeyBytes = (key) => {
-        if (!(key instanceof CryptoKey)) return null;
-        const entry = __cryptoKeyStore[key.__trustCryptoSlot];
-        return entry ? entry[0] : null;
+        return __cryptoKeyEntry(key).bytes;
     };
     const __cryptoAesOperation = (algorithm, key, data, usage) => {
         try {
@@ -9040,7 +9171,8 @@
                 return Promise.reject(__cryptoError("NotSupportedError", "Unsupported AES algorithm"));
             }
             const raw = __cryptoKeyBytes(key);
-            if (!raw || key.usages.indexOf(usage) < 0) {
+            const entry=__cryptoKeyEntry(key);
+            if (entry.algorithm.name !== "AES-CTR" || entry.usages.indexOf(usage) < 0) {
                 return Promise.reject(__cryptoError("InvalidAccessError", "Key usage is not permitted"));
             }
             const counter = __cryptoBytes(algorithm && algorithm.counter);
@@ -9048,50 +9180,125 @@
             if (counter.length !== 16 || !Number.isInteger(length) || length < 1 || length > 128) {
                 return Promise.reject(__cryptoError("OperationError", "Invalid AES-CTR counter"));
             }
-            return __crypto_aes_ctr(raw, counter, length, __cryptoBytes(data));
+            return __nativeAes(raw, counter, length, __cryptoBytes(data));
         } catch (error) {
             return Promise.reject(error);
         }
     };
+    const __cryptoHash = algorithm => {
+        if(algorithm===undefined || algorithm===null || (typeof algorithm==="object" && algorithm.name===undefined))
+            throw new TypeError("Missing hash algorithm name");
+        const name=__cryptoAlgorithmName(algorithm);
+        if(!["SHA-1","SHA-256","SHA-384","SHA-512"].includes(name))
+            throw __cryptoError("NotSupportedError","Unsupported hash algorithm");
+        return name;
+    };
+    const __cryptoUsages = (values,allowed) => {
+        if(values==null || typeof values[Symbol.iterator]!=="function")throw new TypeError("Expected key usages sequence");
+        const all=["encrypt","decrypt","sign","verify","deriveKey","deriveBits","wrapKey","unwrapKey"];
+        const requested=Array.from(values,String);
+        if(requested.some(v=>!all.includes(v)))throw new TypeError("Invalid KeyUsage");
+        if(!requested.length || requested.some(v=>!allowed.includes(v)))throw __cryptoError("SyntaxError","Invalid key usages");
+        return all.filter(v=>requested.includes(v));
+    };
+    const __cryptoLength = value => {
+        if(typeof value==="bigint")throw new TypeError("Expected unsigned long");
+        const n=Number(value);
+        if(!Number.isFinite(n) || Math.trunc(n)<0 || Math.trunc(n)>4294967295)throw new TypeError("Invalid key length");
+        return Math.trunc(n);
+    };
+    const __cryptoMakeKey = (bytes,algorithm,extractable,usages) =>
+        new CryptoKey(__cryptoKeyToken,{bytes,algorithm,extractable:!!extractable,usages});
+    const __hmacAlg = hash => hash==="SHA-1" ? "HS1" : "HS"+hash.slice(4);
+    const __hmacOperation = (algorithm,key,data,signature,usage) => {
+        try {
+            if(__cryptoAlgorithmName(algorithm)!=="HMAC")throw __cryptoError("NotSupportedError","Unsupported signing algorithm");
+            const entry=__cryptoKeyEntry(key);
+            if(entry.algorithm.name!=="HMAC" || !entry.usages.includes(usage))throw __cryptoError("InvalidAccessError","HMAC key usage mismatch");
+            return __nativeHmac(entry.algorithm.hash.name,entry.bytes,__cryptoBytes(data),
+                usage==="verify" ? __cryptoBytes(signature) : undefined);
+        }catch(error){return Promise.reject(error);}
+    };
+    const __typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),Symbol.toStringTag).get;
     g.crypto = {
         getRandomValues(a) {
-            if (a && a.length !== undefined) for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 0x100000000);
+            const tag=__typedArrayTag.call(a);
+            if(!["Int8Array","Uint8Array","Uint8ClampedArray","Int16Array","Uint16Array","Int32Array","Uint32Array","BigInt64Array","BigUint64Array"].includes(tag))
+                throw __cryptoError("TypeMismatchError","Expected an integer typed array");
+            if(a.byteLength>65536)throw __cryptoError("QuotaExceededError","Random view exceeds 65536 bytes");
+            new Uint8Array(a.buffer,a.byteOffset,a.byteLength).set(__nativeRandom(a.byteLength));
             return a;
         },
         randomUUID() {
-            return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
-                const r = Math.random() * 16 | 0;
-                return (ch === "x" ? r : (r & 0x3 | 0x8)).toString(16);
-            });
+            const b=__nativeRandom(16);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;
+            const h=Array.from(b,v=>v.toString(16).padStart(2,"0")).join("");
+            return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20);
         },
         subtle: {
             digest(algo, data) {
-                const name = (typeof algo === "string" ? algo : (algo && algo.name) || "").toUpperCase();
-                if (name === "SHA-256") return __nativeSha256(data);
-                const bytes = __cryptoBytes(data);
-                if (name === "SHA-1") return Promise.resolve(__sha1(bytes).buffer);
-                if (name === "SHA-384") return Promise.resolve(__sha384(bytes).buffer);
-                if (name === "SHA-512") return Promise.resolve(__sha512(bytes).buffer);
-                return Promise.reject(new Error("Unsupported digest algorithm: " + name));
+                try {return __nativeDigest(__cryptoHash(algo),data);}
+                catch(error){return Promise.reject(error);}
+            },
+            generateKey(algorithm,extractable,usages) {
+                try {
+                    if(__cryptoAlgorithmName(algorithm)!=="HMAC")throw __cryptoError("NotSupportedError","Unsupported key generation algorithm");
+                    const hash=__cryptoHash(algorithm.hash);
+                    const length=algorithm.length===undefined ? (hash==="SHA-1"||hash==="SHA-256"?512:1024) : __cryptoLength(algorithm.length);
+                    const requested=__cryptoUsages(usages,["sign","verify"]);
+                    // The byte-oriented backend reports generation failure for
+                    // non-octet key sizes; never silently use the wrong bit key.
+                    if(!length || length%8)throw __cryptoError("OperationError","HMAC generation requires a positive octet length");
+                    return Promise.resolve(__cryptoMakeKey(__nativeRandom(length/8),{name:"HMAC",hash:{name:hash},length},extractable,requested));
+                }catch(error){return Promise.reject(error);}
+            },
+            exportKey(format,key) {
+                try {
+                    if(!["raw","jwk","spki","pkcs8"].includes(String(format)))throw new TypeError("Invalid KeyFormat");
+                    const entry=__cryptoKeyEntry(key);
+                    if(!entry.extractable)throw __cryptoError("InvalidAccessError","Key is not extractable");
+                    if(format==="raw")return Promise.resolve(entry.bytes.slice().buffer);
+                    if(format!=="jwk"||entry.algorithm.name!=="HMAC")throw __cryptoError("NotSupportedError","Unsupported key export format");
+                    let binary="";for(const b of entry.bytes)binary+=String.fromCharCode(b);
+                    return Promise.resolve({kty:"oct",k:btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/, ""),
+                        alg:__hmacAlg(entry.algorithm.hash.name),key_ops:entry.usages.slice(),ext:entry.extractable});
+                }catch(error){return Promise.reject(error);}
             },
             importKey(format, keyData, algorithm, extractable, usages) {
                 try {
+                    format=String(format);
+                    if(!["raw","jwk","spki","pkcs8"].includes(format))throw new TypeError("Invalid KeyFormat");
+                    if(__cryptoAlgorithmName(algorithm)==="HMAC") {
+                        const hash=__cryptoHash(algorithm.hash);
+                        const requested=__cryptoUsages(usages,["sign","verify"]);
+                        let bytes;
+                        if(format==="raw")bytes=__cryptoBytes(keyData);
+                        else if(format==="jwk") {
+                            const jwk=keyData;
+                            if(!jwk || jwk.kty!=="oct" || typeof jwk.k!=="string" || !/^[A-Za-z0-9_-]*$/.test(jwk.k) || jwk.k.length%4===1)
+                                throw __cryptoError("DataError","Invalid symmetric JWK");
+                            if((jwk.alg!==undefined && jwk.alg!==__hmacAlg(hash)) || (jwk.use!==undefined && jwk.use!=="sig") || (jwk.ext===false && extractable))
+                                throw __cryptoError("DataError","JWK metadata mismatch");
+                            if(jwk.key_ops!==undefined && (!Array.isArray(jwk.key_ops) || new Set(jwk.key_ops).size!==jwk.key_ops.length || requested.some(v=>!jwk.key_ops.includes(v))))
+                                throw __cryptoError("DataError","JWK key operations mismatch");
+                            const binary=atob(jwk.k.replace(/-/g,"+").replace(/_/g,"/"));
+                            bytes=Uint8Array.from(binary,c=>c.charCodeAt(0));
+                        } else throw __cryptoError("NotSupportedError","Unsupported HMAC import format");
+                        const bits=bytes.length*8,length=algorithm.length===undefined?bits:__cryptoLength(algorithm.length);
+                        if(!length || length>bits || length<=bits-8)throw __cryptoError("DataError","HMAC key length mismatch");
+                        if(length%8)throw __cryptoError("NotSupportedError","Non-octet HMAC keys are not supported");
+                        return Promise.resolve(__cryptoMakeKey(bytes,{name:"HMAC",hash:{name:hash},length},extractable,requested));
+                    }
                     if (String(format).toLowerCase() !== "raw"
                         || __cryptoAlgorithmName(algorithm) !== "AES-CTR") {
                         return Promise.reject(__cryptoError("NotSupportedError", "Unsupported AES key format or algorithm"));
                     }
-                    const requested = Array.isArray(usages) ? usages.map(String) : [];
                     const allowed = ["encrypt", "decrypt", "wrapKey", "unwrapKey"];
-                    if (requested.some((usage) => allowed.indexOf(usage) < 0)) {
-                        return Promise.reject(__cryptoError("SyntaxError", "Invalid AES key usage"));
-                    }
+                    const requested=__cryptoUsages(usages,allowed);
                     const bytes = __cryptoBytes(keyData);
                     if (bytes.length !== 16 && bytes.length !== 24 && bytes.length !== 32) {
                         return Promise.reject(__cryptoError("DataError", "AES key must be 128, 192, or 256 bits"));
                     }
-                    const slot = __cryptoKeyStore.length;
-                    __cryptoKeyStore.push([bytes, bytes.length, !!extractable, requested]);
-                    return Promise.resolve(new CryptoKey(__cryptoKeyToken, slot));
+                    return Promise.resolve(__cryptoMakeKey(bytes,{name:"AES-CTR",length:bytes.length*8},extractable,requested));
                 } catch (error) {
                     return Promise.reject(error);
                 }
@@ -9102,6 +9309,8 @@
             decrypt(algorithm, key, data) {
                 return __cryptoAesOperation(algorithm, key, data, "decrypt");
             },
+            sign(algorithm,key,data) {return __hmacOperation(algorithm,key,data,undefined,"sign");},
+            verify(algorithm,key,signature,data) {return __hmacOperation(algorithm,key,data,signature,"verify");},
         },
     };
     g.CryptoKey = CryptoKey;
@@ -9171,28 +9380,80 @@
     g.addEventListener = (t, f, o) => { addL(g, t, f, o); };
     g.removeEventListener = (t, f, o) => { removeL(g, t, f, o); };
     g.dispatchEvent = (ev) => dispatch(g, ev, false);
-    // `window.postMessage(message[, targetOrigin][, transfer])` (HTML web
-    // messaging). With no foreign frames the only valid target is ourselves, so
-    // we deliver `message` to our own window ASYNCHRONOUSLY (a task) as a
-    // `MessageEvent` carrying data/origin/source — exactly the observable spec
-    // behaviour a single-window page sees. `targetOrigin` is accepted and the
-    // transferable MessagePort list is preserved; a structured clone is still
-    // approximated as identity. Pages post to themselves to
-    // defer work or hand off across a microtask boundary (Steam's focus-restore
-    // handshake posts `"FocusRestoreReady"` and listens for it); a missing
-    // `window.postMessage` was an uncaught TypeError in that timer.
-    g.postMessage = function (message, targetOrigin, transfer) {
-        const targetFrame = trust.__activeFrame || null;
-        postMessageToFrame(targetFrame, message, g, transferPorts(targetOrigin, transfer),
-            g.location.origin);
+    // HTML "window post message steps": capture sender independently of the
+    // receiving Window, serialize at send time, check targetOrigin at delivery,
+    // then deserialize in the receiving Realm. The shared private slots are
+    // also the cross-Realm Window brand; page properties cannot forge an origin.
+    let messageSerialize, messageDeserialize;
+    const messaging = makeWindowMessageBinding(new WeakMap(), function (target, source, args) {
+        const receiver = windowMessageState(target), sender = windowMessageState(source);
+        if (!receiver || !sender) throw new TypeError("Illegal Window invocation");
+        if (!args.length) throw new TypeError("postMessage requires a message");
+        let targetOrigin = "/", transfer;
+        const options = args[1];
+        if (options == null || typeof options === "object" || typeof options === "function") {
+            if (options != null) {
+                const value = options.targetOrigin;
+                if (value !== undefined) targetOrigin = `${value}`;
+                transfer = options.transfer;
+            }
+        } else {
+            targetOrigin = `${options}`;
+            transfer = args[2];
+        }
+        if (targetOrigin === "/") targetOrigin = sender.originKey;
+        else if (targetOrigin !== "*") {
+            const parsed = __url_parse(targetOrigin, null);
+            if (!parsed) throw new DOMException("Invalid target origin", "SyntaxError");
+            // Parsing an opaque URL creates a different opaque origin, never
+            // one that happens to compare equal to another serialized "null".
+            targetOrigin = parsed[8] === "null" ? Symbol() : parsed[8];
+        }
+        // Port ownership remains the legacy same-Agent implementation. Full
+        // transferable detachment is a separate structured-clone limitation.
+        const ports = transferPorts(undefined, transfer);
+        const wire = sender.serialize(args[0]);
+        receiver.enqueue(wire, sender.origin, sender.sourceFor(receiver.window), ports, targetOrigin);
+    });
+    windowMessageSlots = messaging[0];
+    g.postMessage = messaging[1];
+    const messageOrigin = (__url_parse(cfg.url, null) || [])[8] || "null";
+    const inheritedMessageState = (cfg.url === "about:blank" || cfg.url === "about:srcdoc")
+        && cfg.parentWindow ? windowMessageState(cfg.parentWindow) : null;
+    const messageWindowState = {
+        window: g,
+        origin: inheritedMessageState ? inheritedMessageState.origin : messageOrigin,
+        originKey: inheritedMessageState ? inheritedMessageState.originKey
+            : messageOrigin === "null" ? Symbol() : messageOrigin,
+        sourceFor(receiver) {
+            return realmRootFrame && receiver === cfg.parentWindow ? realmRootFrame.contentWindow : g;
+        },
+        serialize(value) { return messageSerialize(value); },
+        enqueue(wire, origin, source, ports, targetOrigin) {
+            const frame = trust.__activeFrame || null;
+            __queue_message_task(function () {
+                if (targetOrigin !== "*" && targetOrigin !== messageWindowState.originKey) return;
+                let data;
+                try { data = messageDeserialize(wire); }
+                catch (_) {
+                    dispatch(g, new MessageEvent("messageerror", { origin, source }), false);
+                    return;
+                }
+                const event = new MessageEvent("message", {
+                    data, origin, source, ports: Object.freeze(ports)
+                });
+                for (const port of ports) port.__frame = frame;
+                event.__windowTargetSet = true; event.__frameTarget = frame;
+                dispatch(g, event, false);
+            });
+        }
     };
+    messageApply(messageWeakSet, windowMessageSlots, [g, messageWindowState]);
     // `on<event>` IDL attributes (window.onload = fn). Standard semantics:
     // the attribute is backed by an event listener, so the existing
     // dispatch loop fires it — get returns the handler, set swaps the
     // backing listener. Defining them as properties of the global object
-    // is ALSO what lets a module's bare `onload = fn` resolve (Boa's
-    // module scope assigns through the global object; without the property
-    // it throws "cannot assign to uninitialized global property"). css3test
+    // is ALSO what lets a module's bare `onload = fn` resolve. css3test
     // runs its entire suite from `onload`.
     function installEventHandlers(obj, add, remove, types) {
         for (const type of types) {
@@ -9578,36 +9839,7 @@
             "microtask: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")
         ));
     };
-    // Keep a conforming engine's native FinalizationRegistry. The fallback is
-    // only for the legacy Boa comparison backend, whose collector exposes no
-    // cleanup hook; ECMA-262 permits cleanup jobs never to be enqueued.
-    if (typeof g.FinalizationRegistry !== "function") {
-        class FinalizationRegistryFallback {
-            constructor(cleanup) {
-                if (typeof cleanup !== "function") throw new TypeError("FinalizationRegistry: cleanup callback must be callable");
-                this.__cleanup = cleanup;
-                this.__tokens = new WeakSet();
-            }
-            get [Symbol.toStringTag]() { return "FinalizationRegistry"; }
-            register(target, heldValue, unregisterToken) {
-                if (target === null || (typeof target !== "object" && typeof target !== "function"))
-                    throw new TypeError("FinalizationRegistry.register: target must be an object");
-                if (target === heldValue)
-                    throw new TypeError("FinalizationRegistry.register: target and held value must not be the same");
-                if (unregisterToken !== undefined) {
-                    if (typeof unregisterToken !== "object" && typeof unregisterToken !== "function")
-                        throw new TypeError("FinalizationRegistry.register: unregister token must be an object");
-                    this.__tokens.add(unregisterToken);
-                }
-            }
-            unregister(unregisterToken) {
-                if (unregisterToken === null || (typeof unregisterToken !== "object" && typeof unregisterToken !== "function"))
-                    throw new TypeError("FinalizationRegistry.unregister: token must be an object");
-                return this.__tokens.delete(unregisterToken);
-            }
-        }
-        g.FinalizationRegistry = FinalizationRegistryFallback;
-    }
+    // FinalizationRegistry and its cleanup hooks are provided by Lumen.
     // The HTML structured-clone algorithm — via the SAME wire codec workers
     // use (`__sc_serialize`/`__sc_deserialize`, defined below; single source
     // of truth). Cycles, Map/Set, ArrayBuffer/typed arrays/DataView, Date/
@@ -9815,8 +10047,8 @@
     //
     // The WHOLE Date surface follows this clock: the old JS-side
     // `Date.now = () => __epoch0 + timers.now` override is gone — `__clockSync`
-    // mirrors every `timers.now` advance into the Rust-side Boa clock
-    // (`__clock_set` → `PageClock`), which `Date.now()`, `new Date()`, and
+    // mirrors every `timers.now` advance into the Rust-side realm clock
+    // (`__clock_set` → `RealmClock`), which `Date.now()`, `new Date()`, and
     // every other host time read share. Before this, `new Date()` kept reading
     // the REAL host clock while `Date.now()` was fast-forwarded — a page
     // comparing them (or diffing two `new Date()`s across a settle) saw time
@@ -9827,7 +10059,10 @@
     const log = (level) => (...a) => {
         if (trust.logs.length < 100) trust.logs.push(level + ": " + a.map((x) => { try { return String(x); } catch { return "?"; } }).join(" "));
     };
-    g.console = { log: log("log"), info: log("info"), warn: log("warn"), error: log("error"), debug: log("debug"), trace: log("trace"), dir: log("dir"), group() {}, groupEnd() {}, table: log("table"), time() {}, timeEnd() {}, count() {}, assert() {} };
+    // Console §clear permits no visible action when there is no clearable console.
+    // This append-only diagnostic sink has no presentation/group stack to clear;
+    // retain diagnostics already captured by the host. https://console.spec.whatwg.org/#clear
+    g.console = { log: log("log"), info: log("info"), warn: log("warn"), error: log("error"), debug: log("debug"), trace: log("trace"), dir: log("dir"), clear() {}, group() {}, groupEnd() {}, table: log("table"), time() {}, timeEnd() {}, count() {}, assert() {} };
 
     // --- small web APIs ---
     const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -10342,374 +10577,7 @@
             try { g.document.timeline = { currentTime: 0 }; } catch (e) {}
         }
     }
-    // --- Intl: an en-only prelude shim. Measured 2026-06-12: Boa's
-    // bundled ICU costs +11MB and its DateTimeFormat/DisplayNames are
-    // broken anyway. Honest-enough English output for a terminal;
-    // resolvedOptions/supportedLocalesOf exist so feature-detection
-    // passes and pages stop taking polyfill/error paths.
-    {
-        // ECMA-402 §DefaultLocale recommends matching navigator.language in a
-        // browser environment. This is the one default every Intl constructor
-        // below reports when no explicit supported locale was requested.
-        const defaultLocale = (g.navigator && g.navigator.language) || cfg.language || "en-US";
-        const localeList = (l) => (l === undefined ? [] : Array.isArray(l) ? Array.from(l) : [l]).map(String);
-        const supEn = (l) => localeList(l).filter((s) => /^en($|-)/i.test(s));
-        const grouped = (s) => {
-            const i = s.indexOf(".");
-            const head = i < 0 ? s : s.slice(0, i), tail = i < 0 ? "" : s.slice(i);
-            return head.replace(/\B(?=(\d{3})+$)/g, ",") + tail;
-        };
-        const CURRENCY = { USD: "$", EUR: "€", GBP: "£", JPY: "¥" };
-        class NumberFormat {
-            constructor(locales, options) { this.__o = options || {}; }
-            format(n) {
-                const o = this.__o;
-                n = Number(n);
-                if (!isFinite(n)) return isNaN(n) ? "NaN" : n > 0 ? "∞" : "-∞";
-                const neg = n < 0 || (n === 0 && 1 / n < 0);
-                let v = Math.abs(n);
-                if (o.style === "percent") v *= 100;
-                let min = o.minimumFractionDigits, max = o.maximumFractionDigits;
-                if (min === undefined) min = o.style === "currency" ? 2 : 0;
-                if (max === undefined) max = Math.max(min, o.style === "currency" ? 2 : o.style === "percent" ? 0 : 3);
-                let s = v.toFixed(Math.min(20, max));
-                const dot = s.indexOf(".");
-                if (max > min && dot >= 0) {
-                    const h = s.slice(0, dot);
-                    let f = s.slice(dot + 1).replace(/0+$/, "");
-                    while (f.length < min) f += "0";
-                    s = f ? h + "." + f : h;
-                }
-                if (o.useGrouping !== false) s = grouped(s);
-                if (o.style === "currency") {
-                    const c = String(o.currency || "USD").toUpperCase();
-                    s = (CURRENCY[c] || c + " ") + s;
-                }
-                if (o.style === "percent") s += "%";
-                return neg ? "-" + s : s;
-            }
-            formatToParts(n) { return [{ type: "literal", value: this.format(n) }]; }
-            resolvedOptions() {
-                const o = this.__o;
-                return Object.assign({ locale: defaultLocale, numberingSystem: "latn", notation: "standard", style: "decimal", useGrouping: o.useGrouping === false ? false : "auto", minimumIntegerDigits: 1 }, o);
-            }
-            static supportedLocalesOf(l) { return supEn(l); }
-        }
-        const p2 = (x) => String(x).padStart(2, "0");
-        class DateTimeFormat {
-            constructor(locales, options) { this.__o = options || {}; }
-            format(d) {
-                d = d === undefined ? new Date() : new Date(d);
-                if (isNaN(d.getTime())) return "Invalid Date";
-                const o = this.__o;
-                const wantsDate = !!(o.year || o.month || o.day || o.weekday || o.dateStyle);
-                const wantsTime = !!(o.hour || o.minute || o.second || o.timeStyle);
-                const date = d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate());
-                const secs = o.second || o.timeStyle ? ":" + p2(d.getSeconds()) : "";
-                const time = p2(d.getHours()) + ":" + p2(d.getMinutes()) + secs;
-                if (wantsTime && !wantsDate) return time;
-                if (wantsDate && wantsTime) return date + ", " + time;
-                return date;
-            }
-            formatToParts(d) { return [{ type: "literal", value: this.format(d) }]; }
-            resolvedOptions() { return Object.assign({ locale: defaultLocale, calendar: "gregory", numberingSystem: "latn", timeZone: "UTC" }, this.__o); }
-            static supportedLocalesOf(l) { return supEn(l); }
-        }
-        class Collator {
-            constructor(locales, options) {
-                // `var`, NOT const: Boa 0.21 panics (define opcode, OOB
-                // binding slot) when a closure capturing a block-scoped
-                // constructor local is invoked from a native callback —
-                // and `compare` exists to be handed to Array#sort.
-                var o = this.__o = options || {};
-                var fold = o.sensitivity === "base" || o.sensitivity === "accent"
-                    ? (s) => String(s).toLowerCase() : (s) => String(s);
-                this.compare = (a, b) => {
-                    a = fold(a); b = fold(b);
-                    var na = o.numeric ? parseFloat(a) : NaN;
-                    var nb = o.numeric ? parseFloat(b) : NaN;
-                    if (!isNaN(na) && !isNaN(nb) && na !== nb) return na < nb ? -1 : 1;
-                    return a < b ? -1 : a > b ? 1 : 0;
-                };
-            }
-            resolvedOptions() { return Object.assign({ locale: defaultLocale, usage: "sort", sensitivity: "variant", numeric: false }, this.__o); }
-            static supportedLocalesOf(l) { return supEn(l); }
-        }
-        class DisplayNames {
-            constructor(locales, options) { this.__o = options || {}; }
-            of(code) { return String(code); }
-            resolvedOptions() { return Object.assign({ locale: defaultLocale, style: "long", fallback: "code" }, this.__o); }
-            static supportedLocalesOf(l) { return supEn(l); }
-        }
-        class PluralRules {
-            constructor(locales, options) { this.__o = options || {}; }
-            select(n) { return Number(n) === 1 ? "one" : "other"; }
-            resolvedOptions() { return Object.assign({ locale: defaultLocale, type: "cardinal", pluralCategories: ["one", "other"] }, this.__o); }
-            static supportedLocalesOf(l) { return supEn(l); }
-        }
-        class RelativeTimeFormat {
-            constructor(locales, options) { this.__o = options || {}; }
-            format(v, unit) {
-                v = Number(v);
-                unit = String(unit).replace(/s$/, "");
-                const n = Math.abs(v), u = n === 1 ? unit : unit + "s";
-                return v < 0 ? n + " " + u + " ago" : "in " + n + " " + u;
-            }
-            formatToParts(v, unit) { return [{ type: "literal", value: this.format(v, unit) }]; }
-            resolvedOptions() { return Object.assign({ locale: defaultLocale, numeric: "always", style: "long" }, this.__o); }
-            static supportedLocalesOf(l) { return supEn(l); }
-        }
-        // Intl.Locale (ECMA-402): parse a Unicode BCP-47 locale identifier
-        // into its subtags + -u- keywords, with maximize()/minimize() over a
-        // COMPACT likely-subtags map. A full CLDR likelySubtags table is the
-        // +11MB ICU we deliberately rejected; this covers the world's common
-        // languages honestly and defaults unknowns to a Latn script (same
-        // en-only ethos as the rest of this shim). @formatjs/intl-localematcher
-        // (Mastodon's i18n boot; the "best fit" matcher) does
-        // `new Intl.Locale(tag).maximize()` then reads .language/.script/
-        // .region/.toString() — without Intl.Locale the whole SPA fails to
-        // mount ("TypeError: not a constructor"), a blank screen.
-        const LIKELY = {
-            en: ["Latn", "US"], es: ["Latn", "ES"], fr: ["Latn", "FR"], de: ["Latn", "DE"],
-            it: ["Latn", "IT"], pt: ["Latn", "BR"], nl: ["Latn", "NL"], sv: ["Latn", "SE"],
-            da: ["Latn", "DK"], nb: ["Latn", "NO"], nn: ["Latn", "NO"], no: ["Latn", "NO"],
-            fi: ["Latn", "FI"], is: ["Latn", "IS"], pl: ["Latn", "PL"], cs: ["Latn", "CZ"],
-            sk: ["Latn", "SK"], sl: ["Latn", "SI"], hu: ["Latn", "HU"], ro: ["Latn", "RO"],
-            hr: ["Latn", "HR"], et: ["Latn", "EE"], lv: ["Latn", "LV"], lt: ["Latn", "LT"],
-            tr: ["Latn", "TR"], id: ["Latn", "ID"], ms: ["Latn", "MY"], vi: ["Latn", "VN"],
-            tl: ["Latn", "PH"], sw: ["Latn", "TZ"], af: ["Latn", "ZA"], ca: ["Latn", "ES"],
-            eu: ["Latn", "ES"], gl: ["Latn", "ES"], cy: ["Latn", "GB"], ga: ["Latn", "IE"],
-            ru: ["Cyrl", "RU"], uk: ["Cyrl", "UA"], be: ["Cyrl", "BY"], bg: ["Cyrl", "BG"],
-            sr: ["Cyrl", "RS"], mk: ["Cyrl", "MK"], kk: ["Cyrl", "KZ"], el: ["Grek", "GR"],
-            hy: ["Armn", "AM"], ka: ["Geor", "GE"], he: ["Hebr", "IL"], yi: ["Hebr", "UA"],
-            ar: ["Arab", "EG"], fa: ["Arab", "IR"], ur: ["Arab", "PK"], ps: ["Arab", "AF"],
-            hi: ["Deva", "IN"], mr: ["Deva", "IN"], ne: ["Deva", "NP"], bn: ["Beng", "BD"],
-            pa: ["Guru", "IN"], gu: ["Gujr", "IN"], ta: ["Taml", "IN"], te: ["Telu", "IN"],
-            kn: ["Knda", "IN"], ml: ["Mlym", "IN"], si: ["Sinh", "LK"], th: ["Thai", "TH"],
-            lo: ["Laoo", "LA"], my: ["Mymr", "MM"], km: ["Khmr", "KH"], am: ["Ethi", "ET"],
-            ja: ["Jpan", "JP"], ko: ["Kore", "KR"], zh: ["Hans", "CN"], und: ["Latn", "US"],
-        };
-        const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
-        class Locale {
-            constructor(tag, options) {
-                if (tag && typeof tag === "object" && tag.__isLocale) tag = tag.toString();
-                tag = String(tag == null ? "" : tag).replace(/_/g, "-").trim();
-                var o = options || {};
-                var parts = tag.length ? tag.split("-") : [];
-                var i = 0, len = parts.length;
-                var language = "", script = "", region = "", variants = [], kw = {};
-                if (i < len && /^([a-z]{2,3}|[a-z]{5,8})$/i.test(parts[i])) language = parts[i++].toLowerCase();
-                if (i < len && /^[a-z]{4}$/i.test(parts[i])) { script = titleCase(parts[i]); i++; }
-                if (i < len && /^([a-z]{2}|[0-9]{3})$/i.test(parts[i])) region = parts[i++].toUpperCase();
-                while (i < len && /^([a-z0-9]{5,8}|[0-9][a-z0-9]{3})$/i.test(parts[i])) variants.push(parts[i++].toLowerCase());
-                // Extensions: only the -u- (Unicode) extension is interpreted;
-                // any other singleton's subtags are consumed and dropped.
-                while (i < len) {
-                    var sing = parts[i++];
-                    if (!sing || sing.length !== 1) continue;
-                    if (sing.toLowerCase() === "u") {
-                        var key = "";
-                        while (i < len && parts[i].length > 1) {
-                            var pv = parts[i++].toLowerCase();
-                            if (pv.length === 2) { key = pv; if (!(key in kw)) kw[key] = ""; }
-                            else if (key) kw[key] = kw[key] ? kw[key] + "-" + pv : pv;
-                        }
-                    } else {
-                        while (i < len && parts[i].length > 1) i++;
-                    }
-                }
-                // options override subtags + add -u- keywords (ECMA-402
-                // ApplyOptionsToTag / ApplyUnicodeExtensionToTag).
-                if (o.language != null && /^[a-z]{2,3}$/i.test(String(o.language))) language = String(o.language).toLowerCase();
-                if (o.script != null && /^[a-z]{4}$/i.test(String(o.script))) script = titleCase(String(o.script));
-                if (o.region != null && /^([a-z]{2}|[0-9]{3})$/i.test(String(o.region))) region = String(o.region).toUpperCase();
-                var okw = { calendar: "ca", collation: "co", hourCycle: "hc", caseFirst: "kf", numberingSystem: "nu" };
-                for (var ke in okw) if (o[ke] != null) kw[okw[ke]] = String(o[ke]).toLowerCase();
-                if (o.numeric != null) kw.kn = o.numeric ? "true" : "false";
-                this.__isLocale = true;
-                this.__lang = language || "und";
-                this.__script = script;
-                this.__region = region;
-                this.__variants = variants;
-                this.__kw = kw;
-            }
-            get language() { return this.__lang; }
-            get script() { return this.__script; }
-            get region() { return this.__region; }
-            get calendar() { return this.__kw.ca; }
-            get collation() { return this.__kw.co; }
-            get hourCycle() { return this.__kw.hc; }
-            get caseFirst() { return this.__kw.kf; }
-            get numberingSystem() { return this.__kw.nu; }
-            get numeric() { return "kn" in this.__kw && this.__kw.kn !== "false"; }
-            get baseName() {
-                var b = [this.__lang];
-                if (this.__script) b.push(this.__script);
-                if (this.__region) b.push(this.__region);
-                for (var k = 0; k < this.__variants.length; k++) b.push(this.__variants[k]);
-                return b.join("-");
-            }
-            __ext() {
-                var keys = Object.keys(this.__kw).sort();
-                if (!keys.length) return "";
-                var s = "-u";
-                for (var k = 0; k < keys.length; k++) { s += "-" + keys[k]; if (this.__kw[keys[k]]) s += "-" + this.__kw[keys[k]]; }
-                return s;
-            }
-            toString() { return this.baseName + this.__ext(); }
-            __build(lang, scr, reg) {
-                var b = [lang];
-                if (scr) b.push(scr);
-                if (reg) b.push(reg);
-                for (var k = 0; k < this.__variants.length; k++) b.push(this.__variants[k]);
-                return new Locale(b.join("-") + this.__ext());
-            }
-            maximize() {
-                var lang = this.__lang, scr = this.__script, reg = this.__region;
-                var like = LIKELY[lang];
-                if (like) { if (!scr) scr = like[0]; if (!reg) reg = like[1]; }
-                else if (!scr) scr = "Latn";
-                return this.__build(lang, scr, reg);
-            }
-            minimize() {
-                var m = this.maximize(), lang = m.__lang, scr = m.__script, reg = m.__region, t;
-                t = new Locale(lang).maximize();
-                if (t.__script === scr && t.__region === reg) return this.__build(lang, "", "");
-                if (reg) { t = new Locale(lang + "-" + reg).maximize(); if (t.__script === scr && t.__region === reg) return this.__build(lang, "", reg); }
-                if (scr) { t = new Locale(lang + "-" + scr).maximize(); if (t.__script === scr && t.__region === reg) return this.__build(lang, scr, ""); }
-                return this.__build(lang, scr, reg);
-            }
-        }
-        // Intl.NumberFormat/DateTimeFormat/Collator are specced callable
-        // WITHOUT `new` (legacy web-compat — they construct an instance
-        // either way); only the newer ctors require `new`. ES classes throw
-        // when called as functions, so wrap the three legacy ones in a
-        // function that forwards to `new`, preserving prototype/instanceof
-        // and the static supportedLocalesOf. Humble Bundle does
-        // `Intl.NumberFormat(locale, opts).format(amount)` (no `new`).
-        const callable = (Cls) => {
-            const F = function (locales, options) { return new Cls(locales, options); };
-            F.prototype = Cls.prototype;
-            F.prototype.constructor = F;
-            F.supportedLocalesOf = Cls.supportedLocalesOf;
-            return F;
-        };
-        // Intl.Segmenter (ECMA-402 §Segmenter) — text segmentation by grapheme/
-        // word/sentence. Like the rest of this shim it's en/approximate (NOT the
-        // full ICU/UAX-29 machinery): grapheme clusters cover combining marks,
-        // variation selectors, emoji skin-tone modifiers, ZWJ sequences and
-        // regional-indicator (flag) pairs; word/sentence use Unicode-aware regex
-        // over `\p{L}`/`\p{N}` and terminator scanning. chatgpt (and many apps)
-        // do `new Intl.Segmenter(...)` for text metrics; without it that threw
-        // "not a constructor". `index` is the UTF-16 code-unit offset (spec).
-        const SEG_MARK = /\p{M}/u;
-        const segGraphemes = (str) => {
-            const res = [];
-            const n = str.length;
-            let i = 0;
-            while (i < n) {
-                const start = i;
-                let cp = str.codePointAt(i);
-                i += cp > 0xffff ? 2 : 1;
-                // Regional-indicator pair (a flag is exactly two RIs).
-                if (cp >= 0x1f1e6 && cp <= 0x1f1ff && i < n) {
-                    const ncp = str.codePointAt(i);
-                    if (ncp >= 0x1f1e6 && ncp <= 0x1f1ff) i += 2;
-                }
-                for (;;) {
-                    if (i >= n) break;
-                    const ncp = str.codePointAt(i);
-                    const nlen = ncp > 0xffff ? 2 : 1;
-                    if ((ncp >= 0x1f3fb && ncp <= 0x1f3ff) || ncp === 0xfe0e || ncp === 0xfe0f || SEG_MARK.test(String.fromCodePoint(ncp))) {
-                        i += nlen; continue;
-                    }
-                    if (ncp === 0x200d) { // ZWJ joins the following scalar into this cluster
-                        i += 1;
-                        if (i < n) { const jcp = str.codePointAt(i); i += jcp > 0xffff ? 2 : 1; }
-                        continue;
-                    }
-                    break;
-                }
-                res.push({ segment: str.slice(start, i), index: start });
-            }
-            return res;
-        };
-        const segWords = (str) => {
-            const res = [];
-            const re = /[\p{L}\p{N}_]+(?:['’.·’][\p{L}\p{N}_]+)*|\s+|[\s\S]/gu;
-            let m;
-            while ((m = re.exec(str)) !== null) {
-                res.push({ segment: m[0], index: m.index, isWordLike: /[\p{L}\p{N}]/u.test(m[0]) });
-                if (re.lastIndex === m.index) re.lastIndex++;
-            }
-            return res;
-        };
-        const segSentences = (str) => {
-            const res = [];
-            const n = str.length;
-            let i = 0, start = 0;
-            const term = /[.!?。！？]/;
-            const close = /[)\]'"”’»]/;
-            const ws = /\s/;
-            while (i < n) {
-                if (term.test(str[i])) {
-                    i++;
-                    while (i < n && term.test(str[i])) i++;
-                    while (i < n && close.test(str[i])) i++;
-                    while (i < n && ws.test(str[i])) i++;
-                    res.push({ segment: str.slice(start, i), index: start });
-                    start = i;
-                } else i++;
-            }
-            if (start < n) res.push({ segment: str.slice(start, n), index: start });
-            return res;
-        };
-        class Segments {
-            constructor(input, gran) {
-                this.__input = input;
-                this.__segs = gran === "word" ? segWords(input) : gran === "sentence" ? segSentences(input) : segGraphemes(input);
-                for (let k = 0; k < this.__segs.length; k++) this.__segs[k].input = input;
-            }
-            [Symbol.iterator]() {
-                const segs = this.__segs;
-                let i = 0;
-                return { next() { return i < segs.length ? { done: false, value: segs[i++] } : { done: true, value: undefined }; } };
-            }
-            containing(index) {
-                index = index === undefined ? 0 : Math.trunc(Number(index)) || 0;
-                for (let k = 0; k < this.__segs.length; k++) {
-                    const s = this.__segs[k];
-                    if (index >= s.index && index < s.index + s.segment.length) return s;
-                }
-                return undefined;
-            }
-        }
-        class Segmenter {
-            constructor(locales, options) {
-                const gran = (options && options.granularity !== undefined) ? String(options.granularity) : "grapheme";
-                if (gran !== "grapheme" && gran !== "word" && gran !== "sentence")
-                    throw new RangeError("Value " + gran + " out of range for Intl.Segmenter options property granularity");
-                this.__gran = gran;
-                const loc = Array.isArray(locales) ? locales[0] : locales;
-                this.__locale = loc ? String(loc) : defaultLocale;
-            }
-            resolvedOptions() { return { locale: this.__locale, granularity: this.__gran }; }
-            segment(input) { return new Segments(String(input), this.__gran); }
-            get [Symbol.toStringTag]() { return "Intl.Segmenter"; }
-        }
-        Segmenter.supportedLocalesOf = (locales) => localeList(locales);
-        g.Intl = {
-            NumberFormat: callable(NumberFormat),
-            DateTimeFormat: callable(DateTimeFormat),
-            Collator: callable(Collator),
-            DisplayNames, PluralRules, RelativeTimeFormat, Locale, Segmenter,
-            getCanonicalLocales: localeList,
-        };
-        Number.prototype.toLocaleString = function (locales, options) { return new NumberFormat(locales, options).format(this); };
-        Date.prototype.toLocaleDateString = function () { return new DateTimeFormat(0, { year: "numeric", month: "numeric", day: "numeric" }).format(this); };
-        Date.prototype.toLocaleTimeString = function () { return new DateTimeFormat(0, { hour: "numeric", minute: "numeric", second: "numeric" }).format(this); };
-        Date.prototype.toLocaleString = function () { return new DateTimeFormat(0, { year: "numeric", hour: "numeric", second: "numeric" }).format(this); };
-    }
+    // ECMA-402: Intl and Number/Date locale methods are provided by Lumen.
     const dec = (s) => { try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch { return String(s); } };
     // The application/x-www-form-urlencoded byte serializer (URL Standard §"urlencoded
     // serializing"): 0x20→"+", keep only `* - . _ 0-9 A-Z a-z`, percent-encode
@@ -10783,8 +10651,7 @@
     // of TRust's web storage. `createObjectURL` mints a spec-shaped URL + stores
     // the object; `revokeObjectURL` drops it; `fetch`/XHR below resolve a `blob:`
     // URL straight from the store WITHOUT touching the network syscall (a blob URL
-    // never hits the wire). A null-proto object (not a Boa Map) keeps it off the
-    // GC-iterator trap and it is only ever keyed by string.
+    // never hits the wire). The null-prototype store is only ever keyed by string.
     const __blobURLStore = Object.create(null);
     // A latin1 byte string of a Blob's underlying bytes: string parts UTF-8
     // encoded, BufferSource parts raw, nested Blobs recursed. More faithful than
@@ -11244,11 +11111,30 @@
             // with own properties; cloning/fetch must still copy these slots.
             this.__url = fromReq ? input.__url
                 : resolveURL(String((input && input.url !== undefined) ? input.url : input));
-            this.__method = String(init.method || (fromReq ? input.__method : null) || "GET").toUpperCase();
+            const method = String(init.method !== undefined
+                ? init.method
+                : (fromReq ? input.__method : "GET"));
+            const upperMethod = method.toUpperCase();
+            // Fetch §2.2.1 normalizes only the six standard methods listed by
+            // the byte-case-insensitive match. Extension tokens (for example
+            // `m-search`) retain their exact casing and punctuation.
+            this.__method = ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"].includes(upperMethod)
+                ? upperMethod
+                : method;
             this.__headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.__headers : undefined));
             this.__body = init.body !== undefined ? init.body : (fromReq ? input.__body : null);
-            this.__credentials = init.credentials || (fromReq ? input.__credentials : "same-origin");
-            this.__mode = init.mode || (fromReq ? input.__mode : "cors");
+            const credentials = init.credentials !== undefined
+                ? String(init.credentials)
+                : (fromReq ? input.__credentials : "same-origin");
+            if (credentials !== "omit" && credentials !== "same-origin" && credentials !== "include")
+                throw new TypeError("Invalid credentials mode");
+            const mode = init.mode !== undefined
+                ? String(init.mode)
+                : (fromReq ? input.__mode : "cors");
+            if (mode !== "cors" && mode !== "no-cors" && mode !== "same-origin")
+                throw new TypeError("Invalid request mode");
+            this.__credentials = credentials;
+            this.__mode = mode;
             this.__cache = init.cache || (fromReq ? input.__cache : "default");
             this.__redirect = init.redirect || (fromReq ? input.__redirect : "follow");
             this.__referrer = init.referrer !== undefined ? init.referrer : (fromReq ? input.__referrer : "about:client");
@@ -13022,7 +12908,7 @@
     // simply never receives, exactly as a single tab would. SvelteKit opens
     // one at boot for session sync; a missing global was a ReferenceError
     // that aborted the whole app mount. `BC` maps name→array of live
-    // channels (an array, never iterated as a Boa Map — see the MO trap).
+    // channels in creation order.
     const BC = new Map();
     class BroadcastChannel extends EventTarget {
         constructor(name) {
@@ -13208,7 +13094,112 @@
     // in the page realm and a worker realm.)
     /*__SC_CODEC_BEGIN__*/
     (function (G) {
-        var TYPED = { Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1, Int16Array: 1, Uint16Array: 1, Int32Array: 1, Uint32Array: 1, Float32Array: 1, Float64Array: 1, BigInt64Array: 1, BigUint64Array: 1 };
+        // HTML ImageData / Web IDL buffer sources, overload resolution and dictionary conversion.
+        // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagedata
+        // The shared codec block installs the same interface in Window and Worker realms.
+        const apply = Reflect.apply;
+        const descriptor = Object.getOwnPropertyDescriptor;
+        const typedProto = Object.getPrototypeOf(Uint8ClampedArray.prototype);
+        const typedName = descriptor(typedProto, Symbol.toStringTag).get;
+        const typedBuffer = descriptor(typedProto, "buffer").get;
+        const typedBytes = descriptor(typedProto, "byteLength").get;
+        const typedOffset = descriptor(typedProto, "byteOffset").get;
+        const typedLength = descriptor(typedProto, "length").get;
+        const bufferBytes = descriptor(ArrayBuffer.prototype, "byteLength").get;
+        const bufferResizable = descriptor(ArrayBuffer.prototype, "resizable").get;
+        const bufferMaxBytes = descriptor(ArrayBuffer.prototype, "maxByteLength").get;
+        const RawBytes = Uint8Array, RawBuffer = ArrayBuffer;
+        const bytesToBase64 = RawBytes.prototype.toBase64, bytesFromBase64 = RawBytes.fromBase64;
+        const bytesSet = RawBytes.prototype.set;
+        const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+        const imageSlots = typeof G.__image_data_slots === "function"
+            ? G.__image_data_slots(new WeakMap()) : new WeakMap();
+        delete G.__image_data_slots;
+        const BytePixels = Uint8ClampedArray, HalfPixels = Float16Array;
+        const PlatformException = G.DOMException || Error;
+        const imageState = value => apply(weakGet, imageSlots, [value]);
+        function imageGet(value, key) {
+            const state = imageState(value);
+            if (!state) throw new TypeError("Illegal ImageData invocation");
+            return state[key];
+        }
+        function imageSettings(value) {
+            if (value != null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeError("ImageData settings must be a dictionary");
+            let colorSpace = "srgb", pixelFormat = "rgba-unorm8";
+            if (value != null) {
+                // IDL dictionary members are converted in lexicographic order, once each.
+                const color = value.colorSpace;
+                if (color !== undefined) {
+                    colorSpace = `${color}`;
+                    if (colorSpace !== "srgb" && colorSpace !== "srgb-linear"
+                        && colorSpace !== "display-p3" && colorSpace !== "display-p3-linear")
+                        throw new TypeError("Invalid ImageData colorSpace");
+                }
+                const format = value.pixelFormat;
+                if (format !== undefined) {
+                    pixelFormat = `${format}`;
+                    if (pixelFormat !== "rgba-unorm8" && pixelFormat !== "rgba-float16")
+                        throw new TypeError("Invalid ImageData pixelFormat");
+                }
+            }
+            return { colorSpace, pixelFormat };
+        }
+        class ImageData {
+            constructor(dataOrWidth, widthOrHeight, heightOrSettings = undefined, settings = undefined) {
+                if (arguments.length < 2) throw new TypeError("ImageData requires two arguments");
+                const name = apply(typedName, dataOrWidth, []);
+                // Four supplied arguments select only the data overload. With 2/3 arguments,
+                // only the two declared typed-array brands select it; numeric conversion is last.
+                const withData = arguments.length >= 4 || name === "Uint8ClampedArray" || name === "Float16Array";
+                let width, height, data, options;
+                if (withData) {
+                    if (name !== "Uint8ClampedArray" && name !== "Float16Array")
+                        throw new TypeError("ImageData requires a pixel typed array");
+                    const buffer = apply(typedBuffer, dataOrWidth, []);
+                    // These intrinsic getters reject SharedArrayBuffer and ignore author expandos.
+                    apply(bufferBytes, buffer, []);
+                    if (apply(bufferResizable, buffer, []))
+                        throw new TypeError("ImageData does not accept resizable buffers");
+                    width = widthOrHeight >>> 0;
+                    const suppliedHeight = heightOrSettings === undefined ? undefined : heightOrSettings >>> 0;
+                    options = imageSettings(settings);
+                    const bytes = apply(typedBytes, dataOrWidth, []);
+                    const bytesPerPixel = options.pixelFormat === "rgba-unorm8" ? 4 : 8;
+                    if (!bytes || bytes % bytesPerPixel)
+                        throw new PlatformException("Invalid pixel data length", "InvalidStateError");
+                    const pixels = bytes / bytesPerPixel;
+                    if (!width || pixels % width)
+                        throw new PlatformException("Invalid ImageData width", "IndexSizeError");
+                    height = pixels / width;
+                    if (suppliedHeight !== undefined && suppliedHeight !== height)
+                        throw new PlatformException("Invalid ImageData height", "IndexSizeError");
+                    if ((options.pixelFormat === "rgba-unorm8") !== (name === "Uint8ClampedArray"))
+                        throw new PlatformException("Pixel format and array type disagree", "InvalidStateError");
+                    data = dataOrWidth; // Required identity: do not copy a supplied typed array.
+                } else {
+                    width = dataOrWidth >>> 0;
+                    height = widthOrHeight >>> 0;
+                    options = imageSettings(heightOrSettings);
+                    if (!width || !height)
+                        throw new PlatformException("ImageData dimensions must be nonzero", "IndexSizeError");
+                    data = options.pixelFormat === "rgba-unorm8"
+                        ? new BytePixels(width * height * 4) : new HalfPixels(width * height * 4);
+                }
+                apply(weakSet, imageSlots, [this, { width, height, data,
+                    colorSpace: options.colorSpace, pixelFormat: options.pixelFormat }]);
+            }
+            get width() { return imageGet(this, "width"); }
+            get height() { return imageGet(this, "height"); }
+            get data() { return imageGet(this, "data"); }
+            get colorSpace() { return imageGet(this, "colorSpace"); }
+            get pixelFormat() { return imageGet(this, "pixelFormat"); }
+        }
+        for (const key of ["width", "height", "data", "colorSpace", "pixelFormat"])
+            Object.defineProperty(ImageData.prototype, key, { ...descriptor(ImageData.prototype, key), enumerable: true });
+        Object.defineProperty(ImageData.prototype, Symbol.toStringTag, { value: "ImageData", configurable: true });
+        Object.defineProperty(G, "ImageData", { value: ImageData, writable: true, configurable: true });
+        var TYPED = { Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1, Int16Array: 1, Uint16Array: 1, Int32Array: 1, Uint32Array: 1, Float16Array: 1, Float32Array: 1, Float64Array: 1, BigInt64Array: 1, BigUint64Array: 1 };
         function dce(what) {
             try { return new (G.DOMException || Error)(what + " could not be cloned.", "DataCloneError"); }
             catch (e) { var er = new Error(what + " could not be cloned."); er.name = "DataCloneError"; return er; }
@@ -13259,6 +13250,8 @@
             return ["r", idx];
         }
         function encObj(v, heap, seen) {
+            const image = imageState(v);
+            if (image) return ["ID", enc(image.data, heap, seen), image.width, image.height, image.colorSpace, image.pixelFormat];
             if (G.Node && v instanceof G.Node) throw dce("A DOM node");
             if (v instanceof Date) return ["D", v.getTime()];
             if (v instanceof RegExp) return ["R", v.source, v.flags];
@@ -13270,10 +13263,26 @@
                 var s = []; v.forEach(function (val) { s.push(enc(val, heap, seen)); });
                 return ["S", s];
             }
-            if (v instanceof ArrayBuffer) return ["AB", Array.prototype.slice.call(new Uint8Array(v))];
-            var cn = v.constructor && v.constructor.name;
+            // ArrayBuffer branding is realm-independent, including an ImageData view
+            // obtained from a same-origin frame. Do not consult constructor expandos.
+            let isBuffer = false;
+            try { apply(bufferBytes, v, []); isBuffer = true; } catch (_) {}
+            if (isBuffer) {
+                let bytes;
+                try { bytes = new RawBytes(v); } catch (_) { throw dce("A detached ArrayBuffer"); }
+                // Keep binary data binary through the native codec: a 4 MB image
+                // must not become four million boxed Numbers / iterator results.
+                return ["AB64", apply(bytesToBase64, bytes, []),
+                    apply(bufferResizable, v, []) ? apply(bufferMaxBytes, v, []) : null];
+            }
+            var cn = apply(typedName, v, []) || (v.constructor && v.constructor.name);
             if (cn === "DataView" && v.buffer instanceof ArrayBuffer) return ["DV", enc(v.buffer, heap, seen), v.byteOffset, v.byteLength];
-            if (cn && TYPED[cn] && v.buffer instanceof ArrayBuffer) return ["TA", cn, enc(v.buffer, heap, seen), v.byteOffset, v.length];
+            if (cn && TYPED[cn] && apply(typedName, v, [])) {
+                const buffer = apply(typedBuffer, v, []);
+                // A detached view cannot be serialized; a zero-length attached view can.
+                try { new Uint8Array(buffer, 0, 0); } catch (_) { throw dce("A detached typed array"); }
+                return ["TA", cn, enc(buffer, heap, seen), apply(typedOffset, v, []), apply(typedLength, v, [])];
+            }
             if (G.File && v instanceof G.File) return ["F", blobBytes(v), v.type || "", v.name || "", v.lastModified || 0];
             if (G.Blob && v instanceof G.Blob) return ["B", blobBytes(v), v.type || ""];
             if (v instanceof Error) return ["E", v.name || "Error", v.message || "", v.stack || "", (G.DOMException && v instanceof G.DOMException) ? 1 : 0];
@@ -13299,6 +13308,13 @@
                 case "M": return new Map();
                 case "S": return new Set();
                 case "AB": return new Uint8Array(node[1]).buffer;
+                case "AB64": {
+                    const bytes = apply(bytesFromBase64, RawBytes, [node[1]]);
+                    if (node[2] === null) return apply(typedBuffer, bytes, []);
+                    const buffer = new RawBuffer(apply(typedBytes, bytes, []), { maxByteLength: node[2] });
+                    apply(bytesSet, new RawBytes(buffer), [bytes]);
+                    return buffer;
+                }
                 case "F": return G.File ? new G.File([blobPart(node[1])], node[3], { type: node[2], lastModified: node[4] }) : new G.Blob([blobPart(node[1])], { type: node[2] });
                 case "B": return G.Blob ? new G.Blob([blobPart(node[1])], { type: node[2] }) : { __blobText: node[1], type: node[2] };
                 case "E": {
@@ -13340,6 +13356,11 @@
                 if (n[0] === "TA") built[i] = new G[n[1]](decRef(n[2], built), n[3], n[4]);
                 else if (n[0] === "DV") built[i] = new DataView(decRef(n[1], built), n[2], n[3]);
             }
+            // ImageData's typed-array referent now exists, including shared graph identity.
+            for (i = 0; i < heap.length; i++) {
+                const n = heap[i];
+                if (n[0] === "ID") built[i] = new ImageData(decRef(n[1], built), n[2], n[3], { colorSpace: n[4], pixelFormat: n[5] });
+            }
             // Pass 3: fill containers (all referents now exist → cycles close).
             for (i = 0; i < heap.length; i++) {
                 var node = heap[i], obj = built[i], j;
@@ -13352,6 +13373,12 @@
         };
     })(typeof globalThis !== "undefined" ? globalThis : this);
     /*__SC_CODEC_END__*/
+    messageSerialize = g.__sc_serialize;
+    messageDeserialize = g.__sc_deserialize;
+    canvasImageConstructor = g.ImageData;
+    canvasImageGetters = {};
+    for (const key of ["width","height","data","colorSpace","pixelFormat"])
+        canvasImageGetters[key] = Object.getOwnPropertyDescriptor(canvasImageConstructor.prototype,key).get;
 
     // The page side of Web Workers. `new Worker(url)` spawns a real second engine
     // on its own thread (`__worker_spawn`); messages cross as structured-clone
@@ -13521,16 +13548,32 @@
             const body = isFD ? enc.wire : __bodyWire(req.__body);
             const ctype = req.__headers.get("content-type")
                 || (isFD ? enc.type : __bodyType(req.__body));
-            return raceAbort(__http_fetch_async(url, req.__method, body, ctype, __hdrBlob(req.__headers.__h)).then(function (r) {
+            return raceAbort(__http_fetch_async(
+                url, req.__method, body, ctype, __hdrBlob(req.__headers.__h),
+                req.__mode, req.__credentials
+            ).then(function (r) {
                 if (!r) throw new TypeError("fetch failed or blocked: " + url);
                 const status = r[0], respCType = r[1], text = r[2];
+                if (status === 0) {
+                    const opaque = new Response(null, { status: 0, url: "" });
+                    opaque.type = "opaque";
+                    return opaque;
+                }
                 // All response headers (pages read out-of-band API results —
                 // Steam's `x-eresult`); older 3/4-element shapes degrade to
                 // content-type only.
                 const hdrs = __parseHdrBlob(r[4]);
                 if (respCType && hdrs["content-type"] === undefined) hdrs["content-type"] = respCType;
                 const resp = new Response(text, { status: status, statusText: "", headers: hdrs, url: url });
-                resp.type = "basic";
+                // Fetch's response tainting is observable: a successful
+                // cross-origin CORS fetch produces a `cors` response, while a
+                // same-origin fetch is `basic`. The Rust side has already
+                // performed the CORS check and header filtering.
+                let crossOrigin = false;
+                try {
+                    crossOrigin = new g.URL(url).origin !== ((g.location && g.location.origin) || "");
+                } catch (_) {}
+                resp.type = (req.__mode === "cors" && crossOrigin) ? "cors" : "basic";
                 resp.__bytes = r[3]; // native byte-exact body for arrayBuffer()
                 return resp;
             }));
@@ -13759,7 +13802,10 @@
             const ctype = this.__h["content-type"] || (isFD ? enc.type : __bodyType(body));
             const hdrs = __hdrBlob(this.__h);
             if (this.__sync) {
-                this.__finish(__http_fetch(this.__url, this.__method || "GET", b, ctype, hdrs));
+                this.__finish(__http_fetch(
+                    this.__url, this.__method || "GET", b, ctype, hdrs,
+                    "cors", this.withCredentials ? "include" : "same-origin"
+                ));
             } else {
                 // XHR §3.5.6 supplies processResponse/processEndOfBody to
                 // Fetch; response state and readystatechange/load/loadend are
@@ -13770,7 +13816,10 @@
                 // misclassified completion, let pages replace/cancel it, and
                 // starved consent mutations behind the throttled timer source.
                 const xhr = this;
-                __http_fetch_async(this.__url, this.__method || "GET", b, ctype, hdrs)
+                __http_fetch_async(
+                    this.__url, this.__method || "GET", b, ctype, hdrs,
+                    "cors", this.withCredentials ? "include" : "same-origin"
+                )
                     .then(function (r) {
                         __queue_network_task(function () { xhr.__finish(r); }, xhr.__frame);
                     });
@@ -13790,6 +13839,12 @@
 // markers below, exactly as it does the structured-clone codec.
 /*__WASM_BEGIN__*/
 (function (g) {
+    const apply = Reflect.apply;
+    const defineProperty = Object.defineProperty;
+    const iteratorSymbol = Symbol.iterator;
+    function isObject(value) {
+        return value !== null && (typeof value === "object" || typeof value === "function");
+    }
     // The three error types are real `Error` subclasses; `name` is fixed on the
     // prototype so `(new WebAssembly.CompileError("x")).toString()` is
     // "CompileError: x" and `instanceof Error` holds (js-api §Error types).
@@ -13885,13 +13940,17 @@
     // object (js-api), so reading the same export twice — and (Stage 6) a
     // funcref round-tripped through a Table/Global — yields the same function.
     const funcWrappers = new Map();
+    // These caches remain strong until the host can trace Wasm-to-JS reachability.
+    // Weakening just the JS entries loses live wrappers retained by tables/globals.
     function exportedFunction(funcId, arity) {
         let f = funcWrappers.get(funcId);
         if (f) return f;
-        f = function () {
-            return unwrap(__wasm_call_export(funcId, Array.prototype.slice.call(arguments)));
-        };
-        Object.defineProperty(f, "length", { value: Number.isFinite(arity) ? arity : 0 });
+        // JS API §5.6 Exported Functions have no [[Construct]] or prototype
+        // property. Rest arguments also avoid author-overridable slice/call.
+        f = (...args) => unwrap(__wasm_call_export(funcId, args));
+        Object.defineProperty(f, "length", {
+            value: Number.isFinite(arity) ? arity : 0, configurable: true
+        });
         Object.defineProperty(f, "__wasmFunc", { value: funcId });
         funcWrappers.set(funcId, f);
         return f;
@@ -13903,13 +13962,22 @@
 
     // The externref intern map: a wasm externref carries an integer id; the JS
     // value it wraps lives here (JS-land), so reading it back returns the SAME
-    // value (identity preserved, js-api). Entries persist for the page lifetime
-    // (wasm-GC of externrefs is unobservable) — RAM-only like other session
-    // state. id 0 is reserved so a missing/0 id reads back as undefined.
+    // value (identity preserved, js-api §5.6). Repeated conversions reuse an
+    // address; native Store data interns that address too. Distinct values are
+    // still conservatively retained until cross-heap tracing exists: this is
+    // deduplication, not a claim that page-lifetime retention is solved.
+    // Map uses SameValueZero, so -0 needs its own key to preserve its sign.
     const externRefs = [undefined];
+    const externRefIds = new Map([[undefined, 0]]);
+    const negativeZeroKey = {};
     g.__wasm_extern_intern = function (value) {
+        const key = value === 0 && 1 / value === -Infinity ? negativeZeroKey : value;
+        const previous = externRefIds.get(key);
+        if (previous !== undefined) return previous;
         externRefs.push(value);
-        return externRefs.length - 1;
+        const id = externRefs.length - 1;
+        externRefIds.set(key, id);
+        return id;
     };
     g.__wasm_extern_get = function (id) {
         return externRefs[id];
@@ -14096,7 +14164,34 @@
     const wasmImports = Object.create(null);
     g.__wasm_invoke_import = function (token, index, args) {
         const fns = wasmImports[token];
-        return fns[index].apply(undefined, args);
+        if (!fns) throw new TypeError("WebAssembly import token " + token + " is missing");
+        if (typeof fns[index] !== "function") {
+            throw new TypeError(
+                "WebAssembly import " + index + " is missing (binding count " + fns.length + ")"
+            );
+        }
+        // JS API §5.6 Call(func, undefined, args) never reads func.apply.
+        return apply(fns[index], undefined, args);
+    };
+
+    g.__wasm_import_results = function (returned) {
+        // JS API §5.6 and ECMA-262 IteratorToList: require an iterator, get
+        // next once, fully exhaust it before arity checking/value conversion,
+        // and do not call return on an abrupt IteratorStepValue completion.
+        const method = returned[iteratorSymbol];
+        if (typeof method !== "function") throw new TypeError("WebAssembly: multi-value result must be iterable");
+        const iterator = apply(method, returned, []);
+        if (!isObject(iterator)) throw new TypeError("WebAssembly: iterator must be an object");
+        const next = iterator.next;
+        const values = [];
+        while (true) {
+            const step = apply(next, iterator, []);
+            if (!isObject(step)) throw new TypeError("WebAssembly: iterator result must be an object");
+            if (step.done) return values;
+            defineProperty(values, values.length, {
+                value: step.value, writable: true, enumerable: true, configurable: true
+            });
+        }
     };
 
     // js-api "read the imports": for each module import, resolve
@@ -14172,7 +14267,9 @@
                     );
             }
         }
-        wasmImports[token] = funcs;
+        // No native callback can use this token when there are no JS function
+        // imports. Do not retain an empty array for every such instantiation.
+        if (funcs.length > 0) wasmImports[token] = funcs;
         return { token: token, descriptor: descriptor };
     }
 
@@ -14188,9 +14285,9 @@
                 throw new TypeError("WebAssembly.Instance: importObject must be an object");
             }
             const binding = readImports(module, importObject);
-            const id = unwrap(
-                __wasm_instantiate(module.__id, binding.token, binding.descriptor)
-            );
+            // A trapping start function may already have installed callable funcrefs in an
+            // imported table. Its imports must survive even when no Instance is returned.
+            const id = unwrap(__wasm_instantiate(module.__id, binding.token, binding.descriptor));
             Object.defineProperty(this, "__id", { value: id });
             Object.defineProperty(this, "exports", {
                 value: buildExports(id, module.__id),

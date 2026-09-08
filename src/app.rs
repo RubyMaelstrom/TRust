@@ -1464,10 +1464,16 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let title_row = self.last_content_area.y.saturating_sub(1);
             if mouse.row == title_row {
+                if self.finish_form_edit() {
+                    self.dispatch_page_focus(None);
+                }
                 self.open_command_with_address();
                 return;
             }
             if mouse.row == self.last_status_row {
+                if self.finish_form_edit() {
+                    self.dispatch_page_focus(None);
+                }
                 self.open_command();
                 return;
             }
@@ -1510,6 +1516,26 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => self.scroll_drag = None,
             _ => {}
         }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.mode == Mode::Search
+            && matches!(self.search_target, Some(Link::Form { .. }))
+            && self.mouse_in_content_area(mouse.column, mouse.row)
+        {
+            // Hit-test the frame the user actually clicked, before closing
+            // the prompt changes viewport height and may rewrap the page.
+            let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
+            let link = on_link.then(|| self.selected_link()).flatten();
+            if link == self.search_target {
+                return; // Clicking the same field must not discard its draft.
+            }
+            let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
+            self.finish_form_edit();
+            self.dispatch_page_focus(actor);
+            if let Some(link) = link {
+                self.browser_follow_link(link);
+            }
+            return;
+        }
         // 3 lines per wheel click, matching terminal convention.
         match (mouse.kind, self.browser.is_some()) {
             (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
@@ -1531,11 +1557,55 @@ impl App {
             }
             (MouseEventKind::Down(MouseButton::Left), true)
                 if self.mode == Mode::Session
-                    && self.browser_mouse_hover(mouse.column, mouse.row) =>
+                    && self.mouse_in_content_area(mouse.column, mouse.row) =>
             {
-                self.browser_follow();
+                let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
+                let link = on_link.then(|| self.selected_link()).flatten();
+                let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
+                self.dispatch_page_focus(actor);
+                if let Some(link) = link {
+                    self.browser_follow_link(link);
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Clicking away commits a form draft, not a Gopher/Gemini query or a
+    /// command. Never execute a navigation merely because its prompt blurred.
+    fn finish_form_edit(&mut self) -> bool {
+        if self.mode != Mode::Search || !matches!(self.search_target, Some(Link::Form { .. })) {
+            return false;
+        }
+        let value = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        self.select_anchor = None;
+        self.masked_input = false;
+        self.mode = Mode::Session;
+        self.run_search(&value);
+        true
+    }
+
+    fn page_focus_actor(&self, link: Option<&Link>, col: u16, row: u16) -> Option<usize> {
+        match link {
+            Some(Link::Form { form, field }) => {
+                self.browser
+                    .as_ref()?
+                    .doc
+                    .forms
+                    .get(*form)?
+                    .fields
+                    .get(*field)?
+                    .live_node
+            }
+            Some(Link::JsClick { node, .. }) => Some(*node),
+            _ => self.pointer_hit(col, row).hover,
+        }
+    }
+
+    fn dispatch_page_focus(&self, node: Option<usize>) {
+        if let Some(handle) = &self.live_page {
+            let _ = handle.try_send_user(crate::js::PageCmd::Focus(node));
         }
     }
 
@@ -2904,6 +2974,7 @@ impl App {
                 )),
                 headers: Vec::new(),
                 fetch_metadata: None,
+                fetch_policy: None,
             };
             if let Some(page) = &referrer {
                 http::set_referrer(&mut request, page);
@@ -6704,19 +6775,22 @@ impl App {
     }
 
     fn browser_follow(&mut self) {
+        if let Some(link) = self.selected_link() {
+            self.browser_follow_link(link);
+        }
+    }
+
+    fn browser_follow_link(&mut self, link: Link) {
         // Concrete YouTube player pages remain an explicit media integration.
         // Direct files must be fetched and classified from response metadata so
         // unsupported media receives the same Save / Open / Cancel choice as
         // every other top-level resource; extensions are not MIME metadata.
-        if let Some(url) = self.selected_web_url()
+        if let Some(url) = self.web_url_for_link(&link)
             && crate::media::youtube_video_url(&url).is_some()
         {
             self.launch_mpv(url);
             return;
         }
-        let Some(link) = self.selected_link() else {
-            return;
-        };
         match link {
             Link::Gopher(url) => match url.item_type {
                 '0' | '1' | 'I' | 'g' | 'p' => self.start_fetch(Link::Gopher(url)),
@@ -6826,9 +6900,12 @@ impl App {
     /// external program. Relative JS-page hrefs resolve against the page;
     /// foreign schemes (mailto:, …) and non-link selections return None.
     fn selected_web_url(&self) -> Option<String> {
+        self.web_url_for_link(&self.selected_link()?)
+    }
+
+    fn web_url_for_link(&self, link: &Link) -> Option<String> {
         let g = self.browser.as_ref()?;
-        let link = self.selected_link()?;
-        let raw: String = match &link {
+        let raw: String = match link {
             Link::Http(url) => url.to_string(),
             Link::Media(url) => url.to_string(),
             Link::JsClick { href, .. } if !href.is_empty() => href.clone(),
@@ -6908,6 +6985,7 @@ impl App {
         };
         match kind {
             FieldKind::Text | FieldKind::Password | FieldKind::Textarea => {
+                self.dispatch_page_focus(live_node);
                 self.input = value;
                 self.cursor = self.input.chars().count();
                 self.select_anchor = None;
@@ -10432,6 +10510,151 @@ mod tests {
         assert!(matches!(app.search_target, Some(Link::Form { .. })));
     }
 
+    #[test]
+    fn clicking_away_commits_each_kind_of_text_editor() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        for field in [
+            "<input name=q value=old>",
+            "<input name=q type=password value=old>",
+            "<textarea name=q>old</textarea>",
+            "<div contenteditable=true>old</div>",
+        ] {
+            let mut app = super::App::new(None, 23);
+            app.mode = super::Mode::Session;
+            app.last_inner = (80, 20);
+            app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 20);
+            let url = url::Url::parse("https://example.test/").unwrap();
+            let html = format!("<body>{field}<p>Click outside here</p></body>");
+            app.navigate_to(crate::http::parse(
+                &url,
+                "text/html",
+                html.as_bytes(),
+                80,
+                20,
+                &Default::default(),
+            ));
+            let (x, y, _) = item_point(&app, |it| matches!(it.link, Some(Link::Form { .. })));
+            app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+            let Some(Link::Form { form, field }) = app.search_target else {
+                panic!("editor")
+            };
+            app.input = String::from("my draft");
+            app.cursor = 8;
+            app.select_anchor = Some(0);
+            app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 78, 19));
+            assert_eq!(app.mode, super::Mode::Session);
+            assert_eq!(app.search_target, None);
+            assert!(app.input.is_empty());
+            assert_eq!(app.select_anchor, None);
+            assert!(!app.masked_input);
+            assert_eq!(
+                app.browser.as_ref().unwrap().doc.forms[form].fields[field].value,
+                "my draft"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_away_can_switch_fields_or_follow_the_clicked_link() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 20);
+        app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 20);
+        let url = url::Url::parse("https://example.test/").unwrap();
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            b"<body><form><input name=a value=first><br><input name=b value=second></form>\
+              <p><a href='mailto:test@example.test'>Contact</a></p></body>",
+            80,
+            20,
+            &Default::default(),
+        ));
+        let (x, y, _) = item_point(&app, |it| {
+            matches!(it.link, Some(Link::Form { field: 0, .. }))
+        });
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        app.input = String::from("draft one");
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert_eq!(app.mode, super::Mode::Search);
+        assert_eq!(
+            app.input, "draft one",
+            "reclicking the field must not reset the draft"
+        );
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 5, 22));
+        assert_eq!(
+            app.mode,
+            super::Mode::Search,
+            "the native prompt is not outside the editor"
+        );
+        let (x, y, _) = item_point(&app, |it| {
+            matches!(it.link, Some(Link::Form { field: 1, .. }))
+        });
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert_eq!(app.mode, super::Mode::Search);
+        assert_eq!(app.input, "second");
+        app.input = String::from("draft two");
+        let (x, y, _) = item_point(&app, |it| it.text.contains("Contact"));
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert_eq!(app.mode, super::Mode::Session);
+        assert_eq!(app.status, "external link: mailto:test@example.test");
+        let form = &app.browser.as_ref().unwrap().doc.forms[0];
+        assert_eq!(form.fields[0].value, "draft one");
+        assert_eq!(form.fields[1].value, "draft two");
+    }
+
+    #[test]
+    fn clicking_away_sends_the_live_draft_before_blur() {
+        use crate::js::{PageCmd, PageHandle};
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 20);
+        app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 20);
+        let url = url::Url::parse("https://example.test/").unwrap();
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            b"<input name=q value=old>",
+            80,
+            20,
+            &Default::default(),
+        ));
+        app.browser.as_mut().unwrap().doc.forms[0].fields[0].live_node = Some(42);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.live_page = Some(PageHandle::from_test_sender(tx));
+        app.form_interact(0, 0);
+        assert!(matches!(rx.try_recv(), Ok(PageCmd::Focus(Some(42)))));
+        app.input = String::from("live draft");
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 78, 19));
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            if !matches!(command, PageCmd::Hover { .. }) {
+                commands.push(command);
+            }
+        }
+        assert!(
+            matches!(commands.as_slice(), [PageCmd::SetValue { node: 42, value, .. }, PageCmd::Focus(None)] if value == "live draft"),
+            "{commands:?}"
+        );
+        assert_eq!(app.mode, super::Mode::Session);
+    }
+
+    #[test]
+    fn clicking_away_does_not_run_non_form_prompts() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 20);
+        app.mode = super::Mode::Search;
+        app.search_target = Some(gopher_doc(".x.").url);
+        app.input = "unsubmitted query".into();
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 50, 10));
+        assert_eq!(app.mode, super::Mode::Search);
+        assert_eq!(app.input, "unsubmitted query");
+        assert!(app.search_target.is_some());
+        assert!(app.fetch_rx.is_none());
+    }
+
     #[tokio::test]
     async fn gopher_mouse_hover_and_click_select_and_follow_links() {
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -11755,6 +11978,53 @@ mod tests {
             crate::http::execute_js(response, app.last_inner, (8, 16), Default::default()).await;
         app.on_http_response(response, 60);
         app
+    }
+
+    #[tokio::test]
+    async fn live_nested_contenteditable_click_opens_terminal_editor() {
+        // HTML #editing-host / #click-focusable: preserving the editor's
+        // authored block children must not discard its editing interaction.
+        let template = r#"
+          <style>html,body{margin:0}#editor{position:POSITION;left:80px;top:48px;width:320px;height:48px}
+          #editor p{margin:0;line-height:32px}#editor p:before{content:attr(data-placeholder)}</style>
+          <div id=editor contenteditable=true><p data-placeholder="Ask anything"><br></p></div>
+          <script>document.getElementById('editor').addEventListener('input', () => {});</script>"#;
+        for position in ["fixed", "relative"] {
+            let mut app = live_form_app(&template.replace("POSITION", position)).await;
+            app.last_content_area = ratatui::layout::Rect::new(0, 0, 60, 10);
+            let doc = &app.browser.as_ref().unwrap().doc;
+            let targets: Vec<_> = doc
+                .rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, row)| row.items.iter().map(move |item| (0, r as u16, item)))
+                .chain(doc.fixed.iter().flat_map(|f| {
+                    f.rows.iter().enumerate().flat_map(move |(r, row)| {
+                        row.items
+                            .iter()
+                            .map(move |item| (f.col, f.row + r as u16, item))
+                    })
+                }))
+                .filter(|(_, _, item)| matches!(item.link, Some(Link::Form { .. })))
+                .map(|(x, y, item)| (x + item.col + item.width - 1, y + item.height.max(1) - 1))
+                .collect();
+            assert!(
+                targets.len() >= 2,
+                "both placeholder text and empty editor box need editing actions"
+            );
+            for (x, y) in targets {
+                app.mode = super::Mode::Session;
+                app.on_mouse_event(mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    x,
+                    y,
+                ));
+                assert!(
+                    app.mode == super::Mode::Search,
+                    "{position} editor click at {x},{y} must open editing, not only dispatch a page click"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ use super::style::{
     BOTTOM, BoxStyle, InlineStyle, LEFT, Outline, Pos, RIGHT, TOP, block_align,
     legacy_descendant_align,
 };
-use super::tree::{Atom, AtomKind, BoxNode, Content, Inline};
+use super::tree::{Atom, AtomKind, BoxNode, Content, Inline, SharedBox};
 use super::value::{Len, Vp};
 
 /// One laid-out fragment: a border-box rect in absolute px, plus content.
@@ -57,6 +57,9 @@ pub(crate) struct Frag<'t> {
     /// anonymous/line fragments and boxes to which those properties do not
     /// apply. CSSOM §9 exposes these instead of the computed `auto`/percentage.
     pub css_size: Option<[f32; 2]>,
+    /// Untransformed content-box size for CSS container queries (never a
+    /// border-box, even when box-sizing:border-box controls CSSOM width).
+    pub content_size: Option<[f32; 2]>,
     /// How the Appendix E painter treats this fragment.
     pub paint: PaintFlags,
     /// The effective clip rectangle (absolute px) applied to this fragment's
@@ -94,7 +97,7 @@ pub(crate) struct Clip {
 
 impl Clip {
     /// Intersect two clips (a `None` operand is the unbounded clip).
-    fn intersect(a: Option<Clip>, b: Option<Clip>) -> Option<Clip> {
+    pub(super) fn intersect(a: Option<Clip>, b: Option<Clip>) -> Option<Clip> {
         match (a, b) {
             (None, c) | (c, None) => c,
             (Some(a), Some(b)) => Some(Clip {
@@ -110,6 +113,9 @@ impl Clip {
 #[derive(Clone, Debug)]
 pub(crate) enum FragKind<'t> {
     Block,
+    /// A table cell with row/row-group background layers underneath it.
+    /// Relative positioning rectangles survive every later fragment offset.
+    TableCell(Box<Vec<(NodeId, [f32; 4])>>),
     /// A line box with retained typographic metrics in CSS pixels.
     Line(LineFrag),
     /// An out-of-flow box's placeholder, sitting at its STATIC POSITION
@@ -148,6 +154,7 @@ pub(crate) struct LineFrag {
 pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
     let kind = match &fragment.kind {
         FragKind::Block => FragKind::Block,
+        FragKind::TableCell(layers) => FragKind::TableCell(layers.clone()),
         FragKind::Line(line) => FragKind::Line(line.clone()),
         FragKind::Oof(_, _) => return None,
         FragKind::Fixed(index) => FragKind::Fixed(*index),
@@ -165,6 +172,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
         h: fragment.h,
         border: fragment.border,
         css_size: fragment.css_size,
+        content_size: fragment.content_size,
         paint: fragment.paint,
         clip: fragment.clip,
         kind,
@@ -230,16 +238,34 @@ impl Default for PaintFlags {
 /// remains targetable wherever later page paint does not cover it, but it no
 /// longer swallows controls painted above the backdrop.
 pub(super) fn fixed_backdrop(
-    _dom: &Dom,
+    dom: &Dom,
     fragment: &Frag<'_>,
     viewport_w: f32,
     viewport_h: f32,
 ) -> bool {
-    fragment.paint.z.is_none()
-        && fragment.x <= 0.5
-        && fragment.y <= 0.5
-        && fragment.w + 0.5 >= viewport_w
-        && fragment.h + 0.5 >= viewport_h
+    if fragment.paint.z.is_some()
+        || fragment.x > 0.5
+        || fragment.y > 0.5
+        || fragment.w + 0.5 < viewport_w
+        || fragment.h + 0.5 < viewport_h
+    {
+        return false;
+    }
+    // CSS Masking 1 §5: a fixed descendant must remain inside its ancestor
+    // clipping contexts. The standalone viewport underlay has no such stack.
+    let mut parent = (fragment.node != NO_NODE)
+        .then(|| dom.parent_flat(fragment.node))
+        .flatten();
+    while let Some(node) = parent {
+        if dom
+            .computed_value_resolved(node, "clip-path")
+            .is_some_and(|value| super::clip_path::supports(&value))
+        {
+            return false;
+        }
+        parent = dom.parent_flat(node);
+    }
+    true
 }
 
 /// Derive the paint flags from a box style. `item` = the box is a flex/grid
@@ -272,6 +298,7 @@ impl<'t> Frag<'t> {
             h: 0.0,
             border: [0.0; 4],
             css_size: None,
+            content_size: None,
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Block,
@@ -346,7 +373,7 @@ fn button_content_bounds(f: &Frag<'_>) -> Option<ButtonContentBounds> {
                     })
                 })
         }
-        FragKind::Block => Some(ButtonContentBounds {
+        FragKind::Block | FragKind::TableCell(_) => Some(ButtonContentBounds {
             x0: f.x,
             y0: f.y,
             x1: f.x + f.w,
@@ -385,6 +412,7 @@ fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag<'_> {
         h: 0.0,
         border: [0.0; 4],
         css_size: None,
+        content_size: None,
         paint: PaintFlags::default(),
         clip: None,
         kind: FragKind::Oof(m.b, Box::new(m.ctx)),
@@ -438,6 +466,8 @@ pub(crate) struct Flow<'a> {
     pub forms: &'a [Form],
     pub images: &'a ImageSizes,
     pub vp: Vp,
+    /// Only full canonical transactions prepare the persistent cache's inputs.
+    pub reuse: bool,
     /// The intrinsic-size memo: (element, is-min-mode) → content px. Pass-
     /// wide, so nested flex towers query each subtree once per mode.
     pub imemo: std::cell::RefCell<std::collections::HashMap<(NodeId, bool), f32>>,
@@ -448,6 +478,7 @@ pub(crate) struct Flow<'a> {
     /// `repeat(auto-fill, …)`). Populated by the layout pass; read by
     /// `measure_boxes_and_grid_tracks`.
     pub grid_tracks: std::cell::RefCell<GridTrackMap>,
+    pub subgrid_rows: std::cell::RefCell<super::grid::SubgridRows>,
 }
 
 /// Each grid container's used track sizes in px `(columns, rows)`, keyed by node
@@ -561,7 +592,7 @@ impl Flow<'_> {
                     f.h,
                     f.clip.map(|c| (c.x0, c.x1, c.y0, c.y1)),
                     match &f.kind {
-                        FragKind::Block => "B",
+                        FragKind::Block | FragKind::TableCell(_) => "B",
                         FragKind::Line(_) => "L",
                         FragKind::Oof(..) => "OOF",
                         FragKind::Fixed(_) => "FIXED",
@@ -652,7 +683,7 @@ impl Flow<'_> {
         // paint offset.
         let a0 = cur.anchors.len();
         let inl = if b.node == NO_NODE {
-            parent_inl.clone()
+            parent_inl.with_pseudo(s.pseudo)
         } else {
             InlineStyle::derive(self.dom, b.node, parent_inl, self.base)
         };
@@ -802,7 +833,9 @@ impl Flow<'_> {
                 })
             })
             .flatten();
-        let spec_h = authored_h.or(ratio_h);
+        let spec_h = authored_h
+            .or(ratio_h)
+            .or_else(|| (s.size_container == 2).then_some(0.0));
         let min_h = self
             .height_px(&s.min_height, s, bt, bb, cb_h)
             .unwrap_or(0.0);
@@ -1359,6 +1392,7 @@ impl Flow<'_> {
             } else {
                 [h.content_w, (frag_h - vertical_edges).max(0.0)]
             }),
+            content_size: Some([h.content_w, (frag_h - vertical_edges).max(0.0)]),
             paint: paint_flags(&b.style, false),
             clip: None,
             kind: FragKind::Block,
@@ -1434,6 +1468,7 @@ impl Flow<'_> {
                 h: 0.0,
                 border: [0.0; 4],
                 css_size: None,
+                content_size: None,
                 paint: PaintFlags::default(),
                 clip: None,
                 kind: FragKind::Oof(ob, Box::new(inl.clone())),
@@ -1465,6 +1500,7 @@ impl Flow<'_> {
                 h: hpx,
                 border: [0.0; 4],
                 css_size: None,
+                content_size: None,
                 paint: PaintFlags::default(),
                 clip: None,
                 kind: FragKind::Line(line_frag),
@@ -1493,7 +1529,7 @@ impl Flow<'_> {
             for f in frags {
                 let y = match &f.kind {
                     FragKind::Line(_) => Some(f.y),
-                    FragKind::Block => first_line_y(&f.children),
+                    FragKind::Block | FragKind::TableCell(_) => first_line_y(&f.children),
                     FragKind::Oof(..) | FragKind::Fixed(_) => None,
                 };
                 if let Some(y) = y {
@@ -1521,6 +1557,7 @@ impl Flow<'_> {
                     image: Some(source.to_string()),
                     emph: Emphasis::default(),
                     style_node: inl.node,
+                    pseudo: None,
                     node: NO_NODE,
                     link: None,
                     crop: false,
@@ -1544,6 +1581,7 @@ impl Flow<'_> {
                     image: None,
                     emph: inl.emph,
                     style_node: inl.node,
+                    pseudo: None,
                     node: NO_NODE,
                     link: None,
                     crop: false,
@@ -1574,6 +1612,7 @@ impl Flow<'_> {
                     image: None,
                     emph: inl.emph,
                     style_node: inl.node,
+                    pseudo: None,
                     node: NO_NODE,
                     link: None,
                     crop: false,
@@ -1593,6 +1632,7 @@ impl Flow<'_> {
             h,
             border: [0.0; 4],
             css_size: None,
+            content_size: None,
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
@@ -1866,7 +1906,7 @@ impl Flow<'_> {
     fn flex_content<'t>(
         &self,
         b: &'t BoxNode,
-        items: &'t [BoxNode],
+        items: &'t [SharedBox],
         content_x: f32,
         content_top: f32,
         content_w: f32,
@@ -1895,7 +1935,7 @@ impl Flow<'_> {
         // §5.4 `order`: stable reorder.
         let mut idx: Vec<usize> = (0..items.len()).collect();
         idx.sort_by_key(|&i| self.order_of(items[i].node));
-        let ordered: Vec<&BoxNode> = idx.iter().map(|&i| &items[i]).collect();
+        let ordered: Vec<&BoxNode> = idx.iter().map(|&i| items[i].as_ref()).collect();
         if fs.row {
             self.flex_row(
                 &fs,
@@ -2569,7 +2609,10 @@ impl Flow<'_> {
                 // needs layout, as does an unchanged target that became
                 // definite under §9.8 so percentage descendants can resolve.
                 if main_size_changed || became_definite {
-                    let w = fi[i].frag.as_ref().expect("laid above").w;
+                    // Fragments store border-box widths; item_frag takes a
+                    // content-box width. Keep the original cross size when
+                    // redoing layout at the post-flexing main size (§9.4).
+                    let w = (fi[i].frag.as_ref().expect("laid above").w - fi[i].bp_cross).max(0.0);
                     let (frag2, anc2) = self.item_frag(fi[i].b, w, content_w, Some(used), inl);
                     fi[i].frag = Some(frag2);
                     fi[i].anchors = anc2;
@@ -2772,9 +2815,56 @@ impl Flow<'_> {
         parent_inl: &InlineStyle,
         transfer_preferred_ratio: bool,
     ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+        let request = super::memo::Request {
+            node: b,
+            parent: parent_inl,
+            constraint: super::memo::Constraint::Item {
+                width: content_w,
+                basis: pct_basis,
+                height: def_h,
+                ratio: transfer_preferred_ratio,
+            },
+        };
+        // Subgrid descendants depend on inherited track positions as well as
+        // their own containing-block size. Do not reuse independent-item
+        // entries while these additional per-axis constraints are active.
+        let reuse = self.reuse && b.node != NO_NODE && !self.subgrid_rows.borrow().active();
+        if reuse && let Some(item) = self.dom.layout_cache.borrow_mut().item(&request) {
+            self.grid_tracks.borrow_mut().extend(item.tracks);
+            return (item.fragment, item.anchors);
+        }
+        let result = self.item_frag_uncached(
+            b,
+            content_w,
+            pct_basis,
+            def_h,
+            parent_inl,
+            transfer_preferred_ratio,
+        );
+        if reuse {
+            self.dom.layout_cache.borrow_mut().store_item(
+                &request,
+                &result.0,
+                &result.1,
+                &self.grid_tracks.borrow(),
+            );
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn item_frag_uncached<'t>(
+        &self,
+        b: &'t BoxNode,
+        content_w: f32,
+        pct_basis: f32,
+        def_h: Option<f32>,
+        parent_inl: &InlineStyle,
+        transfer_preferred_ratio: bool,
+    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
         let s = &b.style;
         let inl = if b.node == NO_NODE {
-            parent_inl.clone()
+            parent_inl.with_pseudo(s.pseudo)
         } else {
             InlineStyle::derive(self.dom, b.node, parent_inl, self.base)
         };
@@ -2792,7 +2882,7 @@ impl Flow<'_> {
         let def_h = def_h
             .or_else(|| self.iframe_auto_height(b, s, bt, bb))
             .or_else(|| {
-                transfer_preferred_ratio
+                (transfer_preferred_ratio && !self.subgrid_rows.borrow().contains(b.node))
                     .then_some(s.aspect_ratio)
                     .flatten()
                     .map(|ratio| {
@@ -3012,6 +3102,8 @@ impl Flow<'_> {
         }
         if let Some(hd) = def_h {
             content_h = hd;
+        } else if s.size_container == 2 {
+            content_h = 0.0;
         }
         let mut anchors = std::mem::take(&mut cur.anchors);
 
@@ -3040,6 +3132,7 @@ impl Flow<'_> {
                 } else {
                     [content_w, content_h]
                 }),
+                content_size: Some([content_w, content_h]),
                 // `item = true`: only flex/grid items and out-of-flow boxes
                 // lay through here, and for the (always-positioned)
                 // out-of-flow ones the item bit can't change the result.
@@ -3101,6 +3194,7 @@ impl Flow<'_> {
                 .map(str::to_string),
             emph: crate::layout2::Emphasis::default(),
             style_node: node,
+            pseudo: None,
             node,
             link: url
                 .and_then(|u| super::inline::poster_media_target(self.dom, self.base, node, u))
@@ -3118,6 +3212,7 @@ impl Flow<'_> {
             h: r.box_h,
             border: [0.0; 4],
             css_size: None,
+            content_size: None,
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
@@ -3169,8 +3264,9 @@ impl Flow<'_> {
             .unwrap_or(0)
     }
 
-    /// §4.5: a scroll container's automatic minimum size is zero.
-    fn scroll_container(&self, node: NodeId) -> bool {
+    /// Flexbox §4.5 / Grid §6.6 use computed scrollable overflow values,
+    /// including hidden, rather than the presence of scrollbars or overflow.
+    pub(super) fn scroll_container(&self, node: NodeId) -> bool {
         if node == NO_NODE {
             return false;
         }
@@ -3429,6 +3525,7 @@ impl Flow<'_> {
                             h: 0.0,
                             border: [0.0; 4],
                             css_size: None,
+                            content_size: None,
                             paint: PaintFlags {
                                 positioned: true,
                                 sc: true,
@@ -3699,6 +3796,9 @@ impl Flow<'_> {
     /// scroll containers). Flex/grid/table items and out-of-flow boxes lay
     /// through `item_frag`, which establishes its own context directly.
     fn establishes_bfc(&self, b: &BoxNode) -> bool {
+        if b.style.size_container != 0 {
+            return true;
+        }
         if b.node == NO_NODE {
             return false;
         }
@@ -3853,8 +3953,28 @@ impl Flow<'_> {
                 }
             }
         };
-        let def_h = self.height_px(&s.height, s, bt, bb, cb_h);
-        let (frag, anchors) = self.item_frag(ab, content_w, cb_w, def_h, parent_inl);
+        // CSS Sizing 3 #min-size-properties/#max-size-properties also apply
+        // to atomic inlines. `item_frag` accepts an imposed content height;
+        // its callers must enforce the box's own constraints. In particular,
+        // an auto-height inline-flex button must not ignore min-height.
+        let min_h = self
+            .height_px(&s.min_height, s, bt, bb, cb_h)
+            .unwrap_or(0.0);
+        let max_h = self
+            .height_px(&s.max_height, s, bt, bb, cb_h)
+            .unwrap_or(f32::INFINITY)
+            .max(min_h);
+        let def_h = self
+            .height_px(&s.height, s, bt, bb, cb_h)
+            .map(|height| height.clamp(min_h, max_h));
+        let (mut frag, mut anchors) = self.item_frag(ab, content_w, cb_w, def_h, parent_inl);
+        if def_h.is_none() {
+            let natural = (frag.h - bt - bb).max(0.0);
+            let clamped = natural.clamp(min_h, max_h);
+            if (clamped - natural).abs() > 0.01 {
+                (frag, anchors) = self.item_frag(ab, content_w, cb_w, Some(clamped), parent_inl);
+            }
+        }
         PrelaidAtom {
             node: ab.node,
             mw: m[LEFT] + frag.w + m[RIGHT],
@@ -4206,7 +4326,7 @@ fn slice_columns<'t, F: Fn(f32) -> (f32, f32)>(
     out: &mut Vec<Frag<'t>>,
 ) {
     match &f.kind {
-        FragKind::Block if !f.children.is_empty() => {
+        FragKind::Block | FragKind::TableCell(_) if !f.children.is_empty() => {
             for c in std::mem::take(&mut f.children) {
                 slice_columns(c, shift, out);
             }

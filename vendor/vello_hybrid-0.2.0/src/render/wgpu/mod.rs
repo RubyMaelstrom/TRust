@@ -64,7 +64,7 @@ use vello_common::{
         EncodedPaint, MAX_GRADIENT_LUT_SIZE, RadialKind,
     },
     geometry::{RectU16, SizeU16},
-    paint::ImageSource,
+    paint::{ImageId as AtlasImageId, ImageSource},
     peniko,
     pixmap::Pixmap,
     tile::Tile,
@@ -266,19 +266,48 @@ impl Renderer {
             );
         }
 
-        let result = self.render_scene(
-            scene,
-            device,
-            queue,
-            encoder,
-            render_size,
-            view,
-            &resources.image_cache,
-            &scene.encoded_paints,
-            true,
-            RootTarget::UserSurface,
-            texture_bindings,
-        );
+        // Bitmap font glyphs (and other CPU pixmap paints) do not require
+        // the experimental glyph atlas. Normalize their sources into ordinary
+        // image-atlas allocations for this render. Keep every encoded sampling
+        // transform/tint unchanged, including rotated or oversized text that
+        // cannot use the glyph cache. The renderer retains no extra pixmaps.
+        let mut transient_images = HashMap::new();
+        let result = (|| {
+            for paint in &scene.encoded_paints {
+                let EncodedPaint::Image(image) = paint else { continue };
+                let ImageSource::Pixmap(pixmap) = &image.source else { continue };
+                let key = Arc::as_ptr(pixmap);
+                if let Entry::Vacant(slot) = transient_images.entry(key) {
+                    let id = resources.image_cache.allocate(
+                        u32::from(pixmap.width()), u32::from(pixmap.height()), IMAGE_PADDING,
+                    )?;
+                    slot.insert(id);
+                    self.write_to_atlas(
+                        &resources.image_cache, device, queue, encoder, id, pixmap, None,
+                    );
+                }
+            }
+            self.render_scene(
+                scene,
+                device,
+                queue,
+                encoder,
+                render_size,
+                view,
+                &resources.image_cache,
+                &scene.encoded_paints,
+                &transient_images,
+                true,
+                RootTarget::UserSurface,
+                texture_bindings,
+            )
+        })();
+        // Clears are encoder-ordered AFTER the draw, also on a fallible render
+        // or allocation failure. Reusing the slots next frame cannot erase
+        // pixels that the current GPU command stream still needs to sample.
+        for (_, id) in transient_images {
+            self.destroy_image(resources, encoder, id);
+        }
 
         #[cfg(feature = "text")]
         resources.after_render(self, |renderer, rect| {
@@ -372,6 +401,7 @@ impl Renderer {
             &layer_view,
             &dummy_image_cache,
             encoded_paints,
+            &HashMap::new(),
             false,
             RootTarget::AtlasLayer,
             texture_bindings,
@@ -418,12 +448,13 @@ impl Renderer {
         view: &TextureView,
         image_cache: &ImageCache,
         encoded_paints: &[EncodedPaint],
+        pixmap_images: &HashMap<*const Pixmap, AtlasImageId>,
         clear: bool,
         root_output_target: RootTarget,
         texture_bindings: &TextureBindings,
     ) -> Result<(), RenderError> {
         self.programs.depth_cleared_this_frame = false;
-        self.prepare_gpu_encoded_paints(encoded_paints, image_cache, texture_bindings)?;
+        self.prepare_gpu_encoded_paints(encoded_paints, image_cache, pixmap_images, texture_bindings)?;
         let required_texture_size = self
             .layers_config
             .required_intermediate_texture_size(&scene.recorder)?;
@@ -539,12 +570,9 @@ impl Renderer {
     /// allocation. Returns `false` if the image is missing or its upload
     /// dimensions changed.
     ///
-    /// `Pixmap` uploads use `Queue::write_texture`, while `destroy_image`
-    /// records an atlas clear in `encoder`. WebGPU schedules both operations
-    /// on the queue timeline in issue order, so destroying, reallocating the
-    /// same slot, and uploading before submitting `encoder` would clear the
-    /// replacement pixels. Same-sized animation frames should update their
-    /// retained allocation directly instead.
+    /// Same-sized animation frames update their retained allocation directly.
+    /// All built-in atlas writers record their transfers in `encoder`, ordered
+    /// with allocation clears and atlas-growth copies.
     pub fn update_image<T: AtlasWriter>(
         &mut self,
         resources: &Resources,
@@ -723,6 +751,7 @@ impl Renderer {
         &mut self,
         encoded_paints: &[EncodedPaint],
         image_cache: &ImageCache,
+        pixmap_images: &HashMap<*const Pixmap, AtlasImageId>,
         texture_bindings: &TextureBindings,
     ) -> Result<(), RenderError> {
         self.encoded_paints
@@ -734,8 +763,10 @@ impl Renderer {
             self.paint_idxs[encoded_paint_idx] = current_idx;
             match paint {
                 EncodedPaint::Image(img) => {
-                    let ImageSource::OpaqueId { id: image_id, .. } = img.source else {
-                        panic!("pixmap image sources are not supported by Vello Hybrid");
+                    let image_id = match &img.source {
+                        ImageSource::OpaqueId { id, .. } => *id,
+                        ImageSource::Pixmap(pixmap) => *pixmap_images.get(&Arc::as_ptr(pixmap))
+                            .expect("pixmaps must be uploaded before GPU paint encoding"),
                     };
 
                     let image_resource = image_cache.get(image_id).unwrap();
@@ -3310,7 +3341,7 @@ fn create_filter_original_texture_bind_group(
 /// Trait for types that can write image data directly to the atlas texture.
 ///
 /// This allows efficient uploading from different sources:
-/// - `Pixmap`: Direct upload without intermediate texture
+/// - `Pixmap`: Encoder-ordered staging-buffer upload, without intermediate texture
 /// - `Texture`: Texture-to-texture copy
 /// - Custom implementations for other image sources
 pub trait AtlasWriter {
@@ -3320,6 +3351,8 @@ pub trait AtlasWriter {
     fn height(&self) -> u32;
 
     /// Write image data to a specific layer of an atlas texture array at the specified offset.
+    /// Record the transfer in `encoder`: a queue write would execute before
+    /// previously encoded clears/copies when the caller submits that encoder.
     fn write_to_atlas_layer(
         &self,
         device: &Device,
@@ -3380,7 +3413,7 @@ impl AtlasWriter for Texture {
     }
 }
 
-/// Implementation for `Pixmap` - direct upload to atlas
+/// Implementation for `Pixmap` - encoder-ordered upload to atlas
 impl AtlasWriter for Pixmap {
     fn width(&self) -> u32 {
         self.width() as u32
@@ -3392,16 +3425,55 @@ impl AtlasWriter for Pixmap {
 
     fn write_to_atlas_layer(
         &self,
-        _device: &Device,
-        queue: &Queue,
-        _encoder: &mut CommandEncoder,
+        device: &Device,
+        _queue: &Queue,
+        encoder: &mut CommandEncoder,
         atlas_texture: &Texture,
         layer: u32,
         offset: [u32; 2],
         width: u32,
         height: u32,
     ) {
-        queue.write_texture(
+        // WebGPU §§3.4.1, 19.2: writeTexture() issues queue work immediately,
+        // while an encoder's commands run only at submit(). A queue upload
+        // here therefore overtakes an earlier destroy_image() clear or atlas
+        // growth copy, which subsequently erases the freshly uploaded pixels.
+        // Use the same command stream for all three operations. The staging
+        // buffer stays alive through the encoder's resource ownership.
+        // copyBufferToTexture requires 256-byte row alignment (§13.2.1).
+        let row_bytes = width * 4;
+        let padded_row_bytes = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let data = self.data_as_u8_slice();
+        let padded;
+        let contents = if padded_row_bytes == row_bytes {
+            data
+        } else {
+            padded = {
+                let mut bytes = vec![0; padded_row_bytes as usize * height as usize];
+                for (source, dest) in data
+                    .chunks_exact(row_bytes as usize)
+                    .zip(bytes.chunks_exact_mut(padded_row_bytes as usize))
+                {
+                    dest[..row_bytes as usize].copy_from_slice(source);
+                }
+                bytes
+            };
+            &padded
+        };
+        let staging = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Atlas Pixmap Upload"),
+            contents,
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
             wgpu::TexelCopyTextureInfo {
                 texture: atlas_texture,
                 mip_level: 0,
@@ -3411,12 +3483,6 @@ impl AtlasWriter for Pixmap {
                     z: layer,
                 },
                 aspect: wgpu::TextureAspect::All,
-            },
-            self.data_as_u8_slice(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
             },
             Extent3d {
                 width,

@@ -12,6 +12,27 @@ use super::{ImageStore, Scene};
 use crate::core::{CssPoint, CssSize, PhysicalSize, ScaleFactor, ViewportMetrics};
 use crate::layout2::{ControlMap, ImageSizes, Viewport};
 
+/// Rasterize an existing authoritative display list with its inline resources.
+/// No reparse/relayout and no network requests; useful for release diagnostics.
+pub fn render_paint(page: &super::PagePaint, viewport: CssSize) -> Result<OwnedRgbaFrame, String> {
+    let store = ImageStore::default();
+    for request in &page.image_requests {
+        if let Some(bytes) = crate::img::decode_data_url(&request.source)
+            && let Ok(image) = crate::img::decode_graphical(&bytes) {
+            store.insert(request.handle,image);
+        }
+    }
+    let physical = PhysicalSize::new(viewport.width.ceil().max(1.) as u32,viewport.height.ceil().max(1.) as u32);
+    let mut scene = Scene {
+        viewport: ViewportMetrics::from_physical(physical,ScaleFactor::default()),
+        primitives:Vec::new(),controls:Vec::new(),
+        content_viewport:super::CssRect::new(0.,0.,viewport.width,viewport.height),
+        image_store:store,page_scroll_containers:Vec::new(),page_size:CssSize::default(),
+    };
+    scene.append_page(page,CssPoint::default());
+    VelloCpuRenderer::new().render_rgba(&scene)
+}
+
 /// Render a self-contained HTML fixture. `data:` images are decoded
 /// synchronously between an intrinsic-discovery pass and the final layout.
 pub fn render_html(html: &str, base: &Url, viewport: CssSize) -> Result<OwnedRgbaFrame, String> {
@@ -597,6 +618,169 @@ mod tests {
             &second.pixels[16 * 32 * 4 + 16 * 4..][..4],
             &[0, 255, 0, 255]
         );
+    }
+
+    #[test]
+    fn hybrid_recycles_image_slots_without_erasing_replacement_pixels() {
+        // SVG hover changes the serialized data URL, and therefore its image
+        // handle. The previous frame's allocation can be reused in the same
+        // frame that clears it. Exercise actual GPU readback, not just decode.
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(32, 32), ScaleFactor::default());
+        let store = ImageStore::default();
+        let mut scene = Scene {
+            viewport: metrics,
+            primitives: Vec::new(),
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 32.0, 32.0),
+            image_store: store.clone(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::new(32.0, 32.0),
+        };
+        let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) else {
+            eprintln!("GPU slot-reuse regression not exercised: no Hybrid adapter");
+            return;
+        };
+        for (step, color) in [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 0, 0, 255],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let handle = ImageHandle::for_source(&format!("test:svg-paint-{step}"));
+            store.insert(
+                handle,
+                ImageResource {
+                    width: 1,
+                    height: 1,
+                    rgba: std::sync::Arc::from(color),
+                    has_alpha: false,
+                },
+            );
+            scene.primitives = vec![DisplayCommand::Image {
+                rect: CssRect::new(0.0, 0.0, 32.0, 32.0),
+                handle,
+                source_rect: None,
+                fit: ImageFit::Fill,
+                sampling: ImageSampling::Nearest,
+                clip: None,
+                node: 0,
+                link: None,
+            }];
+            for repaint in 0..2 {
+                let frame = hybrid.render_rgba(&scene).unwrap();
+                assert_eq!(
+                    &frame.pixels[16 * 32 * 4 + 16 * 4..][..4],
+                    &color,
+                    "replacement step {step}, repaint {repaint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archive_svg_pixels_survive_hover_and_resource_key_changes() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom =
+            crate::dom::Dom::parse_document(include_str!("fixtures/archive-svg-repaint.html"));
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let viewport = CssSize::new(240.0, 120.0);
+        let book = dom.get_by_id("book").unwrap();
+        let svgs: Vec<_> = dom
+            .descendants(crate::dom::DOCUMENT)
+            .filter(|&node| dom.tag_name(node) == Some("svg"))
+            .collect();
+        assert_eq!(svgs.len(), 2);
+        let mut sizes = ImageSizes::new();
+        let store = ImageStore::default();
+        let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) else {
+            eprintln!("Archive SVG pixel regression not exercised: no Hybrid adapter");
+            return;
+        };
+        for step in 0..6 {
+            dom.set_hover_chain((step % 2 == 1).then_some(book));
+            // A harmless metadata change makes a different serialized resource
+            // key without changing the artwork. Both changed and steady SVG
+            // paints must survive atlas eviction/reallocation across frames.
+            for &svg in &svgs {
+                dom.set_attr(svg, "data-frame", &step.to_string());
+                let (source, _) = dom.svg_image_data(svg, Some(&base)).unwrap();
+                let bytes = crate::img::decode_data_url(&source).unwrap();
+                let image = crate::img::decode_graphical(&bytes).unwrap();
+                assert!(
+                    image
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|p| p[3] > 0)
+                        .count()
+                        > 100
+                );
+                sizes.insert(source.clone(), (image.width, image.height));
+                store.insert(ImageHandle::for_source(&source), image);
+            }
+            let scene = scene_for_dom(
+                &dom,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                &sizes,
+                store.clone(),
+            );
+            let reference = VelloCpuRenderer::new().render_rgba(&scene).unwrap();
+            let image_rects: Vec<_> = scene
+                .primitives
+                .iter()
+                .filter_map(|command| {
+                    if let DisplayCommand::Image { rect, .. } = command {
+                        Some(*rect)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(image_rects.len(), 2, "both Archive SVGs must paint");
+            for repaint in 0..2 {
+                let actual = hybrid.render_rgba(&scene).unwrap();
+                let difference = compare_rgba(&reference, &actual, 2).unwrap();
+                assert!(
+                    difference.fraction_over_tolerance < 0.005,
+                    "step {step}, repaint {repaint}: {difference:?}"
+                );
+                // Check each icon's own rectangle: a missing small book must
+                // not disappear into a whole-page error tolerance.
+                for rect in &image_rects {
+                    let mut compared = 0;
+                    let mut wrong = 0;
+                    for y in rect.y as usize..(rect.y + rect.height) as usize {
+                        for x in rect.x as usize..(rect.x + rect.width) as usize {
+                            let offset = (y * actual.size.width as usize + x) * 4;
+                            for channel in 0..4 {
+                                compared += 1;
+                                wrong += usize::from(
+                                    reference.pixels[offset + channel]
+                                        .abs_diff(actual.pixels[offset + channel])
+                                        > 2,
+                                );
+                            }
+                        }
+                    }
+                    assert!(
+                        compared > 0 && wrong * 200 < compared,
+                        "step {step}, repaint {repaint}, {rect:?}: {wrong}/{compared} channels differ"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

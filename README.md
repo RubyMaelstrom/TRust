@@ -14,7 +14,7 @@ search, channel, and other browsing pages remain in TRust.
 
 ## Installation
 
-The normal TRust binaries use Lumen, a pure-Rust JavaScript engine maintained
+All TRust binaries use Lumen, a pure-Rust JavaScript engine maintained
 in a sibling checkout. The current integration checkout is laid out as:
 
 ```text
@@ -27,9 +27,10 @@ The path dependency is intentional: TRust and Lumen are being developed
 together while the host-boundary work is upstreamed. Keep the sibling Lumen
 checkout at the integration revision recorded above before building.
 
-From `TRust`, `cargo build --release` builds the Lumen-only `trust` and
-`trust-desktop` release binaries. Lumen is selected at compile time, so neither
-normal artifact contains the legacy Boa engine.
+From `TRust`, `cargo build --release` builds the `trust`, `trust-desktop`,
+`trust-headless`, and developer replay binaries. Lumen is an unconditional
+dependency; no backend-selection feature is needed. Use `--no-default-features`
+to build with the system allocator instead of mimalloc.
 
 The native desktop binary, `trust-desktop`, uses
 winit and the same CSS-pixel layout engine as the terminal browser. HTML boxes,
@@ -43,19 +44,17 @@ can render the identical page pipeline without a window through
 
 ## JavaScript engine
 
-Lumen is the production JavaScript engine for both the terminal and desktop
+Lumen is the sole JavaScript engine for the terminal, desktop, and headless
 frontends. The browser-facing contract lives in TRust; engine-specific host
 bindings and the resident page actor live in `src/lumen_backend.rs` and the
 sibling Lumen checkout. This keeps DOM, networking, storage, workers, and
 rendering behavior shared by both frontends.
 
-Boa is retained only as an explicitly selected legacy/regression backend. It is
-not linked into normal release binaries:
-
-```sh
-cargo build --release --no-default-features --features mimalloc,boa-backend \
-  --bin trust-boa --bin trust-desktop-boa
-```
+The normal build advertises US English: `Accept-Language: en-US,en;q=0.9`,
+`navigator.language === "en-US"`, and an `en-US` default for native Intl.
+This preference does not depend on the OS language, region, or geographic
+location and needs no build flag. Explicit locale requests remain supported;
+websites may still choose content using their own account or IP-based settings.
 
 The opt-in `trust-lumen-spike` binary is a synthetic Lumen benchmark harness;
 it is not a separate browser backend and is omitted from ordinary builds.

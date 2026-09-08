@@ -22,6 +22,7 @@
 //! structurally — the visual result for real-world markup like
 //! `<a><div>…</div></a>` is the same).
 
+use std::sync::Arc;
 use url::Url;
 
 use crate::doc::{FieldKind, Form};
@@ -33,13 +34,13 @@ use super::value::Vp;
 
 /// A replaced (atomic) box: its element plus what the layout pass needs to
 /// size and emit it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Atom {
     pub node: NodeId,
     pub kind: AtomKind,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum AtomKind {
     /// An `<img>`: the resolved absolute URL (http(s)/`data:`/`blob:`) and the
     /// alt text fallback for the not-yet-decoded state.
@@ -57,7 +58,7 @@ pub(crate) enum AtomKind {
 }
 
 /// Inline-level content inside an inline formatting context.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Inline {
     /// A text run (raw — white-space collapsing happens at line building).
     /// The originating element is the enclosing `Box`/IFC root.
@@ -68,8 +69,8 @@ pub(crate) enum Inline {
     /// boxes, and an unboxed `BoxStyle` would quintuple every variant.
     Box {
         node: NodeId,
-        style: Box<BoxStyle>,
-        kids: Vec<Inline>,
+        style: Arc<BoxStyle>,
+        kids: Arc<[Inline]>,
     },
     Atom(Atom),
     /// `<br>` — a forced line break (HTML §14.3.8).
@@ -79,13 +80,13 @@ pub(crate) enum Inline {
     /// its hypothetical in-flow first box would have had). It contributes no
     /// inline content; the flow lays it against its containing block in the
     /// positioned post-pass. Its display is already blockified (§9.7).
-    OutOfFlow(Box<BoxNode>),
+    OutOfFlow(SharedBox),
     /// A float (`float:left`/`right` — §9.5), out of normal flow and shifted to
     /// an edge. It rides the inline list at the point it appears in source (its
     /// margin-box top can be no higher than the line box it occurs on — §9.5.1
     /// rule 6); the IFC pulls it aside and shortens the line boxes beside it.
     /// Its display is blockified (§9.7), so the box is a block-level box.
-    Float(Box<BoxNode>),
+    Float(SharedBox),
     /// An ATOMIC INLINE-LEVEL box (`inline-block`/`inline-flex`/`inline-grid`
     /// — CSS-Display-3 §2.5): its content is laid as its own INDEPENDENT
     /// formatting context (block/flex/grid) at the element's used width, then
@@ -93,11 +94,13 @@ pub(crate) enum Inline {
     /// replaced box — §9.4.2/§10.8). The inner box carries the blockified
     /// display in `content` (Blocks/Inlines/Flex/Grid/Table); the block flow
     /// pre-lays it (`item_frag`) and hands its used cell size to the IFC.
-    AtomBox(Box<BoxNode>),
+    AtomBox(SharedBox),
 }
 
+pub(crate) type SharedBox = Arc<BoxNode>;
+
 /// One box in the tree.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BoxNode {
     /// The generating element (`NO_NODE` for anonymous boxes).
     pub node: NodeId,
@@ -118,21 +121,21 @@ pub(crate) struct BoxNode {
     /// position is the container's content-box origin). Block containers
     /// carry their out-of-flow children inside the content lists instead
     /// (`Inline::OutOfFlow`), which records the inline static position.
-    pub oof: Vec<BoxNode>,
+    pub oof: Vec<SharedBox>,
 }
 
 /// What a block container holds (§9.2: all block-level, or an IFC).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Content {
-    Blocks(Vec<BoxNode>),
+    Blocks(Vec<SharedBox>),
     Inlines(Vec<Inline>),
     /// A block-level replaced element (`<img style="display:block">`).
     Atomic(Atom),
     /// A flex container's items (css-flexbox §4: every in-flow child
     /// blockified into an item; text runs wrapped in anonymous items).
-    Flex(Vec<BoxNode>),
+    Flex(Vec<SharedBox>),
     /// A grid container's items (css-grid §6 forms them identically).
-    Grid(Vec<BoxNode>),
+    Grid(Vec<SharedBox>),
     /// A table wrapper's grid + captions (CSS 2.1 §17). Boxed — a `TableBox`
     /// is large and tables are rare, so an unboxed variant would bloat every
     /// `Content`.
@@ -142,12 +145,12 @@ pub(crate) enum Content {
 /// A `display:table` element's resolved structure (CSS 2.1 §17), built once:
 /// its cells placed on a grid (`colspan`/`rowspan` resolved), its column
 /// width preferences, and its caption boxes.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TableBox {
     /// Caption boxes rendered ABOVE the grid (`caption-side: top`, the
     /// default) and BELOW it (`caption-side: bottom`) — §17.4.
-    pub top_captions: Vec<BoxNode>,
-    pub bottom_captions: Vec<BoxNode>,
+    pub top_captions: Vec<SharedBox>,
+    pub bottom_captions: Vec<SharedBox>,
     /// Per-column width preference from `<col>`/`<colgroup>` (§17.5.2),
     /// expanded over columns (`<col span=N>` repeats). May be shorter than
     /// `ncols`; the layout indexes with `.get()`.
@@ -162,9 +165,9 @@ pub(crate) struct TableBox {
 
 /// One cell placed in the grid: its box plus the top-left coordinates and
 /// span it occupies after `colspan`/`rowspan` resolution (CSS 2.1 §17.5).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TableCell {
-    pub b: BoxNode,
+    pub b: SharedBox,
     pub row: usize,
     pub col: usize,
     pub rowspan: usize,
@@ -196,6 +199,7 @@ const MAX_CELL_SPAN_AREA: usize = 10_000;
 
 /// Build the box tree for a document. `None` when there is no root element
 /// (nothing to render).
+#[cfg(test)]
 pub(crate) fn build(
     dom: &Dom,
     base: &Url,
@@ -203,6 +207,17 @@ pub(crate) fn build(
     forms: &[Form],
     vp: Vp,
 ) -> Option<BoxNode> {
+    build_document(dom, base, controls, forms, vp, false).map(Arc::unwrap_or_clone)
+}
+
+pub(super) fn build_document(
+    dom: &Dom,
+    base: &Url,
+    controls: &ControlMap,
+    forms: &[Form],
+    vp: Vp,
+    reuse: bool,
+) -> Option<SharedBox> {
     let root = dom
         .children(DOCUMENT)
         .into_iter()
@@ -215,10 +230,11 @@ pub(crate) fn build(
         vp,
         lists: Vec::new(),
         table_depth: 0,
+        reuse,
     };
     match b.element(root) {
-        Built::Block(bx) => Some(*bx),
-        Built::Inline(inl) => Some(BoxNode {
+        Built::Block(bx) => Some(bx),
+        Built::Inline(inl) => Some(Arc::new(BoxNode {
             node: root,
             style: BoxStyle::of(dom, root, vp),
             content: Content::Inlines(vec![inl]),
@@ -226,7 +242,7 @@ pub(crate) fn build(
             marker_image: None,
             marker_inside: false,
             oof: Vec::new(),
-        }),
+        })),
         _ => None,
     }
 }
@@ -252,9 +268,10 @@ pub(crate) fn build_at(
         vp,
         lists: Vec::new(),
         table_depth: 0,
+        reuse: false,
     };
     match b.element(boundary) {
-        Built::Block(bx) => Some(*bx),
+        Built::Block(bx) => Some(Arc::unwrap_or_clone(bx)),
         Built::Inline(inl) => Some(BoxNode {
             node: boundary,
             style: BoxStyle::of(dom, boundary, vp),
@@ -303,8 +320,9 @@ fn atomic_inline_disp(dom: &Dom, id: NodeId) -> Option<Disp> {
 }
 
 /// What building one DOM child produced.
-enum Built {
-    Block(Box<BoxNode>),
+#[derive(Clone, Debug)]
+pub(super) enum Built {
+    Block(SharedBox),
     Inline(Inline),
     /// `display:contents`: no box — the children hoist into the parent.
     Hoist(Vec<Built>),
@@ -325,8 +343,8 @@ impl Built {
 /// `<svg>` was already rewritten to `<img data:…>` by `rewrite_inline_svgs`;
 /// what remains here has no terminal rendering.
 const SKIP: &[&str] = &[
-    "base", "canvas", "head", "link", "math", "meta", "noscript", "object", "script", "style",
-    "template", "title", "wbr", "area", "map", "datalist",
+    "base", "head", "link", "math", "meta", "noscript", "object", "script", "style", "template",
+    "title", "wbr", "area", "map", "datalist",
 ];
 
 struct Builder<'a> {
@@ -341,10 +359,38 @@ struct Builder<'a> {
     /// How many `display:table` wrappers enclose the current box — the
     /// `MAX_TABLE_DEPTH` recursion lid.
     table_depth: usize,
+    reuse: bool,
 }
 
 impl Builder<'_> {
     fn element(&mut self, id: NodeId) -> Built {
+        if self.reuse {
+            let cached =
+                self.dom
+                    .box_tree_cache
+                    .borrow_mut()
+                    .get(id, &self.lists, self.table_depth);
+            if let Some((built, lists)) = cached {
+                self.lists = lists;
+                return built;
+            }
+        }
+        let lists = self.lists.clone();
+        let depth = self.table_depth;
+        let built = self.element_uncached(id);
+        if self.reuse {
+            // A changed counter/context can rebuild a box even when its own
+            // DOM node was not dirty. Its previous flow result is not valid.
+            self.dom.layout_cache.borrow_mut().invalidate(id);
+            self.dom
+                .box_tree_cache
+                .borrow_mut()
+                .insert(id, lists, depth, &self.lists, &built);
+        }
+        built
+    }
+
+    fn element_uncached(&mut self, id: NodeId) -> Built {
         let Some(tag) = self.dom.tag_name(id) else {
             return Built::Skip;
         };
@@ -431,7 +477,7 @@ impl Builder<'_> {
                     d => self.container(id, d),
                 },
             };
-            return Built::Inline(Inline::OutOfFlow(Box::new(b)));
+            return Built::Inline(Inline::OutOfFlow(Arc::new(b)));
         }
         // Float (§9.5): out of normal flow, its display blockified (§9.7). Like
         // the out-of-flow path, it rides the inline list — but it is NOT a
@@ -453,7 +499,7 @@ impl Builder<'_> {
                     d => self.container(id, d),
                 },
             };
-            return Built::Inline(Inline::Float(Box::new(b)));
+            return Built::Inline(Inline::Float(Arc::new(b)));
         }
         if let Replaced::Atom(kind) = rep {
             return self.atom(id, disp, kind);
@@ -505,7 +551,7 @@ impl Builder<'_> {
             });
             if !has_content_img {
                 let kids = self.build_child_list(&[media], false);
-                return Built::Block(Box::new(self.assemble(
+                return Built::Block(Arc::new(self.assemble(
                     id,
                     BoxStyle::of(self.dom, id, self.vp),
                     kids,
@@ -525,18 +571,18 @@ impl Builder<'_> {
                 Disp::Table => self.table(id),
                 d => self.container(id, d),
             };
-            return Built::Inline(Inline::AtomBox(Box::new(b)));
+            return Built::Inline(Inline::AtomBox(Arc::new(b)));
         }
         match disp {
-            Disp::Table => Built::Block(Box::new(self.table(id))),
+            Disp::Table => Built::Block(Arc::new(self.table(id))),
             Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid => {
-                Built::Block(Box::new(self.container(id, disp)))
+                Built::Block(Arc::new(self.container(id, disp)))
             }
             Disp::Inline => {
                 let kids = self.children(id);
                 if kids.iter().any(Built::is_block) {
                     // Block-in-inline: promote (see module docs).
-                    Built::Block(Box::new(self.assemble(
+                    Built::Block(Arc::new(self.assemble(
                         id,
                         BoxStyle::of(self.dom, id, self.vp),
                         kids,
@@ -547,7 +593,7 @@ impl Builder<'_> {
                 } else {
                     Built::Inline(Inline::Box {
                         node: id,
-                        style: Box::new(BoxStyle::of(self.dom, id, self.vp)),
+                        style: Arc::new(BoxStyle::of(self.dom, id, self.vp)),
                         kids: kids
                             .into_iter()
                             .filter_map(|k| match k {
@@ -612,29 +658,37 @@ impl Builder<'_> {
         let frame = BoxNode {
             node: id,
             style,
-            content: Content::Blocks(body.into_iter().collect()),
+            content: Content::Blocks(body.into_iter().map(Arc::new).collect()),
             marker: None,
             marker_image: None,
             marker_inside: false,
             oof: Vec::new(),
         };
         if Pos::of(self.dom, id).out_of_flow() {
-            return Built::Inline(Inline::OutOfFlow(Box::new(frame)));
+            return Built::Inline(Inline::OutOfFlow(Arc::new(frame)));
         }
         if super::float::float_side(self.dom, id).is_some() {
-            return Built::Inline(Inline::Float(Box::new(frame)));
+            return Built::Inline(Inline::Float(Arc::new(frame)));
         }
         match disp {
             Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid | Disp::Table => {
-                Built::Block(Box::new(frame))
+                Built::Block(Arc::new(frame))
             }
-            _ => Built::Inline(Inline::AtomBox(Box::new(frame))),
+            _ => Built::Inline(Inline::AtomBox(Arc::new(frame))),
         }
     }
 
     /// Classify a replaced element (shared by the in-flow and out-of-flow
     /// paths): its atom kind, a skip (nothing to draw), or not-replaced.
     fn replaced(&mut self, id: NodeId, tag: &str) -> Replaced {
+        if tag == "canvas" {
+            return Replaced::Atom(AtomKind::Img {
+                url: self.dom.canvas_data_url(id),
+                density: 1.0,
+                dimension_source: id,
+                alt: String::new(),
+            });
+        }
         if tag == "img" {
             let selected = self.image_src(id);
             return Replaced::Atom(AtomKind::Img {
@@ -683,20 +737,10 @@ impl Builder<'_> {
                 None => {}
             }
         }
-        // A `contenteditable` host bound to a field (http::walk_forms_arena made
-        // it a synthetic textarea) is ONE editable widget: render it as a
-        // control atom and skip its subtree (the editor's own markup isn't ours
-        // to flow) — the same path a real `<textarea>` takes.
-        if self.dom.is_contenteditable_host(id)
-            && let Some(&(form, field)) = self.controls.get(&id)
-            && self
-                .forms
-                .get(form)
-                .and_then(|f| f.fields.get(field))
-                .is_some_and(|f| f.kind != FieldKind::Hidden)
-        {
-            return Replaced::Atom(AtomKind::Control { form, field });
-        }
+        // HTML #attr-contenteditable changes editability, not CSS display or
+        // replaced-element status. Keep the editor's authored descendants
+        // (including styled paragraphs and generated placeholders). The form
+        // binding remains available for input/focus without replacing paint.
         Replaced::No
     }
 
@@ -707,7 +751,7 @@ impl Builder<'_> {
         let atom = Atom { node: id, kind };
         match disp {
             Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid => {
-                Built::Block(Box::new(BoxNode {
+                Built::Block(Arc::new(BoxNode {
                     node: id,
                     style: BoxStyle::of(self.dom, id, self.vp),
                     content: Content::Atomic(atom),
@@ -770,13 +814,13 @@ impl Builder<'_> {
     /// inline content); each contiguous run of text becomes an anonymous
     /// item; a run of only collapsible white space generates nothing.
     /// Out-of-flow children don't participate (§4.1) — returned separately.
-    fn itemize(&mut self, kids: Vec<Built>) -> (Vec<BoxNode>, Vec<BoxNode>) {
-        let mut items: Vec<BoxNode> = Vec::new();
-        let mut oof: Vec<BoxNode> = Vec::new();
+    fn itemize(&mut self, kids: Vec<Built>) -> (Vec<SharedBox>, Vec<SharedBox>) {
+        let mut items: Vec<SharedBox> = Vec::new();
+        let mut oof: Vec<SharedBox> = Vec::new();
         let mut run: Vec<Inline> = Vec::new();
-        let flush = |run: &mut Vec<Inline>, items: &mut Vec<BoxNode>| {
+        let flush = |run: &mut Vec<Inline>, items: &mut Vec<SharedBox>| {
             if run.iter().any(inline_has_content) {
-                items.push(BoxNode {
+                items.push(Arc::new(BoxNode {
                     node: crate::layout2::NO_NODE,
                     style: BoxStyle::anonymous(),
                     content: Content::Inlines(std::mem::take(run)),
@@ -784,7 +828,7 @@ impl Builder<'_> {
                     marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
-                });
+                }));
             } else {
                 run.clear();
             }
@@ -793,30 +837,30 @@ impl Builder<'_> {
             match k {
                 Built::Block(b) => {
                     flush(&mut run, &mut items);
-                    items.push(*b);
+                    items.push(b);
                 }
-                Built::Inline(Inline::OutOfFlow(b)) => oof.push(*b),
+                Built::Inline(Inline::OutOfFlow(b)) => oof.push(b),
                 // css-flexbox §4.1 / css-grid §6: `float` is ignored on a
                 // flex/grid item — the blockified box becomes an ordinary item.
                 Built::Inline(Inline::Float(b)) => {
                     flush(&mut run, &mut items);
-                    items.push(*b);
+                    items.push(b);
                 }
                 Built::Inline(Inline::Box { node, style, kids }) => {
                     flush(&mut run, &mut items);
-                    items.push(BoxNode {
+                    items.push(Arc::new(BoxNode {
                         node,
-                        style: *style,
-                        content: Content::Inlines(kids),
+                        style: (*style).clone(),
+                        content: Content::Inlines(kids.to_vec()),
                         marker: None,
                         marker_image: None,
                         marker_inside: false,
                         oof: Vec::new(),
-                    });
+                    }));
                 }
                 Built::Inline(Inline::Atom(a)) => {
                     flush(&mut run, &mut items);
-                    items.push(BoxNode {
+                    items.push(Arc::new(BoxNode {
                         node: a.node,
                         style: BoxStyle::of(self.dom, a.node, self.vp),
                         content: Content::Atomic(a),
@@ -824,7 +868,7 @@ impl Builder<'_> {
                         marker_image: None,
                         marker_inside: false,
                         oof: Vec::new(),
-                    });
+                    }));
                 }
                 // css-flexbox §4.1 / css-grid §6: an atomic inline box child of
                 // a flex/grid container is BLOCKIFIED into an ordinary item (its
@@ -832,7 +876,7 @@ impl Builder<'_> {
                 // the blockified content.
                 Built::Inline(Inline::AtomBox(b)) => {
                     flush(&mut run, &mut items);
-                    items.push(*b);
+                    items.push(b);
                 }
                 Built::Inline(i) => run.push(i),
                 Built::Hoist(_) | Built::Skip => {}
@@ -1020,18 +1064,18 @@ impl Builder<'_> {
                 oof: Vec::new(),
             };
             if b.style.position.out_of_flow() {
-                return Some(Built::Inline(Inline::OutOfFlow(Box::new(b))));
+                return Some(Built::Inline(Inline::OutOfFlow(Arc::new(b))));
             }
             if b.style.float.is_some() {
-                return Some(Built::Inline(Inline::Float(Box::new(b))));
+                return Some(Built::Inline(Inline::Float(Arc::new(b))));
             }
-            return Some(Built::Block(Box::new(b)));
+            return Some(Built::Block(Arc::new(b)));
         }
         if matches!(
             display.as_str(),
             "inline-block" | "inline-flex" | "inline-grid" | "inline-table"
         ) {
-            return Some(Built::Inline(Inline::AtomBox(Box::new(BoxNode {
+            return Some(Built::Inline(Inline::AtomBox(Arc::new(BoxNode {
                 node: crate::layout2::NO_NODE,
                 style,
                 content: Content::Inlines(kids),
@@ -1043,8 +1087,8 @@ impl Builder<'_> {
         }
         Some(Built::Inline(Inline::Box {
             node: crate::layout2::NO_NODE,
-            style: Box::new(style),
-            kids,
+            style: Arc::new(style),
+            kids: kids.into(),
         }))
     }
 
@@ -1109,11 +1153,11 @@ impl Builder<'_> {
                 oof: Vec::new(),
             };
         }
-        let mut blocks: Vec<BoxNode> = Vec::new();
+        let mut blocks: Vec<SharedBox> = Vec::new();
         let mut run: Vec<Inline> = Vec::new();
-        let flush = |run: &mut Vec<Inline>, blocks: &mut Vec<BoxNode>| {
+        let flush = |run: &mut Vec<Inline>, blocks: &mut Vec<SharedBox>| {
             if run.iter().any(inline_has_content) {
-                blocks.push(BoxNode {
+                blocks.push(Arc::new(BoxNode {
                     node: crate::layout2::NO_NODE,
                     style: BoxStyle::anonymous(),
                     content: Content::Inlines(std::mem::take(run)),
@@ -1121,7 +1165,7 @@ impl Builder<'_> {
                     marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
-                });
+                }));
             } else {
                 run.clear();
             }
@@ -1130,7 +1174,7 @@ impl Builder<'_> {
             match k {
                 Built::Block(b) => {
                     flush(&mut run, &mut blocks);
-                    blocks.push(*b);
+                    blocks.push(b);
                 }
                 Built::Inline(i) => run.push(i),
                 Built::Hoist(_) | Built::Skip => {}
@@ -1177,7 +1221,7 @@ impl Builder<'_> {
                 .as_deref()
                 .map(str::trim)
                 == Some("bottom");
-            let cap = self.container(c, Disp::Block);
+            let cap = Arc::new(self.container(c, Disp::Block));
             if bottom {
                 bottom_captions.push(cap);
             } else {
@@ -1192,7 +1236,7 @@ impl Builder<'_> {
         let cells = placed
             .into_iter()
             .map(|(cell, row, col, rowspan, colspan)| TableCell {
-                b: self.container(cell, Disp::Block),
+                b: Arc::new(self.container(cell, Disp::Block)),
                 row,
                 col,
                 rowspan,

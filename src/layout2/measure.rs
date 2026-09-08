@@ -68,7 +68,7 @@ struct Own {
 fn walk(f: &Frag<'_>, o: &mut Own) {
     if f.node != NO_NODE {
         o.nodes.insert(f.node);
-        if matches!(f.kind, FragKind::Block) {
+        if matches!(f.kind, FragKind::Block | FragKind::TableCell(_)) {
             let r = Rect {
                 x0: f.x,
                 y0: f.y,

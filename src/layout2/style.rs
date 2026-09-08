@@ -165,13 +165,15 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
 /// used values in px (0 when the side's style is `none`/`hidden`); whether
 /// borders paint is a frontend concern; their canonical geometry is always
 /// honored and retained at fractional CSS-pixel precision.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BoxStyle {
     /// Generated boxes have no DOM node of their own, but CSS Pseudo 4 §4.1
     /// gives them a complete computed style. Retain the originating element
     /// and pseudo identity so graphical paint reads that style rather than
     /// treating the fragment as an unstyled anonymous box.
     pub pseudo: Option<(NodeId, PseudoEl)>,
+    /// CSS Conditional 5: inline-size (1) or two-axis (2) containment.
+    pub size_container: u8,
     pub margin: [Len; 4],
     pub padding: [Len; 4],
     pub border: [f32; 4],
@@ -204,6 +206,9 @@ pub(crate) struct BoxStyle {
     /// containing-block former for out-of-flow descendants (transforms-1 §3)
     /// even when the translation component is zero.
     pub has_transform: bool,
+    /// CSS Masking 1 §5: a clipping path forms a stacking context, but
+    /// unlike a transform it does not establish a containing block.
+    pub has_clip_path: bool,
     /// Used `opacity`, clamped to the CSS `<alpha-value>` range. Retaining the
     /// number (rather than the old terminal-only boolean) lets graphical paint
     /// composite the entire stacking context as one group.
@@ -225,6 +230,7 @@ impl BoxStyle {
     pub fn anonymous() -> BoxStyle {
         BoxStyle {
             pseudo: None,
+            size_container: 0,
             margin: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
             padding: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
             border: [0.0; 4],
@@ -243,6 +249,7 @@ impl BoxStyle {
             tx: (0.0, 0.0),
             ty: (0.0, 0.0),
             has_transform: false,
+            has_clip_path: false,
             opacity: 1.0,
             bg: false,
             float: None,
@@ -288,6 +295,7 @@ impl BoxStyle {
         };
         BoxStyle {
             pseudo: None,
+            size_container: dom.size_container_kind(id),
             margin: [
                 side("margin-top", TOP, ua_margin),
                 side("margin-right", RIGHT, ua_margin),
@@ -328,6 +336,7 @@ impl BoxStyle {
             tx,
             ty,
             has_transform,
+            has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             opacity: dom.effective_opacity(id),
             bg: declares_background(dom, id),
             // §9.7: an out-of-flow box computes `float:none` (positioning wins).
@@ -424,6 +433,7 @@ impl BoxStyle {
         };
         BoxStyle {
             pseudo: Some((id, which)),
+            size_container: 0,
             margin: [
                 len("margin-top", Len::px(0.0)),
                 len("margin-right", Len::px(0.0)),
@@ -469,6 +479,7 @@ impl BoxStyle {
             has_transform: cv("transform")
                 .as_deref()
                 .is_some_and(|value| !matches!(value.trim(), "" | "none")),
+            has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             opacity: cv("opacity")
                 .as_deref()
                 .and_then(|value| {
@@ -496,6 +507,7 @@ impl BoxStyle {
         (self.position.positioned() && self.z_index.is_some())
             || matches!(self.position, Pos::Fixed | Pos::Sticky)
             || self.has_transform
+            || self.has_clip_path
             || self.opacity < 1.0
             || (item && self.z_index.is_some())
     }
@@ -956,12 +968,13 @@ pub(crate) enum WordBrk {
 /// link, the semantic `ItemKind` (heading/quote/pre coloring), the STICKY
 /// `opacity:0` chain (a subtree group — a descendant cannot re-reveal it,
 /// unlike `visibility`), and `font-size:0` (`None` = inherit).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InlineStyle {
     pub kind: ItemKind,
     pub emph: Emphasis,
     pub link: Option<crate::doc::Link>,
     pub node: NodeId,
+    pub pseudo: Option<(NodeId, PseudoEl)>,
     pub ws: WhiteSpace,
     pub transform: TextTransform,
     /// CSS Text spacing in CSS pixels. Parley applies both after shaping and
@@ -989,13 +1002,13 @@ pub(crate) struct InlineStyle {
     opacity_chain: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum TabSize {
     Spaces(f32),
     Length(f32),
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) enum VerticalAlign {
     #[default]
     Baseline,
@@ -1015,6 +1028,7 @@ impl InlineStyle {
             emph: Emphasis::default(),
             link: None,
             node: NO_NODE,
+            pseudo: None,
             ws: WhiteSpace::Normal,
             transform: TextTransform::None,
             letter: 0.0,
@@ -1040,6 +1054,7 @@ impl InlineStyle {
         let u = Units::of(dom, id);
         let mut s = parent.clone();
         s.node = id;
+        s.pseudo = None;
         match dom.tag_name(id) {
             Some("a") => {
                 if let Some(href) = dom.attr(id, "href") {
@@ -1225,6 +1240,14 @@ impl InlineStyle {
             underline: self.emph.underline,
             strikethrough: self.emph.strike,
         }
+    }
+
+    pub fn with_pseudo(&self, pseudo: Option<(NodeId, PseudoEl)>) -> Self {
+        let mut style = self.clone();
+        if let Some(pseudo) = pseudo {
+            style.pseudo = Some(pseudo);
+        }
+        style
     }
 }
 
