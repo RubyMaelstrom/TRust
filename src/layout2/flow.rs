@@ -3468,18 +3468,12 @@ impl Flow<'_> {
                 let FragKind::Oof(b, ctx) = ph.kind else {
                     unreachable!()
                 };
-                // A paint-suppressed (opacity:0 chain) out-of-flow box usually
-                // contributes no visible paint. Retain it when its subtree
-                // contains a hit-testable hyperlink, however: opacity affects
-                // painting, not box generation or pointer targeting. This
-                // narrow exception preserves the old invisible-media
-                // optimization while keeping semantic transparent controls.
-                let pseudo = b.node == NO_NODE;
-                if (ctx.opacity_suppressed() || (!pseudo && self.dom.paint_suppressed(b.node)))
-                    && (pseudo || !self.dom.subtree_has_point_hit_target(b.node))
-                {
-                    continue;
-                }
+                // CSS Color 4 #transparency applies opacity after layout.
+                // Even a fully transparent, pointer-events:none positioned
+                // box retains geometry and scrollable overflow. CSSOM View
+                // offset*/getClientRects measure it; carousel navigation
+                // commonly uses those dimensions to find eligible slides.
+                // Suppress transparent pixels in paint, never box generation.
                 let fixed = b.style.position == Pos::Fixed;
                 let top_layer = b.node != NO_NODE && self.dom.is_popover_showing(b.node);
                 let pinned = fixed && child_fixed.is_none() && !top_layer;

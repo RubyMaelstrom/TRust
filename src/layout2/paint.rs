@@ -70,7 +70,6 @@ struct TerminalNodePaint {
     vertical_scroll: bool,
     horizontal_scroll: bool,
     principal_scroll: bool,
-    point_hit_subtree: bool,
     background_covers: bool,
     scrollbar_hidden: bool,
     /// The element is an atomic inline formatting context or an item in a
@@ -184,7 +183,6 @@ impl TerminalPaintModel {
                 vertical_scroll: dom.is_scroll_container(node),
                 horizontal_scroll: dom.is_hscroll_container(node),
                 principal_scroll: dom.is_principal_scroller(node),
-                point_hit_subtree: dom.subtree_has_point_hit_target(node),
                 background_covers: terminal_background_covers_dom(dom, node),
                 scrollbar_hidden: matches!(
                     dom.computed_value_resolved(node, "scrollbar-width")
@@ -2025,6 +2023,7 @@ fn build_sc(
     links: &HashMap<NodeId, Link>,
     line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
+    let first_op = ops.len();
     // E.2 step 1/2: the element's own background.
     hit_op(f, ops, cw, ch, ox, oy, links);
     fill_op(dom, f, ops, cw, ch, ox, oy);
@@ -2059,6 +2058,17 @@ fn build_sc(
     // E.2 step 9: positive-z stacking contexts, smallest first.
     for c in pos {
         build_sc(dom, c, ops, cw, ch, ox, oy, links, line_rows);
+    }
+    // CSS Color 4 #transparency suppresses the entire painted group, not
+    // its layout boxes or pointer targets. Keep non-painting hit operations
+    // in paint order, but do not let transparent backgrounds/borders/ghost
+    // text erase an underlying terminal cell. Geometry was measured earlier.
+    if f.paint.opacity <= 0.0 {
+        let hits: Vec<_> = ops
+            .drain(first_op..)
+            .filter(|op| matches!(op, Op::Hit { .. }))
+            .collect();
+        ops.extend(hits);
     }
 }
 
