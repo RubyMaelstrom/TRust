@@ -52,6 +52,9 @@ accesskit_winit = { version = "0.33.2", default-features = false, features = ["a
 aes = "0.8.4"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 bytes = "1.12.1"
+# Already used by the raster stack; CSS Color 4 parsing, white-point adaptation
+# and color-space conversion also serve the shared CSS paint path.
+color = "0.3.3"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Default features = the pure-Rust `miniz_oxide` backend. NEVER enable the
 # `zlib`/`zlib-ng`/`cloudflare_zlib`/`miniz-sys` features — those pull a C

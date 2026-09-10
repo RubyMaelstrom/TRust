@@ -23,12 +23,12 @@ use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
 pub use crate::performance::{FetchTiming, NavigationType};
 use crate::tls;
 
-// Per-response ceiling — a memory guard, not a correctness limit. The big
-// web ships large app bundles: YouTube's `kevlar_base` is ~10.5 MB of
-// minified JS, so 5 MB silently dropped it. 16 MB clears today's giants with
-// headroom while staying bounded (bodies are transient: parsed, then only the
-// post-JS HTML is retained).
-const MAX_BODY: usize = 16 * 1024 * 1024;
+// Per-response memory guard, shared by HTTP framing and content decoding.
+// Fetch/XHR bodies include binary application assets (archives, disk images,
+// and WASM data), not just scripts. 512 MiB accommodates those resources,
+// including game archives well over 100 MiB, while keeping buffering bounded.
+// RFC 9112 §6.3 defines framing independently of the resource's media type.
+const MAX_BODY: usize = 512 * 1024 * 1024;
 // A single request's wall cap. Generous because a streamed LLM chat completion
 // (Open WebUI → llama.cpp) holds the connection open for the WHOLE generation —
 // a reasoning model can think for a minute or more before the body closes. The
@@ -13535,6 +13535,99 @@ customElements.define('lit-counter', LitCounter);
             same_origin_request.fetch_metadata.map(|m| m.site),
             Some(FetchSite::SameOrigin)
         );
+    }
+
+    #[tokio::test]
+    async fn large_response_bodies_preserve_bytes_for_every_framing() {
+        // RFC 9112 §6.3 / §7.1.3: framing determines the complete byte
+        // sequence delivered to Fetch/XHR, including binary app resources
+        // larger than the former 16 MiB script-oriented ceiling.
+        let mut payload = vec![0xa5; 17 * 1024 * 1024];
+        payload[..4].copy_from_slice(b"PK\x03\x04");
+        *payload.last_mut().unwrap() = 0x5a;
+        for framing in ["length", "chunked", "eof"] {
+            let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n".to_vec();
+            match framing {
+                "length" => {
+                    raw.extend_from_slice(
+                        format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes(),
+                    );
+                    raw.extend_from_slice(&payload);
+                }
+                "chunked" => {
+                    raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                    // Cross the old cap cumulatively, not in one large chunk.
+                    for chunk in payload.chunks(1024 * 1024) {
+                        raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                        raw.extend_from_slice(chunk);
+                        raw.extend_from_slice(b"\r\n");
+                    }
+                    raw.extend_from_slice(b"0\r\n\r\n");
+                }
+                _ => {
+                    raw.extend_from_slice(b"Connection: close\r\n\r\n");
+                    raw.extend_from_slice(&payload);
+                }
+            }
+            let (status, _, body, reusable, _) =
+                read_response(&mut BufReader::new(raw.as_slice()), false)
+                    .await
+                    .unwrap_or_else(|error| panic!("{framing}: {error}"));
+            assert_eq!(status, 200);
+            assert_eq!(body.len(), payload.len(), "{framing}");
+            assert!(body == payload, "{framing} must preserve every byte");
+            assert_eq!(reusable, framing != "eof", "{framing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn large_response_gzip_preserves_the_complete_decoded_body() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+        let payload = vec![0xa5; 17 * 1024 * 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&compressed);
+        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw.as_slice()), false)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), payload.len());
+        assert!(body == payload);
+        assert!(reusable);
+    }
+
+    #[tokio::test]
+    async fn large_response_limit_still_rejects_oversized_framing() {
+        // Reject before allocating the advertised body, and retain HEAD's
+        // no-body precedence even when Content-Length exceeds the ceiling.
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        let error = read_response(&mut BufReader::new(raw.as_bytes()), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cap"), "{error}");
+        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw.as_bytes()), true)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+        assert!(reusable);
+
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            MAX_BODY + 1
+        );
+        let error = read_response(&mut BufReader::new(raw.as_bytes()), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cap"), "{error}");
     }
 
     #[tokio::test]

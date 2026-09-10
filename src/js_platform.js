@@ -3571,9 +3571,18 @@
         return /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(token)
             && Number(token) !== 0;
     };
+    // CSS Conditional 3 #support-definition: style assignment and
+    // CSS.supports() must agree with the colors the shared painter accepts.
+    const colorProperties = new Set([
+        "color", "background-color", "border-top-color", "border-right-color",
+        "border-bottom-color", "border-left-color", "outline-color", "text-decoration-color"
+    ]);
     const acceptsStyleValue = (property, value) => {
         property = String(property).toLowerCase();
         value = String(value).trim();
+        if (colorProperties.has(property)) {
+            return __css_supports_color(value.replace(/\s*!\s*important\s*$/i, ""));
+        }
         if (!unitlessNonzeroLengthProperties.has(property)) return true;
         // Parenthesized function tokens are not split, so their internal
         // scalar numbers are handled by the function grammar.
