@@ -521,6 +521,8 @@ struct TextSystem {
     shape_cache: HashMap<ShapeKey, CachedShape>,
     shape_order: VecDeque<ShapeKey>,
     shape_cache_bytes: usize,
+    #[cfg(test)]
+    shaped_input_bytes: usize,
 }
 
 // A gallery-sized DOM can contain several thousand distinct words/runs. Keep
@@ -597,6 +599,8 @@ impl TextSystem {
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
+            #[cfg(test)]
+            shaped_input_bytes: 0,
         }
     }
 
@@ -652,6 +656,25 @@ impl TextSystem {
                 ..ShapedText::default()
             };
         }
+        let mut layout = self.styled_layout(text, style, quantize, None);
+        layout.break_all_lines(None);
+        let mut retained = retain_first_line(text, &layout);
+        retained.underline = style.underline;
+        retained.strikethrough = style.strikethrough;
+        retained
+    }
+
+    fn styled_layout(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        quantize: bool,
+        breaks: Option<TextBreakStyle>,
+    ) -> Layout<()> {
+        #[cfg(test)]
+        {
+            self.shaped_input_bytes += text.len();
+        }
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, quantize);
@@ -676,12 +699,24 @@ impl TextSystem {
         }));
         builder.push_default(StyleProperty::Underline(style.underline));
         builder.push_default(StyleProperty::Strikethrough(style.strikethrough));
-        let mut layout: Layout<()> = builder.build(text);
-        layout.break_all_lines(None);
-        let mut retained = retain_first_line(text, &layout);
-        retained.underline = style.underline;
-        retained.strikethrough = style.strikethrough;
-        retained
+        if let Some(breaks) = breaks {
+            builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
+                TextWordBreak::Normal => WordBreak::Normal,
+                TextWordBreak::BreakAll => WordBreak::BreakAll,
+                TextWordBreak::KeepAll => WordBreak::KeepAll,
+            }));
+            builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
+                TextOverflowWrap::Normal => OverflowWrap::Normal,
+                TextOverflowWrap::Anywhere => OverflowWrap::Anywhere,
+                TextOverflowWrap::BreakWord => OverflowWrap::BreakWord,
+            }));
+            builder.push_default(StyleProperty::TextWrapMode(if breaks.wrap {
+                TextWrapMode::Wrap
+            } else {
+                TextWrapMode::NoWrap
+            }));
+        }
+        builder.build(text)
     }
 
     fn first_line_end(
@@ -695,50 +730,54 @@ impl TextSystem {
         if text.is_empty() || width <= 0.0 || style.size <= 0.0 {
             return 0;
         }
-        let mut builder = self
-            .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, true);
-        let family = font_family_source(&style.family);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
-        builder.push_default(StyleProperty::Locale(text_language(style)));
-        builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
-        builder.push_default(StyleProperty::FontWeight(FontWeight::new(
-            style.weight.clamp(1.0, 1000.0),
-        )));
-        builder.push_default(StyleProperty::FontStyle(if style.italic {
-            FontStyle::Italic
-        } else {
-            FontStyle::Normal
-        }));
-        builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
-        builder.push_default(StyleProperty::WordSpacing(style.word_spacing));
-        builder.push_default(StyleProperty::LineHeight(match style.line_height {
-            CssLineHeight::Normal => LineHeight::default(),
-            CssLineHeight::Number(number) => LineHeight::FontSizeRelative(number.max(0.0)),
-            CssLineHeight::Length(px) => LineHeight::Absolute(px.max(0.0)),
-        }));
-        builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
-            TextWordBreak::Normal => WordBreak::Normal,
-            TextWordBreak::BreakAll => WordBreak::BreakAll,
-            TextWordBreak::KeepAll => WordBreak::KeepAll,
-        }));
-        builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
-            TextOverflowWrap::Normal => OverflowWrap::Normal,
-            TextOverflowWrap::Anywhere => OverflowWrap::Anywhere,
-            TextOverflowWrap::BreakWord => OverflowWrap::BreakWord,
-        }));
-        builder.push_default(StyleProperty::TextWrapMode(if breaks.wrap {
-            TextWrapMode::Wrap
-        } else {
-            TextWrapMode::NoWrap
-        }));
-        let mut layout: Layout<()> = builder.build(text);
-        layout.break_all_lines(Some(width.max(0.01)));
+        let mut layout = self.styled_layout(text, style, true, Some(breaks));
+        let mut breaker = layout.break_lines();
+        breaker.state_mut().set_layout_max_advance(width.max(0.01));
+        breaker.state_mut().set_line_max_advance(width.max(0.01));
+        breaker.break_next();
+        breaker.finish();
         layout
             .lines()
             .next()
             .map(|line| line.text_range().end.min(text.len()))
             .unwrap_or(0)
+    }
+
+    fn wrapped_lines(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        first_width: f32,
+        width: f32,
+        breaks: TextBreakStyle,
+    ) -> Vec<ShapedText> {
+        self.refresh_page_fonts();
+        if text.is_empty() || style.size <= 0.0 {
+            return Vec::new();
+        }
+        // Shape one paragraph, then advance a single greedy breaker. Rebuilding
+        // the shrinking tail on every line makes long preserved text quadratic.
+        // CSS Text 3 #word-break-shaping also requires joining forms to survive
+        // emergency line breaks; retain glyphs from the whole shaped paragraph.
+        let mut layout = self.styled_layout(text, style, true, Some(breaks));
+        let mut breaker = layout.break_lines();
+        breaker.state_mut().set_layout_max_advance(f32::INFINITY);
+        breaker
+            .state_mut()
+            .set_line_max_advance(first_width.max(0.01));
+        while breaker.break_next().is_some() {
+            breaker.state_mut().set_line_max_advance(width.max(0.01));
+        }
+        breaker.finish();
+        layout
+            .lines()
+            .map(|line| {
+                let mut shaped = retain_line(text, &line);
+                shaped.underline = style.underline;
+                shaped.strikethrough = style.strikethrough;
+                shaped
+            })
+            .collect()
     }
 
     fn content_widths(
@@ -855,6 +894,19 @@ pub fn first_line_end(text: &str, style: &TextStyle, width: f32, breaks: TextBre
     TEXT.with_borrow_mut(|system| system.first_line_end(text, style, width, breaks))
 }
 
+/// Shape and wrap a preserved-whitespace run in a rectangular inline region.
+/// The first line can have a different available width (indent/preceding boxes).
+/// Callers with varying float exclusions retain the per-line composition path.
+pub(crate) fn wrapped_lines(
+    text: &str,
+    style: &TextStyle,
+    first_width: f32,
+    width: f32,
+    breaks: TextBreakStyle,
+) -> Vec<ShapedText> {
+    TEXT.with_borrow_mut(|system| system.wrapped_lines(text, style, first_width, width, breaks))
+}
+
 /// CSS min-/max-content bounds for a single styled text run.
 pub fn content_widths(text: &str, style: &TextStyle, breaks: TextBreakStyle) -> (f32, f32) {
     TEXT.with_borrow_mut(|system| system.content_widths(text, style, breaks))
@@ -867,12 +919,20 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
             ..ShapedText::default()
         };
     };
+    let mut shaped = retain_line(text, &line);
+    shaped.text = text.to_string();
+    shaped
+}
+
+fn retain_line(text: &str, line: &parley::Line<'_, ()>) -> ShapedText {
+    let range = line.text_range();
+    let line_text = &text[range.clone()];
     let metrics = line.metrics();
     let mut runs = Vec::new();
     let mut clusters: Vec<Cluster> = Vec::new();
-    let graphemes: Vec<Range<usize>> = text
+    let graphemes: Vec<Range<usize>> = line_text
         .grapheme_indices(true)
-        .map(|(start, grapheme)| start..start + grapheme.len())
+        .map(|(start, grapheme)| range.start + start..range.start + start + grapheme.len())
         .collect();
     let mut cluster_x = metrics.offset;
     for run in line.runs() {
@@ -888,6 +948,7 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
                 .filter(|range| range.start < shaped_range.end && shaped_range.start < range.end)
                 .cloned()
                 .unwrap_or_else(|| shaped_range.clone());
+            let logical_range = logical_range.start - range.start..logical_range.end - range.start;
             if let Some(previous) = clusters.last_mut()
                 && previous.text_range == logical_range
             {
@@ -923,18 +984,18 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
                 .map(|glyph| ShapedGlyph {
                     id: glyph.id,
                     x: glyph.x,
-                    y: glyph.y,
+                    y: glyph.y - metrics.block_min_coord,
                     advance: glyph.advance,
                 })
                 .collect(),
-            text_range: run.text_range(),
+            text_range: run.text_range().start - range.start..run.text_range().end - range.start,
             rtl: run.is_rtl(),
             synth_bold: synthesis.embolden(),
             synth_skew_degrees: synthesis.skew(),
         });
     }
     ShapedText {
-        text: text.to_string(),
+        text: line_text.to_string(),
         // Whitespace processing already happened in the CSS inline formatter.
         // Retain the actual shaped advance here: preserved/trailing spaces and
         // tab-size bases must occupy geometry, while collapsed trailing space
@@ -944,7 +1005,7 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
         descent: metrics.descent,
         leading: metrics.leading,
         line_height: metrics.line_height,
-        baseline: metrics.baseline,
+        baseline: metrics.baseline - metrics.block_min_coord,
         underline: false,
         strikethrough: false,
         runs,
@@ -955,6 +1016,136 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_paragraph_retains_line_local_glyphs_and_cluster_ranges() {
+        let style = TextStyle {
+            size: 13.0,
+            line_height: CssLineHeight::Number(1.5),
+            underline: true,
+            ..TextStyle::default()
+        };
+        let breaks = TextBreakStyle {
+            wrap: true,
+            ..TextBreakStyle::default()
+        };
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+        let lines = wrapped_lines(&text, &style, 79.0, 237.0, breaks);
+        assert!(lines.len() > 10);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        let mut rest = text.as_str();
+        for (index, line) in lines.iter().enumerate() {
+            let width = if index == 0 { 79.0 } else { 237.0 };
+            let cut = first_line_end(rest, &style, width, breaks);
+            assert_eq!(line.text, &rest[..cut]);
+            rest = &rest[cut..];
+            let independent = shape(&line.text, &style);
+            assert!((line.advance - independent.advance).abs() < 0.02);
+            assert!((line.baseline - independent.baseline).abs() < 0.02);
+            assert!(line.underline);
+            assert!(
+                line.runs
+                    .iter()
+                    .all(|run| run.text_range.end <= line.text.len())
+            );
+            assert!(
+                line.clusters
+                    .iter()
+                    .all(|cluster| cluster.text_range.end <= line.text.len())
+            );
+            assert!(
+                line.runs
+                    .iter()
+                    .flat_map(|run| &run.glyphs)
+                    .all(|glyph| glyph.y.abs() < style.size * 3.0)
+            );
+        }
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn wrapped_paragraph_preserves_emergency_shaping_and_graphemes() {
+        let style = TextStyle::default();
+        let breaks = TextBreakStyle {
+            wrap: true,
+            overflow_wrap: TextOverflowWrap::Anywhere,
+            ..TextBreakStyle::default()
+        };
+        for text in [
+            "نوشتننوشتننوشتن",
+            "a\u{301}b\u{301}c\u{301}",
+            "你好世界こんにちは",
+            "👩‍👩‍👧‍👦👩‍👩‍👧‍👦",
+        ] {
+            let lines = wrapped_lines(text, &style, 20.0, 20.0, breaks);
+            assert!(lines.len() > 1, "{text}");
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<String>(),
+                text
+            );
+            let boundaries: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(start, _)| start)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            let mut end = 0;
+            for line in &lines {
+                end += line.text.len();
+                assert!(
+                    boundaries.contains(&end),
+                    "split grapheme in {text} at {end}"
+                );
+            }
+            let mut original: Vec<_> = shape(text, &style)
+                .runs
+                .into_iter()
+                .flat_map(|run| run.glyphs.into_iter().map(|glyph| glyph.id))
+                .collect();
+            let mut wrapped: Vec<_> = lines
+                .into_iter()
+                .flat_map(|line| line.runs)
+                .flat_map(|run| run.glyphs.into_iter().map(|glyph| glyph.id))
+                .collect();
+            original.sort_unstable();
+            wrapped.sort_unstable();
+            assert_eq!(
+                wrapped, original,
+                "joining forms must survive emergency wrapping: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_paragraph_shaping_work_is_linear_and_not_line_count_dependent() {
+        let mut system = TextSystem::new();
+        let style = TextStyle::default();
+        let breaks = TextBreakStyle {
+            wrap: true,
+            ..TextBreakStyle::default()
+        };
+        for count in [250, 500] {
+            let text = "A long paragraph must be shaped only once. ".repeat(count);
+            for width in [80.0, 800.0] {
+                let before = system.shaped_input_bytes;
+                let lines = system.wrapped_lines(&text, &style, width, width, breaks);
+                assert!(lines.len() > 10);
+                assert_eq!(system.shaped_input_bytes - before, text.len());
+                assert_eq!(
+                    lines.iter().map(|line| line.text.len()).sum::<usize>(),
+                    text.len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn proportional_advances_are_not_character_counts() {
@@ -1081,6 +1272,8 @@ mod tests {
         let mut editor = TextEditor::new("a👩‍👩‍👧‍👦", &TextStyle::default(), 300.0, false);
         assert!(editor.handle_key(&KeyInput {
             key: Key::Backspace,
+            code: String::new(),
+            location: 0,
             state: KeyState::Pressed,
             modifiers: Default::default(),
             repeat: false,
@@ -1095,6 +1288,8 @@ mod tests {
         editor.select_byte_range(0, 0);
         assert!(editor.handle_key(&KeyInput {
             key: Key::Delete,
+            code: String::new(),
+            location: 0,
             state: KeyState::Pressed,
             modifiers: Default::default(),
             repeat: false,
@@ -1121,6 +1316,8 @@ mod tests {
         let mut editor = TextEditor::new("abc שלום", &TextStyle::default(), 300.0, false);
         editor.handle_key(&KeyInput {
             key: Key::ArrowLeft,
+            code: String::new(),
+            location: 0,
             state: KeyState::Pressed,
             modifiers: crate::core::Modifiers {
                 shift: true,

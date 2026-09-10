@@ -58,6 +58,7 @@ dependencies = [
  "wgpu",
  "winit",
  "wuff",
+ "xml-rs",
 ]
 
 [[package]]

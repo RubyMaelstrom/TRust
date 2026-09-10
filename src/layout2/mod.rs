@@ -644,8 +644,41 @@ pub fn adapt_terminal(
         };
     };
     let mut root = cache.root.clone();
-    let fixed = cache.fixed.clone();
-    let top_layer = cache.top_layer.clone();
+    let mut fixed = cache.fixed.clone();
+    let mut top_layer = cache.top_layer.clone();
+    // Terminal graphics still consume PNG URLs, but only the terminal adapter
+    // serializes them. The shared fragments and graphical paint remain native
+    // immutable bitmaps; adapting an old page cannot read a newer canvas.
+    if !layout.paint.canvas_images.is_empty() {
+        let canvases: HashMap<_, _> = layout
+            .paint
+            .canvas_images
+            .iter()
+            .filter_map(|(node, image)| image.data_url().map(|url| (*node, url)))
+            .collect();
+        fn attach(fragment: &mut flow::Frag<'_>, canvases: &HashMap<NodeId, String>) {
+            if let flow::FragKind::Line(line) = &mut fragment.kind {
+                for piece in &mut line.pieces {
+                    if piece.shaped.is_none()
+                        && piece.item.text.is_empty()
+                        && let Some(url) = canvases.get(&piece.item.node)
+                    {
+                        piece.item.image = Some(url.clone());
+                    }
+                }
+            }
+            for child in &mut fragment.children {
+                attach(child, canvases);
+            }
+        }
+        attach(&mut root, &canvases);
+        for fragment in &mut fixed {
+            attach(fragment, &canvases);
+        }
+        for entry in &mut top_layer {
+            attach(&mut entry.fragment, &canvases);
+        }
+    }
     let candidates = boundary::collect(
         &cache.terminal,
         &root,
@@ -1277,6 +1310,81 @@ mod tests {
             .flat_map(|row| row.items.iter())
             .map(|item| item.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn long_preserved_text_keeps_indent_tabs_breaks_and_terminal_content() {
+        let text = "alpha beta gamma delta ".repeat(30);
+        for mode in ["pre-wrap", "break-spaces"] {
+            let html = format!(
+                "<body style='margin:0'><div style='white-space:{mode};font:16px monospace;line-height:24px;text-indent:40px'>{text}\nend\tTAB</div></body>"
+            );
+            let layout = lay_graphical(&html, 320.0, &HashMap::new());
+            let runs: Vec<_> = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|primitive| {
+                    if let crate::render::Primitive::GlyphRun { origin, shaped, .. } = primitive {
+                        Some((origin, shaped))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(runs.len() > 10);
+            assert!((runs[0].0.x - 40.0).abs() < 0.01);
+            assert!(runs.iter().skip(1).any(|(origin, _)| origin.x.abs() < 0.01));
+            assert!(runs.iter().all(|(_, shaped)| shaped.baseline < 30.0));
+            let tab = graphical_text(&layout, "TAB");
+            let end = graphical_text(&layout, "end");
+            assert!((tab.1 - end.1).abs() < 0.01);
+            assert!(tab.0 > end.0 + 30.0);
+            // Terminal text pieces store their column positions separately;
+            // a tab is a gap between pieces, not a literal character in them.
+            let output = lay(&html, 40);
+            let terminal = output
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let actual: Vec<_> = terminal.split_whitespace().collect();
+            let expected = format!("{text} end TAB");
+            assert_eq!(
+                actual,
+                expected.split_whitespace().collect::<Vec<_>>(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_preserved_text_rechecks_float_bands() {
+        let text = "alpha beta gamma delta ".repeat(20);
+        let html = format!(
+            "<body style='margin:0'><div style='float:left;width:80px;height:96px'></div><div style='white-space:pre-wrap;font:16px monospace;line-height:24px'>{text}</div></body>"
+        );
+        let layout = lay_graphical(&html, 320.0, &HashMap::new());
+        let origins: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| {
+                if let crate::render::Primitive::GlyphRun { origin, shaped, .. } = primitive {
+                    (!shaped.text.is_empty()).then_some(origin)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!((origins[0].x - 80.0).abs() < 0.01);
+        assert!(
+            origins
+                .iter()
+                .any(|origin| origin.y >= 96.0 && origin.x.abs() < 0.01)
+        );
     }
 
     #[test]

@@ -510,12 +510,22 @@ pub fn adapt_rendered_terminal(
     url: &Url,
     content_type: &str,
     raw: Vec<u8>,
-    rendered: RenderedPage,
+    mut rendered: RenderedPage,
     viewport: crate::layout2::TerminalViewport,
     alpha: &std::collections::HashMap<String, bool>,
 ) -> Doc {
     let deferred_images = rendered.deferred_images.clone();
     let output = crate::layout2::adapt_terminal(&rendered.layout, viewport, alpha);
+    for (_, canvas) in &rendered.layout.paint.canvas_images {
+        if let Some(url) = canvas.data_url() {
+            if !rendered.image_urls.contains(&url) {
+                rendered.image_urls.push(url.clone());
+            }
+            if !rendered.eager_image_urls.contains(&url) {
+                rendered.eager_image_urls.push(url);
+            }
+        }
+    }
     let hover_ids = if rendered.direct_actor_nodes {
         rendered
             .layout
@@ -3304,10 +3314,29 @@ pub async fn execute_js(
 /// Desktop/native entry carrying the real output-device density into the
 /// page's responsive-image environment and `window.devicePixelRatio`.
 pub async fn execute_js_for_device(
+    response: Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+    device_pixel_ratio: f32,
+    storage: crate::js::WebStorage,
+) -> Response {
+    execute_js_for_window(
+        response,
+        viewport,
+        cell_px,
+        device_pixel_ratio,
+        (0, 0),
+        storage,
+    )
+    .await
+}
+
+pub(crate) async fn execute_js_for_window(
     mut response: Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
+    screen_position: (i32, i32),
     storage: crate::js::WebStorage,
 ) -> Response {
     let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
@@ -3567,6 +3596,7 @@ pub async fn execute_js_for_device(
         viewport,
         cell_px,
         device_pixel_ratio,
+        screen_position,
         externals,
         sheets,
         cache,
@@ -5482,9 +5512,6 @@ pub(crate) fn collect_image_urls(
             .then(|| dom.svg_image_data(id, Some(base)))
             .flatten()
             .map(|(source, _)| source);
-        let canvas = (dom.tag_name(id) == Some("canvas") && !dom.is_hidden(id))
-            .then(|| dom.canvas_data_url(id))
-            .flatten();
         let poster = (dom.tag_name(id) == Some("video"))
             .then(|| dom.attr(id, "poster"))
             .flatten()
@@ -5494,7 +5521,6 @@ pub(crate) fn collect_image_urls(
             .as_ref()
             .map(|selected| selected.source.as_str())
             .or(svg.as_deref())
-            .or(canvas.as_deref())
             .or(poster)
         else {
             continue;

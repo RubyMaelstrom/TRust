@@ -683,7 +683,9 @@ impl Builder<'_> {
     fn replaced(&mut self, id: NodeId, tag: &str) -> Replaced {
         if tag == "canvas" {
             return Replaced::Atom(AtomKind::Img {
-                url: self.dom.canvas_data_url(id),
+                // Canvas pixels are captured at paint, not serialized into an
+                // image request while building (or reusing) layout geometry.
+                url: None,
                 density: 1.0,
                 dimension_source: id,
                 alt: String::new(),

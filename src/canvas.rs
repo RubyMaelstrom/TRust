@@ -240,7 +240,9 @@ pub(crate) struct Canvas {
     current: Option<Point>,
     start: Option<Point>,
     bitmap: Option<sk::Pixmap>,
-    presentation: Option<String>,
+    presentation: Option<crate::render::CanvasImage>,
+    image_handle: crate::render::ImageHandle,
+    bitmap_revision: u64,
     pub generation: u64,
 }
 
@@ -259,6 +261,8 @@ impl Canvas {
             start: None,
             bitmap: None,
             presentation: None,
+            image_handle: crate::render::ImageHandle::for_canvas(),
+            bitmap_revision: 0,
             generation: 0,
         };
         out.resize(width, height)?;
@@ -270,6 +274,7 @@ impl Canvas {
         self.height = height;
         self.bitmap = None;
         self.presentation = None;
+        self.bitmap_revision = self.bitmap_revision.wrapping_add(1);
         self.origin_clean = true;
         self.state = State::default();
         self.stack.clear();
@@ -307,7 +312,10 @@ impl Canvas {
             })
             .sum();
         self.bitmap.as_ref().map_or(0, |p| p.data().len())
-            + self.presentation.as_ref().map_or(0, String::capacity)
+            + self
+                .presentation
+                .as_ref()
+                .map_or(0, crate::render::CanvasImage::retained_bytes)
             + self.path.elements().len() * std::mem::size_of::<PathEl>()
             + self.stack.capacity() * std::mem::size_of::<State>()
             + self.state.clip.as_ref().map_or(0, |m| m.data().len())
@@ -897,6 +905,7 @@ impl Canvas {
     }
 
     fn changed(&mut self) {
+        self.bitmap_revision = self.bitmap_revision.wrapping_add(1);
         if !self.alpha
             && let Some(bitmap) = self.bitmap.as_mut()
         {
@@ -1113,35 +1122,30 @@ impl Canvas {
         self.changed();
     }
 
-    pub fn data_url(&mut self) -> String {
-        if let Some(url) = &self.presentation {
-            return url.clone();
+    pub(crate) fn image(&mut self) -> Option<crate::render::CanvasImage> {
+        if let Some(image) = &self.presentation {
+            return Some(image.clone());
         }
-        let Some(bitmap) = &self.bitmap else {
-            return "data:,".into();
-        };
-        let Some(rgba) = self.get(0, 0, self.width, self.height) else {
-            return "data:,".into();
-        };
-        let mut encoded = Vec::new();
-        use image::ImageEncoder as _;
-        if image::codecs::png::PngEncoder::new(&mut encoded)
-            .write_image(
-                &rgba,
-                bitmap.width(),
-                bitmap.height(),
-                image::ExtendedColorType::Rgba8,
-            )
-            .is_err()
-        {
-            return "data:,".into();
-        }
-        let url = format!(
-            "data:image/png;base64,{}",
-            crate::img::base64_encode(&encoded)
+        self.bitmap.as_ref()?;
+        let rgba = self.get(0, 0, self.width, self.height)?;
+        let image = crate::render::CanvasImage::new(
+            self.image_handle,
+            self.bitmap_revision,
+            crate::render::ImageResource {
+                width: self.width,
+                height: self.height,
+                has_alpha: rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255),
+                rgba: rgba.into(),
+            },
         );
-        self.presentation = Some(url.clone());
-        url
+        self.presentation = Some(image.clone());
+        Some(image)
+    }
+
+    pub fn data_url(&mut self) -> String {
+        self.image()
+            .and_then(|image| image.data_url())
+            .unwrap_or_else(|| "data:,".into())
     }
 }
 

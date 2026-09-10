@@ -175,6 +175,7 @@ impl EmbeddedDocument {
             controls: vec![],
             content_viewport: rect,
             image_store: self.resources.clone(),
+            canvas_images: Default::default(),
             page_scroll_containers: vec![],
             page_size: CssSize::default(),
         };

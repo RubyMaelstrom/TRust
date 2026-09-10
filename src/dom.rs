@@ -20,10 +20,23 @@ mod class_tokens;
 mod container_queries;
 mod invalidation;
 mod rule_index;
+mod xml;
 
 pub type NodeId = usize;
 
 type SerializationCache = (u64, FxHashMap<(NodeId, u8), String>);
+
+fn attribute_name_matches(name: &QualName, qualified: &str) -> bool {
+    match name.prefix.as_deref() {
+        Some(prefix) => {
+            qualified
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(':'))
+                == Some(name.local.as_ref())
+        }
+        None => name.local.as_ref() == qualified,
+    }
+}
 
 pub enum NodeData {
     Document,
@@ -31,6 +44,11 @@ pub enum NodeData {
     Fragment,
     Doctype,
     Comment(String),
+    ProcessingInstruction {
+        target: String,
+        data: String,
+    },
+    CData(String),
     Text(String),
     Element {
         name: QualName,
@@ -147,6 +165,9 @@ pub fn last_mutation_ms() -> u128 {
 
 pub struct Dom {
     nodes: Vec<Node>,
+    /// Only detached non-HTML documents need an entry. Kept in the arena so
+    /// wrapper collection/recreation cannot change a node's document type.
+    document_content_types: FxHashMap<NodeId, String>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
     /// host element → shadow root fragment (attachShadow).
     shadow_roots: FxHashMap<NodeId, NodeId>,
@@ -510,6 +531,7 @@ impl Dom {
         // classified before the crate builds.
         let Dom {
             nodes,
+            document_content_types,
             canvases,
             shadow_roots,
             shadow_hosts,
@@ -576,8 +598,13 @@ impl Dom {
         let mut unavailable = 0usize;
         for node in nodes {
             match &node.data {
-                NodeData::Comment(text) | NodeData::Text(text) => {
+                NodeData::Comment(text) | NodeData::Text(text) | NodeData::CData(text) => {
                     bytes = bytes.saturating_add(text.capacity());
+                }
+                NodeData::ProcessingInstruction { target, data } => {
+                    bytes = bytes
+                        .saturating_add(target.capacity())
+                        .saturating_add(data.capacity());
                 }
                 NodeData::Element { attrs, .. } => {
                     bytes = bytes.saturating_add(
@@ -611,6 +638,10 @@ impl Dom {
                         .saturating_mul(std::mem::size_of::<$entry>()),
                 );
             }};
+        }
+        fixed_map!(document_content_types, (NodeId, String));
+        for content_type in document_content_types.values() {
+            bytes = bytes.saturating_add(content_type.capacity());
         }
         macro_rules! fixed_set {
             ($set:expr, $entry:ty) => {{
@@ -841,6 +872,7 @@ impl Dom {
     pub fn new() -> Self {
         let mut dom = Dom {
             nodes: Vec::new(),
+            document_content_types: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
@@ -2245,6 +2277,23 @@ impl Dom {
         self.new_node(NodeData::Comment(text.to_string()))
     }
 
+    pub fn create_document(&mut self, content_type: &str) -> NodeId {
+        let doc = self.new_node(NodeData::Document);
+        self.nodes[doc].owner_document = doc;
+        if content_type != "text/html" {
+            self.document_content_types
+                .insert(doc, content_type.to_owned());
+        }
+        doc
+    }
+
+    pub fn document_content_type(&self, doc: NodeId) -> &str {
+        self.document_content_types
+            .get(&doc)
+            .map(String::as_str)
+            .unwrap_or("text/html")
+    }
+
     /// Unlink a node from its parent and siblings (the node and its
     /// subtree stay in the arena; arenas only ever grow — page-lifetime
     /// memory is the deal).
@@ -2664,6 +2713,28 @@ impl Dom {
         }
     }
 
+    /// DOM getAttribute matches qualified names, folding only on HTML
+    /// elements in HTML documents. `attr` remains the renderer's historical
+    /// case-insensitive lookup and is not the web-facing DOM operation.
+    pub fn get_attribute(&self, id: NodeId, qualified: &str) -> Option<&str> {
+        let NodeData::Element { name, attrs, .. } = &self.nodes[id].data else {
+            return None;
+        };
+        let folded;
+        let qualified = if name.ns == ns!(html)
+            && self.document_content_type(self.nodes[id].owner_document) == "text/html"
+        {
+            folded = qualified.to_ascii_lowercase();
+            folded.as_str()
+        } else {
+            qualified
+        };
+        attrs
+            .iter()
+            .find(|attr| attribute_name_matches(&attr.name, qualified))
+            .map(|attr| &*attr.value)
+    }
+
     /// The `content` of the first `<meta>` whose `property`/`name` matches
     /// `key` (case-insensitive) — the Open Graph / page-metadata channel
     /// (`og:image`, `twitter:image`, `og:type`, …). Empty content is treated
@@ -2683,6 +2754,8 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        let html_document =
+            self.document_content_type(self.nodes[id].owner_document) == "text/html";
         let invalidated_attribute = name;
         // HTML canvas bitmap dimensions reset even for an idempotent write.
         let canvas_reset = self.tag_name(id) == Some("canvas")
@@ -2700,12 +2773,15 @@ impl Dom {
             // pushed a duplicate lowercase attr beside the parser's cased one
             // and left reads (case-insensitive, first match) on the stale
             // value — a D3-style `setAttribute("viewBox", …)` never took.
-            let name = if qname.ns == ns!(html) {
+            let name = if qname.ns == ns!(html) && html_document {
                 name.to_ascii_lowercase()
             } else {
                 name.to_string()
             };
-            if let Some(a) = attrs.iter_mut().find(|a| *a.name.local == name) {
+            if let Some(a) = attrs
+                .iter_mut()
+                .find(|a| attribute_name_matches(&a.name, &name))
+            {
                 // Idempotent writes are free: no dirty, no redraw.
                 if *a.value == *value && !canvas_reset {
                     return;
@@ -2728,10 +2804,22 @@ impl Dom {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let html_document =
+            self.document_content_type(self.nodes[id].owner_document) == "text/html";
         let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
-        if let NodeData::Element { attrs, .. } = &mut self.nodes[id].data {
+        if let NodeData::Element {
+            name: qname, attrs, ..
+        } = &mut self.nodes[id].data
+        {
             let before = attrs.len();
-            attrs.retain(|a| !str::eq_ignore_ascii_case(&a.name.local, name));
+            let folded;
+            let qualified = if qname.ns == ns!(html) && html_document {
+                folded = name.to_ascii_lowercase();
+                folded.as_str()
+            } else {
+                name
+            };
+            attrs.retain(|a| !attribute_name_matches(&a.name, qualified));
             // Idempotent removes are free (like `set_attr`): a redundant
             // `removeAttribute` must not dirty the page or bust the epoch
             // caches — frameworks call it unconditionally per render pass.
@@ -2790,19 +2878,22 @@ impl Dom {
         }
     }
 
-    pub(crate) fn canvas_data_url(&self, id: NodeId) -> Option<String> {
+    pub(crate) fn canvas_image(&self, id: NodeId) -> Option<crate::render::CanvasImage> {
         self.canvases
             .borrow_mut()
             .get_mut(&id)
-            .map(|canvas| canvas.data_url())
-            .filter(|url| url != "data:,")
+            .and_then(|canvas| canvas.image())
     }
 
     pub fn attr_names(&self, id: NodeId) -> Vec<String> {
         match &self.nodes[id].data {
-            NodeData::Element { attrs, .. } => {
-                attrs.iter().map(|a| a.name.local.to_string()).collect()
-            }
+            NodeData::Element { attrs, .. } => attrs
+                .iter()
+                .map(|a| match &a.name.prefix {
+                    Some(prefix) => format!("{prefix}:{}", a.name.local),
+                    None => a.name.local.to_string(),
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -5627,11 +5718,13 @@ impl Dom {
 
     fn text_content_uncached(&self, id: NodeId) -> String {
         let mut out = String::new();
-        if let NodeData::Text(t) = &self.nodes[id].data {
-            return t.clone();
+        match &self.nodes[id].data {
+            NodeData::Text(t) | NodeData::CData(t) | NodeData::Comment(t) => return t.clone(),
+            NodeData::ProcessingInstruction { data, .. } => return data.clone(),
+            _ => {}
         }
         for d in self.descendants(id) {
-            if let NodeData::Text(t) = &self.nodes[d].data {
+            if let NodeData::Text(t) | NodeData::CData(t) = &self.nodes[d].data {
                 out.push_str(t);
             }
         }
@@ -5707,6 +5800,12 @@ impl Dom {
         match &mut self.nodes[id].data {
             NodeData::Document | NodeData::Doctype => (),
             NodeData::Comment(_) => self.set_comment_text(id, text),
+            NodeData::CData(data) | NodeData::ProcessingInstruction { data, .. } => {
+                if data != text {
+                    *data = text.to_owned();
+                    self.touch_content(Some(id));
+                }
+            }
             // Idempotent writes are free: no dirty, no redraw.
             NodeData::Text(t) if *t == text => (),
             NodeData::Text(t) => {
@@ -5746,6 +5845,11 @@ impl Dom {
             NodeData::Document | NodeData::Fragment => NodeData::Fragment,
             NodeData::Doctype => NodeData::Doctype,
             NodeData::Comment(t) => NodeData::Comment(t.clone()),
+            NodeData::CData(t) => NodeData::CData(t.clone()),
+            NodeData::ProcessingInstruction { target, data } => NodeData::ProcessingInstruction {
+                target: target.clone(),
+                data: data.clone(),
+            },
             NodeData::Text(t) => NodeData::Text(t.clone()),
             NodeData::Element { name, attrs, .. } => NodeData::Element {
                 name: name.clone(),
@@ -5829,6 +5933,11 @@ impl Dom {
             NodeData::Document | NodeData::Fragment => NodeData::Fragment,
             NodeData::Doctype => NodeData::Doctype,
             NodeData::Comment(t) => NodeData::Comment(t.clone()),
+            NodeData::CData(t) => NodeData::CData(t.clone()),
+            NodeData::ProcessingInstruction { target, data } => NodeData::ProcessingInstruction {
+                target: target.clone(),
+                data: data.clone(),
+            },
             NodeData::Text(t) => NodeData::Text(t.clone()),
             NodeData::Element { name, attrs, .. } => NodeData::Element {
                 name: name.clone(),
@@ -6154,6 +6263,18 @@ impl Dom {
                 }
             }
             NodeData::Doctype => {}
+            NodeData::CData(text) => {
+                out.push_str("<![CDATA[");
+                out.push_str(text);
+                out.push_str("]]>");
+            }
+            NodeData::ProcessingInstruction { target, data } => {
+                out.push_str("<?");
+                out.push_str(target);
+                out.push(' ');
+                out.push_str(data);
+                out.push_str("?>");
+            }
             NodeData::Comment(text) => {
                 out.push_str("<!--");
                 out.push_str(&text.replace("--", "- -"));
@@ -6525,6 +6646,18 @@ impl Dom {
                 }
             }
             NodeData::Doctype => {}
+            NodeData::CData(text) => {
+                out.push_str("<![CDATA[");
+                out.push_str(text);
+                out.push_str("]]>");
+            }
+            NodeData::ProcessingInstruction { target, data } => {
+                out.push_str("<?");
+                out.push_str(target);
+                out.push(' ');
+                out.push_str(data);
+                out.push_str("?>");
+            }
             // Comments survive round-trips (Lit's markers) and the
             // layout pass ignores them.
             NodeData::Comment(t) => {
@@ -7159,6 +7292,18 @@ impl Dom {
                 }
             }
             NodeData::Doctype => {}
+            NodeData::CData(text) => {
+                out.push_str("<![CDATA[");
+                out.push_str(text);
+                out.push_str("]]>");
+            }
+            NodeData::ProcessingInstruction { target, data } => {
+                out.push_str("<?");
+                out.push_str(target);
+                out.push(' ');
+                out.push_str(data);
+                out.push_str("?>");
+            }
             NodeData::Comment(t) => {
                 out.push_str("<!--");
                 out.push_str(&t.replace("--", "- -"));

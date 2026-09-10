@@ -142,6 +142,9 @@ pub struct PageEnv {
     pub viewport: (u16, u16),
     pub cell_px: (u16, u16),
     pub device_pixel_ratio: f32,
+    /// Client-window origin in CSS pixels; zero when the frontend has no
+    /// screen coordinates (CSSOM View #dom-window-screenx).
+    pub screen_position: (i32, i32),
     pub externals: Vec<(String, Option<std::sync::Arc<Vec<u8>>>)>,
     pub sheets: Vec<(String, String)>,
     pub cache: std::sync::Arc<crate::http::PageCache>,
@@ -160,6 +163,7 @@ impl PageEnv {
             viewport: (80, 24),
             cell_px: (8, 16),
             device_pixel_ratio: 1.0,
+            screen_position: (0, 0),
             externals: Vec::new(),
             sheets: Vec::new(),
             cache: Default::default(),
@@ -275,7 +279,8 @@ pub enum PageCmd {
     /// an element resolves to its nearest click-focusable ancestor.
     Focus(Option<usize>),
     Key {
-        node: usize,
+        /// None resolves the currently focused area in the resident page.
+        node: Option<usize>,
         input: crate::core::KeyInput,
     },
     SetValue {
@@ -318,6 +323,7 @@ pub enum PageCmd {
     ImageSizes(Vec<(String, (u32, u32))>),
     Viewport(crate::layout2::Viewport),
     DevicePixelRatio(f32),
+    ScreenPosition(i32, i32),
 }
 
 impl PageCmd {
@@ -389,6 +395,8 @@ pub enum PageEvt {
     ScrollToFragment(String),
     Trouble(Vec<String>),
     Settled,
+    /// Acknowledges a native key. Suppress the frontend default when canceled
+    /// by keyboard handlers or inapplicable (e.g. Enter in a formless input).
     KeyDefault {
         prevented: bool,
     },
@@ -474,6 +482,30 @@ impl PageHandle {
                 return Err(tokio::sync::mpsc::error::TrySendError::Closed(command));
             }
         };
+        self.with_user_preemption(preempt_for_navigation, || permit.send(command));
+        Ok(())
+    }
+
+    pub(crate) fn user_input_sender(&self) -> tokio::sync::mpsc::Sender<PageCmd> {
+        self.state
+            .interactions
+            .as_ref()
+            .unwrap_or(&self.cmds)
+            .clone()
+    }
+
+    pub(crate) fn send_reserved_user(
+        &self,
+        permit: tokio::sync::mpsc::OwnedPermit<PageCmd>,
+        command: PageCmd,
+        preempt_for_navigation: bool,
+    ) {
+        self.with_user_preemption(preempt_for_navigation, || {
+            permit.send(command);
+        });
+    }
+
+    fn with_user_preemption(&self, preempt_for_navigation: bool, send: impl FnOnce()) {
         if preempt_for_navigation {
             let running = self
                 .state
@@ -483,12 +515,11 @@ impl PageHandle {
             if !*running {
                 self.state.runtime_interrupt.request_user_navigation();
             }
-            permit.send(command);
+            send();
             drop(running);
         } else {
-            permit.send(command);
+            send();
         }
-        Ok(())
     }
 
     pub fn send_hover(&self, node: Option<usize>, x: f64, y: f64) -> bool {

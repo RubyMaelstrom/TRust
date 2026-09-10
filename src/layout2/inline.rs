@@ -730,11 +730,41 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.place_wrapped(word, ctx, true, true);
     }
 
-    /// Preserved-mode text: place, breaking anywhere at capacity when the
-    /// mode wraps (`pre-wrap`), overflowing when it doesn't (`pre`/`nowrap`).
+    /// Preserved-mode text: wrap at CSS/Unicode opportunities when permitted,
+    /// overflowing when wrapping is disabled (`pre`/`nowrap`).
     fn preserved(&mut self, t: &str, ctx: &InlineStyle) {
         if !ctx.ws.wraps() {
             self.place(t, ctx, false, true);
+            return;
+        }
+        // With no active float exclusions, all following lines span `cap`.
+        // Keep small runs on the bounded shape cache, but break long paragraphs
+        // from one shape instead of shaping/breaking every remaining tail.
+        // Floats retain per-line band queries and the general composition path.
+        let available = self.line_right - self.pen - self.pending_gap_px;
+        if t.len() >= 256
+            && self.fc.as_ref().is_none_or(|fc| fc.is_empty())
+            && available > 0.0
+            && self.cap > 0.0
+            && !self.pending_space
+        {
+            // Preserve the bounded cache fast path for paragraphs which fit
+            // on one line (including very wide intrinsic-size probes).
+            let style = ctx.text_style();
+            let full = crate::text::shape(t, &style);
+            if super::css_px_fits(full.advance, available) {
+                self.place_shaped(t, full, ctx, false, false);
+                return;
+            }
+            let lines =
+                crate::text::wrapped_lines(t, &style, available, self.cap, self.break_style(ctx));
+            for (index, shaped) in lines.into_iter().enumerate() {
+                if index > 0 {
+                    self.soft_break();
+                }
+                let text = shaped.text.clone();
+                self.place_shaped(&text, shaped, ctx, false, false);
+            }
             return;
         }
         self.place_wrapped(t, ctx, false, true);
@@ -906,6 +936,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// between CJK segments of one word).
     fn place(&mut self, seg: &str, ctx: &InlineStyle, may_wrap: bool, spaced: bool) {
         let shaped = crate::text::shape(seg, &ctx.text_style());
+        self.place_shaped(seg, shaped, ctx, may_wrap, spaced);
+    }
+
+    fn place_shaped(
+        &mut self,
+        seg: &str,
+        shaped: crate::text::ShapedText,
+        ctx: &InlineStyle,
+        may_wrap: bool,
+        spaced: bool,
+    ) {
         let w = shaped.advance;
         if w <= 0.0 {
             return;

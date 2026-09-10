@@ -33,6 +33,7 @@ pub fn render_paint(page: &super::PagePaint, viewport: CssSize) -> Result<OwnedR
         controls: Vec::new(),
         content_viewport: super::CssRect::new(0., 0., viewport.width, viewport.height),
         image_store: store,
+        canvas_images: Default::default(),
         page_scroll_containers: Vec::new(),
         page_size: CssSize::default(),
     };
@@ -113,6 +114,7 @@ pub fn scene_for_dom(
         controls: Vec::new(),
         content_viewport: super::CssRect::new(0.0, 0.0, viewport.width, viewport.height),
         image_store,
+        canvas_images: Default::default(),
         page_scroll_containers: Vec::new(),
         page_size: CssSize::default(),
     };
@@ -547,6 +549,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 96.0, 64.0),
             image_store: ImageStore::default(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::new(96.0, 64.0),
         };
@@ -600,6 +603,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 32.0, 32.0),
             image_store: store.clone(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::new(32.0, 32.0),
         };
@@ -641,6 +645,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 32.0, 32.0),
             image_store: store.clone(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::new(32.0, 32.0),
         };
@@ -949,6 +954,7 @@ mod tests {
                     controls: Vec::new(),
                     content_viewport: CssRect::new(0.0, 0.0, 960.0, 640.0),
                     image_store: ImageStore::default(),
+                    canvas_images: Default::default(),
                     page_scroll_containers: Vec::new(),
                     page_size: CssSize::default(),
                 };
@@ -1008,6 +1014,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 960.0, 640.0),
             image_store: store.clone(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::new(960.0, 1_600.0),
         };
@@ -1076,6 +1083,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 960.0, 646.0),
             image_store: ImageStore::default(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::default(),
         };

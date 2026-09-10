@@ -9,6 +9,7 @@
     const realmRootFrame = cfg.frameElement || null;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
     const documentContentTypes = new WeakMap();
+    const documentURLs = new WeakMap();
     const frameNavigationURLs = new WeakMap();
     const frameResourceTimings = new WeakMap();
     const configuredReferrer = typeof cfg.referrer === "string" ? cfg.referrer : "";
@@ -291,8 +292,10 @@
             );
             rememberElement(w, id);
         } else {
-            w = t === 9 ? new Document(id)
+            w = t === 9 ? (__dom_document_content_type(id) === "text/html" ? new Document(id) : new XMLDocument(id, XML_DOCUMENT_TOKEN))
                 : t === 3 ? new Text(id)
+                : t === 4 ? new CDATASection(id)
+                : t === 7 ? new ProcessingInstruction(id)
                 : t === 8 ? new Comment(id)
                 : t === 11 ? new DocumentFragment(id)
                 : new Node(id);
@@ -2618,23 +2621,89 @@
     // action. Keep a short-lived user-key activation flag so a page handler
     // that calls `sendButton.click()` is still observable by the actor as the
     // submit default of this key, while ordinary script `.click()` calls keep
-    // their non-user semantics.
-    trust.key = function (id, key, code, repeat, composing, shift, ctrl, alt, meta) {
-        const t = wrap(id);
-        if (!t) return false;
+    // their non-user semantics. Return whether the frontend must suppress its
+    // editing/submission default, including when no HTML form owns the input.
+    // UI Events #legacy-key-attributes (compatibility guidance, not normative):
+    // keydown/up report virtual key codes; keypress reports the character.
+    // Modern key/code remain distinct (layout-dependent text vs physical key).
+    // Local reference: w3c/uievents@8c1b809, sections/legacy-key-attributes.txt.
+    const legacyKeyCodes = {
+        Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17, Alt: 18,
+        Pause: 19, CapsLock: 20, Escape: 27, " ": 32, PageUp: 33, PageDown: 34,
+        End: 35, Home: 36, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39,
+        ArrowDown: 40, PrintScreen: 44, Insert: 45, Delete: 46, Meta: 91,
+        ContextMenu: 93, NumLock: 144, ScrollLock: 145,
+    };
+    const legacyPhysicalCodes = {
+        Semicolon: 186, Equal: 187, Comma: 188, Minus: 189, Period: 190,
+        Slash: 191, Backquote: 192, BracketLeft: 219, Backslash: 220,
+        BracketRight: 221, Quote: 222, IntlBackslash: 226,
+        NumpadMultiply: 106, NumpadAdd: 107, NumpadComma: 108,
+        NumpadSubtract: 109, NumpadDecimal: 110, NumpadDivide: 111,
+    };
+    function nativeLegacyKeyCode(key, code) {
+        if (/^Numpad[0-9]$/.test(code) && /^[0-9]$/.test(key)) return 96 + Number(key);
+        if (Object.prototype.hasOwnProperty.call(legacyKeyCodes, key)) return legacyKeyCodes[key];
+        if (/^F([1-9]|1[0-9]|2[0-4])$/.test(key)) return 111 + Number(key.slice(1));
+        if (/^[a-zA-Z0-9]$/.test(key)) return key.toUpperCase().charCodeAt(0);
+        if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+        if (Object.prototype.hasOwnProperty.call(legacyPhysicalCodes, code)) return legacyPhysicalCodes[code];
+        return 0;
+    }
+    trust.key = function (id, key, code, repeat, composing, shift, ctrl, alt, meta, released = false, location = 0) {
         trust.lastClickSubmit = null;
+        // UI Events #events-keyboard-event-order / native-key-up and HTML's
+        // focused-area model: resolve each event against *current* focus. Keep
+        // the inner shadow anchor, not document.activeElement's retargeted host.
+        activeElementFor(g.document); // Perform disconnected-focus fixup.
+        const t = id === null || id === undefined
+            ? focusedArea || viewportFocusAnchor(g.document) : wrap(id);
+        if (!t) return false;
+        if ((id === null || id === undefined) && t.__contentRealmWindow) {
+            const childTrust = t.__contentRealmWindow.__trust;
+            const prevented = childTrust.key(null, key, code, repeat, composing,
+                shift, ctrl, alt, meta, released, location);
+            trust.lastClickSubmit = childTrust.lastClickSubmit;
+            childTrust.lastClickSubmit = null;
+            return prevented;
+        }
         trust.keyDispatch = true;
         let prevented = false;
         try {
-            const ev = createTrustedEvent(KeyboardEvent, "keydown", {
-                bubbles: true, cancelable: true, composed: true, view: g,
+            const init = {
+                bubbles: true, cancelable: true, composed: true, view: g, detail: 0,
                 key: String(key || ""), code: String(code || ""),
-                repeat: !!repeat, isComposing: !!composing,
-                view: g,
+                repeat: !!repeat, isComposing: !!composing, location: Number(location) >>> 0,
                 shiftKey: !!shift, ctrlKey: !!ctrl, altKey: !!alt, metaKey: !!meta,
-            });
+            };
+            init.keyCode = composing && !released ? 229 : nativeLegacyKeyCode(init.key, init.code);
+            init.charCode = 0;
+            init.which = init.keyCode;
+            const ev = createTrustedEvent(KeyboardEvent, released ? "keyup" : "keydown", init);
             dispatch(t, ev, false);
             prevented = ev.defaultPrevented;
+            if (released) return prevented;
+            // UI Events #event-type-keypress / #keypress-event-order: Enter's
+            // legacy character event precedes its form/newline default. A
+            // canceled keydown suppresses it, and IME composition never emits
+            // it. Keep keyDispatch set while keypress handlers activate buttons.
+            const character = init.key === "Enter" ? 13
+                : Array.from(init.key).length === 1 ? init.key.codePointAt(0) : 0;
+            if (!prevented && !composing && !ctrl && !meta && character) {
+                const press = createTrustedEvent(KeyboardEvent, "keypress", {
+                    ...init, charCode: character, keyCode: character, which: character,
+                });
+                dispatch(t, press, false);
+                prevented = press.defaultPrevented;
+            }
+            // HTML #implicit-submission applies only to an actual form owner.
+            // Frontends group formless editors for presentation, but submitting
+            // that group would spuriously navigate to the current document.
+            // Resolve ownership in the live DOM, without crossing shadow roots.
+            if (init.key === "Enter"
+                && (composing || (t.localName === "input" && !formOwner(t)))) {
+                prevented = true;
+            }
         } finally {
             trust.keyDispatch = false;
         }
@@ -3251,7 +3320,7 @@
                 slotQueueCheck(this);
                 return;
             }
-            if (t === 3 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
+            if (t === 3 || t === 4 || t === 7 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
             // DOM string replace all: nonempty strings create a fresh Text node;
             // empty strings remove the children without adding any node.
             const removed = this.childNodes;
@@ -3263,11 +3332,11 @@
             moChildBulk(this, removed, this.childNodes);
             slotQueueCheck(this);
         }
-        get nodeValue() { const t = this.nodeType; return t === 3 || t === 8 ? __dom_text(this.__id) : null; }
+        get nodeValue() { const t = this.nodeType; return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(this.__id) : null; }
         set nodeValue(v) {
             const t = this.nodeType;
-            if (t !== 3 && t !== 8) return;
-            v = String(v);
+            if (t !== 3 && t !== 4 && t !== 7 && t !== 8) return;
+            v = v == null ? "" : String(v);
             if (!MO.length) { __dom_set_text(this.__id, v); return; }
             const old = __dom_text(this.__id);
             __dom_set_text(this.__id, v);
@@ -3986,10 +4055,11 @@
                 qualifiedName = this.prefix === null
                     ? this.localName
                     : this.prefix + ":" + this.localName;
-                if (this.namespaceURI === HTML_NS) qualifiedName = qualifiedName.toUpperCase();
                 this.__trustQN = qualifiedName;
             }
-            return qualifiedName;
+            // Adoption can change HTMLness without changing the expanded name.
+            return this.namespaceURI === HTML_NS && this.ownerDocument.contentType === "text/html"
+                ? qualifiedName.toUpperCase() : qualifiedName;
         }
         get nodeName() { return this.tagName; }
         // DOM Slottable.assignedSlot: finding a slot with the `open` flag
@@ -5766,6 +5836,236 @@
         }
     }
 
+    // HTML §4.9 (tables), DOM §4.2.10 (collections), Web IDL integer/interface
+    // conversions. Consulted local WHATWG HTML e5071a20c856 (2026-09-06).
+    // Use native identity/names for brands: a forged prototype or an SVG <tr>
+    // does not implement an HTML table interface.
+    function htmlElementName(element) {
+        const id = elementIdentity(element);
+        if (id === undefined) return "";
+        const name = __dom_element_name(id);
+        return name && name[1] === HTML_NS ? name[0] : "";
+    }
+    function requireHTMLInterface(element, names) {
+        if (!names.includes(htmlElementName(element))) throw new TypeError("Illegal invocation");
+    }
+    function htmlChildren(element, names) {
+        return element.children.filter(child => names.includes(htmlElementName(child)));
+    }
+    const TABLE_SECTIONS = ["thead", "tbody", "tfoot"];
+    function tableRows(table) {
+        const head = [], body = [], foot = [];
+        for (const child of table.children) {
+            const name = htmlElementName(child);
+            if (name === "tr") body.push(child);
+            else if (TABLE_SECTIONS.includes(name)) {
+                const group = name === "thead" ? head : name === "tfoot" ? foot : body;
+                for (const row of htmlChildren(child, ["tr"])) group.push(row);
+            }
+        }
+        return head.concat(body, foot);
+    }
+    const ELEMENT_COLLECTIONS = new WeakMap();
+    function elementCollection(element, key, resolve) {
+        let collections = ELEMENT_COLLECTIONS.get(element);
+        if (!collections) ELEMENT_COLLECTIONS.set(element, collections = new Map());
+        let collection = collections.get(key);
+        if (!collection) collections.set(key, collection = makeHTMLCollection(resolve));
+        return collection;
+    }
+    function newTableElement(owner, name) {
+        return owner.ownerDocument.createElementNS(HTML_NS, name);
+    }
+    function checkTableIndex(index, length, deleting) {
+        if (index < -1 || index > length || (deleting && index === length))
+            throw new DOMException("The index is outside the collection", "IndexSizeError");
+    }
+    function deleteTableItem(items, index) {
+        checkTableIndex(index, items.length, true);
+        const item = items[index === -1 ? items.length - 1 : index];
+        if (item) item.parentNode.removeChild(item);
+    }
+    function tablePart(table, name) { return htmlChildren(table, [name])[0] || null; }
+    function deleteTablePart(table, name) {
+        const old = tablePart(table, name);
+        if (old) table.removeChild(old);
+    }
+    function insertTablePart(table, part, name) {
+        const before = name === "caption" ? table.firstChild : name === "thead"
+            ? table.children.find(child => !["caption", "colgroup"].includes(htmlElementName(child))) || null
+            : null;
+        table.insertBefore(part, before);
+    }
+    function setTablePart(table, part, name) {
+        requireHTMLInterface(table, ["table"]);
+        if (part != null) {
+            requireHTMLInterface(part, name === "caption" ? ["caption"] : TABLE_SECTIONS);
+            if (htmlElementName(part) !== name)
+                throw new DOMException("Incorrect table section", "HierarchyRequestError");
+        }
+        deleteTablePart(table, name);
+        if (part != null) insertTablePart(table, part, name);
+    }
+    function createTablePart(table, name) {
+        requireHTMLInterface(table, ["table"]);
+        let part = tablePart(table, name);
+        if (!part) {
+            part = newTableElement(table, name);
+            insertTablePart(table, part, name);
+        }
+        return part;
+    }
+    class HTMLTableElement extends HTMLElement {
+        get caption() { requireHTMLInterface(this, ["table"]); return tablePart(this, "caption"); }
+        set caption(value) { setTablePart(this, value, "caption"); }
+        get tHead() { requireHTMLInterface(this, ["table"]); return tablePart(this, "thead"); }
+        set tHead(value) { setTablePart(this, value, "thead"); }
+        get tFoot() { requireHTMLInterface(this, ["table"]); return tablePart(this, "tfoot"); }
+        set tFoot(value) { setTablePart(this, value, "tfoot"); }
+        createCaption() { return createTablePart(this, "caption"); }
+        createTHead() { return createTablePart(this, "thead"); }
+        createTFoot() { return createTablePart(this, "tfoot"); }
+        deleteCaption() { requireHTMLInterface(this, ["table"]); deleteTablePart(this, "caption"); }
+        deleteTHead() { requireHTMLInterface(this, ["table"]); deleteTablePart(this, "thead"); }
+        deleteTFoot() { requireHTMLInterface(this, ["table"]); deleteTablePart(this, "tfoot"); }
+        get tBodies() {
+            requireHTMLInterface(this, ["table"]);
+            return elementCollection(this, "tBodies", () => htmlChildren(this, ["tbody"]));
+        }
+        createTBody() {
+            requireHTMLInterface(this, ["table"]);
+            const bodies = htmlChildren(this, ["tbody"]);
+            const body = newTableElement(this, "tbody");
+            this.insertBefore(body, bodies.length ? bodies[bodies.length - 1].nextSibling : null);
+            return body;
+        }
+        get rows() {
+            requireHTMLInterface(this, ["table"]);
+            return elementCollection(this, "rows", () => tableRows(this));
+        }
+        insertRow(index = -1) {
+            requireHTMLInterface(this, ["table"]);
+            index = (+index) >> 0;
+            const rows = tableRows(this);
+            checkTableIndex(index, rows.length, false);
+            const row = newTableElement(this, "tr");
+            if (!rows.length) {
+                const bodies = htmlChildren(this, ["tbody"]);
+                if (bodies.length) bodies[bodies.length - 1].appendChild(row);
+                else {
+                    const body = newTableElement(this, "tbody");
+                    body.appendChild(row);
+                    this.appendChild(body);
+                }
+            } else if (index === -1 || index === rows.length) {
+                rows[rows.length - 1].parentNode.appendChild(row);
+            } else rows[index].parentNode.insertBefore(row, rows[index]);
+            return row;
+        }
+        deleteRow(index) {
+            requireHTMLInterface(this, ["table"]);
+            if (!arguments.length) throw new TypeError("deleteRow requires an index");
+            index = (+index) >> 0;
+            deleteTableItem(tableRows(this), index);
+        }
+    }
+    class HTMLTableSectionElement extends HTMLElement {
+        get rows() {
+            requireHTMLInterface(this, TABLE_SECTIONS);
+            return elementCollection(this, "rows", () => htmlChildren(this, ["tr"]));
+        }
+        insertRow(index = -1) {
+            requireHTMLInterface(this, TABLE_SECTIONS);
+            index = (+index) >> 0;
+            const rows = htmlChildren(this, ["tr"]);
+            checkTableIndex(index, rows.length, false);
+            const row = newTableElement(this, "tr");
+            this.insertBefore(row, index === -1 ? null : rows[index] || null);
+            return row;
+        }
+        deleteRow(index) {
+            requireHTMLInterface(this, TABLE_SECTIONS);
+            if (!arguments.length) throw new TypeError("deleteRow requires an index");
+            index = (+index) >> 0;
+            deleteTableItem(htmlChildren(this, ["tr"]), index);
+        }
+    }
+    class HTMLTableRowElement extends HTMLElement {
+        get rowIndex() {
+            requireHTMLInterface(this, ["tr"]);
+            let table = this.parentElement;
+            if (TABLE_SECTIONS.includes(htmlElementName(table))) table = table.parentElement;
+            return htmlElementName(table) === "table" ? tableRows(table).indexOf(this) : -1;
+        }
+        get sectionRowIndex() {
+            requireHTMLInterface(this, ["tr"]);
+            const parent = this.parentElement, name = htmlElementName(parent);
+            if (name === "table") return tableRows(parent).indexOf(this);
+            return TABLE_SECTIONS.includes(name) ? htmlChildren(parent, ["tr"]).indexOf(this) : -1;
+        }
+        get cells() {
+            requireHTMLInterface(this, ["tr"]);
+            return elementCollection(this, "cells", () => htmlChildren(this, ["td", "th"]));
+        }
+        insertCell(index = -1) {
+            requireHTMLInterface(this, ["tr"]);
+            index = (+index) >> 0;
+            const cells = htmlChildren(this, ["td", "th"]);
+            checkTableIndex(index, cells.length, false);
+            const cell = newTableElement(this, "td");
+            this.insertBefore(cell, index === -1 ? null : cells[index] || null);
+            return cell;
+        }
+        deleteCell(index) {
+            requireHTMLInterface(this, ["tr"]);
+            if (!arguments.length) throw new TypeError("deleteCell requires an index");
+            index = (+index) >> 0;
+            deleteTableItem(htmlChildren(this, ["td", "th"]), index);
+        }
+    }
+    class HTMLTableCellElement extends HTMLElement {
+        get cellIndex() {
+            requireHTMLInterface(this, ["td", "th"]);
+            const parent = this.parentElement;
+            return htmlElementName(parent) === "tr" ? htmlChildren(parent, ["td", "th"]).indexOf(this) : -1;
+        }
+        get scope() {
+            requireHTMLInterface(this, ["td", "th"]);
+            const value = (this.getAttribute("scope") || "").replace(/[A-Z]/g, c => c.toLowerCase());
+            return ["row", "col", "rowgroup", "colgroup"].includes(value) ? value : "";
+        }
+        set scope(value) { requireHTMLInterface(this, ["td", "th"]); this.setAttribute("scope", domString(value)); }
+    }
+    // DOMString conversion differs from String(): Symbols must throw.
+    function domString(value) { return `${value}`; }
+    function tableReflector(C, names, prop, attr = prop.toLowerCase(), kind = "string", min = 0, max = 0) {
+        Object.defineProperty(C.prototype, prop, {
+            enumerable: true, configurable: true,
+            get() {
+                requireHTMLInterface(this, names);
+                if (kind === "boolean") return this.hasAttribute(attr);
+                const value = this.getAttribute(attr);
+                if (kind !== "range") return value || "";
+                // HTML non-negative integer parsing allows a leading '+' and
+                // stops after the initial digit sequence, unlike Number().
+                const match = /^[\t\n\f\r ]*([+-]?[0-9]+)/.exec(value || "");
+                const parsed = match ? Number(match[1]) : -1;
+                return parsed >= 0 ? Math.min(max, Math.max(min, parsed)) : 1;
+            },
+            set(value) {
+                requireHTMLInterface(this, names);
+                if (kind === "boolean") {
+                    if (value) this.setAttribute(attr, ""); else this.removeAttribute(attr);
+                } else if (kind === "range") {
+                    value = (+value) >>> 0;
+                    // ReflectRange clamps only the GETTER. Reflection setters
+                    // use the unsigned-long 2^31-1 limit and default of one.
+                    this.setAttribute(attr, String(value > 0x7fffffff ? 1 : value));
+                } else this.setAttribute(attr, kind === "legacy" && value === null ? "" : domString(value));
+            },
+        });
+    }
+
     // DOM §4.9 chooses an element interface from its namespace and local name,
     // not its spelling alone. Memoize the pair: HTML <a> is an
     // HTMLAnchorElement, SVG <a> an SVGAElement, and a null/custom-namespace <a>
@@ -6184,9 +6484,16 @@
     }
 
     class Document extends Node {
+        constructor(id) {
+            super(id === undefined ? __dom_create_document("application/xml") : id);
+            if (id === undefined) {
+                rememberWrapper(this.__id, this);
+                documentURLs.set(this, "about:blank");
+            }
+        }
         get nodeType() { return 9; }
         get nodeName() { return "#document"; }
-        get [Symbol.toStringTag]() { return "HTMLDocument"; }
+        get [Symbol.toStringTag]() { return "Document"; }
         // `document.all` — the legacy `HTMLAllCollection`, the web's one
         // `[[IsHTMLDDA]]` object (Annex B.3.6): falsy, `typeof "undefined"`, and
         // `== null`/`== undefined`, but a stable distinct object for `===`. Minted
@@ -6216,7 +6523,7 @@
         // (hot path). A DETACHED document (a `DOMParser` result, `__id !== 0`)
         // scopes to its OWN subtree instead — `__dom_doc_element` only knows the
         // live tree's root.
-        get documentElement() { return this.__id === 0 ? wrap(__dom_doc_element()) : (this.querySelector("html") || this.firstElementChild); }
+        get documentElement() { return this.__id === 0 ? wrap(__dom_doc_element()) : this.firstElementChild; }
         // The element that scrolls the viewport (CSSOM View). Standards mode ⇒
         // the document element; its scrollTop/scrollHeight/clientHeight mirror
         // the page scroll, so `document.scrollingElement.scrollTop` reads the
@@ -6226,7 +6533,7 @@
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
         get readyState() { return trust.readyState; }
-        get contentType() { return documentContentTypes.get(this) || "text/html"; }
+        get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(this.__id); }
         // CSS Font Loading Module Level 3 §4.2: a document's font source is a
         // stable FontFaceSet.  Its setlike collection is independent per
         // Document, including detached documents created by DOMParser.
@@ -6259,12 +6566,12 @@
         // it (GitHub's behaviors bundle: "Unable to get document domain").
         get domain() { return this.__domain !== undefined ? this.__domain : g.location.hostname; }
         set domain(v) { this.__domain = String(v); }
-        get defaultView() { return g; }
+        get defaultView() { return this.__id === 0 ? g : null; }
         // HTML Document creation: snapshot the final request referrer, or the
         // empty default for a Document without navigation request metadata.
         get referrer() { return documentReferrers.get(this) || ""; }
-        get documentURI() { return g.location.href; }
-        get URL() { return g.location.href; }
+        get documentURI() { return this.URL; }
+        get URL() { return documentURLs.get(this) || g.location.href; }
         get currentScript() { return wrap(trust.currentScript); }
         get implementation() {
             const doc = this;
@@ -6337,19 +6644,20 @@
         }
         createElement(t) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
-            const localName = asciiLower(String(t));
+            const isHTML = this.contentType === "text/html";
+            const localName = isHTML ? asciiLower(domString(t)) : domString(t);
             if (!VALID_ELEMENT_LOCAL_NAME.test(localName)) {
                 throw new DOMException("The tag name is not a valid element local name.", "InvalidCharacterError");
             }
-            const el = newElementWrapper(
-                __dom_create_element(localName), localName, HTML_NS, null
-            );
+            const namespace = isHTML || this.contentType === "application/xhtml+xml" ? HTML_NS : null;
+            const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName), localName, namespace, null);
+            if (this.__id !== 0 && __dom_node_type(this.__id) === 9) this.adoptNode(el);
             // HTML's script-element creation steps give dynamically created
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
             // this marker and therefore default to false.
             if (el.localName === "script") el.__trustForceAsync = true;
-            const ctor = CE.defs.get(localName);
+            const ctor = namespace === HTML_NS ? CE.defs.get(localName) : null;
             if (ctor) upgradeElement(el, ctor);
             return el;
         }
@@ -6365,6 +6673,7 @@
                 __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName),
                 localName, extracted[0], extracted[1]
             );
+            if (this.__id !== 0 && __dom_node_type(this.__id) === 9) this.adoptNode(el);
             if (extracted[0] === HTML_NS && localName === "script") el.__trustForceAsync = true;
             if (extracted[0] === HTML_NS) {
                 const ctor = CE.defs.get(localName);
@@ -6372,8 +6681,14 @@
             }
             return el;
         }
-        createTextNode(s) { return wrap(__dom_create_text(s === undefined ? "" : String(s))); }
-        createComment(s) { return wrap(__dom_create_comment(s === undefined ? "" : String(s))); }
+        createTextNode(s) {
+            const node = wrap(__dom_create_text(s === undefined ? "" : String(s)));
+            return this.__id === 0 ? node : this.adoptNode(node);
+        }
+        createComment(s) {
+            const node = wrap(__dom_create_comment(s === undefined ? "" : String(s)));
+            return this.__id === 0 ? node : this.adoptNode(node);
+        }
         // A detached Attr (DOM §4.9.2): a plain object matching what the
         // `attributes` NamedNodeMap yields, so setAttributeNode can consume it.
         createAttribute(n) {
@@ -7518,15 +7833,23 @@
     // threw and every client-routed link went dead. DOMPurify/jQuery.parseHTML
     // (body-level fragments) still work — the document parser wraps a stray
     // fragment into `<html><head></head><body>…`.
+    const XML_DOCUMENT_TOKEN = {};
+    class XMLDocument extends Document {
+        constructor(id, token) {
+            if (token !== XML_DOCUMENT_TOKEN) throw new TypeError("Illegal constructor");
+            super(id);
+        }
+        get [Symbol.toStringTag]() { return "XMLDocument"; }
+    }
     class DOMParser {
         parseFromString(str, type) {
-            const s = String(str === undefined ? "" : str);
-            const t = String(type || "text/html").toLowerCase();
-            // We have no XML parser; treat anything non-XML as HTML (the common
-            // case). An XML mediaType falls back to the HTML document parser too
-            // — best-effort, same as before, but now a well-formed document.
-            void t;
-            return wrap(__dom_parse_document(s));
+            if (arguments.length < 2) throw new TypeError("parseFromString requires two arguments");
+            const s = domString(str), t = domString(type);
+            if (!["text/html", "text/xml", "application/xml", "application/xhtml+xml", "image/svg+xml"].includes(t))
+                throw new TypeError("Unsupported DOMParser MIME type");
+            const doc = wrap(__dom_parse_document(s, t));
+            documentURLs.set(doc, g.document.URL);
+            return doc;
         }
     }
     // `new XMLSerializer().serializeToString(node)` — the inverse of DOMParser.
@@ -8067,8 +8390,17 @@
         configurable: true, enumerable: false,
         get() { return frameElementState; },
     });
-    class CDATASection extends Text {}
-    class ProcessingInstruction extends CharacterData {}
+    class CDATASection extends Text {
+        get nodeType() { return 4; }
+        get nodeName() { return "#cdata-section"; }
+        get [Symbol.toStringTag]() { return "CDATASection"; }
+    }
+    class ProcessingInstruction extends CharacterData {
+        get target() { return __dom_pi_target(this.__id); }
+        get nodeType() { return 7; }
+        get nodeName() { return this.target; }
+        get [Symbol.toStringTag]() { return "ProcessingInstruction"; }
+    }
     class DocumentType extends Node {}
     class Attr extends Node {}
     // WHATWG DOM puts the element-traversal accessors on the ParentNode mixin
@@ -8242,7 +8574,115 @@
         NODE_LIST_DATA.set(proxy, data);
         return proxy;
     }
-    class HTMLCollection {}
+    const HTML_COLLECTION_TOKEN = {};
+    const HTML_COLLECTION_DATA = new WeakMap();
+    function htmlCollectionList(collection) {
+        const resolve = HTML_COLLECTION_DATA.get(collection);
+        if (!resolve) throw new TypeError("Illegal invocation");
+        return resolve();
+    }
+    function collectionNamedItem(list, name) {
+        if (name === "") return null;
+        for (const element of list) {
+            if (element.id === name || (element.namespaceURI === HTML_NS && element.getAttribute("name") === name))
+                return element;
+        }
+        return null;
+    }
+    class HTMLCollection {
+        constructor(...args) {
+            if (args[0] !== HTML_COLLECTION_TOKEN) throw new TypeError("Illegal constructor");
+        }
+        get length() { return htmlCollectionList(this).length; }
+        item(index) {
+            if (!arguments.length) throw new TypeError("item requires an index");
+            const resolve = HTML_COLLECTION_DATA.get(this);
+            if (!resolve) throw new TypeError("Illegal invocation");
+            index = (+index) >>> 0;
+            return resolve()[index] || null;
+        }
+        namedItem(name) {
+            if (!arguments.length) throw new TypeError("namedItem requires a name");
+            const resolve = HTML_COLLECTION_DATA.get(this);
+            if (!resolve) throw new TypeError("Illegal invocation");
+            name = domString(name);
+            return collectionNamedItem(resolve(), name);
+        }
+        [Symbol.iterator]() {
+            htmlCollectionList(this);
+            const collection = this;
+            let index = 0, done = false;
+            return {
+                next() {
+                    if (done) return { value: undefined, done: true };
+                    const list = htmlCollectionList(collection);
+                    if (index < list.length) return { value: list[index++], done: false };
+                    done = true;
+                    return { value: undefined, done: true };
+                },
+                [Symbol.iterator]() { return this; },
+            };
+        }
+        get [Symbol.toStringTag]() { return "HTMLCollection"; }
+    }
+    function makeHTMLCollection(resolve) {
+        const target = new HTMLCollection(HTML_COLLECTION_TOKEN);
+        function named(property) {
+            return typeof property === "string" && !Reflect.has(target, property)
+                && collectionNamedItem(resolve(), property) !== null;
+        }
+        function descriptor(property) {
+            const index = nodeListArrayIndex(property);
+            if (index >= 0) {
+                const value = resolve()[index];
+                return value ? { value, writable: false, enumerable: true, configurable: true } : undefined;
+            }
+            if (named(property)) return {
+                value: collectionNamedItem(resolve(), property),
+                writable: false, enumerable: false, configurable: true,
+            };
+            return Reflect.getOwnPropertyDescriptor(target, property);
+        }
+        const proxy = new Proxy(target, {
+            get(t, property, receiver) {
+                const own = descriptor(property);
+                return own && "value" in own ? own.value : Reflect.get(t, property, receiver);
+            },
+            has(t, property) { return descriptor(property) !== undefined || Reflect.has(t, property); },
+            getOwnPropertyDescriptor(t, property) { return descriptor(property); },
+            ownKeys(t) {
+                const list = resolve(), keys = [];
+                for (let i = 0; i < list.length; i++) keys.push(String(i));
+                for (const element of list) {
+                    const names = [element.id];
+                    if (element.namespaceURI === HTML_NS) names.push(element.getAttribute("name"));
+                    for (const name of names) {
+                        if (name && nodeListArrayIndex(name) < 0 && !Reflect.has(t, name) && !keys.includes(name)) keys.push(name);
+                    }
+                }
+                return keys.concat(Reflect.ownKeys(t));
+            },
+            set(t, property, value, receiver) {
+                if (nodeListArrayIndex(property) >= 0) return false;
+                return Reflect.set(t, property, value, receiver);
+            },
+            defineProperty(t, property, desc) {
+                if (nodeListArrayIndex(property) >= 0) return false;
+                if (typeof property === "string" && !Object.prototype.hasOwnProperty.call(t, property)
+                    && collectionNamedItem(resolve(), property)) return false;
+                return Reflect.defineProperty(t, property, desc);
+            },
+            deleteProperty(t, property) {
+                const index = nodeListArrayIndex(property);
+                if (index >= 0) return index >= resolve().length;
+                return named(property) ? false : Reflect.deleteProperty(t, property);
+            },
+            preventExtensions() { return false; },
+        });
+        HTML_COLLECTION_DATA.set(target, resolve);
+        HTML_COLLECTION_DATA.set(proxy, resolve);
+        return proxy;
+    }
     // WHATWG DOM/HTML collections are live, array-indexed legacy platform
     // objects. Recompute membership at each observable operation so DOM moves,
     // removals, and `form=id` reassociation are visible through an already-held
@@ -8298,9 +8738,13 @@
     }
     class HTMLFormControlsCollection extends HTMLCollection {
         constructor(form) {
-            super();
+            super(HTML_COLLECTION_TOKEN);
             this.__form = form;
-            return collectionProxy(this);
+            const proxy = collectionProxy(this);
+            const resolve = () => listedFormControls(form);
+            HTML_COLLECTION_DATA.set(this, resolve);
+            HTML_COLLECTION_DATA.set(proxy, resolve);
+            return proxy;
         }
         __list() { return listedFormControls(this.__form); }
         get length() { return this.__list().length; }
@@ -8336,6 +8780,7 @@
     g.DocumentType = DocumentType; g.Attr = Attr;
     g.Node = Node; g.Element = Element; g.HTMLElement = HTMLElement;
     g.Text = Text; g.Document = Document; g.HTMLDocument = Document;
+    g.XMLDocument = XMLDocument;
     g.DocumentFragment = DocumentFragment; g.Comment = Comment;
     g.Event = Event; g.CustomEvent = CustomEvent;
     g.UIEvent = UIEvent; g.MouseEvent = MouseEvent; g.PointerEvent = PointerEvent;
@@ -8400,6 +8845,10 @@
     g.HTMLStyleElement = HTMLStyleElement; g.HTMLLinkElement = HTMLLinkElement;
     g.HTMLDialogElement = HTMLDialogElement;
     g.HTMLMarqueeElement = HTMLMarqueeElement;
+    g.HTMLTableElement = HTMLTableElement;
+    g.HTMLTableSectionElement = HTMLTableSectionElement;
+    g.HTMLTableRowElement = HTMLTableRowElement;
+    g.HTMLTableCellElement = HTMLTableCellElement;
     // The rest of the standard HTML element interface zoo. Browsers expose a
     // constructor for every element kind; boot code patches their prototypes
     // and feature-detects them (YouTube's kevlar reads bare `HTMLTemplateElement`,
@@ -8420,6 +8869,38 @@
             const __C = class extends HTMLElement {};
             try { Object.defineProperty(__C, "name", { value: __cn }); } catch (e) {}
             g[__cn] = __C;
+        }
+    }
+    // The caption/column interfaces have reflected members only, including
+    // obsolete members still required by HTML §16.3.10.
+    for (const [C, names, props] of [
+        [HTMLTableElement, ["table"], ["align", "border", "frame", "rules", "summary", "width"]],
+        [HTMLTableSectionElement, TABLE_SECTIONS, ["align", "vAlign"]],
+        [HTMLTableRowElement, ["tr"], ["align", "vAlign"]],
+        [HTMLTableCellElement, ["td", "th"], ["headers", "abbr", "align", "axis", "height", "width", "vAlign"]],
+        [g.HTMLTableColElement, ["col", "colgroup"], ["align", "vAlign", "width"]],
+        [g.HTMLTableCaptionElement, ["caption"], ["align"]],
+    ]) {
+        for (const prop of props) tableReflector(C, names, prop);
+        if (names[0] !== "table" && names[0] !== "caption") {
+            tableReflector(C, names, "ch", "char");
+            tableReflector(C, names, "chOff", "charoff");
+        }
+        if (["table", "tr", "td"].includes(names[0])) tableReflector(C, names, "bgColor", "bgcolor", "legacy");
+    }
+    tableReflector(HTMLTableElement, ["table"], "cellPadding", "cellpadding", "legacy");
+    tableReflector(HTMLTableElement, ["table"], "cellSpacing", "cellspacing", "legacy");
+    tableReflector(HTMLTableCellElement, ["td", "th"], "noWrap", "nowrap", "boolean");
+    tableReflector(HTMLTableCellElement, ["td", "th"], "colSpan", "colspan", "range", 1, 1000);
+    tableReflector(HTMLTableCellElement, ["td", "th"], "rowSpan", "rowspan", "range", 0, 65534);
+    tableReflector(g.HTMLTableColElement, ["col", "colgroup"], "span", "span", "range", 1, 1000);
+    // Web IDL operations and attributes are enumerable on interface prototypes.
+    for (const C of [HTMLTableElement, HTMLTableSectionElement, HTMLTableRowElement, HTMLTableCellElement, HTMLCollection]) {
+        for (const name of Object.getOwnPropertyNames(C.prototype)) {
+            if (name === "constructor") continue;
+            const desc = Object.getOwnPropertyDescriptor(C.prototype, name);
+            desc.enumerable = true;
+            Object.defineProperty(C.prototype, name, desc);
         }
     }
     // Now that every HTML interface constructor exists, install the multi-
@@ -8977,13 +9458,11 @@
             }
         }
     }
-    class WindowNamedCollection extends HTMLCollection {
-        constructor(name) { super(); this.__name = name; return collectionProxy(this); }
-        __list() { refreshWindowNames(); return namedElements.get(this.__name) || []; }
-        get length() { return this.__list().length; }
-        item(index) { return this.__list()[index >>> 0] || null; }
-        namedItem(name) { return this.__list().find(el => el.id === String(name) || el.getAttribute('name') === String(name)) || null; }
-        [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
+    function windowNamedCollection(name) {
+        return makeHTMLCollection(() => {
+            refreshWindowNames();
+            return namedElements.get(name) || [];
+        });
     }
     const namedTarget = Object.create(EventTarget.prototype);
     Object.defineProperty(namedTarget, Symbol.toStringTag, {value:'WindowProperties', configurable:true});
@@ -9003,7 +9482,7 @@
         else if (elements.length === 1) value = elements[0];
         else {
             value = namedCollections.get(property);
-            if (!value) namedCollections.set(property, value = new WindowNamedCollection(property));
+            if (!value) namedCollections.set(property, value = windowNamedCollection(property));
         }
         return {value, writable:true, enumerable:false, configurable:true};
     }
@@ -9262,6 +9741,38 @@
     g.innerWidth = realmRootFrame ? frameViewportDimension(realmRootFrame, "width") : cfg.width;
     g.innerHeight = realmRootFrame ? frameViewportDimension(realmRootFrame, "height") : cfg.height;
     g.outerWidth = cfg.width; g.outerHeight = cfg.height;
+    // CSSOM View #dom-window-screenx/#dom-window-screeny and Web IDL
+    // #Replaceable: these are live, replaceable Window attributes, not mouse
+    // coordinates or iframe offsets. The host owns one client-window origin
+    // shared by its nested browsing contexts, with zero for no exposed screen.
+    (() => {
+        const coordinate = g.__window_screen_coordinate;
+        delete g.__window_screen_coordinate;
+        const define = Object.defineProperty, TypeErrorCtor = TypeError;
+        function receiver(value) {
+            if (value === undefined || value === null) value = g;
+            const state = windowMessageState(value);
+            if (!state) throw new TypeErrorCtor("Illegal Window invocation");
+            if (state.originKey !== windowMessageState(g).originKey)
+                throw new DOMException("Cross-origin Window access", "SecurityError");
+            return value;
+        }
+        for (const name of ["screenX", "screenLeft", "screenY", "screenTop"]) {
+            const vertical = name === "screenY" || name === "screenTop";
+            const descriptor = {
+                configurable: true, enumerable: true,
+                get() { receiver(this); return coordinate(vertical); },
+                set(value) {
+                    define(receiver(this), name, {
+                        value, writable: true, enumerable: true, configurable: true,
+                    });
+                },
+            };
+            define(descriptor.get, "name", {value: "get " + name, configurable: true});
+            define(descriptor.set, "name", {value: "set " + name, configurable: true});
+            define(g, name, descriptor);
+        }
+    })();
     g.devicePixelRatio = cfg.devicePixelRatio; g.pageXOffset = 0; g.pageYOffset = 0;
     g.scrollX = 0; g.scrollY = 0;
     // WHATWG HTML §7.2.5 "The History interface", shared history
@@ -14910,6 +15421,58 @@
     // own `readystatechange` listener. A standalone XHR (own `__ls`, not in the
     // chain) left that stash undefined → `undefined.call` aborted every Angular
     // HttpClient request (the tilvids/PeerTube "Cannot load more videos").
+    // MIME Sniffing §4.3–4.4, used by XHR's final MIME type and encoding.
+    // Preserve first parameters and HTTP quoted-string escaping; a regexp
+    // split on semicolons would misread quoted parameter values.
+    const MIME_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+    function parseMimeType(input) {
+        input = input.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+        const slash = input.indexOf("/");
+        if (slash < 1 || !MIME_TOKEN.test(input.slice(0, slash))) return null;
+        let pos = input.indexOf(";", slash + 1);
+        if (pos === -1) pos = input.length;
+        const subtype = input.slice(slash + 1, pos).replace(/[\t\n\r ]+$/g, "");
+        if (!MIME_TOKEN.test(subtype)) return null;
+        const mime = { essence: input.slice(0, slash).toLowerCase() + "/" + subtype.toLowerCase(), parameters: new Map() };
+        while (pos < input.length) {
+            pos++;
+            while (pos < input.length && /[\t\n\r ]/.test(input[pos])) pos++;
+            const start = pos;
+            while (pos < input.length && input[pos] !== ";" && input[pos] !== "=") pos++;
+            const name = input.slice(start, pos).toLowerCase();
+            if (input[pos] === ";") continue;
+            if (++pos >= input.length) break;
+            let value = "";
+            if (input[pos] === '"') {
+                pos++;
+                while (pos < input.length) {
+                    const ch = input[pos++];
+                    if (ch === '"') break;
+                    if (ch === "\\" && pos < input.length) value += input[pos++];
+                    else value += ch;
+                }
+                while (pos < input.length && input[pos] !== ";") pos++;
+            } else {
+                const startValue = pos;
+                while (pos < input.length && input[pos] !== ";") pos++;
+                value = input.slice(startValue, pos).replace(/[\t\n\r ]+$/g, "");
+                if (!value) continue;
+            }
+            if (MIME_TOKEN.test(name) && /^[\t\x20-\x7e\x80-\xff]*$/.test(value) && !mime.parameters.has(name))
+                mime.parameters.set(name, value);
+        }
+        return mime;
+    }
+    function serializeMimeType(mime) {
+        let result = mime.essence;
+        for (const [name, value] of mime.parameters) {
+            result += ";" + name + "=" + (MIME_TOKEN.test(value) ? value : '"' + value.replace(/["\\]/g, "\\$&") + '"');
+        }
+        return result;
+    }
+    function isXmlMime(mime) {
+        return mime === "text/xml" || mime === "application/xml" || mime.endsWith("+xml");
+    }
     class XMLHttpRequest extends EventTarget {
         constructor() {
             super();
@@ -14955,12 +15518,11 @@
             if (rt === "arraybuffer" || rt === "blob") {
                 const bytes = __bodyBytes(this.__bytes != null ? this.__bytes : utf8Binary(this.__text));
                 const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-                out = rt === "blob" ? new g.Blob([buf], { type: this.__ctype || "" }) : buf;
+                out = rt === "blob" ? new g.Blob([buf], { type: serializeMimeType(this.__finalMime()) }) : buf;
             } else if (rt === "json") {
                 try { out = JSON.parse(this.__ensureText()); } catch (e) { out = null; }
             } else if (rt === "document") {
-                const xml = /xml/i.test(this.__ctype || "") && !/html/i.test(this.__ctype || "");
-                try { out = new g.DOMParser().parseFromString(this.__ensureText(), xml ? "text/xml" : "text/html"); } catch (e) { out = null; }
+                out = this.__documentResponse();
             }
             this.__respObj = out;
             return out;
@@ -14969,19 +15531,26 @@
         // a document only when the response's MIME type is a document type —
         // for "" that means XML ONLY (an HTML response reads null, which is
         // what jQuery-era code expects); "document" mode accepts HTML too.
-        // Parsed via DOMParser (our parser is HTML — the honest approximation
-        // for XML input, same as the `response` document mode).
+        // Both getters use the same cached document response. XML errors yield
+        // null here, unlike DOMParser's parsererror document (XHR §3.6.3).
         get responseXML() {
             if (this.__respType !== "" && this.__respType !== "document")
                 throw new DOMException("responseXML is only available for '' or 'document' responseType", "InvalidStateError");
             if (this.readyState !== 4) return null;
+            return this.__documentResponse();
+        }
+        __documentResponse() {
             if (this.__respXML !== undefined) return this.__respXML;
-            const ct = String(this.__ctype || "").toLowerCase();
-            const isXml = /xml/.test(ct) && !/html/.test(ct);
-            const isHtml = /html/.test(ct);
+            const ct = this.__finalMime().essence;
+            const isXml = isXmlMime(ct);
+            const isHtml = ct === "text/html";
             let out = null;
             if (isXml || (isHtml && this.__respType === "document")) {
-                try { out = new g.DOMParser().parseFromString(this.__ensureText(), isXml ? "text/xml" : "text/html"); } catch (e) { out = null; }
+                try { out = wrap(__dom_parse_document(this.__decodeText(isXml), ct)); }
+                catch (error) { this.__respXML = null; return null; }
+                documentURLs.set(out, this.responseURL);
+                const root = out.documentElement;
+                if (isXml && root && root.localName === "parsererror" && root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml") out = null;
             }
             this.__respXML = out;
             return out;
@@ -15015,12 +15584,43 @@
             return this.__ctype ? "content-type: " + this.__ctype + "\r\n" : "";
         }
         __ensureText() {
-            if ((this.__text === null || this.__text === undefined || this.__text === "") && this.__bytes != null) {
-                this.__text = new g.TextDecoder().decode(__bodyBytes(this.__bytes));
-            }
-            return this.__text || "";
+            if (this.readyState < 3) return "";
+            if (this.__decodedText === undefined) this.__decodedText = this.__decodeText(false);
+            return this.__decodedText;
         }
-        overrideMimeType() {}
+        __finalMime() { return this.__overrideMime || parseMimeType(this.__ctype || "") || parseMimeType("text/xml"); }
+        __decodeText(fatal) {
+            if (this.__bytes == null) return this.__text || "";
+            const bytes = __bodyBytes(this.__bytes);
+            const responseMime = parseMimeType(this.__ctype || "");
+            let label = responseMime && responseMime.parameters.get("charset");
+            if (this.__overrideMime && this.__overrideMime.parameters.has("charset")) label = this.__overrideMime.parameters.get("charset");
+            if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) label = "utf-8";
+            else if (bytes[0] === 0xff && bytes[1] === 0xfe) label = "utf-16le";
+            else if (bytes[0] === 0xfe && bytes[1] === 0xff) label = "utf-16be";
+            else if (!label && isXmlMime(this.__finalMime().essence) && (this.__respType === "" || this.__respType === "document")) {
+                if (bytes[0] === 0 && bytes[1] === 60) label = "utf-16be";
+                else if (bytes[0] === 60 && bytes[1] === 0) label = "utf-16le";
+                else {
+                    let prolog = "";
+                    for (let i = 0; i < Math.min(1024, bytes.length); i++) prolog += String.fromCharCode(bytes[i]);
+                    const match = /^<\?xml[\t\n\r ][\s\S]*?encoding[\t\n\r ]*=[\t\n\r ]*(['"])([^'"]+)\1/.exec(prolog);
+                    if (match) label = match[2];
+                }
+            }
+            let decoder;
+            try { decoder = new g.TextDecoder(label || "utf-8", { fatal }); }
+            catch (error) { if (fatal) throw error; decoder = new g.TextDecoder("utf-8"); }
+            return decoder.decode(bytes);
+        }
+        overrideMimeType(mime) {
+            if (!arguments.length) throw new TypeError("overrideMimeType requires a MIME type");
+            mime = domString(mime);
+            if (this.readyState === 3 || this.readyState === 4)
+                throw new DOMException("The response is already loading or done", "InvalidStateError");
+            this.__overrideMime = parseMimeType(mime) || parseMimeType("application/octet-stream");
+            this.__decodedText = undefined;
+        }
         // XHR §the abort() method: an in-flight request runs the "request error
         // steps" for abort (state DONE, readystatechange, abort, loadend), then
         // state resets to UNSENT. The wire request isn't torn down — its late
@@ -15056,6 +15656,8 @@
             this.__inFlight = false;
             if (!r) {
                 this.readyState = 4; this.status = 0;
+                this.__text = ""; this.__bytes = null; this.__decodedText = "";
+                this.__respObj = null; this.__respXML = null;
                 this.__fire("readystatechange"); this.__fire("error"); this.__fire("loadend");
                 return;
             }
@@ -15069,6 +15671,7 @@
             this.__hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
             if (this.__hdrs && this.__ctype && this.__hdrs["content-type"] === undefined) this.__hdrs["content-type"] = this.__ctype;
             this.__respObj = undefined; this.__respXML = undefined;
+            this.__decodedText = undefined;
             this.responseURL = this.__url;
             this.readyState = 4;
             this.__fire("readystatechange"); this.__fire("load"); this.__fire("loadend");
