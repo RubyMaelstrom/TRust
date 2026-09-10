@@ -971,7 +971,7 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     let shape_clip = PaintStyle::of(fragment)
         .and_then(|style| {
             style.value(builder.dom, "clip-path").and_then(|value| {
-                super::clip_path::Inset::parse(
+                super::clip_path::ClipPath::parse(
                     &value,
                     Units::of(builder.dom, style.node()),
                     super::value::Vp {
@@ -981,9 +981,7 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 )
             })
         })
-        .and_then(|inset| {
-            inset.shape(CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h))
-        });
+        .and_then(|inset| inset.shape_for(fragment));
     if let Some(shape) = &shape_clip {
         builder
             .commands
@@ -1529,7 +1527,15 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         for piece in &line.pieces {
             let node = piece.item.node;
             let style_node = piece.item.style_node;
-            if if style_node == NO_NODE {
+            if if let Some((node, pseudo)) = piece.item.pseudo {
+                matches!(
+                    builder
+                        .dom
+                        .pseudo_layout_value(node, pseudo, "visibility")
+                        .as_deref(),
+                    Some("hidden" | "collapse")
+                )
+            } else if style_node == NO_NODE {
                 piece.item.invisible
             } else {
                 builder.dom.visibility_hidden(style_node)
@@ -2652,6 +2658,112 @@ fn paint_spaced_background(
     builder.commands.push(DisplayCommand::PopClip);
 }
 
+/// A rounded contour and its reverse form a nonzero-winding border ring.
+/// CSS Backgrounds 3 #corner-shaping subtracts each side's inset from the
+/// corresponding outer radius, including unequal border widths.
+fn rounded_contour(rect: CssRect, radii: CornerRadii, reverse: bool) -> Vec<PathElement> {
+    let x = rect.x;
+    let y = rect.y;
+    let r = x + rect.width;
+    let b = y + rect.height;
+    let [(tlx, tly), (trx, try_), (brx, bry), (blx, bly)] = radii.corners;
+    let k = 0.5522848;
+    let point = CssPoint::new;
+    let start = point(x + tlx, y);
+    let path = vec![
+        PathElement::MoveTo(start),
+        PathElement::LineTo(point(r - trx, y)),
+        PathElement::CurveTo(
+            point(r - trx + k * trx, y),
+            point(r, y + try_ - k * try_),
+            point(r, y + try_),
+        ),
+        PathElement::LineTo(point(r, b - bry)),
+        PathElement::CurveTo(
+            point(r, b - bry + k * bry),
+            point(r - brx + k * brx, b),
+            point(r - brx, b),
+        ),
+        PathElement::LineTo(point(x + blx, b)),
+        PathElement::CurveTo(
+            point(x + blx - k * blx, b),
+            point(x, b - bly + k * bly),
+            point(x, b - bly),
+        ),
+        PathElement::LineTo(point(x, y + tly)),
+        PathElement::CurveTo(
+            point(x, y + tly - k * tly),
+            point(x + tlx - k * tlx, y),
+            start,
+        ),
+        PathElement::Close,
+    ];
+    if !reverse {
+        return path;
+    }
+    let mut previous = start;
+    let mut segments = Vec::new();
+    for segment in path.into_iter().skip(1) {
+        match segment {
+            PathElement::LineTo(end) => {
+                segments.push(PathElement::LineTo(previous));
+                previous = end;
+            }
+            PathElement::CurveTo(a, b, end) => {
+                segments.push(PathElement::CurveTo(b, a, previous));
+                previous = end;
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![PathElement::MoveTo(start)];
+    out.extend(segments.into_iter().rev());
+    out.push(PathElement::Close);
+    out
+}
+
+fn border_ring(
+    rect: CssRect,
+    radii: CornerRadii,
+    widths: [f32; 4],
+    start: f32,
+    end: f32,
+) -> PaintShape {
+    let inset = |fraction: f32| {
+        CssRect::new(
+            rect.x + widths[3] * fraction,
+            rect.y + widths[0] * fraction,
+            (rect.width - (widths[1] + widths[3]) * fraction).max(0.),
+            (rect.height - (widths[0] + widths[2]) * fraction).max(0.),
+        )
+    };
+    let outer = inset(start);
+    let inner = inset(end);
+    let mut path = rounded_contour(outer, inset_radii(radii, rect, outer), false);
+    if inner.width > 0. && inner.height > 0. {
+        path.extend(rounded_contour(
+            inner,
+            inset_radii(radii, rect, inner),
+            true,
+        ));
+    }
+    PaintShape::Path(path)
+}
+
+fn border_shade(color: PaintColor, light: bool) -> PaintColor {
+    let PaintColor::Rgba(r, g, b, a) = color else {
+        return color;
+    };
+    let shade = |v: u8| {
+        if light {
+            (u16::from(v) + (255 - u16::from(v)) / 3) as u8
+        } else {
+            (u16::from(v) * 2 / 3) as u8
+        }
+    };
+    PaintColor::Rgba(shade(r), shade(g), shade(b), a)
+}
+
 /// CSS Backgrounds and Borders §6: background first, then border. Uniform
 /// rounded borders use one true stroked rounded path; non-uniform sides retain
 /// each side's own color/style and CSS-pixel width.
@@ -2673,12 +2785,73 @@ fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<
             .unwrap_or_else(|| text_color_for_style(builder.dom, style, false))
     });
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    // #line-style permits UA-chosen band thickness and shading, but double
+    // must have a gap and the 3D styles must preserve their opposite relief.
+    let complex = |s: &str| matches!(s, "double" | "groove" | "ridge" | "inset" | "outset");
+    let inner = CssRect::new(
+        rect.x + left,
+        rect.y + top,
+        (rect.width - left - right).max(0.),
+        (rect.height - top - bottom).max(0.),
+    );
+    let corners = |r: CssRect| {
+        [
+            CssPoint::new(r.x, r.y),
+            CssPoint::new(r.x + r.width, r.y),
+            CssPoint::new(r.x + r.width, r.y + r.height),
+            CssPoint::new(r.x, r.y + r.height),
+        ]
+    };
+    let outside = corners(rect);
+    let inside = corners(inner);
+    for side in 0..4 {
+        if fragment.border[side] <= 0. || !complex(&styles[side]) {
+            continue;
+        }
+        let mut kind = styles[side].as_str();
+        if style.value(builder.dom, "border-collapse").as_deref() == Some("collapse") {
+            kind = match kind {
+                "inset" => "ridge",
+                "outset" => "groove",
+                other => other,
+            };
+        }
+        let raised = side == 0 || side == 3;
+        let light = match kind {
+            "ridge" | "outset" => raised,
+            _ => !raised,
+        };
+        let color = colors[side];
+        let bands = match kind {
+            "double" => vec![(0., 1. / 3., color), (2. / 3., 1., color)],
+            "groove" | "ridge" => vec![
+                (0., 0.5, border_shade(color, light)),
+                (0.5, 1., border_shade(color, !light)),
+            ],
+            _ => vec![(0., 1., border_shade(color, light))],
+        };
+        let next = (side + 1) % 4;
+        builder
+            .commands
+            .push(DisplayCommand::PushClip(PaintShape::Polygon {
+                points: vec![outside[side], outside[next], inside[next], inside[side]],
+                evenodd: false,
+            }));
+        for (start, end, color) in bands {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: border_ring(rect, radii, fragment.border, start, end),
+                brush: PaintBrush::Solid(color),
+            });
+        }
+        builder.commands.push(DisplayCommand::PopClip);
+    }
     let uniform = (top - right).abs() < 0.01
         && (top - bottom).abs() < 0.01
         && (top - left).abs() < 0.01
         && styles.iter().all(|s| s == &styles[0])
         && colors.iter().all(|c| *c == colors[0]);
-    if uniform && top > 0.0 && styles[0] != "none" && styles[0] != "hidden" {
+    if uniform && top > 0.0 && styles[0] != "none" && styles[0] != "hidden" && !complex(&styles[0])
+    {
         let inset = top / 2.0;
         let inner = CssRect::new(
             rect.x + inset,
@@ -2716,7 +2889,10 @@ fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<
         ),
     ];
     for (index, (width, start, end)) in sides.into_iter().enumerate() {
-        if width <= 0.0 || matches!(styles[index].as_str(), "none" | "hidden") {
+        if width <= 0.0
+            || matches!(styles[index].as_str(), "none" | "hidden")
+            || complex(&styles[index])
+        {
             continue;
         }
         builder.commands.push(DisplayCommand::Stroke {
@@ -2821,9 +2997,6 @@ fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
             stroke.cap = LineCap::Round;
         }
         "dashed" => stroke.dash = vec![width * 3.0, width * 2.0],
-        // Double/groove/ridge/inset/outset remain isolated approximations: the
-        // retained style is real, but this phase emits a solid stroke until a
-        // multi-band border painter lands.
         _ => {}
     }
     stroke

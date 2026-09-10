@@ -146,8 +146,15 @@ pub enum PathElement {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaintShape {
     Rect(CssRect),
-    RoundedRect { rect: CssRect, radii: CornerRadii },
+    RoundedRect {
+        rect: CssRect,
+        radii: CornerRadii,
+    },
     Path(Vec<PathElement>),
+    Polygon {
+        points: Vec<CssPoint>,
+        evenodd: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -347,6 +354,9 @@ impl PagePaint {
 impl PaintShape {
     fn retained_bytes(&self) -> usize {
         match self {
+            PaintShape::Polygon { points, .. } => {
+                points.capacity() * std::mem::size_of::<CssPoint>()
+            }
             PaintShape::Path(elements) => elements.capacity() * std::mem::size_of::<PathElement>(),
             PaintShape::Rect(_) | PaintShape::RoundedRect { .. } => 0,
         }
@@ -1352,8 +1362,9 @@ fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
     }
 }
 
-fn shape_css_bounds(shape: &PaintShape) -> Option<CssRect> {
+pub(crate) fn shape_css_bounds(shape: &PaintShape) -> Option<CssRect> {
     match shape {
+        PaintShape::Polygon { points, .. } => css_point_bounds(points.iter().copied()),
         PaintShape::Rect(rect) | PaintShape::RoundedRect { rect, .. } => Some(*rect),
         PaintShape::Path(elements) => css_point_bounds(elements.iter().flat_map(|element| {
             match element {
@@ -2320,6 +2331,40 @@ fn point_in_interaction_state(point: CssPoint, state: &InteractionState) -> bool
 
 fn shape_contains(shape: &PaintShape, point: CssPoint) -> bool {
     match shape {
+        // CSS Shapes 1 #funcdef-polygon: close the last edge and evaluate
+        // the specified SVG fill rule, including concave/self-crossing paths.
+        PaintShape::Polygon { points, evenodd } => {
+            if points.len() < 3 {
+                return false;
+            }
+            let mut winding: i32 = 0;
+            for (&a, &b) in points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+            {
+                let side = (b.x - a.x) * (point.y - a.y) - (point.x - a.x) * (b.y - a.y);
+                if side == 0.
+                    && (a.x != b.x || a.y != b.y)
+                    && point.x >= a.x.min(b.x)
+                    && point.x <= a.x.max(b.x)
+                    && point.y >= a.y.min(b.y)
+                    && point.y <= a.y.max(b.y)
+                {
+                    return true;
+                }
+                if a.y <= point.y && b.y > point.y && side > 0. {
+                    winding += 1;
+                } else if a.y > point.y && b.y <= point.y && side < 0. {
+                    winding -= 1;
+                }
+            }
+            if *evenodd {
+                winding % 2 != 0
+            } else {
+                winding != 0
+            }
+        }
         PaintShape::Rect(rect) => rect.contains(point),
         PaintShape::RoundedRect { rect, radii } => {
             if !rect.contains(point) {
@@ -3768,6 +3813,56 @@ mod tests {
                 .controls
                 .iter()
                 .any(|control| control.id == ControlId::HorizontalHeart)
+        );
+    }
+
+    #[test]
+    fn polygon_clip_hit_testing_uses_winding_instead_of_bounding_rectangles() {
+        let points = [
+            (0., 0.),
+            (40., 0.),
+            (40., 40.),
+            (0., 40.),
+            (0., 0.),
+            (10., 10.),
+            (30., 10.),
+            (30., 30.),
+            (10., 30.),
+            (10., 10.),
+            (0., 0.),
+        ]
+        .map(|(x, y)| CssPoint::new(x, y))
+        .to_vec();
+        let evenodd = PaintShape::Polygon {
+            points: points.clone(),
+            evenodd: true,
+        };
+        let nonzero = PaintShape::Polygon {
+            points,
+            evenodd: false,
+        };
+        assert!(
+            !shape_contains(&evenodd, CssPoint::new(20., 20.)),
+            "same-orientation inner ring creates an evenodd hole"
+        );
+        assert!(shape_contains(&nonzero, CssPoint::new(20., 20.)));
+        assert!(shape_contains(&evenodd, CssPoint::new(5., 20.)));
+        assert!(!shape_contains(&nonzero, CssPoint::new(50., 20.)));
+        let triangle = PaintShape::Polygon {
+            points: vec![
+                CssPoint::new(0., 0.),
+                CssPoint::new(40., 0.),
+                CssPoint::new(0., 40.),
+            ],
+            evenodd: false,
+        };
+        assert!(
+            !shape_contains(&triangle, CssPoint::new(30., 30.)),
+            "inside bounds, outside triangle"
+        );
+        assert!(
+            shape_contains(&triangle, CssPoint::new(20., 20.)),
+            "closing edge belongs to clip"
         );
     }
 

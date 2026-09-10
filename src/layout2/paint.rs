@@ -63,7 +63,7 @@ pub(crate) struct TerminalPaintModel {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct TerminalNodePaint {
     parent: Option<NodeId>,
-    clip_path: Option<super::clip_path::Inset>,
+    clip_path: Option<super::clip_path::ClipPath>,
     tag: Option<String>,
     id: Option<String>,
     anchor_name: Option<String>,
@@ -165,7 +165,7 @@ impl TerminalPaintModel {
                     .computed_value_resolved(node, "clip-path")
                     .and_then(|value| {
                         let (w, h) = dom.viewport_px();
-                        super::clip_path::Inset::parse(
+                        super::clip_path::ClipPath::parse(
                             &value,
                             super::Units::of(dom, node),
                             super::value::Vp { w, h },
@@ -611,15 +611,9 @@ fn collect_inset_bounds(
     if let Some(inset) = dom
         .node(fragment.node)
         .and_then(|node| node.clip_path.as_ref())
-        && let Some(shape) = inset.shape(crate::render::CssRect::new(
-            fragment.x, fragment.y, fragment.w, fragment.h,
-        ))
+        && let Some(shape) = inset.shape_for(fragment)
     {
-        let rect = match shape {
-            crate::render::PaintShape::Rect(rect)
-            | crate::render::PaintShape::RoundedRect { rect, .. } => rect,
-            crate::render::PaintShape::Path(_) => unreachable!("inset shape"),
-        };
+        let rect = crate::render::shape_css_bounds(&shape).unwrap_or_default();
         out.insert(
             fragment.node,
             Clip {

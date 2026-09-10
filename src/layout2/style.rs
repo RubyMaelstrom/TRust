@@ -199,7 +199,7 @@ pub(crate) struct BoxStyle {
     /// The accumulated TRANSLATION of `transform` + the individual
     /// `translate` property, per axis as `(pct-of-own-border-box, px)` —
     /// the transform subset currently represented by the fragment tree
-    /// (css-transforms-1; scale/rotate/skew remain future paint operations).
+    /// (css-transforms-1; affine scale/rotate/skew are handled by graphics paint).
     pub tx: (f32, f32),
     pub ty: (f32, f32),
     /// Any non-none `transform`/`translate`: a stacking-context AND
@@ -1256,12 +1256,133 @@ impl InlineStyle {
         }
     }
 
-    pub fn with_pseudo(&self, pseudo: Option<(NodeId, PseudoEl)>) -> Self {
-        let mut style = self.clone();
-        if let Some(pseudo) = pseudo {
-            style.pseudo = Some(pseudo);
+    pub fn with_pseudo(&self, dom: &Dom, pseudo: Option<(NodeId, PseudoEl)>) -> Self {
+        let mut s = self.clone();
+        let Some((id, which)) = pseudo else {
+            return s;
+        };
+        s.pseudo = pseudo;
+        // CSS Pseudo 4: generated boxes inherit computed text metrics from
+        // their originating element, then apply their own declarations.
+        let declared = |p| {
+            dom.pseudo_style(id, which, p).is_some()
+                || dom.baked_pseudo_value(id, which, p).is_some()
+        };
+        let value = |p| dom.pseudo_layout_value(id, which, p);
+        if declared("font-size") {
+            s.font_size = value("font-size")
+                .as_deref()
+                .and_then(|v| crate::dom::font_size_px(v, self.font_size, dom.root_font_px()))
+                .unwrap_or(crate::dom::FONT_SIZE_INITIAL);
         }
-        style
+        let u = Units {
+            fs: s.font_size,
+            root: dom.root_font_px(),
+            ch: s.font_size * 0.5,
+        };
+        if declared("font-family") {
+            s.font_family = value("font-family").unwrap_or_else(|| "sans-serif".into());
+        }
+        if declared("font-weight") {
+            s.font_weight = value("font-weight")
+                .as_deref()
+                .and_then(|v| crate::layout2::relative_font_weight(v, self.font_weight))
+                .unwrap_or(400.);
+        }
+        if declared("font-style") {
+            s.font_italic = value("font-style").is_some_and(|v| css_is_italic(&v));
+        }
+        s.emph.bold = s.font_weight >= 600.;
+        s.emph.italic = s.font_italic;
+        if declared("text-decoration") || declared("text-decoration-line") {
+            let decor = value("text-decoration-line")
+                .or_else(|| value("text-decoration"))
+                .unwrap_or_default();
+            s.emph.underline |= decor.split_whitespace().any(|v| v == "underline");
+            s.emph.strike |= decor.split_whitespace().any(|v| v == "line-through");
+        }
+        if declared("text-transform") {
+            s.transform = value("text-transform")
+                .as_deref()
+                .and_then(TextTransform::from_css)
+                .unwrap_or(TextTransform::None);
+        }
+        if declared("letter-spacing") {
+            s.letter = value("letter-spacing")
+                .as_deref()
+                .and_then(|v| css_length_px(v, u))
+                .unwrap_or(0.);
+        }
+        if declared("word-spacing") {
+            s.word = value("word-spacing")
+                .as_deref()
+                .and_then(|v| css_length_px(v, u))
+                .unwrap_or(0.);
+        }
+        if declared("line-height") {
+            s.line_height = value("line-height")
+                .as_deref()
+                .and_then(|v| {
+                    if v == "normal" {
+                        Some(crate::text::CssLineHeight::Normal)
+                    } else if let Ok(n) = v.parse::<f32>() {
+                        Some(crate::text::CssLineHeight::Number(n.max(0.)))
+                    } else {
+                        css_length_px(v, u).map(crate::text::CssLineHeight::Length)
+                    }
+                })
+                .unwrap_or(crate::text::CssLineHeight::Normal);
+        }
+        if declared("tab-size") {
+            s.tab = value("tab-size")
+                .as_deref()
+                .and_then(|v| {
+                    v.parse::<f32>()
+                        .ok()
+                        .map(|n| TabSize::Spaces(n.max(0.)))
+                        .or_else(|| css_length_px(v, u).map(|n| TabSize::Length(n.max(0.))))
+                })
+                .unwrap_or(TabSize::Spaces(8.));
+        }
+        if declared("word-break") || declared("overflow-wrap") {
+            let wb = value("word-break");
+            s.keep_all = wb.as_deref() == Some("keep-all");
+            s.brk = match wb.as_deref() {
+                Some("break-all") => WordBrk::BreakAll,
+                Some("break-word") => WordBrk::Anywhere,
+                _ => match value("overflow-wrap").as_deref() {
+                    Some("anywhere") => WordBrk::Anywhere,
+                    Some("break-word") => WordBrk::BreakWord,
+                    _ => WordBrk::Normal,
+                },
+            };
+        }
+        if declared("vertical-align") {
+            s.vertical_align = match value("vertical-align").as_deref() {
+                Some("top" | "text-top") => VerticalAlign::Top,
+                Some("bottom" | "text-bottom") => VerticalAlign::Bottom,
+                Some("middle") => VerticalAlign::Middle(self.font_size * 0.25),
+                Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
+                Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
+                Some(v) => css_length_px(v, u)
+                    .map(VerticalAlign::Shift)
+                    .unwrap_or_default(),
+                None => VerticalAlign::Baseline,
+            };
+        }
+        s.ws = s.ws.with_longhands(
+            value("white-space-collapse").as_deref(),
+            value("text-wrap-mode").as_deref().map(|v| v == "nowrap"),
+        );
+        if declared("visibility") {
+            s.invisible = matches!(value("visibility").as_deref(), Some("hidden" | "collapse"));
+        }
+        s.opacity_chain |= value("opacity")
+            .and_then(|v| v.parse::<f32>().ok())
+            .is_some_and(|v| v <= 0.);
+        s.invisible |= s.opacity_chain;
+        s.font_zero = s.font_size <= 0.;
+        s
     }
 }
 

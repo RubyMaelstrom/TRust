@@ -140,7 +140,9 @@ impl VelloCpuRenderer {
                         continue;
                     }
                     self.set_brush(brush);
+                    self.context.set_fill_rule(shape_fill(shape));
                     self.context.fill_path(&shape_path(shape));
+                    self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
                 }
                 DisplayCommand::Stroke {
                     shape,
@@ -160,7 +162,9 @@ impl VelloCpuRenderer {
                     self.context.stroke_path(&shape_path(shape));
                 }
                 DisplayCommand::PushClip(shape) => {
+                    self.context.set_fill_rule(shape_fill(shape));
                     self.context.push_clip_path(&shape_path(shape));
+                    self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
                     let current = *visible_clips.last().unwrap();
                     let next = shape_bounds(shape)
                         .map(|bounds| {
@@ -742,8 +746,27 @@ pub(super) fn rect_path(rect: CssRect) -> BezPath {
     shape_path(&PaintShape::Rect(rect))
 }
 
+pub(super) fn shape_fill(shape: &PaintShape) -> vello_cpu::peniko::Fill {
+    if matches!(shape, PaintShape::Polygon { evenodd: true, .. }) {
+        vello_cpu::peniko::Fill::EvenOdd
+    } else {
+        vello_cpu::peniko::Fill::NonZero
+    }
+}
+
 pub(super) fn shape_path(shape: &PaintShape) -> BezPath {
     match shape {
+        PaintShape::Polygon { points, .. } => {
+            let mut path = BezPath::new();
+            if let Some(first) = points.first() {
+                path.move_to((f64::from(first.x), f64::from(first.y)));
+                for point in &points[1..] {
+                    path.line_to((f64::from(point.x), f64::from(point.y)));
+                }
+                path.close_path();
+            }
+            path
+        }
         PaintShape::Rect(rect) => {
             let mut path = BezPath::new();
             path.move_to((f64::from(rect.x), f64::from(rect.y)));
@@ -823,6 +846,13 @@ fn rounded_rect_path(rect: CssRect, radii: super::CornerRadii) -> BezPath {
 
 pub(super) fn offset_shape(shape: &PaintShape, dx: f32, dy: f32, spread: f32) -> PaintShape {
     match shape {
+        PaintShape::Polygon { points, evenodd } => PaintShape::Polygon {
+            points: points
+                .iter()
+                .map(|p| crate::core::CssPoint::new(p.x + dx, p.y + dy))
+                .collect(),
+            evenodd: *evenodd,
+        },
         PaintShape::Rect(rect) => PaintShape::Rect(CssRect::new(
             rect.x + dx - spread,
             rect.y + dy - spread,
@@ -912,6 +942,7 @@ pub(super) fn rect_is_visible(rect: CssRect, transform: Affine2d, clip: CssRect)
 
 pub(super) fn shape_bounds(shape: &PaintShape) -> Option<CssRect> {
     match shape {
+        PaintShape::Polygon { points, .. } => point_bounds(points.iter().copied()),
         PaintShape::Rect(rect) | PaintShape::RoundedRect { rect, .. } => Some(*rect),
         PaintShape::Path(elements) => point_bounds(elements.iter().flat_map(|element| {
             match element {

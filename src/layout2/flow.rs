@@ -701,7 +701,7 @@ impl Flow<'_> {
         // paint offset.
         let a0 = cur.anchors.len();
         let inl = if b.node == NO_NODE {
-            parent_inl.with_pseudo(s.pseudo)
+            parent_inl.with_pseudo(self.dom, s.pseudo)
         } else {
             InlineStyle::derive(self.dom, b.node, parent_inl, self.base)
         };
@@ -1658,22 +1658,7 @@ impl Flow<'_> {
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
         let bp = bp_l + bp_r;
         // A declared width, content-box px (box-sizing adjusts).
-        let intrinsic = |l: &Len| -> Option<f32> {
-            match l {
-                Len::MinContent => Some(self.intrinsic_w(b, IMode::Min, inl)),
-                Len::MaxContent => Some(self.intrinsic_w(b, IMode::Max, inl)),
-                Len::FitContent => {
-                    // fit-content = clamp(min-content, stretch-fit, max-content)
-                    // against the available space (css-sizing-3 §5.2.4).
-                    let min = self.intrinsic_w(b, IMode::Min, inl);
-                    let max = self.intrinsic_w(b, IMode::Max, inl).max(min);
-                    let ml = s.margin[LEFT].resolve(Some(cb_w)).unwrap_or(0.0);
-                    let mr = s.margin[RIGHT].resolve(Some(cb_w)).unwrap_or(0.0);
-                    Some((cb_w - ml - mr - bp).max(0.0).clamp(min, max))
-                }
-                _ => None,
-            }
-        };
+        let intrinsic = |l: &Len| self.intrinsic_width_value(l, b, Some(cb_w), inl);
         let spec = |l: &Len| {
             intrinsic(l).or_else(|| {
                 l.resolve(Some(cb_w)).map(|w| {
@@ -1879,11 +1864,28 @@ pub(super) fn cross_shift(extra: f32, auto_start: bool, auto_end: bool, align: A
 /// is the baseline set exported by an ordinary flex item for `align-items:
 /// baseline` (CSS Flexbox §8.5/§9.4). A caller supplies the border-edge
 /// fallback for a fragment with no line boxes.
-fn first_baseline(fragment: &Frag<'_>) -> Option<f32> {
+pub(super) fn first_baseline(fragment: &Frag<'_>) -> Option<f32> {
     fn absolute(fragment: &Frag<'_>, best: &mut Option<(f32, f32)>) {
         if let FragKind::Line(line) = &fragment.kind {
             let candidate = (fragment.y, fragment.y + line.baseline);
             if best.is_none_or(|current| candidate.0 < current.0) {
+                *best = Some(candidate);
+            }
+        }
+        for child in &fragment.children {
+            absolute(child, best);
+        }
+    }
+    let mut best = None;
+    absolute(fragment, &mut best);
+    best.map(|(_, baseline)| baseline - fragment.y)
+}
+
+pub(super) fn last_baseline(fragment: &Frag<'_>) -> Option<f32> {
+    fn absolute(fragment: &Frag<'_>, best: &mut Option<(f32, f32)>) {
+        if let FragKind::Line(line) = &fragment.kind {
+            let candidate = (fragment.y, fragment.y + line.baseline);
+            if best.is_none_or(|current| candidate.0 >= current.0) {
                 *best = Some(candidate);
             }
         }
@@ -2014,24 +2016,15 @@ impl Flow<'_> {
             // use the corresponding CONTENT size directly (box-sizing does
             // not transform it). fit-content clamps the stretch-fit size
             // between the item's min- and max-content sizes.
-            let intrinsic_main = |l: &Len| -> Option<f32> {
-                match l {
-                    Len::MinContent => Some(self.intrinsic_w(it, IMode::Min, inl)),
-                    Len::MaxContent => Some(self.intrinsic_w(it, IMode::Max, inl)),
-                    Len::FitContent => {
-                        let min = self.intrinsic_w(it, IMode::Min, inl);
-                        let max = self.intrinsic_w(it, IMode::Max, inl).max(min);
-                        let stretch = (content_w - m[LEFT] - m[RIGHT] - bp_main).max(0.0);
-                        Some(stretch.clamp(min, max))
-                    }
-                    _ => None,
-                }
-            };
-            let width_def = s.width.resolve(Some(content_w)).map(to_content);
+            let intrinsic_main = |l: &Len| self.intrinsic_width_value(l, it, Some(content_w), inl);
+            let width_def = intrinsic_main(&s.width)
+                .or_else(|| s.width.resolve(Some(content_w)).map(to_content));
             let base = match &basis {
                 Len::Auto => width_def,
                 Len::MinContent => Some(self.intrinsic_w(it, IMode::Min, inl)),
-                Len::MaxContent | Len::FitContent => None,
+                Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => {
+                    intrinsic_main(&basis)
+                }
                 l => l.resolve(Some(content_w)).map(to_content),
             }
             .unwrap_or_else(|| self.intrinsic_w(it, IMode::Max, inl));
@@ -2387,20 +2380,13 @@ impl Flow<'_> {
                     v.max(0.0)
                 }
             };
-            let wmin = s
-                .min_width
-                .resolve(Some(content_w))
-                .map(to_content_h)
-                .unwrap_or(0.0);
-            let wmax = match &s.max_width {
-                Len::None => f32::INFINITY,
-                l => l
-                    .resolve(Some(content_w))
-                    .map(to_content_h)
-                    .unwrap_or(f32::INFINITY),
-            }
-            .max(wmin);
-            let width_def = s.width.resolve(Some(content_w)).map(to_content_h);
+            let width_value = |l: &Len| {
+                self.intrinsic_width_value(l, it, Some(content_w), inl)
+                    .or_else(|| l.resolve(Some(content_w)).map(to_content_h))
+            };
+            let wmin = width_value(&s.min_width).unwrap_or(0.);
+            let wmax = width_value(&s.max_width).unwrap_or(f32::INFINITY).max(wmin);
+            let width_def = width_value(&s.width);
             let avail_c = content_w - m[LEFT] - m[RIGHT] - bp_cross;
             let cross_auto = matches!(s.width, Len::Auto);
             let w = match width_def {
@@ -2430,7 +2416,9 @@ impl Flow<'_> {
             let natural_main = (frag.h - bp_main).max(0.0);
             let base = match &basis {
                 Len::Auto => def_h,
-                Len::MinContent | Len::MaxContent | Len::FitContent => None,
+                Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => {
+                    None
+                }
                 l => l.resolve(def_ch).map(to_content_v),
             }
             .unwrap_or(natural_main);
@@ -2441,7 +2429,9 @@ impl Flow<'_> {
             // heights inside its item definite.
             let basis_definite = match &basis {
                 Len::Auto => def_h.is_some(),
-                Len::MinContent | Len::MaxContent | Len::FitContent => false,
+                Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => {
+                    false
+                }
                 value => value.resolve(def_ch).is_some(),
             };
             post_flex_main_definite.push(def_ch.is_some() || basis_definite);
@@ -2862,7 +2852,7 @@ impl Flow<'_> {
     ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
         let s = &b.style;
         let inl = if b.node == NO_NODE {
-            parent_inl.with_pseudo(s.pseudo)
+            parent_inl.with_pseudo(self.dom, s.pseudo)
         } else {
             InlineStyle::derive(self.dom, b.node, parent_inl, self.base)
         };
@@ -3646,13 +3636,11 @@ impl Flow<'_> {
             _ => None,
         };
         let spec_w = |l: &Len| {
-            l.resolve(Some(cb.w)).map(|v| {
-                if s.border_box {
-                    (v - bp_h).max(0.0)
-                } else {
-                    v.max(0.0)
-                }
-            })
+            self.intrinsic_width_value(l, b, Some(cb.w), ctx)
+                .or_else(|| {
+                    l.resolve(Some(cb.w))
+                        .map(|v| (v - if s.border_box { bp_h } else { 0. }).max(0.))
+                })
         };
         let min_w = spec_w(&s.min_width).unwrap_or(0.0);
         let max_w = match &s.max_width {
@@ -3865,13 +3853,11 @@ impl Flow<'_> {
         let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
         let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
         let spec_w = |l: &Len| {
-            l.resolve(Some(cb_w)).map(|v| {
-                if s.border_box {
-                    (v - bp_h).max(0.0)
-                } else {
-                    v.max(0.0)
-                }
-            })
+            self.intrinsic_width_value(l, fb, Some(cb_w), parent_inl)
+                .or_else(|| {
+                    l.resolve(Some(cb_w))
+                        .map(|v| (v - if s.border_box { bp_h } else { 0. }).max(0.))
+                })
         };
         let min_w = spec_w(&s.min_width).unwrap_or(0.0);
         let max_w = match &s.max_width {
@@ -3934,13 +3920,11 @@ impl Flow<'_> {
         let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
         let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
         let spec_w = |l: &Len| {
-            l.resolve(Some(cb_w)).map(|v| {
-                if s.border_box {
-                    (v - bp_h).max(0.0)
-                } else {
-                    v.max(0.0)
-                }
-            })
+            self.intrinsic_width_value(l, ab, Some(cb_w), parent_inl)
+                .or_else(|| {
+                    l.resolve(Some(cb_w))
+                        .map(|v| (v - if s.border_box { bp_h } else { 0. }).max(0.))
+                })
         };
         let min_w = spec_w(&s.min_width).unwrap_or(0.0);
         let max_w = match &s.max_width {

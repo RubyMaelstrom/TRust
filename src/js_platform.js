@@ -3532,145 +3532,144 @@
     Node.DOCUMENT_POSITION_CONTAINED_BY = 16;
     Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC_ORDER = 32;
 
-    function makeStyle() {
-        return {
-            cssText: "",
-            setProperty(k, v) { this[k] = String(v); },
-            getPropertyValue(k) { return typeof this[k] === "string" ? this[k] : ""; },
-            removeProperty(k) { const v = this[k]; delete this[k]; return typeof v === "string" ? v : ""; },
-        };
-    }
-    const kebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
-    // CSS Values 4 §6: a non-zero <length> requires a unit. CSSOM §6.7.1
-    // parses a value against the property's grammar before mutating its
-    // declaration block, so `el.style.height = 768` is ignored rather than
-    // becoming 768px. This is intentionally the same property family guarded
-    // by Rust's declaration parser: script and authored CSS must cascade alike.
-    const unitlessNonzeroLengthProperties = new Set([
-        "width", "min-width", "max-width", "height", "min-height", "max-height",
-        "inline-size", "min-inline-size", "max-inline-size",
-        "block-size", "min-block-size", "max-block-size",
-        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
-        "margin-inline", "margin-block", "margin-inline-start", "margin-inline-end",
-        "margin-block-start", "margin-block-end",
-        "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
-        "padding-inline", "padding-block", "padding-inline-start", "padding-inline-end",
-        "padding-block-start", "padding-block-end",
-        "inset", "inset-inline", "inset-block", "inset-inline-start", "inset-inline-end",
-        "inset-block-start", "inset-block-end", "top", "right", "bottom", "left",
-        "gap", "row-gap", "column-gap", "column-width", "flex-basis", "font-size",
-        "letter-spacing", "word-spacing", "text-indent", "vertical-align",
-        "border-width", "border-top-width", "border-right-width", "border-bottom-width",
-        "border-left-width", "border-radius", "border-top-left-radius",
-        "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
-        "outline-width", "outline-offset", "background-position", "background-size",
-        "object-position", "transform-origin", "translate", "box-shadow", "text-shadow"
-    ]);
-    const bareNonzeroCssNumber = (token) => {
-        token = token.replace(/^[,/]|[,/]$/g, "").trim();
-        return /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(token)
-            && Number(token) !== 0;
-    };
-    // CSS Conditional 3 #support-definition: style assignment and
-    // CSS.supports() must agree with the colors the shared painter accepts.
-    const colorProperties = new Set([
-        "color", "background-color", "border-top-color", "border-right-color",
-        "border-bottom-color", "border-left-color", "outline-color", "text-decoration-color"
-    ]);
-    const acceptsStyleValue = (property, value) => {
-        property = String(property).toLowerCase();
-        value = String(value).trim();
-        if (colorProperties.has(property)) {
-            return __css_supports_color(value.replace(/\s*!\s*important\s*$/i, ""));
+    const kebab = (s) => s === "cssFloat" ? "float" : s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+    const cssPropertyName = (name) => name.startsWith("--") ? name : asciiLower(name);
+    const cssOp = (op, text, extra = "") => JSON.parse(__css_style(op, text, extra));
+    const cssNamesCache = new Map();
+    function cssNames(name) {
+        let names = cssNamesCache.get(name);
+        if (!names) {
+            names = cssOp("names", name);
+            if (cssNamesCache.size >= 256) cssNamesCache.clear();
+            cssNamesCache.set(name, names);
         }
-        if (!unitlessNonzeroLengthProperties.has(property)) return true;
-        // Parenthesized function tokens are not split, so their internal
-        // scalar numbers are handled by the function grammar.
-        return !value.split(/\s+/).some(bareNonzeroCssNumber);
-    };
-    // el.style is backed by the REAL style attribute: writes are DOM
-    // mutations (dirty bit, serialized, visibility honored). CSSOM §6.6.1's
-    // declaration-block creation/attribute-change steps keep ONE parsed block
-    // synchronized with its owner node; reparsing on every property GET is not
-    // part of those algorithms (and makes framework style reads quadratic).
-    // Keep the parsed block until the exact attribute text changes. All live
-    // attribute writes funnel through setAttribute/removeAttribute, and the
-    // raw-text comparison also covers writes made outside this proxy.
-    function styleFor(el) {
-        let parsedRaw;
-        let parsedMap;
-        const parse = () => {
-            const raw = el.getAttribute("style") || "";
-            if (parsedMap !== undefined && raw === parsedRaw) return parsedMap;
-            const m = Object.create(null);
-            for (const part of raw.split(";")) {
-                const i = part.indexOf(":");
-                if (i > 0) {
-                    const key = part.slice(0, i).trim().toLowerCase();
-                    const value = part.slice(i + 1).trim();
-                    if (acceptsStyleValue(key, value)) m[key] = value;
-                }
-            }
-            parsedRaw = raw;
-            parsedMap = m;
-            return parsedMap;
-        };
-        // CSSStyleDeclaration mutation methods change THIS declaration list,
-        // then update the style attribute. Keep that list alive across a run of
-        // property writes; reparsing after every `style.foo = value` was the
-        // remaining hot path on React commits with large style objects.
-        const write = (m) => {
-            const keys = Object.keys(m);
-            if (keys.length) {
-                const raw = keys.map((k) => k + ": " + m[k]).join("; ");
-                // Publish the complete declaration state before attribute
-                // reactions run. A reaction that directly replaces `style`
-                // produces different raw text, which parse() detects normally.
-                parsedRaw = raw;
-                parsedMap = m;
-                el.setAttribute("style", raw);
-            } else {
-                parsedRaw = "";
-                parsedMap = m;
-                el.removeAttribute("style");
-            }
-        };
-        return new Proxy({}, {
-            get(_, p) {
-                if (typeof p !== "string") return undefined;
-                if (p === "cssText") return el.getAttribute("style") || "";
-                if (p === "setProperty") return (k, v) => {
-                    const m = parse(), key = String(k).toLowerCase(), value = String(v);
-                    if (!value) delete m[key];
-                    else if (acceptsStyleValue(key, value)) m[key] = value;
-                    write(m);
-                };
-                if (p === "getPropertyValue") return (k) => parse()[String(k).toLowerCase()] || "";
-                if (p === "removeProperty") return (k) => { const m = parse(); const key = String(k).toLowerCase(); const v = m[key] || ""; delete m[key]; write(m); return v; };
-                if (p === "length") return Object.keys(parse()).length;
-                return parse()[kebab(p)] ?? "";
-            },
-            set(_, p, v) {
-                if (typeof p !== "string") return true;
-                if (p === "cssText") {
-                    if (String(v).trim()) el.setAttribute("style", String(v));
-                    else el.removeAttribute("style");
-                    return true;
-                }
-                const m = parse();
-                const key = kebab(p);
-                if (v === "" || v === null || v === undefined) delete m[key];
-                else if (acceptsStyleValue(key, v)) m[key] = String(v);
-                write(m);
-                return true;
-            },
-            has() { return true; },
-            deleteProperty(_, p) {
-                if (typeof p === "string") { const m = parse(); delete m[kebab(p)]; write(m); }
-                return true;
-            },
-        });
+        return names;
     }
+    const declarationState = new WeakMap();
+    function declarationData(style) {
+        const state = declarationState.get(style);
+        if (!state) throw new TypeError("Illegal invocation");
+        if (state.read) {
+            const raw = state.read();
+            if (raw !== state.raw) {
+                state.raw = raw;
+                state.pairs = declarationParse(state, raw);
+            }
+        }
+        return state;
+    }
+    function declarationParse(state, raw) {
+        const pairs = cssOp(state.descriptors ? "descriptors" : "parse", raw);
+        return state.descriptors ? pairs.filter((p) => !p[2] && state.descriptors.includes(p[0]) && (state.descriptors !== counterDescriptors || cssOp("counter-descriptor", p[0], p[1]))) : pairs;
+    }
+    function declarationText(style, internal = false) {
+        const state = declarationData(style);
+        return cssOp(internal ? "source" : "serialize", JSON.stringify(state.pairs));
+    }
+    function declarationChanged(state) {
+        state.raw = cssOp("serialize", JSON.stringify(state.pairs));
+        state.write(state.raw, state.pairs);
+    }
+    // CSSOM #the-cssstyledeclaration-interface. Inline and rule declarations
+    // share Rust's grammar and ordered longhands, including priority flags and
+    // case-sensitive custom properties. Rule writes invalidate the live sheet.
+    class CSSStyleDeclaration {
+        constructor(token) { if (token !== declarationState) throw new TypeError("Illegal constructor"); }
+        get length() { return declarationData(this).pairs.length; }
+        item(index) { return declarationData(this).pairs[Number(index) >>> 0]?.[0] || ""; }
+        get parentRule() { return declarationData(this).parent; }
+        get cssText() {
+            return declarationText(this);
+        }
+        set cssText(value) {
+            const state = declarationData(this);
+            state.pairs = declarationParse(state, value == null ? "" : domString(value));
+            declarationChanged(state);
+        }
+        getPropertyValue(name) {
+            if (!arguments.length) throw new TypeError("Property name is required");
+            name = cssPropertyName(domString(name));
+            const state = declarationData(this);
+            const direct = state.pairs.find((v) => v[0] === name);
+            if (direct) return direct[1].startsWith("\0trust-pending-box:") || direct[1].startsWith("\0trust-pending-background:") ? "" : direct[1];
+            return state.descriptors ? "" : cssOp("get", name, JSON.stringify(state.pairs));
+        }
+        getPropertyPriority(name) {
+            if (!arguments.length) throw new TypeError("Property name is required");
+            name = cssPropertyName(domString(name));
+            const state = declarationData(this);
+            const names = state.descriptors ? [name] : cssNames(name);
+            return names.length && names.every((n) => state.pairs.some((v) => v[0] === n && v[2])) ? "important" : "";
+        }
+        setProperty(name, value, priority = "") {
+            if (arguments.length < 2) throw new TypeError("Property name and value are required");
+            const state = declarationData(this);
+            name = cssPropertyName(domString(name));
+            value = value == null ? "" : domString(value);
+            priority = priority == null ? "" : domString(priority);
+            if (!value) { this.removeProperty(name); return; }
+            if (priority && asciiLower(priority) !== "important") return;
+            let pairs;
+            if (state.descriptors) {
+                if (!state.descriptors.includes(name)) return;
+                pairs = cssOp("descriptors", name + ":" + value);
+                if (pairs.length !== 1 || pairs[0][2] || priority || (state.descriptors === counterDescriptors && !cssOp("counter-descriptor", name, value))) return;
+            } else pairs = cssOp("expand", name, value);
+            if (!pairs.length) return;
+            let changed = false;
+            for (const [k, v] of pairs) {
+                const index = state.pairs.findIndex((p) => p[0] === k);
+                const next = [k, v, !!priority];
+                if (index < 0) { state.pairs.push(next); changed = true; }
+                else if (state.pairs[index][1] !== v || state.pairs[index][2] !== !!priority) {
+                    state.pairs[index] = next; changed = true;
+                }
+            }
+            if (changed) declarationChanged(state);
+        }
+        removeProperty(name) {
+            if (!arguments.length) throw new TypeError("Property name is required");
+            name = cssPropertyName(domString(name));
+            const state = declarationData(this), previous = this.getPropertyValue(name);
+            const names = state.descriptors ? [name] : cssNames(name);
+            const next = state.pairs.filter((v) => !names.includes(v[0]));
+            if (next.length !== state.pairs.length) { state.pairs = next; declarationChanged(state); }
+            return previous;
+        }
+        get [Symbol.toStringTag]() { return "CSSStyleDeclaration"; }
+    }
+    function declarationFor(read, write, parent = null, descriptors = null) {
+        const target = new CSSStyleDeclaration(declarationState);
+        const state = { read, write, parent, descriptors, raw: undefined, pairs: [] };
+        const proxy = new Proxy(target, {
+            get(t, p, receiver) {
+                if (p in t || typeof p !== "string") return Reflect.get(t, p, receiver);
+                if (/^(0|[1-9]\d*)$/.test(p)) return declarationData(receiver).pairs[Number(p)]?.[0];
+                return receiver.getPropertyValue(kebab(p));
+            },
+            set(t, p, v, receiver) {
+                if (p in t || typeof p !== "string") return Reflect.set(t, p, v, receiver);
+                if (/^(0|[1-9]\d*)$/.test(p)) return false;
+                receiver.setProperty(kebab(p), v); return true;
+            },
+            has(t, p) { return p in t || typeof p === "string" && cssNames(kebab(p)).length > 0; },
+            ownKeys() { return declarationData(proxy).pairs.map((_, i) => String(i)); },
+            getOwnPropertyDescriptor(t, p) {
+                if (typeof p === "string" && /^(0|[1-9]\d*)$/.test(p)) {
+                    const pair = declarationData(proxy).pairs[Number(p)];
+                    if (pair) return { value: pair[0], enumerable: true, configurable: true, writable: false };
+                }
+                return Reflect.getOwnPropertyDescriptor(t, p);
+            }
+        });
+        declarationState.set(target, state); declarationState.set(proxy, state);
+        return proxy;
+    }
+    function styleFor(el) {
+        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(el.__id), JSON.stringify(pairs)); });
+    }
+    g.CSSStyleDeclaration = CSSStyleDeclaration;
+    g.CSSStyleProperties = CSSStyleDeclaration;
 
     function emptyTimeRanges() { return { length: 0, start() { return 0; }, end() { return 0; } }; }
     function emptyTrackList() { const l = []; l.getTrackById = () => null; l.addEventListener = () => {}; l.removeEventListener = () => {}; return l; }
@@ -3777,14 +3776,11 @@
             || (element.__trustRelList = new DOMTokenList(element, "rel", supported));
     }
 
-    // CSS Font Loading Module Level 3 §§2–3.  The terminal compositor owns
-    // font selection and does not rasterize web-font files, but the platform
-    // objects still have to exist: sites use document.fonts as a readiness
-    // gate before mounting their real view.  Keep the FontFace/FontFaceSet
-    // object model and setlike behavior; URL-backed faces remain unloaded
-    // until explicitly loaded, and an explicit load resolves with terminal
-    // fallback metrics rather than blocking the page forever on an unusable
-    // font resource.
+    // CSS Font Loading 3: the setlike interface is present, but runtime face
+    // loading remains a shell. Navigation installs @font-face resources in
+    // font_system; the actor lacks a document-owned face registry connecting
+    // these objects, descriptors, loading tasks, and layout invalidation.
+    // See CSS_REVIEW.md for the remaining dependencies.
     class FontFace {
         constructor(family, source, descriptors) {
             this.family = String(family);
@@ -3824,9 +3820,8 @@
         load() {
             if (this.__status === "unloaded") {
                 this.__status = "loading";
-                // No web-font rasterizer is present in the terminal backend.
-                // Complete the API operation with the fallback face so callers
-                // waiting on FontFace.loaded do not strand the application.
+                // Pending the actor-to-font-registry integration described above,
+                // this compatibility path still resolves using the fallback face.
                 this.__status = "loaded";
                 for (const set of this.__sets) set.__fontLoaded(this);
                 this.__resolveLoaded(this);
@@ -5704,25 +5699,34 @@
         get content() { return this.getAttribute("content") || ""; }
         set content(v) { this.setAttribute("content", String(v)); }
     }
-    // <style>.sheet — the parsed CSSOM view of this element's CSS text, re-parsed
-    // when textContent changes. <link>.sheet stays null (we don't model the
-    // per-link loaded stylesheet; document.styleSheets is the page-level view).
-    class HTMLStyleElement extends HTMLElement {
-        get sheet() {
-            const text = this.textContent || "";
-            if (!this.__sheet || this.__sheetText !== text) {
-                this.__sheet = makeStyleSheet(text, this);
-                this.__sheetText = text;
-            }
-            return this.__sheet;
+    // HTML #update-a-style-block removes and recreates the associated sheet
+    // on child-list/connection changes, even when its source text is equal.
+    function elementSheet(owner) {
+        const raw=__css_sheet(owner.__id, "");
+        if (raw===null) {
+            if (owner.__sheet) owner.__sheet.ownerNode=null;
+            owner.__sheet=null; return null;
         }
+        const [version,text]=JSON.parse(raw);
+        if (!owner.__sheet || owner.__sheetVersion!==version || owner.__sheetText!==text) {
+            if (owner.__sheet) owner.__sheet.ownerNode=null;
+            owner.__sheet=makeStyleSheet(text,owner); owner.__sheetVersion=version; owner.__sheetText=text;
+        }
+        return owner.__sheet;
+    }
+    class HTMLStyleElement extends HTMLElement {
+        get sheet() { return elementSheet(this); }
+        get disabled() {return this.sheet?.disabled || false;}
+        set disabled(value) {if(this.sheet)this.sheet.disabled=value;}
+
     }
     class HTMLLinkElement extends HTMLElement {
         // HTML §4.2.4: SameObject DOMTokenList reflecting the rel attribute.
         // MSN uses this for feature detection before initializing its app.
         get relList() { return relListFor(this, LINK_REL_SUPPORTED); }
         set relList(v) { this.relList.value = String(v); }
-        get sheet() { return null; }
+        get sheet() { return elementSheet(this); }
+
     }
     // <dialog> (HTML §4.11.4). We implement the observable method/event surface;
     // the modal TOP LAYER + backdrop + inertness are deliberately NOT rendered
@@ -6649,7 +6653,8 @@
         // elements' parsed sheets. Didn't exist at all before — code iterating
         // it threw on `undefined`.
         get styleSheets() {
-            return new StyleSheetList(Array.from(this.querySelectorAll("style"), (s) => s.sheet));
+            if (!this.__styleSheets) this.__styleSheets = new StyleSheetList(() => Array.from(this.querySelectorAll("style, link[rel~='stylesheet']"), (s) => s.sheet).filter(Boolean));
+            return this.__styleSheets;
         }
         createElement(t) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
@@ -6670,8 +6675,8 @@
             if (ctor) upgradeElement(el, ctor);
             return el;
         }
-        get adoptedStyleSheets() { return this.__adopted || (this.__adopted = []); }
-        set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
+        get adoptedStyleSheets() { return adoptedArray(this); }
+        set adoptedStyleSheets(v) { setAdoptedArray(this, v); }
         createElementNS(namespace, qualifiedName) {
             if (arguments.length < 2) throw new TypeError("Failed to execute 'createElementNS': 2 arguments required");
             namespace = namespace === null || namespace === undefined ? null : String(namespace);
@@ -7889,8 +7894,8 @@
             if (CE.defs.size) ceScan(this);
             slotQueueCheck(this);
         }
-        get adoptedStyleSheets() { return this.__adopted || (this.__adopted = []); }
-        set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
+        get adoptedStyleSheets() { return adoptedArray(this); }
+        set adoptedStyleSheets(v) { setAdoptedArray(this, v); }
         getElementById(i) { const r = this.querySelectorAll("[id]"); for (const e of r) if (e.id === String(i)) return e; return null; }
         querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
@@ -8148,11 +8153,68 @@
     // Scopes (document / shadow roots) that ever adopted sheets, so a
     // later replaceSync() re-pushes their joined text to the cascade.
     const adoptedScopes = [];
+    // CSSOM adoptedStyleSheets and Web IDL observable-array operations:
+    // indexed mutation changes the active sheet list just like assignment.
+    function adoptedArray(scope) {
+        if (scope.__adopted) return scope.__adopted;
+        const array = [];
+        const indexOf = (p) => typeof p === "string" && /^(0|[1-9][0-9]*)$/.test(p) && Number(p) < 4294967295 ? Number(p) : null;
+        const validType = (v) => {
+            if (!(v instanceof CSSStyleSheet)) throw new TypeError("Expected a CSSStyleSheet");
+            return v;
+        };
+        const set = (p, value) => {
+            if (p === "length") {
+                const length = value >>> 0;
+                if (length !== +value) throw new RangeError("Invalid observable array length");
+                if (length > array.length) return false;
+                array.length = length; adoptedSync(scope); return true;
+            }
+            const index = indexOf(p);
+            if (index === null) return Reflect.set(array, p, value);
+            if (index > array.length) return false;
+            const sheet = validType(value);
+            const doc = scope.ownerDocument || scope;
+            if (!sheet.__constructed || sheet.__constructorDocument !== doc.__id)
+                throw new DOMException("Stylesheet belongs to another document or is not constructed", "NotAllowedError");
+            array[index] = sheet; adoptedSync(scope); return true;
+        };
+        scope.__adopted = new Proxy(array, {
+            set(_, p, v) { return set(p, v); },
+            deleteProperty(_, p) {
+                if (p === "length") return false;
+                const index = indexOf(p);
+                if (index === null) return Reflect.deleteProperty(array, p);
+                if (index !== array.length - 1) return false;
+                array.pop(); adoptedSync(scope); return true;
+            },
+            defineProperty(_, p, d) {
+                if (p !== "length" && indexOf(p) === null) return Reflect.defineProperty(array,p,d);
+                if ("get" in d || "set" in d || d.writable === false) return false;
+                if (p === "length" ? d.configurable === true || d.enumerable === true : d.configurable === false || d.enumerable === false) return false;
+                return "value" in d ? set(p,d.value) : true;
+            },
+            preventExtensions() { return false; },
+        });
+        return scope.__adopted;
+    }
+    function setAdoptedArray(scope, value) {
+        if (value == null || typeof value[Symbol.iterator] !== "function") throw new TypeError("Expected a stylesheet sequence");
+        const sheets = [];
+        for (const sheet of value) {
+            if (!(sheet instanceof CSSStyleSheet)) throw new TypeError("Expected a CSSStyleSheet");
+            sheets.push(sheet);
+        }
+        const array = adoptedArray(scope); array.length = 0;
+        for (const sheet of sheets) array.push(sheet);
+    }
     const adoptedSync = (scope) => {
         if (!adoptedScopes.includes(scope)) adoptedScopes.push(scope);
-        let text = "";
-        for (const s of scope.__adopted || []) text += ((s && s.__text) || "") + "\n";
-        __dom_adopt_styles(scope.__id, text);
+        const sheets = [];
+        for (const s of scope.__adopted || []) {
+            if (s) sheets.push([s.__appliedText || "", s.__baseURL || scope.baseURI || g.document.baseURI]);
+        }
+        cssOp("adopted-sheets", String(scope.__id), JSON.stringify(sheets));
     };
     const sheetSync = (sheet) => {
         for (const scope of adoptedScopes) {
@@ -8191,187 +8253,354 @@
         if (tail) out.push(tail);
         return out;
     }
-    // A CSSStyleDeclaration over a rule's [name,value] pairs. Read-mostly
-    // (rule edits don't flow back into our cascade); covers the surface
-    // introspection code reads: length/item/getPropertyValue/cssText and
-    // camelCase-or-kebab property access.
-    function ruleStyle(pairs) {
-        const order = [];
-        const map = new Map();
-        for (const pv of pairs || []) {
-            if (!map.has(pv[0])) order.push(pv[0]);
-            map.set(pv[0], pv[1]);
+    // CSSOM rule objects own live child lists. Mutating an attached rule
+    // updates its sheet in the canonical arena without changing DOM text.
+    function ruleStyle(rule, pairs, descriptors = null) {
+        let text = (pairs || []).map(([k, v, p]) => k + ":" + v + (p ? " !important" : "") + ";").join(" ");
+        return declarationFor(() => text, (value) => { text = value; rule.__changed(); }, rule, descriptors);
+    }
+    function cssSplitList(text) {
+        const parts = []; let start = 0, depth = 0, quote = null;
+        for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (c === "\\") { i++; continue; }
+            if (quote) { if (c === quote) quote = null; continue; }
+            if (c === '"' || c === "'") quote = c;
+            else if (c === "(" || c === "[") depth++;
+            else if (c === ")" || c === "]") depth--;
+            else if (c === "," && depth === 0) { parts.push(text.slice(start, i).trim()); start = i + 1; }
         }
-        const base = {
-            get length() { return order.length; },
-            item(i) { return order[Number(i)] || ""; },
-            getPropertyValue(k) { const v = map.get(String(k).toLowerCase()); return v == null ? "" : v; },
-            getPropertyPriority() { return ""; },
-            setProperty(k, v) { k = String(k).toLowerCase(); if (!map.has(k)) order.push(k); map.set(k, String(v)); },
-            removeProperty(k) { k = String(k).toLowerCase(); const v = map.get(k) || ""; if (map.delete(k)) { const i = order.indexOf(k); if (i >= 0) order.splice(i, 1); } return v; },
-            get cssText() { return order.map((k) => k + ": " + map.get(k) + ";").join(" "); },
-            set cssText(_) {},
-        };
-        return new Proxy(base, {
-            get(t, p) {
-                if (p in t) return t[p];
-                if (typeof p === "string") {
-                    if (/^\d+$/.test(p)) return order[Number(p)] || "";
-                    const v = map.get(kebab(p));
-                    return v == null ? "" : v;
-                }
-                return undefined;
-            },
-            set(t, p, v) {
-                if (p in t) { t[p] = v; return true; }
-                if (typeof p === "string") base.setProperty(kebab(p), v);
-                return true;
-            },
-            has(t, p) { return (p in t) || (typeof p === "string" && map.has(kebab(p))); },
-        });
+        parts.push(text.slice(start).trim()); return parts;
     }
-    function mediaList(q) {
-        q = String(q || "");
-        const parts = q.split(",").map((s) => s.trim()).filter(Boolean);
-        const ml = {
-            get mediaText() { return q; },
-            set mediaText(v) { q = String(v); },
-            get length() { return parts.length; },
-            item(i) { return parts[Number(i)] || null; },
-            toString() { return q; },
-        };
-        parts.forEach((p, i) => { ml[i] = p; });
-        return ml;
+    class MediaList {
+        constructor(text = "", changed = () => {}) {
+            this.__parts = []; this.__changed = changed; this.__set(text);
+            return new Proxy(this, {
+                get(t, p, r) { if(typeof p==="string" && /^(0|[1-9]\d*)$/.test(p)){t.__read?.();return t.__parts[Number(p)];}return Reflect.get(t,p,r); }
+            });
+        }
+        __set(text) { this.__parts = String(text || "").trim() ? cssSplitList(String(text)).map((q) => q || "not all") : []; }
+        get mediaText() { this.__read?.(); return this.__parts.join(", "); }
+        set mediaText(value) { this.__set(value == null ? "" : domString(value)); this.__changed(); }
+        get length() {this.__read?.(); return this.__parts.length; }
+        item(index) {this.__read?.(); return this.__parts[Number(index) >>> 0] ?? null; }
+        appendMedium(medium) {
+            this.__read?.();
+            const parts = cssSplitList(domString(medium)); if (parts.length !== 1 || !parts[0]) return;
+            if (!this.__parts.includes(parts[0])) { this.__parts.push(parts[0]); this.__changed(); }
+        }
+        deleteMedium(medium) {
+            this.__read?.();
+            const parts = cssSplitList(domString(medium)); if (parts.length !== 1 || !parts[0]) return;
+            if (!this.__parts.includes(parts[0])) throw new DOMException("Media query not found", "NotFoundError");
+            this.__parts = this.__parts.filter((q) => q !== parts[0]); this.__changed();
+        }
+        toString() { return this.mediaText; }
+        get [Symbol.toStringTag]() { return "MediaList"; }
     }
-    // Array subclassing is finicky across engines; a plain array-like with
-    // copied indices is safe and gives length/[i]/item/iteration + an
-    // honest `constructor.name`.
+    function mediaList(text, changed) { return new MediaList(text, changed); }
     class CSSRuleList {
-        constructor(items) { this.length = items.length; for (let i = 0; i < items.length; i++) this[i] = items[i]; }
-        item(i) { return this[Number(i)] ?? null; }
-        [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
+        constructor(items) {
+            this.__items = items;
+            return new Proxy(this, {
+                get(t, p, r) { return typeof p === "string" && /^(0|[1-9]\d*)$/.test(p) ? t.__items[Number(p)] : Reflect.get(t, p, r); },
+                set(t, p, v, r) { if (typeof p === "string" && /^(0|[1-9]\d*)$/.test(p)) return false; return Reflect.set(t, p, v, r); }
+            });
+        }
+        get length() { return this.__items.length; }
+        item(index) { return this.__items[Number(index) >>> 0] ?? null; }
+        [Symbol.iterator]() { return this.__items[Symbol.iterator](); }
+        get [Symbol.toStringTag]() { return "CSSRuleList"; }
     }
-    function ruleList(items) { return new CSSRuleList(items); }
-    // CSSOM §StyleSheetList — the type behind `document.styleSheets` (which
-    // simply didn't exist; iterating it threw on `undefined`). Same
-    // array-like shape as CSSRuleList.
     class StyleSheetList {
-        constructor(items) { this.length = items.length; for (let i = 0; i < items.length; i++) this[i] = items[i]; }
-        item(i) { return this[Number(i)] ?? null; }
-        [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
+        constructor(read) {
+            this.__read = typeof read === "function" ? read : () => read;
+            return new Proxy(this, { get(t, p, r) { return typeof p === "string" && /^(0|[1-9]\d*)$/.test(p) ? t.__read()[Number(p)] : Reflect.get(t, p, r); } });
+        }
+        get length() { return this.__read().length; }
+        item(index) { return this.__read()[Number(index) >>> 0] ?? null; }
+        [Symbol.iterator]() { return this.__read()[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "StyleSheetList"; }
     }
-
-    class CSSRule { get cssText() { return ""; } get parentStyleSheet() { return null; } }
-    class CSSStyleRule extends CSSRule {
-        constructor(j) { super(); this.selectorText = j.sel || ""; this.style = ruleStyle(j.d); }
-        get type() { return 1; }
-        get cssText() { return this.selectorText + " { " + this.style.cssText + " }"; }
+    class CSSRule {
+        constructor(j = {}) { this.__json = j; this.__parent = null; this.__sheet = null; }
+        get parentRule() { return this.__parent; }
+        get parentStyleSheet() { return this.__sheet; }
+        get type() { return 0; }
+        get cssText() { return this.__serialize(); }
+        // CSSOM expressly specifies that this setter does nothing.
+        set cssText(_) {}
+        __changed() { if (this.__sheet) this.__sheet.__changed(); }
+        __serialize() { return ""; }
+        get [Symbol.toStringTag]() { return this.constructor.name; }
+    }
+    function attachCssRule(rule, parent, sheet) {
+        rule.__parent = parent; rule.__sheet = sheet;
+        for (const child of rule.__children || []) attachCssRule(child, rule, sheet);
+    }
+    function singleCssRule(text, nested=false) {
+        const chunks = splitCssRules(text), parsed = parseCss(text);
+        if (chunks.length !== 1 || parsed.length !== 1) throw new DOMException("Expected one valid CSS rule", "SyntaxError");
+        const j = parsed[0];
+        if (j.t === "style" && !cssOp("selector",j.sel,nested ? "nested" : "")) throw new DOMException("Invalid selector", "SyntaxError");
+        return buildRule(j);
+    }
+    function insertCssRule(owner, text, index) {
+        const list = owner.__children;
+        if (index > list.length) throw new DOMException("Rule index out of range", "IndexSizeError");
+        let ancestor=owner, nestedSelector=false;
+        while(ancestor instanceof CSSRule){if(ancestor instanceof CSSStyleRule){nestedSelector=true;break;}ancestor=ancestor.parentRule;}
+        const rule = singleCssRule(text,nestedSelector);
+        const nested = owner instanceof CSSRule;
+        if (nested && (rule.type === 3 || rule.type === 10)) throw new DOMException("Rule is not allowed in a group", "HierarchyRequestError");
+        const trial = list.slice(); trial.splice(index, 0, rule);
+        let sawBody = false, sawNamespace = false;
+        for (const item of trial) {
+            if (item instanceof CSSLayerStatementRule && !sawBody && !sawNamespace) continue;
+            if (item.type === 3 && (sawBody || sawNamespace) || item.type === 10 && sawBody) throw new DOMException("Invalid rule ordering", "HierarchyRequestError");
+            if (item.type === 10) sawNamespace = true;
+            else if (item.type !== 3) sawBody = true;
+        }
+        if (rule.type === 10 && list.some((r) => r.type !== 3 && r.type !== 10)) throw new DOMException("Namespace cannot be changed after style rules", "InvalidStateError");
+        list.splice(index, 0, rule); attachCssRule(rule, nested ? owner : null, nested ? owner.__sheet : owner);
+        owner.__changed(); return index;
+    }
+    function deleteCssRule(owner, index) {
+        const list = owner.__children;
+        if (index >= list.length) throw new DOMException("Rule index out of range", "IndexSizeError");
+        if (list[index].type === 10 && list.some((r) => r.type !== 3 && r.type !== 10)) throw new DOMException("Namespace is in use", "InvalidStateError");
+        const [removed] = list.splice(index, 1); attachCssRule(removed, null, null); owner.__changed();
     }
     class CSSGroupingRule extends CSSRule {
-        constructor(j) { super(); this.cssRules = buildRules(j.r); }
-        insertRule(_r, i) { return i || 0; }
-        deleteRule() {}
+        constructor(j) { super(j); this.__children = buildRules(j.r); this.__list = new CSSRuleList(this.__children); }
+        get cssRules() { return this.__list; }
+        insertRule(text, index = 0) { return insertCssRule(this, domString(text), Number(index) >>> 0); }
+        deleteRule(index) { if (!arguments.length) throw new TypeError("Rule index is required"); deleteCssRule(this, Number(index) >>> 0); }
+        __serialize(internal = false) { return "@" + this.__json.t + (this.__json.q ? " " + this.__json.q : "") + " { " + this.__children.map((r) => r.__serialize(internal)).join(" ") + " }"; }
+    }
+    class CSSStyleRule extends CSSGroupingRule {
+        constructor(j) { super(j); this.__selector = j.sel || ""; this.__style = ruleStyle(this, j.d); }
+        get type() { return 1; }
+        get style() { return this.__style; }
+        set style(value) { this.__style.cssText = value; }
+        get selectorText() { return this.__selector; }
+        set selectorText(value) { value = domString(value); if (cssOp("selector",value,this.parentRule instanceof CSSStyleRule ? "nested" : "")) { this.__selector = value; this.__changed(); } }
+        __serialize(internal = false) { return this.selectorText + " { " + declarationText(this.style, internal) + (this.__children.length ? " " + this.__children.map((r) => r.__serialize(internal)).join(" ") : "") + " }"; }
     }
     class CSSMediaRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.media = mediaList(j.q); this.conditionText = j.q || ""; }
+        constructor(j) { super(j); this.__media = mediaList(j.q, () => this.__changed()); }
         get type() { return 4; }
+        get media() { return this.__media; }
+        set media(v) { this.__media.mediaText = v; }
+        get conditionText() { return this.media.mediaText; }
+        set conditionText(value) { this.media.mediaText = value; }
+        __serialize(internal = false) { return "@media " + this.conditionText + " { " + this.__children.map((r) => r.__serialize(internal)).join(" ") + " }"; }
     }
     class CSSSupportsRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.conditionText = j.q || ""; }
         get type() { return 12; }
+        get conditionText() { return this.__json.q || ""; }
+        set conditionText(value) { this.__json.q = domString(value); this.__changed(); }
     }
     class CSSContainerRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.conditionText = j.q || ""; this.containerName = ""; }
+        get conditionText() { return this.__json.q || ""; }
+        get containerName() { return this.conditionText.match(/^([^\s(]+)\s+/)?.[1] || ""; }
+        get containerQuery() { return this.conditionText.slice(this.containerName.length).trim(); }
     }
-    class CSSLayerBlockRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.name = j.q || ""; }
+    class CSSLayerBlockRule extends CSSGroupingRule { get name() { return this.__json.q || ""; } }
+    class CSSLayerStatementRule extends CSSRule {
+        get nameList() { return Object.freeze(cssSplitList(this.__json.q || "")); }
+        __serialize(internal = false) { return "@layer " + this.nameList.join(", ") + ";"; }
     }
     class CSSFontFaceRule extends CSSRule {
-        constructor(j) { super(); this.style = ruleStyle(j.d); }
+        constructor(j) { super(j); this.__style = ruleStyle(this, j.d, ["font-family", "src", "font-style", "font-weight", "font-stretch", "font-display", "unicode-range", "font-feature-settings", "font-variation-settings", "ascent-override", "descent-override", "line-gap-override", "size-adjust"]); }
         get type() { return 5; }
+        get style() { return this.__style; }
+        set style(v) { this.__style.cssText = v; }
+        __serialize(internal = false) { return "@font-face { " + declarationText(this.style, internal) + " }"; }
     }
-    class CSSPageRule extends CSSRule {
-        constructor(j) { super(); this.selectorText = j.sel || ""; this.style = ruleStyle(j.d); }
+    class CSSPageRule extends CSSGroupingRule {
+        constructor(j) { super(j); this.__selector = j.sel || ""; this.__style = ruleStyle(this, j.d); }
         get type() { return 6; }
+        get style() { return this.__style; }
+        set style(v) { this.__style.cssText = v; }
+        get selectorText() { return this.__selector; }
+        set selectorText(v) { v = domString(v); if (/^(?:[\w-]+)?(?::(?:left|right|first|blank))?(?:\s*,\s*(?:[\w-]+)?(?::(?:left|right|first|blank))?)*$/.test(v)) { this.__selector = v; this.__changed(); } }
+        __serialize(internal = false) { return "@page" + (this.selectorText ? " " + this.selectorText : "") + " { " + declarationText(this.style, internal) + " }"; }
+    }
+    function keyframeKey(text) {
+        const parts = cssSplitList(text).map((v) => asciiLower(v) === "from" ? "0%" : asciiLower(v) === "to" ? "100%" : v);
+        if (!parts.length || parts.some((v) => !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?%$/.test(v) || Number(v.slice(0, -1)) > 100 || Number(v.slice(0, -1)) < 0)) return null;
+        return parts.map((v) => Number(v.slice(0, -1)) + "%").join(", ");
     }
     class CSSKeyframeRule extends CSSRule {
-        constructor(j) { super(); this.keyText = j.key || ""; this.style = ruleStyle(j.d); }
+        constructor(j) { super(j); this.__key = keyframeKey(j.key || "") || "0%"; this.__style = ruleStyle(this, j.d); }
         get type() { return 8; }
+        get style() { return this.__style; }
+        set style(v) { this.__style.cssText = v; }
+        get keyText() { return this.__key; }
+        set keyText(v) { const key = keyframeKey(domString(v)); if (key === null) throw new DOMException("Invalid keyframe selector", "SyntaxError"); this.__key = key; this.__changed(); }
+        __serialize(internal = false) { return this.keyText + " { " + declarationText(this.style, internal) + " }"; }
     }
     class CSSKeyframesRule extends CSSRule {
-        constructor(j) { super(); this.name = j.name || ""; this.cssRules = buildRules(j.r); }
+        constructor(j) { super(j); this.__name = j.name || ""; this.__children = buildRules(j.r); this.__list = new CSSRuleList(this.__children); }
         get type() { return 7; }
+        get name() { return this.__name; }
+        set name(v) { this.__name = domString(v); this.__changed(); }
+        get cssRules() { return this.__list; }
+        appendRule(text) {
+            text = domString(text); const parsed = parseCss("@keyframes x { " + text + " }");
+            const j = parsed[0]?.r; if (!j || j.length !== 1 || keyframeKey(j[0].key) === null) return;
+            const rule = buildRule(j[0]); this.__children.push(rule); attachCssRule(rule, this, this.__sheet); this.__changed();
+        }
+        findRule(key) { key = keyframeKey(domString(key)); return this.__children.slice().reverse().find((r) => r.keyText === key) || null; }
+        deleteRule(key) { const rule = this.findRule(key); if (rule) { this.__children.splice(this.__children.indexOf(rule), 1); attachCssRule(rule, null, null); this.__changed(); } }
+        __serialize(internal = false) { return "@keyframes " + this.name + " { " + this.__children.map((r) => r.__serialize(internal)).join(" ") + " }"; }
     }
     class CSSImportRule extends CSSRule {
-        constructor(j) { super(); this.href = j.q || ""; this.media = mediaList(""); }
+        constructor(j) {
+            super(j); const m = (j.q || "").match(/^(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))\s*([\s\S]*)$/i);
+            this.__href = m ? (m[1] || m[2]).replace(/^['"]|['"]$/g, "") : "";
+            this.__media = mediaList(m?.[3] || "", () => this.__changed());
+        }
         get type() { return 3; }
+        get href() { return this.__href; }
+        get media() { return this.__media; }
+        set media(v) { this.__media.mediaText = v; }
+        get styleSheet() { return null; }
+        __serialize(internal = false) { return "@import url(" + JSON.stringify(this.href) + ")" + (this.media.mediaText ? " " + this.media.mediaText : "") + ";"; }
     }
-    class CSSNamespaceRule extends CSSRule { get type() { return 10; } }
+    class CSSNamespaceRule extends CSSRule {
+        constructor(j) { super(j); const m = (j.q || "").match(/^(?:([^\s]+)\s+)?(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))$/i); this.__prefix = m?.[1] || ""; this.__namespace = (m?.[2] || m?.[3] || "").replace(/^['"]|['"]$/g, ""); }
+        get type() { return 10; }
+        get prefix() { return this.__prefix; }
+        get namespaceURI() { return this.__namespace; }
+        __serialize(internal = false) { return "@namespace " + (this.prefix ? this.prefix + " " : "") + "url(" + JSON.stringify(this.namespaceURI) + ");"; }
+    }
+    const counterDescriptors = ["system", "symbols", "additive-symbols", "negative", "prefix", "suffix", "range", "pad", "fallback", "speak-as"];
     class CSSCounterStyleRule extends CSSRule {
-        constructor(j) { super(); this.name = j.name || ""; this.style = ruleStyle(j.d); }
+        constructor(j) { super(j); this.__name = j.name || ""; this.__style = ruleStyle(this, j.d, counterDescriptors); }
+        get name() { return this.__name; }
+        set name(v) { v = domString(v); if (["none", "decimal", "disc", "circle", "square", "disclosure-open", "disclosure-closed"].includes(asciiLower(v))) return; this.__name = cssOp("counter-name", v); this.__changed(); }
+        get type() { return 11; }
+        __serialize(internal = false) { return "@counter-style " + CSS.escape(this.name) + " { " + declarationText(this.__style, internal) + " }"; }
+    }
+    for (const descriptor of counterDescriptors) {
+        const name = descriptor.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        Object.defineProperty(CSSCounterStyleRule.prototype, name, { configurable: true, enumerable: true,
+            get() { return this.__style.getPropertyValue(descriptor); }, set(v) {
+                v = domString(v);
+                if (!cssOp("counter-descriptor", descriptor, v)) return;
+                if (descriptor === "system" && (this.system || "symbolic").split(/\s+/)[0] !== v.trim().split(/\s+/)[0]) return;
+                if (!cssOp("counter-style-valid", this.__style.cssText + " " + descriptor + ": " + v + ";")) return;
+                this.__style.setProperty(descriptor, v);
+            } });
     }
     class CSSPropertyRule extends CSSRule {
-        constructor(j) { super(); this.name = j.name || ""; }
+        get name() { return this.__json.name || ""; }
+        get syntax() { return this.__json.syntax; }
+        get inherits() { return this.__json.inherits; }
+        get initialValue() { return this.__json.initialValue; }
+        __serialize() {
+            return "@property " + this.__json.names.map((name) => cssOp("identifier", name)).join(", ") + " { syntax: " + cssOp("string", this.syntax) +
+                "; inherits: " + this.inherits + ";" +
+                (this.initialValue === null ? "" : " initial-value: " + this.initialValue + ";") + " }";
+        }
     }
-    const RULE_CTORS = {
-        style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule,
-        container: CSSContainerRule, layer: CSSLayerBlockRule, scope: CSSGroupingRule,
-        document: CSSGroupingRule, "font-face": CSSFontFaceRule, page: CSSPageRule,
+    const RULE_CTORS = { style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule,
+        container: CSSContainerRule, layer: CSSLayerBlockRule, "layer-statement": CSSLayerStatementRule,
+        scope: CSSGroupingRule, document: CSSGroupingRule, "font-face": CSSFontFaceRule, page: CSSPageRule,
         keyframes: CSSKeyframesRule, keyframe: CSSKeyframeRule, import: CSSImportRule,
-        namespace: CSSNamespaceRule, "counter-style": CSSCounterStyleRule,
-        property: CSSPropertyRule, "font-feature-values": CSSRule,
-    };
-    function buildRules(arr) {
-        const out = [];
-        for (const j of arr || []) { const C = RULE_CTORS[j.t]; if (C) out.push(new C(j)); }
-        return ruleList(out);
+        namespace: CSSNamespaceRule, "counter-style": CSSCounterStyleRule, property: CSSPropertyRule };
+    function buildRule(j) { const C = RULE_CTORS[j.t]; return C ? new C(j) : null; }
+    function buildRules(arr) { return (arr || []).map(buildRule).filter(Boolean); }
+    for (const [name, number] of Object.entries({ STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4,
+        FONT_FACE_RULE: 5, PAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9, NAMESPACE_RULE: 10, COUNTER_STYLE_RULE: 11, SUPPORTS_RULE: 12 })) {
+        Object.defineProperty(CSSRule, name, { value: number, enumerable: true });
+        Object.defineProperty(CSSRule.prototype, name, { value: number, enumerable: true });
     }
-
-    // styled-components & other CSS-in-JS inject ALL their CSS through
-    // sheet.insertRule() in CSSOM "speedy" mode, leaving the owning <style>
-    // element's text node EMPTY (the browser cascades from `cssRules`, not the
-    // text). Our Rust cascade reads `<style>` text, so a <style>-owned sheet
-    // mirrors its joined rules back into the element via __dom_set_text — else
-    // every styled-components flex/grid rule is invisible and the page collapses
-    // to one block column. Rules are kept as an array so insert/delete honour the
-    // CSSOM index (default 0; cascade order is load-bearing). cssRules is lazy.
     class CSSStyleSheet {
-        constructor() { this.__ruleTexts = []; this.__rules = null; this.ownerNode = null; this.media = mediaList(""); }
-        get __text() { return this.__ruleTexts.join("\n"); }
-        get cssRules() { return this.__rules || (this.__rules = buildRules(parseCss(this.__text))); }
-        get rules() { return this.cssRules; }
-        replace(t) { this.replaceSync(t); return Promise.resolve(this); }
-        replaceSync(t) { this.__ruleTexts = splitCssRules(t); this.__rules = null; this.__changed(); }
-        insertRule(r, i) {
-            const idx = (i === undefined) ? 0 : (i | 0);
-            if (idx < 0 || idx > this.__ruleTexts.length) throw new DOMException("insertRule index out of range", "IndexSizeError");
-            this.__ruleTexts.splice(idx, 0, String(r));
-            this.__rules = null; this.__changed();
-            return idx;
-        }
-        deleteRule(i) {
-            const idx = i | 0;
-            if (idx < 0 || idx >= this.__ruleTexts.length) throw new DOMException("deleteRule index out of range", "IndexSizeError");
-            this.__ruleTexts.splice(idx, 1);
-            this.__rules = null; this.__changed();
-        }
-        __changed() {
-            const o = this.ownerNode;
-            if (o && o.__id !== undefined && o.localName === "style") {
-                __dom_set_text(o.__id, this.__text);
-                o.__sheetText = this.__text;   // keep <style>.sheet's getter cache coherent
-            } else {
-                sheetSync(this);
+        constructor(options = {}) {
+            this.__children = []; this.__list = new CSSRuleList(this.__children);
+            this.__constructorDocument = g.document.__id;
+            this.__baseURL = g.document.baseURI;
+            if (options.baseURL != null) {
+                try { this.__baseURL = new URL(domString(options.baseURL), this.__baseURL).href; } catch (_) {}
             }
+            this.ownerNode = null; this.__constructed = true; this.__locked = false; this.__clean = true;
+            this.__disabled = !!options.disabled; this.__media = mediaList(String(options.media || ""), () => this.__changed());
         }
+        get type() { return "text/css"; }
+        get href() { return this.ownerNode?.localName === "link" ? this.ownerNode.href : null; }
+        get title() { return this.ownerNode ? this.ownerNode.getAttribute("title") || "" : null; }
+        get parentStyleSheet() { return null; }
+        get ownerRule() { return null; }
+        get media() { return this.__media; }
+        set media(v) { this.__media.mediaText = v; }
+        get disabled() {
+            if(this.ownerNode) {const attr=this.ownerNode.hasAttribute("disabled");if(attr!==this.__disabledAttr){this.__disabledAttr=attr;this.__disabled=attr;}}
+            return this.__disabled;
+        }
+        set disabled(v) { this.__disabled = !!v; this.__changed(); }
+        get __text() { return this.__children.map((r) => r.__serialize(true)).join("\n"); }
+        get __appliedText() { return this.disabled ? "" : this.media.mediaText ? "@media " + this.media.mediaText + " { " + this.__text + " }" : this.__text; }
+        __check() { if (!this.__clean) throw new DOMException("Cross-origin stylesheet", "SecurityError"); }
+        get cssRules() { this.__check(); return this.__list; }
+        get rules() { return this.cssRules; }
+        __replace(text) {
+            for (const rule of this.__children) attachCssRule(rule, null, null);
+            this.__children.splice(0, this.__children.length, ...buildRules(parseCss(text)).filter((r) => r.type !== 3));
+            for (const rule of this.__children) attachCssRule(rule, null, this);
+            this.__changed();
+        }
+        replace(text) {
+            text = domString(text);
+            if (!this.__constructed || this.__locked) return Promise.reject(new DOMException("Sheet cannot be replaced", "NotAllowedError"));
+            this.__locked = true;
+            return Promise.resolve().then(() => { this.__replace(text); this.__locked = false; return this; });
+        }
+        replaceSync(text) {
+            text = domString(text);
+            if (!this.__constructed || this.__locked) throw new DOMException("Sheet cannot be replaced", "NotAllowedError");
+            this.__replace(text);
+        }
+        insertRule(text, index = 0) {
+            this.__check(); if (this.__locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
+            text = domString(text); index = Number(index) >>> 0;
+            const rule = singleCssRule(text);
+            if (rule.type === 3 && this.__constructed) throw new DOMException("Constructed sheets cannot import", "SyntaxError");
+            return insertCssRule(this, text, index);
+        }
+        deleteRule(index) {
+            this.__check(); if (this.__locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
+            if (!arguments.length) throw new TypeError("Rule index is required"); deleteCssRule(this, Number(index) >>> 0);
+        }
+        addRule(selector = "undefined", style = "undefined", index = this.__children.length) { this.insertRule(domString(selector) + " { " + domString(style) + " }", index); return -1; }
+        removeRule(index = 0) { this.deleteRule(index); }
+        __changed() {
+            if (this.ownerNode) {
+                const owner=this.ownerNode;
+                if (owner.sheet===this) __css_sheet(owner.__id, JSON.stringify([this.__text, this.media.mediaText, this.disabled]));
+            } else sheetSync(this);
+        }
+        get [Symbol.toStringTag]() { return "CSSStyleSheet"; }
     }
     function makeStyleSheet(text, owner) {
-        const s = new CSSStyleSheet();
-        s.__ruleTexts = splitCssRules(text);
-        s.ownerNode = owner || null;
-        return s;
+        const sheet = new CSSStyleSheet({ media: owner?.getAttribute("media") || "", disabled: owner?.hasAttribute("disabled") || false });
+        sheet.ownerNode = owner || null; sheet.__constructed = !owner;
+        sheet.__disabledAttr=owner?.hasAttribute("disabled")||false;
+        if(owner) {
+            let mediaAttr=owner.getAttribute("media")||"";
+            sheet.__media.__read=()=>{const value=owner.getAttribute("media")||"";if(value!==mediaAttr){mediaAttr=value;sheet.__media.__set(value);}};
+        }
+        sheet.__children.push(...buildRules(parseCss(text)));
+        for (const rule of sheet.__children) attachCssRule(rule, null, sheet);
+        if (owner?.localName === "link") {
+            try { sheet.__clean = new URL(owner.href).origin === new URL(owner.ownerDocument.URL).origin; }
+            catch (_) { sheet.__clean = false; }
+        }
+        return sheet;
     }
+    g.MediaList = MediaList; g.CSSLayerStatementRule = CSSLayerStatementRule;
 
     // Distinct namespace bases so `instanceof` answers honestly. The dynamic
     // @@toStringTag on Element reports the concrete interface selected for an
@@ -9835,23 +10064,38 @@
     // returns the inherited / UA-defaulted value for tracked properties and
     // the inline value for the rest, falling back to the element's own inline
     // style on a miss. Was inline-only (it just handed back el.style).
-    function computedStyleFor(el, id) {
+    function computedStyleFor(el, id, pseudo = null) {
+        const source = JSON.stringify([id, pseudo]);
+        const names = () => cssOp("computed-names", source) || [];
         const lookup = (k) => {
-            k = kebab(String(k));
-            let v = null;
-            try { v = __dom_computed(id, k); } catch (e) { v = null; }
-            if (v !== null && v !== undefined) return v;
-            return el.style.getPropertyValue(k) || "";
+            k = domString(k);
+            if (!k.startsWith("--")) k = k.toLowerCase();
+            const v = pseudo === null ? __dom_computed(id, k) : cssOp("computed-pseudo", source, k);
+            return v == null ? "" : v;
         };
-        return new Proxy({}, {
+        const readonly = () => { throw new DOMException("Computed style is read-only", "NoModificationAllowedError"); };
+        return new Proxy(Object.create(CSSStyleDeclaration.prototype), {
             get(_, p) {
+                if (p === Symbol.iterator) return function* () { yield* names(); };
                 if (typeof p !== "string") return undefined;
                 if (p === "getPropertyValue") return (k) => lookup(k);
-                if (p === "cssText") return el.getAttribute("style") || "";
-                return lookup(p);
+                if (p === "getPropertyPriority") return () => "";
+                if (p === "setProperty" || p === "removeProperty") return readonly;
+                if (p === "length") return names().length;
+                if (p === "item") return (i) => names()[Number(i) >>> 0] || "";
+                if (/^(0|[1-9][0-9]*)$/.test(p)) return names()[Number(p)];
+                if (p === "cssText") return "";
+                if (p === "parentRule") return null;
+                if (p === "constructor") return CSSStyleDeclaration;
+                return lookup(p.startsWith("--") ? p : kebab(p));
             },
-            set() { return true; }, // computed style is read-only
-            has() { return true; },
+            set: readonly,
+            has(_, p) { return typeof p === "string"; },
+            ownKeys() { return names().map((_, i) => String(i)); },
+            getOwnPropertyDescriptor(_, p) {
+                if (/^(0|[1-9][0-9]*)$/.test(String(p)) && Number(p) < names().length)
+                    return { configurable: true, enumerable: true, writable: false, value: names()[Number(p)] };
+            },
         });
     }
     const computedStyleTypeError = TypeError;
@@ -9871,10 +10115,8 @@
             // No arguments object or default-parameter activation is needed.
             const id = elementIdentity(el);
             if (id === undefined) throw new computedStyleTypeError('Expected an Element');
-            // Nullable CSSOMString conversion follows interface conversion,
-            // even while pseudo-element style resolution remains incomplete.
-            if (pseudoElt != null) void `${pseudoElt}`;
-            return computedStyleFor(el, id);
+            const pseudo = pseudoElt == null ? "" : domString(pseudoElt);
+            return computedStyleFor(el, id, pseudo.startsWith(":") ? pseudo.toLowerCase() : null);
         }
     }.getComputedStyle;
     // Web IDL operation length counts only required parameters.
@@ -9916,21 +10158,31 @@
     }
     const CSS = {
         escape: cssEscape,
-        supports(prop, value) {
-            if (value === undefined) {
-                let cond = String(prop).trim();
-                const m = /^selector\(([\s\S]*)\)$/.exec(cond);
-                if (m) return __css_supports_selector(m[1].trim());
-                if (cond[0] === "(" && cond[cond.length - 1] === ")") cond = cond.slice(1, -1);
-                const c = cond.indexOf(":");
-                if (c < 0) return false;
-                return CSS.supports(cond.slice(0, c).trim(), cond.slice(c + 1).trim());
+        registerProperty(definition) {
+            // Web IDL #js-to-dictionary: observable Gets and conversions run
+            // in lexicographical member order before the registration algorithm.
+            if (definition !== null && definition !== undefined &&
+                typeof definition !== "object" && typeof definition !== "function") {
+                throw new TypeError("PropertyDefinition must be a dictionary");
             }
-            try {
-                const d = document.createElement("_").style;
-                d.setProperty(String(prop), String(value));
-                return d.getPropertyValue(String(prop)) !== "";
-            } catch (e) { return false; }
+            const d = definition == null ? {} : definition;
+            const inheritValue = d.inherits;
+            const inherits = inheritValue === undefined ? true : !!inheritValue;
+            const initial = d.initialValue;
+            const initialValue = initial === undefined ? null : domString(initial);
+            const rawName = d.name;
+            if (rawName === undefined) throw new TypeError("PropertyDefinition.name is required");
+            const name = domString(rawName);
+            const rawSyntax = d.syntax;
+            const syntax = rawSyntax === undefined ? "*" : domString(rawSyntax);
+            const error = cssOp("register-property", String(g.document.__id),
+                JSON.stringify([name, syntax, inherits, initialValue, g.document.baseURI]));
+            if (error) throw new DOMException("Invalid custom property registration: " + name, error);
+        },
+        supports(prop, value) {
+            if (!arguments.length) throw new TypeError("CSS.supports requires an argument");
+            return arguments.length === 1 ? cssOp("condition", domString(prop))
+                : cssOp("supports", domString(prop), domString(value));
         },
     };
     g.CSS = CSS;
@@ -12206,16 +12458,9 @@
         g.CompressionStream = CompressionStream;
     }
     /*__STREAMS_END__*/
-    // --- Web Animations API (Element.animate). A terminal has no real
-    // animation, so an Animation settles to "finished" immediately — on a
-    // MACROTASK, so a caller assigning `onfinish` AFTER animate() (Svelte 5's
-    // transition system does exactly this) still sees it fire. Critical, not
-    // cosmetic: `element.animate(...)` being undefined threw inside Svelte 5's
-    // intro-transition effect, and a thrown effect ABORTS the whole effect-
-    // flush batch — so a sibling effect in the same flush (a TipTap/ProseMirror
-    // editor's mount) silently never ran, leaving Open WebUI's chat input
-    // unrendered. `finished` always resolves exactly once (finish/cancel/auto),
-    // so nothing awaiting it hangs or reports an unhandled rejection. ---
+    // Web Animations remains a compatibility shell. The canonical page actor
+    // has no keyframe-effect stack or interpolated computed-style pipeline;
+    // desktop CSS paint tracks cannot supply those semantics. See CSS_REVIEW.md.
     {
         class Animation extends EventTarget {
             constructor(effect, timeline) {

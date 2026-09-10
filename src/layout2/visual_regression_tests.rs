@@ -10,6 +10,42 @@ fn by_id(dom: &Dom, id: &str) -> NodeId {
 }
 
 #[test]
+fn css_multiband_borders_preserve_gaps_and_relief() {
+    for kind in ["double", "groove", "ridge", "inset", "outset"] {
+        let html = format!(
+            "<body style='margin:0;background:white'><div style='width:82px;height:52px;border:9px {kind} rgb(120,120,120);border-radius:16px;background:white'></div></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let layout = super::lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            Viewport::new(160., 100.),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let frame = headless::render_paint(&layout.paint, CssSize::new(160., 100.)).unwrap();
+        let px = |x: usize, y: usize| frame.pixels[(y * 160 + x) * 4];
+        if kind == "double" {
+            assert!(
+                px(50, 1) < 180 && px(50, 4) > 240 && px(50, 7) < 180,
+                "two lines separated by a gap"
+            );
+        } else if matches!(kind, "groove" | "ridge") {
+            assert_ne!(px(50, 1), px(50, 7), "{kind} has opposite bands");
+        } else {
+            assert_ne!(
+                px(50, 4),
+                px(50, 66),
+                "{kind} has opposite top/bottom relief"
+            );
+        }
+        assert!(px(0, 0) > 240, "{kind} preserves the rounded outer corner");
+        assert!(px(50, 35) > 240, "{kind} preserves the inner opening");
+    }
+}
+
+#[test]
 fn relative_image_tiles_preserve_sizing_offsets_and_overflow_crop() {
     // CSS 2.2 §9.4.3, §10.3.2/§10.6.2 and §11.1: size against the
     // containing block, then offset without shrinking to the overflow clip.
@@ -1119,7 +1155,7 @@ fn clip_path_inset_rounding_math_and_validation() {
         "inset(0) junk",
         "border-box inset(0) border-box",
         "inset(0 round 1px / 2px / 3px)",
-        "circle(20px)",
+        "circle(-20px)",
         "url(#clip)",
     ] {
         assert!(
