@@ -24,12 +24,14 @@ pub fn release_allocator_memory() {
 }
 
 pub mod accessibility;
-pub mod command;
 mod canvas;
-mod referrer_policy;
+mod canvas_shadow;
+mod canvas_text;
+pub mod command;
 pub mod core;
 mod crypto;
 pub mod embed;
+mod referrer_policy;
 pub mod render;
 pub mod responsive_image;
 
@@ -52,6 +54,7 @@ mod locale;
 pub mod lumen_backend;
 pub mod media;
 pub mod oneshot;
+mod performance;
 pub mod telnet;
 pub mod terminal_view;
 pub mod text;

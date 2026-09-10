@@ -7,8 +7,8 @@
 use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
 use lumen::embed::{
-    Ctx, EvalError, HostRetainedMemoryVisitor, NativeFn, RetainedManagedAllocation, RetainedMemory,
-    Value,
+    Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn,
+    RetainedManagedAllocation, RetainedMemory, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 #[path = "canvas_host.rs"]
 mod canvas_host;
+#[path = "image_host.rs"]
+mod image_host;
 #[path = "lumen_wasm.rs"]
 mod lumen_wasm;
 
@@ -35,6 +37,7 @@ struct LumenGeomCache {
     boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    frame_viewports: std::collections::HashMap<crate::dom::NodeId, crate::render::CssRect>,
     paint: Option<crate::render::PagePaint>,
     fragments: Option<std::sync::Arc<crate::layout2::LayoutFragments>>,
     /// The cached boxes belonging to the container Document remain valid. A nested Document may
@@ -51,6 +54,7 @@ impl LumenGeomCache {
             boxes: Default::default(),
             tracks: Default::default(),
             scrolling_areas: Default::default(),
+            frame_viewports: Default::default(),
             paint: None,
             fragments: None,
             top_document_valid: false,
@@ -60,6 +64,8 @@ impl LumenGeomCache {
 
 type LumenFetchResult = Option<(u16, String, Vec<u8>, String)>;
 type LumenResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
+
+use crate::performance::ResourceTiming as LumenResourceTiming;
 
 #[derive(Clone, Copy)]
 enum LumenResourceKind {
@@ -73,9 +79,15 @@ enum LumenResourceKind {
 /// selecting the corresponding HTML task.
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
+    ImageDone {
+        id: usize,
+        result: Option<image_host::LoadedImage>,
+        timing: Option<LumenResourceTiming>,
+    },
     FetchDone {
         id: usize,
         result: LumenFetchResult,
+        timing: Option<LumenResourceTiming>,
     },
     ResourceDone {
         context: u64,
@@ -83,6 +95,7 @@ enum LumenHostTask {
         name: String,
         kind: LumenResourceKind,
         result: LumenResourceResult,
+        timing: Option<LumenResourceTiming>,
         external: bool,
     },
     DynamicModule {
@@ -148,6 +161,9 @@ enum LumenWorkerCtl {
 struct LumenWorkerHandle {
     ctl: std::sync::mpsc::SyncSender<LumenWorkerCtl>,
     interrupt: Arc<lumen::RuntimeInterrupt>,
+    /// HTML Worker.outside port belongs to its constructor's settings Realm,
+    /// not necessarily the top-level Window that owns the native page actor.
+    context: u64,
 }
 
 impl Drop for LumenWorkerHandle {
@@ -187,6 +203,7 @@ struct LumenWorkerLaunch {
     name: String,
     script_body: Option<Vec<u8>>,
     secure_context: bool,
+    agent_cluster: u64,
 }
 
 struct HostState {
@@ -209,14 +226,29 @@ struct HostState {
     wasm: lumen_wasm::PageWasm,
     next_window_context: u64,
     window_realms: HashMap<u64, Value>,
+    /// Fetch/XHR's client settings belong to the initiating Window, not its
+    /// embedding page. about:blank/srcdoc inherit their creator's origin.
+    window_request_urls: HashMap<u64, url::Url>,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
+    canvas_gradient_slots: Option<Value>,
+    canvas_text_metrics_slots: Option<Value>,
+    permission_slots: Option<Value>,
+    navigator_slots: Option<Value>,
+    performance_slots: Option<Value>,
+    element_slots: Option<Value>,
+    pointer_event_slots: Option<Value>,
+    image_element_slots: Option<Value>,
     window_message_slots: Option<Value>,
+    wasm_module_slots: Option<Value>,
+    /// Child Window Realms share this Agent; dedicated workers inherit its cluster.
+    agent_cluster: u64,
 }
 
 impl HostState {
     fn new(dom: Rc<RefCell<Dom>>, clock: Rc<RealmClock>) -> Self {
+        static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         {
             let mut dom = dom.borrow_mut();
             dom.set_viewport_px(DEFAULT_VIEWPORT.width, DEFAULT_VIEWPORT.height);
@@ -242,8 +274,19 @@ impl HostState {
             wasm: lumen_wasm::PageWasm::new(),
             next_window_context: 1,
             window_realms: HashMap::new(),
+            window_request_urls: HashMap::new(),
             image_data_slots: None,
+            canvas_gradient_slots: None,
+            canvas_text_metrics_slots: None,
+            permission_slots: None,
+            navigator_slots: None,
+            performance_slots: None,
+            element_slots: None,
+            pointer_event_slots: None,
+            image_element_slots: None,
             window_message_slots: None,
+            wasm_module_slots: None,
+            agent_cluster: NEXT_CLUSTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -396,8 +439,19 @@ impl RetainedMemory for HostState {
             wasm,
             next_window_context,
             window_realms,
+            window_request_urls,
             image_data_slots,
+            canvas_gradient_slots,
+            canvas_text_metrics_slots,
+            permission_slots,
+            navigator_slots,
+            performance_slots,
+            element_slots,
+            pointer_event_slots,
+            image_element_slots,
             window_message_slots,
+            wasm_module_slots,
+            agent_cluster: _,
         } = self;
 
         let _ = (
@@ -504,6 +558,9 @@ impl RetainedMemory for HostState {
                 )>()))
                 .saturating_add(cache.scrolling_areas.capacity().saturating_mul(
                     std::mem::size_of::<(crate::dom::NodeId, crate::layout2::PxRect)>(),
+                ))
+                .saturating_add(cache.frame_viewports.capacity().saturating_mul(
+                    std::mem::size_of::<(crate::dom::NodeId, crate::render::CssRect)>(),
                 ));
             for (columns, rows) in cache.tracks.values() {
                 bytes = bytes
@@ -513,6 +570,7 @@ impl RetainedMemory for HostState {
             if cache.boxes.capacity() != 0
                 || cache.tracks.capacity() != 0
                 || cache.scrolling_areas.capacity() != 0
+                || cache.frame_viewports.capacity() != 0
             {
                 visitor.opaque_storage();
             }
@@ -663,8 +721,47 @@ impl RetainedMemory for HostState {
         if let Some(value) = image_data_slots {
             visitor.value(value);
         }
+        if let Some(value) = canvas_gradient_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = canvas_text_metrics_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = permission_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = navigator_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = performance_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = element_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = pointer_event_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = image_element_slots {
+            visitor.value(value);
+        }
         if let Some(value) = window_message_slots {
             visitor.value(value);
+        }
+        if let Some(value) = wasm_module_slots {
+            visitor.value(value);
+        }
+        if !window_request_urls.is_empty() {
+            visitor.opaque_storage();
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.window-request-settings",
+                window_request_urls as *const _ as usize,
+                window_request_urls.capacity() * std::mem::size_of::<(u64, url::Url)>()
+                    + window_request_urls
+                        .values()
+                        .map(|url| url.as_str().len())
+                        .sum::<usize>(),
+            ));
         }
     }
 }
@@ -678,6 +775,15 @@ impl lumen::embed::RetainedExternalMemory for HostState {
     }
 }
 
+impl HostGc for HostState {
+    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        self.wasm.trace_gc(visitor);
+    }
+    fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
+        self.wasm.sweep_gc(is_live);
+    }
+}
+
 struct RealmClock {
     epoch_ms: Cell<f64>,
     anchored_at: Cell<Instant>,
@@ -685,10 +791,7 @@ struct RealmClock {
 
 impl RealmClock {
     fn new() -> Self {
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs_f64() * 1000.0)
-            .unwrap_or(0.0);
+        let epoch_ms = crate::performance::now_ms();
         Self {
             epoch_ms: Cell::new(epoch_ms),
             anchored_at: Cell::new(Instant::now()),
@@ -813,8 +916,12 @@ fn dispatch_timer_task_to(engine: &mut lumen::Engine, deadline: f64) -> Result<b
         .ctx()
         .member_get(&selected, "__trustTimerThis")
         .unwrap_or_else(|_| engine.global_this());
+    let script_caller = engine
+        .ctx()
+        .member_get(&selected, "__trustCallbackSource")
+        .map_err(EvalError::Throw)?;
     let (callback_error, callback_failed, callback_interrupted) =
-        match engine.call_function_interruptible(&handler, callback_this, &args) {
+        match engine.call_callback_interruptible(&handler, callback_this, &args, &script_caller) {
             Ok(_) => (Value::Undefined, false, None),
             Err(EvalError::Throw(error)) => (error, true, None),
             Err(EvalError::Interrupted(reason)) => (Value::Undefined, false, Some(reason)),
@@ -857,7 +964,7 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     )?;
 
     let prelude_started = Instant::now();
-    eval(&mut engine, platform_prelude(), "TRust platform prelude")?;
+    eval_platform_prelude(&mut engine)?;
     let prelude_time = prelude_started.elapsed();
     eval(
         &mut engine,
@@ -964,6 +1071,8 @@ mod desktop {
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
         let env = PageEnv {
             url: env.url.clone(),
+            navigation_timing: env.navigation_timing.clone(),
+            resource_timings: env.resource_timings.clone(),
             viewport: env.viewport,
             cell_px: env.cell_px,
             device_pixel_ratio: env.device_pixel_ratio,
@@ -984,7 +1093,7 @@ mod desktop {
         let _ = evaluate_task(&mut page, "__trust.oneShot = true;", "one-shot setup");
         let _ = evaluate_task(
             &mut page,
-            "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
+            "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
             "load event",
         );
         checkpoint(&mut page, "load event");
@@ -1107,6 +1216,7 @@ mod desktop {
         /// bit; it never runs style/layout or rendering observers itself.
         render_pending: bool,
         task_trace: Option<ActorTaskTrace>,
+        engine_metrics: Option<lumen::PerformanceMetricsSampler>,
     }
 
     enum Wake {
@@ -1248,7 +1358,7 @@ mod desktop {
             prepare_unbounded_task(&interrupt);
             let _ = evaluate_task(
                 &mut page,
-                "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
+                "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
                 "load event",
             );
             checkpoint(&mut page, "load event");
@@ -1576,7 +1686,7 @@ mod desktop {
                     prepare_unbounded_task(&interrupt);
                     let _ = evaluate_task(
                         &mut page,
-                        "__trust.readyState = 'complete'; __trust.fire(window, 'load', false);",
+                        "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
                         "load event",
                     );
                     checkpoint(&mut page, "load event");
@@ -1629,6 +1739,7 @@ mod desktop {
             f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
             f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
         );
+        let document_creation_time = crate::performance::now_ms();
         let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
         {
             let mut dom = dom.borrow_mut();
@@ -1639,14 +1750,25 @@ mod desktop {
                 dom.attach_external_sheets(&env.sheets);
             }
         }
-        let scripts: Vec<_> = {
+        let (scripts, parser_blocking_count) = {
             let dom = dom.borrow();
-            dom.scripts()
+            let (mut blocking, deferred): (Vec<_>, Vec<_>) = dom
+                .scripts()
                 .into_iter()
                 .filter(|(_, _, ty, node)| {
                     !(is_classic(ty) && dom.attr(*node, "nomodule").is_some())
                 })
-                .collect()
+                .partition(|(src, _, ty, node)| {
+                    let module = ty.as_deref().is_some_and(|value| value.trim() == "module");
+                    dom.attr(*node, "async").is_some()
+                        || !(module
+                            || (is_classic(ty)
+                                && src.is_some()
+                                && dom.attr(*node, "defer").is_some()))
+                });
+            let count = blocking.len();
+            blocking.extend(deferred);
+            (blocking, count)
         };
         if scripts.is_empty() && !dom.borrow().hover_css_affects_rendering() {
             return Err(outcome);
@@ -1714,7 +1836,7 @@ mod desktop {
         // the route from location.pathname, so seeding the realm with `base`
         // collapses every such navigation to the base path.
         let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {} }};",
+            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, navigationTiming: {} }};",
             json_string(response_url.as_str()),
             json_string(crate::locale::LANGUAGE),
             json_string(crate::locale::LANGUAGES[0]),
@@ -1728,22 +1850,49 @@ mod desktop {
             crate::http::GLOBAL_PRIVACY_CONTROL,
             lumen_potentially_trustworthy(&response_url),
             std::env::var_os("TRUST_TRACE_FRAMES").is_some(),
+            env.navigation_timing
+                .as_ref()
+                .map_or(serde_json::Value::Null, |timing| {
+                    let mut data = timing.navigation_data(response_url.as_str());
+                    data["legacy:domLoading"] = serde_json::json!(document_creation_time.floor());
+                    data
+                }),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
             return Err(outcome);
         }
-        if let Err(error) = eval(&mut engine, platform_prelude(), "TRust platform prelude") {
+        if let Err(error) = eval_platform_prelude(&mut engine) {
             outcome.errors.push(error);
             return Err(outcome);
+        }
+
+        // Fetch #fetch-finale: reports from parallel parser/preload requests
+        // belong to this Window, and must precede author completion handlers.
+        for timing in &env.resource_timings {
+            record_resource_timing_ref(engine.ctx(), timing);
         }
 
         let started = Instant::now();
         let trace = std::env::var_os("TRUST_LUMEN_TRACE").is_some();
         for (index, (src, inline, ty, node)) in scripts.into_iter().enumerate() {
+            if index == parser_blocking_count {
+                // HTML #the-end: parser-blocking classic scripts see loading;
+                // ordered deferred/module scripts execute after interactive.
+                let _ = eval(
+                    &mut engine,
+                    "__trust.setDocumentReadiness('interactive')",
+                    "parser EOF",
+                );
+            }
             let script_started = Instant::now();
             if is_classic(&ty) {
-                let source = initial_classic_source(src.as_deref(), &inline, &env, &base);
+                let credentials = crate::js::element_cors_credentials(
+                    dom.borrow().attr(node, "crossorigin"),
+                    false,
+                );
+                let source =
+                    initial_classic_source(src.as_deref(), &inline, &env, &base, credentials);
                 let Some((name, source, external)) = source else {
                     // HTML §4.12.1.1 executes a null script result by firing `error` at the
                     // element and returning. A fetch/MIME/status rejection is not an uncaught
@@ -1767,7 +1916,12 @@ mod desktop {
                 }
             } else if ty.as_deref().is_some_and(|ty| ty.trim() == "module") {
                 let external = src.is_some();
-                let source = initial_module_source(src.as_deref(), &inline, &env, &base);
+                let credentials = crate::js::element_cors_credentials(
+                    dom.borrow().attr(node, "crossorigin"),
+                    true,
+                );
+                let source =
+                    initial_module_source(src.as_deref(), &inline, &env, &base, credentials);
                 let Some((mut name, source)) = source else {
                     outcome.modules_skipped += 1;
                     fire_engine_script_event(&mut engine, node, "error");
@@ -1807,10 +1961,11 @@ mod desktop {
             render_environment_dirty: false,
             render_pending: false,
             task_trace: ActorTaskTrace::enabled(),
+            engine_metrics: lumen::PerformanceMetricsSampler::from_env(),
         };
         let _ = evaluate_task(
             &mut page,
-            "__trust.readyState = 'interactive'; __trust.queueInitialFrameNavigations(); __trust.fire(document, 'DOMContentLoaded', true);",
+            "__trust.setDocumentReadiness('interactive'); __trust.queueInitialFrameNavigations(); __trust.fire(document, 'DOMContentLoaded', true);",
             "DOMContentLoaded",
         );
         checkpoint(&mut page, "DOMContentLoaded");
@@ -1832,6 +1987,7 @@ mod desktop {
         inline: &str,
         env: &PageEnv,
         base: &url::Url,
+        credentials: Option<crate::http::CredentialsMode>,
     ) -> Option<(String, String, bool)> {
         let Some(src) = src else {
             return Some((String::from("inline script"), inline.to_string(), false));
@@ -1844,11 +2000,17 @@ mod desktop {
                 true,
             ));
         }
-        if let Some(body) = env
-            .externals
-            .iter()
-            .find(|(name, _)| name == src)
-            .and_then(|(_, body)| body.as_ref())
+        let resolved = base.join(src).ok()?;
+        if (env.net.is_none()
+            || env
+                .cache
+                .peek_resource(&resolved, base, "script", credentials)
+                .is_some())
+            && let Some(body) = env
+                .externals
+                .iter()
+                .find(|(name, _)| name == src)
+                .and_then(|(_, body)| body.as_ref())
         {
             return Some((
                 src.to_string(),
@@ -1861,12 +2023,14 @@ mod desktop {
         // optional optimization. Once a connected classic script with `src`
         // is prepared, fetching that classic script is mandatory even when a
         // preload scanner did not announce it.
-        let resolved = base.join(src).ok()?;
         let handle = env.net.as_ref()?;
         let fetch = env
             .cache
-            .peek(&resolved)
-            .unwrap_or_else(|| env.cache.fetch(handle, resolved.clone()));
+            .peek_resource(&resolved, base, "script", credentials)
+            .unwrap_or_else(|| {
+                env.cache
+                    .fetch_resource(handle, resolved.clone(), base, "script", credentials)
+            });
         let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
         crate::http::classic_script_response_allowed(
             response.status,
@@ -1887,6 +2051,7 @@ mod desktop {
         inline: &str,
         env: &PageEnv,
         base: &url::Url,
+        credentials: Option<crate::http::CredentialsMode>,
     ) -> Option<(String, String)> {
         let Some(src) = src else {
             return Some((base.to_string(), inline.to_string()));
@@ -1905,8 +2070,11 @@ mod desktop {
         let handle = env.net.as_ref()?;
         let fetch = env
             .cache
-            .peek(&resolved)
-            .unwrap_or_else(|| env.cache.fetch(handle, resolved.clone()));
+            .peek_resource(&resolved, base, "script", credentials)
+            .unwrap_or_else(|| {
+                env.cache
+                    .fetch_resource(handle, resolved.clone(), base, "script", credentials)
+            });
         let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
         crate::http::module_script_response_allowed(response.status, &response.content_type).then(
             || {
@@ -2077,7 +2245,9 @@ mod desktop {
 
     fn checkpoint(page: &mut LumenPage, label: &str) {
         let started = Instant::now();
-        if let Err(reason) = page.engine.run_microtasks_interruptible()
+        let checkpoint = page.engine.run_microtasks_interruptible();
+        let completed = checkpoint.is_ok();
+        if let Err(reason) = checkpoint
             && !matches!(
                 reason,
                 lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled
@@ -2089,6 +2259,16 @@ mod desktop {
             ));
         }
         drain_diagnostics(page);
+        // HTML #perform-a-microtask-checkpoint completes jobs and ClearKeptObjects
+        // before this optional post-GC sample. Never collect from inside an author
+        // job or an interrupted checkpoint. The sampler is bounded, disabled by
+        // default, and emits native metadata without evaluating a page probe.
+        if completed
+            && let Some(sampler) = page.engine_metrics.as_mut()
+            && let Some(metrics) = sampler.maybe_dump(&mut page.engine)
+        {
+            eprintln!("lumen: engine-metrics: {metrics}");
+        }
         if page.task_trace.is_some() && started.elapsed() >= Duration::from_secs(1) {
             eprintln!(
                 "lumen: {label} checkpoint elapsed={:.3}s",
@@ -2343,13 +2523,23 @@ mod desktop {
                 {
                     return None;
                 }
-                let shared = if let Some(shared) = network.cache.peek(&url) {
+                let shared = if let Some(shared) =
+                    network
+                        .cache
+                        .peek_resource(&url, &state.base, "image", None)
+                {
                     shared
                 } else {
                     network
                         .fetched
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    network.cache.fetch(&network.handle, url.clone())
+                    network.cache.fetch_resource(
+                        &network.handle,
+                        url.clone(),
+                        &state.base,
+                        "image",
+                        None,
+                    )
                 };
                 Some((network.handle.clone(), shared))
             });
@@ -2390,6 +2580,27 @@ mod desktop {
         interrupt: &Arc<lumen::RuntimeInterrupt>,
     ) -> bool {
         match command {
+            PageCmd::PointerButton {
+                node,
+                pressed,
+                x,
+                y,
+            } => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "pointerButton",
+                    &[
+                        node.map_or(Value::Null, |node| Value::Num(node as f64)),
+                        Value::Bool(pressed),
+                        Value::Num(finite_or_zero(x)),
+                        Value::Num(finite_or_zero(y)),
+                    ],
+                    "pointer button",
+                );
+                checkpoint(page, "pointer button");
+                finish_task_with_ack(page, events, false)
+            }
             PageCmd::Focus(node) => {
                 prepare_interaction(page, interrupt);
                 let _ = call_trust(
@@ -2422,7 +2633,7 @@ mod desktop {
                 };
                 checkpoint(page, "click");
                 if let Some((url, replace)) =
-                    take_navigation(page).or_else(|| anchor.map(|url| (url, false)))
+                    take_navigation(page).or_else(|| anchor.map(|url| (url, NavigationAction::New)))
                 {
                     return send_navigation(events, url, replace);
                 }
@@ -3036,15 +3247,26 @@ mod desktop {
         sent_primary || !acknowledge_settle || events.blocking_send(PageEvt::Settled).is_ok()
     }
 
-    fn take_navigation(page: &mut LumenPage) -> Option<(String, bool)> {
-        let replace = call_trust(page, "navigationReplaces", &[], "navigation")
-            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
-        let value = call_trust(page, "takeNavigation", &[], "navigation")?;
+    enum NavigationAction {
+        New,
+        Replace,
+        Reload,
+    }
+
+    fn take_navigation(page: &mut LumenPage) -> Option<(String, NavigationAction)> {
+        let value = call_trust(page, "takeNavigationRequest", &[], "navigation")?;
         if value_is_nullish(&value) {
             return None;
         }
-        let url = value_to_string(page, &value)?;
-        (!url.trim().is_empty()).then(|| (url.trim().to_string(), replace))
+        let url_value = page.engine.ctx().member_get(&value, "0").ok()?;
+        let action_value = page.engine.ctx().member_get(&value, "1").ok()?;
+        let url = value_to_string(page, &url_value)?;
+        let action = match value_to_string(page, &action_value)?.as_str() {
+            "reload" => NavigationAction::Reload,
+            "replace" => NavigationAction::Replace,
+            _ => NavigationAction::New,
+        };
+        (!url.trim().is_empty()).then(|| (url.trim().to_string(), action))
     }
 
     fn take_history_updates(page: &mut LumenPage) -> Vec<(String, bool)> {
@@ -3060,12 +3282,12 @@ mod desktop {
     fn send_navigation(
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         url: String,
-        replace: bool,
+        action: NavigationAction,
     ) -> bool {
-        let event = if replace {
-            PageEvt::Replace(url)
-        } else {
-            PageEvt::Navigate(url)
+        let event = match action {
+            NavigationAction::Replace => PageEvt::Replace(url),
+            NavigationAction::Reload => PageEvt::Reload(url),
+            NavigationAction::New => PageEvt::Navigate(url),
         };
         events.blocking_send(event).is_ok()
     }
@@ -3228,6 +3450,32 @@ mod desktop {
             })
             .await
             .expect("same-URL navigation was silently discarded");
+        }
+
+        #[tokio::test]
+        async fn navigation_timing_preserves_javascript_reload_intent() {
+            let (_handle, mut events) = spawn_page(
+                "<body><script>setTimeout(() => location.reload(), 0)</script>".into(),
+                PageEnv::bare(DEFAULT_URL),
+            );
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Reload(url)) => {
+                            assert_eq!(url, DEFAULT_URL);
+                            break;
+                        }
+                        Some(PageEvt::Navigate(_) | PageEvt::Replace(_)) => {
+                            panic!("reload intent was lost")
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("reload failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before reload"),
+                    }
+                }
+            })
+            .await
+            .expect("reload task timed out");
         }
 
         #[tokio::test]
@@ -4227,7 +4475,16 @@ pub(crate) use desktop::transform;
 /// the single source used to install functions into each new realm.
 const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__image_data_slots", 1, host_image_data_slots),
+    ("__image_binding", 2, image_host::call),
+    ("__wasm_module_binding", 1, host_wasm_module_binding),
     ("__window_message_binding", 2, host_window_message_binding),
+    ("__callback_api", 3, host_callback_api),
+    ("__invoke_callback", 4, host_invoke_callback),
+    ("__permissions_binding", 2, host_permissions_binding),
+    ("__navigator_binding", 1, host_navigator_binding),
+    ("__performance_binding", 1, host_performance_binding),
+    ("__element_slots", 1, host_element_slots),
+    ("__pointer_event_slots", 1, host_pointer_event_slots),
     ("__canvas_2d", 4, canvas_host::call),
     ("__dom_create_element", 1, host_create_element),
     ("__dom_create_element_ns", 3, host_create_element_ns),
@@ -4241,6 +4498,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_owner_document", 1, host_owner_document),
     ("__dom_adopt", 2, host_adopt),
     ("__dom_parent", 1, host_parent),
+    ("__dom_frame_owner", 1, host_frame_owner),
     ("__dom_is_connected", 1, host_is_connected),
     ("__dom_connected_many", 1, host_connected_many),
     ("__dom_epoch", 0, host_dom_epoch),
@@ -4293,6 +4551,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__http_fetch_async", 5, host_http_fetch_async),
     ("__dom_run_injected_script", 1, host_run_injected_script),
     ("__dom_run_classic_script", 3, host_run_classic_script),
+    ("__dom_fetch_classic_script", 1, host_fetch_classic_script),
     ("__dom_allocate_job_context", 0, host_allocate_job_context),
     ("__dom_create_window_realm", 9, host_create_window_realm),
     ("__dom_set_job_context", 1, host_set_job_context),
@@ -4337,6 +4596,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__crypto_aes_ctr", 4, host_crypto_aes_ctr),
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
+    ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, host_dom_popover),
     ("__wasm_validate", 1, lumen_wasm::host_validate),
     ("__wasm_compile", 1, lumen_wasm::host_compile),
@@ -4354,6 +4614,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
         lumen_wasm::host_instance_exports,
     ),
     ("__wasm_call_export", 2, lumen_wasm::host_call_export),
+    ("__wasm_function_cache", 2, lumen_wasm::host_function_cache),
     ("__wasm_global_new", 3, lumen_wasm::host_global_new),
     ("__wasm_global_get", 1, lumen_wasm::host_global_get),
     ("__wasm_global_set", 2, lumen_wasm::host_global_set),
@@ -4369,8 +4630,10 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
 ];
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
+    engine.ctx().op_state().register_gc::<HostState>();
     debug_assert!(lumen_registry_matches_canonical_boundary());
     engine.set_host_job_context_hooks(host_enter_job_context, host_leave_job_context);
+    engine.set_job_callback_script_caller_capture(true);
     for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
         engine.define_global(name, len, host_fn);
     }
@@ -4388,17 +4651,88 @@ fn host_image_data_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         .clone())
 }
 
-struct WindowMessageOperation(Value);
+fn host_wasm_module_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    // Private internal slots are shared across same-Agent Realms, not author properties.
+    let candidate = args.first().cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("Wasm requires HostState");
+    let slots = state.wasm_module_slots.get_or_insert(candidate).clone();
+    let cluster = Value::from_string(state.agent_cluster.to_string());
+    Ok(ctx.make_array(vec![slots, cluster]))
+}
 
-impl lumen::embed::NativeCallableRetained for WindowMessageOperation {
+struct PlatformOperation(Value);
+
+impl lumen::embed::NativeCallableRetained for PlatformOperation {
     fn scan_retained_memory(&self, visitor: &mut dyn lumen::embed::NativeRetainedMemoryVisitor) {
         visitor.value(&self.0);
         visitor.allocation(lumen::embed::RetainedManagedAllocation::new(
-            "trust.window-message-operation",
+            "trust.platform-operation",
             self as *const Self as usize,
             std::mem::size_of::<Self>(),
         ));
     }
+}
+
+/// Private per-Agent Web IDL brands; values remain owned by the creating
+/// environment, while borrowed getters accept same-Agent Realms.
+fn host_navigator_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("Navigator requires HostState");
+    Ok(state.navigator_slots.get_or_insert(value).clone())
+}
+
+/// Web IDL interface conversion uses platform identity, not mutable properties
+/// or a Realm-local prototype chain. Root the private WeakMap, not its keys.
+fn host_element_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("Element bindings require HostState");
+    Ok(state.element_slots.get_or_insert(value).clone())
+}
+
+// Same-Agent pointer-event brands/list backing, without rooting event keys.
+// Each Window deletes this installation hook before running author scripts.
+fn host_pointer_event_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("PointerEvent bindings require HostState");
+    Ok(state.pointer_event_slots.get_or_insert(value).clone())
+}
+
+// Performance entries and observers use private per-Agent weak identity slots,
+// shared by Window Realms without rooting dead entry/observer keys.
+fn host_performance_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Ok(Value::Undefined);
+    };
+    Ok(state.performance_slots.get_or_insert(value).clone())
+}
+
+/// Private per-Agent interface slots and Window lifecycle check. No permission
+/// grant or capability is inferred from a descriptor supplied by page script.
+fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("Permissions require HostState");
+    if op == "slots" {
+        return Ok(state.permission_slots.get_or_insert(value).clone());
+    }
+    // HTML #fully-active: Window environments are retired together with their
+    // navigable subtree. A retained object does not reactivate its Document.
+    // The top-level actor and independent worker agent have context zero.
+    let context = value.as_num_opt().unwrap_or(0.) as u64;
+    Ok(Value::Bool(
+        context == 0 || state.window_realms.contains_key(&context),
+    ))
 }
 
 /// A native Window operation observes its script caller BEFORE entering the
@@ -4416,7 +4750,7 @@ fn host_window_message_binding(
         .window_message_slots
         .get_or_insert(candidate)
         .clone();
-    let operation = Rc::new(WindowMessageOperation(
+    let operation = Rc::new(PlatformOperation(
         args.get(1).cloned().unwrap_or(Value::Undefined),
     ));
     let retained = operation.clone();
@@ -4440,6 +4774,54 @@ fn host_window_message_binding(
         retained,
     );
     Ok(ctx.make_array(vec![slots, post]))
+}
+
+/// Capture Web IDL callback context at the native API boundary, BEFORE the receiver Realm's
+/// self-hosted implementation is entered. In particular, otherWindow.setTimeout(boundNative)
+/// must retain the registering script's incumbent, not otherWindow or the native's own Realm.
+/// The operation receives (sourceGlobal, receiver, argumentsArray) privately.
+fn host_callback_api(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let operation = Rc::new(PlatformOperation(
+        args.first().cloned().unwrap_or(Value::Undefined),
+    ));
+    let name = host_arg_string(ctx, args, 1);
+    let length = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.) as usize;
+    let retained = operation.clone();
+    Ok(ctx.new_native_fn_with_retained_memory(
+        &name,
+        length,
+        Rc::new(move |ctx, this, args| {
+            let source = ctx.script_caller_global();
+            let arguments = ctx.make_array(args.to_vec());
+            ctx.invoke(
+                operation.0.clone(),
+                Value::Undefined,
+                &[source, this, arguments],
+            )
+        }),
+        retained,
+    ))
+}
+
+/// JavaScript-driven task fallback uses the same source boundary as the native event loop.
+/// This hook is captured privately and removed from the global during platform installation.
+fn host_invoke_callback(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let this = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let list = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let source = args.get(3).cloned().unwrap_or(Value::Undefined);
+    let length = ctx
+        .member_get(&list, "length")?
+        .as_num_opt()
+        .unwrap_or(f64::NAN);
+    if !length.is_finite() || length < 0. || length.fract() != 0. || length > usize::MAX as f64 {
+        return Err(ctx.make_error("RangeError", "invalid host callback argument list"));
+    }
+    let mut arguments = Vec::with_capacity(length as usize);
+    for index in 0..length as usize {
+        arguments.push(ctx.member_get(&list, &index.to_string())?);
+    }
+    ctx.with_callback_script_caller(&source, |ctx| ctx.invoke(callback, this, &arguments))
 }
 
 fn lumen_registry_matches_canonical_boundary() -> bool {
@@ -4543,6 +4925,7 @@ fn host_fetch_args(
     (target, method, body, headers, policy)
 }
 
+#[cfg(test)]
 fn prepare_host_request(
     state: &mut HostState,
     target: &str,
@@ -4556,16 +4939,51 @@ fn prepare_host_request(
     crate::http::Request,
 )> {
     let page = state.base.clone();
+    prepare_client_request(state, &page, target, method, body, headers, fetch_policy)
+}
+
+fn request_client_url(ctx: &mut Ctx) -> url::Url {
+    let context = ctx.host_job_context();
+    request_context_url(ctx, context)
+}
+
+fn request_context_url(ctx: &mut Ctx, context: u64) -> url::Url {
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("request settings require HostState");
+    state
+        .window_request_urls
+        .get(&context)
+        .unwrap_or(&state.base)
+        .clone()
+}
+
+// Fetch §5.4 and XHR §3.5.6 assign the request client from the API object's
+// relevant environment settings. In particular a child Window's own-origin
+// request must not acquire the embedder's Origin/CORS/credentials context.
+fn prepare_client_request(
+    state: &mut HostState,
+    page: &url::Url,
+    target: &str,
+    method: String,
+    body: Option<(String, Vec<u8>)>,
+    headers: Vec<(String, String)>,
+    fetch_policy: Option<(crate::http::RequestMode, crate::http::CredentialsMode)>,
+) -> Option<(
+    tokio::runtime::Handle,
+    Arc<crate::http::PageCache>,
+    crate::http::Request,
+)> {
     let resolved = page.join(target).ok()?;
     let network = state.network.as_mut()?;
     if !matches!(resolved.scheme(), "http" | "https")
-        || !crate::http::subresource_allowed(&page, &resolved)
+        || !crate::http::subresource_allowed(page, &resolved)
     {
         return None;
     }
     if fetch_policy.as_ref().is_some_and(|(mode, _)| {
         *mode == crate::http::RequestMode::SameOrigin
-            && !crate::http::same_origin_for_host(&page, &resolved)
+            && !crate::http::same_origin_for_host(page, &resolved)
     }) {
         return None;
     }
@@ -4580,13 +4998,16 @@ fn prepare_host_request(
         body,
         headers,
         fetch_metadata: None,
+        timing_client: None,
         fetch_policy: fetch_policy.map(|(mode, credentials)| crate::http::FetchPolicy {
             origin: page.clone(),
             mode,
             credentials,
         }),
     };
-    crate::http::set_referrer(&mut request, &page);
+    let mode = fetch_policy.map_or(crate::http::RequestMode::NoCors, |(mode, _)| mode);
+    crate::http::set_fetch_metadata(&mut request, page, "empty", mode.as_str());
+    crate::http::set_referrer(&mut request, page);
     Some((network.handle.clone(), network.cache.clone(), request))
 }
 
@@ -4649,26 +5070,85 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
     ])
 }
 
+fn timed_fetch_result(
+    result: Result<crate::http::Response, crate::http::TimedFetchError>,
+    name: String,
+    initiator: &'static str,
+    started: f64,
+) -> (LumenFetchResult, Option<LumenResourceTiming>) {
+    let (result, timing) = match result {
+        Ok(mut response) => {
+            let timing = response.timing.take();
+            (lumen_fetch_result(response), timing)
+        }
+        Err(error) => (None, error.timing),
+    };
+    let timing = timing.filter(|_| !initiator.is_empty()).map(|mut timing| {
+        // Fetch begins in the initiating API task, before scheduling the
+        // parallel I/O. Include queue time without changing wire boundaries.
+        timing.start_time = started;
+        if timing.redirect_start == 0.0 {
+            timing.fetch_start = started;
+        } else {
+            timing.redirect_start = started;
+        }
+        LumenResourceTiming {
+            name,
+            initiator,
+            timing,
+            cached: false,
+        }
+    });
+    (result, timing)
+}
+
+fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
+    match host_arg_string(ctx, args, 7).as_str() {
+        "fetch" => "fetch",
+        "xmlhttprequest" => "xmlhttprequest",
+        _ => "",
+    }
+}
+
+fn record_resource_timing(ctx: &mut Ctx, report: Option<LumenResourceTiming>) {
+    let Some(report) = report else { return };
+    record_resource_timing_ref(ctx, &report);
+}
+
+fn record_resource_timing_ref(ctx: &mut Ctx, report: &LumenResourceTiming) {
+    let data = report.data();
+    // Worker Performance/EventTarget integration is independent. Do not let
+    // absent reporting hooks change the completion of the underlying request.
+    let value = host_resource_timing_value(ctx, &data);
+    let _ = host_call_trust(ctx, "recordResourceTimingPacked", &[value]);
+}
+
 /// XMLHttpRequest's synchronous flag uses HTML's pause semantics. The network future runs on the
 /// application runtime while only this page thread waits, avoiding a nested Tokio `block_on`.
 fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let started = crate::performance::now_ms();
     let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
+    let initiator = resource_initiator(ctx, args);
+    let client = request_client_url(ctx);
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!("[fetch-trace] sync {method} {target}");
     }
-    let work = ctx
-        .host_mut::<HostState>()
-        .and_then(|state| prepare_host_request(state, &target, method, body, headers, policy));
-    let result = match work {
+    let work = ctx.host_mut::<HostState>().and_then(|state| {
+        prepare_client_request(state, &client, &target, method, body, headers, policy)
+    });
+    let (result, timing) = match work {
         Some((handle, cache, request)) => {
             let (sender, receiver) = std::sync::mpsc::channel();
             cache.spawn(&handle, async move {
-                let _ = sender.send(crate::http::fetch_script(&request).await.ok());
+                let name = request.url.to_string();
+                let result = crate::http::fetch_script_with_timing(&request).await;
+                let _ = sender.send(timed_fetch_result(result, name, initiator, started));
             });
-            receiver.recv().ok().flatten().and_then(lumen_fetch_result)
+            receiver.recv().unwrap_or((None, None))
         }
-        None => None,
+        None => (None, None),
     };
+    record_resource_timing(ctx, timing);
     Ok(host_fetch_result_value(ctx, result))
 }
 
@@ -4677,19 +5157,40 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     use crate::referrer_policy::ReferrerPolicy;
     let target = host_arg_string(ctx, args, 0);
-    let source = url::Url::parse(&host_arg_string(ctx, args, 1)).ok();
     let policy = ReferrerPolicy::parse(&host_arg_string(ctx, args, 2)).unwrap_or_default();
+    let node = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 3)
+    };
+    let client = match node {
+        Some(node) => element_request_client_url(ctx, node),
+        None => request_client_url(ctx),
+    };
+    let destination =
+        if node.is_some_and(|node| host_dom(ctx).borrow().tag_name(node) == Some("frame")) {
+            "frame"
+        } else {
+            "iframe"
+        };
     let work = ctx.host_mut::<HostState>().and_then(|state| {
-        prepare_host_request(state, &target, "GET".into(), None, Vec::new(), None)
+        prepare_client_request(
+            state,
+            &client,
+            &target,
+            "GET".into(),
+            None,
+            Vec::new(),
+            None,
+        )
     });
     let details = match work {
         Some((handle, cache, mut request)) => {
+            crate::http::set_fetch_metadata(&mut request, &client, destination, "navigate");
             request
                 .headers
                 .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
-            if let Some(referrer) =
-                source.and_then(|source| policy.determine(&source, &request.url))
-            {
+            if let Some(referrer) = policy.determine(&client, &request.url) {
                 request
                     .headers
                     .push(("Referer".into(), referrer.to_string()));
@@ -4711,11 +5212,106 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     };
     let final_url = details.response.url.to_string();
     let referrer = details.referrer;
+    let timing = match details.response.timing.as_ref() {
+        Some(timing) => host_navigation_timing_value(ctx, timing, &final_url)?,
+        None => Value::Null,
+    };
+    // HTML #create-navigation-params-by-fetching / #iframe-load-event-steps:
+    // permitted navigation timings report at Fetch completion; otherwise the
+    // container measures only its fallback lifetime at the element load task.
+    // The child's NavigationTiming has different exposure rules and MUST NOT
+    // be reused as the parent's ResourceTiming entry.
+    let resource_timing = match details.response.timing.as_ref() {
+        Some(timing) if node.is_some() && timing.resource_timing_allowed => {
+            host_timing_data_value(ctx, &timing.resource_data(&target, destination))?
+        }
+        _ => Value::Null,
+    };
     let result = lumen_fetch_result(details.response);
     let result = host_fetch_result_value(ctx, result);
     ctx.member_set(&result, "5", Value::from_string(final_url))?;
     ctx.member_set(&result, "6", Value::from_string(referrer))?;
+    ctx.member_set(&result, "7", timing)?;
+    ctx.member_set(&result, "8", resource_timing)?;
     Ok(result)
+}
+
+fn host_navigation_timing_value(
+    ctx: &mut Ctx,
+    timing: &crate::http::FetchTiming,
+    url: &str,
+) -> Result<Value, Value> {
+    let data = timing.navigation_data(url);
+    host_timing_data_value(ctx, &data)
+}
+
+fn host_timing_data_value(ctx: &mut Ctx, data: &serde_json::Value) -> Result<Value, Value> {
+    let object = ctx.new_object_with_proto(&Value::Null);
+    // Closed native scalar record: no author getters, response header objects,
+    // source evaluation, or public JSON.parse operation is involved.
+    if let Some(fields) = data.as_object() {
+        for (key, field) in fields {
+            let value = match field {
+                serde_json::Value::Number(number) => Value::Num(number.as_f64().unwrap_or(0.0)),
+                serde_json::Value::String(text) => Value::from_string(text.clone()),
+                _ => Value::Null,
+            };
+            ctx.member_set(&object, key, value)?;
+        }
+    }
+    Ok(object)
+}
+
+fn host_resource_timing_value(ctx: &mut Ctx, data: &serde_json::Value) -> Value {
+    // Private, ownership-transferred scalar tuple, matching resourceNumbers /
+    // resourceStrings in js_platform.js. The shared native privacy filter has
+    // already coarsened timestamps and applied TAO/body/status restrictions.
+    // Avoid named property insertion and a second per-field JS copy for every
+    // completed request, even when no author ever inspects its timing entry.
+    const NUMBERS: [&str; 19] = [
+        "startTime",
+        "workerStart",
+        "redirectStart",
+        "redirectEnd",
+        "fetchStart",
+        "domainLookupStart",
+        "domainLookupEnd",
+        "connectStart",
+        "connectEnd",
+        "secureConnectionStart",
+        "requestStart",
+        "firstInterimResponseStart",
+        "finalResponseHeadersStart",
+        "responseStart",
+        "responseEnd",
+        "transferSize",
+        "encodedBodySize",
+        "decodedBodySize",
+        "responseStatus",
+    ];
+    const STRINGS: [&str; 6] = [
+        "initiatorType",
+        "deliveryType",
+        "nextHopProtocol",
+        "renderBlockingStatus",
+        "contentType",
+        "contentEncoding",
+    ];
+    let mut fields = Vec::with_capacity(26);
+    fields.push(Value::from_string(
+        data["name"].as_str().unwrap_or("").to_owned(),
+    ));
+    fields.extend(
+        NUMBERS
+            .iter()
+            .map(|name| Value::Num(data[name].as_f64().unwrap_or(0.0))),
+    );
+    fields.extend(
+        STRINGS
+            .iter()
+            .map(|name| Value::from_string(data[name].as_str().unwrap_or("").to_owned())),
+    );
+    ctx.make_array(fields)
 }
 
 enum AsyncFetchSource {
@@ -4728,6 +5324,12 @@ enum AsyncFetchSource {
 /// is invoked later when the browser selects the networking task.
 fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
+    let initiator = resource_initiator(ctx, args);
+    let started = crate::performance::now_ms();
+    let client = request_client_url(ctx);
+    let resource_name = client
+        .join(&target)
+        .map_or_else(|_| String::new(), |url| url.to_string());
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!("[fetch-trace] async {method} {target}");
     }
@@ -4745,24 +5347,34 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         // an unfiltered cached cross-origin response. Browser-owned resource
         // fetches continue to use the cache through `spawn_resource_fetch`.
         let cache_safe_for_policy = policy.is_none()
-            || state
-                .base
+            || client
                 .join(&target)
                 .ok()
-                .is_some_and(|url| crate::http::same_origin_for_host(&state.base, &url));
+                .is_some_and(|url| crate::http::same_origin_for_host(&client, &url));
         let cached = if cache_safe_for_policy {
             state.network.as_ref().and_then(|network| {
                 (method.eq_ignore_ascii_case("GET") && body.is_none())
-                    .then(|| state.base.join(&target).ok())
+                    .then(|| client.join(&target).ok())
                     .flatten()
                     .and_then(|url| network.cache.peek(&url))
+                    .filter(|shared| {
+                        policy.is_none()
+                            || shared.peek().is_some_and(|result| {
+                                result.as_ref().is_ok_and(|response| {
+                                    !response.url_list.is_empty()
+                                        && response.url_list.iter().all(|url| {
+                                            crate::http::same_origin_for_host(&client, url)
+                                        })
+                                })
+                            })
+                    })
             })
         } else {
             None
         };
         let source = match cached {
             Some(shared) => Some(AsyncFetchSource::Cached(shared)),
-            None => prepare_host_request(state, &target, method, body, headers, policy)
+            None => prepare_client_request(state, &client, &target, method, body, headers, policy)
                 .map(|(_, _, request)| AsyncFetchSource::Request(Box::new(request))),
         };
         let events = state.task_events.clone();
@@ -4794,17 +5406,57 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         return Ok(promise);
     };
     cache.spawn(&handle, async move {
-        let result = match source {
-            AsyncFetchSource::Cached(shared) => shared
-                .await
-                .ok()
-                .and_then(|response| lumen_cached_result(&response)),
-            AsyncFetchSource::Request(request) => crate::http::fetch_script(&request)
-                .await
-                .ok()
-                .and_then(lumen_fetch_result),
+        let (result, timing) = match source {
+            AsyncFetchSource::Cached(shared) => match shared.await {
+                Ok(response) => {
+                    let timing = response
+                        .timing
+                        .clone()
+                        .filter(|_| !initiator.is_empty())
+                        .map(|previous| {
+                            // A new script Fetch using a completed page-cache body
+                            // has its own lifetime, not the old connection's times.
+                            let timing = Box::new(crate::http::FetchTiming {
+                                start_time: started,
+                                fetch_start: started,
+                                domain_lookup_start: started,
+                                domain_lookup_end: started,
+                                connect_start: started,
+                                connect_end: started,
+                                request_start: started,
+                                final_response_start: started,
+                                response_end: crate::performance::now_ms(),
+                                encoded_body_size: previous.encoded_body_size,
+                                decoded_body_size: previous.decoded_body_size,
+                                content_type: previous.content_type,
+                                content_encoding: previous.content_encoding,
+                                resource_timing_allowed: true,
+                                resource_body_exposed: true,
+                                resource_response_status: response.status,
+                                ..Default::default()
+                            });
+                            LumenResourceTiming {
+                                name: resource_name,
+                                initiator,
+                                timing,
+                                cached: true,
+                            }
+                        });
+                    (lumen_cached_result(&response), timing)
+                }
+                Err(()) => (None, None),
+            },
+            AsyncFetchSource::Request(request) => {
+                let name = request.url.to_string();
+                timed_fetch_result(
+                    crate::http::fetch_script_with_timing(&request).await,
+                    name,
+                    initiator,
+                    started,
+                )
+            }
         };
-        let _ = events.send(LumenHostTask::FetchDone { id, result });
+        let _ = events.send(LumenHostTask::FetchDone { id, result, timing });
     });
     Ok(promise)
 }
@@ -4838,7 +5490,23 @@ fn host_allocate_job_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Re
 
 fn platform_prelude_snapshot() -> Result<&'static [u8], String> {
     static SNAPSHOT: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
-    match SNAPSHOT.get_or_init(|| lumen::compile_snapshot(crate::js::PRELUDE)) {
+    // Web IDL platform functions use NativeFunction source syntax. The bootstrap
+    // is implementation code, not an author script; do not expose its JS bodies.
+    // This policy also follows nested functions created after initial bootstrap.
+    match SNAPSHOT.get_or_init(|| lumen::compile_host_snapshot(platform_prelude())) {
+        Ok(snapshot) => Ok(snapshot.as_slice()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn eval_platform_prelude(engine: &mut lumen::Engine) -> Result<(), String> {
+    let snapshot = platform_prelude_snapshot()?;
+    eval_bootstrap_snapshot(engine, snapshot, "TRust platform prelude")
+}
+
+fn worker_prelude_snapshot() -> Result<&'static [u8], String> {
+    static SNAPSHOT: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
+    match SNAPSHOT.get_or_init(|| lumen::compile_host_snapshot(crate::js::worker_prelude())) {
         Ok(snapshot) => Ok(snapshot.as_slice()),
         Err(error) => Err(error.clone()),
     }
@@ -4873,6 +5541,14 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     };
 
     let url = host_arg_string(ctx, args, 2);
+    let creator_url = request_client_url(ctx);
+    let parsed_url = url::Url::parse(&url).unwrap_or_else(|_| creator_url.clone());
+    let client_url =
+        if parsed_url.scheme() == "about" && matches!(parsed_url.path(), "blank" | "srcdoc") {
+            creator_url
+        } else {
+            parsed_url
+        };
     let source_config = args.get(3).cloned().unwrap_or(Value::Undefined);
     let parent_window = args.get(4).cloned().unwrap_or(Value::Undefined);
     let top_window = args.get(5).cloned().unwrap_or(Value::Undefined);
@@ -4890,6 +5566,13 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     } else {
         String::new()
     };
+    // Optional document metadata accompanies non-HTML navigations. Keep the
+    // required host arity at nine for existing initial about:blank callers.
+    let content_type = match args.get(9) {
+        Some(Value::Str(value)) => value.to_string(),
+        _ => String::from("text/html"),
+    };
+    let navigation_timing = args.get(10).cloned().unwrap_or(Value::Null);
     let snapshot = platform_prelude_snapshot().map_err(|error| {
         ctx.make_error(
             "SyntaxError",
@@ -4908,6 +5591,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // published through the iframe element.
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.insert(context, realm.clone());
+        state.window_request_urls.insert(context, client_url);
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
         realm_ctx.set_host_job_context(context);
@@ -4926,6 +5610,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             "hardwareConcurrency",
             "globalPrivacyControl",
             "secureContext",
+            "frameTrace",
         ] {
             if let Ok(value) = realm_ctx.member_get(&source_config, name) {
                 realm_ctx.member_set(&config, name, value)?;
@@ -4933,6 +5618,12 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         }
         realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
         realm_ctx.member_set(&config, "referrer", Value::from_string(referrer.clone()))?;
+        realm_ctx.member_set(&config, "navigationTiming", navigation_timing.clone())?;
+        realm_ctx.member_set(
+            &config,
+            "documentContentType",
+            Value::from_string(content_type.clone()),
+        )?;
         realm_ctx.member_set(&config, "frameId", Value::Num(frame_id as f64))?;
         realm_ctx.member_set(&config, "hostSettingsContext", Value::Num(context as f64))?;
         realm_ctx.member_set(&config, "frameElement", frame_element.clone())?;
@@ -4965,6 +5656,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         Ok(Err(error)) | Err(error) => {
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.window_realms.remove(&context);
+                state.window_request_urls.remove(&context);
             }
             return Err(error);
         }
@@ -4993,10 +5685,18 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     }
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.remove(&context);
+        state.window_request_urls.remove(&context);
         if let Some(network) = state.network.as_mut() {
             network
                 .pending_fetches
                 .retain(|_, pending| pending.context != context);
+        }
+        if let Some(workers) = state.workers.as_mut() {
+            // Removing the sole owner closes these dedicated workers. Dropping
+            // their handles interrupts execution; late queued replies are inert.
+            workers
+                .workers
+                .retain(|_, worker| worker.context != context);
         }
     }
     Ok(Value::Bool(ctx.release_host_job_context(context)))
@@ -5017,6 +5717,97 @@ fn host_resource_url(ctx: &mut Ctx, node_id: usize, fallback: Option<String>) ->
         .map(|value| value.to_string())
         .filter(|value| !value.trim().is_empty())
         .or_else(|| fallback.filter(|value| !value.trim().is_empty()))
+}
+
+fn element_request_client_url(ctx: &mut Ctx, node: usize) -> url::Url {
+    let context = host_call_trust(ctx, "resourceClientContext", &[Value::Num(node as f64)])
+        .ok()
+        .and_then(|value| value.as_num_opt())
+        .unwrap_or(0.0) as u64;
+    request_context_url(ctx, context)
+}
+
+fn prepare_element_request(
+    ctx: &mut Ctx,
+    node: usize,
+    target: &str,
+    destination: &'static str,
+    module: bool,
+) -> Option<crate::http::Request> {
+    let client = element_request_client_url(ctx, node);
+    let (credentials, referrer_policy) = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        (
+            crate::js::element_cors_credentials(dom.attr(node, "crossorigin"), module),
+            dom.attr(node, "referrerpolicy")
+                .and_then(crate::referrer_policy::ReferrerPolicy::parse)
+                .unwrap_or_default(),
+        )
+    };
+    let state = ctx.host_mut::<HostState>()?;
+    let (_, _, mut request) = prepare_client_request(
+        state,
+        &client,
+        target,
+        "GET".into(),
+        None,
+        vec![],
+        credentials.map(|credentials| (crate::http::RequestMode::Cors, credentials)),
+    )?;
+    crate::http::set_fetch_metadata(
+        &mut request,
+        &client,
+        destination,
+        if credentials.is_some() {
+            "cors"
+        } else {
+            "no-cors"
+        },
+    );
+    request
+        .headers
+        .retain(|(key, _)| !key.eq_ignore_ascii_case("referer"));
+    if let Some(referrer) = referrer_policy.determine(&client, &request.url) {
+        request
+            .headers
+            .push(("Referer".into(), referrer.to_string()));
+    }
+    Some(request)
+}
+
+/// Parser-blocking nested scripts keep HTML's synchronous script ordering but
+/// fetch as script elements, not as an empty-destination script Fetch request.
+fn host_fetch_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let started = crate::performance::now_ms();
+    let node = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0).filter(|node| dom.tag_name(*node) == Some("script"))
+    };
+    let request = node.and_then(|node| {
+        let target = host_resource_url(ctx, node, None)?;
+        prepare_element_request(ctx, node, &target, "script", false)
+    });
+    let network = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_ref())
+        .map(|network| (network.handle.clone(), network.cache.clone()));
+    let (result, timing) = if let (Some(request), Some((handle, cache))) = (request, network) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cache.spawn(&handle, async move {
+            let name = request.url.to_string();
+            let result = crate::http::fetch_with_timing(&request, Default::default())
+                .await
+                .map(|details| details.response);
+            let _ = sender.send(timed_fetch_result(result, name, "script", started));
+        });
+        receiver.recv().unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    record_resource_timing(ctx, timing);
+    Ok(host_fetch_result_value(ctx, result))
 }
 
 fn host_push_injected_error(ctx: &mut Ctx, message: impl Into<String>) {
@@ -5097,6 +5888,7 @@ fn send_resource_completion(
             name,
             kind,
             result,
+            timing: None,
             external,
         })
         .is_err()
@@ -5115,7 +5907,22 @@ fn spawn_resource_fetch(
     kind: LumenResourceKind,
     request: crate::http::Request,
 ) -> bool {
+    let started = crate::performance::now_ms();
     let name = request.url.to_string();
+    let client = element_request_client_url(ctx, node_id);
+    let destination = match kind {
+        LumenResourceKind::Stylesheet => "style",
+        LumenResourceKind::ClassicScript | LumenResourceKind::ModuleScript => "script",
+    };
+    let initiator = if matches!(kind, LumenResourceKind::Stylesheet) {
+        "css"
+    } else {
+        "script"
+    };
+    let credentials = request
+        .fetch_policy
+        .as_ref()
+        .map(|policy| policy.credentials);
     let context = ctx.host_job_context();
     let Some((handle, cache, events)) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
@@ -5125,26 +5932,54 @@ fn spawn_resource_fetch(
     }) else {
         return false;
     };
-    let shared = cache.peek(&request.url);
+    let shared = cache.peek_resource(&request.url, &client, destination, credentials);
     let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
     cache.spawn(&handle, async move {
-        let result = match shared {
-            Some(shared) => shared.await.ok().map(|response| {
-                (
-                    response.status,
-                    response.content_type.clone(),
-                    response.body.clone(),
-                    response.headers.clone(),
-                )
-            }),
-            None => crate::http::fetch(&request).await.ok().map(|response| {
-                (
-                    response.status,
-                    response.content_type,
-                    response.body,
-                    response.headers,
-                )
-            }),
+        let (result, timing) = match shared {
+            Some(shared) => match shared.await {
+                Ok(response) => {
+                    let timing = LumenResourceTiming::cached(
+                        name.clone(),
+                        initiator,
+                        response.timing.as_deref(),
+                        started,
+                    );
+                    (
+                        Some((
+                            response.status,
+                            response.content_type.clone(),
+                            response.body.clone(),
+                            response.headers.clone(),
+                        )),
+                        timing,
+                    )
+                }
+                Err(()) => (None, None),
+            },
+            None => match crate::http::fetch_with_timing(&request, Default::default()).await {
+                Ok(details) => {
+                    let response = details.response;
+                    let timing = LumenResourceTiming::fetched(
+                        name.clone(),
+                        initiator,
+                        response.timing,
+                        started,
+                    );
+                    (
+                        Some((
+                            response.status,
+                            response.content_type,
+                            response.body,
+                            response.headers,
+                        )),
+                        timing,
+                    )
+                }
+                Err(error) => (
+                    None,
+                    LumenResourceTiming::fetched(name.clone(), initiator, error.timing, started),
+                ),
+            },
         };
         if trace_fetch {
             match &result {
@@ -5162,6 +5997,7 @@ fn spawn_resource_fetch(
             name,
             kind,
             result,
+            timing,
             external: true,
         });
     });
@@ -5269,10 +6105,7 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             }
             return Ok(Value::Undefined);
         }
-        let request = ctx.host_mut::<HostState>().and_then(|state| {
-            prepare_host_request(state, &src, String::from("GET"), None, Vec::new(), None)
-                .map(|(_, _, request)| request)
-        });
+        let request = prepare_element_request(ctx, node_id, &src, "script", module);
         if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
             eprintln!(
                 "[fetch-trace] injected request prepared={}",
@@ -5366,10 +6199,7 @@ fn host_load_injected_stylesheet(
         }
         return Ok(Value::Undefined);
     }
-    let request = ctx.host_mut::<HostState>().and_then(|state| {
-        prepare_host_request(state, &href, String::from("GET"), None, Vec::new(), None)
-            .map(|(_, _, request)| request)
-    });
+    let request = prepare_element_request(ctx, node_id, &href, "style", false);
     match request {
         Some(request) => {
             if !spawn_resource_fetch(ctx, node_id, LumenResourceKind::Stylesheet, request) {
@@ -5510,7 +6340,12 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         .get(3)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
         .map(|_| host_latin1_bytes(ctx, args, 3));
+    let context = ctx.host_job_context();
+    let owner_page = request_client_url(ctx);
 
+    let agent_cluster = ctx
+        .host_mut::<HostState>()
+        .map_or(0, |state| state.agent_cluster);
     let Some((id, launch, handle, tasks, events)) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.workers.as_mut())
@@ -5518,8 +6353,8 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
             if workers.workers.len() >= MAX_LUMEN_WORKERS {
                 return None;
             }
-            let script_url = workers.page.join(&target).ok()?;
-            let secure_context = lumen_potentially_trustworthy(&workers.page)
+            let script_url = owner_page.join(&target).ok()?;
+            let secure_context = lumen_potentially_trustworthy(&owner_page)
                 && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
             let id = workers.next_id;
             workers.next_id += 1;
@@ -5527,12 +6362,13 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
                 id,
                 LumenWorkerLaunch {
                     id,
-                    owner_page: workers.page.clone(),
+                    owner_page: owner_page.clone(),
                     script_url,
                     kind,
                     name,
                     script_body,
                     secure_context,
+                    agent_cluster,
                 },
                 workers.handle.clone(),
                 workers.tasks.clone(),
@@ -5569,9 +6405,14 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         .host_mut::<HostState>()
         .and_then(|state| state.workers.as_mut())
     {
-        workers
-            .workers
-            .insert(id, LumenWorkerHandle { ctl, interrupt });
+        workers.workers.insert(
+            id,
+            LumenWorkerHandle {
+                ctl,
+                interrupt,
+                context,
+            },
+        );
     }
     Ok(Value::Num(id as f64))
 }
@@ -5640,7 +6481,12 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 }
 
 fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
+    engine.ctx().op_state().register_gc::<HostState>();
     engine.define_global("__image_data_slots", 1, host_image_data_slots);
+    engine.define_global("__image_binding", 2, image_host::call);
+    engine.define_global("__wasm_module_binding", 1, host_wasm_module_binding);
+    engine.define_global("__permissions_binding", 2, host_permissions_binding);
+    engine.define_global("__navigator_binding", 1, host_navigator_binding);
     // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
     // shared worker prelude can reach, including its independent per-agent
     // WebAssembly store.
@@ -5670,6 +6516,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             host_compression_encode as NativeFn,
         ),
         ("__text_encode", 1, host_text_encode as NativeFn),
+        ("__base64_convert", 2, host_base64_convert as NativeFn),
         ("__wasm_validate", 1, lumen_wasm::host_validate as NativeFn),
         ("__wasm_compile", 1, lumen_wasm::host_compile as NativeFn),
         (
@@ -5701,6 +6548,11 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             "__wasm_call_export",
             2,
             lumen_wasm::host_call_export as NativeFn,
+        ),
+        (
+            "__wasm_function_cache",
+            2,
+            lumen_wasm::host_function_cache as NativeFn,
         ),
         (
             "__wasm_global_new",
@@ -5819,7 +6671,14 @@ fn fetch_lumen_worker_script(
         return None;
     }
 
-    let request = crate::http::Request::get(launch.script_url.clone());
+    let mut request = crate::http::Request::get(launch.script_url.clone());
+    crate::http::set_fetch_metadata(&mut request, &launch.owner_page, "worker", "same-origin");
+    crate::http::set_referrer(&mut request, &launch.owner_page);
+    request.fetch_policy = Some(crate::http::FetchPolicy {
+        origin: launch.owner_page.clone(),
+        mode: crate::http::RequestMode::SameOrigin,
+        credentials: crate::http::CredentialsMode::SameOrigin,
+    });
     let (sender, receiver) = std::sync::mpsc::channel();
     cache.spawn(handle, async move {
         let result = crate::http::fetch(&request).await.ok().map(|response| {
@@ -5869,6 +6728,20 @@ fn eval_lumen_worker_setup(
             error.line, error.message
         )),
         Ok(Err(EvalError::Throw(error))) => Err(describe_throw(engine, error, label)),
+        Ok(Err(EvalError::Interrupted(_))) => Ok(false),
+        Ok(Ok(_)) => Ok(true),
+    }
+}
+
+fn eval_lumen_worker_platform_setup(engine: &mut lumen::Engine) -> Result<bool, String> {
+    let snapshot = worker_prelude_snapshot()?;
+    const LABEL: &str = "worker platform prelude";
+    match engine.eval_snapshot_value_interruptible(snapshot) {
+        Err(error) => Err(format!(
+            "{LABEL} parse error at line {}: {}",
+            error.line, error.message
+        )),
+        Ok(Err(EvalError::Throw(error))) => Err(describe_throw(engine, error, LABEL)),
         Ok(Err(EvalError::Interrupted(_))) => Ok(false),
         Ok(Ok(_)) => Ok(true),
     }
@@ -6027,6 +6900,7 @@ fn run_lumen_worker(
     let clock = Rc::new(RealmClock::new());
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
     state.base = launch.script_url.clone();
+    state.agent_cluster = launch.agent_cluster;
     state.network = Some(LumenNetwork {
         handle: handle.clone(),
         cache: cache.clone(),
@@ -6070,11 +6944,13 @@ fn run_lumen_worker(
         crate::http::GLOBAL_PRIVACY_CONTROL,
         launch.secure_context,
     );
-    for (source, label) in [
-        (config.as_str(), "worker configuration"),
-        (crate::js::worker_prelude(), "worker platform prelude"),
-    ] {
-        match eval_lumen_worker_setup(&mut engine, source, label) {
+    for platform in [false, true] {
+        let setup = if platform {
+            eval_lumen_worker_platform_setup(&mut engine)
+        } else {
+            eval_lumen_worker_setup(&mut engine, &config, "worker configuration")
+        };
+        match setup {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
@@ -6217,13 +7093,24 @@ fn module_dependency_loader(
     {
         return None;
     }
-    let response = if let Some(shared) = cache.peek(&resolved) {
+    let response = if let Some(shared) = cache.peek_resource(
+        &resolved,
+        page,
+        "script",
+        Some(crate::http::CredentialsMode::SameOrigin),
+    ) {
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     } else {
         // HTML's fetch-a-module-script graph algorithm requires this dependency. Keep the count
         // as diagnostics, but never turn historical activity into a synthetic load failure.
         fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let shared = cache.fetch(handle, resolved.clone());
+        let shared = cache.fetch_resource(
+            handle,
+            resolved.clone(),
+            page,
+            "script",
+            Some(crate::http::CredentialsMode::SameOrigin),
+        );
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     };
     crate::http::module_script_response_allowed(response.status, &response.content_type).then(
@@ -6307,7 +7194,12 @@ fn queue_dynamic_module_load(
         return;
     }
 
-    let shared = if let Some(shared) = network.cache.peek(&resolved) {
+    let shared = if let Some(shared) = network.cache.peek_resource(
+        &resolved,
+        &loader.page,
+        "script",
+        Some(crate::http::CredentialsMode::SameOrigin),
+    ) {
         shared
     } else {
         // ECMA-262 HostLoadImportedModule plus HTML's module-script fetch do not permit a host to
@@ -6315,7 +7207,13 @@ fn queue_dynamic_module_load(
         network
             .fetched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        network.cache.fetch(&network.handle, resolved.clone())
+        network.cache.fetch_resource(
+            &network.handle,
+            resolved.clone(),
+            &loader.page,
+            "script",
+            Some(crate::http::CredentialsMode::SameOrigin),
+        )
     };
     let events = loader.events.clone();
     network.cache.spawn(&network.handle, async move {
@@ -6371,7 +7269,15 @@ fn speculate_module_imports(
         else {
             continue;
         };
-        if cache.peek(&resolved).is_some() {
+        if cache
+            .peek_resource(
+                &resolved,
+                page,
+                "script",
+                Some(crate::http::CredentialsMode::SameOrigin),
+            )
+            .is_some()
+        {
             continue;
         }
         if !crate::http::subresource_allowed(page, &resolved)
@@ -6390,7 +7296,13 @@ fn speculate_module_imports(
         if std::env::var_os("TRUST_NET_TRACE").is_some() {
             eprintln!("lumen: module prefetch {resolved}");
         }
-        cache.prefetch(handle, resolved);
+        drop(cache.fetch_resource(
+            handle,
+            resolved,
+            page,
+            "script",
+            Some(crate::http::CredentialsMode::SameOrigin),
+        ));
     }
 }
 
@@ -6717,9 +7629,50 @@ fn dispatch_websocket_task(
 /// Run the engine-owned portion of one selected host task. The caller performs the HTML event
 /// loop's microtask checkpoint after this returns, before selecting another task.
 #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
+fn settle_network_task(
+    engine: &mut lumen::Engine,
+    id: usize,
+    value: impl FnOnce(&mut Ctx) -> Value,
+) -> Result<(), String> {
+    let pending = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_mut())
+        .and_then(|network| network.pending_fetches.remove(&id));
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let context = pending.context;
+    let run = move |engine: &mut lumen::Engine| {
+        let value = value(engine.ctx());
+        engine
+            .call_function_interruptible(&pending.resolve, Value::Undefined, &[value])
+            .map(|_| ())
+            .map_err(|error| describe_eval_error(engine, error, "image networking task"))
+    };
+    if context == engine.ctx().host_job_context() {
+        return run(engine);
+    }
+    let realm = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.window_realms.get(&context).cloned());
+    let Some(realm) = realm else { return Ok(()) }; // Replaced/inactive Document.
+    match engine.with_embed_realm(&realm, run) {
+        Ok(result) => result,
+        Err(_) => Err(String::from("image networking task Realm is unavailable")),
+    }
+}
+
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
-        LumenHostTask::FetchDone { id, result } => {
+        LumenHostTask::ImageDone { id, result, timing } => {
+            settle_network_task(engine, id, move |ctx| {
+                record_resource_timing(ctx, timing);
+                image_host::result_value(ctx, result)
+            })?;
+        }
+        LumenHostTask::FetchDone { id, result, timing } => {
             let pending = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -6736,6 +7689,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             let context = pending.context;
             let resolve = pending.resolve;
             let run = move |engine: &mut lumen::Engine| {
+                record_resource_timing(engine.ctx(), timing);
                 let value = host_fetch_result_value(engine.ctx(), result);
                 engine
                     .call_function_interruptible(&resolve, Value::Undefined, &[value])
@@ -6774,6 +7728,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             name,
             kind,
             result,
+            timing,
             external,
         } => {
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
@@ -6785,6 +7740,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // dispatching through the actor's root Realm would fire load/error
             // against the wrong Realm-local listener registry.
             if context == engine.ctx().host_job_context() {
+                record_resource_timing(engine.ctx(), timing);
                 run_resource_task(engine, node_id, name, kind, result, external)?;
             } else {
                 let realm = engine
@@ -6798,6 +7754,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     return Ok(());
                 };
                 match engine.with_embed_realm(&realm, move |engine| {
+                    record_resource_timing(engine.ctx(), timing);
                     run_resource_task(engine, node_id, name, kind, result, external)
                 }) {
                     Ok(result) => result?,
@@ -6831,22 +7788,47 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             dispatch_websocket_task(engine, id, event)?;
         }
         LumenHostTask::Worker { id, event } => {
+            let context = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.workers.as_ref())
+                .and_then(|workers| workers.workers.get(&id))
+                .map(|worker| worker.context);
+            let Some(context) = context else {
+                return Ok(());
+            };
             let (name, payload) = match event {
                 crate::js::WorkerOut::Message(message) => ("workerMessage", message),
                 crate::js::WorkerOut::Error(message) => ("workerError", message),
             };
-            host_call_trust(
-                engine.ctx(),
-                name,
-                &[Value::Num(id as f64), Value::from_string(payload)],
-            )
-            .map_err(|error| {
-                engine
+            let run = move |engine: &mut lumen::Engine| {
+                host_call_trust(
+                    engine.ctx(),
+                    name,
+                    &[Value::Num(id as f64), Value::from_string(payload)],
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    engine
+                        .ctx()
+                        .coerce_string(&error)
+                        .map(|message| format!("Worker task: {message}"))
+                        .unwrap_or_else(|_| String::from("Worker task failed"))
+                })
+            };
+            if context == engine.ctx().host_job_context() {
+                run(engine)?;
+            } else {
+                let realm = engine
                     .ctx()
-                    .coerce_string(&error)
-                    .map(|message| format!("Worker task: {message}"))
-                    .unwrap_or_else(|_| String::from("Worker task failed"))
-            })?;
+                    .host_mut::<HostState>()
+                    .and_then(|state| state.window_realms.get(&context).cloned());
+                let Some(realm) = realm else { return Ok(()) };
+                match engine.with_embed_realm(&realm, run) {
+                    Ok(result) => result?,
+                    Err(_) => return Err(String::from("Worker task Realm is unavailable")),
+                }
+            }
         }
         LumenHostTask::WorkerExited { id } => {
             if let Some(workers) = engine
@@ -6988,6 +7970,17 @@ fn host_parent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     let dom = dom.borrow();
     Ok(host_id_value(
         host_arg_node(&dom, args, 0).and_then(|id| dom.node(id).parent),
+    ))
+}
+
+/// HTML child-navigable ownership crosses DOM shadow-root/host links. It
+/// must not depend on which Realm has already constructed a wrapper for the
+/// root, or whether the shadow root is exposed to author JavaScript.
+fn host_frame_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(host_id_value(
+        host_arg_node(&dom, args, 0).and_then(|id| dom.frame_owner(id)),
     ))
 }
 
@@ -7730,6 +8723,7 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
         cached.boxes = measured.boxes;
         cached.tracks = measured.tracks;
         cached.scrolling_areas = measured.scrolling_areas;
+        cached.frame_viewports = measured.frame_viewports;
         cached.fragments = measured.fragments;
         cached.paint = None;
         cached.epoch = epoch;
@@ -7940,7 +8934,8 @@ fn host_match_media(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 
 /// HTML §4.8.4 exposes the absolute URL of the selected current image request.
 fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let (base, viewport, density) = host_layout_environment(ctx);
+    let (_, viewport, density) = host_layout_environment(ctx);
+    let base = request_client_url(ctx);
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let Some(id) = host_arg_node(&dom, args, 0) else {
@@ -7960,7 +8955,8 @@ fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 /// page actor's resource-availability state and is shared with layout so a
 /// script cannot observe a different image state from the one being painted.
 fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let (base, viewport, density) = host_layout_environment(ctx);
+    let (_, viewport, density) = host_layout_environment(ctx);
+    let base = request_client_url(ctx);
     let source = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -8063,7 +9059,33 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     } else {
         ensure_host_geom_cache(ctx, "bounding-rect")
     };
-    let rect = id.and_then(|id| cache.borrow().boxes.get(&id).copied());
+    let rect = id.and_then(|id| {
+        let cached = cache.borrow();
+        let mut rect = if matches!(args.get(1), Some(Value::Bool(true))) {
+            let viewport = cached.frame_viewports.get(&id)?;
+            crate::layout2::PxRect {
+                left: f64::from(viewport.x),
+                top: f64::from(viewport.y),
+                width: f64::from(viewport.width),
+                height: f64::from(viewport.height),
+                css_width: None,
+                css_height: None,
+            }
+        } else {
+            *cached.boxes.get(&id)?
+        };
+        // CSSOM View §6 and HTML Rendering #the-page: the flat layout arena
+        // stores page-absolute positions, but every nested Document has its
+        // own initial containing block at its container's content-box origin.
+        // Normalize here, before the owning Window's viewport scroll is applied
+        // by getBoundingClientRect. offset* also needs Document-local geometry.
+        if let Some(owner) = dom_handle.borrow().frame_owner(id) {
+            let viewport = cached.frame_viewports.get(&owner)?;
+            rect.left -= f64::from(viewport.x);
+            rect.top -= f64::from(viewport.y);
+        }
+        Some(rect)
+    });
     Ok(match rect {
         Some(rect) => ctx.make_array(vec![
             Value::Num(rect.left),
@@ -8122,7 +9144,11 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(frame) = host_arg_node(&dom, args, 0) {
-        dom.install_frame_document(frame, &html, &base);
+        if matches!(args.get(3), Some(Value::Bool(true))) {
+            dom.install_frame_text_document(frame, &html, &base);
+        } else {
+            dom.install_frame_document(frame, &html, &base);
+        }
     }
     Ok(Value::Undefined)
 }
@@ -8148,14 +9174,15 @@ fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 }
 
 fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage, String) {
-    let kind = host_arg_string(ctx, args, 0);
+    // The platform bootstrap binds this private key to the Storage object's
+    // checked origin (Storage #storage-keys). Re-deriving it from state.base
+    // exposed the top page's bucket to every child and changed retained API
+    // objects' maps when a base URL/settings context changed or was retired.
+    let bucket = host_arg_string(ctx, args, 0);
     let state = ctx
         .host_mut::<HostState>()
         .expect("HostState installed before any Lumen host call");
-    (
-        state.storage.clone(),
-        format!("{kind}:{}", state.base.origin().ascii_serialization()),
-    )
+    (state.storage.clone(), bucket)
 }
 
 fn host_storage_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -8429,6 +9456,61 @@ fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ctx.make_uint8array(text.as_bytes())
 }
 
+/// HTML #atob and Infra #forgiving-base64. `null` is an internal invalid-input
+/// sentinel; the JS binding throws the invoking Realm's DOMException.
+fn host_base64_convert(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(Value::Str(text)) = args.first() else {
+        return Ok(Value::Null);
+    };
+    if matches!(args.get(1), Some(Value::Bool(true))) {
+        // Binary strings are Latin-1 code points, NOT UTF-8 encoded text.
+        // Surrogates and every other non-byte code point must be rejected.
+        let bytes: Option<Vec<u8>> = text
+            .chars()
+            .map(|ch| u8::try_from(ch as u32).ok())
+            .collect();
+        return Ok(bytes.map_or(Value::Null, |bytes| {
+            Value::from_string(crate::img::base64_encode(&bytes))
+        }));
+    }
+    let mut data: Vec<u8> = text
+        .bytes()
+        .filter(|byte| !matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' '))
+        .collect();
+    if data.len().is_multiple_of(4) {
+        for _ in 0..2 {
+            if data.last() == Some(&b'=') {
+                data.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    if data.len() % 4 == 1 {
+        return Ok(Value::Null);
+    }
+    let mut output = String::with_capacity(data.len() / 4 * 3);
+    let (mut buffer, mut bits) = (0u32, 0);
+    for byte in data {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Ok(Value::Null),
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(char::from(((buffer >> bits) & 255) as u8));
+        }
+    }
+    // Infra deliberately discards non-zero trailing bits (YR decodes to a).
+    Ok(Value::from_string(output))
+}
+
 fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let open = matches!(args.get(1), Some(Value::Bool(true)));
     let dom = host_dom(ctx);
@@ -8441,6 +9523,21 @@ fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 
 fn eval(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<(), String> {
     eval_value(engine, source, label).map(|_| ())
+}
+
+fn eval_bootstrap_snapshot(
+    engine: &mut lumen::Engine,
+    snapshot: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    match engine.eval_snapshot_value_interruptible(snapshot) {
+        Err(error) => Err(format!(
+            "{label} parse error at line {}: {}",
+            error.line, error.message
+        )),
+        Ok(Err(error)) => Err(describe_eval_error(engine, error, label)),
+        Ok(Ok(_)) => Ok(()),
+    }
 }
 
 fn eval_value(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<Value, String> {
@@ -8510,30 +9607,36 @@ mod tests {
             <div class=slide><div>second</div></div><div class=slide><div>third</div></div></div>
             <div id=fixed></div><div id=parent><div id=child></div></div><div id=none class=slide></div>"#,
         )));
-        let mut engine = configured_engine(
-            HostState::new(dom, Rc::new(RealmClock::new())),
-            DEFAULT_URL,
-        );
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
         assert_eq!(
-            string_value(&mut engine, r#"
+            string_value(
+                &mut engine,
+                r#"
             JSON.stringify(Array.from(document.querySelectorAll('#carousel .slide')).map(
                 el => [el.offsetWidth,el.offsetHeight,el.getBoundingClientRect().width,el.offsetParent.id]))
-        "#),
+        "#
+            ),
             r#"[[240,80,240,"carousel"],[240,80,240,"carousel"],[240,80,240,"carousel"]]"#
         );
         assert_eq!(
-            string_value(&mut engine, r#"
+            string_value(
+                &mut engine,
+                r#"
             JSON.stringify(['fixed','child','none'].map(id => {
                 const el=document.getElementById(id); return [el.offsetWidth,el.offsetHeight];
             }))
-        "#),
+        "#
+            ),
             "[[70,30],[60,40],[0,0]]"
         );
         // The arrow algorithm uses dimensions to skip display:none slides.
         // Unlike a dot's direct index selection, it cannot advance if the
         // transparent candidates were incorrectly removed from layout.
         assert_eq!(
-            string_value(&mut engine, r#"
+            string_value(
+                &mut engine,
+                r#"
             (() => {
                 const slides=Array.from(document.querySelectorAll('#carousel .slide'));
                 let index=0;
@@ -8546,7 +9649,8 @@ mod tests {
                 };
                 return [advance(1),advance(1),advance(1),advance(-1)].join(',');
             })()
-        "#),
+        "#
+            ),
             "1,2,0,2"
         );
     }
@@ -8984,6 +10088,55 @@ mod tests {
     }
 
     #[test]
+    fn wasm_module_structured_clone_preserves_internal_slots() {
+        for worker in [false, true] {
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            eval(
+                &mut engine,
+                if worker {
+                    crate::js::worker_prelude()
+                } else {
+                    crate::js::PRELUDE
+                },
+                "Wasm clone prelude",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/wasm_module_clone.mjs")),
+                "wasm-module-clone-ok"
+            );
+        }
+        let mut sender = platform_engine();
+        let wire = string_value(
+            &mut sender,
+            "__sc_serialize(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])))",
+        );
+        let mut receiver = platform_engine();
+        eval(
+            &mut receiver,
+            &format!(
+                "globalThis.wire = {};",
+                serde_json::to_string(&wire).unwrap()
+            ),
+            "foreign-cluster message",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(
+                &mut receiver,
+                "try { __sc_deserialize(wire); 'accepted'; } catch (error) { error.name; }"
+            ),
+            "DataCloneError"
+        );
+    }
+
+    #[test]
     fn console_clear_is_callable_in_window_and_worker() {
         for worker in [false, true] {
             let mut engine = configured_engine_before_prelude(
@@ -9059,7 +10212,7 @@ mod tests {
 
     fn configured_engine(state: HostState, url: &str) -> lumen::Engine {
         let mut engine = configured_engine_before_prelude(state, url);
-        eval(&mut engine, crate::js::PRELUDE, "prelude").unwrap();
+        eval_platform_prelude(&mut engine).unwrap();
         engine
     }
 
@@ -9267,7 +10420,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 124, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 137, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -9278,7 +10431,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 124);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 137);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -9291,6 +10444,124 @@ mod tests {
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
+        }
+    }
+
+    #[test]
+    fn window_name_tracks_the_navigable_not_its_element_attribute() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r##"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const initialName = name;
+            name = 123;
+            const parentName = name;
+            const frame = document.createElement('iframe');
+            frame.name = 'anchor';
+            body.appendChild(frame);
+            const first = frame.contentWindow;
+            const childInitial = first.name;
+            frame.name = 'attribute-only';
+            const afterAttribute = first.name;
+            first.name = 'renamed';
+            frame.srcdoc = '<body>next</body>';
+            __trust.hydrateFrames();
+            [initialName, parentName, childInitial, afterAttribute, frame.name,
+                frame.contentWindow.name, name].join('|')
+        "##
+            ),
+            "|123|anchor|anchor|attribute-only|renamed|123"
+        );
+    }
+
+    #[test]
+    fn window_named_access_is_live_and_does_not_shadow_builtins() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r##"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); frame.name = 'anchor'; body.appendChild(frame);
+            const initial = frames.anchor === frame.contentWindow && window.anchor === frames.anchor;
+            const count = length;
+            frame.contentWindow.name = 'renamed';
+            const renamed = !('anchor' in window) && frames.renamed === frame.contentWindow;
+            const a = document.createElement('div'); a.id = 'duplicate'; body.appendChild(a);
+            const b = document.createElement('div'); b.id = 'duplicate'; body.appendChild(b);
+            const collection = window.duplicate;
+            const multiple = collection instanceof HTMLCollection && collection.length === 2 && collection[1] === b;
+            b.remove();
+            const live = collection.length === 1 && window.duplicate === a;
+            a.id = 'name';
+            const shadow = typeof window.name === 'string';
+            frame.remove();
+            [initial, count, renamed, multiple, live, shadow, length, typeof frames.renamed].join('|')
+        "##
+            ),
+            "true|1|true|true|true|true|0|undefined"
+        );
+    }
+
+    #[test]
+    fn callback_context_tracks_registration_for_bound_natives_across_realms() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            for native_tasks in [false, true] {
+                let mut engine = platform_engine();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(
+                    string_value(&mut engine, include_str!("fixtures/callback_context.mjs")),
+                    "callback-context-pending"
+                );
+                for _ in 0..32 {
+                    run_microtask_checkpoint(&mut engine);
+                    eval(
+                        &mut engine,
+                        "while (__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                        "messages",
+                    )
+                    .unwrap();
+                    let next = eval_value(&mut engine, "__trust.nextDeadline()", "timer deadline")
+                        .unwrap();
+                    let Some(deadline) = next.as_num_opt().filter(|n| n.is_finite()) else {
+                        break;
+                    };
+                    let dispatched = if native_tasks {
+                        dispatch_timer_task_to(&mut engine, deadline).map(|_| ())
+                    } else {
+                        engine_call_trust_method(&mut engine, "tickTo", &[Value::Num(deadline)])
+                            .map(|_| ())
+                    };
+                    if let Err(error) = dispatched {
+                        panic!(
+                            "{}",
+                            describe_eval_error(&mut engine, error, "callback-context timer")
+                        );
+                    }
+                }
+                assert_eq!(
+                    string_value(&mut engine, "callbackContextTrace.sort().join('|')"),
+                    "context-child-arguments:true:true|context-child-interval:true:true|context-child-interval:true:true|context-child-microtask-arguments:true:true|context-child-parent-microtask:true:true|context-child-parent-timer:true:true|context-child-pending:true:true|context-child-promise:true:true|context-child-timer:true:true|context-opaque-promise:true:true|context-opaque-timer:true:true|context-parent-function:true:true",
+                    "{tier:?}, native_tasks={native_tasks}"
+                );
+                assert_eq!(
+                    string_value(&mut engine, "__trust.takeErrors()"),
+                    "",
+                    "callback errors"
+                );
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        "[typeof __callback_api, typeof __invoke_callback, setTimeout.name, setTimeout.length, setInterval.name, setInterval.length, callbackContextInvalid, callbackContextAssimilated].join('|')"
+                    ),
+                    "undefined|undefined|setTimeout|1|setInterval|1|4|false"
+                );
+            }
         }
     }
 
@@ -9328,6 +10599,205 @@ mod tests {
     }
 
     #[test]
+    fn iframe_text_documents_commit_navigation_without_executing_source() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/frame_text_documents.mjs")
+                ),
+                "frame-text-documents-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_native_conversion_preserves_web_idl_and_forgiving_decode() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/base64.mjs")),
+                "base64-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_unavailable_reports_capabilities_and_asynchronous_source_failure() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/media_unavailable.mjs")),
+                "media-unavailable-pending"
+            );
+            run_microtask_checkpoint(&mut engine);
+            eval(
+                &mut engine,
+                "while (__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                "media events",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                    [mediaEvents.join(','), media.error instanceof MediaError,
+                     media.error.code, media.error.message, media.networkState,
+                     media.currentSrc, sourceErrors.join(','), sourceMedia.error,
+                     sourceMedia.networkState].join('|')
+                "#
+                ),
+                "emptied,loadstart,error|true|4|No inline media decoder is available|3|https://example.com/new.webm|one:true,two:true||3",
+                "{tier:?}"
+            );
+            eval(
+                &mut engine,
+                r#"
+                mediaEvents.length = 0;
+                var oldMediaError = media.error;
+                media.removeAttribute('src');
+                assertMedia(media.error === oldMediaError, 'removing src does not invoke load');
+                media.load();
+                assertMedia(media.error === null, 'load resets the error synchronously');
+            "#,
+                "media reset",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            eval(
+                &mut engine,
+                "while (__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                "media reset events",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "mediaEvents.join(',') + '|' + media.networkState"
+                ),
+                "emptied|0"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_gradients_follow_webidl_state_and_pixel_algorithms() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_gradients.mjs"),
+                "canvas gradient conformance",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref s) if s.as_ref() == "canvas-gradients-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_gradients_are_branded_across_same_agent_window_realms() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            const foreign = frame.contentWindow;
+            const gradient = foreign.document.createElement('canvas').getContext('2d')
+                .createLinearGradient(0.5,0,16.5,0);
+            CanvasGradient.prototype.addColorStop.call(gradient,0,'red');
+            foreign.CanvasGradient.prototype.addColorStop.call(gradient,1,'blue');
+            const context = document.createElement('canvas').getContext('2d');
+            context.fillStyle = gradient; context.fillRect(0,0,32,32);
+            const pixel = context.getImageData(8,4,1,1).data;
+            globalThis.gradientRealmResult = [context.fillStyle === gradient,
+                gradient instanceof foreign.CanvasGradient,
+                !(gradient instanceof CanvasGradient), pixel[0] >= 125 && pixel[0] <= 130,
+                pixel[2] >= 125 && pixel[2] <= 130, pixel[3] === 255].join('|');
+        "#,
+            "cross-Realm canvas gradient state",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "gradientRealmResult"),
+            "true|true|true|true|true|true"
+        );
+    }
+
+    #[test]
+    fn canvas_shadows_follow_the_drawing_model() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_shadows.mjs"),
+                "canvas shadow conformance",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref s) if s.as_ref() == "canvas-shadows-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_text_uses_real_glyphs_metrics_and_saved_state() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_text.mjs"),
+                "canvas text conformance",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref s) if s.as_ref() == "canvas-text-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_text_metrics_are_branded_across_same_agent_realms() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            const foreign = frame.contentWindow;
+            const context = foreign.document.createElement('canvas').getContext('2d');
+            const metric = context.measureText('Hello');
+            const width = Object.getOwnPropertyDescriptor(TextMetrics.prototype,'width').get;
+            if (width.call(metric) !== metric.width || !(metric instanceof foreign.TextMetrics)
+                || metric instanceof TextMetrics || metric.width <= 0) throw Error('metric realm brand');
+            let rejected = false;
+            try { width.call(Object.create(TextMetrics.prototype)); }
+            catch(e) { rejected = e.name === 'TypeError'; }
+            if (!rejected) throw Error('forged metric accepted');
+        "#, "cross-Realm canvas metrics").unwrap();
+    }
+
+    #[test]
     fn canvas_native_pixels_and_drawing_state_conformance() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
@@ -9350,7 +10820,22 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches!(value, Value::Str(ref text) if text.as_ref() == "canvas-paths-images-ok"),
+                matches!(value, Value::Str(ref text) if text.as_ref() == "canvas-paths-images-pending"),
+                "{tier:?}"
+            );
+            run_microtask_checkpoint(&mut engine);
+            for _ in 0..4 {
+                eval(
+                    &mut engine,
+                    "__trust.tickTo(__trust.now() + 50)",
+                    "canvas image tasks",
+                )
+                .unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(&mut engine, "canvasDecodedImageResult"),
+                "canvas-paths-images-ok",
                 "{tier:?}"
             );
         }
@@ -9440,7 +10925,7 @@ mod tests {
             .unwrap();
         let page = url::Url::parse("https://canvas.example/document").unwrap();
         let cache = Arc::new(crate::http::PageCache::default());
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = HostState::new(
             Rc::new(RefCell::new(Dom::parse_document(
                 "<!doctype html><html><head></head><body></body></html>",
@@ -9477,6 +10962,7 @@ mod tests {
                 content_type: "image/png".into(),
                 headers: Vec::new(),
                 body: bytes.clone(),
+                timing: None,
                 url_list: urls
                     .into_iter()
                     .map(|u| url::Url::parse(u).unwrap())
@@ -9486,14 +10972,15 @@ mod tests {
             assert!(fetch.clone().now_or_never().is_some());
             cache.seed_pending(url, fetch);
         }
-        let result = string_value(
+        eval(
             &mut engine,
-            r#"(()=>{
+            r#"globalThis.canvasOriginResult = 'pending'; (async()=>{
             function check(v,m){if(!v)throw Error(m);}
             function security(f){try{f();}catch(e){check(e.name==='SecurityError','wrong error '+e);return;}throw Error('taint missing');}
+            function load(src) { return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=src;}); }
             for(const name of ['same','cross','redirect','unknown']) {
                 const c=document.createElement('canvas');c.width=2;c.height=2;const x=c.getContext('2d');
-                const img=new Image();img.src=(name==='cross'?'https://other.example/':'https://canvas.example/')+name;
+                const img=await load((name==='cross'?'https://other.example/':'https://canvas.example/')+name);
                 x.drawImage(img,0,0);
                 if(name==='same'){check(x.getImageData(0,0,1,1).data[0]===255,'same-origin pixels');continue;}
                 security(()=>x.getImageData(0,0,1,1));security(()=>c.toDataURL());
@@ -9502,11 +10989,33 @@ mod tests {
                 c.width=2;check(x.getImageData(0,0,1,1).data[3]===0,'resize restores clean bitmap');
             }
             const base=document.createElement('base');base.href='https://other.example/';document.head.appendChild(base);
-            const c=document.createElement('canvas'),x=c.getContext('2d'),img=new Image();img.src='https://other.example/cross';x.drawImage(img,0,0);security(()=>c.toDataURL());
+            const c=document.createElement('canvas'),x=c.getContext('2d'),img=await load('https://other.example/cross');x.drawImage(img,0,0);security(()=>c.toDataURL());
             return 'canvas-origin-clean-ok';
-        })()"#,
+        })().then(result=>{canvasOriginResult=result}, error=>{canvasOriginResult=String(error)})"#,
+            "canvas image taint checks",
+        ).unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..5 {
+            let task = runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(5), rx.recv()).await })
+                .unwrap()
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+            for _ in 0..4 {
+                eval(
+                    &mut engine,
+                    "__trust.tickTo(__trust.now()+50)",
+                    "image taint tasks",
+                )
+                .unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+        }
+        assert_eq!(
+            string_value(&mut engine, "canvasOriginResult"),
+            "canvas-origin-clean-ok"
         );
-        assert_eq!(result, "canvas-origin-clean-ok");
         cache.cancel();
     }
 
@@ -9953,6 +11462,333 @@ mod tests {
         for _ in 0..3 {
             run_microtask_checkpoint(engine);
             engine.ctx().collect_garbage_for_host();
+        }
+    }
+
+    fn cached_wasm_functions(engine: &mut lumen::Engine) -> usize {
+        engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .wasm
+            .cached_functions()
+    }
+
+    #[test]
+    fn webassembly_sibling_exports_keep_identity_then_collect_together() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (func $f (export "f") (param i32) (result i32) local.get 0)
+                    (elem declare func $f)
+                    (func (export "again") (result funcref) ref.func $f))
+            "#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                let again;
+                (() => {
+                    const e = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports;
+                    e.f.marker = 'original';
+                    e.f.cycle = e;
+                    again = e.again;
+                })();
+            "#,
+                "sibling-only WASM reachability",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "again().marker + ':' + again().length + ':' + again()(42)"
+                ),
+                "original:1:42",
+                "{tier:?}"
+            );
+            assert_eq!(cached_wasm_functions(&mut engine), 2);
+            eval(&mut engine, "again = null", "release WASM function group").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                cached_wasm_functions(&mut engine),
+                0,
+                "{tier:?}: unreachable group"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_native_reference_containers_keep_wrapper_identity() {
+        // Exercise core-written, UNEXPORTED state, not just JS Table.set / Global.value.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (table 1 funcref)
+                    (global $held (mut funcref) (ref.null func))
+                    (func (export "save") (param funcref)
+                        i32.const 0 local.get 0 table.set
+                        local.get 0 global.set $held)
+                    (func (export "fromTable") (result funcref) i32.const 0 table.get)
+                    (func (export "fromGlobal") (result funcref) global.get $held)
+                    (func (export "clearTable") i32.const 0 ref.null func table.set)
+                    (func (export "clearGlobal") ref.null func global.set $held))
+            "#,
+            );
+            eval(&mut engine,
+                "const keeper = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports;",
+                "private WASM reference containers").unwrap();
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (func (export "f") (param i32) (result i32) local.get 0))
+            "#,
+            );
+            eval(&mut engine, r#"
+                (() => {
+                    const f = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports.f;
+                    f.marker = 'native-held';
+                    keeper.save(f);
+                })();
+            "#, "core table/global writes").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                [keeper.fromTable() === keeper.fromGlobal(), keeper.fromTable().marker,
+                    keeper.fromGlobal().length, keeper.fromTable()(42)].join(':')
+            "#
+                ),
+                "true:native-held:1:42",
+                "{tier:?}"
+            );
+            assert_eq!(cached_wasm_functions(&mut engine), 6);
+            eval(
+                &mut engine,
+                "keeper.clearGlobal()",
+                "leave only native table reference",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "keeper.fromTable().marker"),
+                "native-held"
+            );
+            eval(
+                &mut engine,
+                "keeper.save(keeper.fromTable()); keeper.clearTable()",
+                "leave only native global reference",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "keeper.fromGlobal().marker"),
+                "native-held"
+            );
+            eval(&mut engine, "keeper.clearGlobal()", "clear native funcrefs").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                cached_wasm_functions(&mut engine),
+                5,
+                "{tier:?}: cleared foreign function"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_callback_gc_preserves_active_operands_and_reexports() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.define_global("collectDuringWasm", 0, |ctx, _, _| {
+                ctx.collect_garbage_for_host();
+                Ok(Value::Undefined)
+            });
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (func (export "f") (param i32) (result i32) local.get 0))
+            "#,
+            );
+            eval(&mut engine, r#"
+                let original = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports.f;
+                original.marker = 'before-gc';
+            "#, "original exported function").unwrap();
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (import "env" "f" (func $f (param i32) (result i32)))
+                    (import "env" "gc" (func $gc))
+                    (elem declare func $f)
+                    (func (export "recover") (result funcref)
+                        ref.func $f call $gc))
+            "#,
+            );
+            eval(&mut engine, r#"
+                let recover = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                    env: { get f() { const f = original; original = null; return f; }, gc: collectDuringWasm }
+                }).exports.recover;
+            "#, "import-getter lifetime and Wasm operand GC").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "recover().marker + ':' + recover().length + ':' + recover()(42)"
+                ),
+                "before-gc:1:42",
+                "{tier:?}"
+            );
+            eval(&mut engine, "recover = null", "release re-export graph").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(cached_wasm_functions(&mut engine), 0, "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn webassembly_settled_instantiation_jobs_release_wrappers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (func (export "f") (result i32) i32.const 42))
+            "#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                const module = new WebAssembly.Module(wasmFixture);
+                let answers = 0;
+                async function exercise() {
+                    for (let i = 0; i < 64; ++i) {
+                        const a = await WebAssembly.instantiate(module);
+                        const b = await WebAssembly.instantiate(wasmFixture);
+                        answers += a.exports.f() + b.instance.exports.f();
+                    }
+                }
+                exercise();
+            "#,
+                "settled instantiation promises",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(string_value(&mut engine, "answers"), "5376", "{tier:?}");
+            assert_eq!(cached_wasm_functions(&mut engine), 0, "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn webassembly_live_import_does_not_retain_discarded_importers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (func (export "f") (result i32) i32.const 42))
+            "#,
+            );
+            eval(&mut engine,
+                "const shared = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports.f;",
+                "long-lived Wasm import").unwrap();
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (import "env" "f" (func $f (result i32)))
+                    (func (export "call") (result i32) call $f))
+            "#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                const importer = new WebAssembly.Module(wasmFixture);
+                let answer = 0;
+                for (let i = 0; i < 256; ++i)
+                    answer += new WebAssembly.Instance(importer, {env: {f: shared}}).exports.call();
+            "#,
+                "throwaway importers",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "answer + ':' + shared()"),
+                "10752:42"
+            );
+            assert_eq!(
+                cached_wasm_functions(&mut engine),
+                1,
+                "{tier:?}: backwards ownership edge"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_native_only_escaped_function_retains_imported_wrapper() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module (func (export "f") (result i32) i32.const 42))
+            "#,
+            );
+            eval(&mut engine, r#"
+                let original = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports.f;
+                original.marker = 'escaped-dependency';
+                const table = new WebAssembly.Table({element: 'anyfunc', initial: 1});
+            "#, "Wasm function dependency").unwrap();
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (import "env" "f" (func $f (result i32)))
+                    (import "env" "table" (table 1 funcref))
+                    (func $recover (result funcref) ref.func $f)
+                    (elem declare func $f)
+                    (elem (i32.const 0) $recover)
+                    (func $start unreachable)
+                    (start $start))
+            "#,
+            );
+            eval(&mut engine, r#"
+                try { new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {env: {f: original, table}}); }
+                catch (e) { if (!(e instanceof WebAssembly.RuntimeError)) throw e; }
+                original = null;
+            "#, "native-only escape from trapping start").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(
+                cached_wasm_functions(&mut engine),
+                1,
+                "{tier:?}: dependency survives before table.get"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "table.get(0)().marker + ':' + table.get(0)()()"
+                ),
+                "escaped-dependency:42",
+                "{tier:?}"
+            );
+            eval(
+                &mut engine,
+                "table.set(0, null)",
+                "release escaped dependency",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            assert_eq!(cached_wasm_functions(&mut engine), 0, "{tier:?}");
         }
     }
 
@@ -10433,10 +12269,16 @@ mod tests {
     }
 
     fn check_wasm_trap_retention(fresh_instance: bool, asynchronous: bool) {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            check_wasm_trap_retention_in_tier(fresh_instance, asynchronous, tier);
+        }
+    }
+
+    fn check_wasm_trap_retention_in_tier(fresh_instance: bool, asynchronous: bool, tier: Tier) {
         // Separate settled async-job retention from fresh-instance/cache retention. This is
         // a synthetic bounded diagnostic, not a reproduction of the live Neocities failure.
         let mut engine = platform_engine();
-        engine.set_tier(Tier::Bytecode);
+        engine.set_tier(tier);
         let module = wat::parse_str(
             r#"
             (module
@@ -10500,6 +12342,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("release async trap results"));
         collect_wasm_test_garbage(&mut engine);
         let before = engine.ctx().live_object_count();
+        let cache_before = cached_wasm_functions(&mut engine);
 
         for _ in 0..8 {
             eval(
@@ -10512,10 +12355,15 @@ mod tests {
         }
         let settled = engine.ctx().live_object_count();
         eprintln!(
-            "WASM retention: fresh_instance={fresh_instance} async={asynchronous} baseline={before} final={settled}"
+            "WASM retention: tier={tier:?} fresh_instance={fresh_instance} async={asynchronous} baseline={before} final={settled}"
+        );
+        assert_eq!(
+            cached_wasm_functions(&mut engine),
+            cache_before,
+            "{tier:?}: cache grew"
         );
         assert!(
-            settled < before + 512,
+            settled < before + 64,
             "WASM operations retained objects: fresh_instance={fresh_instance} async={asynchronous} baseline {before}, final {settled}"
         );
     }
@@ -10585,7 +12433,8 @@ mod tests {
         let page = url::Url::parse(DEFAULT_URL).unwrap();
         let response_url = page.join("api").unwrap();
         let cache = Arc::new(crate::http::PageCache::default());
-        cache.seed_with_headers(
+        seed_direct_response_headers(
+            &cache,
             response_url.to_string(),
             206,
             String::from("application/octet-stream"),
@@ -10657,6 +12506,382 @@ mod tests {
         );
     }
 
+    // A synthetic direct response has known redirect provenance, just like a
+    // completed HTTP request. Unknown-provenance raw cache entries must not
+    // satisfy script Fetch's CORS boundary.
+    #[test]
+    fn detached_image_requests_decode_deliver_trusted_events_and_preserve_canvas_taint() {
+        // HTML §§4.8.4.3.1, .3.5: visibility is not a prerequisite for loading.
+        // Canvas §4.12.5.1.16: opaque no-CORS pixels remain un-readable.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        // A small image with an unambiguous red pixel, generated by our encoder.
+        let mut canvas = crate::canvas::Canvas::new(2, 1, true).unwrap();
+        canvas.state.fill = [1., 0., 0., 1.];
+        canvas.rectangle("fillRect", &[0., 0., 2., 1.]);
+        let data_url = canvas.data_url();
+        let bytes = crate::img::decode_data_url(&data_url).unwrap();
+        seed_direct_response(
+            &cache,
+            page.join("pixel.png").unwrap().to_string(),
+            200,
+            "image/png".into(),
+            bytes.clone(),
+        );
+        seed_direct_response(
+            &cache,
+            "https://opaque.example.test/pixel.png".into(),
+            200,
+            "image/png".into(),
+            bytes,
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, DEFAULT_URL);
+        eval(&mut engine, r#"
+            globalThis.imageResults = [];
+            globalThis.exposedImagePixels = 0;
+            const savedImageThen = Promise.prototype.then;
+            Promise.prototype.then = function (resolve, reject) {
+                return Reflect.apply(savedImageThen, this, [function (value) {
+                    if (value && value[2] instanceof Uint8Array) exposedImagePixels++;
+                    return resolve ? resolve(value) : value;
+                }, reject]);
+            };
+            Array.prototype.then = function (resolve) {
+                if (this[2] instanceof Uint8Array) exposedImagePixels++;
+                resolve(undefined);
+            };
+            globalThis.goodImage = new Image();
+            globalThis.opaqueImage = new Image();
+            globalThis.brokenImage = new Image();
+            function watchImage(image, label) {
+                image.onload = function (event) {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 2; canvas.height = 1;
+                    const context = canvas.getContext('2d');
+                    context.drawImage(image, 0, 0);
+                    let result;
+                    try { result = context.getImageData(0, 0, 1, 1).data[0]; }
+                    catch (error) { result = error.name; }
+                    imageResults.push([label, image.complete, image.naturalWidth, image.naturalHeight,
+                        image.width, image.height, image.isConnected, event.isTrusted, result].join(':'));
+                };
+            }
+            watchImage(goodImage, 'good'); watchImage(opaqueImage, 'opaque');
+            goodImage.src = '/superseded.png'; goodImage.src = '/pixel.png';
+            opaqueImage.src = 'https://opaque.example.test/pixel.png';
+            brokenImage.onerror = function (event) {
+                imageResults.push('broken:' + brokenImage.complete + ':' + brokenImage.naturalWidth + ':' + event.isTrusted);
+            };
+            brokenImage.src = 'data:image/png,invalid';
+            globalThis.initialImageState = [goodImage.complete, goodImage.naturalWidth, imageResults.length].join(':');
+        "#, "detached image requests").unwrap();
+        assert_eq!(string_value(&mut engine, "initialImageState"), "false:0:0");
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .network
+                .as_ref()
+                .unwrap()
+                .pending_fetches
+                .len(),
+            2,
+            "successive src assignments must coalesce"
+        );
+        for _ in 0..2 {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), task_rx.recv()).await
+                })
+                .unwrap()
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        for _ in 0..8 {
+            eval(
+                &mut engine,
+                "__trust.tickTo(__trust.now() + 100)",
+                "image element tasks",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "imageResults.sort().join('|')"),
+            "broken:true:0:true|good:true:2:1:2:1:false:true:255|opaque:true:2:1:2:1:false:true:SecurityError"
+        );
+        assert_eq!(
+            string_value(&mut engine, "typeof __image_binding"),
+            "undefined"
+        );
+        assert_eq!(
+            string_value(&mut engine, "exposedImagePixels"),
+            "0",
+            "author Promise/Array prototypes must not receive opaque pixel buffers"
+        );
+        // A later failure replaces the former current image and its pixels.
+        eval(
+            &mut engine,
+            "goodImage.onload = null; goodImage.src = 'data:image/png,broken';",
+            "replace image",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        eval(
+            &mut engine,
+            "__trust.tickTo(__trust.now() + 100)",
+            "replace image task",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[goodImage.complete,goodImage.naturalWidth].join(':')"
+            ),
+            "true:0"
+        );
+    }
+
+    #[test]
+    fn detached_image_cors_requests_do_not_reuse_opaque_cache_authority() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let page_url = "http://127.0.0.1:1/embedding/page";
+        let page = url::Url::parse(page_url).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let mut canvas = crate::canvas::Canvas::new(1, 1, true).unwrap();
+        let bytes = crate::img::decode_data_url(&canvas.data_url()).unwrap();
+        seed_direct_response(
+            &cache,
+            format!("{base}/denied"),
+            200,
+            "image/png".into(),
+            bytes.clone(),
+        );
+        let server = runtime.spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 2048];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 { break; }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let allow = if request.starts_with("GET /denied ") { "" }
+                    else { "Access-Control-Allow-Origin: *\r\n" };
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n{allow}Connection: close\r\n\r\n", bytes.len());
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(&bytes).await.unwrap();
+                requests.push(request.to_ascii_lowercase());
+            }
+            requests
+        });
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, page_url);
+        eval(&mut engine, &format!(r#"
+            globalThis.corsImageResults = [];
+            for (const [path, mode] of [['allowed','anonymous'],['denied','anonymous'],['credentials','use-credentials']]) {{
+                const image = new Image(); image.crossOrigin = mode;
+                image.referrerPolicy = 'no-referrer';
+                image.onload = function () {{
+                    const canvas = document.createElement('canvas'), context = canvas.getContext('2d');
+                    context.drawImage(image,0,0);
+                    context.getImageData(0,0,1,1);
+                    corsImageResults.push(path + ':load');
+                }};
+                image.onerror = function () {{ corsImageResults.push(path + ':error'); }};
+                image.src = {base:?} + '/' + path;
+            }}
+        "#), "potential-CORS image requests").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), task_rx.recv()).await
+                })
+                .unwrap()
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        for _ in 0..6 {
+            eval(
+                &mut engine,
+                "__trust.tickTo(__trust.now()+50)",
+                "CORS image tasks",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "corsImageResults.sort().join('|')"),
+            "allowed:load|credentials:error|denied:error"
+        );
+        let requests = runtime.block_on(server).unwrap();
+        for request in requests {
+            assert!(
+                request.contains("origin: http://127.0.0.1:1\r\n"),
+                "correct request client"
+            );
+            assert!(request.contains("sec-fetch-dest: image\r\n"));
+            assert!(request.contains("sec-fetch-mode: cors\r\n"));
+            assert!(!request.contains("referer:"), "element referrer policy");
+        }
+    }
+
+    fn seed_direct_response(
+        cache: &crate::http::PageCache,
+        url: String,
+        status: u16,
+        content_type: String,
+        body: Vec<u8>,
+    ) {
+        seed_direct_response_headers(cache, url, status, content_type, Vec::new(), body);
+    }
+
+    fn seed_direct_response_headers(
+        cache: &crate::http::PageCache,
+        url: String,
+        status: u16,
+        content_type: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) {
+        use futures::FutureExt as _;
+        let response = Arc::new(crate::http::CachedResp {
+            status,
+            content_type,
+            body,
+            headers,
+            url_list: vec![url::Url::parse(&url).unwrap()],
+            timing: None,
+        });
+        let fetch = futures::future::ready(Ok(response)).boxed().shared();
+        assert!(fetch.clone().now_or_never().is_some());
+        cache.seed_pending(url, fetch);
+    }
+
+    #[test]
+    fn cross_origin_window_fetch_uses_its_own_client_settings() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        seed_direct_response(
+            &cache,
+            "https://widget.example.test/api".into(),
+            200,
+            "text/plain".into(),
+            b"child response".to_vec(),
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            url::Url::parse(DEFAULT_URL).unwrap(),
+            runtime.handle().clone(),
+            cache,
+            task_tx,
+        );
+        let mut engine = configured_engine(state, DEFAULT_URL);
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            // Exercise the same UA Realm-creation boundary as frame navigation,
+            // without needing a live external document server in this unit test.
+            const context = __dom_allocate_job_context();
+            globalThis.foreign = __dom_create_window_realm(context, frame.__id,
+                'https://widget.example.test/widget', __trust_cfg, window, window, frame, 0, '');
+            foreign.eval("globalThis.result='pending'; fetch('/api',{mode:'same-origin'})" +
+                ".then(r=>r.text()).then(t=>globalThis.result=t,e=>globalThis.result=e.name)");
+        "#,
+            "foreign Window fetch",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        let task = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await })
+            .expect("own-origin child fetch must reach networking")
+            .unwrap();
+        dispatch_host_task(&mut engine, task).unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "foreign.result"),
+            "child response"
+        );
+        let client = url::Url::parse("https://widget.example.test/widget").unwrap();
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        let (_, _, request) = prepare_client_request(
+            state,
+            &client,
+            "/post",
+            "POST".into(),
+            None,
+            Vec::new(),
+            Some((
+                crate::http::RequestMode::Cors,
+                crate::http::CredentialsMode::SameOrigin,
+            )),
+        )
+        .unwrap();
+        assert_eq!(request.fetch_policy.unwrap().origin, client);
+        assert!(
+            prepare_client_request(
+                state,
+                &client,
+                DEFAULT_URL,
+                "GET".into(),
+                None,
+                Vec::new(),
+                Some((
+                    crate::http::RequestMode::SameOrigin,
+                    crate::http::CredentialsMode::SameOrigin
+                ))
+            )
+            .is_none(),
+            "own-origin mode must still reject the embedding page's origin"
+        );
+    }
+
     #[test]
     fn iframe_fetch_reactions_run_with_their_relevant_window() {
         // ECMA-262 NewPromiseReactionJob associates a job with its handler's Realm. HTML
@@ -10672,7 +12897,8 @@ mod tests {
         let page = url::Url::parse(DEFAULT_URL).unwrap();
         let response_url = page.join("api").unwrap();
         let cache = Arc::new(crate::http::PageCache::default());
-        cache.seed(
+        seed_direct_response(
+            &cache,
             response_url.to_string(),
             200,
             String::from("text/plain"),
@@ -10848,6 +13074,127 @@ mod tests {
     }
 
     #[test]
+    fn iframe_workers_deliver_to_their_owner_realm_and_stop_on_navigation() {
+        // HTML Worker construction creates its outside port in outsideSettings'
+        // Realm. Deserialization and both message/error dispatch belong there.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let page = url::Url::parse(DEFAULT_URL).unwrap();
+            let cache = Arc::new(crate::http::PageCache::default());
+            let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let clock = Rc::new(RealmClock::new());
+            let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+            state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+            let mut engine = configured_engine(state, page.as_str());
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                globalThis.workerFrame = document.createElement('iframe');
+                workerFrame.srcdoc = '<body>worker owner</body>';
+                body.appendChild(workerFrame);
+                __trust.hydrateFrames();
+                globalThis.ownerWindow = workerFrame.contentWindow;
+                ownerWindow.eval(`
+                    globalThis.messageResult = '', errorResult = '';
+                    globalThis.echo = new Worker(URL.createObjectURL(new Blob([
+                        'onmessage = e => postMessage({array:[e.data], date:new Date(123)});'
+                    ], {type:'text/javascript'})));
+                    echo.onmessage = event => {
+                        messageResult = [event.isTrusted, event.target === echo,
+                            event instanceof MessageEvent, event.data.array instanceof Array,
+                            event.data.date instanceof Date, +event.data.date,
+                            event.data.array[0], event.origin === ''].join('|');
+                    };
+                    echo.postMessage(42);
+                    globalThis.broken = new Worker('data:text/javascript,throw%20new%20Error(%22worker%20failure%22)');
+                    broken.onerror = event => {
+                        event.preventDefault();
+                        errorResult = [event.isTrusted, event.target === broken,
+                            event instanceof ErrorEvent, event.message.includes('worker failure')].join('|');
+                    };
+                `);
+            "#, "nested worker setup").unwrap();
+            for _ in 0..8 {
+                if string_value(
+                    &mut engine,
+                    "String(!!ownerWindow.messageResult && !!ownerWindow.errorResult)",
+                ) == "true"
+                {
+                    break;
+                }
+                let task = runtime
+                    .block_on(async {
+                        tokio::time::timeout(Duration::from_secs(15), task_rx.recv()).await
+                    })
+                    .expect("nested worker reply deadline")
+                    .expect("worker task channel");
+                dispatch_host_task(&mut engine, task).unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(&mut engine, "ownerWindow.messageResult"),
+                "true|true|true|true|true|123|42|true",
+                "{tier:?}"
+            );
+            assert_eq!(
+                string_value(&mut engine, "ownerWindow.errorResult"),
+                "true|true|true|true",
+                "{tier:?}"
+            );
+            let worker_id = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .workers
+                .as_ref()
+                .unwrap()
+                .workers
+                .keys()
+                .copied()
+                .next()
+                .unwrap();
+            eval(
+                &mut engine,
+                r#"
+                workerFrame.srcdoc = '<body>replacement</body>';
+                __trust.hydrateFrames();
+            "#,
+                "replace worker owner",
+            )
+            .unwrap();
+            assert!(
+                engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .workers
+                    .as_ref()
+                    .unwrap()
+                    .workers
+                    .is_empty()
+            );
+            dispatch_host_task(
+                &mut engine,
+                LumenHostTask::Worker {
+                    id: worker_id,
+                    event: crate::js::WorkerOut::Error("stale".into()),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "ownerWindow.errorResult"),
+                "true|true|true|true"
+            );
+        }
+    }
+
+    #[test]
     fn workers_use_lumen_realms_and_preserve_task_microtask_order() {
         // HTML §10.2.4/§10.2.6 and §8.1.7: each Worker gets a distinct dedicated agent;
         // incoming port messages and timers are tasks with a microtask checkpoint between them.
@@ -10875,10 +13222,12 @@ mod tests {
             addEventListener('message', function (event) { workerOrder.push('listener'); });
             onmessage = function (event) {
                 workerOrder.push('handler');
+                var receivedAnswer = new WebAssembly.Instance(event.data.module).exports.answer();
                 setTimeout(function () {
                     postMessage({ kind: 'timer1', cycle: event.data === event.data.self,
                         workerOrder: workerOrder.join(','), trusted: event.isTrusted,
-                        origin: event.origin, workerName: self.name, wasm: workerWasm });
+                        origin: event.origin, workerName: self.name, wasm: workerWasm,
+                        receivedAnswer: receivedAnswer, module: event.data.module });
                     Promise.resolve().then(function () { postMessage({ kind: 'micro' }); });
                 }, 0);
                 setTimeout(function () { postMessage({ kind: 'timer2' }); }, 0);
@@ -10928,7 +13277,10 @@ mod tests {
                     if (event.data.kind === 'timer1') globalThis.timer1 = event.data;
                 }};
                 classicWorker.onerror = function () {{ workerErrors++; }};
-                var cyclic = {{ value: 41 }}; cyclic.self = cyclic;
+                var cyclic = {{ value: 41, module: new WebAssembly.Module(new Uint8Array([
+                    0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,10,1,6,
+                    97,110,115,119,101,114,0,0,10,6,1,4,0,65,42,11
+                ])) }}; cyclic.self = cyclic;
                 classicWorker.postMessage(cyclic);
 
                 globalThis.moduleWorker = new Worker({module_url}, {{ type: 'module' }});
@@ -10964,6 +13316,13 @@ mod tests {
         }
 
         let log = string_value(&mut engine, "workerLog.join('|')");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[timer1.receivedAnswer, timer1.module instanceof WebAssembly.Module, new WebAssembly.Instance(timer1.module).exports.answer()].join('|')"
+            ),
+            "42|true|42"
+        );
         assert!(
             log.starts_with("bad-url:SyntaxError|bad-type:TypeError"),
             "{log}"
@@ -11335,6 +13694,50 @@ mod tests {
                 .map(|state| state.pending_resources),
             Some(0)
         );
+    }
+
+    #[test]
+    fn iframe_stylesheet_sweep_does_not_switch_embedding_window_globals() {
+        // HTML's browsing-context creation assigns an independent Window
+        // Realm. A resource sweep must not temporarily turn the embedding
+        // global into the child's Window, even while calling author accessors.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"
+                    (function () {
+                        const html = document.createElement('html'), body = document.createElement('body');
+                        document.appendChild(html); html.appendChild(body);
+                        const parentDocument = document, observed = [];
+                        const request = requestAnimationFrame;
+                        Object.defineProperty(globalThis, 'frameElement', { value: 'parent-owned' });
+                        Object.defineProperty(globalThis, 'lockedParentValue', { value: 73 });
+                        Object.defineProperty(globalThis, 'requestAnimationFrame', {
+                            configurable: true,
+                            get() { observed.push(document === parentDocument); return request; },
+                            set(value) {}
+                        });
+                        const frame = document.createElement('iframe');
+                        frame.srcdoc = '<body><p>child</p></body>';
+                        body.appendChild(frame); __trust.hydrateFrames();
+                        if (!observed.every(Boolean)) throw Error('parent accessor observed the child Document');
+                        if (document !== parentDocument || frameElement !== 'parent-owned' || lockedParentValue !== 73)
+                            throw Error('parent global was changed');
+                        const child = frame.contentWindow;
+                        if (child.document === parentDocument || child.frameElement !== frame ||
+                            Object.hasOwn(child, 'lockedParentValue')) throw Error('child global was contaminated');
+                        return 'stylesheet-sweep-globals-ok';
+                    })()
+                    "##
+                ),
+                "stylesheet-sweep-globals-ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
@@ -11979,8 +14382,8 @@ mod tests {
                 boxEvents.push(`click:${box.checked}:${box.indeterminate}`);
                 box.click(); // The click-in-progress flag suppresses recursion.
             });
-            box.addEventListener("input", event => boxEvents.push(`input:${box.checked}:${event.composed}`));
-            box.addEventListener("change", () => boxEvents.push(`change:${box.checked}`));
+            box.addEventListener("input", event => boxEvents.push(`input:${box.checked}:${event.composed}:${event.isTrusted}`));
+            box.addEventListener("change", event => boxEvents.push(`change:${box.checked}:${event.isTrusted}`));
             box.click();
 
             const canceled = document.createElement("input");
@@ -12030,7 +14433,7 @@ mod tests {
 
         assert_eq!(
             string_value(&mut engine, "inputClickActivationResult"),
-            "click:true:false,input:true:true,change:true|true|false|click:false:false|true|true|click:false:true,input,change|false|true|0|false"
+            "click:true:false,input:true:true:true,change:true:true|true|false|click:false:false|true|true|click:false:true,input,change|false|true|0|false"
         );
     }
 
@@ -12580,6 +14983,353 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "marqueeResult"),
             "true|right|9|20|3|true|false|true"
+        );
+    }
+
+    #[test]
+    fn frame_storage_maps_follow_the_owning_origin_not_the_top_page() {
+        // HTML #the-localstorage-attribute / #the-sessionstorage-attribute;
+        // Storage #storage-keys: separate origin-keyed maps, including retained
+        // API objects used from another Window. No external requests.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            function storageRealm(url) {
+                const frame = document.createElement('iframe'); body.appendChild(frame);
+                frame.__contentDoc = undefined;
+                const context = __dom_allocate_job_context();
+                return __dom_create_window_realm(context, frame.__id, url,
+                    __trust_cfg, window, window, frame, 0, '');
+            }
+            globalThis.storageForeign = storageRealm('https://storage-child.example.test/a');
+            globalThis.storagePeer = storageRealm('https://storage-child.example.test/b');
+            globalThis.storagePort = storageRealm('https://storage-child.example.test:8443/a');
+            globalThis.storageScheme = storageRealm('http://storage-child.example.test/a');
+            const results = [];
+            for (const kind of ['localStorage', 'sessionStorage']) {
+                const top = window[kind], child = storageForeign[kind];
+                top.clear(); child.clear(); storagePort[kind].clear(); storageScheme[kind].clear();
+                top.setItem('marker', 'top'); child.setItem('marker', 'child');
+                results.push(top.getItem('marker'), child.getItem('marker'),
+                    storagePeer[kind].getItem('marker'), storagePort[kind].getItem('marker') === null,
+                    storageScheme[kind].getItem('marker') === null, child === storageForeign[kind]);
+                storagePeer[kind].setItem('peer', 'shared');
+                results.push(child.length, child.getItem('peer'), top.length);
+                child.removeItem('marker');
+                results.push(top.getItem('marker'), storagePeer[kind].getItem('marker') === null);
+                child.clear(); results.push(top.length, storagePeer[kind].length);
+            }
+            globalThis.frameStorageOriginResult = results.join('|');
+        "#, "frame storage origins").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameStorageOriginResult"),
+            "top|child|child|true|true|true|2|shared|1|top|true|1|0|top|child|child|true|true|true|2|shared|1|top|true|1|0"
+        );
+    }
+
+    #[test]
+    fn frame_storage_inherits_blank_origins_and_rejects_opaque_documents() {
+        // Storage #obtain-a-storage-key rejects opaque origins before exposing
+        // a Storage object. HTML initial about:blank inherits its creator's
+        // origin, rather than using the URL's serialized "null" origin.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            // Ordinary navigation clears the old Document before bootstrapping
+            // its replacement Realm. Reproduce that UA boundary in this test.
+            frame.__contentDoc = undefined;
+            const context = __dom_allocate_job_context();
+            const child = __dom_create_window_realm(context, frame.__id,
+                'https://storage-inherit.example.test/a', __trust_cfg, window, window, frame, 0, '');
+            // Mirror the UA publication step used by createFrameWindowRealm.
+            // Otherwise the arena still associates descendants with the old
+            // initial about:blank Window created when the frame was inserted.
+            frame.__frameUrl = 'https://storage-inherit.example.test/a';
+            frame.__contentRealmWindow = child;
+            frame.__contentDoc = child.document;
+            child.eval(`
+                localStorage.setItem('marker', 'nested');
+                sessionStorage.setItem('marker', 'session-nested');
+                const nested = document.createElement('iframe'); document.body.appendChild(nested);
+                globalThis.inheritedStorageDiagnostic = [location.href, document.URL,
+                    document.body.ownerDocument.URL, nested.ownerDocument.URL,
+                    nested.contentWindow.parent === window,
+                    nested.contentWindow.eval('location.href + ";" + parent.location.href')].join('|');
+                globalThis.inheritedStorageResult = [nested.contentWindow.localStorage.getItem('marker'),
+                    nested.contentWindow.sessionStorage.getItem('marker')].join('|');
+            `);
+            const opaqueFrame = document.createElement('iframe'); body.appendChild(opaqueFrame);
+            opaqueFrame.__contentDoc = undefined;
+            const opaqueContext = __dom_allocate_job_context();
+            const opaque = __dom_create_window_realm(opaqueContext, opaqueFrame.__id,
+                'data:text/html,', __trust_cfg, window, window, opaqueFrame, 0, '');
+            opaque.eval(`
+                globalThis.opaqueStorageResult = ['localStorage', 'sessionStorage'].map(kind => {
+                    try { globalThis[kind]; return 'exposed'; }
+                    catch (e) { return e.name + ':' + (e instanceof DOMException); }
+                }).join('|');
+            `);
+            globalThis.frameStorageSecurityResult = child.inheritedStorageResult + '|' + opaque.opaqueStorageResult;
+            globalThis.frameStorageDiagnostic = child.inheritedStorageDiagnostic;
+        "#, "frame storage origin inheritance").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "frameStorageSecurityResult"),
+            "nested|session-nested|SecurityError:true|SecurityError:true",
+            "{}",
+            string_value(&mut engine, "frameStorageDiagnostic")
+        );
+    }
+
+    #[test]
+    fn storage_maps_are_not_rekeyed_by_document_base_or_retired_host_context() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            frame.__contentDoc = undefined;
+            globalThis.storageContext = __dom_allocate_job_context();
+            const child = __dom_create_window_realm(storageContext, frame.__id,
+                'https://storage-retained.example.test/a', __trust_cfg, window, window, frame, 0, '');
+            globalThis.retainedStorage = child.localStorage;
+            localStorage.setItem('marker', 'top'); retainedStorage.setItem('marker', 'retained');
+        "#, "retained frame storage setup").unwrap();
+        engine.ctx().host_mut::<HostState>().unwrap().base =
+            url::Url::parse("https://different-base.example.test/").unwrap();
+        eval(&mut engine, r#"
+            __dom_release_job_context(storageContext);
+            globalThis.retainedStorageResult = [localStorage.getItem('marker'),
+                retainedStorage.getItem('marker')].join('|');
+            retainedStorage.setItem('marker', 'changed');
+            retainedStorageResult += '|' + localStorage.getItem('marker') + '|' + retainedStorage.getItem('marker');
+        "#, "retained frame storage map identity").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "retainedStorageResult"),
+            "top|retained|top|changed"
+        );
+    }
+
+    #[test]
+    fn storage_apis_cache_and_indexed_db_isolate_origins_and_retain_owning_keys() {
+        // Storage #storage-keys, Service Workers #cache-interface and Indexed
+        // Database #database-concept: ALL native storage callers must bind the
+        // creating environment's origin, including caches and databases.
+        let storage = crate::js::WebStorage::default();
+        for (index, page, expected) in [
+            (0, "https://storage-owner.example.test/a", "||missing"),
+            (1, "https://storage-other.example.test/a", "||missing"),
+            (
+                2,
+                "https://storage-owner.example.test/b",
+                "shared|database|0",
+            ),
+            (3, "https://storage-owner.example.test:8443/a", "||missing"),
+        ] {
+            let mut state = HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            );
+            state.storage = storage.clone();
+            let mut engine = configured_engine(state, page);
+            // A later host base/settings change cannot re-key these objects.
+            engine.ctx().host_mut::<HostState>().unwrap().base =
+                url::Url::parse("https://unrelated-base.example.test/").unwrap();
+            eval(
+                &mut engine,
+                &format!(
+                    r#"
+                globalThis.result = 'pending';
+                (async () => {{
+                    const names = (await caches.keys()).join(',');
+                    const databases = (await indexedDB.databases()).map(x => x.name).join(',');
+                    const cache = await caches.open('shared');
+                    const url = 'https://storage-resource.example.test/item';
+                    const hit = await cache.match(url);
+                    const previous = hit ? await hit.text() : 'missing';
+                    await cache.put(url, new Response('{index}'));
+                    await new Promise((resolve, reject) => {{
+                        const request = indexedDB.open('database');
+                        request.onsuccess = () => {{ request.result.close(); resolve(); }};
+                        request.onerror = () => reject(request.error);
+                    }});
+                    result = [names, databases, previous].join('|');
+                }})().catch(e => result = 'ERROR:' + e.name + ':' + e.message);
+            "#
+                ),
+                "origin-keyed persistent API maps",
+            )
+            .unwrap();
+            for _ in 0..32 {
+                run_microtask_checkpoint(&mut engine);
+                if !engine_call_trust_method(&mut engine, "hasPlatformTask", &[])
+                    .is_ok_and(|value| engine.ctx().to_boolean(&value))
+                {
+                    break;
+                }
+                assert!(engine_call_trust_method(&mut engine, "runPlatformTask", &[]).is_ok());
+            }
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(string_value(&mut engine, "result"), expected, "{page}");
+        }
+        let storage = storage.lock().unwrap();
+        assert!(!storage.contains_key("cache-storage-names"));
+        assert!(!storage.contains_key("cache-storage-data"));
+        assert!(!storage.contains_key("indexed-database"));
+    }
+
+    #[test]
+    fn navigator_interfaces_follow_html_and_webidl() {
+        for worker in [false, true] {
+            for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                let mut engine = configured_engine_before_prelude(
+                    HostState::new(
+                        Rc::new(RefCell::new(Dom::new())),
+                        Rc::new(RealmClock::new()),
+                    ),
+                    DEFAULT_URL,
+                );
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                let prelude = if worker {
+                    crate::js::worker_prelude()
+                } else {
+                    crate::js::PRELUDE
+                };
+                eval(&mut engine, prelude, "Navigator environment").unwrap();
+                let value = eval_value(
+                    &mut engine,
+                    include_str!("fixtures/navigator_interfaces.mjs"),
+                    "Navigator interfaces",
+                )
+                .unwrap();
+                assert!(
+                    matches!(value,Value::Str(ref s) if s.as_ref()=="navigator-interfaces-ok"),
+                    "worker={worker} {tier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn navigator_interfaces_preserve_realms_and_window_security() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/navigator_realms.mjs"),
+                "Navigator Realm boundaries",
+            )
+            .unwrap();
+            assert!(
+                matches!(value,Value::Str(ref s) if s.as_ref()=="navigator-realms-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_query_does_not_advertise_unimplemented_powerful_features() {
+        for worker in [false, true] {
+            for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                let mut engine = configured_engine_before_prelude(
+                    HostState::new(
+                        Rc::new(RefCell::new(Dom::new())),
+                        Rc::new(RealmClock::new()),
+                    ),
+                    DEFAULT_URL,
+                );
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                let prelude = if worker {
+                    crate::js::worker_prelude()
+                } else {
+                    crate::js::PRELUDE
+                };
+                eval(&mut engine, prelude, "permission environment").unwrap();
+                eval(
+                    &mut engine,
+                    include_str!("fixtures/permissions_unsupported.mjs"),
+                    "unsupported permissions",
+                )
+                .unwrap();
+                run_microtask_checkpoint(&mut engine);
+                assert_eq!(
+                    string_value(&mut engine, "permissionResult"),
+                    "permissions-unsupported-ok",
+                    "worker={worker} {tier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn permissions_query_brands_cross_realms_and_checks_retired_documents() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame=document.createElement('iframe'); body.appendChild(frame);
+            const foreign=frame.contentWindow, permissions=foreign.navigator.permissions;
+            const getter=Object.getOwnPropertyDescriptor(Navigator.prototype,'permissions').get;
+            if (getter.call(foreign.navigator)!==permissions) throw Error('foreign Navigator getter');
+            let reads=0;
+            const borrow=Permissions.prototype.query.call(permissions,{get name(){reads++;return 'unsupported';}});
+            if (reads!==1) throw Error('cross-Realm Permissions not branded');
+            frame.remove();
+            let inactiveRead=false;
+            const inactive=permissions.query({get name(){inactiveRead=true;return 'unsupported';}});
+            const invalidObject=permissions.query(null);
+            globalThis.permissionRealmResult='pending';
+            Promise.all([borrow.catch(e=>e.name),inactive.catch(e=>e.name+':'+(e instanceof foreign.DOMException)),
+                invalidObject.catch(e=>e.name)]).then(values=> {
+                    permissionRealmResult=values.join('|')+'|'+inactiveRead;
+                });
+        "#, "permission Realm ownership").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "permissionRealmResult"),
+            "TypeError|InvalidStateError:true|TypeError|false"
+        );
+    }
+
+    #[test]
+    fn storage_apis_indexed_db_rejects_opaque_origin_at_the_operation_boundary() {
+        // Indexed Database #dom-idbfactory-open / -deletedatabase / -databases:
+        // open/delete throw synchronously, databases returns a rejected promise.
+        // Invalid version conversion precedes the storage-key security check.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "data:text/html,",
+        );
+        eval(
+            &mut engine,
+            r#"
+            const errors = [];
+            for (const op of [() => indexedDB.open('x', 0),
+                () => indexedDB.open('x'), () => indexedDB.deleteDatabase('x')]) {
+                try { op(); errors.push('allowed'); }
+                catch(e) { errors.push(e.name); }
+            }
+            globalThis.result = 'pending';
+            indexedDB.databases().then(() => result = 'allowed', e => {
+                result = errors.join('|') + '|' + e.name + '|' + (e instanceof DOMException);
+            });
+        "#,
+            "opaque database storage security",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "result"),
+            "TypeError|SecurityError|SecurityError|SecurityError|true"
         );
     }
 
@@ -14110,6 +16860,31 @@ mod tests {
     }
 
     #[test]
+    fn iframe_destruction_uses_internal_tree_operations() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), outerBody = document.createElement('body');
+            document.appendChild(html); html.appendChild(outerBody);
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const body = frame.contentDocument.body;
+            body.innerHTML = '<section><iframe></iframe></section>';
+            body.contains = undefined;
+            body.querySelectorAll = function () { throw Error('author query invoked by UA'); };
+            body.textContent = 'replaced';
+            globalThis.internalFrameRemoval = body.textContent;
+        "#,
+            "native frame destruction",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "internalFrameRemoval"),
+            "replaced"
+        );
+    }
+
+    #[test]
     fn iframe_cross_document_navigation_discards_old_timers() {
         // HTML §8.7 gives every WindowOrWorkerGlobalScope its own initially
         // empty timer-ID map. A replacement Window therefore neither runs the
@@ -14325,6 +17100,148 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "frameElementEventPathResult"),
             "1|1|1|0|0"
+        );
+    }
+
+    #[test]
+    fn mouse_coordinate_defaults_and_aliases_match_cssom_view() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/mouse_coordinates.mjs")),
+                "mouse-coordinates-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_event_bindings_and_native_metadata_follow_standards() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/pointer_events.mjs"),
+                "PointerEvent regression fixture",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "pointer-events-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_event_coalesced_method_is_secure_context_only() {
+        for (url, exposed) in [
+            ("https://example.org/", true),
+            ("http://127.0.0.1/", true),
+            ("http://example.org/", false),
+        ] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                url,
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "'getCoalescedEvents' in PointerEvent.prototype"
+                ),
+                exposed.to_string(),
+                "{url}"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "typeof new PointerEvent('x').getPredictedEvents"
+                ),
+                "function"
+            );
+        }
+    }
+
+    #[test]
+    fn native_frame_input_order_coordinates_focus_and_listener_discovery() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(&mut engine, include_str!("fixtures/native_frame_input.mjs")),
+            "native-frame-input-ok"
+        );
+    }
+
+    #[test]
+    fn iframe_geometry_uses_the_owning_document_viewport() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/frame_geometry.mjs")),
+                "frame-geometry-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_toggle_input_preserves_trust_coordinates_and_cancellation() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/native_toggle_input.mjs")
+                ),
+                "native-toggle-input-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iframe_native_click_enters_the_target_realm() {
+        // DOM dispatch uses the hit target's listener list, not a wrapper in
+        // the embedding Window. Exercise the same entry point as PageCmd::Click.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement('html');
+            const body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            let parentHits = 0;
+            document.addEventListener('click', () => parentHits++);
+            const frame = document.createElement('iframe');
+            frame.srcdoc = '<button id="target">go</button><script>' +
+                'let hits = [];' +
+                'document.getElementById("target").addEventListener("click", e => {' +
+                'hits.push(e.isTrusted, e instanceof MouseEvent, e.view === window,' +
+                'e.target === document.getElementById("target")); e.preventDefault(); });' +
+                'document.addEventListener("click", () => hits.push("document"));' +
+                'window.addEventListener("click", () => {' +
+                'hits.push("window"); document.body.setAttribute("data-hits", hits.join("|")); });' +
+                '<\/script>';
+            body.appendChild(frame); __trust.hydrateFrames();
+            const canceled = __trust.click(frame.contentDocument.getElementById('target').__id);
+            globalThis.nativeFrameClickResult = [canceled,
+                frame.contentDocument.body.getAttribute('data-hits'), parentHits].join('|');
+            "##,
+            "native iframe click",
+        ).unwrap();
+        assert_eq!(
+            string_value(&mut engine, "nativeFrameClickResult"),
+            "true|true|true|true|true|document|window|0"
         );
     }
 
@@ -14626,6 +17543,84 @@ mod tests {
             string_value(&mut engine, "synchronousQueryResult"),
             "true|true|true|true|true|100|100|100"
         );
+    }
+
+    #[test]
+    fn platform_function_reflection_keeps_implementation_and_author_sources_distinct() {
+        // Web IDL operation/interface objects and ECMA-262 Function.prototype.toString.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/platform_reflection.mjs")
+                ),
+                "platform-reflection-ok",
+                "{tier:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn worker_platform_reflection_keeps_author_sources_visible() {
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            (() => {
+                const platform = [Event, MessageEvent, URL, fetch, atob];
+                const opaque = platform.every(fn => /\{\s*\[native code\]\s*\}$/.test(fn.toString()));
+                const author = function author() { return 17; };
+                return [opaque, author.toString() === 'function author() { return 17; }', author()].join('|');
+            })()
+        "#
+            ),
+            "true|true|17"
+        );
+    }
+
+    #[test]
+    fn console_groups_counters_and_timers_follow_namespace_state() {
+        // WHATWG Console grouping/counting/timing and namespace prototype.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/console_state.mjs")),
+                "console-state-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decoder_supports_web_latin1_labels_and_all_byte_mappings() {
+        // Encoding §4.2, §7.2 and §9.1: all 17 labels select windows-1252,
+        // including C1 mappings that differ from byte-to-code-point Latin-1.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/text_decoder_legacy.mjs")
+                ),
+                "text-decoder-legacy-ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
@@ -14950,6 +17945,92 @@ mod tests {
             parent.style.setProperty('--base','green');
             if (style.getPropertyValue('--paint') !== 'green') throw Error('live inherited value');
         "#, "computed custom property inheritance").unwrap();
+    }
+
+    #[test]
+    fn computed_style_web_idl_bindings_accept_real_elements_across_realms() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let result = eval_value(
+                &mut engine,
+                include_str!("fixtures/computed_style_bindings.mjs"),
+                "computed style binding conformance",
+            )
+            .unwrap();
+            assert!(
+                matches!(result, Value::Str(ref s) if s.as_ref() == "computed-style-bindings-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn computed_style_exposes_initial_visibility_pointer_events_and_transform() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let result = eval_value(
+                &mut engine,
+                include_str!("fixtures/computed_style_initial_values.mjs"),
+                "computed style initial values",
+            )
+            .unwrap();
+            assert!(
+                matches!(result, Value::Str(ref s) if s.as_ref() == "computed-style-initial-values-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn computed_style_element_identity_is_weak_but_live_style_keeps_its_owner() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            (() => {
+                const element = document.createElement('div');
+                globalThis.styleOwnerWeak = new WeakRef(element);
+                globalThis.keptComputedStyle = getComputedStyle(element);
+            })();
+            (() => {
+                const transient = document.createElement('span');
+                globalThis.transientElementWeak = new WeakRef(transient);
+            })();
+        "#,
+            "computed style ownership",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.ctx().collect_garbage_for_host();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(styleOwnerWeak.deref() !== undefined && transientElementWeak.deref() === undefined)"
+            ),
+            "true"
+        );
+        eval(
+            &mut engine,
+            "keptComputedStyle = undefined",
+            "drop computed declarations",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.ctx().collect_garbage_for_host();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "String(styleOwnerWeak.deref() === undefined)"),
+            "true"
+        );
     }
 
     #[test]
@@ -15345,6 +18426,348 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "document.baseURI"),
             "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn navigation_timing_root_parser_readiness_precedes_deferred_scripts() {
+        let html = r#"<!doctype html><body>
+            <script defer src="data:text/javascript,document.body.setAttribute('data-deferred',document.readyState)"></script>
+            <script>document.body.setAttribute('data-blocking',document.readyState)</script>
+            <script type="module">document.body.setAttribute('data-module',document.readyState)</script>
+        </body>"#;
+        let (rendered, outcome) =
+            crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(rendered.contains("data-blocking=\"loading\""), "{rendered}");
+        assert!(
+            rendered.contains("data-deferred=\"interactive\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("data-module=\"interactive\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn resource_timing_packed_native_scalars_match_named_records_across_tiers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            // Original values cover every tuple position independently of
+            // real network timing variability or coincident zero fields.
+            let mut data = serde_json::json!({
+                "name":"https://original.test/packed", "startTime":1000.0,
+                "workerStart":0.0, "redirectStart":1002.0, "redirectEnd":1003.0,
+                "fetchStart":1004.0, "domainLookupStart":1005.0, "domainLookupEnd":1006.0,
+                "connectStart":1007.0, "connectEnd":1008.0, "secureConnectionStart":1009.0,
+                "requestStart":1010.0, "firstInterimResponseStart":1011.0,
+                "finalResponseHeadersStart":1012.0, "responseStart":1013.0, "responseEnd":1014.0,
+                "transferSize":315, "encodedBodySize":16, "decodedBodySize":17, "responseStatus":218,
+                "initiatorType":"fetch", "deliveryType":"cache", "nextHopProtocol":"http/1.1",
+                "renderBlockingStatus":"blocking", "contentType":"text/plain", "contentEncoding":"gzip"
+            });
+            for empty in [false, true] {
+                if empty {
+                    // The same default values apply to missing native fields.
+                    data =
+                        serde_json::json!({"name":"https://original.test/empty", "startTime":1.0});
+                }
+                let named = host_timing_data_value(engine.ctx(), &data)
+                    .unwrap_or_else(|_| panic!("original scalar record conversion"));
+                assert!(host_call_trust(engine.ctx(), "recordResourceTiming", &[named]).is_ok());
+                let packed = host_resource_timing_value(engine.ctx(), &data);
+                assert!(
+                    host_call_trust(engine.ctx(), "recordResourceTimingPacked", &[packed]).is_ok()
+                );
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(()=>{
+                        const entries=performance.getEntriesByType('resource');
+                        const a=entries[entries.length-2],b=entries[entries.length-1];
+                        const x=a.toJSON(),y=b.toJSON();
+                        if(Object.keys(x).length!==28||Object.keys(y).length!==28)return false;
+                        for(const key of Object.keys(x))if(x[key]!==y[key]||a[key]!==b[key])return false;
+                        return a!==b && Object.keys(b).length===0 && b instanceof PerformanceResourceTiming;
+                    })()"#
+                    ),
+                    "true"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resource_timing_interface_buffers_and_observers_across_tiers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                "document.appendChild(document.createElement('body'))",
+                "original body",
+            )
+            .unwrap();
+            eval(
+                &mut engine,
+                include_str!("fixtures/resource_timing.mjs"),
+                "Resource Timing interface",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "document.body.getAttribute('data-resource-interface')"
+                ),
+                "ok"
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_timing_reflection_lifecycle_and_observers_across_tiers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let start = crate::performance::now_ms() - 100.0;
+            let timing = crate::http::FetchTiming {
+                navigation_type: crate::http::NavigationType::Reload,
+                start_time: start,
+                fetch_start: start,
+                domain_lookup_start: start + 1.0,
+                domain_lookup_end: start + 2.0,
+                connect_start: start + 2.0,
+                connect_end: start + 3.0,
+                request_start: start + 4.0,
+                final_response_start: start + 8.0,
+                response_end: start + 10.0,
+                encoded_body_size: 24,
+                decoded_body_size: 48,
+                response_status: 200,
+                next_hop_protocol: "http/1.1",
+                content_type: "text/html; charset=utf-8".into(),
+                ..crate::http::FetchTiming::default()
+            };
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document(
+                        "<!doctype html><body></body>",
+                    ))),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            eval(
+                &mut engine,
+                &format!(
+                    "__trust_cfg.navigationTiming = {}",
+                    timing.navigation_data(DEFAULT_URL)
+                ),
+                "original native timing record",
+            )
+            .unwrap();
+            eval_platform_prelude(&mut engine).unwrap();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/navigation_timing.mjs"),
+                "Navigation Timing fixture",
+            )
+            .unwrap();
+            eval(&mut engine, "__trust.setDocumentReadiness('interactive'); __trust.fire(document,'DOMContentLoaded',true);",
+                "native DOM lifecycle").unwrap();
+            run_microtask_checkpoint(&mut engine);
+            eval(
+                &mut engine,
+                "__trust.setDocumentReadiness('complete'); __trust.fire(window,'load',false);",
+                "native load lifecycle",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            for _ in 0..4 {
+                call_trust_method(&mut engine, "runPlatformTask", &[]);
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(&mut engine, "navigationTimingFinish()"),
+                "navigation-timing-ok",
+                "{tier:?}"
+            );
+            assert_eq!(
+                string_value(&mut engine, "__trust.takeErrors()"),
+                "",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_timing_marks_measures_and_timeline() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/user_timing.mjs"),
+                "User Timing fixture",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref s) if s.as_ref() == "user-timing-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_timing_observers_use_a_dedicated_task_source() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/performance_observers.mjs"),
+                "PerformanceObserver fixture",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "performanceObserverResult.join(',')"),
+                "sync,microtask"
+            );
+            call_trust_method(&mut engine, "runPlatformTask", &[]);
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "performanceObserverResult.join(',')"),
+                "sync,microtask,first,second"
+            );
+            call_trust_method(&mut engine, "runPlatformTask", &[]);
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "performanceObserverResult.join(',')"),
+                "sync,microtask,first,second,first"
+            );
+            eval(
+                &mut engine,
+                "performanceObserverCleanup()",
+                "PerformanceObserver cleanup",
+            )
+            .unwrap();
+            eval(
+                &mut engine,
+                r#"
+                globalThis.observerAfterThrow = 0;
+                const throwingObserver = new PerformanceObserver(() => {
+                    throwingObserver.disconnect();
+                    throw {get message(){throw new Error('formatting also throws');}};
+                });
+                const afterThrowObserver = new PerformanceObserver(() => {
+                    observerAfterThrow++;afterThrowObserver.disconnect();
+                });
+                throwingObserver.observe({type:'mark'});afterThrowObserver.observe({type:'mark'});
+                performance.mark('reported-exception');
+            "#,
+                "observer exception isolation",
+            )
+            .unwrap();
+            call_trust_method(&mut engine, "runPlatformTask", &[]);
+            assert_eq!(string_value(&mut engine, "String(observerAfterThrow)"), "1");
+            assert!(
+                string_value(&mut engine, "__trust.takeErrors()")
+                    .contains("PerformanceObserver callback threw")
+            );
+        }
+    }
+
+    #[test]
+    fn user_timing_private_identity_and_frame_ownership() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/user_timing_realms.mjs"),
+                "User Timing Realms",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref s) if s.as_ref() == "user-timing-realms-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_timing_buffers_and_private_slots_release_cleared_entries() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"(() => {
+            const observer = new PerformanceObserver(() => {});
+            observer.observe({type:'mark'});
+            const mark = performance.mark('retained',{detail:{bytes:new Uint8Array(4096)}});
+            globalThis.performanceObserverWeak = new WeakRef(observer);
+            globalThis.performanceMarkWeak = new WeakRef(mark);
+            globalThis.performanceDetailWeak = new WeakRef(mark.detail);
+            globalThis.unrecordedMarkWeak = new WeakRef(new PerformanceMark('unrecorded'));
+            performance.clearMarks();
+        })()"#,
+            "Performance entry ownership",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.ctx().collect_garbage_for_host();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "unrecordedMarkWeak.deref() === undefined && performanceMarkWeak.deref() !== undefined && performanceDetailWeak.deref() !== undefined && performanceObserverWeak.deref() !== undefined"
+            ),
+            "true"
+        );
+        eval(
+            &mut engine,
+            "performanceObserverWeak.deref().disconnect()",
+            "drop pending Performance records",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.ctx().collect_garbage_for_host();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "performanceMarkWeak.deref() === undefined && performanceDetailWeak.deref() === undefined && performanceObserverWeak.deref() === undefined"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn performance_time_origin_matches_the_monotonic_clock_anchor() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            for (let i=0;i<8;i++) {
+                const before=Date.now(), timestamp=performance.timeOrigin+performance.now(), after=Date.now();
+                if (timestamp < before || timestamp >= after+1) return false;
+            }
+            return true;
+        })()"#
+            ),
+            "true"
         );
     }
 

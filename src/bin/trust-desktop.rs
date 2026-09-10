@@ -4017,6 +4017,20 @@ impl DesktopApp {
             self.form_editor = None;
             self.set_focus(FocusTarget::Form { form, field });
         }
+        // DOM #dispatching-events / HTML #the-input-element: native checkbox
+        // and radio activation is a click, with tentative checkedness and
+        // cancellation handled by the page actor. SetValue is an edit command;
+        // using it here lost pointer coordinates/trust and ignored cancellation.
+        if matches!(control.kind, FieldKind::Checkbox | FieldKind::Radio)
+            && self.browser.page_is_live()
+            && let Some(node) = control.live_node
+        {
+            self.dispatch(UserAction::Activate(Link::JsClick {
+                node,
+                href: String::new(),
+            }));
+            return;
+        }
         match control.kind {
             FieldKind::Text | FieldKind::Password | FieldKind::Textarea => {
                 self.focus_form(form, field);
@@ -4602,6 +4616,24 @@ impl DesktopApp {
                 .and_then(|scene| scene.control_at(self.pointer))
                 .is_some();
         if !chrome_owned {
+            if button == PointerButton::Primary {
+                let actor = self
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| scene.page_hit_at(self.pointer))
+                    .and_then(|hit| hit.actor);
+                let position = self.scene.as_ref().map_or(self.pointer, |scene| {
+                    CssPoint::new(
+                        self.pointer.x - scene.content_viewport.x,
+                        self.pointer.y - scene.content_viewport.y,
+                    )
+                });
+                self.dispatch(UserAction::PagePointerButton {
+                    actor,
+                    position,
+                    pressed: state == ElementState::Pressed,
+                });
+            }
             self.dispatch(UserAction::PointerButton {
                 position: self.pointer,
                 button,
@@ -4760,9 +4792,8 @@ impl DesktopApp {
             self.keyboard_target = None;
             self.set_focus(FocusTarget::Page);
         }
-        self.dispatch(UserAction::PageFocus {
-            actor: self.pressed_hit.as_ref().and_then(|hit| hit.actor),
-        });
+        // A live page's pointerdown/mousedown task performs focusing only if
+        // its default was not canceled. Static pages have no DOM focus task.
         if self.pressed_hit.is_some() {
             return;
         }

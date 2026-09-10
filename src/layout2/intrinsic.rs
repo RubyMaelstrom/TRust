@@ -51,16 +51,23 @@ impl Flow<'_> {
             return hit;
         }
         let request = super::memo::Request {
-            node: b, parent: inl, constraint: super::memo::Constraint::Intrinsic(mode == IMode::Min),
+            node: b,
+            parent: inl,
+            constraint: super::memo::Constraint::Intrinsic(mode == IMode::Min),
         };
         let reuse = self.reuse && b.node != NO_NODE;
         if reuse && let Some(value) = self.dom.layout_cache.borrow_mut().intrinsic(&request) {
-            self.imemo.borrow_mut().insert((b.node, mode == IMode::Min), value);
+            self.imemo
+                .borrow_mut()
+                .insert((b.node, mode == IMode::Min), value);
             return value;
         }
         let v = self.intrinsic_w_inner(b, mode, inl);
         if reuse {
-            self.dom.layout_cache.borrow_mut().store_intrinsic(&request, v);
+            self.dom
+                .layout_cache
+                .borrow_mut()
+                .store_intrinsic(&request, v);
         }
         if b.node != NO_NODE {
             self.imemo

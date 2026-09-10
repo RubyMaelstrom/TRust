@@ -482,8 +482,23 @@ impl<'a, 't> Builder<'a, 't> {
                 || self.dom.is_hscroll_container(fragment.node)
                 || nested_viewport)
         {
-            let viewport = padding_box(fragment);
-            let (right, bottom) = subtree_extent(fragment);
+            let viewport = if nested_viewport {
+                fragment.content_box()
+            } else {
+                padding_box(fragment)
+            };
+            let (right, bottom) = if nested_viewport {
+                // The embedding border/padding is outside the child
+                // Document, so it must not manufacture overflow inside it.
+                fragment.children.iter().map(subtree_extent).fold(
+                    (viewport.x + viewport.width, viewport.y + viewport.height),
+                    |(right, bottom), (child_right, child_bottom)| {
+                        (right.max(child_right), bottom.max(child_bottom))
+                    },
+                )
+            } else {
+                subtree_extent(fragment)
+            };
             let content = CssSize::new(
                 (right - viewport.x).max(viewport.width),
                 (bottom - viewport.y).max(viewport.height),
@@ -1805,6 +1820,7 @@ fn paint_atomic_control_box(
         border: style.border,
         css_size: None,
         content_size: None,
+        content_offset: [0.0; 2],
         paint: Default::default(),
         clip: parent.clip,
         kind: FragKind::Block,

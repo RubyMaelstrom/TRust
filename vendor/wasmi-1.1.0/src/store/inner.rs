@@ -170,6 +170,57 @@ impl StoreInner {
         self.memories.len()
     }
 
+    /// Enumerate conservative function-liveness groups and stored funcref roots.
+    /// This observes core storage directly, including unexported tables/globals and
+    /// passive element segments; an embedder's exported-handle list is insufficient.
+    pub(super) fn visit_function_references(
+        &self,
+        mut group: impl FnMut(&[Func], &[Func]),
+        mut root: impl FnMut(Func),
+    ) {
+        let mut owned = alloc::vec::Vec::new();
+        let mut imports = alloc::vec::Vec::new();
+        for (index, instance) in &self.instances {
+            owned.clear();
+            imports.clear();
+            let owner = Instance::from_inner(self.wrap_stored(index));
+            for function in instance.functions() {
+                if matches!(self.resolve_func(function), FuncEntity::Wasm(wasm) if *wasm.instance() == owner) {
+                    owned.push(*function);
+                } else {
+                    imports.push(*function);
+                }
+            }
+            group(&owned, &imports);
+        }
+        let mut reference = |value: crate::core::UntypedVal| {
+            if let crate::Ref::Val(function) = crate::Ref::<Func>::from(value) {
+                root(function);
+            }
+        };
+        for (_, table) in &self.tables {
+            if table.ty().element() == crate::ValType::FuncRef {
+                for index in 0..table.size() {
+                    if let Some(value) = table.get_untyped(index) {
+                        reference(value);
+                    }
+                }
+            }
+        }
+        for (_, global) in &self.globals {
+            if global.ty().content() == crate::ValType::FuncRef {
+                reference(*global.get_untyped());
+            }
+        }
+        for (_, element) in &self.elems {
+            if element.ty() == crate::ValType::FuncRef {
+                for value in element.items() {
+                    reference(*value);
+                }
+            }
+        }
+    }
+
     /// Wraps an entity `Idx` (index type) as a [`Stored<Idx>`] type.
     ///
     /// # Note

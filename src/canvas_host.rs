@@ -8,6 +8,18 @@ use vello_cpu::kurbo::Affine;
 
 pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let op = host_arg_string(ctx, args, 1);
+    if op == "gradientSlots" || op == "textMetricsSlots" {
+        // Shared, privately rooted WeakMap: cross-Realm CanvasGradient brands
+        // work without exposing data or keeping otherwise dead gradients alive.
+        let candidate = args.get(3).cloned().unwrap_or(Value::Undefined);
+        let state = ctx.host_mut::<HostState>().unwrap();
+        let slots = if op == "gradientSlots" {
+            &mut state.canvas_gradient_slots
+        } else {
+            &mut state.canvas_text_metrics_slots
+        };
+        return Ok(slots.get_or_insert(candidate).clone());
+    }
     let mut n = Vec::new();
     if let Some(values) = args.get(2) {
         let length = ctx.member_get(values, "length")?.as_num_opt().unwrap_or(0.) as usize;
@@ -25,8 +37,24 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     } else {
         String::new()
     };
+    if op == "color" {
+        return Ok(Canvas::color(&text).map_or(Value::Null, |(color, _)| {
+            ctx.make_array(color.into_iter().map(|n| Value::Num(n as f64)).collect())
+        }));
+    }
     let bytes = if op == "put" {
         ctx.typed_array_bytes(&payload)
+    } else {
+        None
+    };
+    let loaded_image = if op == "draw" && !matches!(payload, Value::Undefined) {
+        let width = ctx.member_get(&payload, "0")?.as_num_opt().unwrap_or(0.) as u32;
+        let height = ctx.member_get(&payload, "1")?.as_num_opt().unwrap_or(0.) as u32;
+        let pixels = ctx.member_get(&payload, "2")?;
+        let clean = matches!(ctx.member_get(&payload, "3")?, Value::Bool(true));
+        ctx.typed_array_bytes(&pixels)
+            .and_then(|bytes| rgba_bitmap(width, height, &bytes))
+            .map(|bitmap| (bitmap, clean))
     } else {
         None
     };
@@ -77,8 +105,10 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             .borrow()
             .get(&id)
             .map_or_else(String::new, |canvas| canvas.document_origin.clone());
-        n.first()
-            .and_then(|source| source_bitmap(ctx, &dom, *source as usize, &origin))
+        loaded_image.or_else(|| {
+            n.first()
+                .and_then(|source| source_bitmap(ctx, &dom, *source as usize, &origin))
+        })
     } else {
         None
     };
@@ -88,6 +118,78 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .ok_or_else(|| ctx.make_error("TypeError", "Canvas context not initialized"))?;
     let mut changed = false;
     let result = match op.as_str() {
+        "getTextStyle" => Value::from_string(match n.first().copied().unwrap_or(0.) as u8 {
+            1 => canvas.state.text.align.clone(),
+            2 => canvas.state.text.baseline.clone(),
+            3 => canvas.state.text.direction.clone(),
+            _ => canvas.state.text.font.clone(),
+        }),
+        "setTextStyle" => {
+            match n.first().copied().unwrap_or(0.) as u8 {
+                0 => {
+                    let mut rendered = dom.is_connected(id);
+                    let mut ancestor = Some(id);
+                    while rendered && let Some(node) = ancestor {
+                        if dom.computed_value_resolved(node, "display").as_deref() == Some("none") {
+                            rendered = false;
+                        }
+                        ancestor = dom.parent_flat(node);
+                    }
+                    let units = if rendered {
+                        crate::layout2::Units::of(&dom, id)
+                    } else {
+                        crate::layout2::Units {
+                            fs: 10.,
+                            root: dom.root_font_px(),
+                            ch: crate::text::shape_canvas(
+                                "0",
+                                &crate::text::TextStyle {
+                                    size: 10.,
+                                    ..crate::text::TextStyle::default()
+                                },
+                            )
+                            .advance,
+                        }
+                    };
+                    let weight = if rendered {
+                        dom.computed_value_resolved(id, "font-weight")
+                            .as_deref()
+                            .and_then(crate::layout2::css_font_weight)
+                            .unwrap_or(400.)
+                    } else {
+                        400.
+                    };
+                    canvas.state.text.set_font(&text, units, weight);
+                }
+                1 if matches!(text.as_str(), "start" | "end" | "left" | "right" | "center") => {
+                    canvas.state.text.align = text
+                }
+                2 if matches!(
+                    text.as_str(),
+                    "top" | "hanging" | "middle" | "alphabetic" | "ideographic" | "bottom"
+                ) =>
+                {
+                    canvas.state.text.baseline = text
+                }
+                3 if matches!(text.as_str(), "inherit" | "ltr" | "rtl") => {
+                    canvas.state.text.direction = text
+                }
+                _ => {}
+            }
+            Value::Undefined
+        }
+        "measureText" | "fillText" | "strokeText" => {
+            let rtl = dom.computed_value_resolved(id, "direction").as_deref() == Some("rtl");
+            let language = dom.inherited_lang(id).map(str::to_owned);
+            let prepared = canvas.state.text.prepare(&text, rtl, language);
+            if op == "measureText" {
+                ctx.make_array(prepared.metrics().into_iter().map(Value::Num).collect())
+            } else {
+                canvas.draw_text(&prepared, &n, op == "strokeText");
+                changed = true;
+                Value::Undefined
+            }
+        }
         "generation" => Value::Num(canvas.generation as f64),
         "lost" => Value::Bool(canvas.lost()),
         "reset" => {
@@ -224,8 +326,56 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             }
             Value::Undefined
         }
+        "setShadowColor" => {
+            // CSS Color 4 #parse-color: resolve currentcolor against the
+            // associated canvas element, including inherited currentcolor.
+            let value = if text.trim().eq_ignore_ascii_case("currentcolor") {
+                let mut current = Some(id);
+                let mut used = "black".to_owned();
+                while let Some(node) = current {
+                    if let Some(value) = dom.computed_value_resolved(node, "color")
+                        && !value.trim().eq_ignore_ascii_case("currentcolor")
+                    {
+                        used = value;
+                        break;
+                    }
+                    current = dom.parent_flat(node);
+                }
+                used
+            } else {
+                text
+            };
+            if let Some((color, serialized)) = Canvas::color(&value) {
+                canvas.state.shadow.color = color;
+                canvas.state.shadow.serialized = serialized;
+            }
+            Value::Undefined
+        }
+        "getShadowColor" => Value::from_string(canvas.state.shadow.serialized.clone()),
+        "setShadowBlur" => {
+            if let Some(&value) = n.first()
+                && value.is_finite()
+                && value >= 0.
+            {
+                canvas.state.shadow.blur = value;
+            }
+            Value::Undefined
+        }
+        "getShadowBlur" => Value::Num(canvas.state.shadow.blur),
+        "setShadowOffsetX" | "setShadowOffsetY" => {
+            if let Some(&value) = n.first()
+                && value.is_finite()
+            {
+                canvas.state.shadow.offset[usize::from(op == "setShadowOffsetY")] = value;
+            }
+            Value::Undefined
+        }
+        "getShadowOffsetX" | "getShadowOffsetY" => {
+            Value::Num(canvas.state.shadow.offset[usize::from(op == "getShadowOffsetY")])
+        }
         "setStyle" => {
             if let Some((color, serialized)) = Canvas::color(&text) {
+                canvas.state.gradients[usize::from(n.first() == Some(&1.))] = None;
                 if n.first() == Some(&1.) {
                     canvas.state.stroke_color = color;
                     canvas.state.stroke_text = serialized;
@@ -233,6 +383,17 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                     canvas.state.fill = color;
                     canvas.state.fill_text = serialized;
                 }
+                Value::Bool(true)
+            } else {
+                Value::Bool(false)
+            }
+        }
+        "setGradient" => {
+            if let Some((&index, values)) = n.split_first()
+                && let Some(gradient) = crate::canvas::Gradient::from_numbers(values)
+            {
+                canvas.state.gradients[usize::from(index == 1.)] =
+                    Some(std::sync::Arc::new(gradient));
             }
             Value::Undefined
         }
@@ -400,16 +561,27 @@ fn source_bitmap(
         (response.body.clone(), clean)
     };
     let image = crate::img::decode_graphical(&bytes).ok()?;
-    let mut bitmap = sk::Pixmap::new(image.width, image.height)?;
+    Some((rgba_bitmap(image.width, image.height, &image.rgba)?, clean))
+}
+
+fn rgba_bitmap(width: u32, height: u32, rgba: &[u8]) -> Option<sk::Pixmap> {
+    if (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?
+        != rgba.len()
+    {
+        return None;
+    }
+    let mut bitmap = sk::Pixmap::new(width, height)?;
     for (out, pixel) in bitmap
         .data_mut()
         .chunks_exact_mut(4)
-        .zip(image.rgba.chunks_exact(4))
+        .zip(rgba.chunks_exact(4))
     {
         for channel in 0..3 {
             out[channel] = ((pixel[channel] as u32 * pixel[3] as u32 + 127) / 255) as u8;
         }
         out[3] = pixel[3];
     }
-    Some((bitmap, clean))
+    Some(bitmap)
 }

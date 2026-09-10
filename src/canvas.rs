@@ -13,6 +13,179 @@ use vello_cpu::kurbo::{Affine, Arc as EllipseArc, BezPath, PathEl, Point, Shape}
 
 const MAX_BITMAP_BYTES: usize = 256 * 1024 * 1024;
 
+/// Canvas-neutral gradient data. The API keeps the live JS object; a paint
+/// operation snapshots its stops into native memory. Saving native state shares
+/// this immutable snapshot instead of duplicating stop arrays.
+pub(crate) struct Gradient {
+    kind: u8,
+    coordinates: [f64; 6],
+    stops: Vec<[f32; 5]>,
+}
+
+impl Gradient {
+    fn vello_paint(&self) -> vello_common::paint::PaintType {
+        use vello_cpu::color::{AlphaColor, Srgb};
+        use vello_cpu::peniko::{ColorStop, Gradient as PaintGradient, InterpolationAlphaSpace};
+        let c = self.coordinates;
+        if self.stops.is_empty()
+            || (self.kind == 0 && c[0] == c[2] && c[1] == c[3])
+            || (self.kind == 1
+                && ((c[0] == c[3] && c[1] == c[4] && c[2] == c[5]) || (c[2] == 0. && c[5] == 0.)))
+        {
+            return AlphaColor::<Srgb>::new([0.; 4]).into();
+        }
+        let mut stops: Vec<_> = self
+            .stops
+            .iter()
+            .map(|s| ColorStop {
+                offset: s[0],
+                color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new([
+                    s[1], s[2], s[3], s[4],
+                ])),
+            })
+            .collect();
+        if stops.len() == 1 {
+            let color = stops[0].color;
+            stops = vec![
+                ColorStop { offset: 0., color },
+                ColorStop { offset: 1., color },
+            ];
+        }
+        let mut gradient = match self.kind {
+            0 => PaintGradient::new_linear((c[0], c[1]), (c[2], c[3])),
+            1 => PaintGradient::new_two_point_radial(
+                (c[0], c[1]),
+                c[2] as f32,
+                (c[3], c[4]),
+                c[5] as f32,
+            ),
+            // Rotate a full sweep via its paint transform. Extending the
+            // angular interval past 2pi makes Vello pad, not wrap, its seam.
+            _ => PaintGradient::new_sweep((c[1], c[2]), 0., std::f32::consts::TAU),
+        }
+        .with_stops(stops.as_slice());
+        gradient.interpolation_alpha_space = InterpolationAlphaSpace::Unpremultiplied;
+        gradient.into()
+    }
+
+    fn vello_transform(&self) -> Affine {
+        let c = self.coordinates;
+        if self.kind == 2 {
+            Affine::translate((c[1], c[2]))
+                * Affine::rotate(c[0])
+                * Affine::translate((-c[1], -c[2]))
+        } else {
+            Affine::IDENTITY
+        }
+    }
+
+    pub fn from_numbers(numbers: &[f64]) -> Option<Self> {
+        if numbers.len() < 7
+            || !(numbers.len() - 7).is_multiple_of(5)
+            || numbers.iter().any(|n| !n.is_finite())
+        {
+            return None;
+        }
+        let kind = numbers[0] as u8;
+        if kind > 2 {
+            return None;
+        }
+        let mut coordinates = [0.; 6];
+        coordinates.copy_from_slice(&numbers[1..7]);
+        let mut stops: Vec<[f32; 5]> = numbers[7..]
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .map(|s| {
+                [
+                    s[0] as f32,
+                    s[1] as f32,
+                    s[2] as f32,
+                    s[3] as f32,
+                    s[4] as f32,
+                ]
+            })
+            .collect();
+        // Stable order is required for coincident color stops.
+        stops.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        Some(Self {
+            kind,
+            coordinates,
+            stops,
+        })
+    }
+
+    fn shader(&self, transform: Affine, alpha: f32) -> sk::Shader<'static> {
+        let c = self.coordinates;
+        let transparent = sk::Shader::SolidColor(sk::Color::TRANSPARENT);
+        // HTML #dom-context-2d-createLinearGradient / -createRadialGradient.
+        // Skia's degenerate pad fallback differs, so handle these before it.
+        if self.stops.is_empty()
+            || (self.kind == 0 && c[0] == c[2] && c[1] == c[3])
+            || (self.kind == 1
+                && ((c[0] == c[3] && c[1] == c[4] && c[2] == c[5]) || (c[2] == 0. && c[5] == 0.)))
+        {
+            return transparent;
+        }
+        let mut stops: Vec<_> = self
+            .stops
+            .iter()
+            .map(|s| {
+                sk::GradientStop::new(
+                    s[0],
+                    sk::Color::from_rgba(s[1], s[2], s[3], s[4] * alpha)
+                        .unwrap_or(sk::Color::TRANSPARENT),
+                )
+            })
+            .collect();
+        if stops.len() == 1 {
+            // A solid shader would incorrectly fill OUTSIDE a radial cone.
+            let color = &self.stops[0];
+            let color = sk::Color::from_rgba(color[1], color[2], color[3], color[4] * alpha)
+                .unwrap_or(sk::Color::TRANSPARENT);
+            stops = vec![
+                sk::GradientStop::new(0., color),
+                sk::GradientStop::new(1., color),
+            ];
+        }
+        let point = |x: f64, y: f64| sk::Point::from_xy(x as f32, y as f32);
+        let shader = match self.kind {
+            0 => sk::LinearGradient::new(
+                point(c[0], c[1]),
+                point(c[2], c[3]),
+                stops,
+                sk::SpreadMode::Pad,
+                sk_transform(transform),
+            ),
+            1 => sk::RadialGradient::new(
+                point(c[0], c[1]),
+                c[2] as f32,
+                point(c[3], c[4]),
+                c[5] as f32,
+                stops,
+                sk::SpreadMode::Pad,
+                sk_transform(transform),
+            ),
+            _ => {
+                // HTML conic starts at +x, clockwise, and accepts radians.
+                // Rotate the full-turn shader, not its clamped color interval.
+                let rotation = Affine::translate((c[1], c[2]))
+                    * Affine::rotate(c[0].rem_euclid(std::f64::consts::TAU))
+                    * Affine::translate((-c[1], -c[2]));
+                sk::SweepGradient::new(
+                    point(c[1], c[2]),
+                    0.,
+                    360.,
+                    stops,
+                    sk::SpreadMode::Pad,
+                    sk_transform(transform * rotation),
+                )
+            }
+        };
+        shader.unwrap_or(transparent)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct State {
     pub transform: Affine,
@@ -20,6 +193,9 @@ pub(crate) struct State {
     pub stroke_color: [f32; 4],
     pub fill_text: String,
     pub stroke_text: String,
+    pub gradients: [Option<Arc<Gradient>>; 2],
+    pub text: crate::canvas_text::TextState,
+    pub shadow: crate::canvas_shadow::Shadow,
     pub alpha: f32,
     pub composite: String,
     pub stroke: sk::Stroke,
@@ -37,6 +213,9 @@ impl Default for State {
             stroke_color: [0., 0., 0., 1.],
             fill_text: "#000000".into(),
             stroke_text: "#000000".into(),
+            gradients: [None, None],
+            text: crate::canvas_text::TextState::default(),
+            shadow: crate::canvas_shadow::Shadow::default(),
             alpha: 1.,
             composite: "source-over".into(),
             stroke: sk::Stroke::default(),
@@ -117,12 +296,27 @@ impl Canvas {
     }
 
     pub fn retained_bytes(&self) -> usize {
+        let mut gradients = std::collections::HashSet::new();
+        let gradient_bytes: usize = std::iter::once(&self.state)
+            .chain(self.stack.iter())
+            .flat_map(|state| state.gradients.iter().flatten())
+            .filter(|gradient| gradients.insert(Arc::as_ptr(gradient)))
+            .map(|gradient| {
+                std::mem::size_of::<Gradient>()
+                    + gradient.stops.capacity() * std::mem::size_of::<[f32; 5]>()
+            })
+            .sum();
         self.bitmap.as_ref().map_or(0, |p| p.data().len())
             + self.presentation.as_ref().map_or(0, String::capacity)
             + self.path.elements().len() * std::mem::size_of::<PathEl>()
             + self.stack.capacity() * std::mem::size_of::<State>()
             + self.state.clip.as_ref().map_or(0, |m| m.data().len())
             + self.document_origin.capacity()
+            + gradient_bytes
+            + std::iter::once(&self.state)
+                .chain(self.stack.iter())
+                .map(|state| state.text.retained_bytes() + state.shadow.serialized.capacity())
+                .sum::<usize>()
     }
 
     pub fn save(&mut self) {
@@ -433,6 +627,152 @@ impl Canvas {
         self.paint(path, op == "strokeRect", false, op == "clearRect");
     }
 
+    pub fn draw_text(&mut self, text: &crate::canvas_text::PreparedText, n: &[f64], stroke: bool) {
+        if n.len() < 2
+            || n.iter().any(|x| !x.is_finite())
+            || n.get(2).is_some_and(|x| *x <= 0.)
+            || text.shaped.runs.is_empty()
+            || self.state.transform.determinant() == 0.
+        {
+            return;
+        }
+        let Some(bitmap) = self.bitmap.as_mut() else {
+            return;
+        };
+        let Some(mut layer) = sk::Pixmap::new(self.width, self.height) else {
+            return;
+        };
+        crate::canvas_shadow::paint(bitmap, &self.state, |layer, shift| {
+            Self::text_source(layer, &self.state, text, n, stroke, shift);
+        });
+        Self::text_source(&mut layer, &self.state, text, n, stroke, Affine::IDENTITY);
+        composite_full(
+            bitmap,
+            &layer,
+            blend(&self.state.composite).unwrap_or_default(),
+            self.state.clip.as_deref(),
+        );
+        self.changed();
+    }
+
+    fn text_source(
+        layer: &mut sk::Pixmap,
+        state: &State,
+        text: &crate::canvas_text::PreparedText,
+        n: &[f64],
+        stroke: bool,
+        shift: Affine,
+    ) {
+        use vello_cpu::kurbo::{Cap, Diagonal2, Join, Stroke};
+        use vello_cpu::{RenderContext, Resources};
+        let (width, height) = (layer.width(), layer.height());
+        let ctm = shift * state.transform;
+        let scale = n
+            .get(2)
+            .filter(|width| **width < f64::from(text.shaped.advance))
+            .map_or(1., |width| *width / f64::from(text.shaped.advance));
+        let transform = ctm
+            * Affine::translate((n[0] - text.anchor_x * scale, n[1] + text.baseline_y))
+            * Affine::scale_non_uniform(scale, 1.);
+        let color = if stroke {
+            state.stroke_color
+        } else {
+            state.fill
+        };
+        let paint: vello_common::paint::PaintType =
+            if let Some(gradient) = &state.gradients[usize::from(stroke)] {
+                gradient.vello_paint()
+            } else {
+                vello_cpu::color::AlphaColor::<vello_cpu::color::Srgb>::new(color).into()
+            };
+        let paint_transform = transform.inverse()
+            * ctm
+            * state.gradients[usize::from(stroke)]
+                .as_ref()
+                .map_or(Affine::IDENTITY, |gradient| gradient.vello_transform());
+        let cap = match state.stroke.line_cap {
+            sk::LineCap::Butt => Cap::Butt,
+            sk::LineCap::Round => Cap::Round,
+            sk::LineCap::Square => Cap::Square,
+        };
+        let join = match state.stroke.line_join {
+            sk::LineJoin::Round => Join::Round,
+            sk::LineJoin::Bevel => Join::Bevel,
+            _ => Join::Miter,
+        };
+        let pen = Stroke::new(f64::from(state.stroke.width))
+            .with_caps(cap)
+            .with_join(join)
+            .with_miter_limit(f64::from(state.stroke.miter_limit))
+            .with_dashes(state.dash_offset, state.dash.iter().copied());
+        let mut resources = Resources::new();
+        let mut stroke_cache = glifo::GlyphPrepCache::default();
+        // Vello uses u16 surfaces. Tile instead of silently omitting text on a
+        // wide canvas; each scratch surface is bounded to 16 MiB of RGBA pixels.
+        for top in (0..height).step_by(2048) {
+            for left in (0..width).step_by(2048) {
+                let w = (width - left).min(2048) as u16;
+                let h = (height - top).min(2048) as u16;
+                let mut context = RenderContext::new(w, h);
+                let local = Affine::translate((-(left as f64), -(top as f64))) * transform;
+                context.set_transform(local);
+                context.set_paint(paint.clone());
+                context.set_paint_transform(paint_transform);
+                context.set_stroke(pen.clone());
+                for run in &text.shaped.runs {
+                    if stroke {
+                        crate::canvas_text::stroke_run(
+                            &mut context,
+                            &mut stroke_cache,
+                            run,
+                            text.shaped.baseline,
+                            Affine::translate((-(left as f64), -(top as f64))) * ctm,
+                        );
+                        continue;
+                    }
+                    let mut builder = context
+                        .glyph_run(&mut resources, run.font.data())
+                        .font_size(run.font_size)
+                        .normalized_coords(&run.normalized_coords)
+                        .hint(false);
+                    if run.synth_bold {
+                        let amount = f64::from(run.font_size) * 0.025;
+                        builder = builder.font_embolden(glifo::FontEmbolden::new(Diagonal2::new(
+                            amount, amount,
+                        )));
+                    }
+                    if let Some(degrees) = run.synth_skew_degrees {
+                        builder = builder.glyph_transform(Affine::skew(
+                            f64::from(degrees).to_radians().tan(),
+                            0.,
+                        ));
+                    }
+                    let glyphs = run.glyphs.iter().map(|glyph| vello_cpu::Glyph {
+                        id: glyph.id,
+                        x: glyph.x,
+                        y: glyph.y - text.shaped.baseline,
+                    });
+                    builder.fill_glyphs(glyphs);
+                }
+                let mut pixels = vello_common::pixmap::Pixmap::new(w, h);
+                context.render(&mut pixels, &mut resources);
+                for (y, row) in pixels
+                    .data_as_u8_slice()
+                    .chunks_exact(w as usize * 4)
+                    .enumerate()
+                {
+                    let start = ((top as usize + y) * width as usize + left as usize) * 4;
+                    layer.data_mut()[start..start + row.len()].copy_from_slice(row);
+                }
+            }
+        }
+        if state.alpha != 1. {
+            for byte in layer.data_mut() {
+                *byte = (f32::from(*byte) * state.alpha).round() as u8;
+            }
+        }
+    }
+
     fn paint(&mut self, path: BezPath, stroke: bool, evenodd: bool, clear: bool) {
         let Some(bitmap) = self.bitmap.as_mut() else {
             return;
@@ -447,6 +787,17 @@ impl Canvas {
             sk::Color::from_rgba(color[0], color[1], color[2], color[3] * self.state.alpha)
                 .unwrap_or(sk::Color::TRANSPARENT),
         );
+        if !clear && let Some(gradient) = &self.state.gradients[usize::from(stroke)] {
+            // Strokes are sent to tiny-skia in local coordinates; its painter
+            // transforms BOTH geometry and shader. Fills already use device
+            // paths, so only their shader needs the current transform here.
+            let transform = if stroke {
+                Affine::IDENTITY
+            } else {
+                self.state.transform
+            };
+            paint.shader = gradient.shader(transform, self.state.alpha);
+        }
         // tiny-skia masks modulate source alpha; Clear ignores source alpha,
         // so express rectangle erasure as DestinationOut with an opaque source.
         // This also keeps clearRect independent of the drawing color/alpha.
@@ -480,6 +831,28 @@ impl Canvas {
         let Some(path) = sk_path(&path) else {
             return;
         };
+        if !clear && self.state.shadow.drawn() {
+            let mut source_paint = paint.clone();
+            source_paint.blend_mode = sk::BlendMode::SourceOver;
+            crate::canvas_shadow::paint(bitmap, &self.state, |layer, shift| {
+                let matrix = if stroke {
+                    shift * self.state.transform
+                } else {
+                    shift
+                };
+                if stroke {
+                    layer.stroke_path(
+                        &path,
+                        &source_paint,
+                        &self.state.stroke,
+                        sk_transform(matrix),
+                        None,
+                    );
+                } else {
+                    layer.fill_path(&path, &source_paint, rule, sk_transform(matrix), None);
+                }
+            });
+        }
         // Operators that discard the destination outside the source must see a
         // full transparent source bitmap, not just the shape's covered pixels.
         let full_source = needs_full_source(paint.blend_mode);
@@ -714,6 +1087,13 @@ impl Canvas {
             blend_mode: blend(&self.state.composite).unwrap_or_default(),
             ..Default::default()
         };
+        if self.state.shadow.drawn() {
+            let mut source_paint = paint.clone();
+            source_paint.blend_mode = sk::BlendMode::SourceOver;
+            crate::canvas_shadow::paint(bitmap, &self.state, |layer, shift| {
+                layer.fill_rect(rect, &source_paint, sk_transform(shift * transform), None);
+            });
+        }
         if needs_full_source(paint.blend_mode) {
             let Some(mut layer) = sk::Pixmap::new(self.width, self.height) else {
                 return;
@@ -803,7 +1183,7 @@ fn sk_transform(matrix: Affine) -> sk::Transform {
     sk::Transform::from_row(a, b, c, d, e, f)
 }
 
-fn needs_full_source(mode: sk::BlendMode) -> bool {
+pub(crate) fn needs_full_source(mode: sk::BlendMode) -> bool {
     matches!(
         mode,
         sk::BlendMode::Clear
@@ -821,10 +1201,36 @@ fn composite_full(
     mode: sk::BlendMode,
     clip: Option<&sk::Mask>,
 ) {
-    let original = clip.map(|_| bitmap.data().to_vec());
+    composite_region(bitmap, layer, 0, 0, mode, clip);
+}
+
+/// Composite a disjoint source region. Coverage interpolates the composited
+/// result with the original destination, not merely the source alpha (important
+/// for copy/source-in/etc.). Scratch copies are bounded by the source tile.
+pub(crate) fn composite_region(
+    bitmap: &mut sk::Pixmap,
+    layer: &sk::Pixmap,
+    left: u32,
+    top: u32,
+    mode: sk::BlendMode,
+    clip: Option<&sk::Mask>,
+) {
+    debug_assert!(left + layer.width() <= bitmap.width());
+    debug_assert!(top + layer.height() <= bitmap.height());
+    let stride = bitmap.width() as usize;
+    let width = layer.width() as usize;
+    let height = layer.height() as usize;
+    let original = clip.map(|_| {
+        let mut saved = Vec::with_capacity(width * height * 4);
+        for y in top as usize..top as usize + height {
+            let start = (y * stride + left as usize) * 4;
+            saved.extend_from_slice(&bitmap.data()[start..start + width * 4]);
+        }
+        saved
+    });
     bitmap.draw_pixmap(
-        0,
-        0,
+        left as i32,
+        top as i32,
         layer.as_ref(),
         &sk::PixmapPaint {
             blend_mode: mode,
@@ -834,17 +1240,22 @@ fn composite_full(
         None,
     );
     if let (Some(clip), Some(original)) = (clip, original) {
-        for ((out, original), &coverage) in bitmap
-            .data_mut()
-            .chunks_exact_mut(4)
-            .zip(original.chunks_exact(4))
-            .zip(clip.data())
-        {
-            for channel in 0..4 {
-                out[channel] = ((out[channel] as u32 * coverage as u32
-                    + original[channel] as u32 * (255 - coverage as u32)
-                    + 127)
-                    / 255) as u8;
+        for (y, original) in original.chunks_exact(width * 4).enumerate() {
+            let start = (top as usize + y) * stride + left as usize;
+            let row = &mut bitmap.data_mut()[start * 4..(start + width) * 4];
+            for ((out, original), &coverage) in row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(original.as_chunks::<4>().0.iter())
+                .zip(&clip.data()[start..start + width])
+            {
+                for channel in 0..4 {
+                    out[channel] = ((out[channel] as u32 * coverage as u32
+                        + original[channel] as u32 * (255 - coverage as u32)
+                        + 127)
+                        / 255) as u8;
+                }
             }
         }
     }

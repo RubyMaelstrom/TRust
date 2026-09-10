@@ -347,6 +347,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// `overflow-wrap: break-word`'s emergency breaks must NOT count as
     /// min-content opportunities (CSS Text §5.5 — unlike `anywhere`).
     measuring: bool,
+    /// Block-level replaced content is positioned by its enclosing fragment.
+    /// Only genuine inline atoms need their own post-line position adjustment.
+    position_inline_atoms: bool,
     /// The block container's inherited font/line-height strut. CSS Inline 3
     /// §5.1 requires it to participate even on an otherwise empty line.
     strut: crate::text::ShapedText,
@@ -412,6 +415,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             indent,
             on_first_line: true,
             measuring: false,
+            position_inline_atoms: true,
             strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
         };
         ifc.begin_line();
@@ -1086,6 +1090,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// blockification changes the outer display type; it does not nest a
     /// second replaced element inside the first one.
     pub fn block_atom_content(&mut self, a: &Atom, ctx: &InlineStyle) {
+        self.position_inline_atoms = false;
         let AtomKind::Control { form, field } = &a.kind else {
             self.atom(a, ctx);
             return;
@@ -1654,6 +1659,31 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 if line.width < cap {
                     let extra = cap - line.width;
                     justify(line, extra);
+                }
+            }
+        }
+        if self.position_inline_atoms && !self.measuring {
+            for line in &mut self.lines {
+                for piece in &mut line.pieces {
+                    let node = piece.item.node;
+                    if node == NO_NODE
+                        || (piece.item.graphical_image.is_none() && !piece.paint_control_box)
+                        || super::style::Pos::of(self.dom, node) != super::style::Pos::Relative
+                    {
+                        continue;
+                    }
+                    // CSS 2.2 §9.4.3: move the used box AFTER line breaking,
+                    // baseline alignment and justification. Neither the line's
+                    // dimensions nor following pieces move with this box.
+                    let style = BoxStyle::of(self.dom, node, self.vp);
+                    let (dx, dy) = style.paint_offset(
+                        self.cb_w_px,
+                        self.cb_h_px,
+                        piece.box_width,
+                        piece.box_height,
+                    );
+                    piece.x += dx;
+                    piece.y += dy;
                 }
             }
         }

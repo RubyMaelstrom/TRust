@@ -534,6 +534,7 @@ const MAX_SHAPE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 struct ShapeKey {
     text: String,
     style: TextStyleKey,
+    quantize: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -600,15 +601,25 @@ impl TextSystem {
     }
 
     fn shape(&mut self, text: &str, style: &TextStyle) -> ShapedText {
+        self.shape_with_quantization(text, style, true)
+    }
+
+    fn shape_with_quantization(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        quantize: bool,
+    ) -> ShapedText {
         self.refresh_page_fonts();
         let key = ShapeKey {
             text: text.to_string(),
             style: style.into(),
+            quantize,
         };
         if let Some(hit) = self.shape_cache.get(&key) {
             return hit.shaped.clone();
         }
-        let shaped = self.shape_uncached(text, style);
+        let shaped = self.shape_uncached(text, style, quantize);
         let bytes = shape_cost(&key, &shaped);
         if bytes <= MAX_SHAPE_CACHE_BYTES / 4 {
             self.shape_cache_bytes = self.shape_cache_bytes.saturating_add(bytes);
@@ -634,7 +645,7 @@ impl TextSystem {
         shaped
     }
 
-    fn shape_uncached(&mut self, text: &str, style: &TextStyle) -> ShapedText {
+    fn shape_uncached(&mut self, text: &str, style: &TextStyle, quantize: bool) -> ShapedText {
         if text.is_empty() || style.size <= 0.0 {
             return ShapedText {
                 text: text.to_string(),
@@ -643,7 +654,7 @@ impl TextSystem {
         }
         let mut builder = self
             .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, true);
+            .ranged_builder(&mut self.fonts, text, 1.0, quantize);
         let family = font_family_source(&style.family);
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
         builder.push_default(StyleProperty::Locale(text_language(style)));
@@ -822,6 +833,13 @@ thread_local! {
 /// Shape one unbroken text piece at CSS-pixel scale.
 pub fn shape(text: &str, style: &TextStyle) -> ShapedText {
     TEXT.with_borrow_mut(|system| system.shape(text, style))
+}
+
+/// Canvas metrics stay in fractional CSS pixels, regardless of bitmap/device
+/// transforms. Share the bounded font/shape cache without changing layout's
+/// existing quantization choice or aliasing its entries.
+pub(crate) fn shape_canvas(text: &str, style: &TextStyle) -> ShapedText {
+    TEXT.with_borrow_mut(|system| system.shape_with_quantization(text, style, false))
 }
 
 /// CSS `ch` basis: advance measure of U+0030 ZERO in the element's font.

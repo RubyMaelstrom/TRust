@@ -1212,7 +1212,9 @@ impl Builder<'_> {
         let mut top_captions = Vec::new();
         let mut bottom_captions = Vec::new();
         for c in self.dom.flat_children(id) {
-            if self.dom.effective_display(c).as_deref() != Some("table-caption") {
+            if self.dom.effective_display(c).as_deref() != Some("table-caption")
+                || Pos::of(self.dom, c).out_of_flow()
+            {
                 continue;
             }
             let bottom = self
@@ -1236,7 +1238,7 @@ impl Builder<'_> {
         let cells = placed
             .into_iter()
             .map(|(cell, row, col, rowspan, colspan)| TableCell {
-                b: Arc::new(self.container(cell, Disp::Block)),
+                b: cell,
                 row,
                 col,
                 rowspan,
@@ -1267,49 +1269,140 @@ impl Builder<'_> {
 
     /// The cells of each table row, in visual order (header-group rows first,
     /// then body/implicit rows, then footer-group rows — CSS 2.1 §17.2.1).
-    /// An empty row (a spacer `<tr>`) yields an empty inner vec so it still
-    /// takes a grid row. Misparented cells directly under the table are
-    /// approximated by collecting them into one trailing row.
-    fn table_cell_rows(&self, table: NodeId) -> Vec<Vec<NodeId>> {
+    /// CSS 2.2 §17.2.1 generates anonymous row/cell boxes around improper
+    /// children. In particular, positioned children are zero-size inline
+    /// placeholders during fixup: their complete boxes MUST survive for the
+    /// positioned post-pass. Filtering only explicit rows/cells lost them.
+    fn table_cell_rows(&mut self, table: NodeId) -> Vec<Vec<SharedBox>> {
         let mut header = Vec::new();
         let mut body = Vec::new();
         let mut footer = Vec::new();
         let mut stray = Vec::new();
         for child in self.dom.flat_children(table) {
-            match self.dom.effective_display(child).as_deref() {
+            let display = self.table_child_display(child);
+            if matches!(
+                display.as_deref(),
+                Some(
+                    "table-header-group"
+                        | "table-footer-group"
+                        | "table-row-group"
+                        | "table-row"
+                        | "table-column"
+                        | "table-column-group"
+                        | "table-caption"
+                )
+            ) {
+                self.flush_anonymous_table_row(&mut stray, &mut body);
+            }
+            match display.as_deref() {
                 Some("table-header-group") => header.extend(self.group_rows(child)),
                 Some("table-footer-group") => footer.extend(self.group_rows(child)),
                 Some("table-row-group") => body.extend(self.group_rows(child)),
-                Some("table-row") => body.push(self.row_cells(child)),
-                Some("table-cell") => stray.push(child),
-                _ => {} // columns, captions, whitespace: not rows
+                Some("table-row") => body.push(self.row_cells(self.dom.flat_children(child))),
+                Some("table-column" | "table-column-group" | "table-caption" | "none") => {}
+                _ => stray.push(child),
             }
         }
-        if !stray.is_empty() {
-            body.push(stray);
-        }
+        self.flush_anonymous_table_row(&mut stray, &mut body);
         header.extend(body);
         header.extend(footer);
         header
     }
 
-    /// The `table-row` children of a row group, each resolved to its cells.
-    fn group_rows(&self, group: NodeId) -> Vec<Vec<NodeId>> {
-        self.dom
-            .flat_children(group)
-            .into_iter()
-            .filter(|&r| self.dom.effective_display(r).as_deref() == Some("table-row"))
-            .map(|r| self.row_cells(r))
-            .collect()
+    fn table_child_display(&self, node: NodeId) -> Option<String> {
+        if Pos::of(self.dom, node).out_of_flow() {
+            None
+        } else {
+            self.dom.effective_display(node)
+        }
     }
 
-    /// The `table-cell` children of a row.
-    fn row_cells(&self, row: NodeId) -> Vec<NodeId> {
-        self.dom
-            .flat_children(row)
-            .into_iter()
-            .filter(|&c| self.dom.effective_display(c).as_deref() == Some("table-cell"))
-            .collect()
+    /// Row groups generate missing rows around consecutive non-row children.
+    fn group_rows(&mut self, group: NodeId) -> Vec<Vec<SharedBox>> {
+        let mut rows = Vec::new();
+        let mut pending = Vec::new();
+        for child in self.dom.flat_children(group) {
+            if self.table_child_display(child).as_deref() == Some("table-row") {
+                self.flush_anonymous_table_row(&mut pending, &mut rows);
+                rows.push(self.row_cells(self.dom.flat_children(child)));
+            } else {
+                pending.push(child);
+            }
+        }
+        self.flush_anonymous_table_row(&mut pending, &mut rows);
+        rows
+    }
+
+    fn flush_anonymous_table_row(
+        &mut self,
+        pending: &mut Vec<NodeId>,
+        rows: &mut Vec<Vec<SharedBox>>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let cells = self.row_cells(std::mem::take(pending));
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+
+    /// Explicit cells retain their element style; other consecutive children
+    /// share one anonymous cell. Collapsible whitespace alone creates no cell.
+    fn row_cells(&mut self, children: Vec<NodeId>) -> Vec<SharedBox> {
+        let mut cells = Vec::new();
+        let mut pending = Vec::new();
+        for child in children {
+            if self.table_child_display(child).as_deref() == Some("table-cell") {
+                self.flush_anonymous_table_cell(&mut pending, &mut cells);
+                cells.push(Arc::new(self.container(child, Disp::Block)));
+            } else {
+                pending.push(child);
+            }
+        }
+        self.flush_anonymous_table_cell(&mut pending, &mut cells);
+        cells
+    }
+
+    fn flush_anonymous_table_cell(
+        &mut self,
+        pending: &mut Vec<NodeId>,
+        cells: &mut Vec<SharedBox>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let parent = self.dom.parent_flat(pending[0]);
+        let mut kids = self.build_child_list(&std::mem::take(pending), false);
+        if !kids.iter().any(|child| match child {
+            Built::Block(_) => true,
+            Built::Inline(inline) => inline_has_content(inline),
+            _ => false,
+        }) {
+            return;
+        }
+        // Anonymous boxes inherit from their box-tree parent (§17.2.1).
+        // Explicit descendant elements carry their own computed inheritance;
+        // bare text needs the row/group's inline context, not the table's.
+        if let Some(parent) = parent {
+            for child in &mut kids {
+                if let Built::Inline(Inline::Text(text)) = child {
+                    *child = Built::Inline(Inline::Box {
+                        node: parent,
+                        style: Arc::new(BoxStyle::anonymous()),
+                        kids: vec![Inline::Text(std::mem::take(text))].into(),
+                    });
+                }
+            }
+        }
+        cells.push(Arc::new(self.assemble(
+            crate::layout2::NO_NODE,
+            BoxStyle::anonymous(),
+            kids,
+            None,
+            None,
+            false,
+        )));
     }
 
     /// Place the rows' cells on a grid, resolving `colspan`/`rowspan` into
@@ -1319,8 +1412,8 @@ impl Builder<'_> {
     #[allow(clippy::type_complexity)]
     fn build_grid(
         &self,
-        rows: &[Vec<NodeId>],
-    ) -> (Vec<(NodeId, usize, usize, usize, usize)>, usize, usize) {
+        rows: &[Vec<SharedBox>],
+    ) -> (Vec<(SharedBox, usize, usize, usize, usize)>, usize, usize) {
         let mut cells = Vec::new();
         let mut ncols = 0usize;
         let mut nrows = 0usize;
@@ -1329,21 +1422,21 @@ impl Builder<'_> {
             std::collections::HashSet::new();
         for (r, row) in rows.iter().enumerate() {
             let mut c = 0usize;
-            for &cell in row {
+            for cell in row {
                 while occupied.contains(&(r, c)) {
                     c += 1;
                 }
-                let colspan = self.cell_span(cell, "colspan");
+                let colspan = self.cell_span(cell.node, "colspan");
                 // Cap the occupancy PRODUCT: keep the colspan, clamp rowspan.
                 let rowspan = self
-                    .cell_span(cell, "rowspan")
+                    .cell_span(cell.node, "rowspan")
                     .min((MAX_CELL_SPAN_AREA / colspan).max(1));
                 for rr in r..r + rowspan {
                     for cc in c..c + colspan {
                         occupied.insert((rr, cc));
                     }
                 }
-                cells.push((cell, r, c, rowspan, colspan));
+                cells.push((cell.clone(), r, c, rowspan, colspan));
                 ncols = ncols.max(c + colspan);
                 nrows = nrows.max(r + rowspan);
                 c += colspan;
@@ -1355,6 +1448,9 @@ impl Builder<'_> {
     /// A cell's `colspan`/`rowspan` (HTML attributes), clamped to ≥1 and a
     /// sane ceiling (a hostile `colspan=100000` can't blow up the grid).
     fn cell_span(&self, id: NodeId, attr: &str) -> usize {
+        if id == crate::layout2::NO_NODE {
+            return 1;
+        }
         self.dom
             .attr(id, attr)
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1445,6 +1541,9 @@ fn inline_has_content(i: &Inline) -> bool {
 /// A free function so both the box-tree builder (col/colgroup specs) and the
 /// layout algorithm (per-cell widths — table.rs) read it identically.
 pub(super) fn declared_track_width(dom: &Dom, id: NodeId) -> Option<ColSpec> {
+    if id == crate::layout2::NO_NODE {
+        return None;
+    }
     let raw = dom
         .computed_style(id, "width")
         .or_else(|| dom.attr(id, "width").map(|s| s.trim().to_string()))?;
