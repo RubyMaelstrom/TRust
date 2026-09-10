@@ -368,6 +368,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connectors_advertise_ml_dsa_in_client_hello() {
+        use tokio_rustls::rustls::{ClientConnection, server::Acceptor};
+
+        // RFC 9846 §4.3.3: the ClientHello advertises the signatures the
+        // client can verify. Exercise both WebPKI and our custom TOFU
+        // verifier so rustls's ML-DSA defaults reach the actual wire.
+        for (name, connector) in [
+            ("WebPKI", webpki_connector()),
+            ("TOFU", connector("localhost", 1965)),
+        ] {
+            let mut client = ClientConnection::new(
+                connector.config().clone(),
+                server_name("localhost").unwrap(),
+            )
+            .unwrap();
+            let mut wire = Vec::new();
+            client.write_tls(&mut wire).unwrap();
+            let mut acceptor = Acceptor::default();
+            acceptor.read_tls(&mut wire.as_slice()).unwrap();
+            let accepted = acceptor
+                .accept()
+                .map_err(|(error, _)| error)
+                .unwrap()
+                .expect("complete ClientHello");
+            let hello = accepted.client_hello();
+            for scheme in [
+                SignatureScheme::ML_DSA_44,
+                SignatureScheme::ML_DSA_65,
+                SignatureScheme::ML_DSA_87,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::ED25519,
+            ] {
+                assert!(
+                    hello.signature_schemes().contains(&scheme),
+                    "{name} ClientHello did not advertise {scheme:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn webpki_rejects_untrusted_certificates_in_tls12_and_tls13() {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::{CertificateError, ServerConfig, version};
+
+        // RFC 5280 §6.1.1(d): a self-signed certificate is trusted only
+        // when supplied as a trust anchor through a trusted channel.
+        // Supporting more signature algorithms must preserve WebPKI trust.
+        let connector = webpki_connector();
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        for version in [&version::TLS12, &version::TLS13] {
+            let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(
+                signed.signing_key.serialize_der(),
+            )
+            .unwrap();
+            let config = ServerConfig::builder_with_protocol_versions(&[version])
+                .with_no_client_auth()
+                .with_single_cert(vec![signed.cert.der().clone()], key)
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    connector.connect(server_name("localhost").unwrap(), client_io),
+                    acceptor.accept(server_io),
+                )
+            })
+            .await
+            .expect("TLS handshake timed out");
+            let error = client.unwrap_err();
+            assert!(
+                matches!(
+                    error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<Error>()),
+                    Some(Error::InvalidCertificate(CertificateError::UnknownIssuer))
+                ),
+                "{version:?}: expected an untrusted issuer error, got {error:?}"
+            );
+            assert!(
+                server.is_err(),
+                "{version:?}: server completed an untrusted handshake"
+            );
+        }
+    }
+
+    #[test]
     fn client_identities_mint_and_load_in_any_order() {
         // All identity tests share one temp dir (the env var is
         // process-global); each uses its own hostname.
