@@ -214,6 +214,7 @@ struct HostState {
     blobs: crate::js::BlobMap,
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
+    screen_position: Cell<(i32, i32)>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
@@ -262,6 +263,7 @@ impl HostState {
             blobs: Default::default(),
             viewport: Cell::new(DEFAULT_VIEWPORT),
             device_pixel_ratio: Cell::new(1.0),
+            screen_position: Cell::new((0, 0)),
             geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
             images: Default::default(),
             task_events: None,
@@ -427,6 +429,7 @@ impl RetainedMemory for HostState {
             blobs,
             viewport,
             device_pixel_ratio,
+            screen_position,
             geom_cache,
             images,
             task_events,
@@ -457,6 +460,7 @@ impl RetainedMemory for HostState {
         let _ = (
             viewport,
             device_pixel_ratio,
+            screen_position,
             pending_resources,
             next_window_context,
         );
@@ -1076,6 +1080,7 @@ mod desktop {
             viewport: env.viewport,
             cell_px: env.cell_px,
             device_pixel_ratio: env.device_pixel_ratio,
+            screen_position: env.screen_position,
             externals: env.externals.clone(),
             sheets: env.sheets.clone(),
             cache: env.cache.clone(),
@@ -1798,6 +1803,7 @@ mod desktop {
         state.blobs = env.blobs.clone();
         state.viewport.set(viewport);
         state.device_pixel_ratio.set(env.device_pixel_ratio);
+        state.screen_position.set(env.screen_position);
         // Inline and data-backed module scripts use the HTML task queue even when this document
         // has no network runtime. Keep that local task source independent of `enable_network`.
         state.task_events = Some(host_tasks.clone());
@@ -2654,25 +2660,28 @@ mod desktop {
             }
             PageCmd::Key { node, input } => {
                 prepare_interaction(page, interrupt);
-                let (key, code) = key_and_code(&input.key);
+                let key = key_name(&input.key);
+                let released = input.state == crate::core::KeyState::Released;
                 let prevented = call_trust(
                     page,
                     "key",
                     &[
-                        Value::Num(node as f64),
+                        node.map_or(Value::Null, |node| Value::Num(node as f64)),
                         Value::from_string(key),
-                        Value::from_string(code),
+                        Value::from_string(input.code),
                         Value::Bool(input.repeat),
                         Value::Bool(input.composing),
                         Value::Bool(input.modifiers.shift),
                         Value::Bool(input.modifiers.control),
                         Value::Bool(input.modifiers.alt),
                         Value::Bool(input.modifiers.meta),
+                        Value::Bool(released),
+                        Value::Num(input.location as f64),
                     ],
-                    "keydown",
+                    if released { "keyup" } else { "keydown" },
                 )
                 .is_some_and(|value| page.engine.ctx().to_boolean(&value));
-                checkpoint(page, "keydown");
+                checkpoint(page, if released { "keyup" } else { "keydown" });
                 if let Some((url, replace)) = take_navigation(page) {
                     return send_navigation(events, url, replace);
                 }
@@ -2681,6 +2690,14 @@ mod desktop {
                     return false;
                 }
                 if let Some((form, submitter, submission)) = click_submit {
+                    // The authored key action already activated this submitter. Acknowledge
+                    // the key before submission so subsequent key-up/default replies stay FIFO.
+                    if events
+                        .blocking_send(PageEvt::KeyDefault { prevented: true })
+                        .is_err()
+                    {
+                        return false;
+                    }
                     return events
                         .blocking_send(PageEvt::SubmitForm {
                             form,
@@ -2868,6 +2885,13 @@ mod desktop {
                     true
                 }
             }
+            PageCmd::ScreenPosition(x, y) => {
+                if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                    state.screen_position.set((x, y));
+                }
+                // Moving a client window does not resize or relayout its DOM.
+                true
+            }
             PageCmd::Viewport(viewport) => {
                 let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
                 let changed = page
@@ -2949,9 +2973,9 @@ mod desktop {
         if value.is_finite() { value } else { 0.0 }
     }
 
-    fn key_and_code(key: &crate::core::Key) -> (String, String) {
+    fn key_name(key: &crate::core::Key) -> String {
         use crate::core::Key;
-        let key_name = match key {
+        match key {
             Key::Character(value) | Key::Other(value) => value.clone(),
             Key::Enter => String::from("Enter"),
             Key::Escape => String::from("Escape"),
@@ -2966,15 +2990,7 @@ mod desktop {
             Key::End => String::from("End"),
             Key::PageUp => String::from("PageUp"),
             Key::PageDown => String::from("PageDown"),
-        };
-        let code = match key {
-            Key::Character(value) if value.len() == 1 => {
-                format!("Key{}", value.to_ascii_uppercase())
-            }
-            Key::Character(_) => String::new(),
-            _ => key_name.clone(),
-        };
-        (key_name, code)
+        }
     }
 
     #[cfg(test)]
@@ -3365,6 +3381,194 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn actor_native_keyboard_delivery_uses_current_focus_for_each_event() {
+            let html = r#"<canvas id="game" tabindex="-1"></canvas><button id="next">Next</button><script>
+                const game = document.getElementById('game');
+                const next = document.getElementById('next');
+                game.focus();
+                game.addEventListener('keydown', e => {
+                    if (!e.isTrusted || e.code !== 'KeyY' || e.key !== 'z' || e.keyCode !== 90)
+                        throw Error('bad native keydown');
+                    e.preventDefault();
+                    next.focus();
+                });
+                game.addEventListener('keypress', () => { throw Error('canceled keypress'); });
+                next.addEventListener('keyup', e => {
+                    if (!e.isTrusted || e.keyCode !== 90 || e.charCode !== 0 || e.location !== 0)
+                        throw Error('bad native keyup');
+                    queueMicrotask(() => location.href = '/keyboard-delivered');
+                });
+            </script>"#;
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("keyboard setup: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("keyboard page closed during setup"),
+                    }
+                }
+                for state in [
+                    crate::core::KeyState::Pressed,
+                    crate::core::KeyState::Released,
+                ] {
+                    handle
+                        .try_send_user(PageCmd::Key {
+                            node: None,
+                            input: crate::core::KeyInput {
+                                key: crate::core::Key::Character("z".into()),
+                                code: "KeyY".into(),
+                                location: 0,
+                                state,
+                                modifiers: Default::default(),
+                                repeat: false,
+                                composing: false,
+                            },
+                        })
+                        .unwrap();
+                }
+                let mut acknowledged = false;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::KeyDefault { prevented }) => {
+                            assert!(
+                                prevented && !acknowledged,
+                                "keydown cancellation acknowledgement"
+                            );
+                            acknowledged = true;
+                        }
+                        Some(PageEvt::Navigate(url)) => {
+                            assert!(
+                                acknowledged,
+                                "keydown acknowledged before release navigation"
+                            );
+                            assert_eq!(url, "https://example.com/keyboard-delivered");
+                            break;
+                        }
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors)
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("native keyboard: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("keyboard page closed before keyup"),
+                    }
+                }
+            })
+            .await
+            .expect("native keyboard delivery timed out");
+        }
+
+        #[tokio::test]
+        async fn actor_enter_keypress_search_matches_button_navigation() {
+            // Reduced archive.org pattern: a formless input in nested shadow
+            // roots emits a component submit event on keypress; the separate
+            // type=button search control invokes the same navigation handler.
+            let html = r#"<search-widget id="search">
+                <input id="query"><button id="magnify" type="button">Search</button>
+                </search-widget><script>
+                const search = document.getElementById('search');
+                const input = document.getElementById('query');
+                const button = document.getElementById('magnify');
+                const root = search.attachShadow({mode: 'open'});
+                const component = document.createElement('text-widget');
+                root.appendChild(component);
+                component.attachShadow({mode: 'open'}).appendChild(input);
+                root.appendChild(button);
+                let value = '';
+                input.addEventListener('input', () => { value = input.value; });
+                input.addEventListener('keypress', event => {
+                    if (event.key === 'Enter') {
+                        input.blur();
+                        component.dispatchEvent(new CustomEvent('submit', {detail: value}));
+                    }
+                });
+                function searchRequested() {
+                    queueMicrotask(() => {
+                        location.href = '/search?' + new URLSearchParams({query: value, tab: 'all'});
+                    });
+                }
+                component.addEventListener('submit', searchRequested);
+                button.addEventListener('click', searchRequested);
+                input.focus();
+                </script>"#;
+            let dom = Dom::parse_document(html);
+            let input = dom.get_by_id("query").unwrap();
+            let button = dom.get_by_id("magnify").unwrap();
+            for click in [false, true] {
+                let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        match events.recv().await {
+                            Some(PageEvt::Updated { outcome, .. }) => {
+                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                                break;
+                            }
+                            Some(PageEvt::Trouble(errors)) => panic!("search setup: {errors:?}"),
+                            Some(_) => {}
+                            None => panic!("search page closed during setup"),
+                        }
+                    }
+                    handle
+                        .try_send_user(PageCmd::SetValue {
+                            node: input,
+                            value: "cats & dogs".into(),
+                            checked: None,
+                        })
+                        .unwrap();
+                    handle
+                        .try_send_user(if click {
+                            PageCmd::Click(button)
+                        } else {
+                            PageCmd::Key {
+                                node: Some(input),
+                                input: crate::core::KeyInput {
+                                    key: crate::core::Key::Enter,
+                                    code: String::from("Enter"),
+                                    location: 0,
+                                    state: crate::core::KeyState::Pressed,
+                                    modifiers: Default::default(),
+                                    repeat: false,
+                                    composing: false,
+                                },
+                            }
+                        })
+                        .unwrap();
+                    loop {
+                        match events.recv().await {
+                            Some(PageEvt::Navigate(url)) => {
+                                assert_eq!(
+                                    url,
+                                    "https://example.com/search?query=cats+%26+dogs&tab=all"
+                                );
+                                break;
+                            }
+                            Some(
+                                PageEvt::KeyDefault { .. }
+                                | PageEvt::SubmitForm { .. }
+                                | PageEvt::SubmitDefault
+                                | PageEvt::Reload(_),
+                            ) => {
+                                panic!("search fell through to a native default (click={click})");
+                            }
+                            Some(PageEvt::Updated { outcome, .. }) => {
+                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            }
+                            Some(PageEvt::Trouble(errors)) => panic!("search: {errors:?}"),
+                            Some(_) => {}
+                            None => panic!("search page closed before navigation"),
+                        }
+                    }
+                })
+                .await
+                .expect("search navigation timed out");
+            }
+        }
 
         #[tokio::test]
         async fn actor_page_focus_commits_input_before_blur_and_checkpoints_handlers() {
@@ -4478,6 +4682,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__image_binding", 2, image_host::call),
     ("__wasm_module_binding", 1, host_wasm_module_binding),
     ("__window_message_binding", 2, host_window_message_binding),
+    (
+        "__window_screen_coordinate",
+        1,
+        host_window_screen_coordinate,
+    ),
     ("__callback_api", 3, host_callback_api),
     ("__invoke_callback", 4, host_invoke_callback),
     ("__permissions_binding", 2, host_permissions_binding),
@@ -4490,7 +4699,10 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_create_element_ns", 3, host_create_element_ns),
     ("__dom_create_text", 1, host_create_text),
     ("__dom_create_fragment", 0, host_create_fragment),
-    ("__dom_parse_document", 1, host_parse_document),
+    ("__dom_parse_document", 2, host_parse_document),
+    ("__dom_create_document", 1, host_create_document),
+    ("__dom_document_content_type", 1, host_document_content_type),
+    ("__dom_pi_target", 1, host_pi_target),
     ("__dom_create_comment", 0, host_create_comment),
     ("__dom_append", 2, host_append),
     ("__dom_insert_before", 3, host_insert_before),
@@ -4673,6 +4885,27 @@ impl lumen::embed::NativeCallableRetained for PlatformOperation {
             std::mem::size_of::<Self>(),
         ));
     }
+}
+
+/// CSSOM View client-window origin. All Window Realms in this page share the
+/// native window, not the origin of their individual iframe viewport.
+fn host_window_screen_coordinate(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let (x, y) = ctx
+        .host_mut::<HostState>()
+        .expect("Window coordinates require HostState")
+        .screen_position
+        .get();
+    Ok(Value::Num(f64::from(
+        if matches!(args.first(), Some(Value::Bool(true))) {
+            y
+        } else {
+            x
+        },
+    )))
 }
 
 /// Private per-Agent Web IDL brands; values remain owned by the creating
@@ -7881,9 +8114,44 @@ fn host_create_fragment(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<
 /// page arena; fragment parsing is exposed by the later inner-HTML boundary slice.
 fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let html = host_arg_string(ctx, args, 0);
+    let content_type = args
+        .get(1)
+        .filter(|value| !matches!(value, Value::Undefined))
+        .map(|_| host_arg_string(ctx, args, 1))
+        .unwrap_or_else(|| "text/html".into());
     let dom = host_dom(ctx);
-    let id = dom.borrow_mut().parse_document_into(&html);
+    let id = if content_type == "text/html" {
+        dom.borrow_mut().parse_document_into(&html)
+    } else {
+        dom.borrow_mut()
+            .parse_xml_document_into(&html, &content_type)
+    };
     Ok(host_id_value(Some(id)))
+}
+
+fn host_create_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let content_type = host_arg_string(ctx, args, 0);
+    let id = host_dom(ctx).borrow_mut().create_document(&content_type);
+    Ok(host_id_value(Some(id)))
+}
+
+fn host_document_content_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let content_type = host_arg_node(&dom, args, 0)
+        .map(|id| dom.document_content_type(id))
+        .unwrap_or("text/html");
+    Ok(Value::Str(content_type.to_owned().into()))
+}
+
+fn host_pi_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let target = match host_arg_node(&dom, args, 0).map(|id| &dom.node(id).data) {
+        Some(NodeData::ProcessingInstruction { target, .. }) => target.as_str(),
+        _ => "",
+    };
+    Ok(Value::Str(target.to_owned().into()))
 }
 
 fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -8183,6 +8451,8 @@ fn host_node_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let node_type = match host_arg_node(&dom, args, 0).map(|id| &dom.node(id).data) {
         Some(NodeData::Element { .. }) => 1,
         Some(NodeData::Text(_)) => 3,
+        Some(NodeData::CData(_)) => 4,
+        Some(NodeData::ProcessingInstruction { .. }) => 7,
         Some(NodeData::Comment(_)) => 8,
         Some(NodeData::Document) => 9,
         Some(NodeData::Doctype) => 10,
@@ -8239,7 +8509,7 @@ fn host_get_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(
-        match host_arg_node(&dom, args, 0).and_then(|id| dom.attr(id, &name)) {
+        match host_arg_node(&dom, args, 0).and_then(|id| dom.get_attribute(id, &name)) {
             Some(value) => Value::from_string(value.to_owned()),
             None => Value::Null,
         },
@@ -9881,6 +10151,44 @@ mod tests {
     }
 
     #[test]
+    fn window_screen_coordinates_are_live_replaceable_and_shared_with_frames() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, "[screenX,screenLeft,screenY,screenTop].join()"),
+                "0,0,0,0"
+            );
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .screen_position
+                .set((-137, 245));
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/window_screen.mjs")),
+                "window-screen-ok",
+                "{tier:?}"
+            );
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .screen_position
+                .set((321, -98));
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "[screenX,screenLeft,screenY,screenTop,__screenChild.screenX,__screenChild.screenY].join()"
+                ),
+                "author,321,-98,-98,321,-98",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn native_page_focus_blurs_to_viewport_without_losing_text_or_touching_selection() {
         let mut engine = configured_engine(
             HostState::new(
@@ -10420,7 +10728,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 137, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 141, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -10431,7 +10739,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 137);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 141);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -11038,21 +11346,20 @@ mod tests {
         "#,"canvas presentation setup").unwrap();
         let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
         let base = url::Url::parse(DEFAULT_URL).unwrap();
-        let dom = dom.borrow();
-        let page = crate::http::render_arena(
-            &dom,
-            &base,
-            crate::layout2::Viewport::new(128., 96.),
-            1.,
-            None,
-            &Default::default(),
-        );
-        assert!(
-            page.image_urls
-                .iter()
-                .any(|url| url.starts_with("data:image/png;base64,")),
-            "terminal image discovery"
-        );
+        let make_page = || {
+            crate::http::render_arena(
+                &dom.borrow(),
+                &base,
+                crate::layout2::Viewport::new(128., 96.),
+                1.,
+                None,
+                &Default::default(),
+            )
+        };
+        let page = make_page();
+        assert!(page.image_urls.is_empty(), "canvas is not an image fetch");
+        assert!(page.layout.paint.image_requests.is_empty());
+        assert_eq!(page.layout.paint.canvas_images.len(), 1);
         let frame = crate::render::headless::render_paint(
             &page.layout.paint,
             crate::core::CssSize::new(128., 96.),
@@ -11061,6 +11368,142 @@ mod tests {
         let pixel = |x: usize, y: usize| &frame.pixels[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4];
         assert_eq!(pixel(10, 20), &[255, 0, 0, 255]);
         assert_eq!(pixel(50, 20), &[0, 255, 0, 255]);
+
+        let make_scene = |paint: &crate::render::PagePaint| {
+            use crate::core::{CssPoint, CssSize, PhysicalSize, ViewportMetrics};
+            use crate::render::CssRect;
+            let mut scene = crate::render::Scene {
+                viewport: ViewportMetrics::from_physical(
+                    PhysicalSize::new(128, 96),
+                    Default::default(),
+                ),
+                primitives: Vec::new(),
+                controls: Vec::new(),
+                content_viewport: CssRect::new(0., 0., 128., 96.),
+                image_store: Default::default(),
+                canvas_images: Default::default(),
+                page_scroll_containers: Vec::new(),
+                page_size: CssSize::default(),
+            };
+            scene.append_page(paint, CssPoint::default());
+            scene
+        };
+        let first = make_scene(&page.layout.paint);
+        let mut renderer = crate::render::vello_cpu::VelloCpuRenderer::new();
+        let initial = renderer.render_rgba(&first).unwrap();
+        eval(
+            &mut engine,
+            "context.fillStyle='#0000ff';context.fillRect(0,0,64,48)",
+            "canvas update",
+        )
+        .unwrap();
+        let mut repainted = (*page.layout).clone();
+        assert!(crate::layout2::repaint_graphical(
+            &mut repainted,
+            &dom.borrow(),
+            &base,
+            &Default::default(),
+            &Default::default()
+        ));
+        let updated = make_page();
+        assert_eq!(
+            repainted.paint.canvas_images, updated.layout.paint.canvas_images,
+            "paint-only invalidation refreshes pixels without rebuilding geometry"
+        );
+        let second = make_scene(&updated.layout.paint);
+        let old_image = &page.layout.paint.canvas_images[0].1;
+        let new_image = &updated.layout.paint.canvas_images[0].1;
+        assert_eq!(old_image.handle, new_image.handle, "stable canvas identity");
+        assert_ne!(old_image.generation, new_image.generation);
+        assert_eq!(
+            crate::render::scene_damage(&first, &second),
+            crate::render::SceneDamage::Full
+        );
+        let changed = renderer.render_rgba(&second).unwrap();
+        assert_eq!(
+            &changed.pixels[(20 * 128 + 10) * 4..(20 * 128 + 10) * 4 + 4],
+            &[0, 0, 255, 255]
+        );
+        assert_eq!(
+            renderer.render_rgba(&first).unwrap().pixels,
+            initial.pixels,
+            "old frames retain their pixels, even with a shared renderer cache"
+        );
+        if let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) {
+            let gpu_initial = hybrid.render_rgba(&first).unwrap();
+            let gpu_changed = hybrid.render_rgba(&second).unwrap();
+            assert_eq!(
+                &gpu_changed.pixels[(20 * 128 + 10) * 4..][..4],
+                &[0, 0, 255, 255]
+            );
+            assert_eq!(
+                hybrid.render_rgba(&first).unwrap().pixels,
+                gpu_initial.pixels
+            );
+            eprintln!("canvas snapshot handoff exercised on hybrid renderer");
+        }
+
+        // HTML canvas serialization is still available to the terminal adapter,
+        // and must serialize this page's snapshot, not the newly painted DOM.
+        let old_url = old_image.data_url().unwrap();
+        let terminal = crate::http::adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            page,
+            crate::layout2::TerminalViewport::new(16, 6, 8., 16.),
+            &Default::default(),
+        );
+        assert!(terminal.image_urls.contains(&old_url));
+        assert!(terminal.eager_image_urls.contains(&old_url));
+        assert!(
+            terminal
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .any(|item| item.image.as_ref() == Some(&old_url)),
+            "terminal rows retain their canvas image"
+        );
+        assert_ne!(old_url, new_image.data_url().unwrap());
+
+        // Resizing replaces the bitmap with transparent black, even when the
+        // dimensions are unchanged; retaining the handle must not retain pixels.
+        eval(&mut engine, "c.width=64", "canvas resize").unwrap();
+        let resized = make_page();
+        let resized_scene = make_scene(&resized.layout.paint);
+        assert_eq!(
+            crate::render::scene_damage(&second, &resized_scene),
+            crate::render::SceneDamage::Full
+        );
+        let resized_frame = renderer.render_rgba(&resized_scene).unwrap();
+        assert_eq!(
+            &resized_frame.pixels[(20 * 128 + 10) * 4..(20 * 128 + 10) * 4 + 4],
+            &[255, 255, 255, 255]
+        );
+        eval(&mut engine, r#"
+            document.body.innerHTML='<canvas width="64" height="48" style="position:absolute;left:0;top:0"></canvas>';
+        "#, "canvas without context").unwrap();
+        let blank = make_page();
+        assert!(blank.layout.paint.canvas_images.is_empty());
+        assert!(blank.layout.paint.image_requests.is_empty());
+        assert!(
+            blank
+                .layout
+                .paint
+                .primitives
+                .iter()
+                .any(|command| matches!(command, crate::render::DisplayCommand::HitRegion { .. })),
+            "transparent canvas still participates in hit testing"
+        );
+        assert_eq!(
+            renderer
+                .render_rgba(&make_scene(&blank.layout.paint))
+                .unwrap()
+                .pixels,
+            resized_frame.pixels
+        );
     }
 
     #[test]
@@ -17101,6 +17544,104 @@ mod tests {
             string_value(&mut engine, "frameElementEventPathResult"),
             "1|1|1|0|0"
         );
+    }
+
+    #[test]
+    fn xml_documents_and_xhr_document_responses_follow_standards() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/xml_documents.mjs"),
+                "XML document regression fixture",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "xml-documents-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_table_interfaces_and_live_collections_follow_standards() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/html_tables.mjs"),
+                "HTML table regression fixture",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "html-tables-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_keyboard_delivery_follows_focus_and_preserves_legacy_codes() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/keyboard_delivery.mjs"),
+                "native keyboard delivery fixture",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "keyboard-delivery-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_enter_keypress_and_form_defaults_follow_standards() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/keyboard_enter.mjs"),
+                "native Enter regression fixture",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "keyboard-enter-ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]

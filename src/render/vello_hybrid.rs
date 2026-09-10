@@ -971,7 +971,7 @@ impl VelloHybridRenderer {
         fit: ImageFit,
         sampling: ImageSampling,
     ) -> Result<(), String> {
-        let store_revision = scene.image_store.revision(handle);
+        let store_revision = scene.image_revision(handle);
         let changed = self
             .images
             .get(&handle)
@@ -980,7 +980,7 @@ impl VelloHybridRenderer {
         if changed {
             let replacement =
                 store_revision
-                    .zip(scene.image_store.get(handle))
+                    .zip(scene.image(handle))
                     .and_then(|(revision, image)| {
                         let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
                             .min(self.device.limits().max_texture_dimension_2d)
@@ -1060,7 +1060,7 @@ impl VelloHybridRenderer {
         }
         if !self.images.contains_key(&handle)
             && let Some(revision) = store_revision
-            && let Some(image) = scene.image_store.get(handle)
+            && let Some(image) = scene.image(handle)
         {
             let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
                 .min(self.device.limits().max_texture_dimension_2d)
@@ -1464,6 +1464,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 180.0, 180.0),
             image_store: Default::default(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::new(180.0, 180.0),
         };
@@ -1565,6 +1566,7 @@ mod tests {
                 controls: Vec::new(),
                 content_viewport: CssRect::new(0.0, 0.0, 64.0, 32.0),
                 image_store: store.clone(),
+                canvas_images: Default::default(),
                 page_scroll_containers: Vec::new(),
                 page_size: CssSize::new(64.0, 32.0),
             };

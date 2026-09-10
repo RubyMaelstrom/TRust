@@ -615,13 +615,11 @@ enum FocusTarget {
     },
 }
 
-/// A key whose DOM `keydown` is running in the resident page. The native
-/// editing/default action waits for the actor's `PageEvt::KeyDefault`, so page
-/// script can cancel Enter for rich editors and chat composers.
+/// A native key awaiting its resident-page acknowledgement. Page script can
+/// cancel keyboard defaults (scrolling, activation, or an editor's Enter).
 #[derive(Clone, Debug)]
 struct PendingPageKey {
-    form: usize,
-    field: usize,
+    form: Option<(usize, usize)>,
     input: KeyInput,
 }
 
@@ -1902,33 +1900,39 @@ impl DesktopApp {
     }
 
     /// Apply the user-agent default for a live-page key after its cancelable
-    /// `keydown` has completed in the resident actor. HTML Editing APIs leave
-    /// editing-host insertion to the user agent; HTML §4.10.22.2 defines the
-    /// Enter implicit-submission path for single-line text controls.
+    /// keydown/keypress sequence has completed in the resident actor. HTML
+    /// Editing APIs leave editing-host insertion to the user agent;
+    /// HTML §4.10.22.2 defines Enter submission for single-line text controls.
     fn apply_page_key_defaults(&mut self) {
         while let Some(prevented) = self.browser.take_page_key_default() {
             let Some(pending) = self.pending_page_keys.pop_front() else {
                 continue;
             };
-            if prevented
-                || self.focus
-                    != (FocusTarget::Form {
-                        form: pending.form,
-                        field: pending.field,
-                    })
-            {
+            let Some((form, field)) = pending.form else {
+                if !prevented
+                    && self.focus == FocusTarget::Page
+                    && pending.input.state == KeyState::Pressed
+                    && !self.handle_http_scroll_key(&pending.input)
+                    && pending.input.key == Key::Enter
+                    && let Some(target) = self.keyboard_target.clone()
+                {
+                    self.activate_page_hit(target);
+                }
+                continue;
+            };
+            if prevented || self.focus != (FocusTarget::Form { form, field }) {
                 continue;
             }
             let kind = self
                 .page_layout
                 .as_ref()
-                .and_then(|page| page.document.forms.get(pending.form))
-                .and_then(|form| form.fields.get(pending.field))
+                .and_then(|page| page.document.forms.get(form))
+                .and_then(|form| form.fields.get(field))
                 .map(|field| field.kind.clone());
             match kind {
                 Some(FieldKind::Text | FieldKind::Password) => {
                     self.finish_text_edit();
-                    self.submit_form_default(pending.form);
+                    self.submit_form_default(form);
                 }
                 Some(FieldKind::Textarea)
                     if self
@@ -2066,6 +2070,24 @@ impl DesktopApp {
             self.metrics.scale_factor.get() as f32,
         ));
         self.dispatch(UserAction::Resize(self.browser_viewport()));
+        self.update_screen_position();
+    }
+
+    fn update_screen_position(&mut self) {
+        let position = self
+            .window
+            .as_ref()
+            .and_then(|window| {
+                // Winit exposes physical client-area coordinates on platforms
+                // that permit them. Wayland deliberately does not; CSSOM View
+                // specifies zero when there is no exposed client-window origin.
+                window.inner_position().ok().map(|position| {
+                    let logical = position.to_logical::<f64>(window.scale_factor());
+                    (logical.x.round() as i32, logical.y.round() as i32)
+                })
+            })
+            .unwrap_or((0, 0));
+        self.dispatch(UserAction::ScreenPosition(position.0, position.1));
     }
 
     fn browser_viewport(&self) -> CssSize {
@@ -3149,8 +3171,7 @@ impl DesktopApp {
         // handler reading the editor's value sees the latest native input.
         self.finish_text_edit();
         self.pending_page_keys.push_back(PendingPageKey {
-            form,
-            field,
+            form: Some((form, field)),
             input: input.clone(),
         });
         self.dispatch(UserAction::PageKey {
@@ -3246,6 +3267,22 @@ impl DesktopApp {
 
         let input = KeyInput {
             key: translate_key(&event.logical_key),
+            code: match event.physical_key {
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::SuperLeft) => {
+                    String::from("MetaLeft")
+                }
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::SuperRight) => {
+                    String::from("MetaRight")
+                }
+                winit::keyboard::PhysicalKey::Code(code) => format!("{code:?}"),
+                _ => String::new(),
+            },
+            location: match event.location {
+                winit::keyboard::KeyLocation::Standard => 0,
+                winit::keyboard::KeyLocation::Left => 1,
+                winit::keyboard::KeyLocation::Right => 2,
+                winit::keyboard::KeyLocation::Numpad => 3,
+            },
             state: if pressed {
                 KeyState::Pressed
             } else {
@@ -3327,6 +3364,17 @@ impl DesktopApp {
             && self.terminal.is_none()
             && self.handle_gopherus_key(&input)
         {
+            return;
+        }
+        if self.focus == FocusTarget::Page && self.terminal.is_none() && self.browser.page_is_live()
+        {
+            // UI Events keydown/keyup target live DOM focus. Wait for cancellation before
+            // running page scrolling/activation defaults; UA shortcuts above remain native.
+            self.pending_page_keys.push_back(PendingPageKey {
+                form: None,
+                input: input.clone(),
+            });
+            self.dispatch(UserAction::Key(input));
             return;
         }
         if self.focus == FocusTarget::Page
@@ -3486,7 +3534,10 @@ impl DesktopApp {
                 return;
             }
         }
-        self.dispatch(UserAction::Key(input));
+        // Keys consumed by browser chrome must not leak into the underlying document.
+        if self.focus == FocusTarget::Page {
+            self.dispatch(UserAction::Key(input));
+        }
     }
 
     fn handle_ime(&mut self, event: Ime) {
@@ -5395,6 +5446,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.update_metrics(None);
                 self.request_redraw();
             }
+            WindowEvent::Moved(_) => {
+                self.update_screen_position();
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.update_metrics(Some(scale_factor));
                 self.request_redraw();
@@ -6018,7 +6072,11 @@ fn translate_key(key: &WinitKey) -> Key {
         WinitKey::Named(NamedKey::End) => Key::End,
         WinitKey::Named(NamedKey::PageUp) => Key::PageUp,
         WinitKey::Named(NamedKey::PageDown) => Key::PageDown,
-        other => Key::Other(format!("{other:?}")),
+        WinitKey::Named(NamedKey::Space) => Key::Character(String::from(" ")),
+        WinitKey::Named(NamedKey::Super) => Key::Other(String::from("Meta")),
+        WinitKey::Named(named) => Key::Other(format!("{named:?}")),
+        WinitKey::Dead(_) => Key::Other(String::from("Dead")),
+        WinitKey::Unidentified(_) => Key::Other(String::from("Unidentified")),
     }
 }
 
@@ -6242,6 +6300,7 @@ mod tests {
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 160.0, 100.0),
             image_store: ImageStore::default(),
+            canvas_images: Default::default(),
             page_scroll_containers: Vec::new(),
             page_size: CssSize::new(160.0, 100.0),
         };
@@ -6299,6 +6358,34 @@ mod tests {
         pending = true;
         assert!(consume_pending_redraw(&mut pending));
         assert!(!consume_pending_redraw(&mut pending));
+    }
+
+    #[test]
+    fn native_keyboard_names_preserve_modifier_and_character_identity() {
+        assert_eq!(
+            translate_key(&WinitKey::Named(NamedKey::Super)),
+            Key::Other("Meta".into())
+        );
+        assert_eq!(
+            translate_key(&WinitKey::Named(NamedKey::Shift)),
+            Key::Other("Shift".into())
+        );
+        assert_eq!(
+            translate_key(&WinitKey::Named(NamedKey::F12)),
+            Key::Other("F12".into())
+        );
+        assert_eq!(
+            translate_key(&WinitKey::Named(NamedKey::Space)),
+            Key::Character(" ".into())
+        );
+        assert_eq!(
+            translate_key(&WinitKey::Dead(Some('^'))),
+            Key::Other("Dead".into())
+        );
+        assert_eq!(
+            translate_key(&WinitKey::Character("é".into())),
+            Key::Character("é".into())
+        );
     }
 
     #[test]

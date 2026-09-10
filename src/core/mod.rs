@@ -160,6 +160,9 @@ pub enum KeyState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyInput {
     pub key: Key,
+    /// UI Events physical key identity; empty when the input source cannot provide it.
+    pub code: String,
+    pub location: u32,
     pub state: KeyState,
     pub modifiers: Modifiers,
     pub repeat: bool,
@@ -221,6 +224,8 @@ pub enum UserAction {
     /// Output-device pixels per CSS pixel (monitor scale / browser zoom
     /// density), kept separate from CSS viewport geometry.
     DevicePixelRatio(f32),
+    /// Client-window origin in CSS pixels, independent of viewport scrolling.
+    ScreenPosition(i32, i32),
     Focus(bool),
     PointerMove(CssPoint),
     PointerButton {
@@ -256,8 +261,8 @@ pub enum UserAction {
         value: String,
         checked: Option<bool>,
     },
-    /// Deliver a native keydown to the focused live DOM node. The resident
-    /// actor reports whether page script canceled its default action.
+    /// Deliver a native key press to the focused live DOM node. The resident
+    /// actor reports whether to suppress the frontend's editing/form default.
     PageKey {
         node: usize,
         input: KeyInput,
@@ -409,6 +414,10 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    UserInputReady {
+        generation: u64,
+        permit: Option<tokio::sync::mpsc::OwnedPermit<crate::js::PageCmd>>,
+    },
     FetchFinished {
         generation: u64,
         result: Result<FetchedDocument, String>,
@@ -495,6 +504,9 @@ pub struct BrowserController {
     /// Default-action results for keyboard events delivered to the resident
     /// page. Native frontends consume these after the actor runs `keydown`.
     page_key_defaults: VecDeque<bool>,
+    /// Preserve native input FIFO while the actor's bounded channel is full.
+    pending_user_input: VecDeque<(crate::js::PageCmd, bool)>,
+    user_input_retry: Option<JoinHandle<()>>,
     pending_fragment: Option<String>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
@@ -505,6 +517,7 @@ pub struct BrowserController {
     status: String,
     viewport: CssSize,
     device_pixel_ratio: f32,
+    screen_position: (i32, i32),
     interaction: InteractionState,
     live_regions: Vec<usize>,
     live_boundaries: Vec<usize>,
@@ -551,6 +564,8 @@ impl BrowserController {
             render_is_final: false,
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
+            pending_user_input: VecDeque::new(),
+            user_input_retry: None,
             pending_fragment: None,
             external_media: VecDeque::new(),
             download_offer: None,
@@ -561,6 +576,7 @@ impl BrowserController {
             status: String::from("Ready"),
             viewport,
             device_pixel_ratio: 1.0,
+            screen_position: (0, 0),
             interaction: InteractionState::default(),
             live_regions: Vec::new(),
             live_boundaries: Vec::new(),
@@ -661,9 +677,9 @@ impl BrowserController {
         self.render_is_final
     }
 
-    /// Take the next resident-page keyboard default result. `true` means the
-    /// page canceled `keydown`; `false` lets the native frontend run the
-    /// corresponding editing or implicit-submission default.
+    /// Take the next resident-page keyboard default result. `true` suppresses
+    /// the native default (canceled keydown/keypress, IME composition, or Enter
+    /// in a formless input); `false` lets the frontend apply editing/submission.
     pub fn take_page_key_default(&mut self) -> Option<bool> {
         self.page_key_defaults.pop_front()
     }
@@ -875,6 +891,13 @@ impl BrowserController {
                     true
                 }
             }
+            UserAction::ScreenPosition(x, y) => {
+                if self.screen_position != (x, y) {
+                    self.screen_position = (x, y);
+                    self.send_live(crate::js::PageCmd::ScreenPosition(x, y));
+                }
+                false
+            }
             UserAction::Focus(focused) => {
                 let changed = self.interaction.focused != focused;
                 self.interaction.focused = focused;
@@ -962,7 +985,10 @@ impl BrowserController {
                 true
             }
             UserAction::PageKey { node, input } => {
-                self.send_user(crate::js::PageCmd::Key { node, input });
+                self.send_user(crate::js::PageCmd::Key {
+                    node: Some(node),
+                    input,
+                });
                 false
             }
             UserAction::SubmitForm { form, submitter } => {
@@ -996,10 +1022,16 @@ impl BrowserController {
                 }
                 true
             }
-            UserAction::Key(_) | UserAction::TextInput(_) => false,
+            UserAction::Key(input) => {
+                // The live actor resolves focus at dispatch time, including shadow trees and
+                // child browsing contexts; presentation hit-test state is not DOM focus.
+                self.send_user(crate::js::PageCmd::Key { node: None, input });
+                false
+            }
+            UserAction::TextInput(_) => false,
         };
         ActionOutcome {
-            invalidated,
+            invalidated: invalidated || self.generation != generation_before,
             loading_retired: self.generation != generation_before,
         }
     }
@@ -1011,6 +1043,20 @@ impl BrowserController {
         let mut changed = false;
         while let Some(event) = self.rx.pop() {
             match event {
+                CoreEvent::UserInputReady { generation, permit } => {
+                    if generation == self.generation {
+                        self.user_input_retry = None;
+                        if let (Some(page), Some(permit)) = (&self.live_page, permit) {
+                            if let Some((command, navigation)) = self.pending_user_input.pop_front()
+                            {
+                                page.send_reserved_user(permit, command, navigation);
+                            }
+                            self.flush_user_input();
+                        } else {
+                            changed |= self.stop();
+                        }
+                    }
+                }
                 CoreEvent::FetchFinished { generation, result } => {
                     changed |= self.finish_fetch(generation, result);
                 }
@@ -1038,7 +1084,7 @@ impl BrowserController {
             }
         }
         ActionOutcome {
-            invalidated: changed,
+            invalidated: changed || self.generation != generation_before,
             loading_retired: self.generation != generation_before,
         }
     }
@@ -1129,6 +1175,7 @@ impl BrowserController {
         let tx = self.tx.clone();
         let viewport = self.viewport;
         let device_pixel_ratio = self.device_pixel_ratio;
+        let screen_position = self.screen_position;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
             let result = fetch_protocol_interactive(
@@ -1137,6 +1184,7 @@ impl BrowserController {
                 None,
                 viewport,
                 device_pixel_ratio,
+                screen_position,
                 storage,
                 None,
                 intent,
@@ -1268,6 +1316,10 @@ impl BrowserController {
                     self.send_live(crate::js::PageCmd::DevicePixelRatio(
                         self.device_pixel_ratio,
                     ));
+                    self.send_live(crate::js::PageCmd::ScreenPosition(
+                        self.screen_position.0,
+                        self.screen_position.1,
+                    ));
                 }
                 if let Some(refresh) = declarative_refresh {
                     self.schedule_declarative_refresh(generation, refresh);
@@ -1334,19 +1386,82 @@ impl BrowserController {
             .is_some_and(|handle| handle.cmds.try_send(command).is_ok())
     }
 
-    fn send_user(&self, command: crate::js::PageCmd) -> bool {
-        self.live_page
-            .as_ref()
-            .is_some_and(|handle| handle.try_send_user(command).is_ok())
+    fn send_user(&mut self, command: crate::js::PageCmd) -> bool {
+        self.queue_user_input(command, false)
     }
 
-    fn send_navigation_click(&self, node: usize) -> bool {
-        self.live_page
-            .as_ref()
-            .is_some_and(|handle| handle.try_send_navigation_click(node).is_ok())
+    fn send_navigation_click(&mut self, node: usize) -> bool {
+        self.queue_user_input(crate::js::PageCmd::Click(node), true)
+    }
+
+    fn queue_user_input(&mut self, command: crate::js::PageCmd, navigation: bool) -> bool {
+        if self.live_page.is_none() {
+            return false;
+        }
+        // UI Events keydown/keyup MUST be delivered; HTML #task-queue and
+        // #user-interaction-task-source preserve ordering within the source.
+        // A full transport must not silently drop releases or reorder focus/click
+        // relative to keys. Keep a bounded native backlog; pathological overload
+        // explicitly stops the page, rather than leaking memory or losing input.
+        const MAX_PENDING_INPUT: usize = 4096;
+        if self.pending_user_input.len() == MAX_PENDING_INPUT {
+            self.stop();
+            self.status = String::from("Stopped — page input backlog exceeded its limit.");
+            return false;
+        }
+        self.pending_user_input.push_back((command, navigation));
+        self.flush_user_input();
+        self.live_page.is_some()
+    }
+
+    fn flush_user_input(&mut self) {
+        use tokio::sync::mpsc::error::TrySendError;
+        if self.user_input_retry.is_some() {
+            return;
+        }
+        while let Some((command, navigation)) = self.pending_user_input.pop_front() {
+            let Some(page) = &self.live_page else {
+                return;
+            };
+            let result = if navigation {
+                let crate::js::PageCmd::Click(node) = command else {
+                    unreachable!()
+                };
+                page.try_send_navigation_click(node)
+            } else {
+                page.try_send_user(command)
+            };
+            match result {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => {
+                    self.stop();
+                    return;
+                }
+                Err(TrySendError::Full(command)) => {
+                    self.pending_user_input.push_front((command, navigation));
+                    let sender = page.user_input_sender();
+                    let tx = self.tx.clone();
+                    let generation = self.generation;
+                    // Sleep on real channel capacity, not a timer/poll loop. The
+                    // reserved slot crosses back with the wake so it cannot be
+                    // stolen by a later input. Only one retry task exists per page.
+                    self.user_input_retry = Some(self.runtime.spawn(async move {
+                        let permit = sender.reserve_owned().await.ok();
+                        let _ = tx
+                            .send(CoreEvent::UserInputReady { generation, permit })
+                            .await;
+                    }));
+                    return;
+                }
+            }
+        }
     }
 
     fn drop_live_page(&mut self) {
+        if let Some(retry) = self.user_input_retry.take() {
+            retry.abort();
+        }
+        self.pending_user_input.clear();
         if let Some(page) = self.live_page.take() {
             page.retire();
         }
@@ -1615,6 +1730,7 @@ impl BrowserController {
         let tx = self.tx.clone();
         let viewport = self.viewport;
         let device_pixel_ratio = self.device_pixel_ratio;
+        let screen_position = self.screen_position;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
             let result = fetch_protocol_interactive(
@@ -1623,6 +1739,7 @@ impl BrowserController {
                 None,
                 viewport,
                 device_pixel_ratio,
+                screen_position,
                 storage,
                 Some(body),
                 NavigationIntent::New,
@@ -1676,6 +1793,7 @@ async fn fetch_protocol_interactive(
     referrer: Option<&url::Url>,
     viewport: CssSize,
     device_pixel_ratio: f32,
+    screen_position: (i32, i32),
     storage: crate::js::WebStorage,
     post_body: Option<String>,
     intent: NavigationIntent,
@@ -1735,11 +1853,12 @@ async fn fetch_protocol_interactive(
             viewport.width.round().clamp(1.0, f32::from(u16::MAX)) as u16,
             viewport.height.round().clamp(1.0, f32::from(u16::MAX)) as u16,
         );
-        response = http::execute_js_for_device(
+        response = http::execute_js_for_window(
             response,
             css_viewport,
             (1, 1),
             device_pixel_ratio,
+            screen_position,
             storage,
         )
         .await;
@@ -2080,6 +2199,165 @@ mod tests {
             "report.pdf"
         );
         assert!(browser.pending.is_none());
+    }
+
+    #[test]
+    fn page_keyboard_actions_preserve_focus_routing_and_release_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        for state in [KeyState::Pressed, KeyState::Released] {
+            let input = KeyInput {
+                key: Key::Character(String::from("z")),
+                code: String::from("KeyY"),
+                location: 0,
+                state,
+                modifiers: Modifiers::default(),
+                repeat: false,
+                composing: false,
+            };
+            browser.handle_action(UserAction::Key(input.clone()));
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::js::PageCmd::Key { node: None, input: actual }) if actual == input)
+            );
+            browser.handle_action(UserAction::PageKey {
+                node: 42,
+                input: input.clone(),
+            });
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::js::PageCmd::Key { node: Some(42), input: actual }) if actual == input)
+            );
+        }
+        browser.handle_page_event(crate::js::PageEvt::KeyDefault { prevented: true });
+        browser.handle_page_event(crate::js::PageEvt::KeyDefault { prevented: false });
+        assert_eq!(browser.take_page_key_default(), Some(true));
+        assert_eq!(browser.take_page_key_default(), Some(false));
+        assert_eq!(browser.take_page_key_default(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_input_backpressure_preserves_bursts_focus_clicks_and_releases() {
+        for capacity in [1, 16] {
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let wake_count = wakes.clone();
+            let mut browser = BrowserController::new(
+                Handle::current(),
+                move || {
+                    wake_count.fetch_add(1, Ordering::Relaxed);
+                },
+                CssSize::new(640.0, 480.0),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(capacity);
+            browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+            browser.send_user(crate::js::PageCmd::Focus(Some(42)));
+            for index in 0..100 {
+                for state in [KeyState::Pressed, KeyState::Released] {
+                    browser.handle_action(UserAction::Key(KeyInput {
+                        key: Key::Character(index.to_string()),
+                        code: "KeyA".into(),
+                        location: 0,
+                        state,
+                        modifiers: Default::default(),
+                        repeat: false,
+                        composing: false,
+                    }));
+                }
+            }
+            browser.send_user(crate::js::PageCmd::Focus(None));
+            browser.send_navigation_click(99);
+            assert!(!browser.pending_user_input.is_empty());
+            assert!(browser.user_input_retry.is_some());
+            // No page acknowledgements are sent. Capacity itself must wake the
+            // controller, including when the lane contains only focus/click tasks.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                for ordinal in 0..203 {
+                    let command = loop {
+                        browser.process_async_events();
+                        if let Ok(command) = rx.try_recv() {
+                            break command;
+                        }
+                        tokio::task::yield_now().await;
+                    };
+                    match (ordinal, command) {
+                        (0, crate::js::PageCmd::Focus(Some(42))) => {}
+                        (201, crate::js::PageCmd::Focus(None)) => {}
+                        (202, crate::js::PageCmd::Click(99)) => {}
+                        (ordinal, crate::js::PageCmd::Key { node: None, input })
+                            if (1..201).contains(&ordinal) =>
+                        {
+                            assert_eq!(input.key, Key::Character(((ordinal - 1) / 2).to_string()));
+                            assert_eq!(
+                                input.state,
+                                if ordinal % 2 == 1 {
+                                    KeyState::Pressed
+                                } else {
+                                    KeyState::Released
+                                }
+                            );
+                        }
+                        (ordinal, command) => panic!("input {ordinal} out of order: {command:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("input queue did not wake on capacity");
+            assert!(browser.pending_user_input.is_empty());
+            assert!(browser.user_input_retry.is_none());
+            assert!(wakes.load(Ordering::Relaxed) > 0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_input_backpressure_retires_stale_capacity_and_bounds_overload() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(old_tx));
+        browser.send_user(crate::js::PageCmd::Focus(Some(1)));
+        browser.send_user(crate::js::PageCmd::Focus(Some(2)));
+        assert!(old_rx.try_recv().is_ok());
+        tokio::task::yield_now().await; // The old generation now owns a reserved slot/wake.
+        browser.stop();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.send_user(crate::js::PageCmd::Focus(Some(3)));
+        browser.process_async_events();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::Focus(Some(3)))
+        ));
+        assert!(
+            old_rx.try_recv().is_err(),
+            "retired input must not be delivered"
+        );
+        for _ in 0..4097 {
+            browser.send_user(crate::js::PageCmd::Focus(None));
+        }
+        let overflow = browser.handle_action(UserAction::PageFocus { actor: None });
+        assert!(overflow.invalidated && overflow.loading_retired);
+        assert!(!browser.page_is_live());
+        assert!(browser.pending_user_input.is_empty() && browser.user_input_retry.is_none());
+        assert!(browser.status.contains("input backlog"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_input_backpressure_releases_closed_actor_and_waiter() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.send_user(crate::js::PageCmd::Focus(None));
+        browser.send_user(crate::js::PageCmd::Focus(None));
+        drop(rx);
+        tokio::task::yield_now().await;
+        browser.process_async_events();
+        assert!(!browser.page_is_live());
+        assert!(browser.pending_user_input.is_empty() && browser.user_input_retry.is_none());
     }
 
     #[test]

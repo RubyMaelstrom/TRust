@@ -326,6 +326,8 @@ mod tests {
     fn terminal_keys_are_encoded_without_crossterm() {
         let input = KeyInput {
             key: Key::ArrowUp,
+            code: String::new(),
+            location: 0,
             state: KeyState::Pressed,
             modifiers: Default::default(),
             repeat: false,

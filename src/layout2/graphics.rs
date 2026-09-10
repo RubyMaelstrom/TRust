@@ -84,6 +84,7 @@ struct Builder<'a, 't> {
     commands: Vec<DisplayCommand>,
     lines: Vec<PaintLine>,
     image_requests: Vec<ImageRequest>,
+    canvas_images: Vec<(NodeId, crate::render::CanvasImage)>,
     image_handles: HashSet<ImageHandle>,
     scroll_containers: Vec<ScrollContainer>,
     sticky_constraints: Vec<StickyConstraint>,
@@ -142,6 +143,7 @@ impl<'a, 't> Builder<'a, 't> {
             commands: Vec::new(),
             lines: Vec::new(),
             image_requests: Vec::new(),
+            canvas_images: Vec::new(),
             image_handles: HashSet::new(),
             scroll_containers: Vec::new(),
             sticky_constraints: Vec::new(),
@@ -246,6 +248,19 @@ impl<'a, 't> Builder<'a, 't> {
             self.image_requests.push(ImageRequest { handle, source });
         }
         handle
+    }
+
+    fn replaced_image(&mut self, node: NodeId, source: Option<&String>) -> Option<ImageHandle> {
+        if node != NO_NODE && self.dom.canvas_size(node).is_some() {
+            let canvas = self.dom.canvas_image(node)?;
+            let handle = canvas.handle;
+            if self.image_handles.insert(handle) {
+                self.canvas_images.push((node, canvas));
+            }
+            Some(handle)
+        } else {
+            source.map(|source| self.image(resolve_image_source(self.base, source)))
+        }
     }
 
     fn effective_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
@@ -897,6 +912,7 @@ pub(super) fn paint<'t>(
         fixed_interleaved: true,
         top_layer: top_layer_entries,
         image_requests: builder.image_requests,
+        canvas_images: builder.canvas_images,
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
     };
@@ -1627,14 +1643,18 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         }),
                     );
                 }
-            } else if let Some(source) = piece
-                .item
-                .graphical_image
-                .as_ref()
-                .or(piece.item.image.as_ref())
+            } else if piece.item.graphical_image.is_some()
+                || piece.item.image.is_some()
+                || (node != NO_NODE && builder.dom.canvas_size(node).is_some())
             {
-                let source = resolve_image_source(builder.base, source);
-                let handle = builder.image(source);
+                let handle = builder.replaced_image(
+                    node,
+                    piece
+                        .item
+                        .graphical_image
+                        .as_ref()
+                        .or(piece.item.image.as_ref()),
+                );
                 let rect = CssRect::new(
                     fragment.x + piece.x + piece.paint_x,
                     fragment.y + piece.y + piece.paint_y,
@@ -1660,43 +1680,45 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 let content_clip = radii
                     .filter(|r| r.corners.iter().any(|&(x, y)| x > 0. && y > 0.))
                     .map(|r| rounded_shape(content, inset_radii(r, border, content)));
-                builder.push_clipped_marquee_content(
-                    node,
-                    DisplayCommand::Image {
-                        rect,
-                        handle,
-                        source_rect: None,
-                        fit: if piece.item.crop {
-                            ImageFit::Cover
-                        } else {
-                            ImageFit::Contain
-                        },
-                        sampling: if if style_node == NO_NODE {
-                            piece.item.pixelated
-                        } else {
-                            matches!(
-                                builder
-                                    .dom
-                                    .computed_value_resolved(style_node, "image-rendering")
-                                    .as_deref(),
-                                Some(
-                                    "pixelated"
-                                        | "crisp-edges"
-                                        | "-moz-crisp-edges"
-                                        | "-webkit-optimize-contrast"
-                                )
-                            )
-                        } {
-                            ImageSampling::Nearest
-                        } else {
-                            ImageSampling::Smooth
-                        },
-                        clip,
+                if let Some(handle) = handle {
+                    builder.push_clipped_marquee_content(
                         node,
-                        link: piece.item.link.clone(),
-                    },
-                    content_clip,
-                );
+                        DisplayCommand::Image {
+                            rect,
+                            handle,
+                            source_rect: None,
+                            fit: if piece.item.crop {
+                                ImageFit::Cover
+                            } else {
+                                ImageFit::Contain
+                            },
+                            sampling: if if style_node == NO_NODE {
+                                piece.item.pixelated
+                            } else {
+                                matches!(
+                                    builder
+                                        .dom
+                                        .computed_value_resolved(style_node, "image-rendering")
+                                        .as_deref(),
+                                    Some(
+                                        "pixelated"
+                                            | "crisp-edges"
+                                            | "-moz-crisp-edges"
+                                            | "-webkit-optimize-contrast"
+                                    )
+                                )
+                            } {
+                                ImageSampling::Nearest
+                            } else {
+                                ImageSampling::Smooth
+                            },
+                            clip,
+                            node,
+                            link: piece.item.link.clone(),
+                        },
+                        content_clip,
+                    );
+                }
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
                     builder.push_marquee_content(
                         node,

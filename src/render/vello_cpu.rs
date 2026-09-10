@@ -424,7 +424,7 @@ impl VelloCpuRenderer {
         fit: ImageFit,
         sampling: ImageSampling,
     ) -> Result<(), String> {
-        let store_revision = scene.image_store.revision(handle);
+        let store_revision = scene.image_revision(handle);
         let changed = self
             .images
             .get(&handle)
@@ -462,7 +462,7 @@ impl VelloCpuRenderer {
         }
         if !self.images.contains_key(&handle)
             && let Some(revision) = store_revision
-            && let Some(image) = scene.image_store.get(handle)
+            && let Some(image) = scene.image(handle)
         {
             let expected = usize::try_from(image.width)
                 .ok()

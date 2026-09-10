@@ -228,7 +228,13 @@ impl ImageHandle {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        Self(hash)
+        // Keep author-controlled URLs disjoint from internal canvas identities.
+        Self(hash & !(1 << 63))
+    }
+
+    pub(crate) fn for_canvas() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self((1 << 63) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -263,6 +269,7 @@ impl PagePaint {
             fixed_interleaved,
             top_layer,
             image_requests,
+            canvas_images,
             scroll_containers,
             sticky_constraints,
         } = self;
@@ -325,6 +332,13 @@ impl PagePaint {
         }
         for request in image_requests {
             bytes = bytes.saturating_add(request.source.capacity());
+        }
+        bytes = bytes
+            .saturating_add(canvas_images.capacity() * std::mem::size_of::<(usize, CanvasImage)>());
+        for (_, canvas) in canvas_images {
+            // Conservative, as with retained glyph/image resources: the live
+            // DOM and an older paint may also hold these immutable Arcs.
+            bytes = bytes.saturating_add(canvas.retained_bytes());
         }
         (bytes, opaque)
     }
@@ -459,6 +473,65 @@ pub struct ImageResource {
     /// happens once in that backend's retained cache.
     pub rgba: Arc<[u8]>,
     pub has_alpha: bool,
+}
+
+/// An immutable canvas presentation, delivered with its paint commands rather
+/// than through the asynchronous image loader. HTML's canvas paint source is
+/// the element's bitmap (local HTML snapshot e5071a20c856, canvas section).
+#[derive(Clone, Debug)]
+pub struct CanvasImage {
+    pub(crate) handle: ImageHandle,
+    pub(crate) generation: u64,
+    pub(crate) image: ImageResource,
+    encoded: Arc<std::sync::OnceLock<Option<String>>>,
+}
+
+impl PartialEq for CanvasImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle && self.generation == other.generation
+    }
+}
+
+impl CanvasImage {
+    pub(crate) fn new(handle: ImageHandle, generation: u64, image: ImageResource) -> Self {
+        Self {
+            handle,
+            generation,
+            image,
+            encoded: Arc::default(),
+        }
+    }
+
+    /// Serialization remains lazy: only toDataURL/terminal graphics need PNG.
+    pub(crate) fn data_url(&self) -> Option<String> {
+        self.encoded
+            .get_or_init(|| {
+                use image::ImageEncoder as _;
+                let mut encoded = Vec::new();
+                image::codecs::png::PngEncoder::new(&mut encoded)
+                    .write_image(
+                        &self.image.rgba,
+                        self.image.width,
+                        self.image.height,
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .ok()?;
+                Some(format!(
+                    "data:image/png;base64,{}",
+                    crate::img::base64_encode(&encoded)
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.image.rgba.len()
+            + self
+                .encoded
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(0, String::capacity)
+    }
 }
 
 // The byte ceiling is the primary decoded-image memory bound. A separate,
@@ -928,6 +1001,9 @@ pub struct PagePaint {
     /// pinned. Every entry paints after the root stacking context.
     pub top_layer: Vec<TopLayerEntry>,
     pub image_requests: Vec<ImageRequest>,
+    /// Node-associated canvas snapshots. No URLs, fetches, or intrinsic-size
+    /// round trip is needed; retained old paint keeps its own complete pixels.
+    pub canvas_images: Vec<(usize, CanvasImage)>,
     pub scroll_containers: Vec<ScrollContainer>,
     pub sticky_constraints: Vec<StickyConstraint>,
 }
@@ -1005,6 +1081,9 @@ pub struct Scene {
     pub controls: Vec<ControlRegion>,
     pub content_viewport: CssRect,
     pub image_store: ImageStore,
+    /// Frame-owned pixels are not evictable by the ordinary decoded-image LRU.
+    /// The Arcs share the page's bounded canvas snapshots without copying pixels.
+    pub canvas_images: HashMap<ImageHandle, CanvasImage>,
     pub page_scroll_containers: Vec<ScrollContainer>,
     pub page_size: CssSize,
 }
@@ -1040,7 +1119,7 @@ pub enum SceneDamage {
 /// then union the old and new painted bounds. Removed paint is included so
 /// stale pixels are always cleared by the replacement crop.
 pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
-    if old.viewport != new.viewport {
+    if old.viewport != new.viewport || old.canvas_images != new.canvas_images {
         return SceneDamage::Full;
     }
     let prefix = old
@@ -1127,6 +1206,7 @@ pub fn raster_damage(scene: &Scene, rect: CssRect) -> Option<RasterDamage> {
             controls: Vec::new(),
             content_viewport: scene.content_viewport.translate(-origin.x, -origin.y),
             image_store: scene.image_store.clone(),
+            canvas_images: scene.canvas_images.clone(),
             page_scroll_containers: Vec::new(),
             page_size: scene.page_size,
         },
@@ -1378,6 +1458,19 @@ struct InteractionState {
 }
 
 impl Scene {
+    pub(crate) fn image(&self, handle: ImageHandle) -> Option<ImageResource> {
+        self.canvas_images
+            .get(&handle)
+            .map(|canvas| canvas.image.clone())
+            .or_else(|| self.image_store.get(handle))
+    }
+
+    pub(crate) fn image_revision(&self, handle: ImageHandle) -> Option<u64> {
+        self.canvas_images
+            .get(&handle)
+            .map(|canvas| canvas.generation)
+            .or_else(|| self.image_store.revision(handle))
+    }
     pub fn control_at(&self, point: CssPoint) -> Option<ControlId> {
         self.controls
             .iter()
@@ -1665,6 +1758,11 @@ impl Scene {
     /// on the document timeline. Keeping the time parameter in scene
     /// composition preserves a stable layout/display list between frames.
     pub fn append_page_at(&mut self, page: &PagePaint, scroll: CssPoint, elapsed_seconds: f32) {
+        self.canvas_images.extend(
+            page.canvas_images
+                .iter()
+                .map(|(_, canvas)| (canvas.handle, canvas.clone())),
+        );
         self.page_size = CssSize::new(page.width, page.height);
         self.page_scroll_containers = page
             .scroll_containers
@@ -1847,6 +1945,7 @@ pub fn page_element_hits_at(
         controls: Vec::new(),
         content_viewport: CssRect::new(0.0, 0.0, viewport.width, viewport.height),
         image_store: ImageStore::default(),
+        canvas_images: Default::default(),
         page_scroll_containers: Vec::new(),
         page_size: CssSize::default(),
     };
@@ -2357,6 +2456,7 @@ pub fn desktop_chrome(
         controls: Vec::new(),
         content_viewport: content,
         image_store: ImageStore::default(),
+        canvas_images: Default::default(),
         page_scroll_containers: Vec::new(),
         page_size: CssSize::default(),
     }
