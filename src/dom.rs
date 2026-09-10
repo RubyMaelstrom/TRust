@@ -10917,10 +10917,7 @@ fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&s
             width = Some(tok);
         } else if tok.eq_ignore_ascii_case("currentcolor")
             || tok.eq_ignore_ascii_case("transparent")
-            || tok.parse::<svgtypes::Color>().is_ok()
-            || tok.starts_with("hsl(")
-            || tok.starts_with("hwb(")
-            || tok.starts_with("color(")
+            || crate::render::PaintColor::parse_css(tok).is_some()
         {
             color = Some(tok);
         }
@@ -10947,10 +10944,7 @@ fn parse_outline_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&
             width = Some(tok);
         } else if tok.eq_ignore_ascii_case("currentcolor")
             || tok.eq_ignore_ascii_case("transparent")
-            || tok.parse::<svgtypes::Color>().is_ok()
-            || tok.starts_with("hsl(")
-            || tok.starts_with("hwb(")
-            || tok.starts_with("color(")
+            || crate::render::PaintColor::parse_css(tok).is_some()
         {
             color = Some(tok);
         }
@@ -11689,6 +11683,11 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
             .into_iter()
             .any(is_bare_nonzero_css_number)
     {
+        return None;
+    }
+    // CSS Conditional 3 #support-definition: an unsupported color value is
+    // also invalid in ordinary declarations, preserving earlier fallbacks.
+    if is_color_property(&k) && !supports_color_value(&value) {
         return None;
     }
     Some((k, value, important))
@@ -12509,12 +12508,9 @@ fn split_supports_kw(cond: &str, kw: &str) -> Vec<String> {
     parts
 }
 
-/// Does TRust support a CSS `(prop: value)` feature declaration? `display` is
-/// value-checked (the most commonly feature-queried property — we claim the box
-/// types we actually lay out); every other property we TRACK counts as
-/// supported (we understand and apply it), while a property we don't track —
-/// the visual-only ones we deliberately skip (filter/…) —
-/// is unsupported, so a page's fallback applies instead.
+/// Does TRust support a CSS `(prop: value)` feature declaration? Check the
+/// implemented box types, color syntax and clipping grammar; retaining a
+/// property alone is insufficient evidence that its value can be painted.
 fn css_supports(prop: &str, value: &str) -> bool {
     let prop = prop.to_ascii_lowercase();
     let value = value.to_ascii_lowercase();
@@ -12556,7 +12552,39 @@ fn css_supports(prop: &str, value: &str) -> bool {
     if prop == "clip-path" {
         return value == "none" || crate::layout2::clip_path::supports(&value);
     }
+    if is_color_property(&prop) {
+        // CSS Conditional 3 #support-definition requires usable support for
+        // the value as well as the property. Share paint's actual parser so
+        // unsupported color functions cannot displace working fallbacks.
+        let value = match value.rsplit_once('!') {
+            Some((head, bang)) if bang.trim() == "important" => head.trim(),
+            _ => value.trim(),
+        };
+        return supports_color_value(value);
+    }
     is_tracked(&prop)
+}
+
+fn is_color_property(prop: &str) -> bool {
+    matches!(
+        prop,
+        "color"
+            | "background-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "outline-color"
+            | "text-decoration-color"
+    )
+}
+
+pub(crate) fn supports_color_value(value: &str) -> bool {
+    wide_keyword(value).is_some()
+        || value.eq_ignore_ascii_case("currentcolor")
+        // Custom property substitution occurs at computed-value time.
+        || find_var_function(value).is_some()
+        || crate::render::PaintColor::parse_css(value).is_some()
 }
 
 /// Does a CSS `@media` query list match the viewport (CSS px; `0` = unknown)?
@@ -15477,6 +15505,86 @@ mod tests {
         assert!(supports_condition("(filter: blur(1px)) or (display: grid)"));
         assert!(supports_condition("((display: grid))"));
         assert!(supports_condition("selector(.a)"));
+    }
+
+    #[test]
+    fn supports_color_queries_require_a_paintable_value() {
+        // CSS Conditional 3 §6.1: support requires both the property and its
+        // value. Merely tracking `color` must not enable unsupported color
+        // spaces and replace a page's usable sRGB fallback.
+        for property in [
+            "color",
+            "background-color",
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+            "outline-color",
+            "text-decoration-color",
+        ] {
+            for value in [
+                "#111110",
+                "#ffffff26",
+                "white",
+                "transparent",
+                "currentColor",
+                "inherit",
+                "initial",
+                "unset",
+                "revert",
+                "revert-layer",
+                "var(--foreground)",
+                "rgb(10 20 30 / 50%)",
+                "hsl(120 50% 50%)",
+                "color(display-p3 0 0 0)",
+                "lab(0% 0 0)",
+            ] {
+                assert!(
+                    supports_condition(&format!("({property}: {value})")),
+                    "supported: {property}: {value}"
+                );
+            }
+            for value in [
+                "color(unknown-space 0 0 0)",
+                "lab(0%, 0, 0)",
+                "oklch(0.5 0.1 120)",
+                "not-a-color",
+            ] {
+                assert!(
+                    !supports_condition(&format!("({property}: {value})")),
+                    "unsupported: {property}: {value}"
+                );
+            }
+        }
+        assert!(supports_condition(
+            "not (color: color(unknown-space 0 0 0))"
+        ));
+        assert!(!supports_condition(
+            "(display: grid) and (color: lab(0%, 0, 0))"
+        ));
+        assert!(supports_condition(
+            "(color: lab(0% 0 0)) or (color: #111110)"
+        ));
+        assert!(supports_condition("(color: white !important)"));
+    }
+
+    #[test]
+    fn unsupported_color_declarations_preserve_earlier_fallbacks() {
+        let dom = Dom::parse_document(
+            "<style>#x {color:white; color:color(unknown-space 0 0 0); \
+             background-color:#111110; background-color:lab(0%, 0, 0)}</style>\
+             <p id=x>Readable</p>",
+        );
+        let node = dom.get_by_id("x").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(node, "color").as_deref(),
+            Some("white")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(node, "background-color")
+                .as_deref(),
+            Some("#111110")
+        );
     }
 
     #[test]

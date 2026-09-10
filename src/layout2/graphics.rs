@@ -3506,12 +3506,106 @@ impl PaintColor {
         if let Ok(color) = svgtypes::Color::from_str(value) {
             return Some(Self::Rgba(color.red, color.green, color.blue, color.alpha));
         }
-        parse_modern_rgb(value).or_else(|| parse_hsl(value))
+        parse_modern_rgb(value)
+            .or_else(|| parse_hsl(value))
+            .or_else(|| parse_display_p3_or_lab(value))
     }
 
     pub fn is_transparent(self) -> bool {
         matches!(self, Self::Rgba(_, _, _, 0))
     }
+}
+
+/// CSS Color 4 #color-function / #lab-colors, using the local 2026-09-06
+/// CSSWG snapshot (81c27f686901). Display P3 uses D65; Lab uses D50, so the
+/// conversion includes Bradford white-point adaptation. Keep source components
+/// unclipped until actual-value conversion to our sRGB paint surface.
+fn parse_display_p3_or_lab(value: &str) -> Option<PaintColor> {
+    use color::ColorSpaceTag::{DisplayP3, Lab};
+    let origin = color::parse_color(value).ok()?;
+    if !matches!(origin.cs, DisplayP3 | Lab)
+        || !origin
+            .components
+            .iter()
+            .all(|component| component.is_finite())
+    {
+        return None;
+    }
+    let alpha = origin.components[3];
+    // Lab's parsed lightness is clamped to [0, 100]; its endpoints display
+    // as black/white regardless of the other coordinates (CSS Color 4 §9.4).
+    let rgba = if origin.cs == Lab && origin.components[0] <= 0.0 {
+        [0.0, 0.0, 0.0, alpha]
+    } else if origin.cs == Lab && origin.components[0] >= 100.0 {
+        [1.0, 1.0, 1.0, alpha]
+    } else {
+        gamut_map_to_srgb(origin)?
+    };
+    let [r, g, b, a] = rgba.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    Some(PaintColor::Rgba(r, g, b, a))
+}
+
+/// CSS Color 4 #pseudo-binsearch: binary search with local MINDE. A simple
+/// RGB channel clamp would distort out-of-gamut colors; reduce OkLCh chroma
+/// while keeping lightness/hue, allowing a just-noticeable clipping delta.
+fn gamut_map_to_srgb(origin: color::DynamicColor) -> Option<[f32; 4]> {
+    use color::{ColorSpaceTag, DynamicColor};
+    let in_gamut = |rgb: DynamicColor| rgb.components[..3].iter().all(|v| (0.0..=1.0).contains(v));
+    let delta = |one: DynamicColor, two: DynamicColor| {
+        let one = one.convert(ColorSpaceTag::Oklab).components;
+        let two = two.convert(ColorSpaceTag::Oklab).components;
+        ((one[0] - two[0]).powi(2) + (one[1] - two[1]).powi(2) + (one[2] - two[2]).powi(2)).sqrt()
+    };
+    let rgb = origin.convert(ColorSpaceTag::Srgb);
+    if in_gamut(rgb) {
+        return Some(rgb.components);
+    }
+    // Clear missing-component flags after resolving `none` to zero; those
+    // flags are for interpolation, not the actual-value gamut search.
+    let mut current = DynamicColor::from_alpha_color(origin.to_alpha_color::<color::Oklch>());
+    if !current.components.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let [lightness, chroma, _, alpha] = current.components;
+    if lightness >= 1.0 {
+        return Some([1.0, 1.0, 1.0, alpha]);
+    }
+    if lightness <= 0.0 {
+        return Some([0.0, 0.0, 0.0, alpha]);
+    }
+    const JND: f32 = 0.02;
+    const EPSILON: f32 = 0.0001;
+    let mut clipped = rgb.clip();
+    if delta(clipped, current) < JND {
+        return Some(clipped.components);
+    }
+    let (mut min, mut max) = (0.0, chroma);
+    let mut min_in_gamut = true;
+    while max - min > EPSILON {
+        let chroma = min + (max - min) / 2.0;
+        // Extremely large finite coordinates can exhaust f32 precision.
+        if chroma <= min || chroma >= max {
+            break;
+        }
+        current.components[1] = chroma;
+        let rgb = current.convert(ColorSpaceTag::Srgb);
+        if min_in_gamut && in_gamut(rgb) {
+            min = chroma;
+            continue;
+        }
+        clipped = rgb.clip();
+        let error = delta(clipped, current);
+        if error < JND {
+            if JND - error < EPSILON {
+                return Some(clipped.components);
+            }
+            min_in_gamut = false;
+            min = chroma;
+        } else {
+            max = chroma;
+        }
+    }
+    Some(clipped.components)
 }
 
 fn parse_modern_rgb(value: &str) -> Option<PaintColor> {
@@ -3613,6 +3707,58 @@ fn alpha_byte(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_color4_display_p3_and_lab_convert_to_srgb() {
+        for (source, expected) in [
+            ("color(display-p3 .067 .067 .063)", [17, 17, 16, 255]),
+            ("COLOR(DISPLAY-P3 50% 50% 50% / 25%)", [128, 128, 128, 64]),
+            ("color(display-p3 none 0 0 / none)", [0, 0, 0, 0]),
+            ("lab(100% 0 0 / .15)", [255, 255, 255, 38]),
+            ("lab(50% 0 0)", [119, 119, 119, 255]),
+            // CSS Color 4 #ex-lab-samples, including D50 -> D65 adaptation.
+            ("lab(29.2345% 39.3825 20.0664)", [125, 35, 41, 255]),
+            ("lab(29.69% 44.888% -29.04%)", [128, 0, 128, 255]),
+            ("lab(-10% 40 40 / 120%)", [0, 0, 0, 255]),
+            ("lab(110% 40 40 / -1)", [255, 255, 255, 0]),
+        ] {
+            let Some(PaintColor::Rgba(r, g, b, a)) = PaintColor::parse_css(source) else {
+                panic!("failed to parse {source}");
+            };
+            for (actual, expected) in [r, g, b, a].into_iter().zip(expected) {
+                assert!(
+                    actual.abs_diff(expected) <= 1,
+                    "{source}: {:?}",
+                    [r, g, b, a]
+                );
+            }
+        }
+        for invalid in [
+            "color(display-p3 0, 0, 0)",
+            "color(display-p3 0 0)",
+            "color(display-p3 0 0 0 / bad)",
+            "color(unknown-space 0 0 0)",
+            "lab(0%, 0, 0)",
+            "lab(50 0 0) trailing",
+        ] {
+            assert_eq!(PaintColor::parse_css(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn css_color4_out_of_gamut_colors_reduce_chroma() {
+        // A saturated P3 primary is outside sRGB. Local MINDE retains its
+        // perceived lightness by adding green/blue, rather than clamping to
+        // the darker sRGB red primary. Alpha is independent of the mapping.
+        let Some(PaintColor::Rgba(r, g, b, a)) =
+            PaintColor::parse_css("color(display-p3 1 0 0 / .5)")
+        else {
+            panic!("P3 red must be paintable");
+        };
+        assert_eq!((r, a), (255, 128));
+        assert!((10..=20).contains(&g), "green: {g}");
+        assert!((5..=15).contains(&b), "blue: {b}");
+    }
 
     #[test]
     fn modern_css_colors_and_alpha_are_retained() {

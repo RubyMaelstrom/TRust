@@ -206,6 +206,40 @@ mod tests {
     "#;
 
     #[test]
+    fn css_color4_queries_paint_dark_theme_pixels() {
+        // CSS Conditional 3 #support-definition, nested inside a media rule
+        // and assigning custom properties as modern compiled stylesheets do.
+        let html = r#"
+            <style>
+                :root { --surface: #fff; --ink: #000 }
+                @media (prefers-color-scheme: dark) {
+                    :root { --surface: #00ff00; --ink: #f00 }
+                    @supports (color: color(display-p3 0 0 0)) {
+                        :root { --surface: color(display-p3 .067 .067 .063) }
+                    }
+                    @supports (color: lab(0% 0 0)) {
+                        :root { --ink: lab(100% 0 0) }
+                    }
+                    @supports (color: color(unknown-space 0 0 0)) {
+                        :root { --surface: white }
+                    }
+                }
+                body { margin: 0; background-color: var(--surface); color: var(--ink) }
+                p { margin: 0; font-size: 32px }
+            </style>
+            <p>Readable text</p>
+        "#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let frame = render_html(html, &base, CssSize::new(240.0, 100.0)).unwrap();
+        let pixels = frame.pixels.as_chunks::<4>().0;
+        assert_eq!(pixels[240 * 90 + 230], [17, 17, 16, 255]);
+        assert!(
+            pixels.iter().any(|pixel| *pixel == [255, 255, 255, 255]),
+            "white glyphs must paint over the dark canvas"
+        );
+    }
+
+    #[test]
     fn fixture_builds_semantic_display_list_and_headless_pixels() {
         let base = Url::parse("https://example.test/").unwrap();
         let dom = crate::dom::Dom::parse_document(FIXTURE);

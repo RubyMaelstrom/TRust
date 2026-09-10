@@ -4757,6 +4757,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_adopt_styles", 2, host_adopt_styles),
     ("__css_parse", 1, host_css_parse),
     ("__css_supports_selector", 1, host_css_supports_selector),
+    ("__css_supports_color", 1, host_css_supports_color),
     ("__dom_template_content", 1, host_template_content),
     ("__http_fetch", 5, host_http_fetch),
     ("__http_navigate", 3, host_http_navigate),
@@ -8797,6 +8798,11 @@ fn host_css_supports_selector(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     Ok(Value::Bool(crate::dom::selector_parses(&selector)))
 }
 
+fn host_css_supports_color(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = host_arg_string(ctx, args, 0);
+    Ok(Value::Bool(crate::dom::supports_color_value(&value)))
+}
+
 fn host_template_content(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -10728,7 +10734,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 141, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 142, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -10739,7 +10745,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 141);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 142);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -14918,6 +14924,34 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "cssLengthAssignmentResult"),
             "|100%|0|false|true"
+        );
+    }
+
+    #[test]
+    fn css_color4_style_and_feature_queries_share_paint_support() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const style = document.createElement("div").style;
+            style.color = "white";
+            style.color = "color(unknown-space 0 0 0)";
+            const fallback = style.color;
+            style.color = "lab(50% 0 0)";
+            globalThis.colorSupportResult = [
+                CSS.supports("color", "color(display-p3 .1 .2 .3)"),
+                CSS.supports("(color: lab(50% 0 0))"),
+                CSS.supports("background-color", "color(unknown-space 0 0 0)"),
+                CSS.supports("color", "lab(50%, 0, 0)"),
+                fallback, style.color
+            ].join("|");
+            "#,
+            "CSS Color 4 style validation",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "colorSupportResult"),
+            "true|true|false|false|white|lab(50% 0 0)"
         );
     }
 

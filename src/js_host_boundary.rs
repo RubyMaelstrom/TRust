@@ -81,6 +81,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_adopt_styles", 2),
     ("__css_parse", 1),
     ("__css_supports_selector", 1),
+    ("__css_supports_color", 1),
     ("__dom_template_content", 1),
     ("__http_fetch", 5),
     ("__http_navigate", 3),
