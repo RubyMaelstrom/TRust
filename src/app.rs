@@ -655,6 +655,8 @@ pub struct App {
     /// nothing ever sent — the two are equivalent: a clear is only worth
     /// sending after a `Some`). Reset with the live page.
     hover_sent: Option<usize>,
+    /// A native primary press on a live JS target activates only on release.
+    pressed_js_link: Option<Link>,
     /// A pointer-target change awaiting the dwell: `(actor node or None =
     /// clear, viewport CSS px of the hovered cell)`. The run loop arms a
     /// `HOVER_DWELL` one-shot when this changes (the resize-at-rest pattern)
@@ -1005,6 +1007,7 @@ impl App {
             image_sizes_sent: None,
             viewport_sent: None,
             hover_sent: None,
+            pressed_js_link: None,
             hover_want: None,
             scroll_intent: 0,
             region_geom_sent: std::collections::HashMap::new(),
@@ -1503,6 +1506,7 @@ impl App {
         // hover/click grab so a drag begun on the bar never also follows a link.
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.pressed_js_link = None;
                 if let Some(d) = self.scrollbar_at(mouse.column, mouse.row) {
                     self.scroll_drag = Some(d);
                     self.seek_scroll_drag(mouse.column, mouse.row);
@@ -1526,13 +1530,19 @@ impl App {
             let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
             let link = on_link.then(|| self.selected_link()).flatten();
             if link == self.search_target {
+                let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
+                self.dispatch_primary_pointer(actor, true, mouse.column, mouse.row);
                 return; // Clicking the same field must not discard its draft.
             }
             let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
             self.finish_form_edit();
-            self.dispatch_page_focus(actor);
+            self.dispatch_primary_pointer(actor, true, mouse.column, mouse.row);
             if let Some(link) = link {
-                self.browser_follow_link(link);
+                if self.live_page.is_some() && matches!(link, Link::JsClick { .. }) {
+                    self.pressed_js_link = Some(link);
+                } else {
+                    self.browser_follow_link(link);
+                }
             }
             return;
         }
@@ -1562,9 +1572,27 @@ impl App {
                 let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
                 let link = on_link.then(|| self.selected_link()).flatten();
                 let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
-                self.dispatch_page_focus(actor);
+                self.dispatch_primary_pointer(actor, true, mouse.column, mouse.row);
                 if let Some(link) = link {
-                    self.browser_follow_link(link);
+                    if self.live_page.is_some() && matches!(link, Link::JsClick { .. }) {
+                        self.pressed_js_link = Some(link);
+                    } else {
+                        self.browser_follow_link(link);
+                    }
+                }
+            }
+            (MouseEventKind::Up(MouseButton::Left), true)
+                if self.mode == Mode::Session
+                    || (self.mode == Mode::Search
+                        && matches!(self.search_target, Some(Link::Form { .. }))) =>
+            {
+                let pressed = self.pressed_js_link.take();
+                let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
+                let link = on_link.then(|| self.selected_link()).flatten();
+                let actor = self.page_focus_actor(link.as_ref(), mouse.column, mouse.row);
+                self.dispatch_primary_pointer(actor, false, mouse.column, mouse.row);
+                if let Some(pressed) = pressed.filter(|pressed| Some(pressed) == link.as_ref()) {
+                    self.browser_follow_link(pressed);
                 }
             }
             _ => {}
@@ -1606,6 +1634,18 @@ impl App {
     fn dispatch_page_focus(&self, node: Option<usize>) {
         if let Some(handle) = &self.live_page {
             let _ = handle.try_send_user(crate::js::PageCmd::Focus(node));
+        }
+    }
+
+    fn dispatch_primary_pointer(&self, node: Option<usize>, pressed: bool, col: u16, row: u16) {
+        if let Some(handle) = &self.live_page {
+            let (x, y) = self.viewport_px_of(col, row);
+            let _ = handle.try_send_user(crate::js::PageCmd::PointerButton {
+                node,
+                pressed,
+                x,
+                y,
+            });
         }
     }
 
@@ -2849,7 +2889,7 @@ impl App {
             }
         };
         self.replace_nav = true;
-        self.start_fetch(target);
+        self.start_fetch_with_timing(target, false, None, http::NavigationType::Reload);
     }
 
     /// Fetch a document in the background; the result arrives in the
@@ -2888,6 +2928,21 @@ impl App {
     /// host opened without a scheme (see `http::fetch_web_default`). `referrer`
     /// is the page a link/form was followed from, when policy says to send one.
     fn start_fetch_opts(&mut self, target: Link, fallback_http: bool, referrer: Option<url::Url>) {
+        self.start_fetch_with_timing(
+            target,
+            fallback_http,
+            referrer,
+            http::NavigationType::Navigate,
+        );
+    }
+
+    fn start_fetch_with_timing(
+        &mut self,
+        target: Link,
+        fallback_http: bool,
+        referrer: Option<url::Url>,
+        navigation_type: http::NavigationType,
+    ) {
         // A new fetch intent supersedes a pending deep-travel completion
         // (the deep-travel path itself re-sets the flag after this call).
         self.pending_travel = None;
@@ -2933,10 +2988,15 @@ impl App {
                         Ok(Payload::Gemini(response))
                     }
                     Ok(crate::core::FetchedDocument::OneShot(raw)) => Ok(Payload::OneShot(raw)),
-                    Ok(crate::core::FetchedDocument::Http(response)) => Ok(prepare_http_payload(
-                        *response, viewport, cell_px, storage, js_on,
-                    )
-                    .await),
+                    Ok(crate::core::FetchedDocument::Http(mut response)) => {
+                        if let Some(timing) = response.timing.as_mut() {
+                            timing.navigation_type = navigation_type;
+                        }
+                        Ok(
+                            prepare_http_payload(*response, viewport, cell_px, storage, js_on)
+                                .await,
+                        )
+                    }
                     Ok(crate::core::FetchedDocument::Internal(_)) => Err(String::from(
                         "internal document cannot come from the network",
                     )),
@@ -2974,6 +3034,7 @@ impl App {
                 )),
                 headers: Vec::new(),
                 fetch_metadata: None,
+                timing_client: None,
                 fetch_policy: None,
             };
             if let Some(page) = &referrer {
@@ -3901,6 +3962,7 @@ impl App {
             self.viewport_sent = None;
             // A fresh engine holds no hover chain; start the app's view clean.
             self.hover_sent = None;
+            self.pressed_js_link = None;
             self.hover_want = None;
             self.page_js_errors = response
                 .js
@@ -3946,6 +4008,7 @@ impl App {
         self.image_sizes_sent = None;
         self.viewport_sent = None;
         self.hover_sent = None;
+        self.pressed_js_link = None;
         self.hover_want = None;
         self.region_geom_sent.clear();
         self.region_scroll_sent.clear();
@@ -4697,7 +4760,7 @@ impl App {
             crate::js::Outcome,
         )> = None;
         let mut trouble: Vec<String> = Vec::new();
-        let mut navigate: Option<(String, bool)> = None;
+        let mut navigate: Option<(String, bool, bool)> = None;
         // History API URL writes are same-document updates, not fetch
         // navigations. Preserve their task order while coalescing renders.
         let mut history_updates: Vec<(String, bool)> = Vec::new();
@@ -4754,8 +4817,9 @@ impl App {
                 }) => {
                     submit_nodes = Some((form, submitter, submission));
                 }
-                Some(PageEvt::Navigate(url)) => navigate = Some((url, false)),
-                Some(PageEvt::Replace(url)) => navigate = Some((url, true)),
+                Some(PageEvt::Navigate(url)) => navigate = Some((url, false, false)),
+                Some(PageEvt::Replace(url)) => navigate = Some((url, true, false)),
+                Some(PageEvt::Reload(url)) => navigate = Some((url, true, true)),
                 Some(PageEvt::HistoryUpdate { url, replace }) => {
                     history_updates.push((url, replace));
                 }
@@ -4828,12 +4892,23 @@ impl App {
                 self.submit_form_static(form, field);
             }
         }
-        if let Some((url, replace)) = navigate {
+        if let Some((url, replace, reload)) = navigate {
             // A script navigation carries the page's Referer like any followed
             // link. Location.replace additionally swaps the result into the
             // current history slot rather than retaining the intermediary.
             self.replace_nav = replace;
-            self.navigate_from_page(&url);
+            if reload {
+                if let Some(target) = http::parse_url(&url) {
+                    self.start_fetch_with_timing(
+                        Link::Http(target),
+                        false,
+                        self.http_referrer(),
+                        http::NavigationType::Reload,
+                    );
+                }
+            } else {
+                self.navigate_from_page(&url);
+            }
         }
         (full_replace, drains)
     }
@@ -6966,20 +7041,12 @@ impl App {
     /// Enter on a form control: edit, toggle, cycle, or submit per kind.
     fn form_interact(&mut self, form: usize, field: usize) {
         use crate::doc::FieldKind;
-        let Some((kind, name, value, checked, live_node)) = self
+        let Some((kind, name, value, live_node)) = self
             .browser
             .as_ref()
             .and_then(|g| g.doc.forms.get(form))
             .and_then(|f| f.fields.get(field))
-            .map(|f| {
-                (
-                    f.kind.clone(),
-                    f.name.clone(),
-                    f.value.clone(),
-                    f.checked,
-                    f.live_node,
-                )
-            })
+            .map(|f| (f.kind.clone(), f.name.clone(), f.value.clone(), f.live_node))
         else {
             return;
         };
@@ -6998,13 +7065,11 @@ impl App {
             }
             FieldKind::Checkbox => {
                 if let Some(node) = live_node
-                    && self.dispatch_live_form_set(
-                        node,
-                        String::new(),
-                        Some(!checked),
-                        format!("· {name} changed by page script"),
-                    )
+                    && self.live_page.is_some()
                 {
+                    // HTML checkbox activation is a cancelable click, not a
+                    // direct checked-value edit followed by synthetic events.
+                    self.dispatch_click(node, false);
                     return;
                 }
                 if let Some(g) = &mut self.browser {
@@ -7015,13 +7080,9 @@ impl App {
             }
             FieldKind::Radio => {
                 if let Some(node) = live_node
-                    && self.dispatch_live_form_set(
-                        node,
-                        value,
-                        Some(true),
-                        format!("· {name} changed by page script"),
-                    )
+                    && self.live_page.is_some()
                 {
+                    self.dispatch_click(node, false);
                     return;
                 }
                 if let Some(g) = &mut self.browser {
@@ -7354,7 +7415,7 @@ impl App {
             // Deep travel: the doc was evicted (strict memory, depth-1
             // retention). Refetch it; the response completes the shuffle.
             let url = top.url.clone();
-            self.start_fetch(url);
+            self.start_fetch_with_timing(url, false, None, http::NavigationType::BackForward);
             self.pending_travel = Some(forward);
             return;
         }
@@ -7804,7 +7865,7 @@ async fn load_one_image(
     // Send a Referer like a browser does: many image/media CDNs (gelbooru
     // and most boorus, plenty of others) hotlink-protect and 302/403 a
     // refererless request to a placeholder instead of the file.
-    let mut req = http::Request::get(parsed);
+    let mut req = http::Request::subresource(parsed, page, "image", None);
     http::set_image_accept(&mut req);
     http::set_referrer(&mut req, page);
     let resp = http::fetch(&req).await.ok()?;
@@ -7977,6 +8038,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let payload =
             super::prepare_http_payload(response, (80, 24), (8, 16), Default::default(), true)
@@ -9171,6 +9233,66 @@ mod tests {
             !app.notice,
             "hovering a link releases the notice so the link preview shows"
         );
+    }
+
+    #[test]
+    fn live_mouse_press_release_precedes_click_and_drag_out_does_not_activate() {
+        use crate::js::{PageCmd, PageHandle};
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        let url = url::Url::parse("https://example.test/").unwrap();
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            b"<body><a href='x-trust-js:42:'>Check</a><p>Outside</p></body>",
+            80,
+            10,
+            &Default::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        app.live_page = Some(PageHandle::from_test_sender(tx));
+        let (x, y, _) = item_point(&app, |it| matches!(it.link, Some(Link::JsClick { .. })));
+        let drain = |rx: &mut tokio::sync::mpsc::Receiver<PageCmd>| {
+            let mut commands = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                if !matches!(command, PageCmd::Hover { .. }) {
+                    commands.push(command);
+                }
+            }
+            commands
+        };
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [PageCmd::PointerButton {
+                node: Some(42),
+                pressed: true,
+                ..
+            }]
+        ));
+        app.on_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [
+                PageCmd::PointerButton {
+                    node: Some(42),
+                    pressed: false,
+                    ..
+                },
+                PageCmd::Click(42)
+            ]
+        ));
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        drain(&mut rx);
+        app.on_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 79, 9));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [PageCmd::PointerButton { pressed: false, .. }]
+        ));
+        assert!(app.pressed_js_link.is_none());
     }
 
     #[test]
@@ -10634,7 +10756,7 @@ mod tests {
             }
         }
         assert!(
-            matches!(commands.as_slice(), [PageCmd::SetValue { node: 42, value, .. }, PageCmd::Focus(None)] if value == "live draft"),
+            matches!(commands.as_slice(), [PageCmd::SetValue { node: 42, value, .. }, PageCmd::PointerButton { node: None, pressed: true, .. }] if value == "live draft"),
             "{commands:?}"
         );
         assert_eq!(app.mode, super::Mode::Session);
@@ -11941,6 +12063,7 @@ mod tests {
             declarative_refresh: None,
             challenge: Some(String::from("AWS WAF (challenge)")),
             from_post: false,
+            timing: None,
         };
         app.on_http_response(response, 60);
         assert!(
@@ -11954,6 +12077,34 @@ mod tests {
             "status keeps the challenge actionable: {}",
             app.status
         );
+    }
+
+    #[test]
+    fn live_checkbox_and_radio_activation_queues_click_not_value_edit() {
+        let mut app = super::App::new(None, 23);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            b"<form><input type=checkbox><input type=radio></form>",
+            80,
+            0,
+            &Default::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        for field in 0..2 {
+            app.browser.as_mut().unwrap().doc.forms[0].fields[field].live_node = Some(42 + field);
+            app.form_interact(0, field);
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::js::PageCmd::Click(node)) if node == 42 + field)
+            );
+            assert!(
+                !app.browser.as_ref().unwrap().doc.forms[0].fields[field].checked,
+                "only the page actor may commit or cancel live checkedness"
+            );
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     async fn live_form_app(html: &str) -> super::App {
@@ -11973,6 +12124,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let response =
             crate::http::execute_js(response, app.last_inner, (8, 16), Default::default()).await;
@@ -12063,6 +12215,11 @@ mod tests {
             x,
             y,
         ));
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            x,
+            y,
+        ));
         assert!(app.page_busy);
         drain_page_event(&mut app).await;
         assert!(app.browser.as_ref().unwrap().doc.fixed.is_empty());
@@ -12104,6 +12261,11 @@ mod tests {
         let (_fi, r, _i, col, width) = target;
         app.on_mouse_event(mouse(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            col + width.max(1) / 2,
+            r as u16,
+        ));
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             col + width.max(1) / 2,
             r as u16,
         ));
@@ -13170,6 +13332,7 @@ mod tests {
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,
+                timing: None,
             },
             40,
         );

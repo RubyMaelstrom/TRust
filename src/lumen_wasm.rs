@@ -9,11 +9,11 @@
 
 use super::HostState;
 use lumen::embed::{
-    Ctx, HostRetainedMemoryVisitor, RetainedExternalAllocation, RetainedExternalMemory,
-    RetainedManagedAllocation, Value,
+    Ctx, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, RetainedExternalAllocation,
+    RetainedExternalMemory, RetainedManagedAllocation, Value,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -44,6 +44,14 @@ pub(super) struct PageWasm {
 }
 
 impl PageWasm {
+    #[cfg(test)]
+    pub(super) fn cached_functions(&self) -> usize {
+        self.state
+            .borrow()
+            .as_ref()
+            .map_or(0, |state| state.function_cache.len())
+    }
+
     pub(super) fn new() -> Self {
         Self {
             state: Rc::new(RefCell::new(None)),
@@ -56,6 +64,15 @@ impl PageWasm {
         match self.state.try_borrow() {
             Ok(state) => {
                 if let Some(state) = state.as_ref() {
+                    state_bytes = state_bytes.saturating_add(
+                        state
+                            .function_cache
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(usize, Value)>()),
+                    );
+                    for value in state.function_cache.values() {
+                        visitor.value(value);
+                    }
                     state_bytes =
                         state_bytes
                             .saturating_add(
@@ -136,6 +153,165 @@ impl PageWasm {
     }
 }
 
+impl HostGc for PageWasm {
+    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        let Ok(state) = self.state.try_borrow() else {
+            // Wasm may be suspended in an imported JS callback. Its operand stack and
+            // in-flight instantiation are not represented by an idle Store snapshot.
+            // Leave cache handles undiscounted (strong roots) for this collection.
+            return;
+        };
+        let Some(state) = state.as_ref() else { return };
+        if state.function_cache.is_empty() {
+            return;
+        }
+
+        // JS API #object-caches / #exported-function-exotic-objects: a wrapper's
+        // identity remains observable through native funcrefs even without JS references.
+        // ECMA-262 #sec-liveness permits reclaiming a whole unreachable group, not
+        // rematerializing one member while another can return the original address.
+        let mut groups = FunctionGroups::default();
+        let mut imports = Vec::new();
+        let mut roots = Vec::new();
+        state.store.visit_function_references(
+            |functions, imported| {
+                groups.join(functions);
+                if let Some(&owner) = functions.first() {
+                    imports.extend(imported.iter().map(|&function| (owner, function)));
+                }
+            },
+            |function| roots.push(function),
+        );
+        // An importer keeps its dependencies alive, never the reverse. Otherwise a
+        // long-lived shared import would pin every throwaway importing instance.
+        let mut links: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (owner, dependency) in imports {
+            let owner = groups.group(owner);
+            let dependency = groups.group(dependency);
+            if owner != dependency {
+                links.entry(owner).or_default().push(dependency);
+            }
+        }
+        for targets in links.values_mut() {
+            targets.sort_unstable();
+            targets.dedup();
+        }
+        let mut representatives: HashMap<usize, &Value> = HashMap::new();
+        for (&id, wrapper) in &state.function_cache {
+            let Some(&function) = state.funcs.get(id) else {
+                continue;
+            };
+            let group = groups.group(function);
+            visitor.internal(wrapper);
+            if let Some(first) = representatives.get(&group) {
+                // A linear-size star, not a quadratic all-to-all export graph.
+                visitor.edge(first, wrapper);
+                visitor.edge(wrapper, first);
+            } else {
+                representatives.insert(group, wrapper);
+            }
+        }
+        for (&group, &owner) in &representatives {
+            if let Some(targets) = links.get(&group) {
+                for &target in targets {
+                    visit_cached_function_targets(target, &links, &representatives, &mut |value| {
+                        visitor.edge(owner, value)
+                    });
+                }
+            }
+        }
+        let root_groups: HashSet<usize> = roots
+            .into_iter()
+            .map(|function| groups.group(function))
+            .collect();
+        for group in root_groups {
+            visit_cached_function_targets(group, &links, &representatives, &mut |value| {
+                visitor.root(value)
+            });
+        }
+    }
+
+    fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        if let Some(state) = state.as_mut() {
+            state.function_cache.retain(|_, value| is_live(value));
+        }
+    }
+}
+
+/// Reach an exported wrapper through native-only intermediate modules as well. Stop at
+/// another cached representative: its outgoing JS edges are handled by Lumen's mark queue.
+fn visit_cached_function_targets(
+    start: usize,
+    links: &HashMap<usize, Vec<usize>>,
+    representatives: &HashMap<usize, &Value>,
+    visit: &mut impl FnMut(&Value),
+) {
+    let mut pending = vec![start];
+    let mut seen = HashSet::new();
+    while let Some(group) = pending.pop() {
+        if !seen.insert(group) {
+            continue;
+        }
+        if let Some(value) = representatives.get(&group) {
+            visit(value);
+        } else if let Some(targets) = links.get(&group) {
+            pending.extend(targets);
+        }
+    }
+}
+
+/// Conservative components of functions DEFINED by each module instance. Imported
+/// functions use directed dependencies, never membership in the importer's component.
+#[derive(Default)]
+struct FunctionGroups {
+    indices: HashMap<wasmi::Func, usize>,
+    parents: Vec<usize>,
+    sizes: Vec<usize>,
+}
+
+impl FunctionGroups {
+    fn group(&mut self, function: wasmi::Func) -> usize {
+        let next = self.parents.len();
+        let index = *self.indices.entry(function).or_insert_with(|| {
+            self.parents.push(next);
+            self.sizes.push(1);
+            next
+        });
+        let mut root = index;
+        while self.parents[root] != root {
+            root = self.parents[root];
+        }
+        let mut current = index;
+        while self.parents[current] != root {
+            let next = self.parents[current];
+            self.parents[current] = root;
+            current = next;
+        }
+        root
+    }
+
+    fn join(&mut self, functions: &[wasmi::Func]) {
+        let Some((&first, rest)) = functions.split_first() else {
+            return;
+        };
+        let mut root = self.group(first);
+        for &function in rest {
+            let mut other = self.group(function);
+            if other == root {
+                continue;
+            }
+            if self.sizes[root] < self.sizes[other] {
+                std::mem::swap(&mut root, &mut other);
+            }
+            self.parents[other] = root;
+            self.sizes[root] += self.sizes[other];
+        }
+    }
+}
+
 impl RetainedExternalMemory for PageWasm {
     fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
         let owner_identity = Rc::as_ptr(&self.state) as usize;
@@ -179,6 +355,9 @@ struct WasmState {
     modules: Vec<wasmi::Module>,
     instances: Vec<wasmi::Instance>,
     funcs: Vec<wasmi::Func>,
+    /// Strong handles accounted as internal cache edges by HostGc, not permanent roots.
+    /// Native Store addresses themselves remain agent-lifetime allocations for now.
+    function_cache: HashMap<usize, Value>,
     globals: Vec<wasmi::Global>,
     memories: Vec<MemorySlot>,
     tables: Vec<wasmi::Table>,
@@ -194,6 +373,7 @@ impl WasmState {
             modules: Vec::new(),
             instances: Vec::new(),
             funcs: Vec::new(),
+            function_cache: HashMap::new(),
             globals: Vec::new(),
             memories: Vec::new(),
             tables: Vec::new(),
@@ -261,6 +441,37 @@ impl WasmState {
 
 fn page_wasm(ctx: &mut Ctx) -> Option<PageWasm> {
     ctx.host_mut::<HostState>().map(|state| state.wasm.clone())
+}
+
+pub(super) fn host_function_cache(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let Some(page) = page_wasm(ctx) else {
+        return Ok(Value::Undefined);
+    };
+    let Some(id) = arg_id(args, 0) else {
+        return Ok(Value::Undefined);
+    };
+    let cache = |state: &mut WasmState| {
+        if id >= state.funcs.len() {
+            return Value::Undefined;
+        }
+        if let Some(wrapper) = state.function_cache.get(&id) {
+            return wrapper.clone();
+        }
+        if let Some(wrapper) = args.get(1).filter(|value| value.is_callable()) {
+            state.function_cache.insert(id, wrapper.clone());
+            return wrapper.clone();
+        }
+        Value::Undefined
+    };
+    let result = match page.state.try_borrow_mut() {
+        Ok(mut state) => state.as_mut().map(cache).unwrap_or(Value::Undefined),
+        Err(_) => with_active_state(cache).unwrap_or(Value::Undefined),
+    };
+    Ok(result)
 }
 
 fn arg_id(args: &[Value], index: usize) -> Option<usize> {

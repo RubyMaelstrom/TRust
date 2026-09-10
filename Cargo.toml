@@ -97,6 +97,10 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 # resistance buys nothing for arena-internal keys.
 rustc-hash = "2"
 serde_json = "1"
+# Fetch Metadata uses HTML's schemeful same-site relation, including private
+# suffixes (e.g. github.io). This compiled PSL has no runtime network refresh;
+# Cargo.lock pins the data revision delivered with each browser build.
+psl = "2.1.232"
 # Static SVG image rendering. `resvg`/`usvg`/tiny-skia are pure Rust; text and
 # embedded data: raster images stay enabled for web compatibility. TRust
 # supplies usvg's font database from its shared pure-Rust catalog. Keep

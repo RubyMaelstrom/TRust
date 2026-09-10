@@ -137,6 +137,8 @@ pub(crate) fn headers_to_blob(headers: &[(String, String)]) -> String {
 
 pub struct PageEnv {
     pub url: String,
+    pub navigation_timing: Option<Box<crate::http::FetchTiming>>,
+    pub(crate) resource_timings: Vec<crate::performance::ResourceTiming>,
     pub viewport: (u16, u16),
     pub cell_px: (u16, u16),
     pub device_pixel_ratio: f32,
@@ -153,6 +155,8 @@ impl PageEnv {
     pub fn bare(url: &str) -> Self {
         Self {
             url: url.to_string(),
+            navigation_timing: None,
+            resource_timings: Vec::new(),
             viewport: (80, 24),
             cell_px: (8, 16),
             device_pixel_ratio: 1.0,
@@ -260,6 +264,13 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
 #[derive(Debug)]
 pub enum PageCmd {
     Click(usize),
+    /// Actual primary-pointer transitions, before the separate click action.
+    PointerButton {
+        node: Option<usize>,
+        pressed: bool,
+        x: f64,
+        y: f64,
+    },
     /// Native focus navigation. None focuses the document viewport; a hit on
     /// an element resolves to its nearest click-focusable ancestor.
     Focus(Option<usize>),
@@ -314,6 +325,7 @@ impl PageCmd {
         matches!(
             self,
             Self::Click(_)
+                | Self::PointerButton { .. }
                 | Self::Focus(_)
                 | Self::Key { .. }
                 | Self::SetValue { .. }
@@ -369,6 +381,7 @@ pub enum PageEvt {
     },
     Navigate(String),
     Replace(String),
+    Reload(String),
     HistoryUpdate {
         url: String,
         replace: bool,
@@ -528,7 +541,12 @@ pub(crate) fn worker_prelude() -> &'static str {
             let streams = wrapped_platform_block("/*__STREAMS_BEGIN__*/", "/*__STREAMS_END__*/");
             let wasm = platform_block("/*__WASM_BEGIN__*/", "/*__WASM_END__*/");
             let urlpattern = platform_block("/*__URLPATTERN_BEGIN__*/", "/*__URLPATTERN_END__*/");
-            format!("{WORKER_SCOPE}\n{codec}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}")
+            let permissions =
+                platform_block("/*__PERMISSIONS_BEGIN__*/", "/*__PERMISSIONS_END__*/");
+            let navigator = platform_block("/*__NAVIGATOR_BEGIN__*/", "/*__NAVIGATOR_END__*/");
+            format!(
+                "{WORKER_SCOPE}\n{navigator}\n{permissions}\n{codec}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}"
+            )
         })
         .as_str()
 }
@@ -785,6 +803,188 @@ pub fn external_scripts(html: &str) -> Vec<String> {
         })
         .filter_map(|(source, _, _, _)| source)
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalResourceKind {
+    Script,
+    Sheet,
+    Preload,
+    Sprite,
+}
+
+pub(crate) struct ExternalResource {
+    pub kind: ExternalResourceKind,
+    pub source: String,
+    pub cross_origin: Option<String>,
+    pub initiator: &'static str,
+    pub render_blocking: bool,
+}
+
+impl ExternalResource {
+    pub fn destination(&self) -> &'static str {
+        match self.kind {
+            ExternalResourceKind::Script | ExternalResourceKind::Preload => "script",
+            ExternalResourceKind::Sheet => "style",
+            ExternalResourceKind::Sprite => "image",
+        }
+    }
+
+    pub fn cors_credentials(&self) -> Option<crate::http::CredentialsMode> {
+        element_cors_credentials(
+            self.cross_origin.as_deref(),
+            self.kind == ExternalResourceKind::Preload,
+        )
+    }
+}
+
+/// HTML #create-a-potential-cors-request and #fetch-a-single-module-script:
+/// absent/anonymous module crossorigin uses same-origin credentials, whereas
+/// an ordinary no-CORS element includes credentials. Invalid values select
+/// Anonymous, not No CORS. Keep this separate from the Referer policy.
+pub(crate) fn element_cors_credentials(
+    cross_origin: Option<&str>,
+    module: bool,
+) -> Option<crate::http::CredentialsMode> {
+    match cross_origin {
+        Some(value) if value.eq_ignore_ascii_case("use-credentials") => {
+            Some(crate::http::CredentialsMode::Include)
+        }
+        Some(_) => Some(crate::http::CredentialsMode::SameOrigin),
+        None if module => Some(crate::http::CredentialsMode::SameOrigin),
+        None => None,
+    }
+}
+
+/// Preserve the element's request context when the preload scanner starts its
+/// fetch. The old URL-only lists lost crossorigin/mode. One parse also replaces
+/// four independent scans, while retaining the existing per-kind/source order.
+pub(crate) fn external_resources(html: &str) -> Vec<ExternalResource> {
+    external_resources_at(html, 640.0, 384.0, 1.0)
+}
+
+pub(crate) fn external_resources_at(
+    html: &str,
+    width: f32,
+    height: f32,
+    density: f32,
+) -> Vec<ExternalResource> {
+    let mut dom = Dom::parse_document(html);
+    dom.set_viewport_px(width, height);
+    dom.set_device_pixel_ratio(density);
+    // HTML #render-blocking-mechanism / #link-type-stylesheet: capture
+    // parser-time eligibility before the complete DOM reaches the page actor.
+    // Head children are encountered before the parser creates the body. A
+    // stylesheet is implicitly eligible; scripts require blocking=render.
+    let blocks = |node, sheet| {
+        let mut parent = dom.node(node).parent;
+        let mut in_head = false;
+        while let Some(id) = parent {
+            if dom.tag_name(id) == Some("head") {
+                in_head = true;
+                break;
+            }
+            parent = dom.node(id).parent;
+        }
+        in_head
+            && (sheet
+                || dom.attr(node, "blocking").is_some_and(|tokens| {
+                    tokens
+                        .split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("render"))
+                }))
+            && (!sheet || dom.media_matches(dom.attr(node, "media").unwrap_or("all")))
+    };
+    let mut scripts = Vec::new();
+    let mut sheets = Vec::new();
+    let mut modules = Vec::new();
+    let mut sprites = Vec::new();
+    let mut seen_sheets = std::collections::HashSet::new();
+    let mut seen_modules = std::collections::HashSet::new();
+    let mut seen_sprites = std::collections::HashSet::new();
+    for (source, _, script_type, node) in dom.scripts() {
+        if let Some(source) = source
+            && is_classic(&script_type)
+            && dom.attr(node, "nomodule").is_none()
+        {
+            scripts.push(ExternalResource {
+                kind: ExternalResourceKind::Script,
+                source,
+                cross_origin: dom.attr(node, "crossorigin").map(str::to_string),
+                initiator: "script",
+                render_blocking: blocks(node, false),
+            });
+        }
+    }
+    for node in dom.descendants(DOCUMENT) {
+        let tag = dom.tag_name(node);
+        let rel_has = |name: &str| {
+            dom.attr(node, "rel").is_some_and(|rel| {
+                rel.split_ascii_whitespace()
+                    .any(|part| part.eq_ignore_ascii_case(name))
+            })
+        };
+        let request = |kind, source: &str| ExternalResource {
+            kind,
+            source: source.to_string(),
+            cross_origin: dom.attr(node, "crossorigin").map(str::to_string),
+            // HTML #default-fetch-and-process-the-linked-resource uses css
+            // for stylesheets; #fetch-a-single-module-script uses script,
+            // including modulepreload. Some current engines instead expose
+            // link for both; Resource Timing's informative table is not the
+            // request-construction algorithm.
+            initiator: match (kind, tag) {
+                (ExternalResourceKind::Sheet, _) => "css",
+                (ExternalResourceKind::Preload, _) => "script",
+                (_, Some("link")) => "link",
+                (_, Some("script")) => "script",
+                _ => "other",
+            },
+            render_blocking: kind == ExternalResourceKind::Sheet && blocks(node, true)
+                || tag == Some("script") && blocks(node, false),
+        };
+        if tag == Some("link")
+            && rel_has("stylesheet")
+            && !rel_has("alternate")
+            && dom.attr(node, "disabled").is_none()
+            && let Some(source) = dom.attr(node, "href")
+            && seen_sheets.insert(source.to_string())
+        {
+            sheets.push(request(ExternalResourceKind::Sheet, source));
+        }
+        let module = if tag == Some("link") && rel_has("modulepreload") {
+            dom.attr(node, "href")
+        } else if tag == Some("script")
+            && dom
+                .attr(node, "type")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("module"))
+        {
+            dom.attr(node, "src")
+        } else {
+            None
+        };
+        if let Some(source) = module
+            && seen_modules.insert(source.to_string())
+        {
+            modules.push(request(ExternalResourceKind::Preload, source));
+        }
+        if tag == Some("use")
+            && let Some((file, fragment)) = dom
+                .attr(node, "href")
+                .or_else(|| dom.attr(node, "xlink:href"))
+                .map(str::trim)
+                .and_then(|value| value.split_once('#'))
+            && !file.is_empty()
+            && !fragment.is_empty()
+            && seen_sprites.insert(file.to_string())
+        {
+            sprites.push(request(ExternalResourceKind::Sprite, file));
+        }
+    }
+    scripts.extend(sheets);
+    scripts.extend(modules);
+    scripts.extend(sprites);
+    scripts
 }
 
 pub fn external_stylesheets(html: &str) -> Vec<String> {

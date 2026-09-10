@@ -313,6 +313,49 @@ fn is_javascript_mime(mime: &str) -> bool {
     )
 }
 
+/// MIME Sniffing #minimize-a-supported-mime-type: timing exposes a processing
+/// category, never MIME parameters or an arbitrary server-selected subtype.
+pub(crate) fn minimized_mime_type(value: &str) -> String {
+    let Some(mime) = parse_mime(value) else {
+        return String::new();
+    };
+    let mime = essence(&mime);
+    if is_javascript_mime(mime) {
+        return String::from("text/javascript");
+    }
+    if matches!(mime, "application/json" | "text/json") || mime.ends_with("+json") {
+        return String::from("application/json");
+    }
+    if mime == "image/svg+xml" {
+        return mime.to_string();
+    }
+    if matches!(mime, "application/xml" | "text/xml") || mime.ends_with("+xml") {
+        return String::from("application/xml");
+    }
+    if mime_is_renderable(mime, false)
+        || mime == "application/wasm"
+        || matches!(
+            mime,
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "image/x-icon"
+                | "image/vnd.microsoft.icon"
+                | "font/woff"
+                | "font/woff2"
+                | "font/ttf"
+                | "font/otf"
+                | "application/font-woff"
+                | "application/x-font-ttf"
+                | "application/x-font-opentype"
+        )
+    {
+        return mime.to_string();
+    }
+    String::new()
+}
+
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -857,6 +900,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         }
     }
 

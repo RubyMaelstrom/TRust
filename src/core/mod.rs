@@ -240,6 +240,11 @@ pub enum UserAction {
         actor: Option<usize>,
         position: CssPoint,
     },
+    PagePointerButton {
+        actor: Option<usize>,
+        position: CssPoint,
+        pressed: bool,
+    },
     /// Move native page focus, including clicking non-interactive content.
     /// This is distinct from the window's system-focus notification above.
     PageFocus {
@@ -384,6 +389,16 @@ enum NavigationIntent {
     Forward,
 }
 
+impl NavigationIntent {
+    fn timing_type(self) -> http::NavigationType {
+        match self {
+            Self::Reload => http::NavigationType::Reload,
+            Self::Back | Self::Forward => http::NavigationType::BackForward,
+            Self::New | Self::Replace => http::NavigationType::Navigate,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingNavigation {
     generation: u64,
@@ -505,6 +520,7 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::Static { .. } => "Static",
         crate::js::PageEvt::Navigate(_) => "Navigate",
         crate::js::PageEvt::Replace(_) => "Replace",
+        crate::js::PageEvt::Reload(_) => "Reload",
         crate::js::PageEvt::HistoryUpdate { .. } => "HistoryUpdate",
         crate::js::PageEvt::ScrollToFragment(_) => "ScrollToFragment",
         crate::js::PageEvt::Trouble(_) => "Trouble",
@@ -872,6 +888,19 @@ impl BrowserController {
                 // the resulting live-DOM wake) is what can change pixels.
                 false
             }
+            UserAction::PagePointerButton {
+                actor,
+                position,
+                pressed,
+            } => {
+                self.send_user(crate::js::PageCmd::PointerButton {
+                    node: actor,
+                    pressed,
+                    x: f64::from(position.x),
+                    y: f64::from(position.y),
+                });
+                false
+            }
             UserAction::PointerButton { position, .. } => {
                 let changed = self.interaction.pointer != Some(position);
                 self.interaction.pointer = Some(position);
@@ -1110,6 +1139,7 @@ impl BrowserController {
                 device_pixel_ratio,
                 storage,
                 None,
+                intent,
             )
             .await;
             let event = interactive_fetch_event(generation, result);
@@ -1445,6 +1475,7 @@ impl BrowserController {
                 true
             }
             PageEvt::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
+            PageEvt::Reload(address) => self.begin_address(&address, NavigationIntent::Reload),
             PageEvt::Replace(address) => self.begin_address(&address, NavigationIntent::Replace),
             PageEvt::HistoryUpdate { url, replace } => {
                 self.apply_same_document_history_update(&url, replace)
@@ -1594,6 +1625,7 @@ impl BrowserController {
                 device_pixel_ratio,
                 storage,
                 Some(body),
+                NavigationIntent::New,
             )
             .await;
             let event = interactive_fetch_event(generation, result);
@@ -1637,6 +1669,7 @@ pub async fn fetch_protocol(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_protocol_interactive(
     target: &Link,
     fallback_http: bool,
@@ -1645,6 +1678,7 @@ async fn fetch_protocol_interactive(
     device_pixel_ratio: f32,
     storage: crate::js::WebStorage,
     post_body: Option<String>,
+    intent: NavigationIntent,
 ) -> Result<InteractiveFetch, String> {
     if let Link::Http(url) = target {
         let mut response = if let Some(body) = post_body {
@@ -1657,6 +1691,7 @@ async fn fetch_protocol_interactive(
                 )),
                 headers: Vec::new(),
                 fetch_metadata: None,
+                timing_client: None,
                 fetch_policy: None,
             };
             if let Some(referrer) = referrer {
@@ -1674,6 +1709,9 @@ async fn fetch_protocol_interactive(
             http::set_navigation_metadata(&mut request, referrer);
             http::fetch(&request).await?
         };
+        if let Some(timing) = response.timing.as_mut() {
+            timing.navigation_type = intent.timing_type();
+        }
         if crate::media::is_youtube_video_url(&response.url) {
             return Ok(InteractiveFetch::ExternalMedia(response.url));
         }
@@ -1973,6 +2011,7 @@ mod tests {
                 }),
                 challenge: None,
                 from_post: false,
+                timing: None,
             })))
         ));
 
@@ -2031,6 +2070,7 @@ mod tests {
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,
+                timing: None,
             },
         ));
 
@@ -2091,6 +2131,7 @@ mod tests {
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,
+                timing: None,
             })),
             status: String::from("Ready"),
             rendered: None,

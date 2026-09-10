@@ -225,6 +225,27 @@ pub(crate) struct BoxStyle {
 }
 
 impl BoxStyle {
+    /// CSS 2.2 §9.4.3 relative positioning, followed by the translation
+    /// component of CSS Transforms. The caller preserves normal-flow size.
+    pub(super) fn paint_offset(&self, cb_w: f32, cb_h: Option<f32>, w: f32, h: f32) -> (f32, f32) {
+        let (mut dx, mut dy) = (0.0, 0.0);
+        if self.position == Pos::Relative {
+            dx = self.inset[LEFT]
+                .resolve(Some(cb_w))
+                .or_else(|| self.inset[RIGHT].resolve(Some(cb_w)).map(|v| -v))
+                .unwrap_or(0.0);
+            dy = self.inset[TOP]
+                .resolve(cb_h)
+                .or_else(|| self.inset[BOTTOM].resolve(cb_h).map(|v| -v))
+                .unwrap_or(0.0);
+        }
+        if self.has_transform {
+            dx += self.tx.0 * w + self.tx.1;
+            dy += self.ty.0 * h + self.ty.1;
+        }
+        (dx, dy)
+    }
+
     /// The style of an anonymous box (CSS 2.1 §9.2.1.1: anonymous boxes take
     /// the initial value for every non-inherited property).
     pub fn anonymous() -> BoxStyle {

@@ -62,10 +62,11 @@ struct Own {
     block: HashMap<NodeId, Rect>,
     css_size: HashMap<NodeId, [f32; 2]>,
     nodes: HashSet<NodeId>,
+    frame_viewports: HashMap<NodeId, crate::render::CssRect>,
 }
 
 /// Walk a fragment tree, attributing border boxes and inline piece boxes.
-fn walk(f: &Frag<'_>, o: &mut Own) {
+fn walk(dom: &Dom, f: &Frag<'_>, o: &mut Own) {
     if f.node != NO_NODE {
         o.nodes.insert(f.node);
         if matches!(f.kind, FragKind::Block | FragKind::TableCell(_)) {
@@ -79,6 +80,11 @@ fn walk(f: &Frag<'_>, o: &mut Own) {
             add(&mut o.own, f.node, r);
             if let Some(size) = f.css_size {
                 o.css_size.insert(f.node, size);
+            }
+            if matches!(dom.tag_name(f.node), Some("iframe" | "frame")) {
+                // HTML Rendering #the-page: each child Document fits the
+                // embedding element's content box, not its border/padding box.
+                o.frame_viewports.insert(f.node, f.content_box());
             }
         }
     }
@@ -98,7 +104,7 @@ fn walk(f: &Frag<'_>, o: &mut Own) {
         }
     }
     for c in &f.children {
-        walk(c, o);
+        walk(dom, c, o);
     }
 }
 
@@ -186,27 +192,32 @@ fn select_into(
 
 /// Build the `NodeId → PxRect` geometry map from the laid fragment tree (the
 /// in-flow root + the pinned fixed layer), directly in CSS pixels.
+#[allow(clippy::type_complexity)]
 pub(super) fn boxes(
     dom: &Dom,
     root: &Frag<'_>,
     fixed: &[Frag<'_>],
     top_layer: &[TopFrag<'_>],
-) -> (HashMap<NodeId, PxRect>, HashMap<NodeId, PxRect>) {
+) -> (
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, crate::render::CssRect>,
+) {
     // In-flow tree: its own boxes never include the fixed layer.
     let mut flow = Own::default();
-    walk(root, &mut flow);
+    walk(dom, root, &mut flow);
 
     // The pinned fixed layer: measured separately so a fixed header never
     // inflates the document's scrollable height (a fixed box is viewport-
     // relative, contributing no scroll overflow — CSS Overflow L3).
     let mut fx = Own::default();
     for f in fixed {
-        walk(f, &mut fx);
+        walk(dom, f, &mut fx);
     }
     // Top-layer boxes do not inflate the document scroll area, but CSSOM View
     // still reports their actual ICB-relative border boxes.
     for top in top_layer {
-        walk(&top.fragment, &mut fx);
+        walk(dom, &top.fragment, &mut fx);
     }
 
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
@@ -232,5 +243,6 @@ pub(super) fn boxes(
             &mut scroll,
         );
     }
-    (out, scroll)
+    flow.frame_viewports.extend(fx.frame_viewports);
+    (out, scroll, flow.frame_viewports)
 }

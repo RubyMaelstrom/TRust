@@ -13,8 +13,13 @@
     ctx.save(); ctx.setLineDash([1]); ctx.lineDashOffset=0.125; ctx.restore();
     check(ctx.getLineDash().join(',')==='2,2' && ctx.lineDashOffset===0,'saved dash state');
     ctx.reset(); ctx.fillStyle='red'; ctx.fillRect(0,0,4,8); ctx.fillStyle='lime'; ctx.fillRect(4,0,4,8);
-    const img = new Image(); img.src=c.toDataURL(); img.width=123; img.height=456;
-    ctx.clearRect(0,0,8,8); ctx.drawImage(img,0,0);
-    check(pixel(ctx,1,1)==='255,0,0,255' && pixel(ctx,6,1)==='0,255,0,255','decoded image uses natural pixels not element dimensions');
-    return 'canvas-paths-images-ok';
+    const img = new Image();
+    globalThis.canvasDecodedImageResult = 'pending';
+    img.onload = function () {
+        ctx.clearRect(0,0,8,8); ctx.drawImage(img,0,0);
+        check(pixel(ctx,1,1)==='255,0,0,255' && pixel(ctx,6,1)==='0,255,0,255','decoded image uses natural pixels not element dimensions');
+        globalThis.canvasDecodedImageResult = 'canvas-paths-images-ok';
+    };
+    img.src=c.toDataURL(); img.width=123; img.height=456;
+    return 'canvas-paths-images-pending';
 })();

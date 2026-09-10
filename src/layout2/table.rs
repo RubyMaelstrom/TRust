@@ -267,9 +267,9 @@ impl Flow<'_> {
             .cells
             .iter()
             .map(|cell| {
-                let row = self
-                    .dom
-                    .parent_flat(cell.b.node)
+                let row = (cell.b.node != super::NO_NODE)
+                    .then(|| self.dom.parent_flat(cell.b.node))
+                    .flatten()
                     .filter(|&n| self.dom.effective_display(n).as_deref() == Some("table-row"));
                 let group = row.and_then(|r| self.dom.parent_flat(r)).filter(|&n| {
                     matches!(
@@ -531,6 +531,11 @@ impl Flow<'_> {
     /// `thead,tbody,tfoot { vertical-align: middle }`), so a bare cell defaults
     /// to MIDDLE. `baseline`/inline-only values ≈ top in the cell line model.
     fn cell_valign_offset(&self, cell: NodeId, cell_h: f32, span_h: f32) -> f32 {
+        // Anonymous cells have initial (baseline) alignment, not HTML's
+        // td/th presentational hints, and no DOM identity to query.
+        if cell == super::NO_NODE {
+            return 0.0;
+        }
         let slack = (span_h - cell_h).max(0.0);
         if slack <= 0.0 {
             return 0.0;
@@ -588,6 +593,10 @@ impl Flow<'_> {
 
 /// Whether the cell sets any CSS padding of its own (so `cellpadding` loses).
 fn cell_has_css_padding(flow: &Flow<'_>, node: NodeId) -> bool {
+    // No HTML cellpadding hint applies to a generated anonymous cell.
+    if node == super::NO_NODE {
+        return true;
+    }
     [
         "padding",
         "padding-left",

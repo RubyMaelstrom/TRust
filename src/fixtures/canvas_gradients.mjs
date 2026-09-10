@@ -1,0 +1,74 @@
+// Original HTML CanvasFillStrokeStyles / CanvasGradient conformance checks.
+(function () {
+    function check(ok, message) { if (!ok) throw Error(message); }
+    function throws(name, fn) { try { fn(); } catch (e) { check(e.name === name, 'wrong exception ' + e.name); return; } throw Error('missing ' + name); }
+    function pixel(ctx, x, y) { return Array.from(ctx.getImageData(x, y, 1, 1).data); }
+    function close(actual, expected, label) { check(actual.every((v,i) => Math.abs(v - expected[i]) <= 3), label + ': ' + actual); }
+    const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 32;
+    const ctx = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0.5,0,16.5,0);
+    check(gradient instanceof CanvasGradient && Object.prototype.toString.call(gradient) === '[object CanvasGradient]', 'gradient brand');
+    throws('TypeError', () => new CanvasGradient());
+    throws('TypeError', () => CanvasGradient.prototype.addColorStop.call({}, 0, 'red'));
+    throws('TypeError', () => ctx.createLinearGradient(NaN,0,1,0));
+    throws('TypeError', () => ctx.createRadialGradient(0,0,-1,0,0,Infinity));
+    throws('IndexSizeError', () => ctx.createRadialGradient(0,0,-1,0,0,1));
+    throws('TypeError', () => gradient.addColorStop(Infinity, 'red'));
+    throws('IndexSizeError', () => gradient.addColorStop(2, 'not a color'));
+    throws('SyntaxError', () => gradient.addColorStop(0, 'not a color'));
+    const order = [];
+    throws('TypeError', () => ctx.createLinearGradient(NaN, {valueOf(){order.push('later');return 0;}},1,0));
+    check(order.length === 0, 'finite double conversion stops immediately');
+    throws('IndexSizeError', () => gradient.addColorStop(2, {toString(){order.push('color');return 'red';}}));
+    check(order.join(',') === 'color', 'all IDL conversions precede range algorithm');
+    ctx.fillStyle = gradient; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,4,4), [0,0,0,0], 'no stops is transparent');
+    gradient.addColorStop(1,'blue'); gradient.addColorStop(0,'red');
+    ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,8,4), [128,0,128,255], 'live unordered stops interpolate');
+    check(ctx.fillStyle === gradient, 'getter identity');
+    ctx.fillStyle = 'invalid-color'; check(ctx.fillStyle === gradient, 'invalid color retains gradient');
+    ctx.save(); ctx.fillStyle = 'lime'; ctx.restore();
+    check(ctx.fillStyle === gradient, 'restore retains gradient identity');
+    gradient.addColorStop(0.5,'lime'); ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,8,4), [0,255,0,255], 'restored gradient observes later stop');
+    ctx.reset(); check(ctx.fillStyle === '#000000', 'reset clears gradient identity');
+    ctx.restore(); check(ctx.fillStyle === '#000000', 'reset clears saved styles');
+    ctx.fillStyle = gradient; canvas.width = canvas.width;
+    check(ctx.fillStyle === '#000000', 'same-size bitmap reset clears gradient');
+    const alpha = ctx.createLinearGradient(0.5,0,16.5,0);
+    alpha.addColorStop(0, 'rgba(255,0,0,0)'); alpha.addColorStop(1,'blue');
+    ctx.fillStyle = alpha; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,8,4), [128,0,128,128], 'unpremultiplied interpolation');
+    ctx.reset(); ctx.translate(8,0); ctx.fillStyle = alpha; ctx.fillRect(0,0,24,32);
+    close(pixel(ctx,16,4), [128,0,128,128], 'paint-time transform');
+    ctx.reset(); ctx.fillStyle = 'red'; ctx.fillRect(0,0,32,32);
+    const degenerate = ctx.createRadialGradient(8,8,4,8,8,4); degenerate.addColorStop(0,'blue');
+    ctx.fillStyle = degenerate; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,8,8), [255,0,0,255], 'identical radial circles paint nothing');
+    const zeroLine = ctx.createLinearGradient(0,0,0,0); zeroLine.addColorStop(0,'blue');
+    ctx.fillStyle = zeroLine; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,8,8), [255,0,0,255], 'zero-length linear gradient paints nothing');
+    ctx.reset();
+    const radial = ctx.createRadialGradient(8.5,8.5,2,8.5,8.5,10);
+    radial.addColorStop(0,'red'); radial.addColorStop(1,'blue');
+    ctx.fillStyle = radial; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,14,8), [128,0,128,255], 'nonzero initial radius');
+    ctx.reset();
+    const cylinder = ctx.createRadialGradient(4,8,2,20,8,2); cylinder.addColorStop(0,'lime');
+    ctx.fillStyle = cylinder; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,12,8), [0,255,0,255], 'single-stop radial interior');
+    close(pixel(ctx,12,20), [0,0,0,0], 'single-stop radial exterior stays transparent');
+    ctx.reset();
+    const conic = ctx.createConicGradient(Math.PI / 2, 16.5,16.5);
+    conic.addColorStop(0,'red'); conic.addColorStop(1,'blue');
+    ctx.fillStyle = conic; ctx.fillRect(0,0,32,32);
+    close(pixel(ctx,16,4), [128,0,128,255], 'conic rotated midpoint');
+    ctx.reset(); ctx.strokeStyle = gradient; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(0,8); ctx.lineTo(32,8); ctx.stroke();
+    close(pixel(ctx,8,8), [0,255,0,255], 'gradient stroke');
+    const other = document.createElement('canvas').getContext('2d');
+    other.fillStyle = gradient; other.fillRect(0,0,32,32);
+    close(pixel(other,8,4), [0,255,0,255], 'canvas-neutral gradient');
+    return 'canvas-gradients-ok';
+})();

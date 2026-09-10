@@ -81,6 +81,22 @@ impl<T> Store<T> {
         &self.typed.data
     }
 
+    /// Visit native references needed by an embedding garbage collector's exported-function
+    /// identity cache. Defined functions belonging to an instance form a conservative liveness
+    /// group with outgoing edges to its imports (the second slice, NOT reverse edges).
+    /// Funcrefs in tables, globals and non-dropped element segments
+    /// are conservative roots. This does not collect or reuse native Store addresses.
+    ///
+    /// Call only while the Store is idle. During a re-entrant host callback the embedder must
+    /// conservatively retain its cached wrappers: live Wasm operands are not enumerated here.
+    pub fn visit_function_references(
+        &self,
+        group: impl FnMut(&[crate::Func], &[crate::Func]),
+        root: impl FnMut(crate::Func),
+    ) {
+        self.inner.visit_function_references(group, root);
+    }
+
     /// Returns an exclusive reference to the user provided data owned by this [`Store`].
     pub fn data_mut(&mut self) -> &mut T {
         &mut self.typed.data

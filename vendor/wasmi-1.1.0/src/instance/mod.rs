@@ -87,6 +87,11 @@ impl InstanceEntity {
         self.initialized
     }
 
+    /// Function addresses retained by this module instance, including imports.
+    pub(crate) fn functions(&self) -> &[Func] {
+        &self.funcs
+    }
+
     /// Returns the linear memory at the `index` if any.
     pub fn get_memory(&self, index: u32) -> Option<Memory> {
         self.memories.get(index as usize).copied()

@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use url::{Host, Url};
 
 use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
+pub use crate::performance::{FetchTiming, NavigationType};
 use crate::tls;
 
 // Per-response ceiling — a memory guard, not a correctness limit. The big
@@ -66,6 +67,9 @@ pub struct Request {
     /// User-agent-owned Fetch Metadata context. It is kept apart from the
     /// page header list so JavaScript cannot forge `Sec-Fetch-*` values.
     pub(crate) fetch_metadata: Option<FetchMetadata>,
+    /// The native request client for Resource Timing's TAO check. Referer can
+    /// be suppressed and is not an origin or authorization credential.
+    pub(crate) timing_client: Option<Url>,
     /// The page Fetch/XHR policy, when this request originated in a script
     /// realm. Navigation and browser-owned subresource requests leave this
     /// unset and retain the existing browser defaults.
@@ -77,6 +81,16 @@ pub(crate) enum RequestMode {
     Cors,
     NoCors,
     SameOrigin,
+}
+
+impl RequestMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Cors => "cors",
+            Self::NoCors => "no-cors",
+            Self::SameOrigin => "same-origin",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +111,7 @@ pub(crate) struct FetchPolicy {
 pub(crate) enum FetchSite {
     None,
     SameOrigin,
+    SameSite,
     CrossSite,
 }
 
@@ -116,8 +131,35 @@ impl Request {
             body: None,
             headers: Vec::new(),
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: None,
         }
+    }
+
+    /// HTML #create-a-potential-cors-request. Browser-owned no-CORS consumers
+    /// need the internal response bytes (not script Fetch's opaque response).
+    /// A CORS consumer uses the ordinary CORS/credentials checks before it can
+    /// read those bytes. No page-authored request headers participate here.
+    pub(crate) fn subresource(
+        url: Url,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    ) -> Self {
+        let mut request = Self::get(url);
+        let mode = if cors_credentials.is_some() {
+            "cors"
+        } else {
+            "no-cors"
+        };
+        set_fetch_metadata(&mut request, client, destination, mode);
+        set_referrer(&mut request, client);
+        request.fetch_policy = cors_credentials.map(|credentials| FetchPolicy {
+            origin: client.clone(),
+            mode: RequestMode::Cors,
+            credentials,
+        });
+        request
     }
 }
 
@@ -162,6 +204,9 @@ pub struct Response {
     /// can't be refetched honestly (a re-POST double-submits), so its doc
     /// is never evicted from the trail.
     pub from_post: bool,
+    /// Native Fetch timestamps, never synthesized from page JavaScript. The
+    /// record follows the response into the document's own timing entry.
+    pub timing: Option<Box<FetchTiming>>,
 }
 
 /// A parsed HTML/HTTP declarative refresh. WHATWG HTML's shared declarative
@@ -528,7 +573,7 @@ pub async fn fetch_graphical_image(
             "image subresource blocked by page-origin policy",
         ));
     }
-    let mut request = Request::get(url);
+    let mut request = Request::subresource(url, page, "image", None);
     set_image_accept(&mut request);
     set_referrer(&mut request, page);
     fetch(&request).await.map(|response| response.body)
@@ -553,6 +598,7 @@ pub struct CachedResp {
     /// Fetch URL list, including every redirect hop. Empty means unavailable
     /// provenance (e.g. a legacy seeded entry), never proof of same-origin.
     pub(crate) url_list: Vec<Url>,
+    pub(crate) timing: Option<Box<FetchTiming>>,
 }
 
 pub type FetchOutcome = Result<std::sync::Arc<CachedResp>, ()>;
@@ -643,6 +689,31 @@ pub struct PageCache {
 struct CachedFetch {
     future: SharedFetch,
     module_imports_scanned: bool,
+    resource_context: Option<ResourceCacheContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResourceCacheContext {
+    Unscoped,
+    Element {
+        origin: url::Origin,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    },
+}
+
+impl ResourceCacheContext {
+    fn new(
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    ) -> Self {
+        Self::Element {
+            origin: client.origin(),
+            destination,
+            cors_credentials,
+        }
+    }
 }
 
 impl CachedFetch {
@@ -650,6 +721,7 @@ impl CachedFetch {
         Self {
             future,
             module_imports_scanned: false,
+            resource_context: None,
         }
     }
 }
@@ -695,17 +767,43 @@ impl PageCache {
     /// request. The caller is responsible for cap/`subresource_allowed`
     /// gating BEFORE starting a brand-new fetch (see `page_net_prepare`).
     pub fn fetch(&self, handle: &tokio::runtime::Handle, url: Url) -> SharedFetch {
+        self.fetch_request(handle, Request::get(url), ResourceCacheContext::Unscoped)
+    }
+
+    pub(crate) fn fetch_resource(
+        &self,
+        handle: &tokio::runtime::Handle,
+        url: Url,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    ) -> SharedFetch {
+        self.fetch_request(
+            handle,
+            Request::subresource(url, client, destination, cors_credentials),
+            ResourceCacheContext::new(client, destination, cors_credentials),
+        )
+    }
+
+    fn fetch_request(
+        &self,
+        handle: &tokio::runtime::Handle,
+        request: Request,
+        context: ResourceCacheContext,
+    ) -> SharedFetch {
         use futures::future::FutureExt as _;
-        let key = url.to_string();
+        let key = request.url.to_string();
         let mut map = self.map.lock().unwrap();
-        if let Some(f) = map.get(&key) {
+        if let Some(f) = map.get(&key)
+            && (f.resource_context.as_ref() == Some(&context) || f.resource_context.is_none())
+        {
             return f.future.clone();
         }
         let (abort, registration) = futures::future::AbortHandle::new_pair();
         self.tasks.track_fetch(abort);
         let fut = futures::future::Abortable::new(
             async move {
-                match fetch_with_metadata(&Request::get(url), Default::default()).await {
+                match fetch_with_metadata(&request, Default::default()).await {
                     Ok(details) => {
                         let r = details.response;
                         Ok(std::sync::Arc::new(CachedResp {
@@ -714,6 +812,7 @@ impl PageCache {
                             headers: r.headers,
                             body: r.body,
                             url_list: details.url_list,
+                            timing: r.timing,
                         }))
                     }
                     Err(_) => Err(()),
@@ -724,7 +823,9 @@ impl PageCache {
         .map(|result| result.unwrap_or(Err(())))
         .boxed()
         .shared();
-        map.insert(key, CachedFetch::new(fut.clone()));
+        let mut entry = CachedFetch::new(fut.clone());
+        entry.resource_context = Some(context);
+        map.insert(key, entry);
         // Drive it now (dropping the JoinHandle doesn't cancel the task):
         // speculation overlaps with everything, even with no awaiter yet.
         self.spawn(handle, fut.clone());
@@ -773,6 +874,47 @@ impl PageCache {
             .map(|entry| entry.future.clone())
     }
 
+    /// A no-CORS preload must not satisfy an element's CORS load, nor may an
+    /// authorization for one document origin or credentials mode authorize a
+    /// different one. Retain in-flight sharing only within the same context.
+    pub(crate) fn peek_resource(
+        &self,
+        url: &Url,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    ) -> Option<SharedFetch> {
+        let context = ResourceCacheContext::new(client, destination, cors_credentials);
+        self.map
+            .lock()
+            .unwrap()
+            .get(url.as_str())
+            .filter(|entry| {
+                entry.resource_context.as_ref() == Some(&context)
+                    || entry.resource_context.is_none()
+            })
+            .map(|entry| entry.future.clone())
+    }
+
+    fn seed_resource(
+        &self,
+        url: String,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+        response: CachedResp,
+    ) {
+        use futures::future::FutureExt as _;
+        let response = std::sync::Arc::new(response);
+        let mut entry = CachedFetch::new(async move { Ok(response) }.boxed().shared());
+        entry.resource_context = Some(ResourceCacheContext::new(
+            client,
+            destination,
+            cors_credentials,
+        ));
+        self.map.lock().unwrap().insert(url, entry);
+    }
+
     /// Speculative descendant discovery is optional (HTML's fetch-a-
     /// modulepreload-module-script-graph). Once a cached external module has
     /// been scanned, revisiting it through another importing parent must not
@@ -819,8 +961,9 @@ impl PageCache {
         }
     }
 
-    /// Seed an already-fetched response without discarding metadata that the
-    /// Fetch and HTML processing models inspect later (notably `nosniff`).
+    /// Seed host-provided, preauthorized bytes (e.g. a no-network embedding
+    /// fixture). Network preload consumers must use `seed_resource` to retain
+    /// their authorization context and complete redirect provenance.
     pub fn seed_with_headers(
         &self,
         url: String,
@@ -836,6 +979,7 @@ impl PageCache {
             content_type,
             body,
             url_list: Vec::new(),
+            timing: None,
         });
         let fut = async move { Ok(resp) }.boxed().shared();
         self.map.lock().unwrap().insert(url, CachedFetch::new(fut));
@@ -930,6 +1074,46 @@ pub(crate) async fn fetch_with_metadata(
     request: &Request,
     policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Result<FetchResponseDetails, String> {
+    fetch_with_timing(request, policy)
+        .await
+        .map_err(|error| error.message)
+}
+
+/// Keep transport failures distinct from rejected Fetch preconditions. Only
+/// actual network attempts may produce an opaque failure timing entry.
+#[derive(Debug)]
+pub(crate) struct TimedFetchError {
+    pub message: String,
+    pub timing: Option<Box<FetchTiming>>,
+}
+
+impl From<String> for TimedFetchError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            timing: None,
+        }
+    }
+}
+
+impl TimedFetchError {
+    fn network(message: String, start: f64) -> Self {
+        Self {
+            message,
+            timing: Some(Box::new(FetchTiming {
+                start_time: start,
+                fetch_start: start,
+                response_end: crate::performance::now_ms(),
+                ..Default::default()
+            })),
+        }
+    }
+}
+
+pub(crate) async fn fetch_with_timing(
+    request: &Request,
+    policy: crate::referrer_policy::ReferrerPolicy,
+) -> Result<FetchResponseDetails, TimedFetchError> {
     if std::env::var_os("TRUST_NET_TRACE").is_none() {
         return fetch_redirecting(request, policy).await;
     }
@@ -944,7 +1128,10 @@ pub(crate) async fn fetch_with_metadata(
             r.response.body.len(),
             request.url
         ),
-        Err(e) => eprintln!("net: @{at:>6}ms +{ms:>5}ms ERR {} ({e})", request.url),
+        Err(e) => eprintln!(
+            "net: @{at:>6}ms +{ms:>5}ms ERR {} ({})",
+            request.url, e.message
+        ),
     }
     result
 }
@@ -955,25 +1142,63 @@ pub(crate) async fn fetch_with_metadata(
 /// forbidden author data on the wire. Browser-owned navigations and
 /// subresources call [`fetch`] directly because they do not have a script
 /// policy.
+#[cfg(test)]
 pub(crate) async fn fetch_script(request: &Request) -> Result<Response, String> {
+    fetch_script_with_timing(request)
+        .await
+        .map_err(|error| error.message)
+}
+
+pub(crate) async fn fetch_script_with_timing(
+    request: &Request,
+) -> Result<Response, TimedFetchError> {
+    let start = crate::performance::now_ms();
+    let result = fetch_script_timing_inner(request).await;
+    result
+        .map(|mut response| {
+            if let Some(timing) = response.timing.as_mut() {
+                timing.start_time = start;
+                if timing.redirect_start == 0.0 {
+                    timing.fetch_start = start;
+                }
+            }
+            response
+        })
+        .map_err(|mut error| {
+            if let Some(timing) = error.timing.as_mut() {
+                timing.start_time = start;
+                timing.fetch_start = start;
+            }
+            error
+        })
+}
+
+async fn fetch_timed(request: &Request) -> Result<Response, TimedFetchError> {
+    fetch_with_timing(request, Default::default())
+        .await
+        .map(|details| details.response)
+}
+
+async fn fetch_script_timing_inner(request: &Request) -> Result<Response, TimedFetchError> {
     let Some(policy) = &request.fetch_policy else {
-        return fetch(request).await;
+        return fetch_timed(request).await;
     };
     let cross_origin = !same_origin(&policy.origin, &request.url);
     if !cross_origin {
-        return fetch(request).await;
+        return fetch_timed(request).await;
     }
     let needs_preflight = cors_preflight_required(request);
     if policy.mode == RequestMode::SameOrigin {
-        return Err(String::from("same-origin fetch crossed origins"));
+        return Err(String::from("same-origin fetch crossed origins").into());
     }
     if policy.mode == RequestMode::NoCors {
         if needs_preflight {
             return Err(String::from(
                 "no-cors request uses a non-safelisted method, header, or content type",
-            ));
+            )
+            .into());
         }
-        return fetch(request).await;
+        return fetch_timed(request).await;
     }
     if needs_preflight {
         let names = cors_non_safelisted_header_names(request);
@@ -995,7 +1220,12 @@ pub(crate) async fn fetch_script(request: &Request) -> Result<Response, String> 
             url: request.url.clone(),
             body: None,
             headers,
-            fetch_metadata: None,
+            fetch_metadata: request.fetch_metadata.map(|mut metadata| {
+                metadata.mode = "cors";
+                metadata.user_activation = false;
+                metadata
+            }),
+            timing_client: request.timing_client.clone(),
             fetch_policy: Some(FetchPolicy {
                 origin: policy.origin.clone(),
                 mode: RequestMode::Cors,
@@ -1009,7 +1239,7 @@ pub(crate) async fn fetch_script(request: &Request) -> Result<Response, String> 
         let response = fetch_preflight(&preflight).await?;
         validate_cors_preflight(&response, request, &names)?;
     }
-    fetch(request).await
+    fetch_timed(request).await
 }
 
 fn cors_preflight_required(request: &Request) -> bool {
@@ -1206,12 +1436,14 @@ fn validate_cors_preflight(
     Ok(())
 }
 
-async fn fetch_preflight(request: &Request) -> Result<Response, String> {
+async fn fetch_preflight(request: &Request) -> Result<Response, TimedFetchError> {
+    let start = crate::performance::now_ms();
     let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(request))
         .await
-        .map_err(|_| String::from("timed out"))??;
+        .map_err(|_| TimedFetchError::network(String::from("timed out"), start))?
+        .map_err(|error| TimedFetchError::network(error, start))?;
     if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
-        return Err(String::from("CORS preflight redirect is not allowed"));
+        return Err(String::from("CORS preflight redirect is not allowed").into());
     }
     Ok(response)
 }
@@ -1219,23 +1451,128 @@ async fn fetch_preflight(request: &Request) -> Result<Response, String> {
 async fn fetch_redirecting(
     request: &Request,
     mut policy: crate::referrer_policy::ReferrerPolicy,
-) -> Result<FetchResponseDetails, String> {
+) -> Result<FetchResponseDetails, TimedFetchError> {
+    let navigation_start = crate::performance::now_ms();
+    let mut redirect_end = 0.0;
+    // Fetch's navigation TAO list contains only the timing allow values, not
+    // arbitrary response headers. It is discarded after the final decision.
+    let mut navigation_tao_values: Vec<Vec<String>> = Vec::new();
+    let can_use_navigation_tao = request
+        .fetch_metadata
+        .is_some_and(|metadata| metadata.site == FetchSite::None)
+        || request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("referer"));
     let mut request = request.clone();
     let mut url_list = vec![request.url.clone()];
+    let client = request.timing_client.clone().or_else(|| {
+        request
+            .fetch_policy
+            .as_ref()
+            .map(|policy| policy.origin.clone())
+    });
+    let mode = request.fetch_metadata.map_or_else(
+        || {
+            request
+                .fetch_policy
+                .as_ref()
+                .map_or("no-cors", |policy| policy.mode.as_str())
+        },
+        |metadata| metadata.mode,
+    );
+    let mut timing_allowed = client.is_some();
+    let mut cross_origin_response = false;
     for _ in 0..=MAX_REDIRECTS {
         if let Some(policy) = &request.fetch_policy
             && policy.mode == RequestMode::SameOrigin
             && !same_origin(&policy.origin, &request.url)
         {
-            return Err(String::from("same-origin fetch crossed origins"));
+            return Err(String::from("same-origin fetch crossed origins").into());
         }
         let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(&request))
             .await
-            .map_err(|_| String::from("timed out"))??;
+            .map_err(|_| TimedFetchError::network(String::from("timed out"), navigation_start))?
+            .map_err(|error| TimedFetchError::network(error, navigation_start))?;
+        if let Some(client) = &client {
+            cross_origin_response |= !same_origin(client, &request.url);
+            let opaque_origin = url_list
+                .windows(2)
+                .any(|hop| !same_origin(&hop[0], &hop[1]) && !same_origin(client, &hop[0]));
+            let origin = if opaque_origin {
+                String::from("null")
+            } else {
+                client.origin().ascii_serialization()
+            };
+            let explicit = response
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("timing-allow-origin"))
+                .flat_map(|(_, value)| value.split(','))
+                .any(|value| value.trim() == "*" || value.trim() == origin);
+            // Fetch #concept-tao-check is independent of the response CORS
+            // check, and a failed hop cannot be cleared by a later redirect.
+            timing_allowed &= explicit || !cross_origin_response;
+        }
+        navigation_tao_values.push(
+            response
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("timing-allow-origin"))
+                .flat_map(|(_, value)| value.split(','))
+                .map(|value| value.trim().to_string())
+                .collect(),
+        );
         match response.status {
             301 | 302 | 303 | 307 | 308 => {}
             _ => {
                 let mut response = response;
+                if let Some(timing) = response.timing.as_mut() {
+                    timing.resource_timing_allowed = timing_allowed;
+                    let opaque_origin = client.as_ref().is_none_or(|client| {
+                        url_list.windows(2).any(|hop| {
+                            !same_origin(&hop[0], &hop[1]) && !same_origin(client, &hop[0])
+                        })
+                    });
+                    timing.resource_body_exposed = if mode == "navigate" {
+                        !opaque_origin && !cross_origin_response
+                    } else {
+                        mode != "no-cors" || !cross_origin_response
+                    };
+                    timing.resource_response_status = if mode == "navigate" {
+                        if opaque_origin { 0 } else { response.status }
+                    } else if mode == "no-cors" && cross_origin_response {
+                        0
+                    } else {
+                        response.status
+                    };
+                    timing.start_time = navigation_start;
+                    timing.fetch_start = if redirect_end == 0.0 {
+                        navigation_start
+                    } else {
+                        redirect_end
+                    };
+                    timing.redirect_start = if url_list.len() > 1 {
+                        navigation_start
+                    } else {
+                        0.0
+                    };
+                    timing.redirect_end = redirect_end;
+                    let origin = response.url.origin().ascii_serialization();
+                    let all_same_origin =
+                        url_list.iter().all(|url| same_origin(url, &response.url));
+                    timing.navigation_cross_origin_redirect = !all_same_origin;
+                    let navigation_tao = can_use_navigation_tao
+                        && navigation_tao_values.iter().all(|values| {
+                            values.iter().any(|value| value == "*" || value == &origin)
+                        });
+                    // HTML #initialise-the-document-object / Fetch #navigation-tao-check.
+                    timing.navigation_redirect_count = if all_same_origin || navigation_tao {
+                        (url_list.len() - 1) as u16
+                    } else {
+                        0
+                    };
+                }
                 // Recorded off the FINAL hop: 301-303 rewrite the method to
                 // GET below, so a Post/Redirect/Get flow lands here as a GET.
                 response.from_post = request.method.eq_ignore_ascii_case("POST");
@@ -1257,10 +1594,17 @@ async fn fetch_redirecting(
         let target = request
             .url
             .join(response.content_type.trim())
-            .map_err(|e| format!("bad redirect location: {e}"))?;
+            .map_err(|e| {
+                TimedFetchError::network(format!("bad redirect location: {e}"), navigation_start)
+            })?;
         match target.scheme() {
             "http" | "https" => {}
-            other => return Err(format!("redirect leaves the web: {other}://")),
+            other => {
+                return Err(TimedFetchError::network(
+                    format!("redirect leaves the web: {other}://"),
+                    navigation_start,
+                ));
+            }
         }
         if !same_origin(&request.url, &target) {
             // Fetch §4.5 step 13 removes CORS non-wildcard request headers,
@@ -1308,10 +1652,14 @@ async fn fetch_redirecting(
                 )
             });
         }
+        redirect_end = crate::performance::now_ms();
         url_list.push(target.clone());
         request.url = target;
     }
-    Err(format!("too many redirects (>{MAX_REDIRECTS})"))
+    Err(TimedFetchError::network(
+        format!("too many redirects (>{MAX_REDIRECTS})"),
+        navigation_start,
+    ))
 }
 
 /// Apply the script-facing part of Fetch after the network/redirect steps.
@@ -1352,6 +1700,17 @@ fn enforce_fetch_policy(request: &Request, mut response: Response) -> Result<Res
                         && value.trim().eq_ignore_ascii_case("true")
                 });
             if origin_ok && credentials_ok {
+                // HTML's script/link consumers inspect the unsafe (internal)
+                // response after CORS succeeds. Filtering `nosniff` here would
+                // incorrectly turn a blocked script MIME type into an allowed
+                // one. Only the empty-destination Fetch/XHR API exposes the
+                // CORS-filtered header list to author JavaScript.
+                if request
+                    .fetch_metadata
+                    .is_some_and(|metadata| metadata.destination != "empty")
+                {
+                    return Ok(response);
+                }
                 let exposed = response
                     .headers
                     .iter()
@@ -1551,18 +1910,147 @@ pub(crate) fn cookies_enabled() -> bool {
     COOKIES_ENABLED.load(Ordering::Relaxed)
 }
 
+fn cookie_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_COOKIE_TRACE").is_some())
+}
+
+fn cookie_trace_counts<'a>(lines: impl Iterator<Item = &'a str>) -> (usize, usize) {
+    let mut total = 0;
+    let mut clearance = 0;
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        total += 1;
+        if line
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim() == "cf_clearance")
+        {
+            clearance += 1;
+        }
+    }
+    (total, clearance)
+}
+
+// Opt-in transport diagnostics: fixed event categories, counts and an opaque
+// origin identifier only. Never log cookie values, arbitrary cookie names,
+// request paths/queries, response payloads, or a clearance token's contents.
+fn trace_cookie_counts(event: &'static str, url: &Url, status: u16, counts: (usize, usize)) {
+    if !cookie_trace_enabled() {
+        return;
+    }
+    use std::hash::{Hash as _, Hasher as _};
+    let mut scope = std::collections::hash_map::DefaultHasher::new();
+    url.origin().ascii_serialization().hash(&mut scope);
+    eprintln!(
+        "[cookie-trace] event={event} at_ms={} scope={:016x} root={} status={status} count={} clearance={} enabled={}",
+        trace_ms(),
+        scope.finish(),
+        u8::from(url.path() == "/"),
+        counts.0,
+        counts.1,
+        u8::from(cookies_enabled()),
+    );
+}
+
+fn trace_cookie_line(event: &'static str, url: &Url, line: &str) {
+    if cookie_trace_enabled() {
+        trace_cookie_counts(event, url, 0, cookie_trace_counts(std::iter::once(line)));
+    }
+}
+
+// Diagnostic-only receipts compare the actual outgoing value byte-for-byte
+// with the original received cookie-value (RFC 6265 §5.2 whitespace parsing).
+// Values stay in bounded process memory, never in the diagnostic output.
+// Keep this separate from Cookie so the normal jar's representation is unchanged.
+static COOKIE_TRACE_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<Vec<Cookie>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn trace_cookie_receipt(cookie: &Cookie, line: &str) {
+    if !cookie_trace_enabled() || cookie.name != "cf_clearance" {
+        return;
+    }
+    let pair = line.split_once(';').map_or(line, |(pair, _)| pair);
+    let Some((_, original)) = pair.split_once('=') else {
+        return;
+    };
+    let original = original.trim();
+    let mut receipts = COOKIE_TRACE_RECEIPTS.lock().unwrap();
+    receipts.retain(|old| !(old.domain == cookie.domain && old.path == cookie.path));
+    // Oversized or evicted receipts yield 'unknown', never a false exact match.
+    if original.len() > 8192 {
+        return;
+    }
+    let mut receipt = cookie.clone();
+    receipt.value = original.to_string();
+    receipts.push(receipt);
+    if receipts.len() > 64 {
+        receipts.remove(0);
+    }
+}
+
+fn cookie_wire_integrity(url: &Url, line: &str, receipts: &[Cookie]) -> (usize, usize, usize) {
+    let host = url.host_str().unwrap_or_default();
+    let mut total = 0;
+    let mut exact = 0;
+    let mut empty = 0;
+    for pair in line.split(';') {
+        let Some((name, value)) = pair.trim_start().split_once('=') else {
+            continue;
+        };
+        if name != "cf_clearance" {
+            continue;
+        }
+        total += 1;
+        empty += usize::from(value.is_empty());
+        exact += usize::from(receipts.iter().any(|receipt| {
+            receipt.name == name
+                && receipt.value.as_bytes() == value.as_bytes()
+                && cookie_domain_match(host, receipt)
+                && cookie_path_matches(url.path(), &receipt.path)
+                && (!receipt.secure || url.scheme() == "https")
+        }));
+    }
+    (total, exact, empty)
+}
+
+fn trace_cookie_wire(url: &Url, line: &str) {
+    if !cookie_trace_enabled() {
+        return;
+    }
+    let receipts = COOKIE_TRACE_RECEIPTS.lock().unwrap();
+    let (total, exact, empty) = cookie_wire_integrity(url, line, &receipts);
+    if total > 0 {
+        eprintln!(
+            "[cookie-integrity] at_ms={} total={total} exact={exact} unknown={} empty={empty}",
+            trace_ms(),
+            total - exact,
+        );
+    }
+}
+
 /// Store a `Set-Cookie` header value against the response URL. `from_js`
-/// (a `document.cookie` write) forces off HttpOnly, as the platform does.
+/// (a `document.cookie` write) cannot create or overwrite HttpOnly cookies.
 fn store_cookie(url: &Url, line: &str, from_js: bool) {
+    trace_cookie_line(
+        if from_js {
+            "script-write"
+        } else {
+            "http-store-attempt"
+        },
+        url,
+        line,
+    );
     if !cookies_enabled() {
+        trace_cookie_line("store-disabled", url, line);
         return;
     }
     let (nv, rest) = line.split_once(';').unwrap_or((line, ""));
     let Some((name, value)) = nv.split_once('=') else {
+        trace_cookie_line("store-invalid-pair", url, line);
         return;
     };
     let (name, value) = (name.trim().to_string(), value.trim().to_string());
     if name.is_empty() {
+        trace_cookie_line("store-empty-name", url, line);
         return;
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -1597,9 +2085,11 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
     if from_js && http_only {
         // RFC 6265 §5.3 step 10: a non-HTTP API cannot create an
         // HttpOnly cookie, even if the attribute appears in the string.
+        trace_cookie_line("store-script-httponly", url, line);
         return;
     }
     if invalid_domain {
+        trace_cookie_line("store-domain-mismatch", url, line);
         return;
     }
     let mut jar = COOKIE_JAR.lock().unwrap();
@@ -1610,13 +2100,15 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
     {
         // RFC 6265 §5.3 step 11.2: document.cookie cannot overwrite or
         // delete an existing HttpOnly cookie with the same name/domain/path.
+        trace_cookie_line("store-protected-httponly", url, line);
         return;
     }
     jar.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
     if max_age.is_some_and(|m| m <= 0) {
+        trace_cookie_line("store-deleted", url, line);
         return; // deletion (the retain above removed it)
     }
-    jar.push(Cookie {
+    let cookie = Cookie {
         name,
         value,
         domain,
@@ -1624,10 +2116,13 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         path,
         secure,
         http_only,
-    });
+    };
+    trace_cookie_receipt(&cookie, line);
+    jar.push(cookie);
     if jar.len() > COOKIE_JAR_MAX {
         jar.remove(0);
     }
+    trace_cookie_line("stored", url, line);
 }
 
 /// RFC 6265 §5.1.3 domain-match. The suffix form is only valid for DNS host
@@ -1681,20 +2176,31 @@ fn cookie_domain_match(host: &str, c: &Cookie) -> bool {
 /// JS can never read).
 pub(crate) fn cookies_for_js(page: &Url) -> String {
     if !cookies_enabled() {
+        trace_cookie_counts("script-read-disabled", page, 0, (0, 0));
         return String::new();
     }
     let host = page.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = page.path();
     let https = page.scheme() == "https";
     let jar = COOKIE_JAR.lock().unwrap();
-    jar.iter()
+    let result = jar
+        .iter()
         .filter(|c| !c.http_only)
         .filter(|c| !c.secure || https)
         .filter(|c| cookie_domain_match(&host, c))
         .filter(|c| cookie_path_matches(path, &c.path))
         .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+    if cookie_trace_enabled() {
+        trace_cookie_counts(
+            "script-read",
+            page,
+            0,
+            cookie_trace_counts(result.split(';')),
+        );
+    }
+    result
 }
 
 /// A `document.cookie = "..."` write from page JS. Stored in the same
@@ -1722,12 +2228,39 @@ pub(crate) fn cookies_for_request(url: &Url) -> String {
 }
 
 async fn dial(scheme: &str, host: &str, port: u16) -> Result<BufReader<Conn>, String> {
-    let stream = TcpStream::connect((host, port))
+    dial_with_timing(scheme, host, port, None).await
+}
+
+async fn dial_with_timing(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    mut timing: Option<&mut crate::performance::FetchTiming>,
+) -> Result<BufReader<Conn>, String> {
+    // Same resolver and address-order fallback as TcpStream::connect(host),
+    // with the actual DNS and connection boundaries made explicit (Fetch
+    // #create-a-connection / #record-connection-timing-info).
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.connection_reused = false;
+        timing.domain_lookup_start = crate::performance::now_ms();
+    }
+    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| e.to_string())?
+        .collect();
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.domain_lookup_end = crate::performance::now_ms();
+        timing.connect_start = timing.domain_lookup_end;
+    }
+    let stream = TcpStream::connect(addresses.as_slice())
         .await
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
     let conn = if scheme == "https" {
         let name = tls::server_name(host)?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.secure_connection_start = crate::performance::now_ms();
+        }
         let stream = tls::webpki_connector()
             .connect(name, stream)
             .await
@@ -1736,6 +2269,12 @@ async fn dial(scheme: &str, host: &str, port: u16) -> Result<BufReader<Conn>, St
     } else {
         Conn::Plain(stream)
     };
+    if let Some(timing) = timing {
+        timing.connect_end = crate::performance::now_ms();
+        // This transport implements HTTP/1.1 even when no ALPN negotiation
+        // occurs; Fetch permits the protocol's descriptive registered ID.
+        timing.next_hop_protocol = "http/1.1";
+    }
     Ok(BufReader::new(conn))
 }
 
@@ -1760,6 +2299,7 @@ pub(crate) fn download_referrer(source: &Url, target: &Url) -> Option<String> {
 }
 
 async fn fetch_once(request: &Request) -> Result<Response, String> {
+    let mut timing = crate::performance::FetchTiming::new();
     let url = &request.url;
     let host = url.host_str().ok_or("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(80);
@@ -1774,14 +2314,21 @@ async fn fetch_once(request: &Request) -> Result<Response, String> {
             && let Some(mut io) = pool_get(&key)
         {
             tried += 1;
-            if let Ok(parts) = exchange(&mut io, request, &host, port).await {
-                return finish_response(request, parts, io, key);
+            timing.reused_connection(url.scheme() == "https");
+            timing.first_interim_response_start = 0.0;
+            timing.final_response_start = 0.0;
+            if let Ok(parts) = exchange(&mut io, request, &host, port, &mut timing).await {
+                return finish_response(request, parts, io, key, timing);
             }
         }
     }
-    let mut io = dial(url.scheme(), &host, port).await?;
-    let parts = exchange(&mut io, request, &host, port).await?;
-    finish_response(request, parts, io, key)
+    // A failed stale-connection attempt does not contribute response metadata
+    // to the successful retry. Preserve this hop's fetch start, not its errors.
+    timing.first_interim_response_start = 0.0;
+    timing.final_response_start = 0.0;
+    let mut io = dial_with_timing(url.scheme(), &host, port, Some(&mut timing)).await?;
+    let parts = exchange(&mut io, request, &host, port, &mut timing).await?;
+    finish_response(request, parts, io, key, timing)
 }
 
 /// Build the Response and return a still-healthy connection to the
@@ -1815,11 +2362,27 @@ fn finish_response(
     (status, headers, body, reusable, set_cookies): (u16, Headers, Vec<u8>, bool, Vec<String>),
     io: BufReader<Conn>,
     key: PoolKey,
+    mut timing: crate::performance::FetchTiming,
 ) -> Result<Response, String> {
+    timing.response_status = status;
+    timing.content_type = headers.get("content-type").cloned().unwrap_or_default();
+    timing.content_encoding = headers.get("content-encoding").cloned().unwrap_or_default();
     if reusable {
         pool_put(key, io);
     }
     let url = &request.url;
+    if cookie_trace_enabled() {
+        trace_cookie_counts(
+            if credentials_included(request) {
+                "response"
+            } else {
+                "response-credentials-excluded"
+            },
+            url,
+            status,
+            cookie_trace_counts(set_cookies.iter().map(String::as_str)),
+        );
+    }
     if credentials_included(request) {
         for line in &set_cookies {
             store_cookie(url, line, false);
@@ -1853,6 +2416,7 @@ fn finish_response(
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: Some(Box::new(timing)),
         });
     }
     // RFC 9110 §8.3 and MIME Sniffing §5: an absent Content-Type is unknown,
@@ -1872,6 +2436,7 @@ fn finish_response(
         declarative_refresh: None,
         challenge: detect_challenge(&headers),
         from_post: false,
+        timing: Some(Box::new(timing)),
     })
 }
 
@@ -1886,6 +2451,7 @@ async fn exchange(
     request: &Request,
     host: &str,
     port: u16,
+    timing: &mut crate::performance::FetchTiming,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
     let url = &request.url;
     let mut path = url.path().to_string();
@@ -1960,26 +2526,42 @@ async fn exchange(
         let site = match metadata.site {
             FetchSite::None => "none",
             FetchSite::SameOrigin => "same-origin",
+            FetchSite::SameSite => "same-site",
             FetchSite::CrossSite => "cross-site",
         };
         head.push_str(&format!(
             "Sec-Fetch-Dest: {}\r\nSec-Fetch-Mode: {}\r\nSec-Fetch-Site: {site}\r\n",
             metadata.destination, metadata.mode,
         ));
-        if metadata.user_activation {
+        if metadata.mode == "navigate" && metadata.user_activation {
             head.push_str("Sec-Fetch-User: ?1\r\n");
         }
         // UIR §3.2.1: advertise support for secure navigations. TRust does
         // not yet maintain an HSTS preload list, so this applies to every
         // trustworthy top-level navigation.
-        head.push_str("Upgrade-Insecure-Requests: 1\r\n");
+        if metadata.mode == "navigate" {
+            head.push_str("Upgrade-Insecure-Requests: 1\r\n");
+        }
     }
     let cookie = if credentials_included(request) {
         cookies_for_request(url)
     } else {
         String::new()
     };
+    if cookie_trace_enabled() {
+        trace_cookie_counts(
+            if credentials_included(request) {
+                "request"
+            } else {
+                "request-credentials-excluded"
+            },
+            url,
+            0,
+            cookie_trace_counts(cookie.split(';')),
+        );
+    }
     if !cookie.is_empty() {
+        trace_cookie_wire(url, &cookie);
         head.push_str(&format!("Cookie: {cookie}\r\n"));
     }
     if let Some(policy) = &request.fetch_policy
@@ -2028,6 +2610,7 @@ async fn exchange(
     }
     head.push_str("\r\n");
 
+    timing.request_start = crate::performance::now_ms();
     io.write_all(head.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
@@ -2040,10 +2623,11 @@ async fn exchange(
         && request
             .fetch_metadata
             .is_some_and(|metadata| metadata.destination == "document");
-    read_response_with_policy(
+    read_response_with_timing(
         io,
         request.method.eq_ignore_ascii_case("HEAD"),
         navigation_get,
+        Some(timing),
     )
     .await
 }
@@ -2095,16 +2679,30 @@ async fn read_response<R: AsyncRead + Unpin>(
     read_response_with_policy(io, is_head, false).await
 }
 
+#[cfg(test)]
 async fn read_response_with_policy<R: AsyncRead + Unpin>(
     io: &mut BufReader<R>,
     is_head: bool,
     navigation_get: bool,
+) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    read_response_with_timing(io, is_head, navigation_get, None).await
+}
+
+async fn read_response_with_timing<R: AsyncRead + Unpin>(
+    io: &mut BufReader<R>,
+    is_head: bool,
+    navigation_get: bool,
+    mut timing: Option<&mut crate::performance::FetchTiming>,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
     const MAX_HEADER_LINE: usize = 64 * 1024;
     const MAX_HEADER_BYTES: usize = 256 * 1024;
     const MAX_HEADER_FIELDS: usize = 256;
     let mut interim_framing_violation = false;
     let (status, headers, set_cookies, http11) = loop {
+        // Wait for the first available response bytes before sampling. A
+        // timestamp taken before this await would measure request completion.
+        let _ = io.fill_buf().await.map_err(|e| e.to_string())?;
+        let response_start = crate::performance::now_ms();
         let status_line = read_line(io).await?;
         let Some((version, rest)) = status_line.split_once(' ') else {
             return Err(format!("malformed status line: {status_line:?}"));
@@ -2177,9 +2775,18 @@ async fn read_response_with_policy<R: AsyncRead + Unpin>(
         // included forbidden framing fields. Retire that connection after
         // the final response; never consume an invented informational body.
         if (100..200).contains(&status) && status != 101 {
+            if let Some(timing) = timing.as_deref_mut()
+                && timing.first_interim_response_start == 0.0
+            {
+                timing.first_interim_response_start = response_start;
+            }
             interim_framing_violation |=
                 headers.contains_key("transfer-encoding") || headers.contains_key("content-length");
             continue;
+        }
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.final_response_start = response_start;
+            timing.next_hop_protocol = if http11 { "http/1.1" } else { "http/1.0" };
         }
         break (status, headers, set_cookies, http11);
     };
@@ -2212,6 +2819,9 @@ async fn read_response_with_policy<R: AsyncRead + Unpin>(
             || length.is_some_and(|value| parse_content_length(value).is_err())
             || (status == 204 && (transfer || length.is_some()));
         reusable &= status != 101 && !contradictory;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.response_end = crate::performance::now_ms();
+        }
         return Ok((status, headers, Vec::new(), reusable, set_cookies));
     }
 
@@ -2246,6 +2856,9 @@ async fn read_response_with_policy<R: AsyncRead + Unpin>(
     // Stop after headers for GET navigations; Save/Open owns a separate bounded
     // streaming transfer, so large PDFs/media never enter the 16 MiB page heap.
     if navigation_get && navigation_headers_need_download(&headers) {
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.response_end = crate::performance::now_ms();
+        }
         return Ok((status, headers, Vec::new(), false, set_cookies));
     }
 
@@ -2258,6 +2871,9 @@ async fn read_response_with_policy<R: AsyncRead + Unpin>(
         let c = c.trim_start().to_ascii_lowercase();
         c.starts_with("video/") || c.starts_with("audio/")
     }) {
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.response_end = crate::performance::now_ms();
+        }
         return Ok((status, headers, Vec::new(), false, set_cookies));
     }
 
@@ -2286,8 +2902,15 @@ async fn read_response_with_policy<R: AsyncRead + Unpin>(
         reusable = false;
         read_to_eof(io).await?
     };
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.response_end = crate::performance::now_ms();
+        timing.encoded_body_size = body.len();
+    }
     // Undo any (unsolicited) Content-Encoding now the body is fully framed.
     let body = decode_content_encoding(&headers, body);
+    if let Some(timing) = timing {
+        timing.decoded_body_size = body.len();
+    }
     Ok((status, headers, body, reusable, set_cookies))
 }
 
@@ -2736,39 +3359,29 @@ pub async fn execute_js_for_device(
     // graph the page announces up front (modulepreload + module entry
     // srcs) — fetch CONCURRENTLY. With the keep-alive pool this turns
     // a page load from sum-of-latencies into max-of-latencies.
-    enum Kind {
-        Script,
-        Sheet,
-        Preload,
-        Sprite,
-    }
-    let mut jobs: Vec<(Kind, String)> = crate::js::external_scripts(&html)
-        .into_iter()
-        .take(MAX_PAGE_SCRIPTS)
-        .map(|s| (Kind::Script, s))
-        .collect();
-    if prefetched_sheets.is_none() {
-        jobs.extend(
-            crate::js::external_stylesheets(&html)
-                .into_iter()
-                .map(|s| (Kind::Sheet, s)),
-        );
-    }
-    jobs.extend(
-        crate::js::module_preloads(&html)
-            .into_iter()
-            .take(MAX_PAGE_PRELOADS)
-            .map(|s| (Kind::Preload, s)),
-    );
-    // SVG 2 §5.6 processes external `<use>` references as external resource
-    // documents. Fetch authored sheets in the same parallel first-paint batch
-    // as scripts/styles; script-created references are handled by the resident
-    // actor before it derives a subsequent PixelLayout.
-    jobs.extend(
-        crate::js::sprite_use_sheets(&html)
-            .into_iter()
-            .map(|s| (Kind::Sprite, s)),
-    );
+    use crate::js::ExternalResourceKind as Kind;
+    let mut scripts = 0;
+    let mut preloads = 0;
+    let jobs: Vec<_> = crate::js::external_resources_at(
+        &html,
+        f32::from(viewport.0) * f32::from(cell_px.0.max(1)),
+        f32::from(viewport.1) * f32::from(cell_px.1.max(1)),
+        device_pixel_ratio,
+    )
+    .into_iter()
+    .filter(|job| match job.kind {
+        Kind::Script => {
+            scripts += 1;
+            scripts <= MAX_PAGE_SCRIPTS
+        }
+        Kind::Preload => {
+            preloads += 1;
+            preloads <= MAX_PAGE_PRELOADS
+        }
+        Kind::Sheet => prefetched_sheets.is_none(),
+        Kind::Sprite => true,
+    })
+    .collect();
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!(
             "js : @{:>6}ms prefetch start ({} subresources)",
@@ -2784,12 +3397,12 @@ pub async fn execute_js_for_device(
     // "unexpected token '<'" and the app never boots). The SSRF gate still
     // keys off the real page URL.
     let doc_base = base_with_doc_base(&html, &response.url);
-    let results = futures::stream::iter(jobs.into_iter().map(|(kind, raw)| {
+    let results = futures::stream::iter(jobs.into_iter().map(|job| {
         let doc_base = doc_base.clone();
         let page_url = response.url.clone();
         async move {
             let resolved = doc_base
-                .join(&raw)
+                .join(&job.source)
                 .ok()
                 .filter(|u| matches!(u.scheme(), "http" | "https"))
                 .filter(|u| subresource_allowed(&page_url, u));
@@ -2798,11 +3411,18 @@ pub async fn execute_js_for_device(
                     if std::env::var_os("TRUST_NET_TRACE").is_some() {
                         eprintln!("src: @{:>6}ms PREFETCH {u}", trace_ms());
                     }
-                    fetch(&Request::get(u.clone())).await.ok()
+                    let request = Request::subresource(
+                        u.clone(),
+                        &page_url,
+                        job.destination(),
+                        job.cors_credentials(),
+                    );
+                    Some(fetch_with_timing(&request, Default::default()).await)
                 }
                 None => None,
             };
-            (kind, raw, resolved, resp)
+            let credentials = job.cors_credentials();
+            (job, resolved, resp, credentials)
         }
     }))
     // `buffered` keeps list order: scripts execute and sheets cascade
@@ -2817,7 +3437,38 @@ pub async fn execute_js_for_device(
     let cache = std::sync::Arc::new(PageCache::default());
     let mut externals = Vec::new();
     let mut sheets = prefetched_sheets.unwrap_or_default();
-    for (kind, raw, resolved, resp) in results {
+    let mut resource_timings = Vec::new();
+    for (job, resolved, details, credentials) in results {
+        let kind = job.kind;
+        let raw = job.source;
+        let (resp, url_list) = match details {
+            Some(Ok(details)) => (Some(details.response), details.url_list),
+            failure => {
+                if let (Some(Err(error)), Some(url)) = (failure, resolved.as_ref())
+                    && let Some(mut timing) = error.timing
+                {
+                    timing.render_blocking = job.render_blocking;
+                    resource_timings.push(crate::performance::ResourceTiming {
+                        name: url.to_string(),
+                        initiator: job.initiator,
+                        timing,
+                        cached: false,
+                    });
+                }
+                (None, Vec::new())
+            }
+        };
+        if let (Some(response), Some(url)) = (resp.as_ref(), resolved.as_ref())
+            && let Some(mut timing) = response.timing.clone()
+        {
+            timing.render_blocking = job.render_blocking;
+            resource_timings.push(crate::performance::ResourceTiming {
+                name: url.to_string(),
+                initiator: job.initiator,
+                timing,
+                cached: false,
+            });
+        }
         match kind {
             Kind::Script => {
                 // HTML "fetch a classic script" rejects non-OK responses;
@@ -2826,12 +3477,19 @@ pub async fn execute_js_for_device(
                 // Preserve the complete metadata in the shared HTTP cache, but
                 // only expose an allowed body to the parser/executor.
                 if let (Some(u), Some(r)) = (resolved.as_ref(), resp.as_ref()) {
-                    cache.seed_with_headers(
+                    cache.seed_resource(
                         u.to_string(),
-                        r.status,
-                        r.content_type.clone(),
-                        r.headers.clone(),
-                        r.body.clone(),
+                        &response.url,
+                        "script",
+                        credentials,
+                        CachedResp {
+                            status: r.status,
+                            content_type: r.content_type.clone(),
+                            headers: r.headers.clone(),
+                            body: r.body.clone(),
+                            url_list: url_list.clone(),
+                            timing: r.timing.clone(),
+                        },
                     );
                 }
                 let allowed = resp.as_ref().is_some_and(|r| {
@@ -2871,12 +3529,19 @@ pub async fn execute_js_for_device(
                 // MIME check before parsing, including for rejected responses;
                 // caching those responses avoids an incorrect second request.
                 if let (Some(u), Some(r)) = (resolved, resp) {
-                    cache.seed_with_headers(
+                    cache.seed_resource(
                         u.to_string(),
-                        r.status,
-                        r.content_type,
-                        r.headers,
-                        r.body,
+                        &response.url,
+                        "script",
+                        credentials,
+                        CachedResp {
+                            status: r.status,
+                            content_type: r.content_type,
+                            headers: r.headers,
+                            body: r.body,
+                            url_list,
+                            timing: r.timing,
+                        },
                     );
                 }
             }
@@ -2897,6 +3562,8 @@ pub async fn execute_js_for_device(
     response.blobs = Some(blobs.clone());
     let env = crate::js::PageEnv {
         url: response.url.to_string(),
+        navigation_timing: response.timing.clone(),
+        resource_timings,
         viewport,
         cell_px,
         device_pixel_ratio,
@@ -2995,7 +3662,7 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
             if crate::dom::sprite_sheet_cached(abs.as_str()) {
                 return;
             }
-            if let Ok(r) = fetch(&Request::get(abs.clone())).await
+            if let Ok(r) = fetch(&Request::subresource(abs.clone(), &page_url, "image", None)).await
                 && (200..300).contains(&r.status)
             {
                 let text = decode_body(&r.content_type, &r.body);
@@ -3012,20 +3679,29 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
 /// `(href, css)` in document order. The request pool bounds simultaneous I/O;
 /// no arbitrary declaration-count cutoff is applied to the cascade.
 async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
-    let jobs: Vec<String> = crate::js::external_stylesheets(html).into_iter().collect();
-    let fetched = futures::stream::iter(jobs.into_iter().map(|raw| {
+    let jobs = crate::js::external_resources(html)
+        .into_iter()
+        .filter(|job| job.kind == crate::js::ExternalResourceKind::Sheet);
+    let fetched = futures::stream::iter(jobs.map(|job| {
         let base = base.clone();
         async move {
             let resolved = base
-                .join(&raw)
+                .join(&job.source)
                 .ok()
                 .filter(|u| matches!(u.scheme(), "http" | "https"))
                 .filter(|u| subresource_allowed(&base, u));
             let resp = match &resolved {
-                Some(u) => fetch(&Request::get(u.clone())).await.ok(),
+                Some(u) => fetch(&Request::subresource(
+                    u.clone(),
+                    &base,
+                    "style",
+                    job.cors_credentials(),
+                ))
+                .await
+                .ok(),
                 None => None,
             };
-            (raw, resolved, resp)
+            (job.source, resolved, resp)
         }
     }))
     .buffered(PREFETCH_CONCURRENCY)
@@ -3112,10 +3788,11 @@ fn expand_stylesheet_imports(
             if ancestry.iter().any(|seen| seen == url.as_str()) {
                 continue;
             }
-            let Some(response) = fetch(&Request::get(url.clone()))
-                .await
-                .ok()
-                .and_then(StylesheetResponseExt::filter_stylesheet)
+            let Some(response) =
+                fetch(&Request::subresource(url.clone(), &page_url, "style", None))
+                    .await
+                    .ok()
+                    .and_then(StylesheetResponseExt::filter_stylesheet)
             else {
                 continue;
             };
@@ -3618,7 +4295,14 @@ async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_
         // CSS Fonts 4 §4.3.3: try external references in specified order and
         // proceed to the next item when loading or format decoding fails.
         for url in sources {
-            let Ok(response) = fetch(&Request::get(url)).await else {
+            let Ok(response) = fetch(&Request::subresource(
+                url,
+                page_url,
+                "font",
+                Some(CredentialsMode::SameOrigin),
+            ))
+            .await
+            else {
                 continue;
             };
             if !(200..300).contains(&response.status) {
@@ -4187,7 +4871,10 @@ fn potentially_trustworthy(url: &Url) -> bool {
     match url.scheme() {
         "https" | "wss" => true,
         "http" => match url.host() {
-            Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(Host::Domain(host)) => {
+                let host = host.strip_suffix('.').unwrap_or(host);
+                host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+            }
             Some(Host::Ipv4(ip)) => ip.is_loopback(),
             Some(Host::Ipv6(ip)) => ip.is_loopback(),
             None => false,
@@ -4197,18 +4884,68 @@ fn potentially_trustworthy(url: &Url) -> bool {
 }
 
 /// Fetch Metadata sends a `Sec-Fetch-Site` value on every redirect hop. A
-/// direct user navigation remains `none`; otherwise a redirect to another
-/// origin can never become *more* trusted than the chain already was. Without
-/// a public-suffix database we can prove same-origin transitions exactly and
-/// conservatively classify every other transition as cross-site.
+/// direct user navigation remains `none`; otherwise a redirect can never make
+/// the chain more trusted. Same-origin and schemeful same-site are equivalence
+/// relations, so retaining the least-trusted relation over successive hops is
+/// equivalent to checking the request origin against the whole URL list.
 fn update_navigation_metadata_for_redirect(request: &mut Request, target: &Url) {
-    let crosses_origin = !same_origin(&request.url, target);
+    let relation = fetch_site(&request.url, target);
     let Some(metadata) = request.fetch_metadata.as_mut() else {
         return;
     };
-    if metadata.site != FetchSite::None && crosses_origin {
-        metadata.site = FetchSite::CrossSite;
+    if metadata.site == FetchSite::SameOrigin
+        || (metadata.site == FetchSite::SameSite && relation == FetchSite::CrossSite)
+    {
+        metadata.site = relation;
     }
+}
+
+/// HTML #obtain-a-site / #same-site and URL #host-registrable-domain. URL has
+/// already applied IDNA/canonicalization. Preserve the trailing dot: the URL
+/// standard's registrable-domain algorithm does not equate example.com and
+/// example.com. Use the byte helper, not psl::domain_str (which trims it).
+fn fetch_site(source: &Url, target: &Url) -> FetchSite {
+    if same_origin(source, target) {
+        return FetchSite::SameOrigin;
+    }
+    let (url::Origin::Tuple(a_scheme, a_host, _), url::Origin::Tuple(b_scheme, b_host, _)) =
+        (source.origin(), target.origin())
+    else {
+        return FetchSite::CrossSite;
+    };
+    if a_scheme != b_scheme {
+        return FetchSite::CrossSite;
+    }
+    let equal_sites = match (&a_host, &b_host) {
+        (Host::Domain(a), Host::Domain(b)) => {
+            let a = psl::domain(a.as_bytes()).map_or(a.as_bytes(), |d| d.as_bytes());
+            let b = psl::domain(b.as_bytes()).map_or(b.as_bytes(), |d| d.as_bytes());
+            a == b
+        }
+        _ => a_host == b_host,
+    };
+    if equal_sites {
+        FetchSite::SameSite
+    } else {
+        FetchSite::CrossSite
+    }
+}
+
+/// Fetch Metadata #fetch-integration: caller-owned request context, never
+/// inferred from Referer (which may be suppressed) or author Sec-* headers.
+pub(crate) fn set_fetch_metadata(
+    request: &mut Request,
+    source: &Url,
+    destination: &'static str,
+    mode: &'static str,
+) {
+    request.timing_client = Some(source.clone());
+    request.fetch_metadata = Some(FetchMetadata {
+        destination,
+        mode,
+        site: fetch_site(source, &request.url),
+        user_activation: false,
+    });
 }
 
 /// Mark a request as a top-level, user-activated document navigation. Fetch
@@ -4216,15 +4953,14 @@ fn update_navigation_metadata_for_redirect(request: &mut Request, target: &Url) 
 /// `Sec-Fetch-*` are forbidden request-header names for page JavaScript.
 ///
 /// The initial address-bar navigation has no referrer (`none`). A navigation
-/// from the current document is same-origin when its origin matches; other
-/// origins are conservatively cross-site. (The distinction matters to Reddit
-/// and other CSRF defenses, while a full public-suffix database is outside
-/// this small client.)
+/// from the current document uses its actual schemeful site. Callers must use
+/// this only for browser/user navigation; script and iframe fetches carry their
+/// own source context through `set_fetch_metadata`.
 pub fn set_navigation_metadata(req: &mut Request, referrer: Option<&Url>) {
+    req.timing_client = referrer.cloned();
     let site = match referrer {
         None => FetchSite::None,
-        Some(source) if same_origin(source, &req.url) => FetchSite::SameOrigin,
-        Some(_) => FetchSite::CrossSite,
+        Some(source) => fetch_site(source, &req.url),
     };
     req.fetch_metadata = Some(FetchMetadata {
         destination: "document",
@@ -5274,6 +6010,14 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 }
 
 #[cfg(test)]
+#[path = "fetch_metadata_tests.rs"]
+mod fetch_metadata_tests;
+
+#[cfg(test)]
+#[path = "resource_timing_tests.rs"]
+mod resource_timing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5336,6 +6080,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         }
     }
 
@@ -5356,6 +6101,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         }
     }
 
@@ -5367,12 +6113,48 @@ mod tests {
             body: None,
             headers: Vec::new(),
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: Some(FetchPolicy {
                 origin: Url::parse("https://app.example").unwrap(),
                 mode,
                 credentials,
             }),
         }
+    }
+
+    #[test]
+    fn fetch_metadata_element_cors_keeps_internal_nosniff_headers() {
+        let page = Url::parse("https://app.example/").unwrap();
+        let url = Url::parse("https://cdn.example/a.js").unwrap();
+        let request = Request::subresource(
+            url.clone(),
+            &page,
+            "script",
+            Some(CredentialsMode::SameOrigin),
+        );
+        let response = enforce_fetch_policy(
+            &request,
+            policy_response(
+                url.as_str(),
+                200,
+                &[
+                    ("access-control-allow-origin", "*"),
+                    ("x-content-type-options", "nosniff"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(!classic_script_response_allowed(
+            response.status,
+            &response.content_type,
+            &response.headers
+        ));
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, _)| name == "x-content-type-options")
+        );
     }
 
     #[test]
@@ -5628,6 +6410,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let response = image_navigation_response(response, "image/png");
         assert_eq!(response.content_type, "text/html; charset=utf-8");
@@ -6949,6 +7732,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
@@ -7013,6 +7797,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
@@ -7204,6 +7989,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
@@ -7237,6 +8023,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         };
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let initial = String::from_utf8_lossy(&response.body).into_owned();
@@ -11700,6 +12487,7 @@ customElements.define('lit-counter', LitCounter);
             )),
             headers: Vec::new(),
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -11721,6 +12509,7 @@ customElements.define('lit-counter', LitCounter);
                 body: None,
                 headers: Vec::new(),
                 fetch_metadata: None,
+                timing_client: None,
                 fetch_policy: None,
             };
             let response = fetch(&request).await.unwrap();
@@ -11740,6 +12529,7 @@ customElements.define('lit-counter', LitCounter);
             )),
             headers: Vec::new(),
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -11803,6 +12593,7 @@ customElements.define('lit-counter', LitCounter);
                 String::from("Bearer should-not-cross-origin"),
             )],
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -11930,6 +12721,66 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
+    fn cookie_trace_metadata_never_confuses_names_with_values() {
+        assert_eq!(cookie_trace_counts(["", "  "].into_iter()), (0, 0));
+        assert_eq!(
+            cookie_trace_counts(
+                [
+                    "cf_clearance=opaque-test-only; Secure; HttpOnly; Path=/",
+                    "preference=cf_clearance=not-a-cookie-name",
+                    "CF_CLEARANCE=case-sensitive-name",
+                ]
+                .into_iter()
+            ),
+            (3, 1)
+        );
+        assert_eq!(
+            cookie_trace_counts("a=1; cf_clearance=opaque-test-only; b=2".split(';')),
+            (3, 1)
+        );
+    }
+
+    #[test]
+    fn cookie_integrity_requires_exact_bytes_and_matching_scope() {
+        let page = parse_url("https://cookie-integrity.example.test/path/page").unwrap();
+        let receipt = Cookie {
+            name: "cf_clearance".into(),
+            value: "original-test.%2F+/:=end".into(),
+            domain: "cookie-integrity.example.test".into(),
+            host_only: true,
+            path: "/path".into(),
+            secure: true,
+            http_only: true,
+        };
+        let line = "other=ignored; cf_clearance=original-test.%2F+/:=end";
+        let receipts = [receipt];
+        assert_eq!(cookie_wire_integrity(&page, line, &receipts), (1, 1, 0));
+        assert_eq!(cookie_wire_integrity(&page, line, &[]), (1, 0, 0));
+        assert_eq!(
+            cookie_wire_integrity(&page, "cf_clearance=original-test.%2F+/:=en", &receipts),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            cookie_wire_integrity(&page, "cf_clearance=original-test./+/:=end", &receipts),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            cookie_wire_integrity(&page, "cf_clearance=", &receipts),
+            (1, 0, 1)
+        );
+        for url in [
+            "https://other.example.test/path/page",
+            "https://cookie-integrity.example.test/path-other",
+            "http://cookie-integrity.example.test/path/page",
+        ] {
+            assert_eq!(
+                cookie_wire_integrity(&parse_url(url).unwrap(), line, &receipts),
+                (1, 0, 0)
+            );
+        }
+    }
+
+    #[test]
     fn google_consent_domain_cookie_survives_sibling_redirect() {
         let _guard = COOKIE_TEST_LOCK.lock().unwrap();
         set_cookies_enabled(true);
@@ -11990,6 +12841,339 @@ customElements.define('lit-counter', LitCounter);
             "HttpOnly cookie hidden from JS: {out}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn navigation_timing_response_bytes_and_interim_boundaries() {
+        use std::io::Write as _;
+        let payload = b"original timing test payload ".repeat(128);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded_size = compressed.len();
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            writer
+                .write_all(b"HTTP/1.1 103 Early Hints\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            writer.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {encoded_size}\r\n\r\n").as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            writer.write_all(&compressed).await.unwrap();
+        });
+        let mut timing = FetchTiming::new();
+        let (status, _, body, _, _) =
+            read_response_with_timing(&mut BufReader::new(reader), false, false, Some(&mut timing))
+                .await
+                .unwrap();
+        server.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, payload);
+        assert!(timing.first_interim_response_start >= timing.start_time);
+        assert!(timing.final_response_start > timing.first_interim_response_start);
+        assert!(timing.response_end > timing.final_response_start);
+        assert_eq!(timing.encoded_body_size, encoded_size);
+        assert_eq!(timing.decoded_body_size, payload.len());
+        let data = timing.navigation_data("http://localhost/original");
+        assert_eq!(data["responseStart"], data["firstInterimResponseStart"]);
+        assert!(
+            data["finalResponseHeadersStart"].as_f64().unwrap()
+                > data["responseStart"].as_f64().unwrap()
+        );
+        assert_eq!(data["transferSize"], encoded_size + 300);
+        assert_eq!(data["secureConnectionStart"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn navigation_timing_redirect_details_obey_navigation_tao() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let port = address.port();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let tao = if path.contains("tao") {
+                    "Timing-Allow-Origin: *\r\n"
+                } else {
+                    ""
+                };
+                let response = if path.starts_with("/start/") {
+                    let host = if path.contains("same") {
+                        "127.0.0.1"
+                    } else {
+                        "localhost"
+                    };
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{host}:{port}/final/{path}\r\n{tao}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{tao}Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        for (path, allowed, no_referrer) in [
+            ("same", true, false),
+            ("cross", false, false),
+            ("tao", true, false),
+            ("no-referrer-tao", false, true),
+        ] {
+            let url = parse_url(&format!("http://{address}/start/{path}")).unwrap();
+            let mut request = Request::get(url.clone());
+            set_navigation_metadata(&mut request, if no_referrer { Some(&url) } else { None });
+            let response = fetch(&request).await.unwrap();
+            let timing = response.timing.unwrap();
+            assert!(timing.redirect_end > timing.start_time);
+            assert!(timing.fetch_start <= timing.request_start);
+            let data = timing.navigation_data(response.url.as_str());
+            assert_eq!(data["redirectCount"], u16::from(allowed), "{path}");
+            if allowed {
+                assert!(data["redirectEnd"].as_f64().unwrap() > 0.0, "{path}");
+            } else {
+                assert_eq!(data["redirectStart"], 0.0);
+                assert_eq!(data["redirectEnd"], 0.0);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn navigation_timing_is_available_to_the_first_document_script() {
+        // Navigation Timing #dfn-create-the-navigation-timing-entry and HTML
+        // #initialise-the-document-object: expose the real navigation before
+        // author scripts run, not an end-of-load snapshot or fabricated marks.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            let body = r#"<!doctype html><body><script>
+                const navigation = performance.getEntriesByType('navigation');
+                document.body.setAttribute('data-navigation-count', String(navigation.length));
+                if (navigation.length === 1) {
+                    const entry = navigation[0];
+                    const valid = entry instanceof PerformanceNavigationTiming &&
+                        entry instanceof PerformanceResourceTiming && entry instanceof PerformanceEntry &&
+                        entry.name === location.href && entry.entryType === 'navigation' &&
+                        entry.startTime === 0 && entry.duration === 0 &&
+                        entry.responseEnd >= entry.responseStart && entry.responseStart >= entry.requestStart &&
+                        entry.requestStart >= entry.connectEnd && entry.connectEnd >= entry.fetchStart &&
+                        entry.responseEnd > 0 && entry.responseEnd <= performance.now() &&
+                        entry.domInteractive === 0 && entry.domComplete === 0 && entry.loadEventEnd === 0;
+                    document.body.setAttribute('data-navigation-valid', String(valid));
+                    document.addEventListener('DOMContentLoaded', () => {
+                        document.body.setAttribute('data-navigation-dom-event', String(
+                            document.readyState === 'interactive' && entry.domInteractive > 0 &&
+                            entry.domContentLoadedEventStart >= entry.domInteractive &&
+                            entry.domContentLoadedEventEnd === 0 && entry.domComplete === 0));
+                    });
+                    addEventListener('load', () => {
+                        document.body.setAttribute('data-navigation-load-event', String(
+                            document.readyState === 'complete' && entry.domComplete >= entry.domContentLoadedEventEnd &&
+                            entry.loadEventStart >= entry.domComplete && entry.loadEventEnd === 0 && entry.duration === 0));
+                        setTimeout(() => document.body.setAttribute('data-navigation-final', String(
+                            entry.loadEventEnd >= entry.loadEventStart && entry.duration === entry.loadEventEnd &&
+                            entry.loadEventEnd <= performance.now())), 0);
+                    });
+                }
+            </script></body>"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        });
+        let url = parse_url(&format!("http://{address}/navigation")).unwrap();
+        let response = fetch_web_default(&url).await.unwrap();
+        server.await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        assert!(
+            response
+                .js
+                .as_ref()
+                .is_some_and(|outcome| outcome.errors.is_empty()),
+            "navigation script errors: {:?}",
+            response.js.as_ref().map(|outcome| &outcome.errors)
+        );
+        let html = navigation_timing_snapshot_after(response, "data-navigation-final=").await;
+        assert!(
+            html.contains("data-navigation-count=\"1\""),
+            "missing first-script entry: {html}"
+        );
+        assert!(
+            html.contains("data-navigation-valid=\"true\""),
+            "invalid first-script timing: {html}"
+        );
+        for phase in ["dom-event", "load-event", "final"] {
+            assert!(
+                html.contains(&format!("data-navigation-{phase}=\"true\"")),
+                "invalid {phase}: {html}"
+            );
+        }
+    }
+
+    pub(super) async fn navigation_timing_snapshot_after(
+        mut response: Response,
+        marker: &str,
+    ) -> String {
+        let initial = String::from_utf8_lossy(&response.body).into_owned();
+        if initial.contains(marker) {
+            return initial;
+        }
+        let mut live = response
+            .live
+            .take()
+            .expect("pending timing tasks retain their page actor");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match live.events.recv().await {
+                    Some(
+                        crate::js::PageEvt::Updated { html, outcome }
+                        | crate::js::PageEvt::Static { html, outcome },
+                    ) => {
+                        assert!(
+                            outcome.errors.is_empty(),
+                            "timing actor errors: {:?}",
+                            outcome.errors
+                        );
+                        if html.contains(marker) {
+                            break html;
+                        }
+                    }
+                    Some(crate::js::PageEvt::Patched { patches, outcome }) => {
+                        assert!(
+                            outcome.errors.is_empty(),
+                            "timing actor errors: {:?}",
+                            outcome.errors
+                        );
+                        if let Some(patch) = patches
+                            .into_iter()
+                            .find(|patch| patch.html.contains(marker))
+                        {
+                            break patch.html;
+                        }
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => {
+                        panic!("timing task failed: {errors:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("timing page closed before {marker}; initial {initial}"),
+                }
+            }
+        })
+        .await
+        .expect("timing lifecycle completion timed out")
+    }
+
+    #[tokio::test]
+    async fn navigation_timing_follows_real_iframe_navigation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let (mime, body) = if request.starts_with(b"GET /child ") {
+                    (
+                        "text/html",
+                        r#"<!doctype html><body>
+                        <script defer src="/deferred.js"></script><script>
+                        const n = performance.getEntriesByType('navigation')[0];
+                        parent.document.body.setAttribute('data-child-first', String(
+                            !!n && n.name === location.href && n instanceof PerformanceNavigationTiming &&
+                            document.readyState === 'loading' && n.domInteractive === 0 &&
+                            n.duration === 0 && n.loadEventEnd === 0 && n.responseEnd > 0 &&
+                            n.responseEnd <= performance.now()));
+                        </script></body>"#,
+                    )
+                } else if request.starts_with(b"GET /deferred.js ") {
+                    (
+                        "text/javascript",
+                        r#"const deferredNav = performance.getEntriesByType('navigation')[0];
+                        parent.document.body.setAttribute('data-child-deferred', String(
+                            document.readyState === 'interactive' && deferredNav.domInteractive > 0 &&
+                            deferredNav.domContentLoadedEventStart === 0));"#,
+                    )
+                } else {
+                    (
+                        "text/html",
+                        r#"<!doctype html><body><script>
+                        const frame = document.createElement('iframe'); document.body.appendChild(frame);
+                        const initialWindowArray = frame.contentWindow.Array;
+                        const initialPerformance = frame.contentWindow.performance;
+                        const initialOrigin = initialPerformance.timeOrigin;
+                        setTimeout(() => {
+                            frame.onload = () => {
+                                setTimeout(() => {
+                                    const p = frame.contentWindow.performance, n = p.getEntriesByType('navigation')[0];
+                                    document.body.setAttribute('data-child-final', String(
+                                        !!n && p.timeOrigin > initialOrigin &&
+                                        p === initialPerformance && frame.contentWindow.Array === initialWindowArray &&
+                                        n.domComplete > 0 && n.loadEventEnd >= n.domComplete && n.duration === n.loadEventEnd &&
+                                        performance.getEntriesByType('navigation')[0].name === location.href));
+                                }, 0);
+                            };
+                            frame.src = '/child';
+                        }, 5);
+                    </script></body>"#,
+                    )
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let url = parse_url(&format!("http://{address}/parent")).unwrap();
+        let response = fetch_web_default(&url).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        assert!(
+            response
+                .js
+                .as_ref()
+                .is_some_and(|outcome| outcome.errors.is_empty()),
+            "iframe errors: {:?}",
+            response.js.as_ref().map(|outcome| &outcome.errors)
+        );
+        let html = navigation_timing_snapshot_after(response, "data-child-final=").await;
+        server.abort();
+        for phase in ["first", "deferred", "final"] {
+            assert!(
+                html.contains(&format!("data-child-{phase}=\"true\"")),
+                "invalid child {phase}: {html}"
+            );
+        }
     }
 
     // Same safe-across-await rationale as
@@ -12115,6 +13299,7 @@ customElements.define('lit-counter', LitCounter);
             body: Some((String::from("text/plain"), b"hi".to_vec())),
             headers: Vec::new(),
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: None,
         };
         let resp = fetch(&request).await.unwrap();
@@ -12171,6 +13356,7 @@ customElements.define('lit-counter', LitCounter);
                 ("Upgrade-Insecure-Requests".into(), "0".into()),
             ],
             fetch_metadata: None,
+            timing_client: None,
             fetch_policy: None,
         };
         let resp = fetch(&request).await.unwrap();

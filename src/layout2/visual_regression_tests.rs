@@ -10,6 +10,49 @@ fn by_id(dom: &Dom, id: &str) -> NodeId {
 }
 
 #[test]
+fn relative_image_tiles_preserve_sizing_offsets_and_overflow_crop() {
+    // CSS 2.2 §9.4.3, §10.3.2/§10.6.2 and §11.1: size against the
+    // containing block, then offset without shrinking to the overflow clip.
+    let source = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cpath fill='red' d='M0 0h300v100H0z'/%3E%3Cpath fill='lime' d='M0 100h300v100H0z'/%3E%3Cpath fill='blue' d='M0 200h300v100H0z'/%3E%3Cpath fill='yellow' d='M100 100h100v100H100z'/%3E%3C/svg%3E";
+    let html = format!(
+        "<style>body{{margin:0;background:white}}.tile{{width:100px;height:100px;overflow:hidden;position:relative}}img{{width:300%;height:300%;position:relative}}</style><div class=tile><img id=image src=\"{source}\" style='left:-100%;top:-100%'></div><div id=after>After</div>"
+    );
+    let dom = Dom::parse_document(&html);
+    let page = lay_out_graphical(
+        &dom,
+        &Url::parse("https://example.test/").unwrap(),
+        Viewport::new(160., 160.),
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let image = by_id(&dom, "image");
+    let rect = page
+        .paint
+        .primitives
+        .iter()
+        .find_map(|c| match c {
+            crate::render::DisplayCommand::Image { node, rect, .. } if *node == image => {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((rect.width, rect.height), (300., 300.), "{rect:?}");
+    assert_eq!((rect.x, rect.y), (-100., -100.), "{rect:?}");
+    let frame = headless::render_paint(&page.paint, CssSize::new(160., 160.)).unwrap();
+    for (x, y) in [(10, 10), (50, 50), (90, 90)] {
+        let pixel = &frame.pixels[(y * 160 + x) * 4..][..4];
+        assert!(
+            pixel[0] > 240 && pixel[1] > 240 && pixel[2] < 10,
+            "{x},{y}: {pixel:?}"
+        );
+    }
+    let outside = &frame.pixels[(50 * 160 + 120) * 4..][..4];
+    assert_eq!(outside, &[255, 255, 255, 255]);
+}
+
+#[test]
 fn carousel_inline_paint_and_hits_survive_retained_scroll_and_hover() {
     // CSS Overflow 3 #scrolling and CSS Transforms 1 #transform-rendering:
     // scrolling moves contents through a stationary scrollport. A card's

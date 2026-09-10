@@ -495,7 +495,7 @@ pub fn lay_out_graphical(
             return empty_graphical_layout(viewport);
         };
         let measure_started = std::time::Instant::now();
-        let (boxes, _) = measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+        let (boxes, _, _) = measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
         let measure_elapsed = measure_started.elapsed();
         let (paint, patch_boundaries, boundaries) = graphics::paint(
             dom,
@@ -731,7 +731,7 @@ pub fn lay_graphical_subtree(
         Flow::offset_frag(&mut top.fragment, rect.x, rect.y);
     }
     flow_bottom += rect.y;
-    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
+    let (boxes, _scrolling_areas, _) = measure::boxes(dom, &frag, &fixed, &top_layer);
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
@@ -899,7 +899,7 @@ pub fn measure_boxes_css(
         let Some(layout) = layout else {
             return (HashMap::new(), HashMap::new(), HashMap::new());
         };
-        let (boxes, scrolling_areas) =
+        let (boxes, scrolling_areas, _) =
             measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
         (boxes, layout.tracks, scrolling_areas)
     })
@@ -910,6 +910,7 @@ pub(crate) struct RetainedMeasurement {
     pub boxes: HashMap<NodeId, PxRect>,
     pub tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     pub scrolling_areas: HashMap<NodeId, PxRect>,
+    pub frame_viewports: HashMap<NodeId, crate::render::CssRect>,
     pub fragments: Option<std::sync::Arc<LayoutFragments>>,
     pub work: LayoutWork,
 }
@@ -929,7 +930,7 @@ pub(crate) fn measure_retained_layout(
         let Some(layout) = layout else {
             return RetainedMeasurement::default();
         };
-        let (boxes, scrolling_areas) =
+        let (boxes, scrolling_areas, frame_viewports) =
             measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
         let fragments = LayoutFragments::retain(
             &layout.root,
@@ -943,6 +944,7 @@ pub(crate) fn measure_retained_layout(
             boxes,
             tracks: layout.tracks,
             scrolling_areas,
+            frame_viewports,
             fragments,
             work: layout.work,
         }
@@ -982,7 +984,7 @@ pub fn measure_cssom_with_paint_css(
                 },
             );
         };
-        let (boxes, scrolling_areas) =
+        let (boxes, scrolling_areas, _) =
             measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
         let (paint, _, _) = graphics::paint(
             dom,
@@ -3519,6 +3521,38 @@ mod tests {
         assert_eq!(scroll.viewport.height, 100.0);
         assert!(scroll.content.height >= 400.0, "{scroll:?}");
         assert!(scroll.vertical);
+    }
+
+    #[test]
+    fn iframe_border_and_padding_do_not_create_child_scroll_overflow() {
+        // HTML #the-page / CSS Overflow 3 #scrollable-overflow-calculation:
+        // an embedding element's edges are outside the child Document.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><iframe id=f style="position:absolute;left:30px;top:40px;width:100px;height:60px;border:3px solid;padding:7px 11px"></iframe>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(frame, "<body style='margin:0'>", "https://frame.test/")
+            .unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &Url::parse("https://page.test/").unwrap(),
+            Viewport::new(400.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let scroll = layout
+            .paint
+            .scroll_containers
+            .iter()
+            .find(|scroll| scroll.node == frame)
+            .unwrap();
+        assert_eq!(
+            scroll.viewport,
+            crate::render::CssRect::new(44.0, 50.0, 100.0, 60.0)
+        );
+        assert_eq!(scroll.content, crate::core::CssSize::new(100.0, 60.0));
+        assert!(!scroll.horizontal && !scroll.vertical, "{scroll:?}");
     }
 
     #[test]
@@ -6727,6 +6761,75 @@ mod tests {
     fn cell_at(out: &Output, text: &str) -> (usize, usize) {
         let (r, it) = find(out, text);
         (r, it.col as usize)
+    }
+
+    #[test]
+    fn css_table_retains_positioned_children_in_anonymous_cells() {
+        // CSS 2.2 §17.2.1: out-of-flow children participate in table fixup
+        // as zero-size inline placeholders, not as absent content.
+        let html = r#"<body style="margin:0">
+          <div style="position:relative;width:320px;height:120px;background:white">
+            <div style="display:table;position:absolute;left:0;top:0;width:300px;height:110px;z-index:0;border-spacing:0">
+              <div style="position:absolute;left:10px;top:10px;width:280px;height:90px">
+                <h2 style="display:table-cell;position:absolute;margin:0;font:18px sans-serif;color:white;z-index:5">Instructions</h2>
+              </div>
+              <div style="position:absolute;left:0;top:0;width:300px;height:110px;background:#00838f;z-index:-1"></div>
+            </div>
+          </div><p style="margin:0">After</p></body>"#;
+        let graphical = lay_graphical(html, 640.0, &ImageSizes::new());
+        let (x, y, _) = graphical_text(&graphical, "Instructions");
+        assert!((x - 10.0).abs() < 0.1 && y >= 10.0 && y < 40.0, "{x},{y}");
+        let terminal = lay(html, 80);
+        assert!(terminal_text(&terminal).contains("Instructions"));
+        assert!(graphical_text(&graphical, "After").1 >= 120.0);
+    }
+
+    #[test]
+    fn css_table_fixup_preserves_order_cells_and_text_inheritance() {
+        let html = r#"<style>body {margin:0} .table {display:table;border-spacing:0}
+          .row {display:table-row} .cell {display:table-cell}
+          .group {display:table-row-group}</style>
+          <div class=table><div class=cell>First</div><div>Second</div>
+            <div class=row><div class=cell>Third</div><div class=cell>Fourth</div></div>
+            <div class=group><div>Fifth</div><div class=row style="color:blue;font:24px monospace">Sixth</div></div>
+            <div class=cell>Seventh</div></div>"#;
+        let terminal = lay(html, 80);
+        assert_eq!(
+            cell_at(&terminal, "First").0,
+            cell_at(&terminal, "Second").0
+        );
+        assert!(cell_at(&terminal, "First").1 < cell_at(&terminal, "Second").1);
+        assert_eq!(
+            cell_at(&terminal, "Third").0,
+            cell_at(&terminal, "Fourth").0
+        );
+        for (a, b) in [
+            ("First", "Third"),
+            ("Third", "Fifth"),
+            ("Fifth", "Sixth"),
+            ("Sixth", "Seventh"),
+        ] {
+            assert!(
+                cell_at(&terminal, a).0 < cell_at(&terminal, b).0,
+                "{a} before {b}"
+            );
+        }
+        let graphical = lay_graphical(html, 640.0, &ImageSizes::new());
+        let sixth = graphical
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, color, .. }
+                    if shaped.text == "Sixth" =>
+                {
+                    Some((shaped, color))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(sixth.0.line_height >= 24.0);
+        assert_eq!(*sixth.1, crate::render::PaintColor::Rgba(0, 0, 255, 255));
     }
 
     #[test]

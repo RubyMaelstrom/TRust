@@ -18,18 +18,25 @@ pub fn render_paint(page: &super::PagePaint, viewport: CssSize) -> Result<OwnedR
     let store = ImageStore::default();
     for request in &page.image_requests {
         if let Some(bytes) = crate::img::decode_data_url(&request.source)
-            && let Ok(image) = crate::img::decode_graphical(&bytes) {
-            store.insert(request.handle,image);
+            && let Ok(image) = crate::img::decode_graphical(&bytes)
+        {
+            store.insert(request.handle, image);
         }
     }
-    let physical = PhysicalSize::new(viewport.width.ceil().max(1.) as u32,viewport.height.ceil().max(1.) as u32);
+    let physical = PhysicalSize::new(
+        viewport.width.ceil().max(1.) as u32,
+        viewport.height.ceil().max(1.) as u32,
+    );
     let mut scene = Scene {
-        viewport: ViewportMetrics::from_physical(physical,ScaleFactor::default()),
-        primitives:Vec::new(),controls:Vec::new(),
-        content_viewport:super::CssRect::new(0.,0.,viewport.width,viewport.height),
-        image_store:store,page_scroll_containers:Vec::new(),page_size:CssSize::default(),
+        viewport: ViewportMetrics::from_physical(physical, ScaleFactor::default()),
+        primitives: Vec::new(),
+        controls: Vec::new(),
+        content_viewport: super::CssRect::new(0., 0., viewport.width, viewport.height),
+        image_store: store,
+        page_scroll_containers: Vec::new(),
+        page_size: CssSize::default(),
     };
-    scene.append_page(page,CssPoint::default());
+    scene.append_page(page, CssPoint::default());
     VelloCpuRenderer::new().render_rgba(&scene)
 }
 

@@ -60,6 +60,9 @@ pub(crate) struct Frag<'t> {
     /// Untransformed content-box size for CSS container queries (never a
     /// border-box, even when box-sizing:border-box controls CSSOM width).
     pub content_size: Option<[f32; 2]>,
+    /// Used content-box origin relative to this border box. Keep the resolved
+    /// padding from layout (including percentages), not a later CSS reparse.
+    pub content_offset: [f32; 2],
     /// How the Appendix E painter treats this fragment.
     pub paint: PaintFlags,
     /// The effective clip rectangle (absolute px) applied to this fragment's
@@ -71,6 +74,18 @@ pub(crate) struct Frag<'t> {
     pub clip: Option<Clip>,
     pub kind: FragKind<'t>,
     pub children: Vec<Frag<'t>>,
+}
+
+impl Frag<'_> {
+    pub(super) fn content_box(&self) -> crate::render::CssRect {
+        let [width, height] = self.content_size.unwrap_or([0.0; 2]);
+        crate::render::CssRect::new(
+            self.x + self.content_offset[0],
+            self.y + self.content_offset[1],
+            width,
+            height,
+        )
+    }
 }
 
 /// A box promoted into the document top layer. CSS Positioned Layout 4 §3
@@ -173,6 +188,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
         border: fragment.border,
         css_size: fragment.css_size,
         content_size: fragment.content_size,
+        content_offset: fragment.content_offset,
         paint: fragment.paint,
         clip: fragment.clip,
         kind,
@@ -299,6 +315,7 @@ impl<'t> Frag<'t> {
             border: [0.0; 4],
             css_size: None,
             content_size: None,
+            content_offset: [0.0; 2],
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Block,
@@ -413,6 +430,7 @@ fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag<'_> {
         border: [0.0; 4],
         css_size: None,
         content_size: None,
+        content_offset: [0.0; 2],
         paint: PaintFlags::default(),
         clip: None,
         kind: FragKind::Oof(m.b, Box::new(m.ctx)),
@@ -1393,6 +1411,7 @@ impl Flow<'_> {
                 [h.content_w, (frag_h - vertical_edges).max(0.0)]
             }),
             content_size: Some([h.content_w, (frag_h - vertical_edges).max(0.0)]),
+            content_offset: [h.bp_l, b.style.border[TOP] + self.pad(&b.style, TOP, cb.0)],
             paint: paint_flags(&b.style, false),
             clip: None,
             kind: FragKind::Block,
@@ -1420,31 +1439,7 @@ impl Flow<'_> {
         w: f32,
         h: f32,
     ) -> (f32, f32) {
-        let mut dx = 0.0f32;
-        let mut dy = 0.0f32;
-        if s.position == Pos::Relative {
-            let l = s.inset[LEFT].resolve(Some(cb_w));
-            let r = s.inset[RIGHT].resolve(Some(cb_w));
-            // §9.4.3: used left = -right; both auto → 0; both set → left
-            // wins (ltr). A % against an indefinite CB height stays auto.
-            dx += match (l, r) {
-                (Some(l), _) => l,
-                (None, Some(r)) => -r,
-                (None, None) => 0.0,
-            };
-            let t = s.inset[TOP].resolve(cb_h);
-            let bo = s.inset[BOTTOM].resolve(cb_h);
-            dy += match (t, bo) {
-                (Some(t), _) => t,
-                (None, Some(b)) => -b,
-                (None, None) => 0.0,
-            };
-        }
-        if s.has_transform {
-            dx += s.tx.0 * w + s.tx.1;
-            dy += s.ty.0 * h + s.ty.1;
-        }
-        (dx, dy)
+        s.paint_offset(cb_w, cb_h, w, h)
     }
 
     /// Placeholders for a flex/grid container's out-of-flow children. Their
@@ -1469,6 +1464,7 @@ impl Flow<'_> {
                 border: [0.0; 4],
                 css_size: None,
                 content_size: None,
+                content_offset: [0.0; 2],
                 paint: PaintFlags::default(),
                 clip: None,
                 kind: FragKind::Oof(ob, Box::new(inl.clone())),
@@ -1501,6 +1497,7 @@ impl Flow<'_> {
                 border: [0.0; 4],
                 css_size: None,
                 content_size: None,
+                content_offset: [0.0; 2],
                 paint: PaintFlags::default(),
                 clip: None,
                 kind: FragKind::Line(line_frag),
@@ -1633,6 +1630,7 @@ impl Flow<'_> {
             border: [0.0; 4],
             css_size: None,
             content_size: None,
+            content_offset: [0.0; 2],
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
@@ -3133,6 +3131,7 @@ impl Flow<'_> {
                     [content_w, content_h]
                 }),
                 content_size: Some([content_w, content_h]),
+                content_offset: [bp_l, bt],
                 // `item = true`: only flex/grid items and out-of-flow boxes
                 // lay through here, and for the (always-positioned)
                 // out-of-flow ones the item bit can't change the result.
@@ -3213,6 +3212,7 @@ impl Flow<'_> {
             border: [0.0; 4],
             css_size: None,
             content_size: None,
+            content_offset: [0.0; 2],
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
@@ -3362,6 +3362,15 @@ impl Flow<'_> {
         if !cx && !cy {
             return None;
         }
+        if matches!(self.dom.tag_name(f.node), Some("iframe" | "frame")) {
+            let content = f.content_box();
+            return Some(Clip {
+                x0: content.x,
+                y0: content.y,
+                x1: content.x + content.width,
+                y1: content.y + content.height,
+            });
+        }
         let x0 = f.x + f.border[LEFT];
         let y0 = f.y + f.border[TOP];
         let x1 = (f.x + f.w - f.border[RIGHT]).max(x0);
@@ -3454,7 +3463,22 @@ impl Flow<'_> {
             w: (f.w - f.border[LEFT] - f.border[RIGHT]).max(0.0),
             h: (f.h - f.border[TOP] - f.border[BOTTOM]).max(0.0),
         };
-        let child_abs = if establishes_abs_cb { pad } else { abs_cb };
+        let child_abs = if frame_viewport {
+            // HTML #the-page: a child Document's initial containing block
+            // fills the container's content box. The iframe is not a DOM
+            // ancestor establishing a CSS padding-box containing block.
+            let content = f.content_box();
+            CbRect {
+                x: content.x,
+                y: content.y,
+                w: content.width,
+                h: content.height,
+            }
+        } else if establishes_abs_cb {
+            pad
+        } else {
+            abs_cb
+        };
         let child_fixed = if f.paint.cb_fixed {
             Some(pad)
         } else {
@@ -3520,6 +3544,7 @@ impl Flow<'_> {
                             border: [0.0; 4],
                             css_size: None,
                             content_size: None,
+                            content_offset: [0.0; 2],
                             paint: PaintFlags {
                                 positioned: true,
                                 sc: true,

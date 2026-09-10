@@ -418,10 +418,18 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
     }
     let _ = out.flush();
     if let Some(path) = std::env::var_os("TRUST_HEADLESS_PNG")
-        && let Some(rendered) = controller.current_page().and_then(|page| page.rendered_page()) {
-        let frame = trust::render::headless::render_paint(&rendered.layout.paint,CssSize::new(options.width,options.height))?;
-        trust::render::headless::write_png(&frame,path)?;
-        eprintln!("[snapshot] canonical display list with inline image resources (no additional image fetches)");
+        && let Some(rendered) = controller
+            .current_page()
+            .and_then(|page| page.rendered_page())
+    {
+        let frame = trust::render::headless::render_paint(
+            &rendered.layout.paint,
+            CssSize::new(options.width, options.height),
+        )?;
+        trust::render::headless::write_png(&frame, path)?;
+        eprintln!(
+            "[snapshot] canonical display list with inline image resources (no additional image fetches)"
+        );
     }
     Ok(settled != Settle::Timeout)
 }
@@ -820,6 +828,7 @@ mod tests {
             declarative_refresh: None,
             challenge: None,
             from_post: false,
+            timing: None,
         }));
         assert_eq!(describe_fetch(&missing), "HTTP 404 (text/html)");
         assert_eq!(

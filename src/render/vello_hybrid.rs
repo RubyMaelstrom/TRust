@@ -1450,12 +1450,16 @@ mod tests {
     #[test]
     fn hybrid_bitmap_glyphs_render_without_fallback_or_atlas_growth() {
         use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
-        let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+        let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless())
+        else {
             eprintln!("Bitmap-glyph GPU regression not exercised: no Hybrid adapter");
             return;
         };
         let mut scene = Scene {
-            viewport: ViewportMetrics::from_physical(PhysicalSize::new(180, 180), ScaleFactor::default()),
+            viewport: ViewportMetrics::from_physical(
+                PhysicalSize::new(180, 180),
+                ScaleFactor::default(),
+            ),
             primitives: Vec::new(),
             controls: Vec::new(),
             content_viewport: CssRect::new(0.0, 0.0, 180.0, 180.0),
@@ -1466,25 +1470,44 @@ mod tests {
         // Include sizes beyond the experimental glyph cache's limit. These
         // must still render via ordinary image uploads, not panic to CPU.
         for size in [48.0, 128.0, 320.0] {
-            let shaped = crate::text::shape("👍", &crate::text::TextStyle {
-                family: "Noto Color Emoji".into(), size, ..Default::default()
-            });
+            let shaped = crate::text::shape(
+                "👍",
+                &crate::text::TextStyle {
+                    family: "Noto Color Emoji".into(),
+                    size,
+                    ..Default::default()
+                },
+            );
             scene.primitives = vec![DisplayCommand::GlyphRun {
-                origin: CssPoint::new(4.0, 4.0), shaped,
+                origin: CssPoint::new(4.0, 4.0),
+                shaped,
                 color: PaintColor::Rgba(0, 0, 0, 255),
                 decoration: crate::render::TextDecorationPaint {
-                    color: PaintColor::Rgba(0, 0, 0, 255), style: DecorationStyle::Solid,
+                    color: PaintColor::Rgba(0, 0, 0, 255),
+                    style: DecorationStyle::Solid,
                 },
-                shadows: Vec::new(), clip: None, node: 0, link: None,
+                shadows: Vec::new(),
+                clip: None,
+                node: 0,
+                link: None,
             }];
             for _ in 0..20 {
-                let frame = hybrid.render_rgba(&scene).expect("bitmap glyph stays on Hybrid");
-                let colored = frame.pixels.chunks_exact(4).filter(|p| {
-                    p[3] > 0 && p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 50
-                }).count();
+                let frame = hybrid
+                    .render_rgba(&scene)
+                    .expect("bitmap glyph stays on Hybrid");
+                let colored = frame
+                    .pixels
+                    .chunks_exact(4)
+                    .filter(|p| {
+                        p[3] > 0 && p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 50
+                    })
+                    .count();
                 assert!(colored > 100, "missing color bitmap at {size}px: {colored}");
-                assert_eq!(hybrid.renderer.atlas_texture().size().depth_or_array_layers, 1,
-                    "temporary glyph images must release their atlas allocations");
+                assert_eq!(
+                    hybrid.renderer.atlas_texture().size().depth_or_array_layers,
+                    1,
+                    "temporary glyph images must release their atlas allocations"
+                );
             }
         }
     }

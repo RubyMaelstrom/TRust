@@ -2129,6 +2129,22 @@ impl Dom {
         html5ever::parse_document(sink, ParseOpts::default()).one(StrTendril::from(html))
     }
 
+    /// HTML §7.5.5 “Loading text documents”: a no-quirks HTML document with
+    /// a pre element and the tokenizer in PLAINTEXT state. Feed the sacrificial
+    /// LF before switching states so a leading newline in the resource survives.
+    /// The tokenizer handles CR/CRLF and NUL normally, without interpreting
+    /// markup, character references, or script in the resource.
+    fn parse_text_document(text: &str) -> Self {
+        let sink = Sink {
+            dom: RefCell::new(Dom::new()),
+        };
+        let mut parser = html5ever::parse_document(sink, ParseOpts::default());
+        parser.process(StrTendril::from("<!doctype html><pre>\n"));
+        parser.tokenizer.set_plaintext_state();
+        parser.process(StrTendril::from(text));
+        parser.finish()
+    }
+
     fn new_node(&mut self, data: NodeData) -> NodeId {
         self.nodes.push(Node {
             parent: None,
@@ -2761,6 +2777,14 @@ impl Dom {
     }
 
     pub(crate) fn canvas_changed(&mut self, id: NodeId) {
+        if self.is_connected(id) {
+            self.touch_content(Some(id));
+        }
+    }
+
+    /// HTML image request completion can change intrinsic layout without an
+    /// attribute mutation. Detached image loads must not invalidate the page.
+    pub(crate) fn image_changed(&mut self, id: NodeId) {
         if self.is_connected(id) {
             self.touch_content(Some(id));
         }
@@ -3666,8 +3690,8 @@ impl Dom {
     /// those defaults. CSSOM cannot expose that sentinel: CSS Cascade 5 §4
     /// assigns every property a specified and computed value, and CSSOM §9
     /// requires `getComputedStyle()` to return its resolved value. Materialize
-    /// the initial values for the positional/sizing surface implemented by
-    /// TRust so script cannot confuse `""` with a non-`auto` inset.
+    /// initial values for the implemented positioning, sizing and interaction
+    /// surface so script does not mistake an empty sentinel for a CSS value.
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
         // CSS Fonts 4 §2.5 defines the computed value of `font-size` as an
         // absolute length. Do not expose the authored percentage/relative
@@ -5480,6 +5504,25 @@ impl Dom {
         base: &str,
     ) -> Option<NodeId> {
         let doc = Dom::parse_document(html);
+        self.install_parsed_frame_document(frame, &doc, base)
+    }
+
+    pub(crate) fn install_frame_text_document(
+        &mut self,
+        frame: NodeId,
+        text: &str,
+        base: &str,
+    ) -> Option<NodeId> {
+        let doc = Dom::parse_text_document(text);
+        self.install_parsed_frame_document(frame, &doc, base)
+    }
+
+    fn install_parsed_frame_document(
+        &mut self,
+        frame: NodeId,
+        doc: &Dom,
+        base: &str,
+    ) -> Option<NodeId> {
         let src_html = doc
             .children(DOCUMENT)
             .into_iter()
@@ -5489,7 +5532,7 @@ impl Dom {
         for c in self.children(frame) {
             self.detach(c);
         }
-        let new_html = self.transplant(&doc, src_html);
+        let new_html = self.transplant(doc, src_html);
         self.append(frame, new_html);
         if let Ok(base_url) = url::Url::parse(base) {
             self.absolutize_subtree_urls(new_html, &base_url);
@@ -9442,11 +9485,19 @@ const PROPS: &[PropDef] = &[
 
 /// Initial values which must be materialized at the CSSOM boundary rather
 /// than represented by the engine's internal `None` sentinel. These cover the
-/// complete positioned-box state read by standards-based fitting libraries.
-/// Values come from CSS Positioned Layout 3, CSS Box Sizing 3, CSS2 §8, CSS
-/// Writing Modes 4, and CSS Color 4.
+/// positioned-box state read by fitting libraries and the interaction state
+/// already honored by layout/hit testing. Values come from CSS Positioned
+/// Layout 3, CSS Box Sizing 3, CSS2 §8, CSS Writing Modes 4 and CSS Color 4;
+/// the additional visibility/pointer/transform clauses are cited below.
 fn cssom_initial_value(name: &str) -> Option<&'static str> {
     match name {
+        // CSS Display 4 #visibility: inherited, initial visible.
+        "visibility" => Some("visible"),
+        // CSS UI 4 #pointer-events-control / SVG 2 #PointerEventsProp:
+        // inherited, initial auto (also for SVG's extended value grammar).
+        "pointer-events" => Some("auto"),
+        // CSS Transforms 1 #transform-property: non-inherited, initial none.
+        "transform" => Some("none"),
         "position" => Some("static"),
         "top" | "right" | "bottom" | "left" => Some("auto"),
         "max-width" | "max-height" => Some("none"),

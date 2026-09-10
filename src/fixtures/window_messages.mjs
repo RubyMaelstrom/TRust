@@ -25,6 +25,7 @@
     drain();
     assert(received.length === 4, 'child-to-parent delivery: ' + received.length);
     for (const event of received) {
+        assert(event.isTrusted, 'posted message is delivered by the user agent');
         assert(event.source === child, 'child source');
         assert(event.origin === location.origin, 'inherited about:blank origin');
         assert(Object.getPrototypeOf(event.data) === Object.prototype, 'receiver object realm');
@@ -68,5 +69,48 @@
     opaque.contentWindow.postMessage('ping', '*');
     drain();
     assert(received.some(event => event.data === 'reply:ping'), 'cross-origin proxy reply');
+    const channel = new MessageChannel();
+    const queued = { value: 1 };
+    channel.port1.postMessage(queued);
+    queued.value = 2;
+    child.eval(`
+        globalThis.portReceived = [];
+        addEventListener('message', event => {
+            if (!event.data || event.data.kind !== 'port') return;
+            const port = event.ports[0];
+            if (!(port instanceof MessagePort) || event.data.port !== port)
+                throw Error('receiver port realm/graph');
+            port.onmessage = e => {
+                portReceived.push([e.data.value, e.isTrusted,
+                    Object.getPrototypeOf(e.data) === Object.prototype, e.target === port].join('|'));
+                port.postMessage('ack');
+            };
+        });
+    `);
+    const acknowledgements = [];
+    channel.port1.onmessage = e => acknowledgements.push(e.data);
+    child.postMessage({kind:'port', port:channel.port2}, '*', [channel.port2]);
+    let detached = false;
+    try { structuredClone(channel.port2, {transfer:[channel.port2]}); }
+    catch (e) { detached = e.name === 'DataCloneError'; }
+    assert(detached, 'source port detaches at send time');
+    drain();
+    assert(child.portReceived.join() === '1|true|true|true', 'queued message follows transfer: ' + child.portReceived);
+    assert(acknowledgements.join() === 'ack', 'bidirectional transferred channel');
+    const cycle = {port:channel.port1}; cycle.self = cycle;
+    const copy = structuredClone(cycle, {transfer:new Set([channel.port1])});
+    assert(copy.self === copy && copy.port instanceof MessagePort, 'cyclic port clone');
+    const pending = new MessageChannel();
+    let duplicate = false;
+    try { structuredClone(null, {transfer:[pending.port1,pending.port1]}); }
+    catch (e) { duplicate = e.name === 'DataCloneError'; }
+    assert(duplicate, 'duplicate transfer rejected');
+    let untransferred = false;
+    try { structuredClone(pending.port1); }
+    catch (e) { untransferred = e.name === 'DataCloneError'; }
+    assert(untransferred, 'ports require transfer list');
+    const buffer = new Uint8Array([3,4]).buffer;
+    const bufferCopy = structuredClone({buffer}, {transfer:[buffer]});
+    assert(buffer.byteLength === 0 && new Uint8Array(bufferCopy.buffer).join() === '3,4', 'buffer transfer detaches');
     return 'window-messages-ok';
 })()
