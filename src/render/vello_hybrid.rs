@@ -30,9 +30,9 @@ use winit::window::Window;
 
 use super::vello_cpu::{
     MAX_REGISTERED_IMAGES, OwnedRgbaFrame, intersect_rect, offset_shape, point_bounds,
-    rect_is_visible, rect_path, shape_bounds, shape_is_visible, shape_path, simple_rounded_rect,
-    transformed_bounds, vello_affine, vello_blend, vello_color, vello_rect, vello_stops,
-    vello_stroke,
+    rect_is_visible, rect_path, shape_bounds, shape_fill, shape_is_visible, shape_path,
+    simple_rounded_rect, transformed_bounds, vello_affine, vello_blend, vello_color, vello_rect,
+    vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
@@ -752,7 +752,9 @@ impl VelloHybridRenderer {
                         0.0,
                     ) {
                         set_brush(&mut target, brush);
+                        target.set_fill_rule(shape_fill(shape));
                         target.fill_path(&shape_path(shape));
+                        target.set_fill_rule(vello_common::peniko::Fill::NonZero);
                     }
                 }
                 DisplayCommand::Stroke {
@@ -772,7 +774,9 @@ impl VelloHybridRenderer {
                     }
                 }
                 DisplayCommand::PushClip(shape) => {
+                    target.set_fill_rule(shape_fill(shape));
                     target.push_clip_path(&shape_path(shape));
+                    target.set_fill_rule(vello_common::peniko::Fill::NonZero);
                     let current = *visible_clips.last().unwrap();
                     let next = shape_bounds(shape)
                         .map(|bounds| {

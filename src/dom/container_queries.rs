@@ -324,6 +324,7 @@ impl Dom {
         *self.cascaded_cache.borrow_mut() = NodeCache::default();
         self.computed_cache.borrow_mut().1.clear();
         self.custom_prop_cache.borrow_mut().1.clear();
+        self.properties.invalidate_values();
         *self.hidden_cache.borrow_mut() = NodeCache::default();
         *self.font_cache.borrow_mut() = NodeCache::default();
         *self.font_units_cache.borrow_mut() = NodeCache::default();

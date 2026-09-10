@@ -31,13 +31,13 @@ pub(crate) enum Len {
     Auto,
     /// `none` — the initial value of `max-width`/`max-height`.
     None,
-    /// The intrinsic-sizing keywords. P0 carries them so the parser is
-    /// complete; the block algorithms treat them as `Auto` until the
-    /// intrinsic-size query lands (an explicit, memoized query by the layout
-    /// algorithms).
+    /// Intrinsic sizing, resolved by the memoized content-size query.
     MinContent,
     MaxContent,
     FitContent,
+    /// CSS Sizing 4 #sizing-values: clamp the argument between the
+    /// min-content and max-content sizes, preserving percentages.
+    FitContentLimit(Node),
     Val(Node),
 }
 
@@ -70,9 +70,9 @@ impl Node {
 
     /// Resolve against `basis` (the containing block's relevant dimension in
     /// px). `None` basis ⇒ any percentage-carrying branch is unresolvable.
-    /// `min()`/`max()` skip unresolvable arguments (fail-open, matching the
-    /// engine-wide rule: a bound we can't parse yields the other bound rather
-    /// than dropping the whole value); an empty fold is `None`.
+    /// CSS Values 4 #comp-func / #calc-computed-value: comparison functions
+    /// retain unresolved percentages until their basis is known. Dropping an
+    /// operand would change the function, rather than simplify it.
     pub fn resolve(&self, basis: Option<f32>) -> Option<f32> {
         match self {
             Node::Lin { k, b } => {
@@ -82,22 +82,21 @@ impl Node {
                     basis.map(|base| k * base + b)
                 }
             }
-            Node::Min(args) => args
-                .iter()
-                .filter_map(|a| a.resolve(basis))
-                .reduce(f32::min),
-            Node::Max(args) => args
-                .iter()
-                .filter_map(|a| a.resolve(basis))
-                .reduce(f32::max),
+            Node::Min(args) | Node::Max(args) => {
+                let mut values = args.iter();
+                let first = values.next()?.resolve(basis)?;
+                values.try_fold(first, |value, arg| {
+                    let arg = arg.resolve(basis)?;
+                    Some(if matches!(self, Node::Min(_)) {
+                        value.min(arg)
+                    } else {
+                        value.max(arg)
+                    })
+                })
+            }
             Node::Clamp(lo, val, hi) => {
                 let v = val.resolve(basis)?;
-                let lo = lo.resolve(basis);
-                let hi = hi.resolve(basis);
-                // clamp(MIN, VAL, MAX) = max(MIN, min(VAL, MAX)); degrade
-                // gracefully when a bound is unresolvable.
-                let v = hi.map_or(v, |h| v.min(h));
-                Some(lo.map_or(v, |l| v.max(l)))
+                Some(lo.resolve(basis)?.max(v.min(hi.resolve(basis)?)))
             }
             Node::Sum(a, b, sign) => Some(a.resolve(basis)? + sign * b.resolve(basis)?),
             Node::Scale(a, f) => Some(a.resolve(basis)? * f),
@@ -121,8 +120,27 @@ impl Len {
             "max-content" => return Some(Len::MaxContent),
             _ => {}
         }
-        if v.to_ascii_lowercase().starts_with("fit-content") {
+        if v.eq_ignore_ascii_case("fit-content") {
             return Some(Len::FitContent);
+        }
+        if let Some(inner) = strip_fn(&v.to_ascii_lowercase(), v, "fit-content(") {
+            let inner = inner.trim();
+            if inner.parse::<f32>().is_ok_and(|n| n != 0.) {
+                return None;
+            }
+            let node = parse_node(inner, u, vp)?;
+            if !inner.to_ascii_lowercase().starts_with("calc(")
+                && node.resolve(Some(0.)).is_some_and(|n| n < 0.)
+            {
+                return None;
+            }
+            if let Node::Lin { k, .. } = node
+                && k < 0.
+                && !inner.to_ascii_lowercase().starts_with("calc(")
+            {
+                return None;
+            }
+            return Some(Len::FitContentLimit(node));
         }
         parse_node(v, u, vp).map(Len::Val)
     }
@@ -183,8 +201,8 @@ fn parse_node(v: &str, u: Units, vp: Vp) -> Option<Node> {
         if let Some(inner) = strip_fn(&lower, v, name) {
             let args: Vec<Node> = split_args(inner)
                 .into_iter()
-                .filter_map(|a| parse_node(a, u, vp))
-                .collect();
+                .map(|a| parse_calculation(a, u, vp))
+                .collect::<Option<_>>()?;
             if args.is_empty() {
                 return None;
             }
@@ -196,15 +214,19 @@ fn parse_node(v: &str, u: Units, vp: Vp) -> Option<Node> {
         }
     }
     if let Some(inner) = strip_fn(&lower, v, "clamp(") {
-        let args: Vec<Option<Node>> = split_args(inner)
-            .into_iter()
-            .map(|a| parse_node(a, u, vp))
-            .collect();
+        let args = split_args(inner);
+        let bound = |value: &str, infinite: f32| {
+            if value.trim().eq_ignore_ascii_case("none") {
+                Some(Node::px(infinite))
+            } else {
+                parse_calculation(value, u, vp)
+            }
+        };
         return match args.as_slice() {
-            [lo, Some(val), hi] => Some(Node::Clamp(
-                Box::new(lo.clone().unwrap_or(Node::px(f32::NEG_INFINITY))),
-                Box::new(val.clone()),
-                Box::new(hi.clone().unwrap_or(Node::px(f32::INFINITY))),
+            [lo, val, hi] => Some(Node::Clamp(
+                Box::new(bound(lo, f32::NEG_INFINITY)?),
+                Box::new(parse_calculation(val, u, vp)?),
+                Box::new(bound(hi, f32::INFINITY)?),
             )),
             _ => None,
         };
@@ -213,6 +235,19 @@ fn parse_node(v: &str, u: Units, vp: Vp) -> Option<Node> {
         Term::Num(n) => Node::px(n), // unitless number: legacy px (quirk kept engine-wide)
         t => t.into_node(),
     })
+}
+
+fn parse_calculation(value: &str, u: Units, vp: Vp) -> Option<Node> {
+    let mut parser = Calc {
+        s: value.as_bytes(),
+        src: value,
+        pos: 0,
+        u,
+        vp,
+    };
+    let value = parser.sum()?;
+    parser.skip_ws();
+    (parser.pos == parser.s.len()).then_some(value)?.into_len()
 }
 
 /// The body of `name(...)` when `v` is exactly that call (matched on the
@@ -617,8 +652,7 @@ mod tests {
     fn min_max_clamp() {
         assert_eq!(val("min(100%, 200px)").resolve(Some(400.0)), Some(200.0));
         assert_eq!(val("min(100%, 200px)").resolve(Some(100.0)), Some(100.0));
-        // Unresolvable arg skipped, fail-open.
-        assert_eq!(val("min(100%, 200px)").resolve(None), Some(200.0));
+        assert_eq!(val("min(100%, 200px)").resolve(None), None);
         assert_eq!(
             val("clamp(100px, 50%, 300px)").resolve(Some(400.0)),
             Some(200.0)
@@ -632,6 +666,22 @@ mod tests {
             val("min(calc(50% + 10px), 500px)").resolve(Some(400.0)),
             Some(210.0)
         );
+    }
+
+    #[test]
+    fn comparison_functions_keep_every_operand() {
+        for value in [
+            "min(bogus, 20px)",
+            "max(20px,)",
+            "clamp(bogus, 20px, 30px)",
+            "clamp(10px, 20px, bogus)",
+        ] {
+            assert_eq!(Len::parse(value, u(), vp()), None, "{value}");
+        }
+        assert_eq!(val("max(100%, 20px)").resolve(None), None);
+        assert_eq!(val("clamp(10%, 20px, 30px)").resolve(None), None);
+        assert_eq!(val("clamp(none, 20px, none)").resolve(None), Some(20.));
+        assert_eq!(val("min(50% + 10px, 200px)").resolve(Some(100.)), Some(60.));
     }
 
     #[test]
@@ -681,7 +731,10 @@ mod tests {
         assert!(val("auto").is_auto());
         assert_eq!(val("none"), Len::None);
         assert_eq!(val("min-content"), Len::MinContent);
-        assert_eq!(val("fit-content(20%)"), Len::FitContent);
+        assert_eq!(
+            val("fit-content(20%)"),
+            Len::FitContentLimit(Node::Lin { k: 0.2, b: 0. })
+        );
         assert_eq!(val("AUTO"), Len::Auto);
     }
 }

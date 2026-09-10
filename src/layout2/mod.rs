@@ -61,7 +61,7 @@ mod table;
 mod terminal;
 mod tree;
 mod tree_cache;
-mod value;
+pub(crate) mod value;
 
 pub(crate) use memo::LayoutCache;
 pub(crate) use tree_cache::BoxTreeCache;
@@ -1310,6 +1310,98 @@ mod tests {
             .flat_map(|row| row.items.iter())
             .map(|item| item.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn white_space_modes_preserve_separators_and_override_shorthands_in_order() {
+        let layout = lay_graphical(
+            "<body style='margin:0;font:16px monospace'><div style='white-space:preserve-spaces nowrap'>a\tb\nc</div></body>",
+            300.,
+            &HashMap::new(),
+        );
+        let (_, _, text) = graphical_text(&layout, "a");
+        assert_eq!(text, "a b c");
+        let layout = lay_graphical(
+            "<body style='margin:0;font:16px monospace'><div style='width:20px;white-space:preserve-breaks nowrap'>abc def\nxyz uvw</div></body>",
+            300.,
+            &HashMap::new(),
+        );
+        let a = graphical_text(&layout, "abc");
+        let b = graphical_text(&layout, "xyz");
+        assert!(b.1 > a.1);
+        assert!(a.2.contains("def") && b.2.contains("uvw"));
+        let layout = lay_graphical(
+            "<body style='margin:0;font:16px monospace'><div style='width:2ch;white-space:break-spaces'>a  b</div></body>",
+            300.,
+            &HashMap::new(),
+        );
+        let runs: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|p| {
+                if let crate::render::Primitive::GlyphRun { origin, shaped, .. } = p {
+                    Some((origin.y, shaped.text.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(runs.iter().any(|(_, text)| text == "a "), "{runs:?}");
+        assert!(runs.iter().any(|(_, text)| text == " b"), "{runs:?}");
+        let dom = Dom::parse_document(
+            "<p id=x style='white-space-collapse:preserve;white-space:normal'></p>",
+        );
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("x").unwrap(), "white-space-collapse")
+                .as_deref(),
+            Some("collapse")
+        );
+    }
+
+    #[test]
+    fn fit_content_function_respects_argument_across_formatting_contexts() {
+        for display in ["block", "inline-block", "flex", "grid"] {
+            let html = format!(
+                "<body style='margin:0;font:16px monospace'><div id=fit style='display:{display};width:fit-content(120px);padding:10px;box-sizing:border-box'>word word word word word word word</div></body>"
+            );
+            let dom = Dom::parse_document(&html);
+            let base = Url::parse("http://e.com/").unwrap();
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(400., 600.),
+                &forms,
+                &controls,
+                &HashMap::new(),
+            );
+            let rect = layout.boxes.get(&dom.get_by_id("fit").unwrap()).unwrap();
+            assert!((rect.width - 120.).abs() < 0.1, "{display}: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn generated_pseudo_metrics_and_hidden_geometry_follow_css() {
+        let hidden = lay_graphical(
+            "<style>body{margin:0} p{margin:0} p::before{content:'reserve';display:inline-block;width:80px;height:40px;visibility:hidden}</style><p>visible</p>",
+            300.,
+            &HashMap::new(),
+        );
+        let (x, _, _) = graphical_text(&hidden, "visible");
+        assert!(x >= 80., "hidden pseudo retains its box: {x}");
+        assert!(!hidden.paint.primitives.iter().any(|p|matches!(p,crate::render::Primitive::GlyphRun{shaped,..} if shaped.text.contains("reserve"))));
+        let small = lay_graphical(
+            "<style>body{margin:0;font-size:10px} p::before{content:'XX';font-size:10px}</style><p>after</p>",
+            300.,
+            &HashMap::new(),
+        );
+        let large = lay_graphical(
+            "<style>body{margin:0;font-size:10px} p::before{content:'XX';font-size:30px}</style><p>after</p>",
+            300.,
+            &HashMap::new(),
+        );
+        assert!(graphical_text(&large, "after").0 > graphical_text(&small, "after").0 * 2.5);
     }
 
     #[test]
@@ -3242,7 +3334,7 @@ mod tests {
         let shape_rect = |shape: &crate::render::PaintShape| match shape {
             crate::render::PaintShape::Rect(rect)
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
-            crate::render::PaintShape::Path(_) => None,
+            crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
         };
         let painted = layout
             .paint
@@ -3355,7 +3447,7 @@ mod tests {
         let shape_rect = |shape: &crate::render::PaintShape| match shape {
             crate::render::PaintShape::Rect(rect)
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
-            crate::render::PaintShape::Path(_) => None,
+            crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
         };
         let checkable_has_surface = |node| {
             let origin = layout
@@ -3433,7 +3525,7 @@ mod tests {
         let shape_rect = |shape: &crate::render::PaintShape| match shape {
             crate::render::PaintShape::Rect(rect)
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
-            crate::render::PaintShape::Path(_) => None,
+            crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
         };
         let authored_surfaces: Vec<_> = layout
             .paint
@@ -4934,6 +5026,46 @@ mod tests {
         let dom = Dom::parse_document(html);
         let layout = lay_graphical(html, 320.0, &HashMap::new());
         assert_eq!(layout.boxes[&node_by_id(&dom, "item")].top, -50.0);
+    }
+
+    #[test]
+    fn grid_intrinsic_sizes_include_tracks_gutters_and_flex_constraints() {
+        for (width, columns, gap, expected) in [
+            ("max-content", "50px 70px", "10px", 130.),
+            ("min-content", "50px 70px", "10px", 130.),
+            ("max-content", "1fr 1fr", "10px", 150.),
+            ("min-content", "1fr 1fr", "10px", 130.),
+            ("max-content", "auto auto", "10%", 120.),
+        ] {
+            let html = format!(
+                "<body style='margin:0'><div id=g style='display:grid;width:{width};grid-template-columns:{columns};gap:{gap}'><div style='width:50px'></div><div style='width:70px'></div></div></body>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 500., &HashMap::new());
+            assert!(
+                (layout.boxes[&dom.get_by_id("g").unwrap()].width - expected).abs() < 0.1,
+                "{width} {columns} {gap}: {:?}",
+                layout.boxes
+            );
+        }
+    }
+
+    #[test]
+    fn grid_baseline_alignment_uses_first_and_last_line_groups() {
+        for alignment in ["first baseline", "last baseline"] {
+            let layout = lay_graphical(
+                &format!(
+                    "<body style='margin:0'><div style='display:grid;grid-template-columns:100px 100px;align-items:{alignment}'><div style='font-size:12px;line-height:18px'>small<br>end</div><div style='font-size:28px;line-height:36px'>BIG</div></div></body>"
+                ),
+                300.,
+                &HashMap::new(),
+            );
+            assert_eq!(layout.paint.lines.len(), 3);
+            let small =
+                layout.paint.lines[if alignment == "first baseline" { 0 } else { 1 }].baseline;
+            let big = layout.paint.lines[2].baseline;
+            assert!((small - big).abs() < 0.01, "{alignment}: {small} vs {big}");
+        }
     }
 
     #[test]

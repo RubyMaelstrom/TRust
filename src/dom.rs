@@ -18,7 +18,11 @@ use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
 
 mod class_tokens;
 mod container_queries;
+mod counter_styles;
+pub(crate) mod cssom;
+mod generated;
 mod invalidation;
+mod properties;
 mod rule_index;
 mod xml;
 
@@ -213,6 +217,12 @@ pub struct Dom {
     adopted_styles: FxHashMap<NodeId, String>,
     /// Fetched `<link rel=stylesheet>` text, keyed by the link element.
     external_sheets: FxHashMap<NodeId, String>,
+    /// CSSOM edits replace a sheet's rule list, without mutating its DOM text.
+    cssom_sheets: FxHashMap<NodeId, cssom::Sheet>,
+    cssom_sheet_versions: FxHashMap<NodeId, u64>,
+    cssom_inline: FxHashMap<NodeId, cssom::Declarations>,
+    /// Document registrations and the computed-value dependency stack.
+    properties: properties::State,
     /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
     /// Layout-provided query-container content sizes, in untransformed CSS px.
@@ -226,6 +236,7 @@ pub struct Dom {
     /// property inherited; a deep application tree otherwise re-walks the
     /// same ancestor chain for every `var()` in every resolved box property.
     custom_prop_cache: RefCell<CustomPropCache>,
+    generated_cache: RefCell<Option<((u64, u64), generated::Generated)>>,
     /// Memoized selector-match results for the current epoch: for an element,
     /// the indices (into its tree scope's rule vec) of every author rule whose
     /// selector matches it. Selector matching is the cascade's dominant cost on
@@ -412,7 +423,10 @@ type ComputedCache = ((u64, u64), FxHashMap<(NodeId, usize), Option<String>>);
 /// cache hit. The cached value is the same cascaded-or-inherited token stream
 /// that [`Dom::custom_prop`] returned before memoization; `var()` dependency
 /// resolution and cycle detection still happen at the use site.
-type CustomPropCache = (u64, FxHashMap<NodeId, FxHashMap<String, Option<String>>>);
+type CustomPropCache = (
+    (u64, u64),
+    FxHashMap<NodeId, FxHashMap<String, Option<String>>>,
+);
 
 /// A node-indexed, epoch-STAMPED slot cache for the per-epoch memos keyed
 /// by bare `NodeId`. NodeIds are dense arena indices, so a Vec slot
@@ -459,11 +473,12 @@ impl<T> NodeCache<T> {
 /// plus its `::before`/`::after` generated boxes (their rules ride the same
 /// matched list, bucketed by the rule's pseudo target). An absent key = no
 /// author declaration for that property (the cascade's `None`).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CascadedMaps {
     elem: FxHashMap<String, String>,
     before: FxHashMap<String, String>,
     after: FxHashMap<String, String>,
+    custom_bases: FxHashMap<(Option<PseudoEl>, String), std::rc::Rc<url::Url>>,
 }
 
 impl CascadedMaps {
@@ -545,10 +560,15 @@ impl Dom {
             style_epoch,
             adopted_styles,
             external_sheets,
+            cssom_sheets,
+            cssom_sheet_versions,
+            cssom_inline,
+            properties,
             style_cache,
             container_sizes,
             computed_cache,
             custom_prop_cache,
+            generated_cache,
             matched_cache,
             selector_cache,
             selector_epoch,
@@ -675,6 +695,12 @@ impl Dom {
             bytes = bytes.saturating_add(text.capacity());
         }
         fixed_map!(external_sheets, (NodeId, String));
+        bytes = bytes.saturating_add(properties.retained_bytes());
+        fixed_map!(cssom_sheets, (NodeId, cssom::Sheet));
+        fixed_map!(cssom_sheet_versions, (NodeId, u64));
+        for sheet in cssom_sheets.values() {
+            bytes += sheet.text.capacity() + sheet.media.capacity();
+        }
         for text in external_sheets.values() {
             bytes = bytes.saturating_add(text.capacity());
         }
@@ -705,6 +731,27 @@ impl Dom {
                 fixed_map!(cache, ((NodeId, usize), Option<String>));
                 for value in cache.values().flatten() {
                     bytes = bytes.saturating_add(value.capacity());
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+        bytes = bytes.saturating_add(
+            cssom_inline.capacity() * std::mem::size_of::<(NodeId, cssom::Declarations)>(),
+        );
+        for declarations in cssom_inline.values() {
+            bytes = bytes.saturating_add(
+                declarations.capacity() * std::mem::size_of::<(String, String, bool)>(),
+            );
+            for (name, value, _) in declarations {
+                bytes = bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(value.capacity());
+            }
+        }
+        match generated_cache.try_borrow() {
+            Ok(cache) => {
+                if let Some((_, value)) = cache.as_ref() {
+                    bytes = bytes.saturating_add(value.retained_bytes());
                 }
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
@@ -788,6 +835,14 @@ impl Dom {
                                 .saturating_add(value.capacity());
                         }
                     }
+                    bytes += value.custom_bases.capacity()
+                        * std::mem::size_of::<((Option<PseudoEl>, String), std::rc::Rc<url::Url>)>(
+                        )
+                        + value
+                            .custom_bases
+                            .keys()
+                            .map(|(_, name)| name.capacity())
+                            .sum::<usize>();
                 }
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
@@ -886,10 +941,15 @@ impl Dom {
             style_epoch: 0,
             adopted_styles: FxHashMap::default(),
             external_sheets: FxHashMap::default(),
+            cssom_sheets: FxHashMap::default(),
+            cssom_sheet_versions: FxHashMap::default(),
+            cssom_inline: FxHashMap::default(),
+            properties: properties::State::default(),
             style_cache: RefCell::new(None),
             container_sizes: RefCell::new(FxHashMap::default()),
             computed_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
-            custom_prop_cache: RefCell::new((u64::MAX, FxHashMap::default())),
+            custom_prop_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
+            generated_cache: RefCell::new(None),
             matched_cache: RefCell::new(NodeCache::default()),
             selector_cache: RefCell::new(NodeCache::default()),
             selector_epoch: 0,
@@ -1411,6 +1471,25 @@ impl Dom {
     /// changes dominate content changes, which dominate paint-only changes, because the strongest
     /// retained kind is the one the cache must prove isolated before reusing a box.
     fn record_geometry_dirty(&mut self, id: NodeId, kind: DirtyKind) {
+        // CSS Lists 3 / Content 3: counters and quote depth can affect later
+        // sibling subtrees. Until their dependencies have a narrower proof,
+        // mutations of a document using them require a complete layout pass.
+        let generated_dependency = self
+            .generated_cache
+            .get_mut()
+            .as_ref()
+            .is_some_and(|(_, g)| g.dynamic)
+            || self.attr(id, "style").is_some_and(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("counter-") || v.contains("quotes:")
+            });
+        if generated_dependency {
+            self.layout_cache.get_mut().clear();
+            self.box_tree_cache.get_mut().clear();
+            self.dirty_attributed = false;
+            self.geometry_dirty_attributed = false;
+        }
+
         let strength = |kind| match kind {
             DirtyKind::Paint => 0,
             DirtyKind::Content => 1,
@@ -1489,8 +1568,18 @@ impl Dom {
     /// (a fresh leaf node) pays one tag check; only subtree attaches walk,
     /// early-exiting on the first sheet element found.
     fn note_tree_style_mutation(&mut self, parent: Option<NodeId>, child: NodeId) {
+        if let Some(parent) = parent.filter(|&id| self.tag_name(id) == Some("style")) {
+            self.reset_cssom_sheet(parent);
+        }
         let styled = parent.is_some_and(|parent| self.tree_mutation_changes_style(parent, child));
         if styled && let Some(scope) = parent {
+            let mut stack = vec![child];
+            while let Some(node) = stack.pop() {
+                if matches!(self.tag_name(node), Some("style" | "link")) {
+                    self.reset_cssom_sheet(node);
+                }
+                self.push_composed_children(node, &mut stack);
+            }
             self.touch_style_at(scope);
         }
     }
@@ -1527,6 +1616,9 @@ impl Dom {
     /// dirties the epoch but records no target and does NOT force a full relayout.
     fn touch_content(&mut self, id: Option<NodeId>) {
         if let Some(parent) = id {
+            if self.tag_name(parent) == Some("style") {
+                self.reset_cssom_sheet(parent);
+            }
             self.invalidate_structure(parent);
         }
         self.mark_dom_revision();
@@ -1938,10 +2030,12 @@ impl Dom {
         self.device_pixel_ratio
     }
 
-    /// Set the document's URL (DOM §4.5). No `touch()`: it only affects how
-    /// the serializer resolves sprite `<use>` hrefs, not the cascade.
+    /// The base also participates in registered URL and image computed values.
     pub fn set_doc_url(&mut self, url: Option<url::Url>) {
-        self.doc_url = url;
+        if self.doc_url != url {
+            self.doc_url = url;
+            self.touch_style();
+        }
     }
 
     pub fn doc_url(&self) -> Option<&url::Url> {
@@ -2500,6 +2594,22 @@ impl Dom {
                 .any(|child| self.tree_mutation_changes_style(parent, child));
         }
 
+        if style_changed {
+            if self.tag_name(parent) == Some("style") {
+                self.reset_cssom_sheet(parent);
+            }
+            let mut stack: Vec<_> = self
+                .child_iter(parent)
+                .chain(new_children.iter().copied())
+                .collect();
+            while let Some(node) = stack.pop() {
+                if matches!(self.tag_name(node), Some("style" | "link")) {
+                    self.reset_cssom_sheet(node);
+                }
+                self.push_composed_children(node, &mut stack);
+            }
+        }
+
         // Snapshot each next link before severing it. Removed subtrees remain
         // intact and detached, retaining their node identities and listeners.
         if !text_only {
@@ -2754,6 +2864,8 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        let cssom_reset =
+            name.eq_ignore_ascii_case("style") && self.cssom_inline.remove(&id).is_some();
         let html_document =
             self.document_content_type(self.nodes[id].owner_document) == "text/html";
         let invalidated_attribute = name;
@@ -2783,7 +2895,7 @@ impl Dom {
                 .find(|a| attribute_name_matches(&a.name, &name))
             {
                 // Idempotent writes are free: no dirty, no redraw.
-                if *a.value == *value && !canvas_reset {
+                if *a.value == *value && !canvas_reset && !cssom_reset {
                     return;
                 }
                 a.value = StrTendril::from(value);
@@ -2794,6 +2906,7 @@ impl Dom {
                 });
             }
             if sheet_el {
+                self.note_cssom_sheet_attribute(id, invalidated_attribute);
                 self.touch_style_at(id);
             }
             self.touch_attr(id, invalidated_attribute);
@@ -2804,6 +2917,9 @@ impl Dom {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        if name.eq_ignore_ascii_case("style") {
+            self.cssom_inline.remove(&id);
+        }
         let html_document =
             self.document_content_type(self.nodes[id].owner_document) == "text/html";
         let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
@@ -2825,6 +2941,7 @@ impl Dom {
             // caches — frameworks call it unconditionally per render pass.
             if attrs.len() != before {
                 if sheet_el {
+                    self.note_cssom_sheet_attribute(id, name);
                     self.touch_style_at(id);
                 }
                 self.touch_attr(id, name);
@@ -3691,7 +3808,8 @@ impl Dom {
     /// parent's computed value regardless of inheritedness, `initial` the
     /// property's initial value (`None` — the caller's default), `unset`
     /// whichever of those the property's inheritedness selects, and
-    /// `revert`/`revert-layer` roll the author origin back to the UA origin.
+    /// `revert` rolls the author origin back to the UA origin. Layer rollback
+    /// has already selected its earlier-layer declaration in the cascade maps.
     /// Memoized per epoch because the layout reads it per element.
     /// getComputedStyle and the layout's inherited-text reads both go through
     /// here, so a property inherits everywhere by being marked `inherited`
@@ -3700,6 +3818,18 @@ impl Dom {
         if name.starts_with("--") {
             return self.custom_prop(id, name);
         }
+        let unit_guard = if matches!(name, "line-height" | "font-weight") {
+            match self.property_guard(id, None, name) {
+                Some(guard) => Some(guard),
+                None => {
+                    return self
+                        .style_parent(id)
+                        .and_then(|parent| self.computed_value(parent, name));
+                }
+            }
+        } else {
+            None
+        };
         let Some(idx) = prop_index(name) else {
             // Untracked: no UA default, no inheritance — author cascade.
             return self.cascaded(id, name);
@@ -3721,7 +3851,7 @@ impl Dom {
                 .and_then(|p| self.computed_value(p, name))
         };
         let author = self.cascaded(id, name).map(|value| {
-            if name == "line-height" {
+            if matches!(name, "line-height" | "font-weight") {
                 self.resolve_vars(id, &value)
             } else {
                 value
@@ -3758,6 +3888,28 @@ impl Dom {
         } else {
             v
         };
+        let v = if name == "font-weight" {
+            v.map(|v| {
+                if matches!(v.as_str(), "bolder" | "lighter") {
+                    let parent = parent_computed()
+                        .as_deref()
+                        .and_then(crate::layout2::css_font_weight)
+                        .unwrap_or(400.);
+                    crate::layout2::relative_font_weight(&v, parent)
+                        .unwrap_or(400.)
+                        .to_string()
+                } else {
+                    v
+                }
+            })
+        } else {
+            v
+        };
+        let v = if unit_guard.as_ref().is_some_and(|guard| guard.cyclic()) {
+            parent_computed()
+        } else {
+            v
+        };
         if inherited {
             self.computed_cache_put(id, idx, v.clone());
         }
@@ -3770,8 +3922,31 @@ impl Dom {
     /// `marginRight` back as the substituted value). A no-op when the value
     /// has no `var(`.
     pub fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
-        self.computed_value(id, name)
-            .map(|v| self.resolve_vars(id, &v))
+        let value = self
+            .computed_value(id, name)
+            .map(|v| self.resolve_vars(id, &v))?;
+        let inherited = prop_index(name).is_some_and(|index| PROPS[index].inherited);
+        match properties::ident(&value).as_deref().and_then(wide_keyword) {
+            Some(WideKeyword::Initial) => None,
+            Some(WideKeyword::Inherit) => self
+                .style_parent(id)
+                .and_then(|parent| self.computed_value_resolved(parent, name)),
+            Some(WideKeyword::Unset) => inherited
+                .then(|| {
+                    self.style_parent(id)
+                        .and_then(|parent| self.computed_value_resolved(parent, name))
+                })
+                .flatten(),
+            Some(WideKeyword::Revert) => self.ua_default(id, name).or_else(|| {
+                inherited
+                    .then(|| {
+                        self.style_parent(id)
+                            .and_then(|parent| self.computed_value_resolved(parent, name))
+                    })
+                    .flatten()
+            }),
+            None => Some(value),
+        }
     }
 
     /// The resolved value exposed by `getComputedStyle()`.
@@ -3791,6 +3966,15 @@ impl Dom {
         // numerically with inheritance in `font_px`.
         if name == "font-size" {
             return Some(format!("{}px", self.font_px(id)));
+        }
+        if name == "font-weight" {
+            return Some(
+                self.computed_value_resolved(id, name)
+                    .as_deref()
+                    .and_then(crate::layout2::css_font_weight)
+                    .unwrap_or(400.)
+                    .to_string(),
+            );
         }
         // CSSOM #resolved-values preserves `normal`, but exposes the used
         // absolute line height for a unitless computed number too.
@@ -3884,13 +4068,9 @@ impl Dom {
     }
 
     fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId> {
-        let scope = self.tree_scope(id);
-        if matches!(self.tag_name(scope), Some("iframe" | "frame")) {
-            self.child_iter(scope)
-                .find(|&child| self.tag_name(child) == Some("html"))
-        } else {
-            self.document_element()
-        }
+        let document = self.registration_document(id);
+        self.child_iter(document)
+            .find(|&child| self.tag_name(child).is_some())
     }
 
     /// The element's COMPUTED `font-size` in CSS px (CSS Fonts §6.1) — the
@@ -3903,6 +4083,11 @@ impl Dom {
     /// Unresolvable declarations (`calc()`, dangling `var()`) inherit —
     /// fail-open, like the rest of the cascade. Memoized per epoch.
     pub(crate) fn font_px(&self, id: NodeId) -> f32 {
+        let Some(guard) = self.property_guard(id, None, "font-size") else {
+            return self
+                .style_parent(id)
+                .map_or(FONT_SIZE_INITIAL, |parent| self.font_px(parent));
+        };
         if let Some(&v) = self.font_cache.borrow().get(id, self.style_value_epoch) {
             return v;
         }
@@ -3918,16 +4103,16 @@ impl Dom {
         } else {
             scope_root.map_or(FONT_SIZE_INITIAL, |root| self.font_px(root))
         };
-        let v = self
-            .cascaded(id, "font-size")
-            .map(|raw| self.resolve_vars(id, &raw))
-            .and_then(|decl| font_size_px(&decl, parent_px, root_px))
-            .or_else(|| {
-                self.tag_name(id)
-                    .and_then(ua_font_factor)
-                    .map(|f| f * parent_px)
-            })
-            .unwrap_or(parent_px);
+        let author = self.cascaded(id, "font-size");
+        let v = if let Some(raw) = author {
+            let decl = self.resolve_vars(id, &raw);
+            font_size_px(&decl, parent_px, root_px).unwrap_or(parent_px)
+        } else {
+            self.tag_name(id)
+                .and_then(ua_font_factor)
+                .map_or(parent_px, |f| f * parent_px)
+        };
+        let v = if guard.cyclic() { parent_px } else { v };
         self.font_cache
             .borrow_mut()
             .put(id, self.style_value_epoch, v);
@@ -4127,31 +4312,47 @@ impl Dom {
     /// here, matching real-browser behavior for the properties we don't
     /// track.
     fn build_cascaded_maps(&self, id: NodeId) -> CascadedMaps {
-        type Winners = FxHashMap<String, (CascadeKey, String)>;
+        type Winners = FxHashMap<String, CascadeWinner>;
+        let index = self.style_index();
+        let preserve_layers = index.has_revert_layer
+            || self
+                .attr(id, "style")
+                .is_some_and(|s| s.to_ascii_lowercase().contains("revert-layer"))
+            || self.cssom_inline.get(&id).is_some_and(|ds| {
+                ds.iter()
+                    .any(|(_, v, _)| v.to_ascii_lowercase().contains("revert-layer"))
+            });
         // Clone only on first sight or a WIN — a losing declaration costs a
         // lookup and a key compare, never an allocation.
-        fn consider_into(map: &mut Winners, prop: &str, key: CascadeKey, value: &str) {
-            match map.get_mut(prop) {
-                Some(slot) => {
-                    if key >= slot.0 {
-                        *slot = (key, value.to_string());
-                    }
-                }
+        let consider_into =
+            |map: &mut Winners, prop: &str, key: CascadeKey, value: &str| match map.get_mut(prop) {
+                Some(slot) => slot.consider(key, value, preserve_layers),
                 None => {
-                    map.insert(prop.to_string(), (key, value.to_string()));
+                    map.insert(
+                        prop.to_string(),
+                        CascadeWinner::One((key, value.to_string())),
+                    );
                 }
-            }
-        }
+            };
         let mut elem = Winners::default();
         let mut before = Winners::default();
         let mut after = Winners::default();
         let mut conditional_pseudos = Vec::new();
         if let Some(style) = self.attr(id, "style") {
-            for decl in style.split(';') {
-                let Some((k, v, important)) = parse_decl(decl) else {
-                    continue;
-                };
-                for (pk, pv) in expand_box_shorthand(&k, &v) {
+            let parsed;
+            let declarations = match self.cssom_inline.get(&id) {
+                Some(declarations) => declarations,
+                None => {
+                    parsed = split_top_level(style, ';')
+                        .into_iter()
+                        .filter_map(parse_decl)
+                        .collect::<Vec<_>>();
+                    &parsed
+                }
+            };
+            for (k, v, important) in declarations {
+                let important = *important;
+                for (pk, pv) in expand_box_shorthand(k, v) {
                     // Element-attached: the inline flag outranks the layer
                     // component, so the (unlayered) encoding is inert. This
                     // declaration belongs to the element's OUTER tree context.
@@ -4172,7 +4373,6 @@ impl Dom {
                 }
             }
         }
-        let index = self.style_index();
         if let Some(rules) = index.scopes.get(&self.tree_scope(id)) {
             for &ri in self.matched_rules(id).iter() {
                 let r = &rules[ri as usize];
@@ -4280,10 +4480,11 @@ impl Dom {
                 std::rc::Rc::new(CascadedMaps {
                     elem: elem
                         .iter()
-                        .map(|(k, (_, v))| (k.clone(), v.clone()))
+                        .map(|(k, v)| (k.clone(), v.resolve(|_| false).to_owned()))
                         .collect(),
                     before: Default::default(),
                     after: Default::default(),
+                    custom_bases: Default::default(),
                 }),
             );
             for r in conditional_pseudos {
@@ -4312,12 +4513,133 @@ impl Dom {
                 }
             }
         }
-        let strip = |m: Winners| m.into_iter().map(|(k, (_, v))| (k, v)).collect();
-        CascadedMaps {
-            elem: strip(elem),
-            before: strip(before),
-            after: strip(after),
+        let strip = |m: &Winners| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.resolve(|_| false).to_owned()))
+                .collect()
+        };
+        let mut maps = CascadedMaps {
+            elem: strip(&elem),
+            before: strip(&before),
+            after: strip(&after),
+            custom_bases: Default::default(),
+        };
+        for (pseudo, winners) in [
+            (None, &elem),
+            (Some(PseudoEl::Before), &before),
+            (Some(PseudoEl::After), &after),
+        ] {
+            for (name, winner) in winners.iter().filter(|(name, _)| name.starts_with("--")) {
+                if let Some((key, _)) = winner.resolve_with_key(|_| false)
+                    && let Some(base) = index.rule_bases.get(&key.5)
+                {
+                    maps.custom_bases
+                        .insert((pseudo, name.clone()), base.clone());
+                }
+            }
         }
+        if preserve_layers {
+            // A var() fallback can supply a cascade-dependent keyword at
+            // computed-value time (CSS Values 5 #substitution). Install the
+            // provisional maps so custom-property dependency resolution uses
+            // this element's cascade, then settle custom properties before
+            // ordinary declarations and the generated boxes that inherit them.
+            for (pseudo, winners) in [
+                (None, &elem),
+                (Some(PseudoEl::Before), &before),
+                (Some(PseudoEl::After), &after),
+            ] {
+                let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
+                for pass in 0..=custom_count + 1 {
+                    self.cascaded_cache.borrow_mut().put(
+                        id,
+                        self.style_value_epoch,
+                        std::rc::Rc::new(maps.clone()),
+                    );
+                    let mut changed = false;
+                    for (property, winner) in winners {
+                        if pass <= custom_count && !property.starts_with("--") {
+                            continue;
+                        }
+                        let selected = winner.resolve_with_key(|raw| {
+                            find_var_function(raw).is_some()
+                                && match pseudo {
+                                    None => self.resolve_vars(
+                                        id,
+                                        pending_shorthand(raw).map_or(raw, |(_, v)| v),
+                                    ),
+                                    Some(which) => self.resolve_pseudo_vars(
+                                        id,
+                                        which,
+                                        pending_shorthand(raw).map_or(raw, |(_, v)| v),
+                                    ),
+                                }
+                                .trim()
+                                .eq_ignore_ascii_case("revert-layer")
+                        });
+                        if property.starts_with("--") {
+                            let source_key = (pseudo, property.clone());
+                            maps.custom_bases.remove(&source_key);
+                            if let Some((key, _)) = selected
+                                && let Some(base) = index.rule_bases.get(&key.5)
+                            {
+                                maps.custom_bases.insert(source_key, base.clone());
+                            }
+                        }
+                        let value = selected.map_or("revert", |(_, value)| value);
+                        let target = match pseudo {
+                            None => &mut maps.elem,
+                            Some(PseudoEl::Before) => &mut maps.before,
+                            Some(PseudoEl::After) => &mut maps.after,
+                        };
+                        if target.get(property).is_none_or(|old| old != value) {
+                            target.insert(property.clone(), value.to_owned());
+                            changed = true;
+                        }
+                    }
+                    if pass > custom_count {
+                        break;
+                    }
+                    if !changed {
+                        // Dependencies are settled; ordinary properties still
+                        // need one pass through the same resolved environment.
+                        self.cascaded_cache.borrow_mut().put(
+                            id,
+                            self.style_value_epoch,
+                            std::rc::Rc::new(maps.clone()),
+                        );
+                        for (property, winner) in
+                            winners.iter().filter(|(k, _)| !k.starts_with("--"))
+                        {
+                            let value = winner.resolve(|raw| {
+                                find_var_function(raw).is_some()
+                                    && match pseudo {
+                                        None => self.resolve_vars(
+                                            id,
+                                            pending_shorthand(raw).map_or(raw, |(_, v)| v),
+                                        ),
+                                        Some(which) => self.resolve_pseudo_vars(
+                                            id,
+                                            which,
+                                            pending_shorthand(raw).map_or(raw, |(_, v)| v),
+                                        ),
+                                    }
+                                    .trim()
+                                    .eq_ignore_ascii_case("revert-layer")
+                            });
+                            match pseudo {
+                                None => &mut maps.elem,
+                                Some(PseudoEl::Before) => &mut maps.before,
+                                Some(PseudoEl::After) => &mut maps.after,
+                            }
+                            .insert(property.clone(), value.to_owned());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        maps
     }
 
     /// Match a `::slotted(<compound-selector>)` rule against a light-DOM
@@ -4365,7 +4687,11 @@ impl Dom {
     fn custom_prop(&self, id: NodeId, name: &str) -> Option<String> {
         if let Some(hit) = {
             let cache = self.custom_prop_cache.borrow();
-            (cache.0 == self.style_value_epoch)
+            (cache.0
+                == (
+                    self.style_value_epoch,
+                    crate::font_system::page_font_epoch(),
+                ))
                 .then(|| cache.1.get(&id).and_then(|node| node.get(name)).cloned())
                 .flatten()
         } {
@@ -4376,8 +4702,12 @@ impl Dom {
             VarResult::Undefined | VarResult::Cycle => None,
         };
         let mut cache = self.custom_prop_cache.borrow_mut();
-        if cache.0 != self.style_value_epoch {
-            cache.0 = self.style_value_epoch;
+        let stamp = (
+            self.style_value_epoch,
+            crate::font_system::page_font_epoch(),
+        );
+        if cache.0 != stamp {
+            cache.0 = stamp;
             cache.1.clear();
         }
         cache
@@ -4441,30 +4771,8 @@ impl Dom {
     /// into a property that is its own (in)direct ancestor and the walk always
     /// terminates (each step either resolves a literal/fallback or pushes a new,
     /// finite custom-property name).
-    fn resolve_custom_prop(&self, id: NodeId, name: &str, active: &mut Vec<String>) -> VarResult {
-        let raw = self.cascaded(id, name);
-        match raw.as_deref().and_then(wide_keyword) {
-            Some(WideKeyword::Initial) => return VarResult::Undefined,
-            Some(_) => {}
-            None if raw.is_some() => {
-                // Resolve a locally declared value in this element's cycle
-                // context below. Inherited values have already been computed
-                // on the parent and must not join a child's dependency cycle.
-                if active.iter().any(|n| n == name) {
-                    return VarResult::Cycle;
-                }
-                active.push(name.to_owned());
-                let resolved = self.substitute_vars(id, raw.as_ref().unwrap(), active);
-                active.pop();
-                return resolved.map_or(VarResult::Undefined, VarResult::Resolved);
-            }
-            None => {}
-        }
-        // Custom properties inherit by default; inherit/unset/revert use
-        // that same chain (there are no UA custom-property declarations).
-        self.style_parent(id)
-            .and_then(|parent| self.custom_prop(parent, name))
-            .map_or(VarResult::Undefined, VarResult::Resolved)
+    fn resolve_custom_prop(&self, id: NodeId, name: &str, _active: &mut Vec<String>) -> VarResult {
+        self.registered_custom_value(id, None, name)
     }
 
     /// Substitute every `var(--name, fallback)` in `value` against `id`'s
@@ -4485,28 +4793,9 @@ impl Dom {
         id: NodeId,
         which: PseudoEl,
         name: &str,
-        active: &mut Vec<String>,
+        _active: &mut Vec<String>,
     ) -> VarResult {
-        if active.iter().any(|n| n == name) {
-            return VarResult::Cycle;
-        }
-        let raw = self
-            .pseudo_style(id, which, name)
-            .or_else(|| self.baked_pseudo_value(id, which, name));
-        match raw.as_deref().and_then(wide_keyword) {
-            Some(WideKeyword::Initial) => return VarResult::Undefined,
-            Some(_) => return self.resolve_custom_prop(id, name, &mut Vec::new()),
-            None => {}
-        }
-        let Some(raw) = raw else {
-            // Inherit the originating element's computed value, not a token
-            // stream rebound against the pseudo's overriding custom properties.
-            return self.resolve_custom_prop(id, name, &mut Vec::new());
-        };
-        active.push(name.to_owned());
-        let result = self.substitute_vars_for(id, Some(which), &raw, active);
-        active.pop();
-        result.map_or(VarResult::Undefined, VarResult::Resolved)
+        self.registered_custom_value(id, Some(which), name)
     }
 
     fn substitute_vars_for(
@@ -4514,107 +4803,82 @@ impl Dom {
         id: NodeId,
         pseudo: Option<PseudoEl>,
         value: &str,
-        active: &mut Vec<String>,
+        _active: &mut Vec<String>,
     ) -> Option<String> {
-        if find_var_function(value).is_none() {
+        // Keep the ordinary no-substitution path allocation-compatible. Escaped
+        // function names require tokenization even without a literal "var(".
+        if find_var_function(value).is_none() && !value.contains('\\') {
             return Some(value.to_owned());
         }
-        let mut out = String::new();
-        let mut rest = value;
-        let mut guard = 0;
-        while let Some(pos) = find_var_function(rest) {
-            guard += 1;
-            if guard > 64 {
-                out.push_str(rest);
-                return Some(out);
-            }
-            out.push_str(&rest[..pos]);
-            let after = &rest[pos + 4..];
-            // Find the `)` that closes this `var(`.
-            let mut depth = 1usize;
-            let mut end = None;
-            for (i, c) in after.char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let Some(end) = end else {
-                out.push_str(&rest[pos..]); // unbalanced: leave as-is
-                return Some(out);
-            };
-            let inner = &after[..end];
-            let (name, fallback) = match inner.split_once(',') {
-                Some((n, f)) => (n.trim(), Some(f.trim())),
-                None => (inner.trim(), None),
-            };
-            let resolved = match pseudo {
-                Some(which) => self.resolve_pseudo_custom_prop(id, which, name, active),
-                None => self.resolve_custom_prop(id, name, active),
-            };
-            match resolved {
-                VarResult::Resolved(v) => out.push_str(&v),
-                // A dependency cycle: every property in it is invalid at
-                // computed-value time, and — unlike a plain undefined reference
-                // — its fallback is NOT consulted (CSS Variables L1 §3). The
-                // whole value is invalid.
-                VarResult::Cycle => return None,
-                // Guaranteed-invalid / undefined target: substitute the
-                // fallback if present, else this value is invalid.
-                VarResult::Undefined => {
-                    let fallback = fallback?;
-                    out.push_str(&self.substitute_vars_for(id, pseudo, fallback, active)?);
-                }
-            }
-            rest = &after[end + 1..];
-        }
-        out.push_str(rest);
-        Some(out)
+        properties::substitute(self, id, pseudo, value)
     }
 
     /// The resolved `content` text for an element's `::before`/`::after`
     /// box, or `None` when no rule sets it (or it resolves to `none`/an
-    /// unsupported value like `counter()`). Reads the pseudo's bucket of
+    /// unavailable resource content). Reads the pseudo's bucket of
     /// the element's winner maps (inline styles can't target a pseudo).
     pub fn pseudo_content(&self, id: NodeId, which: PseudoEl) -> Option<String> {
-        let raw = self.cascaded_maps(id).pseudo(which).get("content")?.clone();
-        // A hidden pseudo-element generates NO rendered content here — a
-        // deliberate TERMINAL DEVIATION, distinct from Phase 2's element-level
-        // `visibility:hidden` (which reserves a blank box). The width-reservation
-        // idiom `[data-content]::before{content:attr(data-content);
-        // font-weight:bold;visibility:hidden}` (Primer's UnderlineNav tabs, many
-        // tab/button components) paints a hidden BOLD copy of the label ONLY to
-        // reserve the selected (bold) pixel width, so switching a tab to bold
-        // doesn't reflow. In a cell grid BOLD IS THE SAME WIDTH as normal, so the
-        // reservation is vacuous: reserving its blank width would just append a
-        // blank copy after the real label (bloating every tab), and rendering it
-        // gives the doubled "CodeCode". Dropping it yields the correct terminal
-        // result ("Code Issues PullRequests") with no reflow to prevent. (A
-        // `visibility:hidden` ELEMENT still reserves its box — see
-        // `visibility_hidden`; only the pseudo SIZER idiom drops, since its whole
-        // purpose is pixel-width reflow-avoidance a cell grid doesn't have.)
-        // `display:none` on a pseudo generates no box at all, likewise dropped.
-        if matches!(
-            self.pseudo_style(id, which, "visibility").as_deref(),
-            Some("hidden" | "collapse")
-        ) || self.pseudo_style(id, which, "display").as_deref() == Some("none")
-        {
+        let raw = self.pseudo_style(id, which, "content").or_else(|| {
+            (self.tag_name(id) == Some("q")).then(|| {
+                if which == PseudoEl::Before {
+                    "open-quote"
+                } else {
+                    "close-quote"
+                }
+                .to_string()
+            })
+        })?;
+        if self.pseudo_style(id, which, "display").as_deref() == Some("none") {
             return None;
         }
-        // CSS Variables 1 §3 substitutes var() at computed-value time for
-        // every ordinary property, including `content`. Font Awesome and many
-        // icon systems keep the glyph in a custom property on the originating
-        // element (`content:var(--icon)/""`). Parsing the specified token stream
-        // directly would discard that otherwise-valid generated content.
         let resolved = self.resolve_pseudo_vars(id, which, &raw);
-        self.parse_content_value(id, &resolved)
+        if matches!(resolved.trim(), "none" | "normal" | "") {
+            return None;
+        }
+        if let Some(simple) = self.parse_content_value(id, &resolved) {
+            return Some(simple);
+        }
+        self.generated_values()
+            .content
+            .get(&(id, if which == PseudoEl::Before { 0 } else { 1 }))
+            .cloned()
+    }
+
+    fn generated_values(&self) -> std::cell::Ref<'_, generated::Generated> {
+        if self
+            .generated_cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|(epoch, _)| *epoch != (self.epoch, self.style_value_epoch))
+        {
+            let values = generated::build(self);
+            *self.generated_cache.borrow_mut() =
+                Some(((self.epoch, self.style_value_epoch), values));
+        }
+        std::cell::Ref::map(self.generated_cache.borrow(), |v| &v.as_ref().unwrap().1)
+    }
+
+    pub(crate) fn css_list_marker(&self, id: NodeId, kind: &str) -> String {
+        let value = self
+            .generated_values()
+            .list_items
+            .get(&id)
+            .copied()
+            .unwrap_or(1);
+        let index = self.style_index();
+        let empty = counter_styles::Styles::default();
+        let styles = index
+            .counter_styles
+            .get(&self.tree_scope(id))
+            .unwrap_or(&empty);
+        let marker = counter_styles::representation(kind, value, styles, true);
+        if kind.eq_ignore_ascii_case("disclosure-closed")
+            && self.computed_value_resolved(id, "direction").as_deref() == Some("rtl")
+        {
+            marker.replace('▸', "◂")
+        } else {
+            marker
+        }
     }
 
     /// The cascade-winning value of `prop` on `id`'s `::before`/`::after`
@@ -4636,20 +4900,33 @@ impl Dom {
         which: PseudoEl,
         prop: &str,
     ) -> Option<String> {
+        if prop.starts_with("--") {
+            return match self.resolve_pseudo_custom_prop(id, which, prop, &mut Vec::new()) {
+                VarResult::Resolved(value) => Some(value),
+                _ => None,
+            };
+        }
+        let Some(guard) = self.property_guard(id, Some(which), prop) else {
+            return self.computed_value_resolved(id, prop);
+        };
         let direct = self
             .pseudo_style(id, which, prop)
             .or_else(|| self.baked_pseudo_value(id, which, prop))
-            .and_then(|value| self.resolve_pseudo_pending_shorthand(id, which, prop, &value));
+            .and_then(|value| self.resolve_pseudo_pending_shorthand(id, which, prop, &value))
+            .map(|value| self.resolve_pseudo_vars(id, which, &value));
         let inherited = prop_index(prop).is_some_and(|i| PROPS[i].inherited);
         let inherited_value = || self.computed_value_resolved(id, prop);
-        match direct.as_deref().and_then(wide_keyword) {
+        let value = match direct.as_deref().and_then(wide_keyword) {
             Some(WideKeyword::Inherit) => inherited_value(),
             Some(WideKeyword::Initial) => None,
             Some(WideKeyword::Unset) => inherited.then(inherited_value).flatten(),
             Some(WideKeyword::Revert) => inherited.then(inherited_value).flatten(),
-            None => direct
-                .map(|value| self.resolve_pseudo_vars(id, which, &value))
-                .or_else(|| inherited.then(inherited_value).flatten()),
+            None => direct.or_else(|| inherited.then(inherited_value).flatten()),
+        };
+        if guard.cyclic() {
+            inherited.then(inherited_value).flatten()
+        } else {
+            value
         }
     }
 
@@ -4658,13 +4935,18 @@ impl Dom {
     /// parsing it through `parse_decl`/`expand_box_shorthand` keeps semicolons,
     /// `!important`, and shorthand expansion consistent with ordinary inline
     /// style instead of inventing a second CSS parser.
-    fn baked_pseudo_value(&self, id: NodeId, which: PseudoEl, prop: &str) -> Option<String> {
+    pub(crate) fn baked_pseudo_value(
+        &self,
+        id: NodeId,
+        which: PseudoEl,
+        prop: &str,
+    ) -> Option<String> {
         let attr = match which {
             PseudoEl::Before => "data-trust-before-style",
             PseudoEl::After => "data-trust-after-style",
         };
         let mut found = None;
-        for decl in self.attr(id, attr)?.split(';') {
+        for decl in split_top_level(self.attr(id, attr)?, ';') {
             let Some((name, value, _important)) = parse_decl(decl) else {
                 continue;
             };
@@ -4720,37 +5002,7 @@ impl Dom {
     /// whole. The old single-component reader mangled the common
     /// `content:"(" attr(data-n) ")"` decoration idiom.
     fn parse_content_value(&self, id: NodeId, raw: &str) -> Option<String> {
-        // CSS Content 3 §1.2 puts optional speech alternative text after a
-        // top-level slash. It is not part of the visual content list. Keep a
-        // slash inside url()/attr()/a quoted string intact.
-        let visual = split_top_level_slash(raw).map_or(raw, |(visual, _alt)| visual);
-        let v = visual.trim();
-        if v.is_empty() || v == "none" || v == "normal" {
-            return None;
-        }
-        let mut out = String::new();
-        for tok in split_top_level(v, ' ') {
-            let tok = tok.trim();
-            if tok.is_empty() {
-                continue;
-            }
-            if let Some(s) = unquote_css(tok) {
-                out.push_str(&s);
-                continue;
-            }
-            if let Some(inner) = tok.strip_prefix("attr(").and_then(|r| r.strip_suffix(')')) {
-                if let Some(a) = self.attr(id, inner.trim()) {
-                    out.push_str(a);
-                }
-                continue;
-            }
-            return None;
-        }
-        // An empty <string> is still a valid content list. CSS Content 3 §2
-        // distinguishes it from `none`: `content:""` creates an empty but fully
-        // styleable pseudo box (the ubiquitous percentage-padding aspect-ratio
-        // box), while `none` inhibits pseudo-element generation altogether.
-        Some(out)
+        generated::simple_content(self, id, raw)
     }
 
     /// The root of a node's tree: DOCUMENT for the light DOM, the
@@ -4829,9 +5081,17 @@ impl Dom {
             std::collections::HashMap::new();
         for id in self.composed_descendants(DOCUMENT) {
             let css: Cow<str> = match self.tag_name(id) {
-                Some("style") if self.style_sheet_applies(id) => Cow::Owned(self.text_content(id)),
+                Some("style") if self.style_sheet_applies(id) => match self.cssom_sheets.get(&id) {
+                    Some(sheet) => Cow::Borrowed(&sheet.text),
+                    None => Cow::Owned(self.text_content(id)),
+                },
                 Some("link") if self.style_sheet_applies(id) => {
-                    match self.external_sheets.get(&id) {
+                    match self
+                        .cssom_sheets
+                        .get(&id)
+                        .map(|sheet| &sheet.text)
+                        .or_else(|| self.external_sheets.get(&id))
+                    {
                         Some(css) => Cow::Borrowed(css.as_str()),
                         None => continue,
                     }
@@ -4839,15 +5099,37 @@ impl Dom {
                 _ => continue,
             };
             let scope = self.tree_scope(id);
+            let document = self.registration_document(id);
+            let base = if self.tag_name(id) == Some("link") {
+                self.attr(id, "href").and_then(|href| {
+                    self.property_base(id)
+                        .and_then(|base| base.join(href).ok())
+                        .or_else(|| url::Url::parse(href).ok())
+                })
+            } else {
+                self.property_base(id).cloned()
+            };
+            let first = index.scopes.get(&scope).map_or(0, Vec::len);
             parse_sheet(
                 &css,
                 &mut order,
                 index.scopes.entry(scope).or_default(),
                 &mut index.keyframes,
+                index.counter_styles.entry(scope).or_default(),
+                index.properties.entry(document).or_default(),
+                base.as_ref(),
                 media,
                 layer_regs.entry(scope).or_default(),
                 "",
             );
+            if let Some(base) = base {
+                let base = std::rc::Rc::new(base);
+                for rule in &index.scopes[&scope][first..] {
+                    if rule.decls.iter().any(|(name, _)| name.starts_with("--")) {
+                        index.rule_bases.insert(rule.order, base.clone());
+                    }
+                }
+            }
         }
         // Adopted sheets cascade after their scope's tree sheets (their
         // order values are necessarily higher); cross-scope order is
@@ -4856,21 +5138,54 @@ impl Dom {
         let mut adopted: Vec<_> = self.adopted_styles.iter().collect();
         adopted.sort_by_key(|(scope, _)| **scope);
         for (scope, css) in adopted {
-            parse_sheet(
-                css,
-                &mut order,
-                index.scopes.entry(*scope).or_default(),
-                &mut index.keyframes,
-                media,
-                layer_regs.entry(*scope).or_default(),
-                "",
-            );
+            if !self.is_connected(*scope) {
+                continue;
+            }
+            let document = if matches!(self.tag_name(*scope), Some("iframe" | "frame")) {
+                *scope
+            } else {
+                self.registration_document(*scope)
+            };
+            let sources = self
+                .properties
+                .adopted_sources
+                .get(scope)
+                .cloned()
+                .unwrap_or_else(|| vec![(0..css.len(), self.property_base(*scope).cloned())]);
+            for (range, base) in sources {
+                let first = index.scopes.get(scope).map_or(0, Vec::len);
+                parse_sheet(
+                    &css[range],
+                    &mut order,
+                    index.scopes.entry(*scope).or_default(),
+                    &mut index.keyframes,
+                    index.counter_styles.entry(*scope).or_default(),
+                    index.properties.entry(document).or_default(),
+                    base.as_ref(),
+                    media,
+                    layer_regs.entry(*scope).or_default(),
+                    "",
+                );
+                if let Some(base) = base {
+                    let base = std::rc::Rc::new(base);
+                    for rule in &index.scopes[scope][first..] {
+                        if rule.decls.iter().any(|(name, _)| name.starts_with("--")) {
+                            index.rule_bases.insert(rule.order, base.clone());
+                        }
+                    }
+                }
+            }
         }
         index.has_opacity = index
             .scopes
             .values()
             .flatten()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
+        index.has_revert_layer = index.scopes.values().flatten().any(|r| {
+            r.decls
+                .iter()
+                .any(|(_, (_, value))| value.to_ascii_lowercase().contains("revert-layer"))
+        });
         index.has_container_queries = index
             .scopes
             .values()
@@ -5025,6 +5340,9 @@ impl Dom {
     /// pushed by the prelude on adoption and on replace/replaceSync.
     /// Idempotent pushes are free — no dirty, no rebuild.
     pub fn set_adopted_styles(&mut self, scope: NodeId, css: &str) {
+        if self.properties.adopted_sources.remove(&scope).is_some() {
+            self.touch_style_at(scope);
+        }
         if self.adopted_styles.get(&scope).map(String::as_str) == Some(css)
             || (css.trim().is_empty() && !self.adopted_styles.contains_key(&scope))
         {
@@ -5060,11 +5378,27 @@ impl Dom {
     /// to activate it without another network request.
     fn style_sheet_applies(&self, id: NodeId) -> bool {
         let eligible = match self.tag_name(id) {
-            Some("style") => true,
-            Some("link") => self.is_stylesheet_link(id),
+            Some("style") => self
+                .attr(id, "type")
+                .is_none_or(|v| v.is_empty() || v.eq_ignore_ascii_case("text/css")),
+            Some("link") => {
+                self.attr(id, "rel").is_some_and(|v| {
+                    v.split_ascii_whitespace()
+                        .any(|w| w.eq_ignore_ascii_case("stylesheet"))
+                }) && !self.attr(id, "rel").is_some_and(|v| {
+                    v.split_ascii_whitespace()
+                        .any(|w| w.eq_ignore_ascii_case("alternate"))
+                })
+            }
             _ => false,
         };
+        if let Some(sheet) = self.cssom_sheets.get(&id) {
+            return eligible
+                && !sheet.disabled
+                && (sheet.media.trim().is_empty() || self.media_matches(&sheet.media));
+        }
         eligible
+            && self.attr(id, "disabled").is_none()
             && self
                 .attr(id, "media")
                 .is_none_or(|media| media.trim().is_empty() || self.media_matches(media))
@@ -5126,6 +5460,7 @@ impl Dom {
     /// full relayout a sheet-set change requires. Replaces any earlier body on
     /// the same link (a loader may rewrite `href` and re-trigger the load).
     pub fn attach_sheet_to_link(&mut self, id: NodeId, css: String) {
+        self.reset_cssom_sheet(id);
         self.external_sheets.insert(id, css);
         self.touch_style_at(id);
     }
@@ -5625,8 +5960,13 @@ impl Dom {
         }
         let new_html = self.transplant(doc, src_html);
         self.append(frame, new_html);
+        self.properties.javascript.remove(&frame);
+        self.properties.document_bases.remove(&frame);
+        self.adopted_styles.remove(&frame);
+        self.properties.adopted_sources.remove(&frame);
         if let Ok(base_url) = url::Url::parse(base) {
             self.absolutize_subtree_urls(new_html, &base_url);
+            self.properties.document_bases.insert(frame, base_url);
         }
         self.frame_body(frame)
     }
@@ -5815,6 +6155,7 @@ impl Dom {
                 if let Some(parent) = parent
                     && self.tag_name(parent) == Some("style")
                 {
+                    self.reset_cssom_sheet(parent);
                     self.touch_style_at(parent); // sheet text changed in place
                 } else if let Some(parent) = parent {
                     self.touch_text(parent, was_empty != self.is_element_empty(parent));
@@ -8167,7 +8508,7 @@ enum Combinator {
 /// The `::before` / `::after` generated-content pseudo-elements (CSS2
 /// `:before`/`:after` legacy spelling too). The only pseudo-elements we
 /// act on; others parse but never match.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PseudoEl {
     Before,
     After,
@@ -8595,7 +8936,7 @@ impl Complex {
 
 /// Split on `sep` outside parens, brackets, and quotes — `:not(.a, .b)`
 /// and `[title="x,y"]` must survive list splitting.
-fn split_top_level(input: &str, sep: char) -> Vec<&str> {
+pub(crate) fn split_top_level(input: &str, sep: char) -> Vec<&str> {
     let mut out = Vec::new();
     let (mut depth, mut start) = (0i32, 0usize);
     let mut quote: Option<char> = None;
@@ -8613,8 +8954,8 @@ fn split_top_level(input: &str, sep: char) -> Vec<&str> {
             (Some(q), c) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') => quote = Some(c),
-            (None, '(' | '[') => depth += 1,
-            (None, ')' | ']') => depth -= 1,
+            (None, '(' | '[' | '{') => depth += 1,
+            (None, ')' | ']' | '}') => depth -= 1,
             (None, c) if c == sep && depth == 0 => {
                 out.push(&input[start..i]);
                 start = i + c.len_utf8();
@@ -8632,32 +8973,51 @@ fn split_top_level(input: &str, sep: char) -> Vec<&str> {
 /// `calc(.25rem`, `*`, `-1)`, so a box shorthand (`margin`/`padding`/`inset`)
 /// carrying a `calc()` component would parse as three sides — the `-m-1`
 /// negative-margin idiom Tailwind emits.
-fn split_top_level_ws(input: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_ws(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut start: Option<usize> = None; // Some(i) ⇒ currently inside a token
-    for (i, c) in input.char_indices() {
-        if quote.is_none() && depth == 0 && c.is_whitespace() {
-            if let Some(s) = start.take() {
-                out.push(&input[s..i]);
+    let mut start = None;
+    let mut depth = 0u32;
+    let mut quote = None;
+    let mut iter = input.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if quote.is_none() && depth == 0 && matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c') {
+            if let Some(start) = start.take() {
+                out.push(&input[start..i]);
             }
             continue;
         }
         if start.is_none() {
             start = Some(i);
         }
+        if c == '\\' {
+            let mut digits = 0;
+            while digits < 6 && iter.peek().is_some_and(|(_, c)| c.is_ascii_hexdigit()) {
+                iter.next();
+                digits += 1;
+            }
+            if digits == 0 {
+                iter.next();
+            } else if iter
+                .peek()
+                .is_some_and(|(_, c)| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+                && iter.next().is_some_and(|(_, c)| c == '\r')
+                && iter.peek().is_some_and(|(_, c)| *c == '\n')
+            {
+                iter.next();
+            }
+            continue;
+        }
         match (quote, c) {
-            (Some(q), ch) if ch == q => quote = None,
+            (Some(q), c) if q == c => quote = None,
             (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '(' | '[') => depth += 1,
-            (None, ')' | ']') => depth -= 1,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '(' | '[' | '{') => depth += 1,
+            (None, ')' | ']' | '}') => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
-    if let Some(s) = start {
-        out.push(&input[s..]);
+    if let Some(start) = start {
+        out.push(&input[start..]);
     }
     out
 }
@@ -9299,9 +9659,8 @@ const fn prop(name: &'static str, inherited: bool, baked: bool) -> PropDef {
 
 /// The CSS-wide keywords (css-cascade-4 §7.3), valid as the whole value of
 /// any property. `revert-layer` (css-cascade-5 §7.3.4) rolls back to the
-/// previous cascade LAYER; the winner maps keep only the top declaration, so
-/// it degrades to `revert` — the spec's own behavior when no lower layer
-/// declares the property.
+/// previous cascade layer in `CascadeWinner`. Only an exhausted rollback
+/// reaches defaulting as `revert`, as required when no earlier layer applies.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum WideKeyword {
     Inherit,
@@ -9482,6 +9841,10 @@ const PROPS: &[PropDef] = &[
     prop("text-decoration-style", false, true),
     prop("text-shadow", true, true),
     prop("content", false, false),
+    prop("counter-reset", false, false),
+    prop("counter-increment", false, false),
+    prop("counter-set", false, false),
+    prop("quotes", true, true),
     // CSS Box Sizing 3: whether declared width/height include border+padding.
     // The modern web's near-universal `*{box-sizing:border-box}` reset makes
     // this load-bearing for any width math (consumed by layout2's §10.3.3).
@@ -9831,7 +10194,7 @@ fn ua_font_factor(tag: &str) -> Option<f32> {
 /// root's, and the physical units convert at CSS's fixed ratios (96px/in).
 /// `None` (→ inherit) for anything unresolvable: `calc()`, a dangling
 /// `var()`, negative sizes, garbage.
-fn font_size_px(value: &str, parent: f32, root: f32) -> Option<f32> {
+pub(crate) fn font_size_px(value: &str, parent: f32, root: f32) -> Option<f32> {
     let v = value.trim().to_ascii_lowercase();
     match v.as_str() {
         "xx-small" => return Some(FONT_SIZE_INITIAL * 3.0 / 5.0),
@@ -9940,6 +10303,26 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .map(|(name, _)| (name, pending.clone()))
                 .collect();
         }
+    }
+    if prop == "white-space" {
+        if wide_keyword(value).is_some() {
+            return ["white-space-collapse", "text-wrap-mode"]
+                .into_iter()
+                .map(|p| (p.to_string(), value.to_string()))
+                .collect();
+        }
+        return crate::layout2::WhiteSpace::components(value).map_or_else(
+            Vec::new,
+            |(collapse, nowrap)| {
+                vec![
+                    ("white-space-collapse".into(), collapse.into()),
+                    (
+                        "text-wrap-mode".into(),
+                        if nowrap { "nowrap" } else { "wrap" }.into(),
+                    ),
+                ]
+            },
+        );
     }
     if prop == "container" {
         let (name, kind) = value
@@ -11061,12 +11444,103 @@ impl StyleRule {
 /// specificity — the point of the feature).
 type CascadeKey = (bool, bool, bool, u64, (u32, u32, u32), usize);
 
+/// CSS Cascade 5 #revert-layer: keep the strongest declaration at each
+/// importance/context/inline/layer level when rollback occurs in the sheet.
+/// Ordinary pages retain the single-winner path and allocate no candidate list.
+enum CascadeWinner {
+    One((CascadeKey, String)),
+    Layers(Vec<(CascadeKey, String)>),
+}
+
+fn cascade_level(key: CascadeKey) -> (bool, bool, bool, u64) {
+    (key.0, key.1, key.2, key.3)
+}
+
+impl CascadeWinner {
+    fn consider(&mut self, key: CascadeKey, value: &str, preserve_layers: bool) {
+        match self {
+            Self::One(slot) => {
+                if preserve_layers && cascade_level(slot.0) != cascade_level(key) {
+                    let old = std::mem::replace(slot, (key, value.to_owned()));
+                    let new = std::mem::replace(slot, (key, String::new()));
+                    *self = Self::Layers(vec![old, new]);
+                } else if key >= slot.0 {
+                    *slot = (key, value.to_owned());
+                }
+            }
+            Self::Layers(candidates) => {
+                if let Some(slot) = candidates
+                    .iter_mut()
+                    .find(|(k, _)| cascade_level(*k) == cascade_level(key))
+                {
+                    if key >= slot.0 {
+                        *slot = (key, value.to_owned());
+                    }
+                } else {
+                    candidates.push((key, value.to_owned()));
+                }
+            }
+        }
+    }
+
+    fn resolve(&self, is_substituted_rollback: impl Fn(&str) -> bool) -> &str {
+        self.resolve_with_key(is_substituted_rollback)
+            .map_or("revert", |(_, value)| value)
+    }
+
+    fn resolve_with_key(
+        &self,
+        is_substituted_rollback: impl Fn(&str) -> bool,
+    ) -> Option<(CascadeKey, &str)> {
+        let candidates = match self {
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Layers(many) => many.as_slice(),
+        };
+        let mut below = None;
+        let mut exclude_inline = false;
+        loop {
+            let (key, value) = candidates
+                .iter()
+                .filter(|(key, _)| {
+                    (!exclude_inline || !key.2)
+                        && below.is_none_or(|floor| cascade_level(*key) < floor)
+                })
+                .max_by_key(|(key, _)| key)?;
+            if !value.trim().eq_ignore_ascii_case("revert-layer") && !is_substituted_rollback(value)
+            {
+                return Some((*key, value));
+            }
+            if key.0 && key.2 {
+                // Important element-attached styles revert their own normal
+                // declarations, but preserve intervening author-important rules.
+                exclude_inline = true;
+            } else if key.0 {
+                // Remove this layer and everything between its important and
+                // normal levels. Invert encode_layer's per-component ordering.
+                let mut normal_layer = 0u64;
+                for shift in [48, 32, 16, 0] {
+                    let component = (key.3 >> shift) & 0xffff;
+                    normal_layer |= (if component == 0 {
+                        0xffff
+                    } else {
+                        0xfffe - component
+                    }) << shift;
+                }
+                below = Some((false, !key.1, false, normal_layer));
+            } else {
+                below = Some(cascade_level(*key));
+            }
+        }
+    }
+}
+
 /// Rules bucketed by tree scope: DOCUMENT for the light DOM, the shadow
 /// fragment for each shadow tree. Shadow sheets never leak out;
 /// document sheets never reach in.
 #[derive(Default)]
 struct StyleIndex {
     has_container_queries: bool,
+    has_revert_layer: bool,
     selector_dependencies: invalidation::SelectorDependencies,
     scopes: FxHashMap<NodeId, Vec<StyleRule>>,
     /// Per-scope rule index, keyed by each rule's rightmost-compound key
@@ -11083,6 +11557,9 @@ struct StyleIndex {
     /// retained by property and sorted offset so paint can sample supported
     /// tracks without reparsing the stylesheet every frame.
     keyframes: FxHashMap<String, KeyframesRule>,
+    counter_styles: FxHashMap<NodeId, counter_styles::Styles>,
+    properties: FxHashMap<NodeId, properties::Registry>,
+    rule_bases: FxHashMap<usize, std::rc::Rc<url::Url>>,
     /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
     /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
@@ -11282,11 +11759,15 @@ impl StyleIndex {
     fn retained_memory(&self) -> (usize, bool) {
         let StyleIndex {
             has_container_queries,
+            has_revert_layer,
             selector_dependencies,
             scopes,
             buckets,
             slotted_rules,
             keyframes,
+            counter_styles,
+            properties,
+            rule_bases,
             has_opacity,
             hover_probes,
             hover_buckets,
@@ -11295,12 +11776,39 @@ impl StyleIndex {
         let _ = (
             has_opacity,
             has_container_queries,
+            has_revert_layer,
             boxless_content_may_escape,
         );
         let mut bytes = scopes
             .capacity()
             .saturating_mul(std::mem::size_of::<(NodeId, Vec<StyleRule>)>());
+        bytes += properties.capacity() * std::mem::size_of::<(NodeId, properties::Registry)>();
+        bytes += properties
+            .values()
+            .map(properties::registry_bytes)
+            .sum::<usize>();
+        bytes += rule_bases.capacity() * std::mem::size_of::<(usize, std::rc::Rc<url::Url>)>();
+        let mut seen_bases = FxHashSet::default();
+        for base in rule_bases.values() {
+            if seen_bases.insert(std::rc::Rc::as_ptr(base)) {
+                bytes += std::mem::size_of::<url::Url>() + base.as_str().len();
+            }
+        }
         bytes = bytes.saturating_add(selector_dependencies.retained_bytes());
+        bytes = bytes.saturating_add(
+            counter_styles.capacity() * std::mem::size_of::<(NodeId, counter_styles::Styles)>(),
+        );
+        for styles in counter_styles.values() {
+            bytes = bytes.saturating_add(
+                styles.capacity()
+                    * std::mem::size_of::<(String, (u64, counter_styles::CounterStyle))>(),
+            );
+            for (name, (_, style)) in styles {
+                bytes = bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(style.retained_bytes());
+            }
+        }
         let mut queries = FxHashSet::default();
         for rules in scopes.values() {
             bytes = bytes.saturating_add(rules.capacity() * std::mem::size_of::<StyleRule>());
@@ -11648,8 +12156,16 @@ impl RuleBuckets {
 /// here changes the resource identity on case-sensitive servers (for example
 /// `/images/HeartDot.png`). Preserve those tokens while normalizing the rest.
 fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
-    let (k, v) = decl.split_once(':')?;
-    let k = k.trim();
+    let uncommented = strip_css_comments(decl);
+    let decl = uncommented.as_ref();
+    let mut input = cssparser::ParserInput::new(decl);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let k = parser.expect_ident_cloned().ok()?.to_string();
+    parser.expect_colon().ok()?;
+    let v = &decl[parser.position().byte_index()..];
+    if k == "-" || k == "--" {
+        return None;
+    }
     // CSS Custom Properties §2: custom-property names compare codepoint for
     // codepoint, and their arbitrary token streams retain author casing.
     // Ordinary property names remain ASCII case-insensitive.
@@ -11660,12 +12176,38 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
         k.to_ascii_lowercase()
     };
     let v = v.trim();
-    let (v, important) = match v.rsplit_once('!') {
-        Some((head, bang)) if bang.trim().eq_ignore_ascii_case("important") => (head, true),
-        _ => (v, false),
-    };
+    // CSS Syntax 3 #consume-declaration: only top-level trailing tokens
+    // can be the priority. A bang inside a string/function is ordinary data.
+    let priority = split_top_level(v, '!');
+    let (v, important) =
+        if priority.len() == 2 && priority[1].trim().eq_ignore_ascii_case("important") {
+            (priority[0], true)
+        } else {
+            (v, false)
+        };
     let v = v.trim();
-    let value = if custom || matches!(k.as_str(), "content" | "container" | "container-name") {
+    let value = if custom
+        || v.starts_with(PENDING_BOX_SHORTHAND)
+        || k.starts_with("grid-")
+        || matches!(
+            k.as_str(),
+            "content"
+                | "container"
+                | "container-name"
+                | "counter-reset"
+                | "counter-increment"
+                | "counter-set"
+                | "list-style"
+                | "list-style-type"
+                | "quotes"
+                | "symbols"
+                | "additive-symbols"
+                | "prefix"
+                | "suffix"
+                | "negative"
+                | "fallback"
+                | "system"
+        ) {
         v.to_string()
     } else {
         normalize_css_value(v)
@@ -11688,6 +12230,15 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     // CSS Conditional 3 #support-definition: an unsupported color value is
     // also invalid in ordinary declarations, preserving earlier fallbacks.
     if is_color_property(&k) && !supports_color_value(&value) {
+        return None;
+    }
+    if matches!(
+        k.as_str(),
+        "counter-reset" | "counter-increment" | "counter-set"
+    ) && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && !generated::valid_changes(&value, &k)
+    {
         return None;
     }
     Some((k, value, important))
@@ -11906,17 +12457,50 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
     if !css.contains("/*") {
         return Cow::Borrowed(css);
     }
-    let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    while let Some(i) = rest.find("/*") {
-        out.push_str(&rest[..i]);
-        out.push(' ');
-        match rest[i + 2..].find("*/") {
-            Some(j) => rest = &rest[i + 2 + j + 2..],
-            None => return Cow::Owned(out),
+    // CSS Syntax comments are tokens, not substrings inside a string or URL.
+    fn collect<'i>(
+        p: &mut cssparser::Parser<'i, '_>,
+        spans: &mut Vec<std::ops::Range<usize>>,
+        depth: usize,
+    ) -> Result<(), cssparser::ParseError<'i, ()>> {
+        if depth > 128 {
+            return Err(p.new_custom_error(()));
         }
+        loop {
+            let start = p.position().byte_index();
+            let Ok(token) = p.next_including_whitespace_and_comments().cloned() else {
+                break;
+            };
+            match token {
+                cssparser::Token::Comment(_) => spans.push(start..p.position().byte_index()),
+                cssparser::Token::Function(_)
+                | cssparser::Token::ParenthesisBlock
+                | cssparser::Token::CurlyBracketBlock
+                | cssparser::Token::SquareBracketBlock => {
+                    let _ = p.parse_nested_block(|p| collect(p, spans, depth + 1));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
-    out.push_str(rest);
+    let mut spans = Vec::new();
+    let _ = collect(
+        &mut cssparser::Parser::new(&mut cssparser::ParserInput::new(css)),
+        &mut spans,
+        0,
+    );
+    if spans.is_empty() {
+        return Cow::Borrowed(css);
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut start = 0;
+    for span in spans {
+        out.push_str(&css[start..span.start]);
+        out.push(' ');
+        start = span.end;
+    }
+    out.push_str(&css[start..]);
     Cow::Owned(out)
 }
 
@@ -12042,11 +12626,15 @@ struct MediaEnvironment {
     density: f32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_sheet(
     css: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
     keyframes: &mut FxHashMap<String, KeyframesRule>,
+    counter_styles: &mut counter_styles::Styles,
+    properties: &mut properties::Registry,
+    base: Option<&url::Url>,
     media: MediaEnvironment,
     layers: &mut LayerRegistry,
     layer: &str,
@@ -12067,6 +12655,49 @@ fn parse_sheet(
             return;
         }
         if let Some(after) = rest.strip_prefix('@') {
+            // CSS Properties and Values API #determining-registration:
+            // last active rule in stylesheet order wins, globally per document.
+            if let Some((rule, tail)) = properties::consume_rule(after) {
+                if let Some(mut rule) = rule {
+                    rule.registration.base = base.cloned();
+                    let registration = std::rc::Rc::new(rule.registration);
+                    for name in rule.names {
+                        properties.insert(name, registration.clone());
+                    }
+                }
+                rest = tail;
+                continue;
+            }
+            if let Some(prelude) = after.strip_prefix("counter-style")
+                && prelude.starts_with(char::is_whitespace)
+                && let Some(brace) = prelude.find('{')
+            {
+                let name = prelude[..brace].trim();
+                let (block, tail) = take_block(&prelude[brace..]);
+                if counter_styles::valid_name(name) {
+                    let name = counter_styles::normalize_name(name);
+                    if !matches!(
+                        name.as_str(),
+                        "decimal"
+                            | "disc"
+                            | "circle"
+                            | "square"
+                            | "disclosure-open"
+                            | "disclosure-closed"
+                    ) {
+                        let layer = encode_layer(&lpath, false);
+                        if counter_styles
+                            .get(&name)
+                            .is_none_or(|(old, _)| layer >= *old)
+                        {
+                            counter_styles
+                                .insert(name, (layer, counter_styles::CounterStyle::parse(block)));
+                        }
+                    }
+                }
+                rest = tail;
+                continue;
+            }
             // CSS Animations 1 §3: keyframe names are case-sensitive and the
             // last rule of a given name wins. Store supported property tracks
             // in sorted offset order; duplicate offsets cascade in rule order.
@@ -12099,7 +12730,18 @@ fn parse_sheet(
                 let query = &after[after.len() - rest_q.len()..brace_off];
                 let (block, tail) = take_block(&after[brace_off..]);
                 if media_query_matches_with_density(query, media.viewport, media.density) {
-                    parse_sheet(block, order, out, keyframes, media, layers, layer);
+                    parse_sheet(
+                        block,
+                        order,
+                        out,
+                        keyframes,
+                        counter_styles,
+                        properties,
+                        base,
+                        media,
+                        layers,
+                        layer,
+                    );
                 }
                 rest = tail;
                 continue;
@@ -12122,7 +12764,18 @@ fn parse_sheet(
                 let cond = &after[after.len() - rest_c.len()..brace_off];
                 let (block, tail) = take_block(&after[brace_off..]);
                 if supports_condition(cond) {
-                    parse_sheet(block, order, out, keyframes, media, layers, layer);
+                    parse_sheet(
+                        block,
+                        order,
+                        out,
+                        keyframes,
+                        counter_styles,
+                        properties,
+                        base,
+                        media,
+                        layers,
+                        layer,
+                    );
                 }
                 rest = tail;
                 continue;
@@ -12173,7 +12826,18 @@ fn parse_sheet(
                         continue; // malformed name: drop the block (fail-open)
                     };
                     layers.declare(&qualified);
-                    parse_sheet(block, order, out, keyframes, media, layers, &qualified);
+                    parse_sheet(
+                        block,
+                        order,
+                        out,
+                        keyframes,
+                        counter_styles,
+                        properties,
+                        base,
+                        media,
+                        layers,
+                        &qualified,
+                    );
                     continue;
                 }
                 return; // no `;` and no `{`: malformed tail
@@ -12190,10 +12854,47 @@ fn parse_sheet(
                 ));
                 let (block, tail) = take_block(&after[brace..]);
                 let start = out.len();
-                parse_sheet(block, order, out, keyframes, media, layers, layer);
+                parse_sheet(
+                    block,
+                    order,
+                    out,
+                    keyframes,
+                    counter_styles,
+                    properties,
+                    base,
+                    media,
+                    layers,
+                    layer,
+                );
                 for rule in &mut out[start..] {
                     rule.containers.push(query.clone());
                 }
+                rest = tail;
+                continue;
+            }
+            // CSS Cascade 6 #scope-scope: global name definitions are
+            // unaffected by @scope. Its ordinary scoped selectors still use
+            // the separate (currently unsupported) scope matching machinery.
+            if let Some(query) = lower.strip_prefix("scope")
+                && query
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || c == '(' || c == '{')
+                && let Some(brace) = after.find('{')
+            {
+                let (block, tail) = take_block(&after[brace..]);
+                parse_sheet(
+                    block,
+                    order,
+                    &mut Vec::new(),
+                    keyframes,
+                    counter_styles,
+                    properties,
+                    base,
+                    media,
+                    layers,
+                    layer,
+                );
                 rest = tail;
                 continue;
             }
@@ -12293,7 +12994,7 @@ fn parse_style_rule(
 /// pairs (later wins; never demote `!important`); shorthands are expanded.
 fn collect_decls(decl_text: &str) -> Vec<(String, (bool, String))> {
     let mut decls: Vec<(String, (bool, String))> = Vec::new();
-    for decl in decl_text.split(';') {
+    for decl in split_top_level(decl_text, ';') {
         let Some((k, v, important)) = parse_decl(decl) else {
             continue;
         };
@@ -12383,30 +13084,58 @@ fn split_block(block: &str) -> (Cow<'_, str>, Vec<(&str, &str)>) {
     (Cow::Owned(decls), nested)
 }
 
-/// Expand a nested selector against its parent (CSS Nesting `&`). Returns a
-/// concrete comma-joined selector list. Each `&` is replaced by the parent; a
-/// nested selector with no `&` is a descendant (`parent nested`). When the
-/// parent is itself a list, the product over (parent × nested) parts is taken
-/// — equivalent to substituting `:is(parent)` for matching, without needing
-/// `:is`.
-fn expand_nesting(nested: &str, parent: &str) -> String {
-    let parents = split_top_level(parent, ',');
-    let mut out: Vec<String> = Vec::new();
-    for n in split_top_level(nested, ',') {
-        let n = n.trim();
-        if n.is_empty() {
+/// CSS Nesting 1 #nest-selector: `&` has the maximum specificity of the
+/// entire parent selector list, as :is() does. Strings and escaped ampersands
+/// are tokens, not nesting selectors. A leading combinator is relative even
+/// when another nesting selector appears later in the selector.
+fn replace_nesting_tokens(selector: &str, parent: &str) -> (String, bool) {
+    let mut result = String::new();
+    let mut chars = selector.chars();
+    let mut quote = None;
+    let mut found = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            result.push(c);
+            if let Some(c) = chars.next() {
+                result.push(c);
+            }
             continue;
         }
-        for p in &parents {
-            let p = p.trim();
-            if n.contains('&') {
-                out.push(n.replace('&', p));
-            } else {
-                out.push(format!("{p} {n}"));
+        if let Some(q) = quote {
+            result.push(c);
+            if c == q {
+                quote = None;
             }
+            continue;
+        }
+        if matches!(c, '\'' | '"') {
+            quote = Some(c);
+            result.push(c);
+        } else if c == '&' {
+            result.push_str(parent);
+            found = true;
+        } else {
+            result.push(c);
         }
     }
-    out.join(", ")
+    (result, found)
+}
+fn expand_nesting(nested: &str, parent: &str) -> String {
+    let parent = format!(":is({parent})");
+    split_top_level(nested, ',')
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|n| {
+            let n = n.trim();
+            let (expanded, found) = replace_nesting_tokens(n, &parent);
+            if !found || n.starts_with(['>', '+', '~']) {
+                format!("{parent} {expanded}")
+            } else {
+                expanded
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Evaluate a CSS `@supports` condition — does TRust support it? Feature
@@ -12416,153 +13145,21 @@ fn expand_nesting(nested: &str, parent: &str) -> String {
 /// tests, and `selector( <complex-selector> )`. An unrecognized function form
 /// (`<general-enclosed>`) is treated as unsupported, so a page falls back.
 fn supports_condition(cond: &str) -> bool {
-    let c = cond.trim();
-    if c.is_empty() {
-        return false;
-    }
-    // `not <in-parens>`
-    if let Some(rest) = c.strip_prefix("not ").or_else(|| c.strip_prefix("not(")) {
-        // Re-attach the `(` we may have eaten so `supports_in_parens` sees it.
-        let rest = if c.starts_with("not(") {
-            &c["not".len()..]
-        } else {
-            rest
-        };
-        return !supports_in_parens(rest.trim());
-    }
-    // `and`/`or` chains (a chain can't mix the two without parens, per spec).
-    let ands = split_supports_kw(c, "and");
-    if ands.len() > 1 {
-        return ands.iter().all(|p| supports_in_parens(p));
-    }
-    let ors = split_supports_kw(c, "or");
-    if ors.len() > 1 {
-        return ors.iter().any(|p| supports_in_parens(p));
-    }
-    supports_in_parens(c)
+    cssom::condition(cond).unwrap_or(false)
 }
 
-/// One `<supports-in-parens>`: `( <condition> )`, `( <declaration> )`,
-/// `selector( … )`, or an unknown function form.
-fn supports_in_parens(s: &str) -> bool {
-    let s = s.trim();
-    if let Some(inner) = s
-        .strip_prefix("selector(")
-        .and_then(|x| x.strip_suffix(')'))
-    {
-        // We support the query if our selector engine can parse the selector.
-        return SelectorList::parse(inner.trim()).is_some();
-    }
-    if let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
-        let inner = inner.trim();
-        // `( <condition> )` — a nested condition begins with `(` or `not`/has a
-        // top-level and/or; otherwise it's `( <declaration> )`.
-        if inner.starts_with('(')
-            || inner.starts_with("not ")
-            || inner.starts_with("not(")
-            || split_supports_kw(inner, "and").len() > 1
-            || split_supports_kw(inner, "or").len() > 1
-        {
-            return supports_condition(inner);
-        }
-        if let Some((prop, value)) = inner.split_once(':') {
-            return css_supports(prop.trim(), value.trim());
-        }
-        return false;
-    }
-    false // a bare ident or unknown function form: general-enclosed → unsupported
-}
-
-/// Split a `@supports` condition on a top-level ` and `/` or ` keyword
-/// (paren-depth 0), trimming each part. Returns one element when absent.
-/// Byte-wise: the keyword pattern is pure ASCII, so a match position is
-/// always a char boundary — a multi-byte char in the condition must never
-/// be sliced into (str-indexing `cond[i..]` at every byte offset panicked
-/// on non-ASCII input; the byte-slice compare can't).
-fn split_supports_kw(cond: &str, kw: &str) -> Vec<String> {
-    let bytes = cond.as_bytes();
+fn split_supports_kw(cond: &str, keyword: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut i = 0usize;
-    let pat = format!(" {kw} ");
-    let pat = pat.as_bytes();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ => {}
+    let mut start = 0;
+    for token in split_top_level_ws(cond) {
+        if token.eq_ignore_ascii_case(keyword) {
+            let offset = token.as_ptr() as usize - cond.as_ptr() as usize;
+            parts.push(cond[start..offset].trim().to_string());
+            start = offset + token.len();
         }
-        if depth == 0
-            && bytes[i..].len() >= pat.len()
-            && bytes[i..i + pat.len()].eq_ignore_ascii_case(pat)
-        {
-            parts.push(cond[start..i].trim().to_string());
-            i += pat.len();
-            start = i;
-            continue;
-        }
-        i += 1;
     }
     parts.push(cond[start..].trim().to_string());
     parts
-}
-
-/// Does TRust support a CSS `(prop: value)` feature declaration? Check the
-/// implemented box types, color syntax and clipping grammar; retaining a
-/// property alone is insufficient evidence that its value can be painted.
-fn css_supports(prop: &str, value: &str) -> bool {
-    let prop = prop.to_ascii_lowercase();
-    let value = value.to_ascii_lowercase();
-    if value.is_empty() {
-        return false;
-    }
-    if prop == "display" {
-        return matches!(
-            value.as_str(),
-            "grid"
-                | "inline-grid"
-                | "flex"
-                | "inline-flex"
-                | "block"
-                | "inline"
-                | "inline-block"
-                | "none"
-                | "list-item"
-                | "table"
-                | "inline-table"
-                | "table-row"
-                | "table-cell"
-                | "table-row-group"
-                | "table-header-group"
-                | "table-footer-group"
-                | "table-column"
-                | "table-column-group"
-                | "table-caption"
-                | "contents"
-                | "flow-root"
-        );
-    }
-    // Retained for clean diagnostics/future backend work, but not painted.
-    // Merely preserving a declaration must not make feature queries select a
-    // path whose required visual effect TRust cannot provide.
-    if prop == "filter" {
-        return false;
-    }
-    if prop == "clip-path" {
-        return value == "none" || crate::layout2::clip_path::supports(&value);
-    }
-    if is_color_property(&prop) {
-        // CSS Conditional 3 #support-definition requires usable support for
-        // the value as well as the property. Share paint's actual parser so
-        // unsupported color functions cannot displace working fallbacks.
-        let value = match value.rsplit_once('!') {
-            Some((head, bang)) if bang.trim() == "important" => head.trim(),
-            _ => value.trim(),
-        };
-        return supports_color_value(value);
-    }
-    is_tracked(&prop)
 }
 
 fn is_color_property(prop: &str) -> bool {
@@ -12963,7 +13560,7 @@ fn parse_keyframes_rule(block: &str) -> KeyframesRule {
         if offsets.is_empty() {
             continue;
         }
-        for decl in decls.split(';') {
+        for decl in split_top_level(decls, ';') {
             let Some((property, value, important)) = parse_decl(decl) else {
                 continue;
             };
@@ -13209,10 +13806,17 @@ fn cssom_rules_json(css: &str) -> String {
         if sel.is_empty() {
             continue;
         }
+        let (decls, nested) = split_block(block);
+        let nested = nested
+            .into_iter()
+            .map(|(selector, body)| format!("{selector} {{{body}}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let item = format!(
-            "{{\"t\":\"style\",\"sel\":{},\"d\":{}}}",
+            "{{\"t\":\"style\",\"sel\":{},\"d\":{},\"r\":{}}}",
             json_string(&sel),
-            decls_json(block)
+            decls_json(&decls),
+            cssom_rules_json(&nested)
         );
         push_item(&mut out, &mut first, &item);
     }
@@ -13223,6 +13827,9 @@ fn cssom_rules_json(css: &str) -> String {
 /// An at-rule body (text after the `@`). Returns its JSON (None = unknown,
 /// dropped) and the tail after its `;` or closing `}`.
 fn at_rule_json(after: &str) -> (Option<String>, &str) {
+    if let Some((rule, tail)) = properties::consume_rule(after) {
+        return (rule.map(|rule| rule.json().to_string()), tail);
+    }
     let name_end = after
         .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
         .unwrap_or(after.len());
@@ -13286,11 +13893,9 @@ fn block_at_rule_json(name: &str, prelude: &str, body: &str) -> Option<String> {
             json_string(prelude),
             decls_json(body)
         )),
-        "property" => Some(format!(
-            "{{\"t\":\"property\",\"name\":{},\"d\":{}}}",
-            json_string(prelude),
-            decls_json(body)
-        )),
+        "property" => {
+            properties::PropertyRule::parse(prelude, body).map(|rule| rule.json().to_string())
+        }
         "font-feature-values" => Some(format!(
             "{{\"t\":\"font-feature-values\",\"name\":{},\"d\":[]}}",
             json_string(prelude)
@@ -13311,7 +13916,7 @@ fn statement_at_rule_json(name: &str, prelude: &str) -> Option<String> {
             json_string(prelude)
         )),
         "layer" => Some(format!(
-            "{{\"t\":\"layer\",\"q\":{},\"r\":[]}}",
+            "{{\"t\":\"layer-statement\",\"q\":{}}}",
             json_string(prelude)
         )),
         _ => None,
@@ -13350,11 +13955,11 @@ fn keyframes_rules_json(body: &str) -> String {
 fn decls_json(block: &str) -> String {
     let mut out = String::from("[");
     let mut first = true;
-    for decl in block.split(';') {
-        let Some((k, v, _important)) = parse_decl(decl) else {
+    for decl in split_top_level(block, ';') {
+        let Some((k, v, important)) = parse_decl(decl) else {
             continue;
         };
-        let item = format!("[{},{}]", json_string(&k), json_string(&v));
+        let item = format!("[{},{},{}]", json_string(&k), json_string(&v), important);
         push_item(&mut out, &mut first, &item);
     }
     out.push(']');
@@ -13699,8 +14304,8 @@ mod tests {
         );
         assert!(json.contains(r#""t":"style""#), "{json}");
         assert!(json.contains(r#""sel":"a.x""#), "{json}");
-        assert!(json.contains(r#"["color","red"]"#), "{json}");
-        assert!(json.contains(r#"["margin","0"]"#), "{json}");
+        assert!(json.contains(r#"["color","red",false]"#), "{json}");
+        assert!(json.contains(r#"["margin","0",false]"#), "{json}");
         assert!(json.contains(r#""t":"media""#), "{json}");
         assert!(json.contains(r#""q":"(min-width: 1px)""#), "{json}");
         assert!(json.contains(r#""t":"font-face""#), "{json}");
@@ -14548,6 +15153,29 @@ mod tests {
     }
 
     #[test]
+    fn relative_font_weights_compute_before_inheritance() {
+        for (weight, bolder, lighter) in [
+            (50., 400., 50.),
+            (100., 400., 100.),
+            (350., 700., 100.),
+            (550., 900., 400.),
+            (750., 900., 700.),
+            (950., 950., 700.),
+        ] {
+            let dom = Dom::parse_document(&format!(
+                "<div style='font-weight:{weight}'><b id=b style='font-weight:bolder'><span id=inherited></span></b><i id=l style='font-weight:lighter'></i></div>"
+            ));
+            for (id, expected) in [("b", bolder), ("inherited", bolder), ("l", lighter)] {
+                assert_eq!(
+                    dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "font-weight"),
+                    Some(expected.to_string()),
+                    "parent {weight}, {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn font_sizes_accept_css_exponent_dimensions() {
         assert_eq!(font_size_px("+1e1px", 20., 16.), Some(10.));
         assert_eq!(font_size_px("1.5E2%", 20., 16.), Some(30.));
@@ -14819,11 +15447,8 @@ mod tests {
     }
 
     #[test]
-    fn hidden_pseudo_element_generates_no_content() {
-        // The width-reservation idiom: a hidden bold copy of a tab label via
-        // `::before{content:attr(data-content);visibility:hidden}`. Its content
-        // must NOT render (else the label doubles — GitHub's "CodeCode"). A
-        // visible `::before` still renders.
+    fn hidden_pseudo_element_retains_generated_content_for_layout() {
+        // Visibility suppresses paint while retaining the generated box.
         let dom = Dom::parse_document(
             "<head><style>\
              .tab::before{content:attr(data-content);visibility:hidden}\
@@ -14843,15 +15468,33 @@ mod tests {
             .find(|&i| dom.attr(i, "class") == Some("tag"))
             .unwrap();
         assert_eq!(
-            dom.pseudo_content(tab, PseudoEl::Before),
-            None,
-            "hidden ::before renders nothing"
+            dom.pseudo_content(tab, PseudoEl::Before).as_deref(),
+            Some("Code"),
+            "hidden ::before keeps its content for measurement"
         );
         assert_eq!(
             dom.pseudo_content(tag, PseudoEl::Before).as_deref(),
             Some("#"),
             "visible ::before still renders"
         );
+    }
+
+    #[test]
+    fn nesting_preserves_parent_list_specificity_and_literal_ampersands() {
+        let dom = Dom::parse_document(
+            r#"<style>#unmatched,.parent {& > span {color:blue} &[data-value="a&b"] {padding-left:7px}} .parent span{color:red}</style><div class=parent id=p data-value="a&b"><span id=child></span></div>"#,
+        );
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("child").unwrap(), "color")
+                .as_deref(),
+            Some("blue")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("p").unwrap(), "padding-left")
+                .as_deref(),
+            Some("7px")
+        );
+        assert!(!replace_nesting_tokens(r#"[data-x="a&b"] .escaped\&"#, ":scope").1);
     }
 
     #[test]
@@ -15488,7 +16131,7 @@ mod tests {
         assert!(supports_condition("(gap: 1rem)"));
         assert!(supports_condition("(aspect-ratio: 1 / 1)"));
         assert!(supports_condition("(clip-path: inset(0 0 100% 0))"));
-        assert!(!supports_condition("(clip-path: circle(50%))"));
+        assert!(supports_condition("(clip-path: circle(50%))"));
         assert!(!supports_condition("(clip-path: inset(3))"));
         // A box type we don't lay out, and visual-only properties we don't
         // track, are unsupported → the page's fallback applies.
@@ -17763,9 +18406,9 @@ mod tests {
             Some("(42)")
         );
         assert_eq!(
-            dom.pseudo_content(by("c"), PseudoEl::Before),
-            None,
-            "counter() unsupported → whole value dropped"
+            dom.pseudo_content(by("c"), PseudoEl::Before).as_deref(),
+            Some("0"),
+            "an absent counter is instantiated at zero"
         );
         assert_eq!(
             dom.pseudo_content(by("ab"), PseudoEl::Before).as_deref(),
@@ -17855,6 +18498,97 @@ mod tests {
             dom.computed_style(t, "letter-spacing").as_deref(),
             Some("1px"),
             "unlayered (0,1,0) beats layered (1,0,0): layers outrank specificity"
+        );
+    }
+
+    #[test]
+    fn revert_layer_rolls_back_normal_important_inline_and_pseudo_values() {
+        let dom = Dom::parse_document(
+            r#"<style>
+          @layer base, theme, utilities;
+          @layer base { p { letter-spacing: 1px; margin: 3px; --gap: 4px }
+            p::before { content: "x"; letter-spacing: 2px } }
+          @layer theme {
+            p { letter-spacing: 8px; margin: 9px; --gap: 10px }
+            p { letter-spacing: revert-layer; margin: revert-layer; --gap: revert-layer }
+            p::before { letter-spacing: revert-layer }
+            #important { letter-spacing: revert-layer !important }
+          }
+          @layer utilities { #important { letter-spacing: 7px !important } }
+          #plain { letter-spacing: revert-layer }
+          #important { letter-spacing: 6px; }
+          #inline { letter-spacing: 5px !important }
+          #fallback { letter-spacing: var(--absent, revert-layer); margin: var(--absent, revert-layer) }
+        </style><p id=plain></p><p id=important></p>
+        <p id=inline style="letter-spacing:revert-layer!important"></p>
+        <p id=normal style="letter-spacing:revert-layer"></p>
+        <p id=fallback></p>"#,
+        );
+        for (name, expected) in [
+            ("plain", "1px"),
+            ("important", "1px"),
+            ("inline", "5px"),
+            ("normal", "1px"),
+            ("fallback", "1px"),
+        ] {
+            let id = dom.get_by_id(name).unwrap();
+            assert_eq!(
+                dom.computed_style(id, "letter-spacing").as_deref(),
+                Some(expected),
+                "{name}"
+            );
+            assert_eq!(
+                dom.computed_style(id, "margin-top").as_deref(),
+                Some("3px"),
+                "{name} shorthand rollback"
+            );
+            assert_eq!(
+                dom.custom_prop(id, "--gap").as_deref(),
+                Some("4px"),
+                "{name} custom rollback"
+            );
+            assert_eq!(
+                dom.cascaded_maps(id)
+                    .before
+                    .get("letter-spacing")
+                    .map(String::as_str),
+                Some("2px"),
+                "{name} pseudo rollback"
+            );
+        }
+    }
+
+    #[test]
+    fn revert_layer_distinguishes_sublayers_and_origin_rollback() {
+        let dom = Dom::parse_document(
+            r#"<style>
+          @layer base { p { display: none; letter-spacing: 1px; } }
+          @layer theme {
+            @layer first { p { letter-spacing: 2px; } }
+            @layer second { p { letter-spacing: revert-layer; } }
+            p { letter-spacing: revert-layer; }
+          }
+          #origin { display: revert; letter-spacing: revert; }
+          #layer { display: revert-layer; letter-spacing: revert-layer; }
+          #exhausted { text-indent: revert-layer; }
+        </style><p id=origin></p><p id=layer></p><p id=exhausted></p>"#,
+        );
+        let origin = dom.get_by_id("origin").unwrap();
+        let layer = dom.get_by_id("layer").unwrap();
+        assert!(!dom.is_hidden(origin));
+        assert!(dom.is_hidden(layer));
+        assert_eq!(
+            dom.computed_style(layer, "letter-spacing").as_deref(),
+            Some("2px")
+        );
+        assert_ne!(
+            dom.computed_style(origin, "letter-spacing").as_deref(),
+            Some("2px")
+        );
+        assert_ne!(
+            dom.computed_style(dom.get_by_id("exhausted").unwrap(), "text-indent")
+                .as_deref(),
+            Some("revert-layer")
         );
     }
 

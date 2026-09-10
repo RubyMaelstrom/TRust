@@ -4756,6 +4756,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_shadow_root", 1, host_shadow_root),
     ("__dom_adopt_styles", 2, host_adopt_styles),
     ("__css_parse", 1, host_css_parse),
+    ("__css_style", 3, host_css_style),
+    ("__css_sheet", 2, host_css_sheet),
     ("__css_supports_selector", 1, host_css_supports_selector),
     ("__css_supports_color", 1, host_css_supports_color),
     ("__dom_template_content", 1, host_template_content),
@@ -8793,6 +8795,112 @@ fn host_css_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::from_string(crate::dom::parse_cssom_json(&css)))
 }
 
+fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let text = host_arg_string(ctx, args, 1);
+    let extra = host_arg_string(ctx, args, 2);
+    if op == "adopted-sheets" {
+        if let (Ok(scope), Ok(sheets)) = (
+            text.parse::<usize>(),
+            serde_json::from_str::<Vec<(String, String)>>(&extra),
+        ) {
+            host_dom(ctx).borrow_mut().set_adopted_sheets(
+                scope,
+                sheets
+                    .into_iter()
+                    .map(|(text, base)| (text, url::Url::parse(&base).ok()))
+                    .collect(),
+            );
+        }
+        return Ok(Value::from_string("null".into()));
+    }
+    if matches!(op.as_str(), "computed-names" | "computed-pseudo") {
+        if host_dom(ctx).borrow().has_container_queries() {
+            let _ = ensure_host_geom_cache(ctx, "computed-container-query");
+        }
+        let value = if let Ok((id, pseudo)) = serde_json::from_str::<(usize, Option<String>)>(&text)
+        {
+            let dom = host_dom(ctx);
+            let dom = dom.borrow();
+            let which = match pseudo.as_deref() {
+                Some(":before" | "::before") => Some(crate::dom::PseudoEl::Before),
+                Some(":after" | "::after") => Some(crate::dom::PseudoEl::After),
+                _ => None,
+            };
+            if id >= dom.node_count()
+                || !dom.is_connected(id)
+                || pseudo.is_some() && which.is_none()
+            {
+                if op == "computed-names" {
+                    serde_json::json!([])
+                } else {
+                    serde_json::Value::Null
+                }
+            } else if op == "computed-names" {
+                serde_json::json!(dom.cssom_computed_names(id, which))
+            } else {
+                serde_json::json!(
+                    which.and_then(|which| dom.pseudo_layout_value(id, which, &extra))
+                )
+            }
+        } else {
+            serde_json::Value::Null
+        };
+        return Ok(Value::from_string(value.to_string()));
+    }
+    if op == "register-property" {
+        let result = match (
+            text.parse::<usize>(),
+            serde_json::from_str::<(String, String, bool, Option<String>, String)>(&extra),
+        ) {
+            (Ok(document), Ok((name, syntax, inherits, initial, base))) => {
+                host_dom(ctx).borrow_mut().register_property(
+                    document,
+                    &name,
+                    &syntax,
+                    inherits,
+                    initial,
+                    url::Url::parse(&base).ok(),
+                )
+            }
+            _ => Err("SyntaxError"),
+        };
+        return Ok(Value::from_string(
+            serde_json::to_string(&result.err()).unwrap(),
+        ));
+    }
+    if op == "inline-write" {
+        if let (Ok(id), Ok(declarations)) = (
+            text.parse::<usize>(),
+            serde_json::from_str::<crate::dom::cssom::Declarations>(&extra),
+        ) {
+            let dom = host_dom(ctx);
+            let mut dom = dom.borrow_mut();
+            dom.set_cssom_inline(id, declarations);
+        }
+        return Ok(Value::from_string("null".to_string()));
+    }
+    Ok(Value::from_string(
+        crate::dom::cssom::operation(&op, &text, &extra).to_string(),
+    ))
+}
+
+fn host_css_sheet(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let update = host_arg_string(ctx, args, 1);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Null);
+    };
+    if let Ok((text, media, disabled)) = serde_json::from_str::<(String, String, bool)>(&update) {
+        dom.set_cssom_sheet(id, text, media, disabled);
+    }
+    Ok(dom
+        .cssom_sheet_source(id)
+        .map(Value::from_string)
+        .unwrap_or(Value::Null))
+}
+
 fn host_css_supports_selector(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let selector = host_arg_string(ctx, args, 0);
     Ok(Value::Bool(crate::dom::selector_parses(&selector)))
@@ -9163,6 +9271,13 @@ fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<
 /// layout pass; all other properties come from the canonical DOM cascade.
 fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 1);
+    {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        if host_arg_node(&dom, args, 0).is_none_or(|id| !dom.is_connected(id)) {
+            return Ok(Value::Null);
+        }
+    }
     // CSS Conditional 5 §5.4: query results participate in the same style
     // change event. Even a non-geometric getter (color/display) can depend
     // on an ancestor's newly changed size, so flush layout before exposing it.
@@ -10734,7 +10849,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 142, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 144, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -10745,7 +10860,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 142);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 144);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -14460,6 +14575,27 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "htmlDdaResult"),
             "undefined|false|true|true|false|false|true|null"
+        );
+    }
+
+    #[test]
+    fn cssom_mutations_update_the_live_cascade() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(&mut engine, include_str!("fixtures/cssom_mutations.mjs")),
+            "cssom-mutations-ok"
+        );
+    }
+
+    #[test]
+    fn property_registration_updates_the_live_cascade() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                include_str!("fixtures/property_registration.mjs")
+            ),
+            "property-registration-ok"
         );
     }
 

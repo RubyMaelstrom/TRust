@@ -15,9 +15,7 @@
 //! containers carry theirs separately (`BoxNode::oof` — they don't
 //! participate in flex/grid layout, css-flexbox §4.1).
 //!
-//! Honesty notes (staged phases, not policy): floats are not yet taken out
-//! of flow; an
-//! inline-level element whose subtree holds block-level boxes is promoted to
+//! An inline-level element whose subtree holds block-level boxes is promoted to
 //! a block box (the §9.2.1.1 block-in-inline split, approximated
 //! structurally — the visual result for real-world markup like
 //! `<a><div>…</div></a>` is the same).
@@ -27,7 +25,7 @@ use url::Url;
 
 use crate::doc::{FieldKind, Form};
 use crate::dom::{DOCUMENT, Dom, NodeData, NodeId, PseudoEl};
-use crate::layout2::{ControlMap, Units, css_length_px, format_list_marker, is_collapsible_space};
+use crate::layout2::{ControlMap, Units, css_length_px, is_collapsible_space};
 
 use super::style::{BoxStyle, Disp, Pos, display_of};
 use super::value::Vp;
@@ -915,6 +913,8 @@ impl Builder<'_> {
 
     /// The formatted `::marker` for a list item, advancing the counter.
     fn marker(&mut self, id: NodeId) -> (Option<String>, Option<String>, bool) {
+        // Retain the list sequence in box-cache keys. CSS counter values use
+        // the canonical flattened-tree pass below, including author overrides.
         if let Some(v) = self
             .dom
             .attr(id, "value")
@@ -923,14 +923,9 @@ impl Builder<'_> {
         {
             top.0 = v;
         }
-        let n = match self.lists.last_mut() {
-            Some(top) => {
-                let n = top.0;
-                top.0 += top.1;
-                n
-            }
-            None => 1,
-        };
+        if let Some(top) = self.lists.last_mut() {
+            top.0 = top.0.saturating_add(top.1);
+        }
         let image = self
             .dom
             .computed_value_resolved(id, "list-style-image")
@@ -956,7 +951,7 @@ impl Builder<'_> {
         let text = image
             .as_ref()
             .map(|_| " ".to_string())
-            .unwrap_or_else(|| format_list_marker(kind.trim(), n));
+            .unwrap_or_else(|| self.dom.css_list_marker(id, kind.trim()));
         let inside = matches!(
             self.dom
                 .computed_value_resolved(id, "list-style-position")

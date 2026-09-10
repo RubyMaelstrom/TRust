@@ -34,6 +34,40 @@ pub(crate) enum IMode {
 }
 
 impl Flow<'_> {
+    /// CSS Sizing 3/4 #sizing-values. Intrinsic keywords name content-box
+    /// sizes; the argument of fit-content() resolves like a specified size,
+    /// including box-sizing, before applying its min/max-content bounds.
+    pub(super) fn intrinsic_width_value(
+        &self,
+        value: &Len,
+        b: &BoxNode,
+        basis: Option<f32>,
+        inl: &InlineStyle,
+    ) -> Option<f32> {
+        let mode = match value {
+            Len::MinContent => Some(IMode::Min),
+            Len::MaxContent => Some(IMode::Max),
+            Len::FitContent | Len::FitContentLimit(_) => None,
+            _ => return None,
+        };
+        if let Some(mode) = mode {
+            return Some(self.intrinsic_w(b, mode, inl));
+        }
+        let s = &b.style;
+        let side = |v: &Len| v.resolve(basis).unwrap_or(0.);
+        let bp =
+            s.border[3] + s.border[1] + side(&s.padding[3]).max(0.) + side(&s.padding[1]).max(0.);
+        let stretch = match value {
+            Len::FitContentLimit(limit) => limit
+                .resolve(basis)
+                .map(|v| (v - if s.border_box { bp } else { 0. }).max(0.))?,
+            _ => (basis? - bp - side(&s.margin[3]) - side(&s.margin[1])).max(0.),
+        };
+        let min = self.intrinsic_w(b, IMode::Min, inl);
+        let max = self.intrinsic_w(b, IMode::Max, inl).max(min);
+        Some(stretch.clamp(min, max))
+    }
+
     /// The CONTENT-box intrinsic width of `b`'s content, px. `inl` is the
     /// inherited inline context (only measurement-relevant pieces matter:
     /// white-space, letter-spacing, transform, font-zero — all re-derived
@@ -79,7 +113,7 @@ impl Flow<'_> {
 
     fn intrinsic_w_inner(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
         let here = if b.node == NO_NODE {
-            inl.clone()
+            inl.with_pseudo(self.dom, b.style.pseudo)
         } else {
             InlineStyle::derive(self.dom, b.node, inl, self.base)
         };
@@ -167,17 +201,7 @@ impl Flow<'_> {
                 }
             }
             Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode, &here),
-            Content::Grid(items) => {
-                // Grid intrinsic sizing under a constraint (§11.9 runs the
-                // whole track algorithm) — approximated pending real
-                // constraint plumbing: min = the widest item's min
-                // contribution; max = the widest item's max contribution
-                // (a shrink-wrapped grid sizes to its largest column set;
-                // definite templates dominate via the container's own
-                // width property in practice).
-                let contributions = items.iter().map(|it| self.contribution(it, mode, &here));
-                contributions.fold(0.0f32, f32::max)
-            }
+            Content::Grid(items) => self.grid_intrinsic_width(b, items, mode, &here),
             Content::Flex(items) => {
                 let u = Units::of(self.dom, b.node);
                 let fs = super::flex::container_style(self.dom, b.node, u, self.vp);
@@ -232,21 +256,19 @@ impl Flow<'_> {
                 v.max(0.0)
             }
         };
-        let content = s
-            .width
-            .resolve(preferred_basis)
-            .map(to_content)
+        let content = self
+            .intrinsic_width_value(&s.width, b, preferred_basis, inl)
+            .or_else(|| s.width.resolve(preferred_basis).map(to_content))
             .unwrap_or_else(|| self.intrinsic_w(b, mode, inl));
-        let min = s
-            .min_width
-            .resolve(Some(0.0))
-            .map(to_content)
+        let min = self
+            .intrinsic_width_value(&s.min_width, b, Some(0.), inl)
+            .or_else(|| s.min_width.resolve(Some(0.0)).map(to_content))
             .unwrap_or(0.0);
         let max = match &s.max_width {
             Len::None => f32::INFINITY,
-            l => l
-                .resolve(preferred_basis)
-                .map(to_content)
+            l => self
+                .intrinsic_width_value(l, b, preferred_basis, inl)
+                .or_else(|| l.resolve(preferred_basis).map(to_content))
                 .unwrap_or(f32::INFINITY),
         }
         .max(min);

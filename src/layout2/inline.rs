@@ -307,6 +307,8 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     pen: f32,
     line_start: f32,
     pending_space: bool,
+    /// A break-spaces opportunity survives inline element/text boundaries.
+    preserved_break: bool,
     /// Owed inline-box edge width (margins/borders/padding of opened/closed
     /// inline boxes), in px — folded into the next placement so an edge at a
     /// wrap point travels with the content it precedes.
@@ -399,6 +401,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
+            preserved_break: false,
             pending_gap_px: 0.0,
             fc,
             float_boxes,
@@ -455,6 +458,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.line_start = self.line_left + indent;
         self.pen = self.line_start;
         self.pending_space = false;
+        self.preserved_break = false;
     }
 
     /// Place the k-th inline float met (§9.5.1): pull it aside into the float
@@ -598,7 +602,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // their inherited text context is the originating element's
                 // surrounding context and their own box model is in `style`.
                 let inner = if *node == crate::layout2::NO_NODE {
-                    ctx.with_pseudo(style.pseudo)
+                    ctx.with_pseudo(self.dom, style.pseudo)
                 } else {
                     self.form_context(*node, ctx)
                 };
@@ -641,6 +645,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             return;
         }
         let t = ctx.transform.apply(t);
+        let t = if ctx.ws.converts_to_spaces() {
+            std::borrow::Cow::Owned(t.replace("\r\n", " ").replace(['\t', '\n', '\r'], " "))
+        } else if t.contains('\r') {
+            std::borrow::Cow::Owned(t.replace("\r\n", "\n").replace('\r', "\n"))
+        } else {
+            t
+        };
         if ctx.ws.collapses_spaces() {
             let mut word = String::new();
             for c in t.chars() {
@@ -673,8 +684,28 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     if j > 0 {
                         let tab = self.tab_advance(ctx);
                         if tab > 0.0 {
-                            let rel = (self.pen - self.line_start).max(0.0);
-                            self.pen = self.line_start + (rel / tab).floor().mul_add(tab, tab);
+                            if ctx.ws.breaks_spaces() {
+                                let advance =
+                                    |pen: f32, start: f32| tab - (pen - start).max(0.0) % tab;
+                                if self.preserved_break
+                                    && ctx.ws.wraps()
+                                    && self.pen > self.line_start
+                                    && !super::css_px_fits(
+                                        advance(self.pen, self.line_start),
+                                        self.line_right - self.pen,
+                                    )
+                                {
+                                    self.soft_break();
+                                }
+                                // The tab's advance is a gap, not a shaped
+                                // U+0020: merging it into a text run would
+                                // replace its tab-stop width when reshaped.
+                                self.pen += advance(self.pen, self.line_start);
+                                self.preserved_break = true;
+                            } else {
+                                let rel = (self.pen - self.line_start).max(0.0);
+                                self.pen = self.line_start + (rel / tab).floor().mul_add(tab, tab);
+                            }
                         }
                     }
                     if !piece.is_empty() {
@@ -735,6 +766,23 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     fn preserved(&mut self, t: &str, ctx: &InlineStyle) {
         if !ctx.ws.wraps() {
             self.place(t, ctx, false, true);
+            return;
+        }
+        if ctx.ws.breaks_spaces() {
+            // CSS Text 4 #white-space-collapse: every preserved separator
+            // supplies a break AFTER itself and keeps its advance at line end.
+            // U+00A0 is explicitly excluded from "other space separators".
+            let separator = |c: char| {
+                matches!(
+                    c,
+                    ' ' | '\u{1680}' | '\u{2000}'
+                        ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+                )
+            };
+            for part in t.split_inclusive(separator) {
+                self.place_wrapped(part, ctx, self.preserved_break, true);
+                self.preserved_break = part.chars().next_back().is_some_and(separator);
+            }
             return;
         }
         // With no active float exclusions, all following lines span `cap`.

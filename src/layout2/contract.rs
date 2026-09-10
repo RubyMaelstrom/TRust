@@ -242,9 +242,9 @@ pub enum ItemKind {
     Pre,
     /// A followable anchor (carries a `link`).
     Link,
-    /// A form-control stub (carries the control's element `node`).
+    /// A form control, painted and edited through its element `node`.
     Form,
-    /// An image placeholder (alt text for now; real pixels in L3).
+    /// An image with resource identity, sizing, and an alt-text fallback.
     Image,
     /// A generated border glyph (box-drawing) — rendered as quiet structural
     /// chrome (the theme's DIM), never selectable or wrapped.
@@ -1042,75 +1042,123 @@ pub(crate) enum WhiteSpace {
     PreWrap,
     /// Collapse spaces but preserve newlines; wrap.
     PreLine,
+    PreLineNoWrap,
+    /// Preserve all spaces, including line-end advance, and break after each.
+    BreakSpaces,
+    BreakSpacesNoWrap,
+    /// SVG-compatible preservation: turn tabs and segment breaks into spaces.
+    PreserveSpaces,
+    PreserveSpacesNoWrap,
 }
 
 impl WhiteSpace {
     pub(crate) fn from_css(value: &str) -> Option<WhiteSpace> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "normal" => Some(WhiteSpace::Normal),
-            "nowrap" => Some(WhiteSpace::Nowrap),
-            "pre" => Some(WhiteSpace::Pre),
-            // `break-spaces` (CSS Text 4) = preserve + wrap, differing from
-            // pre-wrap only in trailing-space breaking — at terminal cell
-            // resolution the pre-wrap chunker already breaks anywhere, so
-            // they coincide (documented approximation).
-            "pre-wrap" | "break-spaces" => Some(WhiteSpace::PreWrap),
-            "pre-line" => Some(WhiteSpace::PreLine),
-            _ => None,
-        }
+        let (collapse, nowrap) = Self::components(value)?;
+        Some(Self::Normal.with_longhands(Some(collapse), Some(nowrap)))
     }
 
-    /// Fold the CSS Text 4 longhands over this (shorthand-derived) mode:
-    /// `white-space-collapse` replaces the collapse half, `text-wrap-mode`
-    /// the wrap half — §2: `white-space` is now their shorthand. Approximations
-    /// (terminal scale): `break-spaces`/`preserve-spaces` act as `preserve`,
-    /// and preserve-breaks + nowrap has no variant here (stays `PreLine`).
+    /// CSS Text 4 #white-space-property: legacy keywords expand into the
+    /// independent collapse and wrap longhands; modern values may combine them.
+    pub(crate) fn components(value: &str) -> Option<(&'static str, bool)> {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "normal" => return Some(("collapse", false)),
+            "pre" => return Some(("preserve", true)),
+            "pre-wrap" => return Some(("preserve", false)),
+            "pre-line" => return Some(("preserve-breaks", false)),
+            _ => {}
+        }
+        let (mut collapse, mut nowrap) = (None, None);
+        for token in value.split_whitespace() {
+            match token {
+                "collapse" | "preserve" | "preserve-breaks" | "preserve-spaces"
+                | "break-spaces"
+                    if collapse.is_none() =>
+                {
+                    collapse = Some(match token {
+                        "collapse" => "collapse",
+                        "preserve" => "preserve",
+                        "preserve-breaks" => "preserve-breaks",
+                        "preserve-spaces" => "preserve-spaces",
+                        _ => "break-spaces",
+                    });
+                }
+                "wrap" | "nowrap" if nowrap.is_none() => nowrap = Some(token == "nowrap"),
+                _ => return None,
+            }
+        }
+        if collapse.is_none() && nowrap.is_none() {
+            return None;
+        }
+        Some((collapse.unwrap_or("collapse"), nowrap.unwrap_or(false)))
+    }
+
     pub(crate) fn with_longhands(self, collapse: Option<&str>, nowrap: Option<bool>) -> WhiteSpace {
-        // Decompose to (collapse: 0 collapse / 1 preserve / 2 preserve-breaks,
-        // nowrap), override the declared half, recompose.
         let (mut c, mut nw) = match self {
-            WhiteSpace::Normal => (0u8, false),
-            WhiteSpace::Nowrap => (0, true),
-            WhiteSpace::Pre => (1, true),
-            WhiteSpace::PreWrap => (1, false),
-            WhiteSpace::PreLine => (2, false),
+            Self::Normal => (0u8, false),
+            Self::Nowrap => (0, true),
+            Self::PreWrap => (1, false),
+            Self::Pre => (1, true),
+            Self::PreLine => (2, false),
+            Self::PreLineNoWrap => (2, true),
+            Self::BreakSpaces => (3, false),
+            Self::BreakSpacesNoWrap => (3, true),
+            Self::PreserveSpaces => (4, false),
+            Self::PreserveSpacesNoWrap => (4, true),
         };
         if let Some(v) = collapse {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "collapse" => c = 0,
-                "preserve" | "break-spaces" | "preserve-spaces" => c = 1,
-                "preserve-breaks" => c = 2,
-                _ => {}
-            }
+            c = match v.trim().to_ascii_lowercase().as_str() {
+                "collapse" => 0,
+                "preserve" => 1,
+                "preserve-breaks" => 2,
+                "break-spaces" => 3,
+                "preserve-spaces" => 4,
+                _ => c,
+            };
         }
         if let Some(n) = nowrap {
             nw = n;
         }
         match (c, nw) {
-            (0, false) => WhiteSpace::Normal,
-            (0, true) => WhiteSpace::Nowrap,
-            (1, false) => WhiteSpace::PreWrap,
-            (1, true) => WhiteSpace::Pre,
-            _ => WhiteSpace::PreLine,
+            (0, false) => Self::Normal,
+            (0, true) => Self::Nowrap,
+            (1, false) => Self::PreWrap,
+            (1, true) => Self::Pre,
+            (2, false) => Self::PreLine,
+            (2, true) => Self::PreLineNoWrap,
+            (3, false) => Self::BreakSpaces,
+            (3, true) => Self::BreakSpacesNoWrap,
+            (_, false) => Self::PreserveSpaces,
+            (_, true) => Self::PreserveSpacesNoWrap,
         }
     }
-    /// Whether runs of spaces collapse to a single space.
     pub(crate) fn collapses_spaces(self) -> bool {
         matches!(
             self,
-            WhiteSpace::Normal | WhiteSpace::Nowrap | WhiteSpace::PreLine
+            Self::Normal | Self::Nowrap | Self::PreLine | Self::PreLineNoWrap
         )
     }
-    /// Whether literal `\n` forces a line break.
     pub(crate) fn preserves_newlines(self) -> bool {
-        matches!(
+        !matches!(
             self,
-            WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+            Self::Normal | Self::Nowrap | Self::PreserveSpaces | Self::PreserveSpacesNoWrap
         )
     }
-    /// Whether lines wrap at the content width.
     pub(crate) fn wraps(self) -> bool {
-        !matches!(self, WhiteSpace::Nowrap | WhiteSpace::Pre)
+        !matches!(
+            self,
+            Self::Nowrap
+                | Self::Pre
+                | Self::PreLineNoWrap
+                | Self::BreakSpacesNoWrap
+                | Self::PreserveSpacesNoWrap
+        )
+    }
+    pub(crate) fn breaks_spaces(self) -> bool {
+        matches!(self, Self::BreakSpaces | Self::BreakSpacesNoWrap)
+    }
+    pub(crate) fn converts_to_spaces(self) -> bool {
+        matches!(self, Self::PreserveSpaces | Self::PreserveSpacesNoWrap)
     }
 }
 
@@ -1175,87 +1223,6 @@ fn capitalize_words(s: &str) -> String {
         }
     }
     out
-}
-
-/// Render a list marker for `list-style-type` `kind` at counter `n`: a bullet
-/// glyph, a formatted ordinal (`N. `/`a. `/`i. `), or empty for `none`. Each
-/// ordinal carries its trailing `". "`; bullets a trailing space. Unknown
-/// types fall back to a disc, matching the UA default.
-pub(crate) fn format_list_marker(kind: &str, n: i64) -> String {
-    // css-counter-styles-3 §3: a <counter-style-name> that doesn't name a
-    // style we implement falls back to DECIMAL (the `_` arm — it was a
-    // bullet, which numbered nothing). Alphabetic/roman systems are defined
-    // for n ≥ 1 only; outside their range the marker also falls back to
-    // decimal (a `<ol reversed>` can count through zero into negatives).
-    let alpha = |n: i64, upper: bool| match u32::try_from(n) {
-        Ok(v) if v >= 1 => format!("{}. ", alpha_marker(v, upper)),
-        _ => format!("{n}. "),
-    };
-    let roman = |n: i64, upper: bool| match u32::try_from(n) {
-        Ok(v) if v >= 1 => format!("{}. ", roman_marker(v, upper)),
-        _ => format!("{n}. "),
-    };
-    match kind {
-        "none" => String::new(),
-        "disc" => "• ".to_owned(),
-        "circle" => "◦ ".to_owned(),
-        "square" => "▪ ".to_owned(),
-        "decimal" => format!("{n}. "),
-        "decimal-leading-zero" => format!("{n:02}. "),
-        "lower-alpha" | "lower-latin" => alpha(n, false),
-        "upper-alpha" | "upper-latin" => alpha(n, true),
-        "lower-roman" => roman(n, false),
-        "upper-roman" => roman(n, true),
-        _ => format!("{n}. "),
-    }
-}
-
-/// A bijective base-26 alphabetic ordinal: 1→a, 26→z, 27→aa, … (`0` keeps a
-/// literal `0`). Upper-cased when `upper`.
-fn alpha_marker(mut n: u32, upper: bool) -> String {
-    if n == 0 {
-        return "0".to_owned();
-    }
-    let mut buf = Vec::new();
-    while n > 0 {
-        n -= 1;
-        buf.push(b'a' + (n % 26) as u8);
-        n /= 26;
-    }
-    buf.reverse();
-    let s = String::from_utf8(buf).unwrap_or_default();
-    if upper { s.to_uppercase() } else { s }
-}
-
-/// A Roman-numeral ordinal (1→i, 4→iv, …); out of range (0 or >3999) falls
-/// back to the decimal number. Upper-cased when `upper`.
-fn roman_marker(mut n: u32, upper: bool) -> String {
-    if n == 0 || n > 3999 {
-        return n.to_string();
-    }
-    const VALS: &[(u32, &str)] = &[
-        (1000, "m"),
-        (900, "cm"),
-        (500, "d"),
-        (400, "cd"),
-        (100, "c"),
-        (90, "xc"),
-        (50, "l"),
-        (40, "xl"),
-        (10, "x"),
-        (9, "ix"),
-        (5, "v"),
-        (4, "iv"),
-        (1, "i"),
-    ];
-    let mut s = String::new();
-    for &(v, sym) in VALS {
-        while n >= v {
-            s.push_str(sym);
-            n -= v;
-        }
-    }
-    if upper { s.to_uppercase() } else { s }
 }
 
 /// The page's standard preview image (Open Graph `og:image`, else Twitter's
@@ -1475,19 +1442,42 @@ pub(crate) fn page_declares_video(dom: &Dom) -> bool {
             == 1
 }
 
-/// Resolve the numeric CSS Fonts weight used by the font matcher. Relative
-/// weights are approximated against the inherited normal face until the
-/// cascade stores parent-relative numeric computed values.
+/// Resolve an absolute CSS Fonts weight used by the font matcher. Relative
+/// weights are computed against the parent by the canonical cascade.
 pub(crate) fn css_font_weight(value: &str) -> Option<f32> {
     match value.trim().to_ascii_lowercase().as_str() {
         "normal" => Some(400.0),
         "bold" => Some(700.0),
-        "bolder" => Some(700.0),
-        "lighter" => Some(300.0),
         number => number
             .parse::<f32>()
             .ok()
             .map(|weight| weight.clamp(1.0, 1000.0)),
+    }
+}
+
+/// CSS Fonts 4 #relative-weights, including variable weights outside the
+/// historical 100–900 range. Values are computed before inheritance.
+pub(crate) fn relative_font_weight(value: &str, parent: f32) -> Option<f32> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "bolder" => Some(if parent < 350. {
+            400.
+        } else if parent < 550. {
+            700.
+        } else if parent < 900. {
+            900.
+        } else {
+            parent
+        }),
+        "lighter" => Some(if parent < 100. {
+            parent
+        } else if parent < 550. {
+            100.
+        } else if parent < 750. {
+            400.
+        } else {
+            700.
+        }),
+        _ => css_font_weight(value),
     }
 }
 

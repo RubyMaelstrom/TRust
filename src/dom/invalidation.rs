@@ -302,6 +302,7 @@ impl Dom {
                 self.selector_cache.get_mut().invalidate(id);
             }
             self.custom_prop_cache.get_mut().1.remove(&id);
+            self.properties.invalidate(id);
             self.matched_cache.get_mut().invalidate(id);
             self.cascaded_cache.get_mut().invalidate(id);
             self.font_cache.get_mut().invalidate(id);

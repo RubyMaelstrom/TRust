@@ -7,14 +7,11 @@
 //! tracks via find-the-size-of-an-fr (§11.7), and stretch auto tracks
 //! (§11.8).
 //!
-//! The old engine's TrackSpec GRAMMAR survives through its proven
-//! tokenizer (`split_track_tokens` — paren-aware, `[line-name]`-dropping);
-//! the sizing functions themselves are rebuilt on `Len` so everything
-//! resolves in px space against real used widths, never pre-quantized
-//! cells. Named LINES are dropped by that tokenizer (documented — named
-//! AREAS are supported and cover the common authoring pattern). Row subgrids
-//! share track sizing and placement with their parent (css-grid-2 §9).
-//! Column subgrids, named-line matching and baseline shims remain separate work.
+//! Track sizing uses the parenthesis-aware token stream and a separate
+//! line-name index. Named lines, occurrences, spans and areas participate in
+//! signed placement before implicit tracks are normalized. Row subgrids share
+//! track sizing and placement with their parent (css-grid-2 §9).
+//! Column subgrids require the matching parent inline-track constraint pass.
 
 use std::ops::Range;
 
@@ -270,124 +267,248 @@ fn parse_template(
 
 // ---------------------------------------------------------------- placement
 
-/// One `<grid-line>` as written (§8.3), before resolution.
+/// One <grid-line> (CSS Grid 2 #line-placement). Names are case-sensitive.
 #[derive(Clone, Debug, PartialEq)]
 enum LineRaw {
     Auto,
-    /// Nonzero line number (negative counts from the explicit end).
     Index(i32),
     Span(usize),
-    /// A `<custom-ident>`: a named AREA edge (named lines are not tracked).
     Name(String),
+    NamedIndex(String, i32),
+    NamedSpan(String, usize),
 }
 
 fn parse_grid_line(v: Option<&str>) -> LineRaw {
-    let Some(v) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
         return LineRaw::Auto;
     };
-    let lower = v.to_ascii_lowercase();
-    if lower == "auto" {
+    if v.eq_ignore_ascii_case("auto") {
         return LineRaw::Auto;
     }
-    if let Some(rest) = lower.strip_prefix("span") {
-        let n = rest.trim().parse::<usize>().unwrap_or(1).max(1);
-        return LineRaw::Span(n.min(1000));
-    }
-    if let Ok(n) = lower.parse::<i32>() {
-        if n == 0 {
-            return LineRaw::Auto; // zero is invalid (§8.3)
+    let mut span = false;
+    let mut number = None;
+    let mut name = None;
+    for part in v.split_whitespace() {
+        if part.eq_ignore_ascii_case("span") {
+            if span {
+                return LineRaw::Auto;
+            }
+            span = true;
+        } else if let Ok(n) = part.parse::<i32>() {
+            if number.is_some() || n == 0 {
+                return LineRaw::Auto;
+            }
+            number = Some(n.clamp(-1000, 1000));
+        } else {
+            if name.is_some() || part.eq_ignore_ascii_case("auto") {
+                return LineRaw::Auto;
+            }
+            name = Some(part.to_string());
         }
-        return LineRaw::Index(n);
     }
-    // "N ident" — the integer wins (named-line filtering unsupported).
-    let mut parts = lower.split_whitespace();
-    if let Some(first) = parts.next()
-        && let Ok(n) = first.parse::<i32>()
-        && n != 0
-    {
-        return LineRaw::Index(n);
+    match (span, number, name) {
+        (true, Some(n), _) if n < 1 => LineRaw::Auto,
+        (true, n, Some(name)) => LineRaw::NamedSpan(name, n.unwrap_or(1) as usize),
+        (true, Some(n), None) => LineRaw::Span(n as usize),
+        (true, None, None) => LineRaw::Auto,
+        (false, Some(n), Some(name)) => LineRaw::NamedIndex(name, n),
+        (false, None, Some(name)) => LineRaw::Name(name),
+        (false, Some(n), None) => LineRaw::Index(n),
+        _ => LineRaw::Auto,
     }
-    LineRaw::Name(v.to_string())
 }
 
-/// A resolved axis placement: definite 0-based start track, or auto, plus
-/// the span count.
+/// Extract line-name sets alongside the already expanded track list. Repeated
+/// boundaries merge names; the final boundary is retained as well. Grid 2
+/// #named-lines, #repeat-notation and #implicit-named-lines.
+fn template_line_names(value: &str, tracks: usize) -> Vec<Vec<String>> {
+    let mut names = vec![Vec::new(); tracks + 1];
+    let parts = named_track_tokens(value);
+    let count_tracks = |text: &str| split_track_tokens(text).len();
+    let fixed: usize = parts
+        .iter()
+        .filter_map(|part| {
+            if part.starts_with('[') {
+                return Some(0);
+            }
+            if part.to_ascii_lowercase().starts_with("repeat(") {
+                let (count, list) = part[7..part.len() - 1].split_once(',')?;
+                return Some(
+                    count.trim().parse::<usize>().unwrap_or(0).min(1000) * count_tracks(list),
+                );
+            }
+            Some(1)
+        })
+        .sum();
+    let mut line = 0;
+    let append = |part: &str, line: &mut usize, names: &mut Vec<Vec<String>>| {
+        if let Some(group) = part.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            if let Some(current) = names.get_mut(*line) {
+                for name in group.split_whitespace() {
+                    if !current.iter().any(|n| n == name) {
+                        current.push(name.to_owned());
+                    }
+                }
+            }
+        } else {
+            *line += 1;
+        }
+    };
+    for part in parts {
+        if part.to_ascii_lowercase().starts_with("repeat(") && part.ends_with(')') {
+            let Some((count, list)) = part[7..part.len() - 1].split_once(',') else {
+                continue;
+            };
+            let count = count
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| tracks.saturating_sub(fixed) / count_tracks(list).max(1))
+                .min(1000);
+            let repeated = named_track_tokens(list);
+            for _ in 0..count {
+                for part in &repeated {
+                    append(part, &mut line, &mut names);
+                }
+                if line > tracks {
+                    break;
+                }
+            }
+        } else {
+            append(part, &mut line, &mut names);
+        }
+    }
+    names
+}
+
+fn named_track_tokens(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut parens = 0;
+    let mut bracket = false;
+    let mut escaped = false;
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        match c {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' if parens == 0 => {
+                if start < i && !value[start..i].trim().is_empty() {
+                    parts.push(value[start..i].trim());
+                }
+                start = i;
+                bracket = true;
+            }
+            ']' if parens == 0 => {
+                parts.push(&value[start..i + 1]);
+                start = i + 1;
+                bracket = false;
+            }
+            c if c.is_whitespace() && parens == 0 && !bracket => {
+                if start < i {
+                    parts.push(&value[start..i]);
+                }
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < value.len() {
+        parts.push(&value[start..]);
+    }
+    parts
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AxisPlace {
-    start: Option<usize>,
+    /// Signed until implicit tracks before the explicit grid are allocated.
+    start: Option<i32>,
     span: usize,
 }
 
-/// §8.3.1: combine a start/end pair into a definite-or-auto placement.
-/// `explicit_tracks` anchors negative indexes; `area` is the named area's
-/// (start, end) track range for this axis when one matches.
 fn resolve_axis(
     start: LineRaw,
     end: LineRaw,
     explicit_tracks: usize,
-    area_of: &dyn Fn(&str) -> Option<(usize, usize)>,
+    names: &[Vec<String>],
 ) -> AxisPlace {
-    let lines = explicit_tracks as i32 + 1;
-    let to_index = |raw: &LineRaw, is_end: bool| -> Option<i32> {
-        match raw {
-            LineRaw::Index(n) => Some(if *n < 0 { lines + 1 + n } else { *n }),
-            LineRaw::Name(name) => {
-                // The area's track range is half-open (s..e): start edge =
-                // line s+1, END edge = line e+1.
-                area_of(name).map(|(s, e)| if is_end { e as i32 + 1 } else { s as i32 + 1 })
+    let explicit_end = explicit_tracks as i32;
+    let has = |line: i32, name: &str| {
+        line >= 0
+            && names
+                .get(line as usize)
+                .is_some_and(|v| v.iter().any(|n| n == name))
+    };
+    let nth = |name: &str, number: i32| {
+        let step = if number < 0 { -1 } else { 1 };
+        let mut left = number.unsigned_abs();
+        let mut line = if step < 0 { explicit_end } else { 0 };
+        loop {
+            if line < 0 || line > explicit_end || has(line, name) {
+                left -= 1;
             }
-            _ => None,
+            if left == 0 {
+                break line;
+            }
+            line += step;
         }
     };
-    let s_idx = to_index(&start, false);
-    let e_idx = to_index(&end, true);
-    match (s_idx, e_idx) {
-        (Some(a), Some(b)) => {
-            // Equal lines: the end becomes auto (span 1). Swapped: swap.
-            let (a, b) = if a == b {
-                (a, a + 1)
-            } else if b < a {
-                (b, a)
-            } else {
-                (a, b)
-            };
-            AxisPlace {
-                start: Some((a - 1).max(0) as usize),
-                span: (b - a).max(1) as usize,
+    let index = |raw: &LineRaw, end: bool| match raw {
+        LineRaw::Index(n) => Some(if *n > 0 { n - 1 } else { explicit_end + 1 + n }),
+        LineRaw::NamedIndex(name, n) => Some(nth(name, *n)),
+        LineRaw::Name(name) => {
+            let edge = format!("{name}-{}", if end { "end" } else { "start" });
+            Some(
+                (0..=explicit_end)
+                    .find(|&line| has(line, &edge))
+                    .unwrap_or_else(|| nth(name, 1)),
+            )
+        }
+        _ => None,
+    };
+    let span_to = |from: i32, raw: &LineRaw, step: i32| {
+        let (mut left, name) = match raw {
+            LineRaw::Span(n) => (*n, None),
+            LineRaw::NamedSpan(name, n) => (*n, Some(name.as_str())),
+            _ => (1, None),
+        };
+        let mut line = from;
+        while left > 0 {
+            line += step;
+            if name.is_none_or(|name| {
+                has(line, name) || step > 0 && line > explicit_end || step < 0 && line < 0
+            }) {
+                left -= 1;
             }
         }
-        (Some(a), None) => {
-            let span = match end {
-                LineRaw::Span(n) => n,
-                _ => 1,
-            };
-            AxisPlace {
-                start: Some((a - 1).max(0) as usize),
-                span,
-            }
-        }
-        (None, Some(b)) => {
+        line
+    };
+    let (a, b) = match (index(&start, false), index(&end, true)) {
+        (Some(a), Some(b)) if a == b => (a, a + 1),
+        (Some(a), Some(b)) => (a.min(b), a.max(b)),
+        (Some(a), None) => (a, span_to(a, &end, 1)),
+        (None, Some(b)) => (span_to(b, &start, -1), b),
+        (None, None) => {
             let span = match start {
                 LineRaw::Span(n) => n,
-                _ => 1,
+                LineRaw::NamedSpan(_, _) => 1,
+                _ => match end {
+                    LineRaw::Span(n) => n,
+                    _ => 1,
+                },
             };
-            // Ends at line b, spanning back; a start before line 1 clamps
-            // (implicit tracks are appended, never prepended — documented).
-            let s = b - 1 - span as i32;
-            AxisPlace {
-                start: Some(s.max(0) as usize),
-                span,
-            }
+            return AxisPlace { start: None, span };
         }
-        (None, None) => {
-            // §8.3.1: two spans drop the end one; a lone span rides auto.
-            let span = match (&start, &end) {
-                (LineRaw::Span(n), _) => *n,
-                (_, LineRaw::Span(n)) => *n,
-                _ => 1,
-            };
-            AxisPlace { start: None, span }
-        }
+    };
+    AxisPlace {
+        start: Some(a),
+        span: (b - a).max(1) as usize,
     }
 }
 
@@ -449,7 +570,7 @@ fn auto_place(
     // Step 3: the implicit grid's column count.
     let mut cols = explicit_cols.max(1);
     for (c, _) in &items {
-        if let Some(s) = c.start {
+        if let Some(s) = c.start.map(|n| n as usize) {
             cols = cols.max(s + c.span);
         } else {
             cols = cols.max(c.span);
@@ -462,7 +583,7 @@ fn auto_place(
     let mut out: Vec<Option<Placed>> = vec![None; items.len()];
     // Step 1: definite positions in both axes.
     for (i, (c, r)) in items.iter().enumerate() {
-        if let (Some(cs), Some(rs)) = (c.start, r.start) {
+        if let (Some(cs), Some(rs)) = (c.start.map(|n| n as usize), r.start.map(|n| n as usize)) {
             occ.mark(rs, cs, r.span, c.span);
             out[i] = Some(Placed {
                 cols: cs..cs + c.span,
@@ -476,7 +597,7 @@ fn auto_place(
         if out[i].is_some() || c.start.is_some() || r.start.is_none() {
             continue;
         }
-        let rs = r.start.unwrap();
+        let rs = r.start.unwrap() as usize;
         let from = if dense {
             0
         } else {
@@ -509,7 +630,7 @@ fn auto_place(
             cur_r = 0;
             cur_c = 0;
         }
-        let (rs, cs) = if let Some(cs) = c.start {
+        let (rs, cs) = if let Some(cs) = c.start.map(|n| n as usize) {
             // Definite column: walk rows at that column.
             if dense {
                 cur_r = 0;
@@ -592,7 +713,7 @@ fn parse_areas(value: &str) -> Option<(AreaMap, usize, usize)> {
             if name.starts_with('.') {
                 continue; // null cell
             }
-            let key = name.to_ascii_lowercase();
+            let key = name.clone();
             match map.get_mut(&key) {
                 None => {
                     map.insert(key, (r..r + 1, c..c + 1));
@@ -610,7 +731,7 @@ fn parse_areas(value: &str) -> Option<(AreaMap, usize, usize)> {
     for (name, (rr, cc)) in &map {
         for r in rr.clone() {
             for c in cc.clone() {
-                if rows[r][c].to_ascii_lowercase() != *name {
+                if rows[r][c] != *name {
                     return None;
                 }
             }
@@ -630,6 +751,17 @@ struct Contrib {
     minimum: f32,
     min: f32,
     max: f32,
+}
+
+struct GridSetup<'t> {
+    ordered: Vec<&'t BoxNode>,
+    cols: Vec<Track>,
+    rows: Vec<Track>,
+    placed: Vec<Placed>,
+    row_names: Vec<Vec<String>>,
+    gap_col: f32,
+    gap_row: f32,
+    inherited: Option<RowInput>,
 }
 
 /// Per-transaction parent constraints, never retained across layouts. A subgrid
@@ -653,6 +785,7 @@ impl SubgridRows {
 #[derive(Clone)]
 struct RowInput {
     tracks: Vec<Track>,
+    names: Vec<Vec<String>>,
     // None during intrinsic measurement; exact parent positions on final layout.
     positions: Option<Vec<f32>>,
     gap: f32,
@@ -835,6 +968,17 @@ fn size_tracks(
     gap: f32,
     stretch: bool,
 ) {
+    size_tracks_constrained(tracks, items, avail, gap, stretch, false);
+}
+
+fn size_tracks_constrained(
+    tracks: &mut [Track],
+    items: &[Contrib],
+    avail: Option<f32>,
+    gap: f32,
+    stretch: bool,
+    min_content: bool,
+) {
     let n_live = tracks.iter().filter(|t| !t.collapsed).count();
     let gaps_total = gap * (n_live.saturating_sub(1)) as f32;
     let track_avail = avail.map(|a| (a - gaps_total).max(0.0));
@@ -1002,7 +1146,7 @@ fn size_tracks(
 
     // §11.6 maximize: distribute positive free space equally to bases,
     // freezing at growth limits.
-    if track_avail.is_none() {
+    if track_avail.is_none() && !min_content {
         // An auto-sized axis is sized under a max-content constraint; maximize
         // with infinite free space (§11.6) up to the growth limits. A
         // scrollable item's zero auto minimum must not collapse auto rows.
@@ -1037,7 +1181,7 @@ fn size_tracks(
 
     // §11.7 expand flexible tracks.
     let has_fr = tracks.iter().any(|t| matches!(t.size.max, TrackFn::Fr(_)));
-    if has_fr {
+    if has_fr && !min_content {
         let fr_size = match track_avail {
             Some(av) => {
                 let free = av - tracks.iter().map(|t| t.base).sum::<f32>();
@@ -1319,7 +1463,7 @@ fn self_align(own: Option<&str>, items_default: super::flex::AlignItem) -> super
         "end" | "flex-end" | "self-end" | "right" => AlignItem::End,
         "center" => AlignItem::Center,
         "stretch" | "normal" => AlignItem::Stretch,
-        "baseline" | "first baseline" | "last baseline" => AlignItem::Start,
+        "baseline" | "first baseline" | "last baseline" => AlignItem::Baseline,
         _ => items_default,
     }
 }
@@ -1350,7 +1494,7 @@ impl Flow<'_> {
         if preferred.resolve(None).is_some()
             || matches!(
                 preferred,
-                Len::MinContent | Len::MaxContent | Len::FitContent
+                Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_)
             )
         {
             return min_content;
@@ -1369,7 +1513,7 @@ impl Flow<'_> {
             }
             Len::MinContent => min_content,
             Len::MaxContent => max_content,
-            Len::FitContent => min_content,
+            Len::FitContent | Len::FitContentLimit(_) => min_content,
             length => {
                 let size = length.resolve(Some(0.0)).unwrap_or(0.0).max(0.0);
                 if s.border_box {
@@ -1381,23 +1525,18 @@ impl Flow<'_> {
         }
     }
 
-    /// Lay a grid container's items (css-grid-1): placement → column
-    /// sizing (§11) → item layout at real track widths → row sizing (§11 in
-    /// the block axis, contributions = laid heights) → §10.4/§10.5 track
-    /// alignment and §6.6-adjacent item alignment.
+    /// Placement and column sizing are shared by intrinsic queries and
+    /// final layout (CSS Grid 2 #intrinsic-sizes / #algo-track-sizing).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn grid_content<'t>(
+    fn grid_setup<'t>(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         items: &'t [SharedBox],
-        content_x: f32,
-        content_top: f32,
-        content_w: f32,
+        basis: Option<f32>,
         def_ch: Option<f32>,
         inl: &InlineStyle,
-        anchors: &mut Vec<(NodeId, f32)>,
-    ) -> (Vec<Frag<'t>>, f32) {
-        use super::flex::AlignItem;
+        mode: Option<IMode>,
+    ) -> GridSetup<'t> {
         let node = b.node;
         let u = Units::of(self.dom, node);
         let cv = |p: &str| self.dom.computed_value_resolved(node, p);
@@ -1418,7 +1557,7 @@ impl Flow<'_> {
                 .unwrap_or(0.0)
                 .max(0.0)
         };
-        let gap_col = parse_gap(cv("column-gap"), short_col, Some(content_w));
+        let gap_col = parse_gap(cv("column-gap"), short_col, basis);
         let row_gap_value = cv("row-gap").or(short_row);
         let gap_row = if row_gap_value
             .as_deref()
@@ -1438,7 +1577,7 @@ impl Flow<'_> {
         };
         let mut cols: Vec<Track> = cv("grid-template-columns")
             .as_deref()
-            .and_then(|v| parse_template(v, u, self.vp, Some(content_w), gap_col))
+            .and_then(|v| parse_template(v, u, self.vp, basis, gap_col))
             .unwrap_or_default();
         let mut rows: Vec<Track> =
             inherited
@@ -1472,19 +1611,42 @@ impl Flow<'_> {
 
         // Per-item grid lines: grid-area, overridden by grid-row/column
         // shorthands, overridden by the *-start/*-end longhands.
-        let area_col = |name: &str| -> Option<(usize, usize)> {
-            areas
-                .as_ref()
-                .and_then(|(m, _, _)| m.get(&name.to_ascii_lowercase()))
-                .map(|(_, cc)| (cc.start, cc.end))
+        let mut col_names = template_line_names(
+            &cv("grid-template-columns").unwrap_or_default(),
+            explicit_cols,
+        );
+        let mut row_names = if let Some(parent) = &inherited {
+            let mut names = parent.names.clone();
+            let serialized = serialize_subgrid_rows(
+                &cv("grid-template-rows").unwrap_or_default(),
+                explicit_rows,
+            );
+            for (line, token) in named_track_tokens(&serialized)
+                .into_iter()
+                .skip(1)
+                .enumerate()
+            {
+                if let Some(group) = token.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                    names[line].extend(group.split_whitespace().map(str::to_owned));
+                }
+            }
+            names
+        } else {
+            template_line_names(&cv("grid-template-rows").unwrap_or_default(), explicit_rows)
         };
-        let area_row = |name: &str| -> Option<(usize, usize)> {
-            areas
-                .as_ref()
-                .and_then(|(m, _, _)| m.get(&name.to_ascii_lowercase()))
-                .map(|(rr, _)| (rr.start, rr.end))
-        };
-        let placements: Vec<(AxisPlace, AxisPlace)> = ordered
+        if let Some((areas, _, _)) = &areas {
+            for (name, (rr, cc)) in areas {
+                for (names, range) in [(&mut col_names, cc), (&mut row_names, rr)] {
+                    if let Some(line) = names.get_mut(range.start) {
+                        line.push(format!("{name}-start"));
+                    }
+                    if let Some(line) = names.get_mut(range.end) {
+                        line.push(format!("{name}-end"));
+                    }
+                }
+            }
+        }
+        let mut placements: Vec<(AxisPlace, AxisPlace)> = ordered
             .iter()
             .map(|it| {
                 let icv = |p: &str| {
@@ -1545,17 +1707,42 @@ impl Flow<'_> {
                     ce = parse_grid_line(Some(&v));
                 }
                 (
-                    resolve_axis(cs, ce, explicit_cols, &area_col),
-                    resolve_axis(rs, re, explicit_rows, &area_row),
+                    resolve_axis(cs, ce, explicit_cols, &col_names),
+                    resolve_axis(rs, re, explicit_rows, &row_names),
                 )
             })
             .collect();
+        // Grid 2 #implicit-grids: signed placements can create tracks on
+        // either side. Shift all definite placements by the prepended extent
+        // before passing nonnegative indices to the occupancy algorithm.
+        let before_cols = placements
+            .iter()
+            .filter_map(|(c, _)| c.start)
+            .min()
+            .unwrap_or(0)
+            .min(0)
+            .unsigned_abs() as usize;
+        let before_rows = if inherited.is_some() {
+            0
+        } else {
+            placements
+                .iter()
+                .filter_map(|(_, r)| r.start)
+                .min()
+                .unwrap_or(0)
+                .min(0)
+                .unsigned_abs() as usize
+        };
+        for (c, r) in &mut placements {
+            c.start = c.start.map(|n| n + before_cols as i32);
+            r.start = r.start.map(|n| (n + before_rows as i32).max(0));
+        }
         // §8.5 works in flow-relative axes: its "columns" are the real
         // columns under row flow, the real ROWS under column flow.
         let minor_tracks = if row_flow {
-            explicit_cols
+            explicit_cols + before_cols
         } else {
-            explicit_rows
+            explicit_rows + before_rows
         };
         let mut placed = auto_place(placements, minor_tracks.max(1), row_flow, dense);
         if inherited.is_some() {
@@ -1586,16 +1773,31 @@ impl Flow<'_> {
         };
         let auto_cols = auto_list("grid-auto-columns");
         let auto_rows = auto_list("grid-auto-rows");
+        // Auto-track patterns count backwards before the explicit grid.
+        for (tracks, pattern, count) in [
+            (&mut cols, &auto_cols, before_cols),
+            (&mut rows, &auto_rows, before_rows),
+        ] {
+            let prefix = (0..count)
+                .map(|i| {
+                    let index = (pattern.len() - (count - i) % pattern.len()) % pattern.len();
+                    Track::new(pattern[index].clone(), false)
+                })
+                .collect::<Vec<_>>();
+            tracks.splice(0..0, prefix);
+        }
         let need_cols = placed.iter().map(|p| p.cols.end).max().unwrap_or(0);
         let need_rows = placed.iter().map(|p| p.rows.end).max().unwrap_or(0);
         while cols.len() < need_cols {
-            let i = (cols.len() - explicit_cols) % auto_cols.len();
+            let i = (cols.len() - explicit_cols - before_cols) % auto_cols.len();
             cols.push(Track::new(auto_cols[i].clone(), false));
         }
         while rows.len() < need_rows {
-            let i = (rows.len() - explicit_rows) % auto_rows.len();
+            let i = (rows.len() - explicit_rows - before_rows) % auto_rows.len();
             rows.push(Track::new(auto_rows[i].clone(), false));
         }
+        row_names.splice(0..0, (0..before_rows).map(|_| Vec::new()));
+        row_names.resize(rows.len() + 1, Vec::new());
 
         // auto-fit: collapse repetition tracks no item spans (§7.2.3.2).
         for (ci, t) in cols.iter_mut().enumerate() {
@@ -1610,7 +1812,7 @@ impl Flow<'_> {
         }
 
         // ---- §11 column sizing from intrinsic contributions ----
-        let col_contribs: Vec<Contrib> = ordered
+        let mut col_contribs: Vec<Contrib> = ordered
             .iter()
             .zip(&placed)
             .map(|(it, p)| {
@@ -1639,14 +1841,88 @@ impl Flow<'_> {
                 }
             })
             .collect();
+        if mode.is_some() {
+            for contribution in &mut col_contribs {
+                let limits = cols[contribution.tracks.clone()]
+                    .iter()
+                    .map(|t| match &t.size.max {
+                        TrackFn::FitContent(v) => v.resolve(None),
+                        other => other.definite(None),
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let limited = limits.map_or(contribution.min, |v| {
+                    contribution.min.min(
+                        v.iter().sum::<f32>()
+                            + gap_col * contribution.tracks.len().saturating_sub(1) as f32,
+                    )
+                });
+                contribution.minimum = contribution.minimum.max(limited);
+            }
+        }
         let jc = cv("justify-content");
-        size_tracks(
+        size_tracks_constrained(
             &mut cols,
             &col_contribs,
-            Some(content_w),
+            basis,
             gap_col,
             dist_stretches(jc.as_deref()),
+            mode == Some(IMode::Min),
         );
+        GridSetup {
+            ordered,
+            cols,
+            rows,
+            placed,
+            row_names,
+            gap_col,
+            gap_row,
+            inherited,
+        }
+    }
+
+    pub(super) fn grid_intrinsic_width(
+        &self,
+        b: &BoxNode,
+        items: &[SharedBox],
+        mode: IMode,
+        inl: &InlineStyle,
+    ) -> f32 {
+        let setup = self.grid_setup(b, items, None, None, inl, Some(mode));
+        let live = setup.cols.iter().filter(|t| !t.collapsed).count();
+        setup.cols.iter().map(|t| t.base).sum::<f32>()
+            + setup.gap_col * live.saturating_sub(1) as f32
+    }
+
+    /// Lay a grid container's items (css-grid-1): placement → column
+    /// sizing (§11) → item layout at real track widths → row sizing (§11 in
+    /// the block axis, contributions = laid heights) → §10.4/§10.5 track
+    /// alignment and §6.6-adjacent item alignment.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn grid_content<'t>(
+        &self,
+        b: &'t BoxNode,
+        items: &'t [SharedBox],
+        content_x: f32,
+        content_top: f32,
+        content_w: f32,
+        def_ch: Option<f32>,
+        inl: &InlineStyle,
+        anchors: &mut Vec<(NodeId, f32)>,
+    ) -> (Vec<Frag<'t>>, f32) {
+        use super::flex::AlignItem;
+        let node = b.node;
+        let cv = |p: &str| self.dom.computed_value_resolved(node, p);
+        let jc = cv("justify-content");
+        let GridSetup {
+            ordered,
+            cols,
+            mut rows,
+            placed,
+            row_names,
+            gap_col,
+            gap_row,
+            inherited,
+        } = self.grid_setup(b, items, Some(content_w), def_ch, inl, None);
 
         // Track positions + content-distribution of leftover main space.
         let positions =
@@ -1687,6 +1963,8 @@ impl Flow<'_> {
             m: [f32; 4],
             auto: [bool; 4],
             align: AlignItem,
+            last_baseline: bool,
+            baseline_shim: f32,
             border_x: f32,
             content_w: f32,
             bp_cross: f32,
@@ -1727,7 +2005,11 @@ impl Flow<'_> {
                 }
             };
             let justify = self_align(icv("justify-self").as_deref(), justify_items);
-            let width_def = s.width.resolve(Some(area_w)).map(to_content);
+            let width_value = |l: &Len| {
+                self.intrinsic_width_value(l, it, Some(area_w), inl)
+                    .or_else(|| l.resolve(Some(area_w)).map(to_content))
+            };
+            let width_def = width_value(&s.width);
             let avail_c = (area_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
             let w = match width_def {
                 Some(v) => v,
@@ -1738,10 +2020,14 @@ impl Flow<'_> {
                     avail_c.max(minc).min(maxc)
                 }
             };
+            let min = width_value(&s.min_width).unwrap_or(0.);
+            let max = width_value(&s.max_width).unwrap_or(f32::INFINITY).max(min);
+            let w = w.clamp(min, max);
             let subgrid = (matches!(it.content, Content::Grid(_))
                 && self.dom.is_row_subgrid_item(it.node))
             .then(|| RowInput {
                 tracks: rows[p.rows.clone()].to_vec(),
+                names: row_names[p.rows.start..=p.rows.end].to_vec(),
                 positions: None,
                 gap: gap_row,
                 start_edge: m[TOP] + s.border[TOP] + self.pad(s, TOP, area_w),
@@ -1770,6 +2056,28 @@ impl Flow<'_> {
             // auto margins win over the alignment keyword).
             let extra = area_w - (frag.w + m[LEFT] + m[RIGHT]);
             let shift = super::flow::cross_shift(extra, auto[LEFT], auto[RIGHT], justify);
+            let last_baseline = icv("align-self")
+                .filter(|v| v != "auto")
+                .or_else(|| cv("align-items"))
+                .as_deref()
+                == Some("last baseline");
+            let mut alignment = self_align(icv("align-self").as_deref(), align_items);
+            let cyclic_height = [&s.height, &s.min_height, &s.max_height]
+                .iter()
+                .any(|v| matches!(v,Len::Val(n) if n.resolve(None).is_none()));
+            if alignment == AlignItem::Baseline
+                && cyclic_height
+                && rows[p.rows.clone()].iter().any(|t| {
+                    !matches!(t.size.min, TrackFn::Fixed(_))
+                        || !matches!(t.size.max, TrackFn::Fixed(_))
+                })
+            {
+                alignment = if last_baseline {
+                    AlignItem::End
+                } else {
+                    AlignItem::Start
+                };
+            }
             gitems.push(GItem {
                 it,
                 border_x: area_x + shift + m[LEFT],
@@ -1784,11 +2092,66 @@ impl Flow<'_> {
                 align: if subgrid.is_some() {
                     AlignItem::Stretch
                 } else {
-                    self_align(icv("align-self").as_deref(), align_items)
+                    alignment
                 },
+                last_baseline,
+                baseline_shim: 0.,
                 subgrid,
                 row_contributions,
             });
+        }
+
+        // CSS Grid 2 #algo-baseline-shims / CSS Align 3 #align-by-baseline:
+        // each row's first/last baseline-sharing groups contribute the shim
+        // needed to align their baselines before intrinsic track sizing.
+        let mut baseline_groups: std::collections::HashMap<(usize, bool), f32> =
+            std::collections::HashMap::new();
+        for (g, p) in gitems.iter().zip(&placed) {
+            if g.align != AlignItem::Baseline || g.auto[TOP] || g.auto[BOTTOM] {
+                continue;
+            }
+            let baseline = if g.last_baseline {
+                super::flow::last_baseline(&g.frag)
+            } else {
+                super::flow::first_baseline(&g.frag)
+            }
+            .unwrap_or(g.frag.h);
+            let edge = if g.last_baseline {
+                g.m[BOTTOM] + g.frag.h - baseline
+            } else {
+                g.m[TOP] + baseline
+            };
+            let line = if g.last_baseline {
+                p.rows.end - 1
+            } else {
+                p.rows.start
+            };
+            baseline_groups
+                .entry((line, g.last_baseline))
+                .and_modify(|old| *old = old.max(edge))
+                .or_insert(edge);
+        }
+        for (g, p) in gitems.iter_mut().zip(&placed) {
+            if g.align != AlignItem::Baseline || g.auto[TOP] || g.auto[BOTTOM] {
+                continue;
+            }
+            let baseline = if g.last_baseline {
+                super::flow::last_baseline(&g.frag)
+            } else {
+                super::flow::first_baseline(&g.frag)
+            }
+            .unwrap_or(g.frag.h);
+            let edge = if g.last_baseline {
+                g.m[BOTTOM] + g.frag.h - baseline
+            } else {
+                g.m[TOP] + baseline
+            };
+            let line = if g.last_baseline {
+                p.rows.end - 1
+            } else {
+                p.rows.start
+            };
+            g.baseline_shim = (baseline_groups[&(line, g.last_baseline)] - edge).max(0.);
         }
 
         // ---- §11 row sizing from laid heights ----
@@ -1807,7 +2170,7 @@ impl Flow<'_> {
                         })
                         .collect::<Vec<_>>();
                 }
-                let h = g.frag.h + g.m[TOP] + g.m[BOTTOM];
+                let h = g.frag.h + g.m[TOP] + g.m[BOTTOM] + g.baseline_shim;
                 vec![Contrib {
                     tracks: p.rows.clone(),
                     minimum: self.grid_minimum_contribution(
@@ -1915,7 +2278,15 @@ impl Flow<'_> {
                 g.anchors = anchors;
             }
             let extra = area_h - (g.frag.h + g.m[TOP] + g.m[BOTTOM]);
-            let shift = super::flow::cross_shift(extra, g.auto[TOP], g.auto[BOTTOM], g.align);
+            let shift = if g.align == AlignItem::Baseline && !g.auto[TOP] && !g.auto[BOTTOM] {
+                if g.last_baseline {
+                    extra - g.baseline_shim
+                } else {
+                    g.baseline_shim
+                }
+            } else {
+                super::flow::cross_shift(extra, g.auto[TOP], g.auto[BOTTOM], g.align)
+            };
             // §9.4.3 relative offset + transform translation — a grid item's
             // containing block is its grid area (css-grid §9.1).
             let (rx, ry) =
@@ -2446,18 +2817,17 @@ mod tests {
 
     #[test]
     fn line_resolution_rules() {
-        let no_area = |_: &str| None;
         // 3 explicit tracks = 4 lines. `1 / 3` = start 0, span 2.
-        let p = resolve_axis(LineRaw::Index(1), LineRaw::Index(3), 3, &no_area);
+        let p = resolve_axis(LineRaw::Index(1), LineRaw::Index(3), 3, &[]);
         assert_eq!((p.start, p.span), (Some(0), 2));
         // Negative: -1 is the last explicit line (line 4).
-        let p = resolve_axis(LineRaw::Index(2), LineRaw::Index(-1), 3, &no_area);
+        let p = resolve_axis(LineRaw::Index(2), LineRaw::Index(-1), 3, &[]);
         assert_eq!((p.start, p.span), (Some(1), 2));
         // span from a definite start.
-        let p = resolve_axis(LineRaw::Index(2), LineRaw::Span(2), 3, &no_area);
+        let p = resolve_axis(LineRaw::Index(2), LineRaw::Span(2), 3, &[]);
         assert_eq!((p.start, p.span), (Some(1), 2));
         // auto + span rides the placement algorithm.
-        let p = resolve_axis(LineRaw::Auto, LineRaw::Span(3), 3, &no_area);
+        let p = resolve_axis(LineRaw::Auto, LineRaw::Span(3), 3, &[]);
         assert_eq!((p.start, p.span), (None, 3));
     }
 
@@ -2492,5 +2862,67 @@ mod tests {
             0..1,
             "dense fills the gap before the wide item"
         );
+    }
+
+    #[test]
+    fn named_grid_lines_resolve_occurrences_spans_and_implicit_edges() {
+        let names = template_line_names("[edge] 10px [Edge] repeat(2,[edge] 20px [end]) [last]", 3);
+        assert_eq!(names[0], ["edge"]);
+        assert_eq!(names[1], ["Edge", "edge"]);
+        assert_eq!(names[2], ["end", "edge"]);
+        assert_eq!(names[3], ["end", "last"]);
+        for (start, end, expected) in [
+            ("edge 2", "span edge", (Some(1), 1)),
+            ("edge -1", "last", (Some(2), 1)),
+            ("Edge", "span 2", (Some(1), 2)),
+            ("span edge", "end 2", (Some(2), 1)),
+            ("missing", "span 2", (Some(4), 2)),
+            ("-2 missing", "1", (Some(-2), 2)),
+            ("span missing", "1", (Some(-1), 1)),
+            ("span 4 edge", "auto", (None, 1)),
+        ] {
+            let placed = resolve_axis(
+                parse_grid_line(Some(start)),
+                parse_grid_line(Some(end)),
+                3,
+                &names,
+            );
+            assert_eq!((placed.start, placed.span), expected, "{start} / {end}");
+        }
+        assert_eq!(
+            template_line_names("[a]10px[b]20px[c]", 2),
+            vec![vec!["a"], vec!["b"], vec!["c"]]
+        );
+    }
+
+    #[test]
+    fn named_grid_lines_reach_geometry_and_inherited_subgrid_names() {
+        let dom = crate::dom::Dom::parse_document(
+            r#"<style>
+            body {margin:0} #grid {display:grid; width:200px;
+                grid-template-columns:[start] 40px [Main] 60px [end];
+                grid-template-rows:[first] 30px [middle] 50px [last];
+                grid-auto-columns:10px 20px}
+            #before {grid-column:-1 missing / start; grid-row:1}
+            #item {grid-column:Main / end;grid-row:middle / last}
+            #sub {display:grid;grid-column:start / Main;grid-row:first / last;
+                grid-template-rows:subgrid [local] [Local]}
+            #child {grid-row:middle / last}
+        </style><div id=grid><div id=before></div><div id=item></div>
+            <div id=sub><div id=child></div></div></div>"#,
+        );
+        let out = crate::layout2::lay_out_graphical(
+            &dom,
+            &url::Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let rect = |id| out.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(rect("before").width, 20.);
+        assert_eq!((rect("item").left, rect("item").width), (60., 60.));
+        assert_eq!((rect("item").top, rect("item").height), (30., 50.));
+        assert_eq!((rect("child").top, rect("child").height), (30., 50.));
     }
 }

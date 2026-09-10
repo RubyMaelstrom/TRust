@@ -32,6 +32,19 @@ From `TRust`, `cargo build --release` builds the `trust`, `trust-desktop`,
 dependency; no backend-selection feature is needed. Use `--no-default-features`
 to build with the system allocator instead of mimalloc.
 
+Before handing off browser changes, run both `cargo test` and
+`cargo test --release`, then `cargo clippy --all-targets` and
+`cargo build --release`. Test page rendering with the release binaries, including
+the sites affected by the change. A debug test pass and release startup check
+do not verify release rendering or performance.
+
+`python3 tools/check_css_wpt.py` runs a pinned official WPT subset for CSS
+variables, registered properties, and background shorthands in the release
+headless browser. It caches upstream sources, supports `--offline` on subsequent
+runs, writes JSON results and browser logs under `target/css-wpt-results`, and
+exits unsuccessfully for failed tests or incomplete harness runs. It is a
+targeted conformance check; its result files retain every failure.
+
 The native desktop binary, `trust-desktop`, uses
 winit and the same CSS-pixel layout engine as the terminal browser. HTML boxes,
 author colors, borders, gradients, images and Parley-shaped text paint through
