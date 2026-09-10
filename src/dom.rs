@@ -10636,7 +10636,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ("grid-template-areas".to_string(), "none".to_string()),
         ];
     }
-    // `flex: none | auto | <grow> [<shrink>] [<basis>] | <basis>` → the three
+    // `flex: none | [ <grow> <shrink>? || <basis> ]` → the three
     // longhands, so the CASCADE resolves them by source order (a `flex-grow:0`
     // BEFORE a `flex:1` must lose to the shorthand's grow:1 — manually merging
     // shorthand-then-longhand in the layout got this backwards). `flex:<n>`
@@ -10655,7 +10655,6 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         let (g, s, b) = match v.to_ascii_lowercase().as_str() {
             "none" => ("0", "0", "auto".to_string()),
             "auto" => ("1", "1", "auto".to_string()),
-            "initial" | "" => ("0", "1", "auto".to_string()),
             _ => {
                 let mut nums = Vec::new();
                 let mut basis = None;
@@ -10664,11 +10663,44 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 // contain whitespace. Flexbox §7.1 consumes component
                 // values, so splitting `calc(50% - 5px)` at raw whitespace
                 // corrupts the basis into three unrelated tokens.
-                for t in split_top_level_ws(v) {
-                    if t.parse::<f32>().is_ok() {
-                        nums.push(t);
+                let tokens = split_top_level_ws(v);
+                if tokens.is_empty() || tokens.len() > 3 {
+                    return Vec::new();
+                }
+                let mut previous_factor = false;
+                for t in tokens {
+                    if let Ok(number) = t.parse::<f32>() {
+                        // Flexbox 1 #flex-property: at most two nonnegative
+                        // factors, kept together in grow/shrink order. Only
+                        // a unitless ZERO after both factors can be a basis.
+                        // CSS Syntax 3 #style-rules requires dropping the
+                        // entire invalid declaration; ignoring the third
+                        // number in `flex:0 0 75` incorrectly resets basis
+                        // to zero and masks a valid `flex:0 0 auto` fallback.
+                        if !number.is_finite() || number < 0.0 {
+                            return Vec::new();
+                        }
+                        if nums.len() < 2 {
+                            if nums.len() == 1 && !previous_factor {
+                                return Vec::new();
+                            }
+                            nums.push(t);
+                            previous_factor = true;
+                        } else if number == 0.0 && basis.is_none() {
+                            basis = Some(t.to_string());
+                            previous_factor = false;
+                        } else {
+                            return Vec::new();
+                        }
                     } else {
+                        if basis.is_some()
+                            || wide_keyword(t).is_some()
+                            || t.eq_ignore_ascii_case("none")
+                        {
+                            return Vec::new();
+                        }
                         basis = Some(t.to_string());
+                        previous_factor = false;
                     }
                 }
                 let g = nums.first().copied().unwrap_or("1");
@@ -15609,6 +15641,96 @@ mod tests {
                 ("margin-right".to_string(), "auto".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn flex_shorthand_invalid_components_preserve_cascaded_longhands() {
+        // Flexbox 1 #flex-property and CSS Syntax 3 #style-rules: an invalid
+        // shorthand contributes no longhands, even when it is !important.
+        for value in [
+            "0 0 75",
+            "2 3 4",
+            "1 1 0 0",
+            "1 1 0 auto",
+            "20px 30%",
+            "1 auto 2",
+            "none 1",
+            "1 inherit",
+            "-1 0 auto",
+            "1 -2 auto",
+        ] {
+            let dom = Dom::parse_document(&format!(
+                "<style>.item{{flex:2 3 40%;flex:{value}!important}}</style>\
+                 <div id=sheet class=item></div>\
+                 <div id=inline style='flex:2 3 40%;flex:{value}!important'></div>"
+            ));
+            for id in ["sheet", "inline"] {
+                let item = dom.get_by_id(id).unwrap();
+                for (property, expected) in [
+                    ("flex-grow", "2"),
+                    ("flex-shrink", "3"),
+                    ("flex-basis", "40%"),
+                ] {
+                    assert_eq!(
+                        dom.computed_value_resolved(item, property).as_deref(),
+                        Some(expected),
+                        "{id}: flex:{value} must not override {property}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flex_shorthand_factors_and_zero_basis_follow_component_order() {
+        for (value, expected) in [
+            ("none", ["0", "0", "auto"]),
+            ("auto", ["1", "1", "auto"]),
+            ("0", ["0", "1", "0"]),
+            ("2 0", ["2", "0", "0"]),
+            ("2 3 0", ["2", "3", "0"]),
+            ("0 0 0", ["0", "0", "0"]),
+            ("0px 2 3", ["2", "3", "0px"]),
+            ("2 0px", ["2", "1", "0px"]),
+            ("2 3 75%", ["2", "3", "75%"]),
+            ("75% 2 3", ["2", "3", "75%"]),
+            ("75% 0", ["0", "1", "75%"]),
+            ("content", ["1", "1", "content"]),
+            (".5 2e0 auto", [".5", "2e0", "auto"]),
+            ("2 3 calc(50% - 5px)", ["2", "3", "calc(50% - 5px)"]),
+            ("calc(50% - 5px) 2 3", ["2", "3", "calc(50% - 5px)"]),
+        ] {
+            let expanded = expand_box_shorthand("flex", value);
+            let actual: Vec<_> = expanded.iter().map(|(_, value)| value.as_str()).collect();
+            assert_eq!(actual, expected, "flex:{value}");
+        }
+        for keyword in ["inherit", "initial", "unset", "revert", "revert-layer"] {
+            let expanded = expand_box_shorthand("flex", keyword);
+            assert_eq!(expanded.len(), 3);
+            assert!(expanded.iter().all(|(_, value)| value == keyword));
+        }
+    }
+
+    #[test]
+    fn flex_shorthand_validates_after_variable_substitution() {
+        // CSS Values 5 #substitution-in-shorthands and #invalid-substitution:
+        // invalid after substitution resets to initial, without reviving the
+        // earlier shorthand. A variable can also supply multiple components.
+        let dom = Dom::parse_document(
+            "<style>.item{flex:2 3 40%;flex:var(--parts)}\
+             #valid{--parts:0 0 75%}#invalid{--parts:0 0 75}</style>\
+             <div id=valid class=item></div><div id=invalid class=item></div>",
+        );
+        let valid = dom.get_by_id("valid").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(valid, "flex-basis").as_deref(),
+            Some("75%")
+        );
+        let invalid = dom.get_by_id("invalid").unwrap();
+        for property in ["flex-grow", "flex-shrink", "flex-basis"] {
+            let value = dom.computed_value_resolved(invalid, property);
+            assert_eq!(value, dom.ua_default(invalid, property), "{property}");
+        }
     }
 
     #[test]
