@@ -7517,6 +7517,63 @@ mod tests {
     }
 
     #[test]
+    fn invalid_flex_shorthand_preserves_responsive_column_geometry() {
+        // Flexbox 1 #flex-property + #flex-basis-property: dropping the whole
+        // invalid override preserves `auto`, which uses the column's width.
+        // Both frontends must retain the same percentage-sized border boxes.
+        let html = r#"<style>
+            * { box-sizing:border-box }
+            body { margin:0 }
+            .row { display:flex;flex-wrap:wrap }
+            .row > div { flex:0 0 auto;width:100%;padding:0 12px }
+            @media (min-width:768px) {
+                #feed { width:75% }
+                #sidebar { width:25% }
+            }
+            #feed { flex:0 0 75!important }
+            </style><div class=row><div id=feed>Feed</div>
+            <div id=sidebar>Sidebar</div></div>"#;
+        let base = Url::parse("http://e.com/").unwrap();
+        for width in [640.0, 1280.0, 1920.0] {
+            let mut dom = Dom::parse_document(html);
+            dom.set_viewport_px(width, 800.0);
+            let graphical = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(width, 800.0),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            let terminal = measure_boxes_terminal(
+                &dom,
+                &base,
+                (width as usize / 8, 50),
+                &[],
+                &HashMap::new(),
+                (8, 16),
+                &HashMap::new(),
+            )
+            .0;
+            let width = f64::from(width);
+            for boxes in [&graphical.boxes, &terminal] {
+                let feed = rect(&dom, boxes, "feed");
+                let sidebar = rect(&dom, boxes, "sidebar");
+                let expected = if width >= 768.0 { width * 0.75 } else { width };
+                assert!((feed.width - expected).abs() < 0.1, "{width}: {feed:?}");
+                if width >= 768.0 {
+                    assert!((sidebar.left - expected).abs() < 0.1, "{sidebar:?}");
+                    assert!((sidebar.width - width * 0.25).abs() < 0.1, "{sidebar:?}");
+                    assert!((sidebar.top - feed.top).abs() < 0.1, "{sidebar:?}");
+                } else {
+                    assert!((sidebar.width - width).abs() < 0.1, "{sidebar:?}");
+                    assert!(sidebar.top >= feed.top + feed.height, "{sidebar:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn geometry_reports_a_blocks_own_border_box() {
         let (dom, boxes) = measure(
             r#"<body style="margin:0"><div id="a" style="height:48px">x</div><div id="b" style="height:32px">y</div></body>"#,
