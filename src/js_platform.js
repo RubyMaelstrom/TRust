@@ -13115,8 +13115,8 @@
         return String(body);
     };
     // The WIRE encoding of a request body: the exact bytes to put on the socket,
-    // as a LATIN1 byte-string (one code unit per byte) the Rust syscall reads
-    // byte-exact (`arg_bytes_latin1`). A text string is UTF-8-encoded (Fetch
+    // as a native buffer or a LATIN1 byte-string (one code unit per byte) the
+    // Rust syscall reads byte-exact. A text string is UTF-8-encoded (Fetch
     // §"Body" — a string body is UTF-8); URLSearchParams is UTF-8 of its
     // serialization; a Blob/File and an ArrayBuffer(view) are already raw bytes,
     // so they map straight to latin1. Without this a binary body (e.g. a page
@@ -13127,14 +13127,7 @@
         if (typeof body === "string") return utf8Binary(body);
         if (body instanceof URLSearchParams) return utf8Binary(body.toString());
         if (Array.isArray(body.__parts)) return __blobBytes(body); // Blob/File: the true bytes ARE the wire form
-        if (typeof body.byteLength === "number") {
-            try {
-                const v = body instanceof ArrayBuffer ? new Uint8Array(body)
-                    : new Uint8Array(body.buffer || body);
-                let s = ""; for (let i = 0; i < v.length; i++) s += String.fromCharCode(v[i]);
-                return s;
-            } catch (e) { return ""; }
-        }
+        if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return __body_buffer(body);
         return utf8Binary(String(body));
     };
     // The multipart/form-data wire encoding of a FormData body (RFC 7578 +
@@ -13208,7 +13201,9 @@
             return pump();
         }
         owner.__bodyUsed = true;
-        const bin = owner.__bytes != null ? owner.__bytes : __bodyWire(owner.__body || "");
+        const bin = owner.__bytes != null ? owner.__bytes :
+            owner.__body instanceof ArrayBuffer || ArrayBuffer.isView(owner.__body)
+                ? __body_buffer(owner.__body) : __bodyWire(owner.__body || "");
         return Promise.resolve(__bodyBytes(bin));
     };
     // Body mixin shared by Request and Response. Stream bodies follow Fetch's
@@ -13253,6 +13248,8 @@
                 : method;
             this.__headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.__headers : undefined));
             this.__body = init.body !== undefined ? init.body : (fromReq ? input.__body : null);
+            if (this.__body instanceof ArrayBuffer || ArrayBuffer.isView(this.__body))
+                this.__body = __body_buffer(this.__body);
             const credentials = init.credentials !== undefined
                 ? String(init.credentials)
                 : (fromReq ? input.__credentials : "same-origin");
@@ -13299,6 +13296,13 @@
         constructor(body, init) {
             init = init || {};
             this.__body = body !== undefined ? body : null;
+            // Fetch #concept-bodyinit-extract snapshots a BufferSource at
+            // construction. Preserve its byte range and avoid per-byte JS
+            // string conversion for multi-megabyte Wasm/image/cache bodies.
+            if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+                this.__bytes = __body_buffer(body);
+                this.__body = null;
+            }
             this.status = init.status !== undefined ? (init.status | 0) : 200;
             this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
             this.headers = new Headers(init.headers);
@@ -13447,6 +13451,8 @@
         }
         return true;
     }
+    const cacheBytesFromBase64 = Uint8Array.fromBase64.bind(Uint8Array);
+    const cacheBytesToBase64 = Function.prototype.call.bind(Uint8Array.prototype.toBase64);
     function __cacheResponse(record) {
         const response = new Response(null, {
             status: record.status,
@@ -13456,7 +13462,10 @@
         });
         response.type = record.type;
         response.redirected = record.redirected;
-        response.__bytes = record.body;
+        // The old representation stored binary strings. Read those existing
+        // session entries too; new entries use the engine's native base64
+        // codec so Cache.put/match do linear work over binary payloads.
+        response.__bytes = record.body64 === undefined ? record.body : cacheBytesFromBase64(record.body64);
         return response;
     }
     function __cacheResponseRecord(request, response) {
@@ -13482,7 +13491,7 @@
                 url: response.url,
                 type: response.type,
                 redirected: response.redirected,
-                body: __bodyWire(new Uint8Array(buffer)),
+                body64: cacheBytesToBase64(new Uint8Array(buffer)),
             },
         }));
     }

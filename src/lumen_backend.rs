@@ -5002,6 +5002,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__crypto_aes_ctr", 4, host_crypto_aes_ctr),
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
+    ("__body_buffer", 1, host_body_buffer),
     ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, host_dom_popover),
     ("__wasm_validate", 1, lumen_wasm::host_validate),
@@ -6961,6 +6962,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             host_compression_encode as NativeFn,
         ),
         ("__text_encode", 1, host_text_encode as NativeFn),
+        ("__body_buffer", 1, host_body_buffer as NativeFn),
         ("__base64_convert", 2, host_base64_convert as NativeFn),
         ("__wasm_validate", 1, lumen_wasm::host_validate as NativeFn),
         ("__wasm_compile", 1, lumen_wasm::host_compile as NativeFn),
@@ -9909,6 +9911,12 @@ fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 }
 
 fn host_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
+    if let Some(bytes) = args
+        .get(index)
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+    {
+        return bytes;
+    }
     args.get(index)
         .and_then(|value| ctx.coerce_string(value).ok())
         .map(|string| {
@@ -10113,6 +10121,18 @@ fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let text = host_arg_string(ctx, args, 0);
     ctx.make_uint8array(text.as_bytes())
+}
+
+/// Fetch #concept-bodyinit-extract: take a byte-exact snapshot of a BufferSource,
+/// including a view's offset and length, without reading author properties or
+/// converting binary data into a JavaScript string. Web IDL excludes shared,
+/// detached, and out-of-bounds buffers from this union.
+fn host_body_buffer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let bytes = args
+        .first()
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+        .ok_or_else(|| ctx.make_error("TypeError", "Body is not an attached BufferSource"))?;
+    ctx.make_array_buffer(&bytes)
 }
 
 /// HTML #atob and Infra #forgiving-base64. `null` is an internal invalid-input
@@ -11117,7 +11137,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 146, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 147, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -11128,7 +11148,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 146);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 147);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -16748,6 +16768,26 @@ mod tests {
             string_value(&mut engine, "cacheStorageResult"),
             "function|function|true|true|hello|true|hello|1|true|conformance|true|hello|true|true|false|true"
         );
+    }
+
+    #[test]
+    fn fetch_binary_body_snapshots_views_and_cache_bytes() {
+        // Fetch #concept-bodyinit-extract / #concept-body-consume-body and
+        // Service Workers #cache-put, local snapshots 2026-09-06.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, &format!(
+                "globalThis.binaryResult = 'pending'; ({}).then(v => binaryResult = v, e => binaryResult = e.stack);",
+                include_str!("fixtures/fetch_binary_body.mjs")
+            ), "binary body conformance").unwrap();
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "binaryResult"),
+                "fetch-binary-body-ok"
+            );
+        }
     }
 
     #[test]
