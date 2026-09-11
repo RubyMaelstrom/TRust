@@ -1930,7 +1930,22 @@ impl DesktopApp {
                 .and_then(|form| form.fields.get(field))
                 .map(|field| field.kind.clone());
             match kind {
-                Some(FieldKind::Text | FieldKind::Password) => {
+                Some(FieldKind::Number)
+                    if matches!(pending.input.key, Key::ArrowUp | Key::ArrowDown) =>
+                {
+                    self.step_number_control(
+                        form,
+                        field,
+                        if pending.input.key == Key::ArrowUp {
+                            1
+                        } else {
+                            -1
+                        },
+                    );
+                }
+                Some(FieldKind::Text | FieldKind::Number | FieldKind::Password)
+                    if pending.input.key == Key::Enter =>
+                {
                     self.finish_text_edit();
                     self.submit_form_default(form);
                 }
@@ -2278,6 +2293,20 @@ impl DesktopApp {
             }
         });
         if let Some(cache) = &self.page_layout {
+            if page_is_live
+                && let FocusTarget::Form { form, field } = self.focus
+                && let Some(control) = cache
+                    .document
+                    .forms
+                    .get(form)
+                    .and_then(|f| f.fields.get(field))
+                && control.kind == FieldKind::Number
+                && let Some(editor) = self.form_editor.as_mut()
+                && !editor.is_composing()
+                && editor.text() != control.editing_value()
+            {
+                editor.set_text(control.editing_value());
+            }
             let live = graphical_live_boundaries(&cache.layout);
             self.browser.set_live_layout_boundaries(live.0, live.1);
         }
@@ -2737,21 +2766,28 @@ impl DesktopApp {
             return;
         }
         if let Some(editor) = &mut self.form_editor {
-            let password = cache
+            let control = cache
                 .document
                 .forms
                 .get(form)
-                .and_then(|form| form.fields.get(field))
-                .is_some_and(|field| field.kind == FieldKind::Password);
+                .and_then(|form| form.fields.get(field));
+            let password = control.is_some_and(|field| field.kind == FieldKind::Password);
+            let mut edit_rect = rect;
+            if control
+                .and_then(|f| f.number.as_ref())
+                .is_some_and(|n| n.spin_buttons)
+            {
+                edit_rect.width = (rect.width - rect.width.clamp(8.0, 18.0)).max(0.0);
+            }
             let visual = Self::editor_visual(editor, password);
             scene.primitives.push(DisplayCommand::FillRect {
-                rect,
+                rect: edit_rect,
                 color: PaintColor::Rgba(250, 252, 255, 255),
             });
             paint_text_editor(
                 &mut scene.primitives,
                 &visual,
-                rect,
+                edit_rect,
                 PaintColor::Rgba(25, 31, 39, 255),
             );
         }
@@ -2796,7 +2832,10 @@ impl DesktopApp {
                 .is_some_and(|field| {
                     matches!(
                         field.kind,
-                        FieldKind::Text | FieldKind::Password | FieldKind::Textarea
+                        FieldKind::Text
+                            | FieldKind::Number
+                            | FieldKind::Password
+                            | FieldKind::Textarea
                     )
                 }),
             FocusTarget::Page => self
@@ -3005,10 +3044,16 @@ impl DesktopApp {
         else {
             return;
         };
-        if control.value == value {
+        if control.number.as_ref().is_some_and(|n| !n.mutable) {
+            if let Some(editor) = self.form_editor.as_mut() {
+                editor.set_text(&control.value);
+            }
             return;
         }
-        control.value = value.clone();
+        if control.editing_value() == value {
+            return;
+        }
+        control.set_editing_value(value.clone());
         let actor = control.live_node;
         let _ = control;
         self.dispatch(UserAction::SetFormValue {
@@ -3155,16 +3200,27 @@ impl DesktopApp {
     /// button, while ordinary uncanceled contenteditable Enter still inserts a
     /// newline when the actor reports that default is allowed.
     fn dispatch_live_form_key(&mut self, input: &KeyInput) -> bool {
+        if !self.browser.page_is_live() {
+            return false;
+        }
         let FocusTarget::Form { form, field } = self.focus else {
             return false;
         };
-        let node = self
+        let control = self
             .page_layout
             .as_ref()
             .and_then(|page| page.document.forms.get(form))
             .and_then(|form| form.fields.get(field))
-            .and_then(|field| field.live_node);
-        let Some(node) = node else {
+            .cloned();
+        let Some(control) = control else {
+            return false;
+        };
+        let number_step =
+            matches!(input.key, Key::ArrowUp | Key::ArrowDown) && control.kind == FieldKind::Number;
+        if input.key != Key::Enter && !number_step {
+            return false;
+        }
+        let Some(node) = control.live_node else {
             return false;
         };
         // The text edit must reach the actor before its keydown, so a page
@@ -3383,7 +3439,10 @@ impl DesktopApp {
         {
             return;
         }
-        if pressed && input.key == Key::Enter && self.dispatch_live_form_key(&input) {
+        if pressed
+            && (input.key == Key::Enter || matches!(input.key, Key::ArrowUp | Key::ArrowDown))
+            && self.dispatch_live_form_key(&input)
+        {
             return;
         }
         if pressed {
@@ -3410,6 +3469,21 @@ impl DesktopApp {
                     self.request_redraw();
                     return;
                 }
+                (FocusTarget::Form { form, field }, Key::ArrowUp | Key::ArrowDown)
+                    if self
+                        .page_layout
+                        .as_ref()
+                        .and_then(|page| page.document.forms.get(form))
+                        .and_then(|form| form.fields.get(field))
+                        .is_some_and(|control| control.kind == FieldKind::Number) =>
+                {
+                    self.step_number_control(
+                        form,
+                        field,
+                        if input.key == Key::ArrowUp { 1 } else { -1 },
+                    );
+                    return;
+                }
                 (FocusTarget::Form { form, field }, Key::Enter) => {
                     let kind = self
                         .page_layout
@@ -3419,7 +3493,7 @@ impl DesktopApp {
                         .map(|field| field.kind.clone());
                     match kind {
                         Some(FieldKind::Textarea) => {}
-                        Some(FieldKind::Text | FieldKind::Password) => {
+                        Some(FieldKind::Text | FieldKind::Number | FieldKind::Password) => {
                             self.finish_text_edit();
                             let submitter = self
                                 .page_layout
@@ -3449,7 +3523,10 @@ impl DesktopApp {
                         .is_some_and(|field| {
                             matches!(
                                 field.kind,
-                                FieldKind::Text | FieldKind::Password | FieldKind::Textarea
+                                FieldKind::Text
+                                    | FieldKind::Number
+                                    | FieldKind::Password
+                                    | FieldKind::Textarea
                             )
                         });
                     if !editable {
@@ -4039,12 +4116,14 @@ impl DesktopApp {
             })
         });
         self.form_editor = match control.kind {
-            FieldKind::Text | FieldKind::Password | FieldKind::Textarea => Some(TextEditor::new(
-                &control.value,
-                &presentation.map_or_else(TextStyle::default, |p| p.style.clone()),
-                presentation.map_or(360.0, |p| p.width),
-                control.kind == FieldKind::Textarea,
-            )),
+            FieldKind::Text | FieldKind::Number | FieldKind::Password | FieldKind::Textarea => {
+                Some(TextEditor::new(
+                    control.editing_value(),
+                    &presentation.map_or_else(TextStyle::default, |p| p.style.clone()),
+                    presentation.map_or(360.0, |p| p.width),
+                    control.kind == FieldKind::Textarea,
+                ))
+            }
             _ => None,
         };
         self.set_focus(FocusTarget::Form { form, field });
@@ -4063,7 +4142,11 @@ impl DesktopApp {
         };
         if !matches!(
             control.kind,
-            FieldKind::Text | FieldKind::Password | FieldKind::Textarea | FieldKind::Hidden
+            FieldKind::Text
+                | FieldKind::Number
+                | FieldKind::Password
+                | FieldKind::Textarea
+                | FieldKind::Hidden
         ) {
             self.form_editor = None;
             self.set_focus(FocusTarget::Form { form, field });
@@ -4083,7 +4166,7 @@ impl DesktopApp {
             return;
         }
         match control.kind {
-            FieldKind::Text | FieldKind::Password | FieldKind::Textarea => {
+            FieldKind::Text | FieldKind::Number | FieldKind::Password | FieldKind::Textarea => {
                 self.focus_form(form, field);
                 self.position_form_caret(form, field);
             }
@@ -4263,7 +4346,7 @@ impl DesktopApp {
         else {
             return;
         };
-        control.value = value.clone();
+        control.set_editing_value(value.clone());
         if let Some(checked) = checked {
             control.checked = checked;
         }
@@ -4274,6 +4357,45 @@ impl DesktopApp {
             checked,
         });
         self.relayout_cached_page();
+    }
+
+    fn step_number_control(&mut self, form: usize, field: usize, direction: i8) {
+        if self.browser.page_is_live()
+            && let Some(node) = self
+                .page_layout
+                .as_ref()
+                .and_then(|p| p.document.forms.get(form))
+                .and_then(|f| f.fields.get(field))
+                .and_then(|f| f.live_node)
+        {
+            self.dispatch(UserAction::StepNumber {
+                node,
+                direction,
+                click: false,
+            });
+            return;
+        }
+        let next = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .filter(|control| control.kind == FieldKind::Number)
+            .and_then(|control| {
+                control
+                    .number
+                    .as_ref()?
+                    .stepped_value(&control.value, direction)
+            });
+        let Some(next) = next else {
+            return;
+        };
+        if self.focus == (FocusTarget::Form { form, field })
+            && let Some(editor) = self.form_editor.as_mut()
+        {
+            editor.set_text(&next);
+        }
+        self.set_field_value(form, field, next, None);
     }
 
     fn submit_form(&mut self, form: usize, submitter: Option<usize>) {
@@ -4357,6 +4479,54 @@ impl DesktopApp {
         if let Some(activation) = page_hit_activation(&target, self.browser.page_is_live()) {
             self.activate_link(activation);
         }
+    }
+
+    fn step_number_from_pointer(&mut self, target: &PageHit) -> bool {
+        let Some((form, field)) = self.form_target_for_hit(target) else {
+            return false;
+        };
+        let is_number = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .is_some_and(|control| {
+                control.kind == FieldKind::Number
+                    && control
+                        .number
+                        .as_ref()
+                        .is_some_and(|n| n.spin_buttons && n.mutable)
+            });
+        if !is_number || target.rect.width < 8.0 || target.rect.height < 8.0 {
+            return false;
+        }
+        let rail = target.rect.width.clamp(8.0, 18.0);
+        if self.pointer.x < target.rect.x + target.rect.width - rail {
+            return false;
+        }
+        let direction = if self.pointer.y < target.rect.y + target.rect.height * 0.5 {
+            1
+        } else {
+            -1
+        };
+        self.focus_form(form, field);
+        if self.browser.page_is_live()
+            && let Some(node) = self
+                .page_layout
+                .as_ref()
+                .and_then(|p| p.document.forms.get(form))
+                .and_then(|f| f.fields.get(field))
+                .and_then(|f| f.live_node)
+        {
+            self.dispatch(UserAction::StepNumber {
+                node,
+                direction,
+                click: true,
+            });
+        } else {
+            self.step_number_control(form, field, direction);
+        }
+        true
     }
 
     fn same_document_fragment(&self, target: &url::Url) -> bool {
@@ -4626,7 +4796,10 @@ impl DesktopApp {
                         .is_some_and(|field| {
                             matches!(
                                 field.kind,
-                                FieldKind::Text | FieldKind::Password | FieldKind::Textarea
+                                FieldKind::Text
+                                    | FieldKind::Number
+                                    | FieldKind::Password
+                                    | FieldKind::Textarea
                             )
                         }) =>
                 {
@@ -4738,7 +4911,9 @@ impl DesktopApp {
                     if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                         eprintln!("desktop: primary click target={click_target:?}");
                     }
-                    if let Some(target) = click_target {
+                    if let Some(target) = click_target
+                        && !self.step_number_from_pointer(&target)
+                    {
                         self.activate_page_hit(target);
                     }
                 }
@@ -5035,7 +5210,20 @@ impl DesktopApp {
                     .as_ref()
                     .and_then(|page| page.document.controls.get(&node).copied());
                 if let Some((form, field)) = control {
-                    if let Some(ActionData::Value(value)) = request.data {
+                    if matches!(
+                        request.action,
+                        AccessAction::Increment | AccessAction::Decrement
+                    ) {
+                        self.step_number_control(
+                            form,
+                            field,
+                            if request.action == AccessAction::Increment {
+                                1
+                            } else {
+                                -1
+                            },
+                        );
+                    } else if let Some(ActionData::Value(value)) = request.data {
                         self.set_field_value(form, field, value.into(), None);
                     } else if request.action == AccessAction::Click {
                         self.activate_form_control(form, field);
@@ -5611,8 +5799,12 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
             node.value = match field.kind {
                 FieldKind::Password => Some(String::new()),
                 FieldKind::Hidden => None,
+                FieldKind::Number => Some(field.editing_value().to_string()),
                 _ => Some(field.value.clone()),
             };
+            if field.kind == FieldKind::Number {
+                node.numeric_value = field.value.parse::<f64>().ok().filter(|n| n.is_finite());
+            }
             node.checked = matches!(field.kind, FieldKind::Checkbox | FieldKind::Radio)
                 .then_some(field.checked);
         }
@@ -5625,6 +5817,15 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
             }
             if let Some(value) = semantic_node.value {
                 node.set_value(value);
+            }
+            if let Some(value) = semantic_node.numeric_value {
+                node.set_numeric_value(value);
+            }
+            if let Some(value) = semantic_node.numeric_min {
+                node.set_min_numeric_value(value);
+            }
+            if let Some(value) = semantic_node.numeric_max {
+                node.set_max_numeric_value(value);
             }
             node.set_bounds(AccessRect::new(
                 f64::from(content_viewport.x + semantic_node.bounds.x - scroll.x),
@@ -5650,6 +5851,8 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
                     trust::accessibility::Action::Focus => AccessAction::Focus,
                     trust::accessibility::Action::Activate => AccessAction::Click,
                     trust::accessibility::Action::SetValue => AccessAction::SetValue,
+                    trust::accessibility::Action::Increment => AccessAction::Increment,
+                    trust::accessibility::Action::Decrement => AccessAction::Decrement,
                     trust::accessibility::Action::SetSelection => AccessAction::SetTextSelection,
                     trust::accessibility::Action::ScrollIntoView => AccessAction::ScrollIntoView,
                 });
@@ -5820,6 +6023,7 @@ fn access_role(role: SemanticRole) -> AccessRole {
         SemanticRole::Link => AccessRole::Link,
         SemanticRole::Button => AccessRole::Button,
         SemanticRole::TextInput => AccessRole::TextInput,
+        SemanticRole::SpinButton => AccessRole::SpinButton,
         SemanticRole::PasswordInput => AccessRole::PasswordInput,
         SemanticRole::Textarea => AccessRole::MultilineTextInput,
         SemanticRole::Checkbox => AccessRole::CheckBox,

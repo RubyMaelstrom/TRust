@@ -63,6 +63,12 @@ bindings and the resident page actor live in `src/lumen_backend.rs` and the
 sibling Lumen checkout. This keeps DOM, networking, storage, workers, and
 rendering behavior shared by both frontends.
 
+Number inputs provide desktop spin buttons and Up/Down keyboard stepping.
+The shared DOM implements `stepUp()`, `stepDown()`, and `valueAsNumber` for
+number, range, date, month, week, time, and datetime-local inputs, including
+step/bounds validation and independent current/default values. A manual
+acceptance page is available at `src/fixtures/number_input.html`.
+
 The normal build advertises US English: `Accept-Language: en-US,en;q=0.9`,
 `navigator.language === "en-US"`, and an `en-US` default for native Intl.
 This preference does not depend on the OS language, region, or geographic

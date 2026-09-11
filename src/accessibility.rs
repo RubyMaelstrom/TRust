@@ -21,6 +21,7 @@ pub enum Role {
     Link,
     Button,
     TextInput,
+    SpinButton,
     PasswordInput,
     Textarea,
     Checkbox,
@@ -39,6 +40,8 @@ pub enum Action {
     Focus,
     Activate,
     SetValue,
+    Increment,
+    Decrement,
     SetSelection,
     ScrollIntoView,
 }
@@ -50,6 +53,9 @@ pub struct SemanticNode {
     pub role: Role,
     pub name: String,
     pub value: Option<String>,
+    pub numeric_value: Option<f64>,
+    pub numeric_min: Option<f64>,
+    pub numeric_max: Option<f64>,
     pub bounds: CssRect,
     pub children: Vec<u64>,
     pub actions: Vec<Action>,
@@ -82,6 +88,9 @@ impl SemanticTree {
                     && left.role == right.role
                     && left.name == right.name
                     && left.value == right.value
+                    && left.numeric_value == right.numeric_value
+                    && left.numeric_min == right.numeric_min
+                    && left.numeric_max == right.numeric_max
                     && left.bounds == right.bounds
                     && left.children == right.children
                     && left.actions == right.actions
@@ -108,6 +117,9 @@ impl SemanticTree {
             role: Role::Document,
             name: document_title(dom),
             value: None,
+            numeric_value: None,
+            numeric_min: None,
+            numeric_max: None,
             bounds: document_bounds(boxes),
             children: root_children,
             actions: Vec::new(),
@@ -127,6 +139,7 @@ impl SemanticTree {
                 Role::Link
                     | Role::Button
                     | Role::TextInput
+                    | Role::SpinButton
                     | Role::PasswordInput
                     | Role::Textarea
                     | Role::Checkbox
@@ -144,13 +157,26 @@ impl SemanticTree {
             }
             if matches!(
                 role,
-                Role::TextInput | Role::PasswordInput | Role::Textarea | Role::Select
+                Role::TextInput
+                    | Role::SpinButton
+                    | Role::PasswordInput
+                    | Role::Textarea
+                    | Role::Select
             ) {
                 actions.push(Action::SetValue);
             }
             if matches!(role, Role::TextInput | Role::PasswordInput | Role::Textarea) {
                 actions.push(Action::SetSelection);
             }
+            // HTML-AAM #el-input-number and ARIA #spinbutton: expose the
+            // numeric range and native increment/decrement operations.
+            if role == Role::SpinButton && dom.input_mutable(node) {
+                actions.push(Action::Increment);
+                actions.push(Action::Decrement);
+            }
+            let numeric = (role == Role::SpinButton)
+                .then(|| dom.numeric_input(node))
+                .flatten();
             let children = dom
                 .flat_children(node)
                 .into_iter()
@@ -174,8 +200,12 @@ impl SemanticTree {
                 value: field.and_then(|field| match field.kind {
                     FieldKind::Password => Some(String::new()),
                     FieldKind::Hidden => None,
+                    FieldKind::Number => Some(field.editing_value().to_string()),
                     _ => Some(field.value.clone()),
                 }),
+                numeric_value: numeric.and_then(|c| field.and_then(|f| c.kind.parse(&f.value))),
+                numeric_min: numeric.and_then(|c| c.min),
+                numeric_max: numeric.and_then(|c| c.max),
                 bounds: CssRect::new(
                     bounds.left as f32,
                     bounds.top as f32,
@@ -232,6 +262,7 @@ fn node_role(dom: &Dom, node: NodeId, controls: &ControlMap, forms: &[Form]) -> 
     {
         return match field.kind {
             FieldKind::Text => Role::TextInput,
+            FieldKind::Number => Role::SpinButton,
             FieldKind::Password => Role::PasswordInput,
             FieldKind::Textarea => Role::Textarea,
             FieldKind::Checkbox => Role::Checkbox,

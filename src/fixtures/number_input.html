@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Number input acceptance checks</title>
+<style>
+body { font: 16px sans-serif; margin: 24px; max-width: 700px; }
+label { display: block; margin: 12px 0; }
+input { width: 160px; padding: 8px; border: 1px solid #777; }
+button { margin: 4px; padding: 6px; }
+pre { white-space: pre-wrap; }
+</style>
+<h1>Number inputs</h1>
+<p>Use the arrows or Up/Down keys, then try typing a negative number or an exponent.
+Script API buttons should change the value without adding input/change events.</p>
+<form id="form">
+  <label>Decimal step <input id="number" name="number" type="number" min="-5" max="5" step="0.1" value="0.2" required></label>
+  <label>Value attribute sets the base <input type="number" step="0.5" value="0.2"></label>
+  <label>Tiny step <input type="number" step="0.000000000001" value="0"></label>
+  <label>No native arrows <input type="number" value="2" style="appearance:none"></label>
+  <label>Read only <input type="number" value="3" readonly></label>
+  <label>Disabled <input type="number" value="4" disabled></label>
+  <button type="button" id="up">stepUp(3)</button>
+  <button type="button" id="down">stepDown(2)</button>
+  <button type="button" id="assign">valueAsNumber = 1.25</button>
+  <button type="button" id="clear">valueAsNumber = NaN</button>
+  <button type="reset">Reset</button>
+  <button type="submit">Validate</button>
+</form>
+<pre id="status"></pre>
+<pre id="events"></pre>
+<script>
+const input = document.getElementById('number');
+const status = document.getElementById('status');
+const events = document.getElementById('events');
+function report() {
+  status.textContent = 'value: ' + JSON.stringify(input.value) + '\nvalueAsNumber: ' + input.valueAsNumber
+    + '\ndefaultValue: ' + input.defaultValue + '\nvalid: ' + input.validity.valid
+    + '\nbadInput: ' + input.validity.badInput + '\nstepMismatch: ' + input.validity.stepMismatch;
+}
+for (const type of ['input', 'change', 'invalid']) input.addEventListener(type, event => {
+  events.textContent = (events.textContent + type + ' trusted=' + event.isTrusted + '\n').slice(-2000);
+  report();
+});
+document.getElementById('up').onclick = () => { input.stepUp(3); report(); };
+document.getElementById('down').onclick = () => { input.stepDown(2); report(); };
+document.getElementById('assign').onclick = () => { input.valueAsNumber = 1.25; report(); };
+document.getElementById('clear').onclick = () => { input.valueAsNumber = NaN; report(); };
+document.getElementById('form').addEventListener('reset', () => setTimeout(report, 0));
+document.getElementById('form').addEventListener('submit', event => { event.preventDefault(); report(); });
+// Add ?selftest for a release-headless smoke check of API-to-paint propagation.
+if (location.search === '?selftest') {
+  input.stepUp(3);
+  if (input.value !== '0.5') throw new Error('stepUp smoke check');
+  input.valueAsNumber = 0.7;
+  input.stepDown(2);
+  if (input.value !== '0.5' || input.defaultValue !== '0.2' || events.textContent !== '')
+    throw new Error('numeric value and silent API smoke check');
+}
+report();
+</script>
+</html>

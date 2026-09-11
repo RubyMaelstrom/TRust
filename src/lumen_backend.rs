@@ -2732,6 +2732,25 @@ mod desktop {
                 checkpoint(page, "form input");
                 finish_task(page, events)
             }
+            PageCmd::StepNumber {
+                node,
+                direction,
+                click,
+            } => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "numberStep",
+                    &[
+                        Value::Num(node as f64),
+                        Value::Num(f64::from(direction)),
+                        Value::Bool(click),
+                    ],
+                    "number step",
+                );
+                checkpoint(page, "number step");
+                finish_task(page, events)
+            }
             PageCmd::Submit { form, submitter } => {
                 prepare_interaction(page, interrupt);
                 let prevented = call_trust(
@@ -4743,6 +4762,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_namespace", 1, host_namespace),
     ("__dom_element_name", 1, host_element_name),
     ("__dom_get_attr", 2, host_get_attr),
+    ("__dom_input", 3, host_input),
     ("__dom_set_attr", 3, host_set_attr),
     ("__dom_remove_attr", 2, host_remove_attr),
     ("__dom_attr_names", 1, host_attr_names),
@@ -8548,6 +8568,65 @@ fn host_get_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     )
 }
 
+fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 1);
+    let arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(id) = host_arg_node(&dom, args, 0).filter(|id| dom.tag_name(*id) == Some("input"))
+    else {
+        return Ok(Value::Null);
+    };
+    Ok(match op.as_str() {
+        "type" => Value::from_string(dom.input_type(id)),
+        "get" => Value::from_string(dom.input_value(id)),
+        "set" | "user" => {
+            let value = host_arg_string(ctx, args, 2);
+            Value::Bool(dom.set_input_value(id, &value, op == "user"))
+        }
+        "reset" => {
+            dom.reset_input_value(id);
+            Value::Undefined
+        }
+        "mutable" => Value::Bool(dom.input_mutable(id)),
+        "number" => Value::Num(
+            dom.numeric_input(id)
+                .and_then(|c| c.kind.parse(&dom.input_value(id)))
+                .unwrap_or(f64::NAN),
+        ),
+        "set-number" => Value::Bool(dom.set_input_number(id, arg.as_num_opt().unwrap_or(f64::NAN))),
+        "up" | "down" => {
+            match dom.step_input(id, op == "down", arg.as_num_opt().unwrap_or(1.0) as i32) {
+                Ok(changed) => Value::Bool(changed),
+                Err(()) => Value::Null,
+            }
+        }
+        "validity" => {
+            let (mut under, mut over, mut mismatch) = (false, false, false);
+            if let Some(c) = dom.numeric_input(id)
+                && let Some(n) = c.kind.parse(&dom.input_value(id))
+            {
+                under = c.min.is_some_and(|min| n < min);
+                over = c.max.is_some_and(|max| n > max);
+                if c.kind == crate::input::NumericType::Time
+                    && c.min.zip(c.max).is_some_and(|(a, b)| a > b)
+                {
+                    under = under && over;
+                    over = under;
+                }
+                mismatch = c.mismatch(n);
+            }
+            ctx.make_array(vec![
+                Value::Bool(under),
+                Value::Bool(over),
+                Value::Bool(mismatch),
+                Value::Bool(dom.input_bad_input(id)),
+            ])
+        }
+        _ => Value::Undefined,
+    })
+}
+
 fn host_set_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 1);
     let value = host_arg_string(ctx, args, 2);
@@ -10878,7 +10957,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 145, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 146, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -10889,7 +10968,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 145);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 146);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -15200,6 +15279,137 @@ mod tests {
         )
         .unwrap();
         assert_eq!(string_value(&mut engine, "acceptReflectionResult"), "true");
+    }
+
+    #[test]
+    fn numeric_input_apis_values_constraints_and_native_actions() {
+        // WHATWG HTML e5071a20 #dom-input-stepup, #dom-input-valueasnumber,
+        // #concept-input-min-zero, #number-state, #common-input-element-events.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document(
+                        "<!doctype html><html><body></body></html>",
+                    ))),
+                    Rc::new(RealmClock::new()),
+                ),
+                "https://example.test/",
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                const check = (v,m) => { if (!v) throw Error(m); };
+                const throws = (f,name) => { try { f(); } catch(e) { check(e.name===name,'expected '+name+', got '+e); return; } throw Error('missing '+name); };
+                const form = document.createElement('form'); document.body.appendChild(form);
+                const input = document.createElement('input'); input.type='number'; input.name='amount'; form.appendChild(input);
+                check(Number.isNaN(input.valueAsNumber),'empty is NaN');
+                input.required=true; check(input.hasAttribute('required') && input.validity.valueMissing,'required reflection');
+                input.required=false; check(!input.validity.valueMissing,'optional empty control');
+                input.defaultValue='0.2'; input.step='0.1';
+                let events=[]; input.addEventListener('input',e=>events.push([e.type,e.isTrusted,e.composed]));
+                input.addEventListener('change',e=>events.push([e.type,e.isTrusted,e.composed]));
+                for(let i=0;i<8;i++) input.stepUp();
+                check(input.value==='1' && input.defaultValue==='0.2','decimal stepping and unchanged base');
+                check(events.length===0,'script stepping is silent');
+                input.value='0.25'; input.stepUp(5); check(input.value==='0.3','mismatch aligns before count');
+                input.value='0.25'; input.stepDown(0); check(input.value==='0.2','zero count still aligns');
+                input.value='0.2'; input.stepUp('2.9'); check(input.value==='0.4','long conversion');
+                input.stepUp(4294967297); check(input.value==='0.5','long wraps');
+                input.stepUp(-1); check(input.value==='0.5','method direction guard');
+                input.step='any'; throws(()=>input.stepUp(),'InvalidStateError');
+                input.valueAsNumber=12.5; check(input.value==='12.5','any allows numeric assignment');
+                for(const n of [1e-7,1e-6,1e20,1e21,-1.25e21,Number.MIN_VALUE,-0]) {
+                    input.valueAsNumber=n; check(input.value===String(n),'ECMAScript number serialization '+n);
+                }
+                input.valueAsNumber=NaN; check(input.value==='' && Number.isNaN(input.valueAsNumber),'NaN clears');
+                throws(()=>input.valueAsNumber=Infinity,'TypeError');
+                throws(()=>input.stepDown(1n),'TypeError');
+                throws(()=>input.valueAsNumber=1n,'TypeError');
+                for(const value of ['+1',' 1','1.','0x10','NaN','Infinity','1e','1e309']) { input.value=value; check(input.value==='', 'sanitize '+value); }
+                input.value='-1.25e2'; check(input.valueAsNumber===-125,'exponent');
+                input.step='1e-12'; input.min='0'; input.value='0'; input.stepUp(); check(input.valueAsNumber===1e-12,'tiny step');
+                input.step='0'; input.value='0'; input.stepUp(); check(input.value==='1','invalid step uses default');
+                input.min='2'; input.max='5'; input.step='2'; input.value='3';
+                check(input.validity.stepMismatch && !input.checkValidity(),'step validation');
+                let submitted=0; form.addEventListener('submit',e=>{submitted++;e.preventDefault();});
+                __trust.formSubmit(form.__id,null); check(submitted===0,'native submit validates');
+                form.noValidate=true;
+                __trust.formSubmit(form.__id,null); check(submitted===1,'novalidate bypass'); form.noValidate=false;
+                for(const tag of ['button','input']) {
+                    const submit=document.createElement(tag); submit.type='submit'; submit.formNoValidate=true; form.appendChild(submit);
+                    const before=submitted; __trust.formSubmit(form.__id,submit.__id);
+                    check(submitted===before+1,'submitter formNoValidate reflection'); submit.remove();
+                }
+                input.value='1'; check(input.validity.rangeUnderflow,'underflow');
+                input.value='6'; check(input.validity.rangeOverflow,'overflow');
+                input.value='4'; input.stepUp(); check(input.value==='4','aligned upper bound');
+                input.max='1'; input.stepDown(); check(input.value==='4','reversed bounds no-op');
+                input.removeAttribute('min'); input.removeAttribute('max'); input.removeAttribute('step');
+                input.value='7'; input.defaultValue='2'; check(input.value==='7','dirty value independent from attribute');
+                const clone=input.cloneNode(); check(clone.value==='7' && clone.defaultValue==='2','clone current and default');
+                form.reset(); check(input.value==='2','reset current from content');
+                input.defaultValue='3'; check(input.value==='3','reset clears dirtiness');
+                input.value='4'; input.type='text'; check(Number.isNaN(input.valueAsNumber),'non-numeric getter');
+                throws(()=>input.stepUp(),'InvalidStateError'); throws(()=>input.valueAsNumber=1,'InvalidStateError');
+                throws(()=>input.valueAsNumber=Infinity,'TypeError');
+                input.type='number'; events=[];
+                __trust.numberStep(input.__id,1,false); check(input.value==='5','native step');
+                check(JSON.stringify(events)==='[["input",true,true],["change",true,false]]','trusted native event order');
+                input.readOnly=true; __trust.numberStep(input.__id,1,false); check(input.value==='5','readonly native');
+                input.stepUp(); check(input.value==='6','readonly script may step'); input.readOnly=false;
+                input.disabled=true; __trust.numberStep(input.__id,1,false); check(input.value==='6','disabled native'); input.disabled=false;
+                const cancel=e=>e.preventDefault(); input.addEventListener('click',cancel);
+                __trust.numberStep(input.__id,1,true); check(input.value==='6','cancel click'); input.removeEventListener('click',cancel);
+                input.addEventListener('keydown',cancel);
+                __trust.key(input.__id,'ArrowUp','ArrowUp',false,false,false,false,false,false);
+                check(input.value==='6','cancel key'); input.removeEventListener('keydown',cancel);
+                input.addEventListener('keydown',()=>{input.value='10';input.step='2';input.min='0';},{once:true});
+                __trust.key(input.__id,'ArrowUp','ArrowUp',false,false,false,false,false,false);
+                check(input.value==='12','native key reads updated actor state');
+                __trust.formSet(input.__id,'garbage',null); check(input.value==='' && input.validity.badInput,'bad native input');
+                input.value='1'; check(!input.validity.badInput,'script clears bad input');
+                const proto=HTMLInputElement.prototype, desc=Object.getOwnPropertyDescriptor(proto,'valueAsNumber');
+                check(proto.stepUp.length===0 && desc.enumerable && desc.configurable,'IDL descriptors');
+                let coerced=false;
+                throws(()=>proto.stepUp.call({}, {valueOf(){coerced=true;return 1;}}),'TypeError');
+                check(!coerced,'brand before conversion');
+                for(const receiver of [null,document.createElement('div'),Object.create(proto),new Proxy(input,{})]) {
+                    throws(()=>desc.get.call(receiver),'TypeError'); throws(()=>desc.set.call(receiver,1),'TypeError');
+                }
+                const frame=document.createElement('iframe'); document.body.appendChild(frame);
+                input.value='2'; frame.contentWindow.HTMLInputElement.prototype.stepUp.call(input);
+                check(input.value==='4','cross-realm receiver');
+                const fieldset=document.createElement('fieldset'); fieldset.disabled=true; form.appendChild(fieldset);
+                fieldset.appendChild(input); __trust.numberStep(input.__id,1,false); check(input.value==='4','disabled fieldset');
+                const legend=document.createElement('legend'); fieldset.appendChild(legend); legend.appendChild(input);
+                __trust.numberStep(input.__id,1,false); check(input.value==='6','first legend exception');
+                input.type=' NUMBER '; check(input.type==='text' && Number.isNaN(input.valueAsNumber),'invalid type defaults to text');
+            "#, "numeric input conformance").unwrap();
+        }
+    }
+
+    #[test]
+    fn numeric_input_apis_calendar_and_range_states() {
+        let mut engine = platform_engine();
+        eval(&mut engine,r#"
+            const check=(v,m)=>{if(!v)throw Error(m);};
+            const i=document.createElement('input');
+            for(const [type,value,next] of [
+                ['date','2024-02-28','2024-02-29'], ['month','2024-12','2025-01'],
+                ['week','2020-W53','2021-W01'], ['time','12:34','12:35'],
+                ['datetime-local','2024-12-31T23:59','2025-01-01T00:00']
+            ]) { i.type=type;i.value=value;i.stepUp();check(i.value===next,type+' step '+i.value);i.stepDown();check(i.value===value,type+' reverse'); }
+            for(const [type,value] of [['date','1970-01-01'],['month','1970-01'],['time','00:00'],['datetime-local','1970-01-01T00:00']]) {
+                i.type=type;i.valueAsNumber=0;check(i.value===value,type+' epoch');check(i.valueAsNumber===0,type+' numeric');
+            }
+            i.type='week';i.valueAsNumber=0;check(i.value==='1970-W01' && i.valueAsNumber===-259200000,'week epoch');
+            i.type='datetime-local';i.value='2024-01-01 00:00:00.000';check(i.value==='2024-01-01T00:00','datetime normalization');
+            i.type='range';i.min='0';i.max='100';i.step='20';i.value='50';check(i.value==='60','range rounds ties up');
+            i.valueAsNumber=999;check(i.value==='100','range clamps');i.valueAsNumber=NaN;check(i.value==='60','range NaN sanitization');
+            i.type='time';i.min='21:00';i.max='06:00';i.step='any';i.value='12:00';
+            check(i.validity.rangeUnderflow && i.validity.rangeOverflow,'periodic reversed bounds');
+            i.value='23:00';check(!i.validity.rangeUnderflow && !i.validity.rangeOverflow,'periodic allowed interval');
+        "#, "calendar numeric inputs").unwrap();
     }
 
     #[test]

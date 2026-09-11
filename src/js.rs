@@ -288,6 +288,11 @@ pub enum PageCmd {
         value: String,
         checked: Option<bool>,
     },
+    StepNumber {
+        node: usize,
+        direction: i8,
+        click: bool,
+    },
     Submit {
         form: usize,
         submitter: Option<usize>,
@@ -335,6 +340,7 @@ impl PageCmd {
                 | Self::Focus(_)
                 | Self::Key { .. }
                 | Self::SetValue { .. }
+                | Self::StepNumber { .. }
                 | Self::Submit { .. }
                 | Self::Scroll { .. }
                 | Self::Hover { .. }

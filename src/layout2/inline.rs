@@ -1986,6 +1986,9 @@ pub(crate) enum ControlWidthBasis {
     /// An intrinsic contribution. CSS Sizing 3 §5.2.1 treats a cyclic
     /// percentage size as `auto` while calculating that contribution.
     Intrinsic,
+    /// The min-content contribution, based on the displayed value or
+    /// placeholder rather than the control's preferred width.
+    MinContent,
 }
 
 #[cfg(test)]
@@ -2008,11 +2011,26 @@ pub(crate) fn control_intrinsic_width(
     inline_style: &InlineStyle,
     vp: Vp,
 ) -> f32 {
+    control_intrinsic_width_for_mode(dom, node, field, inline_style, vp, false)
+}
+
+pub(crate) fn control_intrinsic_width_for_mode(
+    dom: &Dom,
+    node: NodeId,
+    field: &crate::doc::Field,
+    inline_style: &InlineStyle,
+    vp: Vp,
+    min_content: bool,
+) -> f32 {
     control_labels(
         dom,
         node,
         field,
-        ControlWidthBasis::Intrinsic,
+        if min_content {
+            ControlWidthBasis::MinContent
+        } else {
+            ControlWidthBasis::Intrinsic
+        },
         f32::INFINITY,
         inline_style,
         vp,
@@ -2046,9 +2064,10 @@ fn control_labels(
         f.kind,
         FieldKind::Text | FieldKind::Password | FieldKind::Textarea
     );
+    let number_field = f.kind == FieldKind::Number;
     let basis = match width_basis {
         ControlWidthBasis::ContainingBlock(width) => Some(width),
-        ControlWidthBasis::Intrinsic => None,
+        ControlWidthBasis::Intrinsic | ControlWidthBasis::MinContent => None,
     };
     let box_style = BoxStyle::of(dom, node, vp);
     let padding = box_style
@@ -2082,11 +2101,25 @@ fn control_labels(
     // requested, a text field's preferred inline size comes from `size`
     // (default 20), never from its value or placeholder. Buttons and other
     // controls use their one-line label as their intrinsic content width.
-    let intrinsic_content = if text_field {
-        crate::text::zero_advance(&text_style) * attr_ch(attr_name).unwrap_or(20) as f32
-    } else {
-        shaped.advance
-    };
+    let intrinsic_content =
+        if matches!(width_basis, ControlWidthBasis::MinContent) && (text_field || number_field) {
+            // CSS Sizing 3 §5.2: a text-rendering control's min-content size is
+            // based on the value/placeholder it displays. The UA may impose a
+            // usable floor; one character keeps an empty control measurable.
+            // The placeholder participates even when the value is nonempty.
+            shaped
+                .advance
+                .max(crate::text::shape(&f.label, &text_style).advance)
+                .max(crate::text::zero_advance(&text_style))
+        } else if text_field {
+            crate::text::zero_advance(&text_style) * attr_ch(attr_name).unwrap_or(20) as f32
+        } else if number_field {
+            // HTML Number state does not apply the `size` attribute; retain the
+            // UA's finite one-line fallback for its preferred width.
+            crate::text::zero_advance(&text_style) * 20.0
+        } else {
+            shaped.advance
+        };
     let specified_width = box_style.width.resolve(basis);
     let mut box_width = specified_width.map_or(intrinsic_content + horizontal_edges, |width| {
         if box_style.border_box {

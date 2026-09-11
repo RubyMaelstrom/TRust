@@ -313,7 +313,13 @@ impl Flow<'_> {
                 let Some(f) = self.forms.get(*form).and_then(|f| f.fields.get(*field)) else {
                     return 0.0;
                 };
-                super::inline::control_intrinsic_width(self.dom, atom.node, f, inl, self.vp)
+                if mode == IMode::Min {
+                    super::inline::control_intrinsic_width_for_mode(
+                        self.dom, atom.node, f, inl, self.vp, true,
+                    )
+                } else {
+                    super::inline::control_intrinsic_width(self.dom, atom.node, f, inl, self.vp)
+                }
             }
             AtomKind::Media { video } => {
                 // A decoded poster's box, else the external-player text
