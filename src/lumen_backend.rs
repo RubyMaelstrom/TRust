@@ -236,6 +236,7 @@ struct HostState {
     canvas_gradient_slots: Option<Value>,
     canvas_text_metrics_slots: Option<Value>,
     permission_slots: Option<Value>,
+    history_slots: Option<Value>,
     navigator_slots: Option<Value>,
     performance_slots: Option<Value>,
     element_slots: Option<Value>,
@@ -281,6 +282,7 @@ impl HostState {
             canvas_gradient_slots: None,
             canvas_text_metrics_slots: None,
             permission_slots: None,
+            history_slots: None,
             navigator_slots: None,
             performance_slots: None,
             element_slots: None,
@@ -447,6 +449,7 @@ impl RetainedMemory for HostState {
             canvas_gradient_slots,
             canvas_text_metrics_slots,
             permission_slots,
+            history_slots,
             navigator_slots,
             performance_slots,
             element_slots,
@@ -732,6 +735,9 @@ impl RetainedMemory for HostState {
             visitor.value(value);
         }
         if let Some(value) = permission_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = history_slots {
             visitor.value(value);
         }
         if let Some(value) = navigator_slots {
@@ -4085,9 +4091,13 @@ mod desktop {
             let html = r#"<!doctype html><html><body>
                 <a id="target" href="https://www.youtube.com/watch?v=spa">watch</a>
                 <script>
+                    const frame = document.createElement("iframe");
+                    document.body.appendChild(frame);
+                    const pushState = frame.contentWindow.history.pushState;
+                    frame.remove();
                     document.getElementById("target").addEventListener("click", function (event) {
                         event.preventDefault();
-                        history.pushState({ video: "spa" }, "", this.href);
+                        pushState.call(history, { video: "spa" }, "", this.href);
                     });
                 </script>
             </body></html>"#;
@@ -4690,6 +4700,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__callback_api", 3, host_callback_api),
     ("__invoke_callback", 4, host_invoke_callback),
     ("__permissions_binding", 2, host_permissions_binding),
+    ("__history_binding", 2, host_history_binding),
     ("__navigator_binding", 1, host_navigator_binding),
     ("__performance_binding", 1, host_performance_binding),
     ("__element_slots", 1, host_element_slots),
@@ -4965,6 +4976,24 @@ fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // HTML #fully-active: Window environments are retired together with their
     // navigable subtree. A retained object does not reactivate its Document.
     // The top-level actor and independent worker agent have context zero.
+    let context = value.as_num_opt().unwrap_or(0.) as u64;
+    Ok(Value::Bool(
+        context == 0 || state.window_realms.contains_key(&context),
+    ))
+}
+
+/// History operations may be borrowed from another Window Realm. Share the
+/// receiver brand without rooting History objects, and check the receiver's
+/// Document lifecycle rather than the Realm that supplied the method.
+fn host_history_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("History requires HostState");
+    if op == "slots" {
+        return Ok(state.history_slots.get_or_insert(value).clone());
+    }
     let context = value.as_num_opt().unwrap_or(0.) as u64;
     Ok(Value::Bool(
         context == 0 || state.window_realms.contains_key(&context),
@@ -10849,7 +10878,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 144, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 145, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -10860,7 +10889,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 144);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 145);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -15908,6 +15937,84 @@ mod tests {
             string_value(&mut engine, "permissionRealmResult"),
             "TypeError|InvalidStateError:true|TypeError|false"
         );
+    }
+
+    #[test]
+    fn history_state_methods_use_the_receiver_across_window_realms() {
+        // Local WHATWG HTML snapshot e5071a20 (2026-09-06):
+        // #shared-history-push/replace-state-steps, #can-have-its-url-rewritten,
+        // #restore-the-history-object-state; Web IDL #dfn-create-operation-function.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document(
+                        "<!doctype html><html><head><base href='/search/'></head><body></body></html>",
+                    ))),
+                    Rc::new(RealmClock::new()),
+                ),
+                "https://example.test/home",
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                const check = (condition, message) => { if (!condition) throw Error(message); };
+                const throws = (f, name) => {
+                    try { f(); } catch (e) { check(e.name === name, 'expected '+name+', got '+e); return; }
+                    throw Error('missing '+name);
+                };
+                const frame = document.createElement('iframe'); document.body.appendChild(frame);
+                const child = frame.contentWindow, childHistory = child.history;
+                const borrowedPush = childHistory.pushState, borrowedReplace = childHistory.replaceState;
+                const originalPush = history.pushState, originalReplace = history.replaceState;
+                const initialLength = history.length;
+                let events = 0;
+                addEventListener('popstate', () => events++);
+                addEventListener('hashchange', () => events++);
+                const input = {query: ['rust']}; input.self = input;
+                borrowedPush.call(history, input, '', 'results?q=rust#list');
+                check(location.href === 'https://example.test/search/results?q=rust#list', 'receiver base URL');
+                check(document.URL === location.href, 'Document URL updated');
+                check(history.length === initialLength + 1, 'receiver history length');
+                check(history.state !== input && history.state.self === history.state, 'state cloned with cycles');
+                check(history.state.query instanceof Array, 'state uses receiver Realm');
+                check(child.location.href === 'about:blank' && childHistory.state === null, 'child untouched');
+                input.query[0] = 'changed'; check(history.state.query[0] === 'rust', 'state detached');
+
+                originalReplace.call(childHistory, {child: true}, '', null);
+                check(childHistory.state.child && childHistory.state instanceof child.Object, 'reverse borrow targets child');
+                check(history.state.query[0] === 'rust', 'reverse borrow leaves parent untouched');
+                frame.remove();
+                borrowedReplace.call(history, {search: 'next'}, '', '/results?q=next');
+                check(location.pathname === '/results' && history.state.search === 'next', 'removed source Realm method');
+                check(history.length === initialLength + 1, 'replace preserves length');
+                const saved = history.state, href = location.href;
+                for (const url of ['https://other.test/', 'http://example.test/', 'https://user@example.test/']) {
+                    throws(() => borrowedReplace.call(history, {bad: true}, '', url), 'SecurityError');
+                    check(history.state === saved && location.href === href, 'rejection must be atomic');
+                }
+                throws(() => originalPush.call(childHistory, {}, '', null), 'SecurityError');
+                let converted = false;
+                throws(() => borrowedPush.call({}, {}, {toString(){converted=true;return '';}}, '/x'), 'TypeError');
+                check(!converted, 'receiver checked before arguments');
+                for (const receiver of [null, undefined, Object.create(history), new Proxy(history, {})])
+                    throws(() => borrowedReplace.call(receiver, {}, ''), 'TypeError');
+                throws(() => borrowedReplace.call(history, {}), 'TypeError');
+                throws(() => borrowedReplace.call(history, {}, Symbol()), 'TypeError');
+                throws(() => borrowedReplace.call(history, {}, '', Symbol()), 'TypeError');
+                throws(() => borrowedReplace.call(history, () => {}, '', '/x'), 'DataCloneError');
+                check(history.state === saved && location.href === href, 'clone failure must be atomic');
+                for (const url of [undefined, null, '']) {
+                    borrowedReplace.call(history, {url}, '', url);
+                    check(location.href === href, 'empty URL keeps Document URL despite base element');
+                }
+                check(events === 0, 'history state update does not fire navigation events');
+                const updates = JSON.parse(__trust.takeHistoryUpdates());
+                check(updates[0].url === 'https://example.test/search/results?q=rust#list' && !updates[0].replace,
+                    'host receives parent push');
+                check(updates[1].url === href && updates[1].replace, 'host receives parent replace');
+                check(updates.length === 5, 'no failed or child update delivered as parent history');
+            "#, "borrowed History operations").unwrap();
+        }
     }
 
     #[test]
