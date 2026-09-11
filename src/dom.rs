@@ -21,6 +21,7 @@ mod container_queries;
 mod counter_styles;
 pub(crate) mod cssom;
 mod generated;
+mod input;
 mod invalidation;
 mod properties;
 mod rule_index;
@@ -172,6 +173,7 @@ pub struct Dom {
     /// Only detached non-HTML documents need an entry. Kept in the arena so
     /// wrapper collection/recreation cannot change a node's document type.
     document_content_types: FxHashMap<NodeId, String>,
+    input_values: FxHashMap<NodeId, input::InputValue>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
     /// host element → shadow root fragment (attachShadow).
     shadow_roots: FxHashMap<NodeId, NodeId>,
@@ -547,6 +549,7 @@ impl Dom {
         let Dom {
             nodes,
             document_content_types,
+            input_values,
             canvases,
             shadow_roots,
             shadow_hosts,
@@ -660,6 +663,11 @@ impl Dom {
             }};
         }
         fixed_map!(document_content_types, (NodeId, String));
+        fixed_map!(input_values, (NodeId, input::InputValue));
+        for value in input_values.values() {
+            bytes = bytes.saturating_add(value.value.capacity());
+            bytes = bytes.saturating_add(value.editing.as_ref().map_or(0, String::capacity));
+        }
         for content_type in document_content_types.values() {
             bytes = bytes.saturating_add(content_type.capacity());
         }
@@ -928,6 +936,7 @@ impl Dom {
         let mut dom = Dom {
             nodes: Vec::new(),
             document_content_types: FxHashMap::default(),
+            input_values: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
@@ -2864,6 +2873,11 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        let old_input_type = (self.tag_name(id) == Some("input")
+            && ["type", "min", "max", "step"]
+                .iter()
+                .any(|attr| name.eq_ignore_ascii_case(attr)))
+        .then(|| (self.input_type(id), self.input_value(id)));
         let cssom_reset =
             name.eq_ignore_ascii_case("style") && self.cssom_inline.remove(&id).is_some();
         let html_document =
@@ -2872,6 +2886,8 @@ impl Dom {
         // HTML canvas bitmap dimensions reset even for an idempotent write.
         let canvas_reset = self.tag_name(id) == Some("canvas")
             && (name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height"));
+        let input_reset = name.eq_ignore_ascii_case("value")
+            && self.input_values.get(&id).is_some_and(|s| !s.dirty);
         // An attribute change on a sheet-bearing element can change the
         // sheet set (`<link rel/href/disabled>`; conservatively any).
         let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
@@ -2895,7 +2911,7 @@ impl Dom {
                 .find(|a| attribute_name_matches(&a.name, &name))
             {
                 // Idempotent writes are free: no dirty, no redraw.
-                if *a.value == *value && !canvas_reset && !cssom_reset {
+                if *a.value == *value && !canvas_reset && !cssom_reset && !input_reset {
                     return;
                 }
                 a.value = StrTendril::from(value);
@@ -2910,6 +2926,7 @@ impl Dom {
                 self.touch_style_at(id);
             }
             self.touch_attr(id, invalidated_attribute);
+            self.input_attribute_changed(id, invalidated_attribute, old_input_type);
             if canvas_reset {
                 self.reset_canvas(id);
             }
@@ -2917,6 +2934,11 @@ impl Dom {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let old_input_type = (self.tag_name(id) == Some("input")
+            && ["type", "min", "max", "step"]
+                .iter()
+                .any(|attr| name.eq_ignore_ascii_case(attr)))
+        .then(|| (self.input_type(id), self.input_value(id)));
         if name.eq_ignore_ascii_case("style") {
             self.cssom_inline.remove(&id);
         }
@@ -2945,6 +2967,7 @@ impl Dom {
                     self.touch_style_at(id);
                 }
                 self.touch_attr(id, name);
+                self.input_attribute_changed(id, name, old_input_type);
                 if self.tag_name(id) == Some("canvas")
                     && (name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height"))
                 {
@@ -6206,6 +6229,9 @@ impl Dom {
             _ => None,
         };
         let copy = self.new_node(data);
+        if let Some(value) = self.input_values.get(&id).cloned() {
+            self.input_values.insert(copy, value);
+        }
         if let Some(sc) = src_content {
             let frag = self.new_node(NodeData::Fragment);
             if let NodeData::Element {
@@ -7107,6 +7133,9 @@ impl Dom {
                 out.push('<');
                 out.push_str(tag);
                 self.write_attrs(id, attrs, &mut |_, _| None, out);
+                if !js_serialization {
+                    self.write_input_presentation(id, out);
+                }
                 out.push('>');
                 if VOID_ELEMENTS.contains(&tag) {
                     return;
@@ -7317,6 +7346,7 @@ impl Dom {
             out,
         );
         // A live anchor that never had an href still needs the marker.
+        self.write_input_presentation(id, out);
         if is_click && is_anchor && self.attr(id, "href").is_none() {
             out.push_str(&format!(" href=\"x-trust-js:{id}:\""));
         }
@@ -7992,7 +8022,8 @@ impl Dom {
             StatePseudo::PlaceholderShown => match tag {
                 "input" => {
                     self.attr(id, "placeholder").is_some()
-                        && self.attr(id, "value").is_none_or(str::is_empty)
+                        && self.input_value(id).is_empty()
+                        && self.input_editing_value(id).is_none()
                 }
                 "textarea" => self.attr(id, "placeholder").is_some() && self.is_element_empty(id),
                 _ => false,
@@ -8016,10 +8047,37 @@ impl Dom {
 
     /// An `<input>`'s effective type: the `type` attribute, ASCII-lowercased,
     /// defaulting to `text`.
-    fn input_type(&self, id: NodeId) -> String {
-        self.attr(id, "type")
-            .map(|t| t.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "text".to_string())
+    pub(crate) fn input_type(&self, id: NodeId) -> String {
+        let ty = self.attr(id, "type").unwrap_or("text").to_ascii_lowercase();
+        if matches!(
+            ty.as_str(),
+            "hidden"
+                | "text"
+                | "search"
+                | "tel"
+                | "url"
+                | "email"
+                | "password"
+                | "date"
+                | "month"
+                | "week"
+                | "time"
+                | "datetime-local"
+                | "number"
+                | "range"
+                | "color"
+                | "checkbox"
+                | "radio"
+                | "file"
+                | "submit"
+                | "image"
+                | "reset"
+                | "button"
+        ) {
+            ty
+        } else {
+            "text".into()
+        }
     }
 
     /// Whether some radio in `id`'s radio button group is checked (HTML

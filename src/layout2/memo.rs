@@ -170,6 +170,19 @@ impl Environment {
                                     + field.value.capacity()
                                     + field.default_value.capacity()
                                     + field.label.capacity()
+                                    + field.number.as_ref().map_or(0, |number| {
+                                        [
+                                            &number.min,
+                                            &number.max,
+                                            &number.step,
+                                            &number.value_base,
+                                            &number.editing,
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                        .map(String::capacity)
+                                        .sum::<usize>()
+                                    })
                                     + match &field.kind {
                                         crate::doc::FieldKind::Select(options) => {
                                             options.capacity() * size_of::<(String, String)>()

@@ -105,6 +105,9 @@ pub enum FormMethod {
 pub enum FieldKind {
     /// text/search/email/... — edited through the input prompt.
     Text,
+    /// Numeric input; edited like a single-line text control and rendered
+    /// with the user agent's spinbox affordance when graphical.
+    Number,
     /// Edited like Text but the value renders masked.
     Password,
     /// Submitted but never rendered.
@@ -124,6 +127,49 @@ pub enum FieldKind {
     Reset,
 }
 
+/// Numeric constraints copied from a `type=number` control's attributes.
+/// Form submission still carries the value as the control's string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NumberConstraints {
+    pub min: Option<String>,
+    pub max: Option<String>,
+    /// `None` means the HTML default step (1); `step_any` represents
+    /// `step=any`.
+    pub step: Option<String>,
+    pub step_any: bool,
+    /// Content attribute, not the live edited value (HTML step base).
+    pub value_base: Option<String>,
+    pub mutable: bool,
+    pub spin_buttons: bool,
+    /// Incomplete user text is visible, while the submitted value is empty.
+    pub editing: Option<String>,
+}
+
+impl NumberConstraints {
+    /// Apply the numeric input stepping direction and bounds for a native
+    /// spinbox default action.
+    pub fn stepped_value(&self, current: &str, direction: i8) -> Option<String> {
+        if direction == 0 || !self.mutable {
+            return None;
+        }
+        crate::input::NumericInput::new(
+            crate::input::NumericType::Number,
+            self.min.as_deref(),
+            self.max.as_deref(),
+            if self.step_any {
+                Some("any")
+            } else {
+                self.step.as_deref()
+            },
+            self.value_base.as_deref(),
+        )
+        .stepped(current, direction < 0, 1)
+        .ok()
+        .flatten()
+        .filter(|v| v != current)
+    }
+}
+
 /// One control in an HTML form, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
@@ -137,12 +183,34 @@ pub struct Field {
     /// Placeholder text (editable fields) or button label (submits).
     pub label: String,
     pub kind: FieldKind,
+    pub number: Option<NumberConstraints>,
     /// Original DOM node id inside the living page actor, when this
     /// field came from a live JS render.
     pub live_node: Option<usize>,
 }
 
 impl Field {
+    pub fn editing_value(&self) -> &str {
+        self.number
+            .as_ref()
+            .and_then(|n| n.editing.as_deref())
+            .unwrap_or(&self.value)
+    }
+
+    pub fn set_editing_value(&mut self, value: String) {
+        if let Some(number) = &mut self.number {
+            if !number.mutable {
+                return;
+            }
+            if !value.is_empty() && !crate::input::valid_number(&value) {
+                number.editing = Some(value);
+                self.value.clear();
+                return;
+            }
+            number.editing = None;
+        }
+        self.value = value;
+    }
     /// Text painted by a graphical user agent inside the control.
     ///
     /// HTML leaves the exact native-control appearance to the user agent, but
@@ -178,9 +246,9 @@ impl Field {
             }
             FieldKind::Password if self.value.is_empty() => self.label.clone(),
             FieldKind::Password => "•".repeat(self.value.chars().count()),
-            FieldKind::Text | FieldKind::Textarea => {
-                if !self.value.is_empty() {
-                    self.value.clone()
+            FieldKind::Text | FieldKind::Number | FieldKind::Textarea => {
+                if !self.editing_value().is_empty() {
+                    self.editing_value().to_string()
                 } else {
                     self.label.clone()
                 }
@@ -236,10 +304,10 @@ impl Field {
             }
             FieldKind::Password if self.value.is_empty() => format!("[{name}]"),
             FieldKind::Password => format!("[{}]", "•".repeat(self.value.chars().count())),
-            FieldKind::Text | FieldKind::Textarea => {
+            FieldKind::Text | FieldKind::Number | FieldKind::Textarea => {
                 // Value, else the placeholder (carried in `label`), else name.
-                let shown = if !self.value.is_empty() {
-                    self.value.as_str()
+                let shown = if !self.editing_value().is_empty() {
+                    self.editing_value()
                 } else if !self.label.is_empty() {
                     self.label.as_str()
                 } else {
@@ -582,6 +650,7 @@ mod tests {
             default_checked: false,
             label: String::new(),
             kind,
+            number: None,
             live_node: None,
         }
     }
@@ -619,6 +688,24 @@ mod tests {
             "session=cafe123&msg=hello+there+%26+good+night&box=on&pick=b",
             "requestSubmit() without a submitter excludes every submit button"
         );
+    }
+
+    #[test]
+    fn number_constraints_follow_step_and_bounds() {
+        let constraints = NumberConstraints {
+            min: Some(String::from("0")),
+            max: Some(String::from("5")),
+            step: Some(String::from("0.5")),
+            step_any: false,
+            value_base: None,
+            mutable: true,
+            spin_buttons: true,
+            editing: None,
+        };
+        assert_eq!(constraints.stepped_value("", 1).as_deref(), Some("0.5"));
+        assert_eq!(constraints.stepped_value("0.25", 1).as_deref(), Some("0.5"));
+        assert_eq!(constraints.stepped_value("0.25", -1).as_deref(), Some("0"));
+        assert_eq!(constraints.stepped_value("5", 1), None);
     }
 
     #[test]

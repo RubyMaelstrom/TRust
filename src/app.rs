@@ -7046,12 +7046,19 @@ impl App {
             .as_ref()
             .and_then(|g| g.doc.forms.get(form))
             .and_then(|f| f.fields.get(field))
-            .map(|f| (f.kind.clone(), f.name.clone(), f.value.clone(), f.live_node))
+            .map(|f| {
+                (
+                    f.kind.clone(),
+                    f.name.clone(),
+                    f.editing_value().to_string(),
+                    f.live_node,
+                )
+            })
         else {
             return;
         };
         match kind {
-            FieldKind::Text | FieldKind::Password | FieldKind::Textarea => {
+            FieldKind::Text | FieldKind::Number | FieldKind::Password | FieldKind::Textarea => {
                 self.dispatch_page_focus(live_node);
                 self.input = value;
                 self.cursor = self.input.chars().count();
@@ -7583,7 +7590,7 @@ impl App {
                         .get_mut(form)
                         .and_then(|f| f.fields.get_mut(field))
                 {
-                    f.value = query.to_string();
+                    f.set_editing_value(query.to_string());
                     self.status = if f.name.is_empty() {
                         String::from("Field set.")
                     } else {

@@ -2357,7 +2357,7 @@
         const event = new Event("reset", { bubbles: true, cancelable: true });
         dispatch(form, event, false);
         if (event.defaultPrevented) return false;
-        const controls = form.querySelectorAll("input, textarea, select");
+        const controls = listedFormControls(form);
         for (let i = 0; i < controls.length; i++) {
             const control = controls[i];
             if (control.localName === "select") {
@@ -2382,9 +2382,7 @@
                         ? control.hasAttribute("checked")
                         : !!control.__trustResetChecked;
                 } else if (! ["button", "submit", "reset", "image", "file"].includes(type)) {
-                    control.value = control.__trustResetValue === undefined
-                        ? (control.getAttribute("value") || "")
-                        : control.__trustResetValue;
+                    __dom_input(elementIdentity(control), "reset", null);
                 }
             }
         }
@@ -2591,6 +2589,7 @@
         if (btn) {
             const form = formOwner(btn);
             if (form) {
+                if (!form.hasAttribute("novalidate") && !btn.hasAttribute("formnovalidate") && !form.checkValidity()) return true;
                 const sev = trusted
                     ? createTrustedEvent(Event, "submit", { bubbles: true, cancelable: true })
                     : new Event("submit", { bubbles: true, cancelable: true });
@@ -2683,6 +2682,12 @@
             dispatch(t, ev, false);
             prevented = ev.defaultPrevented;
             if (released) return prevented;
+            if (t.localName === "input" && t.type === "number"
+                && (init.key === "ArrowUp" || init.key === "ArrowDown")) {
+                if (!prevented && !composing && !ctrl && !alt && !meta)
+                    trust.numberStep(elementIdentity(t), init.key === "ArrowDown" ? -1 : 1, false);
+                return true; // Actor already performed (or canceled) the default.
+            }
             // UI Events #event-type-keypress / #keypress-event-order: Enter's
             // legacy character event precedes its form/newline default. A
             // canceled keydown suppresses it, and IME composition never emits
@@ -2929,7 +2934,7 @@
     }
     function controlWillValidate(el) {
         const type = el.localName === "input" ? String(el.type || "text").toLowerCase() : "";
-        return !(el.hasAttribute("disabled")
+        return !(el.matches(":disabled")
             || el.hasAttribute("readonly")
             || (el.localName === "input" && ["hidden", "button", "reset", "submit", "image"].includes(type)));
     }
@@ -2954,11 +2959,12 @@
             }
         }
         const customError = !!el.__trustValidationMessage;
+        const numeric = el.localName === "input" ? __dom_input(elementIdentity(el), "validity", null) : [false,false,false,false];
         return {
             valueMissing: valueMissing, customError: customError,
             typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false,
-            rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
-            valid: !valueMissing && !customError,
+            rangeUnderflow: numeric[0], rangeOverflow: numeric[1], stepMismatch: numeric[2], badInput: numeric[3],
+            valid: !valueMissing && !customError && !numeric.some(Boolean),
         };
     }
     function installConstraintValidation(C) {
@@ -2966,13 +2972,19 @@
             willValidate: { configurable: true, get() { return controlWillValidate(this); } },
             validity: { configurable: true, get() { return controlValidity(this); } },
             validationMessage: { configurable: true, get() {
+                if (!controlWillValidate(this)) return "";
                 if (this.__trustValidationMessage) return this.__trustValidationMessage;
-                return controlValidity(this).valueMissing ? "Please fill out this field." : "";
+                const validity = controlValidity(this);
+                if (validity.badInput) return "Please enter a number.";
+                if (validity.valueMissing) return "Please fill out this field.";
+                if (validity.rangeUnderflow) return "The value is below the minimum.";
+                if (validity.rangeOverflow) return "The value is above the maximum.";
+                return validity.stepMismatch ? "Please enter a value matching the step." : "";
             }},
         });
         C.prototype.setCustomValidity = function (message) { this.__trustValidationMessage = String(message); };
         C.prototype.checkValidity = function () {
-            if (controlValidity(this).valid) return true;
+            if (!controlWillValidate(this) || controlValidity(this).valid) return true;
             dispatch(this, new Event("invalid", { cancelable: true }), false);
             return false;
         };
@@ -3077,20 +3089,42 @@
         } else if (tag === "textarea") {
             if (el.__trustResetValue === undefined) el.__trustResetValue = el.textContent;
             if (el.textContent !== value) { el.textContent = value; changed = true; }
+        } else if (tag === "input") {
+            changed = __dom_input(elementIdentity(el), "user", value);
         } else {
             if (el.__trustResetValue === undefined) el.__trustResetValue = el.getAttribute("value") || "";
             if (el.value !== value) { nativeSet(el, "value", value); changed = true; }
         }
-        if (changed) fireFormEvents(el, isToggle);
+        if (changed && tag === "input" && type === "number") {
+            dispatch(el, createTrustedEvent(Event, "input", {bubbles:true, composed:true}), false);
+            dispatch(el, createTrustedEvent(Event, "change", {bubbles:true}), false);
+        } else if (changed) fireFormEvents(el, isToggle);
         return changed;
+    };
+    // Native spin actions use the actor's current constraints after the
+    // cancelable event. Script APIs below never generate input/change events.
+    trust.numberStep = function(id, direction, click) {
+        const el = wrap(id);
+        if (!el || htmlElementName(el) !== "input") return false;
+        if (click && activateClick(el, true, true)) return false;
+        if (el.type !== "number" || !__dom_input(id, "mutable", null)) return false;
+        const changed = __dom_input(id, direction < 0 ? "down" : "up", 1);
+        if (changed) {
+            __dom_input(id, "user", __dom_input(id, "get", null));
+            dispatch(el, createTrustedEvent(Event, "input", {bubbles:true, composed:true}), false);
+            dispatch(el, createTrustedEvent(Event, "change", {bubbles:true}), false);
+        }
+        return !!changed;
     };
     trust.formSubmit = function (formId, submitterId) {
         const form = wrap(formId);
         if (!form) return false;
+        const submitter = submitterId == null ? null : wrap(submitterId);
+        if (!form.hasAttribute("novalidate") && !(submitter && submitter.hasAttribute("formnovalidate")) && !form.checkValidity()) return true;
         const ev = new SubmitEvent("submit", {
             bubbles: true,
             cancelable: true,
-            submitter: submitterId === null || submitterId === undefined ? null : wrap(submitterId),
+            submitter,
         });
         dispatch(form, ev, false);
         if (!ev.defaultPrevented && handleDialogSubmission(form, ev.submitter)) return true;
@@ -5401,9 +5435,8 @@
         get defaultSelected() { return this.hasAttribute("selected"); }
         set defaultSelected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
     }
-    // HTMLInputElement: value reflects the `value` attribute (no dirty-value
-    // tracking here); checked reflects `checked`; the `type` IDL attribute
-    // defaults to "text" when absent (React's change-event plugin keys off it).
+    // HTML #common-input-element-apis: live values and numeric constraints
+    // are arena-owned, shared with rendering and native editing.
     const inputElementBrand = new WeakSet();
     class HTMLInputElement extends HTMLElement {
         constructor(id) { super(id); inputElementBrand.add(this); }
@@ -5419,8 +5452,32 @@
             if (typeof v === "symbol") throw new TypeError("Cannot convert a Symbol to a DOMString");
             this.setAttribute("accept", String(v));
         }
-        get value() { const v = this.getAttribute("value"); return v === null ? "" : v; }
-        set value(v) { this.setAttribute("value", String(v)); }
+        get value() { requireHTMLInterface(this,["input"]); return __dom_input(elementIdentity(this), "get", null); }
+        set value(v) {
+            requireHTMLInterface(this,["input"]);
+            v = v === null ? "" : domString(v);
+            if (this.type === "file" && v !== "") throw new DOMException("File input value cannot be set", "InvalidStateError");
+            __dom_input(elementIdentity(this), "set", v);
+        }
+        get defaultValue() { requireHTMLInterface(this,["input"]); return this.getAttribute("value") || ""; }
+        set defaultValue(v) { requireHTMLInterface(this,["input"]); this.setAttribute("value",domString(v)); }
+        get valueAsNumber() { requireHTMLInterface(this,["input"]); return __dom_input(elementIdentity(this), "number", null); }
+        set valueAsNumber(v) {
+            requireHTMLInterface(this,["input"]);
+            v = +v; // Web IDL unrestricted double (rejects Symbols and BigInts).
+            if (v === Infinity || v === -Infinity) throw new TypeError("Infinite input value");
+            if (!__dom_input(elementIdentity(this), "set-number", v)) throw new DOMException("Input is not numeric", "InvalidStateError");
+        }
+        stepUp(n = 1) {
+            requireHTMLInterface(this,["input"]);
+            if (__dom_input(elementIdentity(this), "up", (+n) >> 0) === null)
+                throw new DOMException("Input has no allowed value step", "InvalidStateError");
+        }
+        stepDown(n = 1) {
+            requireHTMLInterface(this,["input"]);
+            if (__dom_input(elementIdentity(this), "down", (+n) >> 0) === null)
+                throw new DOMException("Input has no allowed value step", "InvalidStateError");
+        }
         get checked() { return this.hasAttribute("checked"); }
         set checked(v) {
             v = !!v;
@@ -5433,12 +5490,24 @@
         }
         get indeterminate() { return !!this.__trustIndeterminate; }
         set indeterminate(v) { this.__trustIndeterminate = !!v; }
-        get type() { const t = this.getAttribute("type"); return t === null ? "text" : t.toLowerCase(); }
-        set type(v) { this.setAttribute("type", String(v)); }
+        get type() { requireHTMLInterface(this,["input"]); return __dom_input(elementIdentity(this), "type", null); }
+        set type(v) { requireHTMLInterface(this,["input"]); this.setAttribute("type", domString(v)); }
     }
     Object.defineProperty(HTMLInputElement.prototype, "accept", {
         ...Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "accept"), enumerable: true,
     });
+    for (const name of ["value", "defaultValue", "valueAsNumber", "stepUp", "stepDown"]) {
+        Object.defineProperty(HTMLInputElement.prototype,name, {
+            ...Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,name), enumerable:true,
+        });
+    }
+    for (const name of ["min", "max", "step"]) {
+        Object.defineProperty(HTMLInputElement.prototype,name, {
+            configurable:true, enumerable:true,
+            get() { requireHTMLInterface(this,["input"]); return this.getAttribute(name) || ""; },
+            set(v) { requireHTMLInterface(this,["input"]); this.setAttribute(name,domString(v)); },
+        });
+    }
     // <textarea>.value is its raw text content (no `value` content attribute) —
     // the form-submit path and formSet read/write the same.
     class HTMLTextAreaElement extends HTMLElement {
@@ -5521,6 +5590,7 @@
         }
     }
     class HTMLFormElement extends HTMLElement {
+        reset() { requireHTMLInterface(this,["form"]); resetForm(this); }
         get elements() {
             return this.__trustElements
                 || (this.__trustElements = new HTMLFormControlsCollection(this));
@@ -6078,6 +6148,14 @@
             },
         });
     }
+    // HTML input/form/button IDL and #reflect: validation controls must also
+    // work when configured through JavaScript boolean properties.
+    for (const [C, names, properties] of [
+        [HTMLInputElement, ["input"], ["readOnly", "required", "formNoValidate"]],
+        [HTMLFormElement, ["form"], ["noValidate"]],
+        [HTMLButtonElement, ["button"], ["formNoValidate"]],
+    ]) for (const property of properties)
+        tableReflector(C, names, property, property.toLowerCase(), "boolean");
 
     // DOM §4.9 chooses an element interface from its namespace and local name,
     // not its spelling alone. Memoize the pair: HTML <a> is an
@@ -17222,7 +17300,7 @@
     // Keep native activation, editing, and their default-action bookkeeping in
     // the same Realm as the target. HTMLElement.click() remains synthetic and
     // never enters this host-only routing layer.
-    for (const name of ["click", "key", "formSet", "formSubmit", "formSubmission", "followAnchorDefault"]) {
+    for (const name of ["click", "key", "numberStep", "formSet", "formSubmit", "formSubmission", "followAnchorDefault"]) {
         const local = trust[name];
         trust[name] = function (...args) {
             const frame = nativeInputChildFrame(args[0]);

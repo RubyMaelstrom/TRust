@@ -7517,6 +7517,148 @@ mod tests {
     }
 
     #[test]
+    fn nested_flex_range_controls_fit_their_containing_panel() {
+        // CSS Flexbox 1 §9.9.1 and §4.5: the nested flex items have
+        // min-width:0, so their form-group parents must be able to shrink
+        // within the single-line range container instead of retaining the
+        // number control's intrinsic width as an automatic minimum.
+        let html = r#"<style>
+            body { margin:0 }
+            #side { width:300px }
+            .range-container { display:flex; align-items:center; justify-content:flex-start }
+            .range-container .form-group { display:flex; margin-right:0 }
+            .range-container .form-group input {
+                flex:1 1 0; min-width:0; height:33px; margin:0;
+                border:1px solid #aaa; border-radius:4px; font-size:16px
+            }
+            .range-container .form-group input[data-range-low] { margin-right:5px }
+            .range-container .form-group input[data-range-high] { margin-left:5px }
+            .form-group { position:relative; background-color:white }
+            .form-group input { flex-grow:0; width:100%; height:48px; padding:22px 16px 6px }
+            .form-group .control-label { position:absolute; top:6px; left:16px }
+        </style>
+        <form id="form"><div id="side"><div id="range" class="range-container">
+            <div id="low-group" class="form-group"><label class="control-label">Minimum</label>
+                <input id="low" type="number" min="0" data-range-low></div>
+            <div id="high-group" class="form-group"><label class="control-label">Maximum</label>
+                <input id="high" type="number" min="0" data-range-high></div>
+        </div></div></form>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        assert!(
+            forms[0]
+                .fields
+                .iter()
+                .all(|field| field.kind == crate::doc::FieldKind::Number)
+        );
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 600.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let side = rect(&dom, &layout.boxes, "side");
+        let range = rect(&dom, &layout.boxes, "range");
+        let low_group = rect(&dom, &layout.boxes, "low-group");
+        let high_group = rect(&dom, &layout.boxes, "high-group");
+        let low = rect(&dom, &layout.boxes, "low");
+        let high = rect(&dom, &layout.boxes, "high");
+        let side_right = side.left + side.width;
+        let range_right = range.left + range.width;
+        assert!(
+            range_right <= side_right + 0.01,
+            "range container leaks past panel: range={range:?}, side={side:?}"
+        );
+        for (name, group, input) in [("low", low_group, low), ("high", high_group, high)] {
+            assert!(
+                group.left >= range.left - 0.01 && group.left + group.width <= range_right + 0.01,
+                "{name} form-group is outside range: group={group:?}, range={range:?}"
+            );
+            assert!(
+                input.left >= group.left - 0.01
+                    && input.left + input.width <= group.left + group.width + 0.01,
+                "{name} number input is outside form-group: input={input:?}, group={group:?}"
+            );
+        }
+        let spin_shapes = layout
+            .paint
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive,
+                    crate::render::DisplayCommand::Fill {
+                        shape: crate::render::PaintShape::Polygon { points, .. },
+                        ..
+                    } if points.len() == 3
+                )
+            })
+            .count();
+        assert_eq!(
+            spin_shapes, 4,
+            "each number input paints an up/down affordance"
+        );
+    }
+
+    #[test]
+    fn number_spin_appearance_and_accessibility_follow_the_control() {
+        let dom = Dom::parse_document(
+            r#"<input id=n type=number min=2 max=8 value=4>
+            <input id=plain type=number style='appearance:none'>
+            <input id=readonly type=number readonly value=3>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let plain = dom.get_by_id("plain").unwrap();
+        assert!(!dom.input_spin_buttons(plain));
+        let tree = crate::accessibility::SemanticTree::for_document(
+            &dom,
+            &layout.boxes,
+            &forms,
+            &controls,
+            None,
+        );
+        let node = tree
+            .nodes
+            .iter()
+            .find(|n| n.dom_node == dom.get_by_id("n"))
+            .unwrap();
+        assert_eq!(node.role, crate::accessibility::Role::SpinButton);
+        assert_eq!(
+            (node.numeric_value, node.numeric_min, node.numeric_max),
+            (Some(4.0), Some(2.0), Some(8.0))
+        );
+        assert!(
+            node.actions
+                .contains(&crate::accessibility::Action::Increment)
+        );
+        let readonly = tree
+            .nodes
+            .iter()
+            .find(|n| n.dom_node == dom.get_by_id("readonly"))
+            .unwrap();
+        assert!(
+            !readonly
+                .actions
+                .contains(&crate::accessibility::Action::Increment)
+        );
+        let arrows=layout.paint.primitives.iter().filter(|p| matches!(p,
+            crate::render::DisplayCommand::Fill { shape:crate::render::PaintShape::Polygon{points,..},.. } if points.len()==3)).count();
+        assert_eq!(arrows, 4, "appearance:none removes the two native arrows");
+    }
+
+    #[test]
     fn invalid_flex_shorthand_preserves_responsive_column_geometry() {
         // Flexbox 1 #flex-property + #flex-basis-property: dropping the whole
         // invalid override preserves `auto`, which uses the column's width.

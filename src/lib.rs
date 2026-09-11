@@ -47,6 +47,7 @@ pub mod gemini;
 pub mod gopher;
 pub mod http;
 pub mod img;
+mod input;
 pub mod js;
 mod js_host_boundary;
 pub mod layout2;

@@ -5736,6 +5736,9 @@ pub fn extract_forms_arena(
             {
                 for (a, b) in new.fields.iter_mut().zip(&old.fields) {
                     a.value = b.value.clone();
+                    if let Some(number) = &mut a.number {
+                        number.editing = b.number.as_ref().and_then(|n| n.editing.clone());
+                    }
                     a.checked = b.checked;
                 }
             }
@@ -5862,6 +5865,7 @@ fn walk_forms_arena(
                     default_checked: false,
                     label: contenteditable_placeholder(dom, child),
                     kind: FieldKind::Textarea,
+                    number: None,
                     live_node: live_node(dom, child),
                 });
                 map.insert(child, (form, forms[form].fields.len() - 1));
@@ -5913,7 +5917,11 @@ fn live_node(dom: &crate::dom::Dom, id: usize) -> Option<usize> {
 
 fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field> {
     let name = dom.attr(id, "name").unwrap_or("").to_string();
-    let value = dom.attr(id, "value").unwrap_or("").to_string();
+    let value = if tag == "input" {
+        dom.input_value(id)
+    } else {
+        dom.attr(id, "value").unwrap_or("").to_string()
+    };
     let checked = dom.attr(id, "checked").is_some();
     let mut label = String::new();
     let kind = match tag {
@@ -5921,6 +5929,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
             let ty = dom.attr(id, "type").unwrap_or("").to_ascii_lowercase();
             match ty.as_str() {
                 "hidden" => FieldKind::Hidden,
+                "number" => FieldKind::Number,
                 "password" => FieldKind::Password,
                 "checkbox" => FieldKind::Checkbox,
                 "radio" => FieldKind::Radio,
@@ -5986,6 +5995,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 default_checked: false,
                 label,
                 kind: FieldKind::Textarea,
+                number: None,
                 live_node: live_node(dom, id),
             });
         }
@@ -6018,19 +6028,39 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 default_checked: false,
                 label,
                 kind: FieldKind::Select(options),
+                number: None,
                 live_node: live_node(dom, id),
             });
         }
         _ => return None,
     };
+    let number = matches!(&kind, FieldKind::Number).then(|| {
+        let step_raw = dom.attr(id, "step").unwrap_or("");
+        let step_any = step_raw.eq_ignore_ascii_case("any");
+        crate::doc::NumberConstraints {
+            min: dom.attr(id, "min").map(str::to_string),
+            max: dom.attr(id, "max").map(str::to_string),
+            step: dom.attr(id, "step").map(str::to_string),
+            step_any,
+            value_base: dom.attr(id, "value").map(str::to_string),
+            mutable: dom.input_mutable(id),
+            spin_buttons: dom.input_spin_buttons(id),
+            editing: dom.input_editing_value(id).map(str::to_string),
+        }
+    });
     Some(Field {
         name,
-        default_value: value.clone(),
+        default_value: if tag == "input" {
+            dom.attr(id, "value").unwrap_or("").to_string()
+        } else {
+            value.clone()
+        },
         value,
         checked,
         default_checked: checked,
         label,
         kind,
+        number,
         live_node: live_node(dom, id),
     })
 }

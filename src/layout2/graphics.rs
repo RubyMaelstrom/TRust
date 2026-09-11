@@ -1458,6 +1458,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             paint_nested_document_canvas(fragment, builder);
         }
         paint_borders(fragment, radii, builder);
+        paint_number_spin_buttons(fragment, builder);
         // CSS Pseudo 4 §4.1 generates a real box even for content:"". Its hit
         // target is the originating element, including when positioned outside
         // that element's principal box (the stretched-link card pattern).
@@ -1587,12 +1588,18 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 // not merely to the outer border box. This is the same box
                 // used to place the glyphs, so authored padding cannot become
                 // a second nested control surface or an overflow escape hatch.
-                let label_rect = CssRect::new(
+                let mut label_rect = CssRect::new(
                     fragment.x + piece.x + piece.paint_x,
                     fragment.y + piece.y + piece.paint_y,
                     piece.paint_width,
                     piece.paint_height,
                 );
+                if builder.dom.input_spin_buttons(style_node)
+                    && let Some(rect) = piece_rect
+                {
+                    let right = rect.x + rect.width - rect.width.clamp(8.0, 18.0);
+                    label_rect.width = label_rect.width.min((right - label_rect.x).max(0.0));
+                }
                 clip = intersect_css_rects(clip, label_rect);
             }
             if let Some(shaped) = &piece.shaped {
@@ -1868,6 +1875,7 @@ fn paint_atomic_control_box(
     }
     paint_background_images(&control, shape, builder, None);
     paint_borders(&control, radii, builder);
+    paint_number_spin_buttons(&control, builder);
     if builder.dom.point_hit_testable(node) {
         builder.commands.push(DisplayCommand::HitRegion(HitRegion {
             rect,
@@ -1978,6 +1986,51 @@ fn paint_native_control_surface(
             ),
             brush: PaintBrush::Solid(edge),
             style: StrokeStyle::solid(1.0),
+        });
+    }
+}
+
+/// HTML Rendering §15.5.6 leaves the exact number-control UI to the user
+/// agent, but explicitly calls a spinbox with up/down controls a reasonable
+/// rendering for `type=number`. Keep the affordance in the graphical display
+/// list (the terminal frontend uses its own character-cell adaptation), and
+/// suppress it when CSS UI requests `appearance:none`.
+fn paint_number_spin_buttons(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+    let node = fragment.node;
+    if node == NO_NODE
+        || !builder.dom.input_spin_buttons(node)
+        || fragment.w < 8.0
+        || fragment.h < 8.0
+    {
+        return;
+    }
+    let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let rail = fragment.w.clamp(8.0, 18.0);
+    let center_x = rect.x + rect.width - rail * 0.5 - 1.0;
+    let midpoint = rect.y + rect.height * 0.5;
+    let half_width = (rail * 0.22).max(1.5);
+    let inset = (rect.height * 0.16).max(1.5);
+    let color = text_color(builder.dom, node, false);
+    let up = PaintShape::Polygon {
+        points: vec![
+            CssPoint::new(center_x - half_width, midpoint - inset),
+            CssPoint::new(center_x + half_width, midpoint - inset),
+            CssPoint::new(center_x, rect.y + inset),
+        ],
+        evenodd: false,
+    };
+    let down = PaintShape::Polygon {
+        points: vec![
+            CssPoint::new(center_x - half_width, midpoint + inset),
+            CssPoint::new(center_x + half_width, midpoint + inset),
+            CssPoint::new(center_x, rect.y + rect.height - inset),
+        ],
+        evenodd: false,
+    };
+    for shape in [up, down] {
+        builder.commands.push(DisplayCommand::Fill {
+            shape,
+            brush: PaintBrush::Solid(color),
         });
     }
 }

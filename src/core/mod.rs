@@ -261,6 +261,11 @@ pub enum UserAction {
         value: String,
         checked: Option<bool>,
     },
+    StepNumber {
+        node: usize,
+        direction: i8,
+        click: bool,
+    },
     /// Deliver a native key press to the focused live DOM node. The resident
     /// actor reports whether to suppress the frontend's editing/form default.
     PageKey {
@@ -988,6 +993,18 @@ impl BrowserController {
                 self.send_user(crate::js::PageCmd::Key {
                     node: Some(node),
                     input,
+                });
+                false
+            }
+            UserAction::StepNumber {
+                node,
+                direction,
+                click,
+            } => {
+                self.send_user(crate::js::PageCmd::StepNumber {
+                    node,
+                    direction,
+                    click,
                 });
                 false
             }
