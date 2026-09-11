@@ -509,6 +509,7 @@ pub struct BrowserController {
     /// Default-action results for keyboard events delivered to the resident
     /// page. Native frontends consume these after the actor runs `keydown`.
     page_key_defaults: VecDeque<bool>,
+    pending_form_values: std::collections::HashMap<usize, usize>,
     /// Preserve native input FIFO while the actor's bounded channel is full.
     pending_user_input: VecDeque<(crate::js::PageCmd, bool)>,
     user_input_retry: Option<JoinHandle<()>>,
@@ -569,6 +570,7 @@ impl BrowserController {
             render_is_final: false,
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
+            pending_form_values: Default::default(),
             pending_user_input: VecDeque::new(),
             user_input_retry: None,
             pending_fragment: None,
@@ -687,6 +689,11 @@ impl BrowserController {
     /// in a formless input); `false` lets the frontend apply editing/submission.
     pub fn take_page_key_default(&mut self) -> Option<bool> {
         self.page_key_defaults.pop_front()
+    }
+
+    /// Whether a native value is still ahead of the actor's canonical DOM.
+    pub fn form_value_pending(&self, node: usize) -> bool {
+        self.pending_form_values.contains_key(&node)
     }
 
     /// Publish graphical layout boundaries the resident actor may target.
@@ -980,12 +987,14 @@ impl BrowserController {
                 value,
                 checked,
             } => {
-                if let Some(node) = actor {
-                    self.send_user(crate::js::PageCmd::SetValue {
+                if let Some(node) = actor
+                    && self.send_user(crate::js::PageCmd::SetValue {
                         node,
                         value,
                         checked,
-                    });
+                    })
+                {
+                    *self.pending_form_values.entry(node).or_default() += 1;
                 }
                 true
             }
@@ -1484,6 +1493,7 @@ impl BrowserController {
         }
         self.pending_live_submit = None;
         self.page_key_defaults.clear();
+        self.pending_form_values.clear();
         if let Some(task) = self.live_task.take() {
             task.abort();
         }
@@ -1634,6 +1644,17 @@ impl BrowserController {
             }
             PageEvt::KeyDefault { prevented } => {
                 self.page_key_defaults.push_back(prevented);
+                false
+            }
+            PageEvt::FormValueApplied { node } => {
+                let Some(pending) = self.pending_form_values.get_mut(&node) else {
+                    return false;
+                };
+                *pending -= 1;
+                if *pending == 0 {
+                    self.pending_form_values.remove(&node);
+                    return true;
+                }
                 false
             }
             PageEvt::Scrolled { node, top, left } => {
@@ -2216,6 +2237,37 @@ mod tests {
             "report.pdf"
         );
         assert!(browser.pending.is_none());
+    }
+
+    #[test]
+    fn form_value_acknowledgements_do_not_release_newer_edits() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        for value in ["a", "ab"] {
+            browser.handle_action(UserAction::SetFormValue {
+                actor: Some(42),
+                value: value.into(),
+                checked: None,
+            });
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(crate::js::PageCmd::SetValue { node: 42, .. })
+            ));
+        }
+        assert!(browser.form_value_pending(42));
+        assert!(!browser.handle_page_event(crate::js::PageEvt::FormValueApplied { node: 42 }));
+        assert!(browser.form_value_pending(42));
+        assert!(browser.handle_page_event(crate::js::PageEvt::FormValueApplied { node: 42 }));
+        assert!(!browser.form_value_pending(42));
+        assert!(!browser.handle_page_event(crate::js::PageEvt::FormValueApplied { node: 42 }));
     }
 
     #[test]

@@ -51,6 +51,7 @@ mod inline;
 mod intrinsic;
 mod measure;
 mod memo;
+mod overflow;
 // The legacy Row/Item output is now explicitly a terminal compatibility
 // adapter. Its source filename is retained to keep this refactor reviewable.
 mod replaced;
@@ -316,6 +317,16 @@ pub struct RichEditorPresentation {
     pub caret_color: crate::render::PaintColor,
     pub origin: crate::core::CssPoint,
     pub width: f32,
+    /// A single unformatted editing paragraph can present a pending native
+    /// edit using its existing CSS text style while the actor handles input.
+    pub pending_text: Option<PendingEditorText>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingEditorText {
+    pub text: String,
+    pub nodes: Vec<NodeId>,
+    pub color: crate::render::PaintColor,
 }
 
 pub(crate) fn rich_editor_presentation(
@@ -355,11 +366,52 @@ pub(crate) fn rich_editor_presentation(
         .as_deref()
         .and_then(crate::render::PaintColor::parse_css)
         .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+    let nodes: Vec<_> = std::iter::once(node).chain(dom.descendants(node)).collect();
+    let mut paragraphs = 0;
+    let plain = nodes.iter().all(|&id| {
+        if id == node {
+            return true;
+        }
+        match dom.tag_name(id) {
+            Some("p") => {
+                paragraphs += 1;
+                paragraphs == 1
+            }
+            Some("br") | None => true,
+            _ => false,
+        }
+    }) && nodes.iter().all(|&id| {
+        ["text-transform", "transform", "filter", "text-shadow"]
+            .iter()
+            .all(|property| {
+                dom.computed_value_resolved(id, property)
+                    .is_none_or(|v| v == "none")
+            })
+            && dom
+                .computed_value_resolved(id, "text-align")
+                .is_none_or(|v| matches!(v.as_str(), "left" | "start"))
+            && dom
+                .computed_value_resolved(id, "direction")
+                .is_none_or(|v| v == "ltr")
+            && dom
+                .computed_value_resolved(id, "writing-mode")
+                .is_none_or(|v| v == "horizontal-tb")
+    });
+    let pending_text = plain.then(|| PendingEditorText {
+        text: dom.text_content(node),
+        nodes,
+        color: dom
+            .computed_value_resolved(style_node, "color")
+            .as_deref()
+            .and_then(crate::render::PaintColor::parse_css)
+            .unwrap_or(color),
+    });
     Some(RichEditorPresentation {
         style,
         caret_color: color,
         origin: crate::core::CssPoint::new(line.x - host.x, line.y - host.y),
         width: host.content_size.map_or(host.w, |s| s[0]),
+        pending_text,
     })
 }
 
@@ -466,7 +518,8 @@ pub fn repaint_graphical(
     layout.patch_boundaries = patch_boundaries;
     layout.boundaries = boundaries;
     if let Some(cache) = &mut layout.paint_cache {
-        cache.terminal = terminal::TerminalPaintModel::from_dom(dom, base, controls);
+        cache.terminal =
+            terminal::TerminalPaintModel::from_layout(dom, base, controls, &layout.boxes);
         cache.terminal.capture_page_media(dom, base, images);
     }
     true
@@ -509,7 +562,8 @@ pub fn lay_out_graphical(
             viewport.height,
         );
         let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
-        let mut terminal_model = terminal::TerminalPaintModel::from_dom(dom, base, controls);
+        let mut terminal_model =
+            terminal::TerminalPaintModel::from_layout(dom, base, controls, &boxes);
         terminal_model.capture_page_media(dom, base, images);
         let paint_cache = graphical_paint_cache(
             &layout.root,
@@ -583,7 +637,7 @@ pub(crate) fn paint_retained_layout(
         fragments.viewport.height,
     );
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
-    let mut terminal = terminal::TerminalPaintModel::from_dom(dom, base, controls);
+    let mut terminal = terminal::TerminalPaintModel::from_layout(dom, base, controls, &boxes);
     terminal.capture_page_media(dom, base, images);
     GraphicalLayout {
         paint,
@@ -784,7 +838,7 @@ pub fn lay_graphical_subtree(
         flow_bottom,
         Viewport::new(viewport.width, viewport.height),
         &anchors,
-        terminal::TerminalPaintModel::from_dom(dom, base, controls),
+        terminal::TerminalPaintModel::from_layout(dom, base, controls, &boxes),
     );
     Some(GraphicalLayout {
         paint,
@@ -7018,7 +7072,10 @@ mod tests {
           </div><p style="margin:0">After</p></body>"#;
         let graphical = lay_graphical(html, 640.0, &ImageSizes::new());
         let (x, y, _) = graphical_text(&graphical, "Instructions");
-        assert!((x - 10.0).abs() < 0.1 && y >= 10.0 && y < 40.0, "{x},{y}");
+        assert!(
+            (x - 10.0).abs() < 0.1 && (10.0..40.0).contains(&y),
+            "{x},{y}"
+        );
         let terminal = lay(html, 80);
         assert!(terminal_text(&terminal).contains("Instructions"));
         assert!(graphical_text(&graphical, "After").1 >= 120.0);

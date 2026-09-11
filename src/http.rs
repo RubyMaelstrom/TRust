@@ -234,6 +234,7 @@ pub struct RenderedPage {
     pub parents: std::collections::HashMap<crate::dom::NodeId, crate::dom::NodeId>,
     pub fragment_y: std::collections::HashMap<String, f32>,
     pub semantics: crate::accessibility::SemanticTree,
+    pub focus_order: Vec<crate::dom::NodeId>,
     /// Layout node ids are the resident actor's canonical arena ids. Static
     /// snapshots leave this false because there is no actor to receive input.
     pub direct_actor_nodes: bool,
@@ -255,6 +256,7 @@ impl Clone for RenderedPage {
             parents: self.parents.clone(),
             fragment_y: self.fragment_y.clone(),
             semantics: self.semantics.clone(),
+            focus_order: self.focus_order.clone(),
             direct_actor_nodes: self.direct_actor_nodes,
         }
     }
@@ -278,6 +280,7 @@ impl RenderedPage {
             && self.parents == other.parents
             && self.fragment_y == other.fragment_y
             && self.semantics.content_eq(&other.semantics)
+            && self.focus_order == other.focus_order
             && self.direct_actor_nodes == other.direct_actor_nodes
     }
 }
@@ -321,10 +324,11 @@ pub(crate) fn render_arena_with_layout(
     let started = diagnostic.then(std::time::Instant::now);
     let (forms, controls) = extract_forms_arena(dom, base, seed);
     let forms_elapsed = started.map(|started| started.elapsed());
-    let resources = collect_image_urls(dom, base, viewport, device_pixel_ratio);
-    let resources_elapsed = started.map(|started| started.elapsed());
     let layout = layout(&forms, &controls);
     let layout_elapsed = started.map(|started| started.elapsed());
+    let resources =
+        collect_image_urls_for_boxes(dom, base, viewport, device_pixel_ratio, Some(&layout.boxes));
+    let resources_elapsed = started.map(|started| started.elapsed());
     let deferred_images = resources
         .lazy_nodes
         .iter()
@@ -409,9 +413,9 @@ pub(crate) fn render_arena_with_layout(
             dom.node_count(),
             started.elapsed().as_millis(),
             forms_elapsed.as_millis(),
-            (resources_elapsed - forms_elapsed).as_millis(),
-            (layout_elapsed - resources_elapsed).as_millis(),
-            (started.elapsed() - layout_elapsed).as_millis(),
+            (resources_elapsed - layout_elapsed).as_millis(),
+            (layout_elapsed - forms_elapsed).as_millis(),
+            (started.elapsed() - resources_elapsed).as_millis(),
             layout.boxes.len(),
         );
     }
@@ -422,6 +426,7 @@ pub(crate) fn render_arena_with_layout(
                 .map(|style| (node, style))
         })
         .collect();
+    let focus_order = dom.sequential_focus_order(&layout.boxes);
     RenderedPage {
         layout: std::sync::Arc::new(layout),
         viewport,
@@ -436,6 +441,7 @@ pub(crate) fn render_arena_with_layout(
         parents,
         fragment_y,
         semantics,
+        focus_order,
         direct_actor_nodes: dom.render_live(),
     }
 }
@@ -5497,6 +5503,16 @@ pub(crate) fn collect_image_urls(
     viewport: crate::layout2::Viewport,
     device_pixel_ratio: f32,
 ) -> CollectedImages {
+    collect_image_urls_for_boxes(dom, base, viewport, device_pixel_ratio, None)
+}
+
+fn collect_image_urls_for_boxes(
+    dom: &crate::dom::Dom,
+    base: &Url,
+    viewport: crate::layout2::Viewport,
+    device_pixel_ratio: f32,
+    boxes: Option<&std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>>,
+) -> CollectedImages {
     let mut urls = Vec::new();
     let mut eager = Vec::new();
     let mut lazy_handles = std::collections::HashSet::new();
@@ -5560,6 +5576,16 @@ pub(crate) fn collect_image_urls(
     // before the first paint rather than waiting for a later display-list
     // rebuild (CSS Backgrounds 3 §§2.1, 2.3).
     for id in dom.flat_descendants(crate::dom::DOCUMENT) {
+        // CSS Backgrounds 3 §2.3 permits deferring invisible images; CSS
+        // Display 3 §2.5 excludes display:none subtrees from the box tree.
+        // The desktop already has measured boxes: don't cascade thousands
+        // of unrendered descendants just to discover unused CSS resources.
+        // Visible descendants resolve inherited cursor/list images through
+        // display:contents ancestors normally. Offscreen boxes still count.
+        // HTML image selection above remains independent of CSS rendering.
+        if dom.tag_name(id).is_none() || boxes.is_some_and(|boxes| !boxes.contains_key(&id)) {
+            continue;
+        }
         for property in ["background-image", "list-style-image", "cursor"] {
             let Some(value) = dom.computed_value_resolved(id, property) else {
                 continue;
@@ -6722,6 +6748,57 @@ mod tests {
                 .image_urls
                 .contains(&"https://example.test/images/HeartDot.png".to_string())
         );
+    }
+
+    #[test]
+    fn desktop_css_images_follow_boxes_and_reappear_after_display_changes() {
+        let base = Url::parse("https://images.example/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>
+              #hidden { display:none; background-image:url(hidden.png) }
+              #hidden span { background-image:url(child.png) }
+              #contents { display:contents; cursor:url(cursor.png),pointer; list-style-image:url(marker.png) }
+              #offscreen { position:absolute; top:2000px; background-image:url(offscreen.png) }
+            </style><div id=hidden><span>hidden</span><img src=html.png></div>
+            <ul id=contents><li>visible item</li></ul><div id=offscreen>offscreen</div>"#,
+        );
+        let render = |dom: &crate::dom::Dom| {
+            render_arena(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(800.0, 600.0),
+                1.0,
+                None,
+                &Default::default(),
+            )
+        };
+        let first = render(&dom);
+        for file in ["html.png", "cursor.png", "marker.png", "offscreen.png"] {
+            assert!(
+                first
+                    .image_urls
+                    .contains(&base.join(file).unwrap().to_string()),
+                "{file}"
+            );
+        }
+        for file in ["hidden.png", "child.png"] {
+            assert!(
+                !first
+                    .image_urls
+                    .contains(&base.join(file).unwrap().to_string()),
+                "{file}"
+            );
+        }
+        dom.set_attr(dom.get_by_id("hidden").unwrap(), "style", "display:block");
+        let shown = render(&dom);
+        for file in ["hidden.png", "child.png"] {
+            assert!(
+                shown
+                    .image_urls
+                    .contains(&base.join(file).unwrap().to_string()),
+                "{file}"
+            );
+        }
     }
 
     #[test]
@@ -14226,6 +14303,75 @@ customElements.define('lit-counter', LitCounter);
         );
         assert!(has_item(&doc, "[ Reject all ]"));
         assert!(has_item(&doc, "[ Accept all ]"));
+    }
+
+    #[test]
+    fn pending_plain_edit_paints_immediately_without_replacing_the_authored_surface() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<style>
+          body{margin:0} #editor{width:240px;color:white;background:#123456}
+          #editor p{margin:0;white-space:pre-wrap;font-size:17px}
+          #editor p:empty:before{content:'Placeholder';color:gray}
+          </style><div id=editor contenteditable=true><p></p></div>
+          <div id=rich contenteditable=true><b>Bold text</b></div>"#,
+        );
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640., 480.),
+            1.,
+            None,
+            &Default::default(),
+        );
+        let node = dom.get_by_id("editor").unwrap();
+        let presentation = &rendered.rich_editors[&node];
+        assert!(presentation.pending_text.is_some());
+        assert!(
+            rendered.rich_editors[&dom.get_by_id("rich").unwrap()]
+                .pending_text
+                .is_none()
+        );
+        let mut paint = rendered.layout.paint.primitives.clone();
+        let surfaces = paint
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    crate::render::DisplayCommand::Fill { .. }
+                        | crate::render::DisplayCommand::FillRect { .. }
+                )
+            })
+            .count();
+        assert!(crate::render::paint_pending_editor_text(
+            &mut paint,
+            "Typed before JS finishes",
+            crate::render::CssRect::new(0., 0., 240., 60.),
+            presentation
+        ));
+        let texts: Vec<_> = paint
+            .iter()
+            .filter_map(|p| match p {
+                crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                    Some(shaped.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("Typed before")));
+        assert!(!texts.iter().any(|t| t.contains("Placeholder")));
+        assert!(texts.iter().any(|t| t.contains("Bold text")));
+        assert_eq!(
+            surfaces,
+            paint
+                .iter()
+                .filter(|p| matches!(
+                    p,
+                    crate::render::DisplayCommand::Fill { .. }
+                        | crate::render::DisplayCommand::FillRect { .. }
+                ))
+                .count()
+        );
     }
 
     #[test]

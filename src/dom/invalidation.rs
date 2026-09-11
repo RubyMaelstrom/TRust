@@ -20,7 +20,8 @@ pub(super) enum Impact {
 pub(super) struct SelectorDependencies {
     attributes: FxHashMap<String, Impact>,
     empty: bool,
-    text_state: bool,
+    text_direction: bool,
+    text_placeholder: bool,
     structure_global: bool,
     empty_siblings: bool,
     sibling_structure: bool,
@@ -151,7 +152,8 @@ impl SelectorDependencies {
                 state,
                 StatePseudo::AnyLink | StatePseudo::Disabled | StatePseudo::Enabled
             );
-            self.text_state |= matches!(state, StatePseudo::Dir(_) | StatePseudo::PlaceholderShown);
+            self.text_direction |= matches!(state, StatePseudo::Dir(_));
+            self.text_placeholder |= matches!(state, StatePseudo::PlaceholderShown);
             // HTML state can propagate through fieldsets, radio groups,
             // inherited language/editability, and flat-tree ancestors. Keep
             // these dependencies broad until separately proven and tested.
@@ -176,6 +178,19 @@ impl SelectorDependencies {
 }
 
 impl Dom {
+    /// DOM #connected / #shadow-trees: an unattached feature-probe shadow
+    /// tree cannot affect selector matching or slot distribution in the live
+    /// document. Keep the conservative cross-tree fallback when a host is
+    /// connected, or when the mutation itself is outside the document.
+    fn shadow_style_dependencies(&self, node: NodeId) -> bool {
+        !self.shadow_roots.is_empty()
+            && (!self.is_connected(node)
+                || self
+                    .shadow_roots
+                    .keys()
+                    .any(|host| self.is_connected(*host)))
+    }
+
     #[cfg(test)]
     pub(crate) fn force_cold_style_layout_for_test(&mut self) {
         self.mark();
@@ -187,7 +202,7 @@ impl Dom {
         // a child-list mutation. That is an implicit cross-tree dependency,
         // including for state resolved through the style parent, even when
         // no rule contains a literal [slot] or [name] selector.
-        if !self.shadow_roots.is_empty()
+        if self.shadow_style_dependencies(node)
             && (name.eq_ignore_ascii_case("slot")
                 || (name.eq_ignore_ascii_case("name") && self.tag_name(node) == Some("slot")))
         {
@@ -204,11 +219,11 @@ impl Dom {
                 _ => Some(Impact::All),
             }
         };
-        if impact.is_none() && self.shadow_roots.is_empty() {
+        if impact.is_none() && !self.shadow_style_dependencies(node) {
             return Impact::Element;
         }
         let impact = impact.unwrap_or(Impact::All);
-        if impact == Impact::All || !self.shadow_roots.is_empty() {
+        if impact == Impact::All || self.shadow_style_dependencies(node) {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             return Impact::All;
         }
@@ -318,9 +333,7 @@ impl Dom {
         // Detached construction uses the same dependency proof. Recursively
         // invalidating its entire growing root on each append would make a
         // fragment-building loop quadratic even without structural selectors.
-        let local = self
-            .shadow_roots
-            .is_empty()
+        let local = (!self.shadow_style_dependencies(parent))
             .then(|| {
                 let index = self.style_cache.borrow();
                 index.as_ref().and_then(|(epoch, index)| {
@@ -372,11 +385,14 @@ impl Dom {
     /// intact. Selectors 4 :empty is relevant only when its truth value changes;
     /// directionality/state and shadow distribution keep the broad fallback.
     pub(super) fn touch_text(&mut self, parent: NodeId, empty_changed: bool) {
-        let independent = self.shadow_roots.is_empty() && {
+        let independent = !self.shadow_style_dependencies(parent) && {
             let index = self.style_cache.borrow();
             index.as_ref().is_some_and(|(epoch, index)| {
                 *epoch == self.style_epoch
-                    && !index.selector_dependencies.text_state
+                    && !(index.selector_dependencies.text_direction
+                        && self.text_may_change_direction(parent))
+                    && !(index.selector_dependencies.text_placeholder
+                        && self.tag_name(parent) == Some("textarea"))
                     && !(empty_changed && index.selector_dependencies.empty)
             })
         };
@@ -394,6 +410,32 @@ impl Dom {
         self.mark_dom_revision();
         self.dirty_nodes.push((parent, DirtyKind::Content));
         self.record_geometry_dirty(parent, DirtyKind::Content);
+    }
+
+    /// Selectors 4 #the-dir-pseudo and HTML #contained-text-auto-directionality:
+    /// text only affects directionality inside an automatic-direction subtree.
+    /// Explicit ltr/rtl and excluded descendants stop the upward dependency.
+    /// Shadow/slot dependencies have already taken the conservative fallback.
+    fn text_may_change_direction(&self, parent: NodeId) -> bool {
+        let mut current = Some(parent);
+        while let Some(node) = current {
+            match self.attr(node, "dir") {
+                Some(value) if value.eq_ignore_ascii_case("auto") => return true,
+                Some(value)
+                    if value.eq_ignore_ascii_case("ltr") || value.eq_ignore_ascii_case("rtl") =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+            match self.tag_name(node) {
+                Some("bdi") => return true,
+                Some("script" | "style" | "textarea") => return false,
+                _ => {}
+            }
+            current = self.style_parent(node);
+        }
+        false
     }
 }
 

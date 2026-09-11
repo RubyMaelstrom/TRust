@@ -118,6 +118,46 @@ mod tests {
     }
 
     #[test]
+    fn cursor_candidates_preserve_cascade_and_avoid_unrelated_elements() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            * { box-sizing:border-box; margin:0 }
+            .active :is(.target, #alternate) { cursor:pointer }
+            [data-cursor] { cursor:var(--cursor) }
+            .target:hover { cursor:crosshair }
+            </style><main id=root class=active><a id=target class=target>one</a>
+            <span id=alternate>two</span><span id=inline style='cursor:pointer'>three</span>
+            <span id=variable data-cursor style='--cursor:pointer'>four</span>
+            <p id=unrelated>unrelated</p></main>"#,
+        );
+        // Detached feature probes must not disable candidate rejection for
+        // the whole document merely because a shadow root exists somewhere.
+        let probe = dom.create_element("div");
+        dom.attach_shadow(probe);
+        for active in ["active", ""] {
+            dom.set_attr(dom.get_by_id("root").unwrap(), "class", active);
+            let nodes = dom.composed_descendants(DOCUMENT);
+            let candidates = dom.cursor_style_candidates(&nodes);
+            let pointers = |ids: &[NodeId]| {
+                ids.iter()
+                    .copied()
+                    .filter(|&node| {
+                        dom.computed_style(node, "cursor").as_deref() == Some("pointer")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(pointers(&candidates), pointers(&nodes));
+            assert!(!candidates.contains(&dom.get_by_id("unrelated").unwrap()));
+        }
+        let unrelated = dom.get_by_id("unrelated").unwrap();
+        dom.set_attr(unrelated, "style", "cursor:pointer");
+        assert!(
+            dom.cursor_style_candidates(&dom.composed_descendants(DOCUMENT))
+                .contains(&unrelated)
+        );
+    }
+
+    #[test]
     fn rule_index_logical_subjects_preserve_full_matching_and_specificity() {
         let mut dom = Dom::parse_document(
             r#"<style>

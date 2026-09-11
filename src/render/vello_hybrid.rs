@@ -1337,13 +1337,20 @@ fn premultiply_rgba(rgba: &[u8]) -> Vec<PremulRgba8> {
 fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
     match brush {
         PaintBrush::Solid(color) => target.set_paint(vello_color(*color)),
-        PaintBrush::LinearGradient { start, end, stops } => {
+        PaintBrush::LinearGradient {
+            start,
+            end,
+            stops,
+            interpolation,
+        } => {
             let stops = vello_stops(stops);
             target.set_paint(
                 vello_common::peniko::Gradient::new_linear(
                     (f64::from(start.x), f64::from(start.y)),
                     (f64::from(end.x), f64::from(end.y)),
                 )
+                .with_interpolation_cs(interpolation.space)
+                .with_hue_direction(interpolation.hue)
                 .with_stops(stops.as_slice()),
             );
         }
@@ -1351,6 +1358,7 @@ fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
             center,
             radius,
             stops,
+            interpolation,
         } => {
             let stops = vello_stops(stops);
             target.set_paint(
@@ -1358,6 +1366,8 @@ fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
                     (f64::from(center.x), f64::from(center.y)),
                     *radius,
                 )
+                .with_interpolation_cs(interpolation.space)
+                .with_hue_direction(interpolation.hue)
                 .with_stops(stops.as_slice()),
             );
         }

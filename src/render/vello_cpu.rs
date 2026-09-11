@@ -396,13 +396,20 @@ impl VelloCpuRenderer {
     fn set_brush(&mut self, brush: &PaintBrush) {
         match brush {
             PaintBrush::Solid(color) => self.context.set_paint(vello_color(*color)),
-            PaintBrush::LinearGradient { start, end, stops } => {
+            PaintBrush::LinearGradient {
+                start,
+                end,
+                stops,
+                interpolation,
+            } => {
                 let stops = vello_stops(stops);
                 self.context.set_paint(
                     Gradient::new_linear(
                         (f64::from(start.x), f64::from(start.y)),
                         (f64::from(end.x), f64::from(end.y)),
                     )
+                    .with_interpolation_cs(interpolation.space)
+                    .with_hue_direction(interpolation.hue)
                     .with_stops(stops.as_slice()),
                 );
             }
@@ -410,10 +417,13 @@ impl VelloCpuRenderer {
                 center,
                 radius,
                 stops,
+                interpolation,
             } => {
                 let stops = vello_stops(stops);
                 self.context.set_paint(
                     Gradient::new_radial((f64::from(center.x), f64::from(center.y)), *radius)
+                        .with_interpolation_cs(interpolation.space)
+                        .with_hue_direction(interpolation.hue)
                         .with_stops(stops.as_slice()),
                 );
             }
@@ -680,7 +690,7 @@ pub(super) fn vello_stops(stops: &[super::GradientStop]) -> Vec<ColorStop> {
         .iter()
         .map(|stop| ColorStop {
             offset: stop.offset,
-            color: vello_cpu::color::DynamicColor::from_alpha_color(vello_color(stop.color)),
+            color: stop.color,
         })
         .collect()
 }

@@ -243,6 +243,20 @@ pub(super) fn boxes(
             &mut scroll,
         );
     }
+    // Scroll overflow follows containing blocks and local overflow clipping;
+    // the composed union above remains solely the inline border-box fallback.
+    let mut areas = super::overflow::ScrollAreas::new(dom, root);
+    for f in fixed {
+        areas.extend(dom, f);
+    }
+    for top in top_layer {
+        areas.extend(dom, &top.fragment);
+    }
+    for (node, rect) in areas.nodes {
+        if scroll.contains_key(&node) {
+            scroll.insert(node, rect);
+        }
+    }
     flow.frame_viewports.extend(fx.frame_viewports);
     (out, scroll, flow.frame_viewports)
 }

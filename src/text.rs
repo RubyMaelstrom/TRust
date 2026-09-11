@@ -26,6 +26,10 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::core::{ImeAction, Key, KeyInput, KeyState};
 
+mod layout_cache;
+mod outline;
+pub(crate) use outline::{append_text_path, x_height};
+
 /// CSS-facing text style. No Parley, Glifo, or renderer type escapes this
 /// boundary.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,14 +74,14 @@ pub enum CssLineHeight {
 }
 
 /// CSS line-breaking controls, kept independent of Parley's public enums.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextBreakStyle {
     pub wrap: bool,
     pub word_break: TextWordBreak,
     pub overflow_wrap: TextOverflowWrap,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextWordBreak {
     #[default]
     Normal,
@@ -85,7 +89,7 @@ pub enum TextWordBreak {
     KeepAll,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextOverflowWrap {
     #[default]
     Normal,
@@ -521,6 +525,7 @@ struct TextSystem {
     shape_cache: HashMap<ShapeKey, CachedShape>,
     shape_order: VecDeque<ShapeKey>,
     shape_cache_bytes: usize,
+    layout_cache: layout_cache::Cache,
     #[cfg(test)]
     shaped_input_bytes: usize,
 }
@@ -599,6 +604,7 @@ impl TextSystem {
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
+            layout_cache: Default::default(),
             #[cfg(test)]
             shaped_input_bytes: 0,
         }
@@ -719,7 +725,7 @@ impl TextSystem {
         builder.build(text)
     }
 
-    fn first_line_end(
+    fn first_line_end_uncached(
         &mut self,
         text: &str,
         style: &TextStyle,
@@ -743,7 +749,7 @@ impl TextSystem {
             .unwrap_or(0)
     }
 
-    fn wrapped_lines(
+    fn wrapped_lines_uncached(
         &mut self,
         text: &str,
         style: &TextStyle,
@@ -780,7 +786,7 @@ impl TextSystem {
             .collect()
     }
 
-    fn content_widths(
+    fn content_widths_uncached(
         &mut self,
         text: &str,
         style: &TextStyle,
@@ -832,6 +838,7 @@ impl TextSystem {
         self.shape_cache.clear();
         self.shape_order.clear();
         self.shape_cache_bytes = 0;
+        self.layout_cache = Default::default();
         self.page_font_epoch = epoch;
     }
 }

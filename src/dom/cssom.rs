@@ -377,6 +377,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
                     .all(|v| matches!(*v, "visible" | "hidden" | "clip" | "scroll" | "auto"))
         }
         "overflow-x" | "overflow-y" => one_of("visible hidden clip scroll auto"),
+        "overscroll-behavior-x" | "overscroll-behavior-y" => one_of("auto contain none chain"),
         "overflow-wrap" => one_of("normal break-word anywhere"),
         "word-break" => one_of("normal break-all keep-all break-word"),
         "text-wrap-mode" => one_of("wrap nowrap"),
