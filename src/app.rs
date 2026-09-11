@@ -4804,7 +4804,7 @@ impl App {
                 }
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
                 Some(PageEvt::Settled) => tally_evt(3),
-                Some(PageEvt::KeyDefault { .. }) => {}
+                Some(PageEvt::KeyDefault { .. } | PageEvt::FormValueApplied { .. }) => {}
                 Some(PageEvt::Scrolled { node, top, left }) => {
                     tally_evt(2);
                     scrolled.push((node, top, left));

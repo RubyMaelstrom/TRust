@@ -196,6 +196,51 @@ mod tests {
         )
     }
 
+    #[test]
+    fn measured_terminal_metadata_preserves_full_adapter_output() {
+        let dom = Dom::parse_document(
+            r#"<style>
+            #hidden { display:none } #contents { display:contents }
+            #scroll { overflow:auto; width:160px; height:40px }
+            #fixed { position:fixed; top:120px }
+            </style><div id=hidden><button>hidden</button><span>hidden</span></div>
+            <main id=contents><a id=anchor href='/next'>A link with wrapped text</a>
+            <div id=scroll><p>one</p><p>two</p><p>three</p></div>
+            <div contenteditable=true>editable <b>text</b></div></main>
+            <div id=fixed>fixed</div>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let images = ImageSizes::new();
+        let measured = measure_retained_layout(
+            &dom,
+            &base,
+            Viewport::new(720., 480.),
+            &forms,
+            &controls,
+            &images,
+        );
+        let optimized = paint_retained_layout(
+            &dom,
+            &base,
+            &controls,
+            &images,
+            measured.fragments.unwrap(),
+            measured.boxes,
+            measured.tracks,
+        );
+        let mut full = optimized.clone();
+        full.paint_cache.as_mut().unwrap().terminal =
+            crate::layout2::terminal::TerminalPaintModel::from_dom(&dom, &base, &controls);
+        let viewport = TerminalViewport::new(90, 30, 8., 16.);
+        let optimized = adapt_terminal(&optimized, viewport, &Default::default());
+        let full = adapt_terminal(&full, viewport, &Default::default());
+        assert_eq!(optimized.rows, full.rows);
+        assert_eq!(optimized.anchor_rows, full.anchor_rows);
+        assert_eq!(optimized.fixed, full.fixed);
+        assert_eq!(optimized.regions, full.regions);
+    }
+
     fn equivalent_to_cold(dom: &mut Dom) -> LayoutWork {
         let base = Url::parse("https://example.com/").unwrap();
         let images = ImageSizes::new();

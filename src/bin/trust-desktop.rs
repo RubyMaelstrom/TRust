@@ -623,6 +623,27 @@ struct PendingPageKey {
     input: KeyInput,
 }
 
+fn sync_editor_value(editor: &mut TextEditor, value: &str) {
+    if !editor.is_composing() && editor.text() != value {
+        editor.set_text(value);
+    }
+}
+
+fn remap_form_index(
+    old: &[trust::doc::Form],
+    new: &[trust::doc::Form],
+    (form, field): (usize, usize),
+) -> Option<(usize, usize)> {
+    let node = old.get(form)?.fields.get(field)?.live_node?;
+    new.iter().enumerate().find_map(|(form, entry)| {
+        entry
+            .fields
+            .iter()
+            .position(|field| field.live_node == Some(node))
+            .map(|field| (form, field))
+    })
+}
+
 struct PageLayoutCache {
     generation: u64,
     revision: u64,
@@ -667,6 +688,8 @@ struct DesktopPageAdapter {
     forms: Vec<trust::doc::Form>,
     controls: trust::layout2::ControlMap,
     rich_editors: HashMap<usize, trust::layout2::RichEditorPresentation>,
+    focus_order: Vec<usize>,
+    direct_actor_nodes: bool,
     lazy_image_handles: HashSet<ImageHandle>,
     parents: HashMap<usize, usize>,
     fragment_y: HashMap<String, f32>,
@@ -685,6 +708,8 @@ impl DesktopPageAdapter {
                 forms: rendered.forms,
                 controls: rendered.controls,
                 rich_editors: rendered.rich_editors,
+                focus_order: rendered.focus_order,
+                direct_actor_nodes: rendered.direct_actor_nodes,
                 lazy_image_handles: rendered.lazy_image_handles,
                 parents: rendered.parents,
                 fragment_y: rendered.fragment_y,
@@ -1198,11 +1223,17 @@ fn scroll_container_delta(container: &ScrollContainer, delta: CssPoint) -> (CssP
         let max_x = (container.content.width - container.viewport.width).max(0.0);
         next.x = (container.offset.x + delta.x).clamp(0.0, max_x);
         residual.x = delta.x - (next.x - container.offset.x);
+        if container.contain_overscroll[0] {
+            residual.x = 0.;
+        }
     }
     if container.vertical {
         let max_y = (container.content.height - container.viewport.height).max(0.0);
         next.y = (container.offset.y + delta.y).clamp(0.0, max_y);
         residual.y = delta.y - (next.y - container.offset.y);
+        if container.contain_overscroll[1] {
+            residual.y = 0.;
+        }
     }
     (next, residual)
 }
@@ -2292,21 +2323,39 @@ impl DesktopApp {
                 layout,
             }
         });
-        if let Some(cache) = &self.page_layout {
-            if page_is_live
-                && let FocusTarget::Form { form, field } = self.focus
-                && let Some(control) = cache
-                    .document
-                    .forms
-                    .get(form)
-                    .and_then(|f| f.fields.get(field))
-                && control.kind == FieldKind::Number
-                && let Some(editor) = self.form_editor.as_mut()
-                && !editor.is_composing()
-                && editor.text() != control.editing_value()
-            {
-                editor.set_text(control.editing_value());
+        if page_is_live && let Some(old) = seed.as_deref() {
+            let new = self
+                .page_layout
+                .as_ref()
+                .map_or(&[][..], |page| page.document.forms.as_slice());
+            // HTML #focus-fixup-rule / UI Events keyboard targets: focus is
+            // attached to a DOM node, never to an extraction-vector index.
+            // Inserting a tool dialog before the composer must not retarget it.
+            let next_focus = if let FocusTarget::Form { form, field } = self.focus {
+                remap_form_index(old, new, (form, field)).map_or(
+                    FocusTarget::Page,
+                    |(form, field)| FocusTarget::Form { form, field },
+                )
+            } else {
+                self.focus
+            };
+            for pending in &mut self.pending_page_keys {
+                if let Some(indices) = pending.form {
+                    // Keep the FIFO acknowledgement slot if its target was
+                    // removed, but prevent its default from reaching a new field.
+                    pending.form = Some(
+                        remap_form_index(old, new, indices).unwrap_or((usize::MAX, usize::MAX)),
+                    );
+                }
             }
+            if next_focus != self.focus {
+                if next_focus == FocusTarget::Page {
+                    self.form_editor = None;
+                }
+                self.set_focus(next_focus);
+            }
+        }
+        if let Some(cache) = &self.page_layout {
             let live = graphical_live_boundaries(&cache.layout);
             self.browser.set_live_layout_boundaries(live.0, live.1);
         }
@@ -2515,6 +2564,7 @@ impl DesktopApp {
         );
         let layout_patch = if self.terminal.is_none() {
             let eligible = self.ensure_page_layout(page_viewport);
+            self.sync_focused_form();
             // A fragment request can arrive before the matching layout exists.
             // Apply it now that the committed document's boxes are available.
             self.scroll_to_fragment();
@@ -2756,6 +2806,17 @@ impl DesktopApp {
             if let Some(editor) = &mut self.form_editor {
                 editor.set_width(presentation.width);
                 let visual = Self::editor_visual(editor, false);
+                if cache.document.forms[form].fields[field]
+                    .live_node
+                    .is_some_and(|actor| self.browser.form_value_pending(actor))
+                {
+                    trust::render::paint_pending_editor_text(
+                        &mut scene.primitives,
+                        &visual.text,
+                        rect,
+                        presentation,
+                    );
+                }
                 trust::render::paint_rich_editor_overlay(
                     &mut scene.primitives,
                     &visual,
@@ -3064,6 +3125,32 @@ impl DesktopApp {
         self.relayout_cached_page();
     }
 
+    /// HTML textarea.value and DOM textContent/replace-all change the actual
+    /// editor contents. The native editor is only a presentation adapter. Wait
+    /// for outstanding input tasks, then accept script edits (including an
+    /// empty composer after submission) even if no new layout was needed.
+    fn sync_focused_form(&mut self) {
+        let FocusTarget::Form { form, field } = self.focus else {
+            return;
+        };
+        let Some(control) = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+        else {
+            return;
+        };
+        if self.browser.page_is_live()
+            && !control
+                .live_node
+                .is_some_and(|node| self.browser.form_value_pending(node))
+            && let Some(editor) = self.form_editor.as_mut()
+        {
+            sync_editor_value(editor, control.editing_value());
+        }
+    }
+
     fn copy(&mut self, cut: bool) {
         let selected = self
             .active_editor_mut()
@@ -3359,6 +3446,9 @@ impl DesktopApp {
                 FocusTarget::Command => self.close_command(),
                 FocusTarget::Download => self.open_command(false),
                 FocusTarget::Form { .. } => self.focus_next(input.modifiers.shift),
+                FocusTarget::Page if self.keyboard_target.is_some() => {
+                    self.focus_next(input.modifiers.shift)
+                }
                 _ => self.open_command(false),
             }
             return;
@@ -3957,14 +4047,18 @@ impl DesktopApp {
             self.set_focus(FocusTarget::Page);
             return;
         };
-        let mut controls = scene.interactive_hits();
-        controls.sort_by(|a, b| {
-            a.rect
-                .y
-                .total_cmp(&b.rect.y)
-                .then(a.rect.x.total_cmp(&b.rect.x))
+        let mut controls = self.page_layout.as_ref().map_or_else(Vec::new, |page| {
+            scene.ordered_focus_hits(&page.document.focus_order)
         });
-        controls.dedup_by(|left, right| same_page_target(left, right));
+        if self
+            .page_layout
+            .as_ref()
+            .is_some_and(|page| page.document.direct_actor_nodes)
+        {
+            for target in &mut controls {
+                target.actor = Some(target.node);
+            }
+        }
         if reverse {
             controls.reverse();
         }
@@ -4004,6 +4098,9 @@ impl DesktopApp {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
+        self.browser.handle_action(UserAction::PageFocus {
+            actor: target.actor,
+        });
         self.keyboard_target = Some(target);
         self.request_redraw();
     }
@@ -5053,12 +5150,11 @@ impl DesktopApp {
             return;
         }
         let mut remaining = CssPoint::new(dx, dy);
-        if let Some(container) = self
+        let chain = self
             .scene
             .as_ref()
-            .and_then(|scene| scene.scroll_container_at(self.pointer))
-            .cloned()
-        {
+            .map_or_else(Vec::new, |scene| scene.scroll_chain_at(self.pointer));
+        for container in chain {
             let (next, residual) = scroll_container_delta(&container, remaining);
             let changed = next != container.offset;
             if changed {
@@ -6565,6 +6661,38 @@ mod tests {
     }
 
     #[test]
+    fn inserting_and_removing_dialog_fields_preserves_composer_identity() {
+        let forms = |html| {
+            let dom = trust::dom::Dom::parse_document(html);
+            trust::http::extract_forms_arena(
+                &dom,
+                &url::Url::parse("https://example.test/").unwrap(),
+                None,
+            )
+            .0
+        };
+        let old = forms("<form><textarea data-trust-node=42>draft</textarea></form>");
+        let dialog = forms(
+            "<form><input data-trust-node=81><input data-trust-node=82></form><form><textarea data-trust-node=42>draft</textarea></form>",
+        );
+        assert_eq!(remap_form_index(&old, &dialog, (0, 0)), Some((1, 0)));
+        assert_eq!(remap_form_index(&dialog, &old, (1, 0)), Some((0, 0)));
+        assert_eq!(
+            remap_form_index(&dialog, &old, (0, 1)),
+            None,
+            "removed dialog cannot retarget to the composer"
+        );
+        assert_eq!(
+            remap_form_index(
+                &old,
+                &forms("<form><input data-trust-node=99></form>"),
+                (0, 0)
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn native_keyboard_names_preserve_modifier_and_character_identity() {
         assert_eq!(
             translate_key(&WinitKey::Named(NamedKey::Super)),
@@ -6656,6 +6784,31 @@ mod tests {
     }
 
     #[test]
+    fn canonical_empty_value_clears_the_native_editor_and_preserves_unchanged_selection() {
+        let mut editor = TextEditor::new("sent message", &TextStyle::default(), 300., true);
+        editor.select_all();
+        sync_editor_value(&mut editor, "sent message");
+        assert_eq!(editor.selected_text(), Some("sent message"));
+        sync_editor_value(&mut editor, "");
+        assert_eq!(editor.text(), "");
+        assert_eq!(editor.selected_text(), None);
+        sync_editor_value(&mut editor, "next message");
+        assert_eq!(editor.text(), "next message");
+    }
+
+    #[test]
+    fn contained_overscroll_stops_only_the_selected_axis_even_at_zero_range() {
+        let container = ScrollContainer {
+            horizontal: true,
+            vertical: true,
+            contain_overscroll: [false, true],
+            ..Default::default()
+        };
+        let (_, remaining) = scroll_container_delta(&container, CssPoint::new(40., 120.));
+        assert_eq!(remaining, CssPoint::new(40., 0.));
+    }
+
+    #[test]
     fn zero_range_auto_scroll_container_passes_wheel_to_viewport() {
         let container = ScrollContainer {
             node: 1,
@@ -6665,6 +6818,7 @@ mod tests {
             offset: CssPoint::default(),
             horizontal: true,
             vertical: true,
+            ..Default::default()
         };
         let (next, residual) = scroll_container_delta(&container, CssPoint::new(0.0, 120.0));
         assert_eq!(next, CssPoint::default());
@@ -6681,6 +6835,7 @@ mod tests {
             offset: CssPoint::new(200.0, 300.0),
             horizontal: true,
             vertical: true,
+            ..Default::default()
         };
         let (next, residual) = scroll_container_delta(&container, CssPoint::new(80.0, 700.0));
         assert_eq!(next, CssPoint::new(280.0, 300.0));

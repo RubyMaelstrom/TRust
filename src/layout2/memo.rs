@@ -138,6 +138,9 @@ struct Entry {
 }
 
 struct Environment {
+    // Scroll offsets and hover/paint-patch markers only affect presentation.
+    // Their paint epoch must not expire geometry on each streamed auto-scroll;
+    // fragments are composed with the latest offsets at paint time.
     base: Url,
     vp: Vp,
     forms: Vec<Form>,
@@ -146,7 +149,6 @@ struct Environment {
     font_epoch: u64,
     image_metadata_epoch: u64,
     presentation_epoch: u64,
-    paint_epoch: u64,
 }
 
 impl Environment {
@@ -261,7 +263,6 @@ impl LayoutCache {
         let font_epoch = crate::font_system::page_font_epoch();
         let image_metadata_epoch = crate::img::svg_intrinsic_epoch();
         let presentation_epoch = dom.layout_presentation_epoch();
-        let paint_epoch = dom.layout_paint_epoch();
         let same = self.environment.as_ref().is_some_and(|e| {
             e.base == *base
                 && e.vp == vp
@@ -271,7 +272,6 @@ impl LayoutCache {
                 && e.font_epoch == font_epoch
                 && e.image_metadata_epoch == image_metadata_epoch
                 && e.presentation_epoch == presentation_epoch
-                && e.paint_epoch == paint_epoch
         });
         if !same {
             self.clear();
@@ -285,7 +285,6 @@ impl LayoutCache {
                 font_epoch,
                 image_metadata_epoch,
                 presentation_epoch,
-                paint_epoch,
             });
             self.environment_bytes = self.environment.as_ref().map_or(0, Environment::bytes);
             if self.retained_bytes() > MAX_BYTES {
@@ -553,6 +552,35 @@ mod tests {
             );
             let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
             assert!(hits.0 + hits.1 > 0, "test must exercise reuse");
+        }
+    }
+
+    #[test]
+    fn streaming_text_after_shadow_probe_and_scroll_keeps_unchanged_items() {
+        let mut dom = Dom::parse_document(&format!(
+            "{HTML}<style>:dir(ltr) {{ color:black }} :placeholder-shown {{ color:gray }}</style>"
+        ));
+        let probe = dom.create_element("div");
+        dom.attach_shadow(probe);
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let controls = ControlMap::new();
+        let images = ImageSizes::new();
+        let island = dom.get_by_id("island").unwrap();
+        let tick = dom.get_by_id("tick").unwrap();
+        for i in 0..4 {
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            dom.set_scroll_pos(island, f64::from(i) * 20., 0., true);
+            dom.set_text(tick, &format!("streamed token {i}"));
+            assert!(
+                dom.layout_cache.borrow().entries.contains_key(&island),
+                "detached shadow probe cannot invalidate unrelated layout"
+            );
+            let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            assert!(
+                hits.0 + hits.1 > 0,
+                "unchanged items must survive scrolling followed by text updates"
+            );
         }
     }
 

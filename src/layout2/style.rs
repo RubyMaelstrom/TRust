@@ -1180,10 +1180,9 @@ impl InlineStyle {
             s.vertical_align = match dom.computed_value_resolved(id, "vertical-align").as_deref() {
                 Some("top") | Some("text-top") => VerticalAlign::Top,
                 Some("bottom") | Some("text-bottom") => VerticalAlign::Bottom,
-                // CSS Values defines `ex` from the first available font and
-                // permits 0.5em when no reliable metric is available. Parley does
-                // not currently expose x-height, so retain that specified fallback.
-                Some("middle") => VerticalAlign::Middle(parent.font_size * 0.25),
+                Some("middle") => {
+                    VerticalAlign::Middle(crate::text::x_height(&parent.text_style()) * 0.5)
+                }
                 Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
                 Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
                 Some(value) => css_length_px(value, u)
@@ -1361,7 +1360,9 @@ impl InlineStyle {
             s.vertical_align = match value("vertical-align").as_deref() {
                 Some("top" | "text-top") => VerticalAlign::Top,
                 Some("bottom" | "text-bottom") => VerticalAlign::Bottom,
-                Some("middle") => VerticalAlign::Middle(self.font_size * 0.25),
+                Some("middle") => {
+                    VerticalAlign::Middle(crate::text::x_height(&self.text_style()) * 0.5)
+                }
                 Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
                 Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
                 Some(v) => css_length_px(v, u)

@@ -96,6 +96,9 @@ ttf-parser = "0.25.1"
 # Noto Color Emoji (CBDT/CBLC) and sbix fonts embed PNG glyphs. Without
 # this feature shaping succeeds, but the CPU and Hybrid painters skip them.
 glifo = { version = "0.3.0", features = ["png"] }
+# The raster stack already uses this font outline decoder. Text-clipped CSS
+# backgrounds consume the same shaped glyph IDs and variation coordinates.
+skrifa = "0.44.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 # FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner

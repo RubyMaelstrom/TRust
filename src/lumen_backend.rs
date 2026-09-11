@@ -1226,6 +1226,9 @@ mod desktop {
         /// next rendering opportunity. Ordinary task completion only sets this
         /// bit; it never runs style/layout or rendering observers itself.
         render_pending: bool,
+        /// Native edits run their input events and microtasks in order, but
+        /// acknowledge presentation only after the next rendering opportunity.
+        pending_form_acknowledgements: Vec<usize>,
         task_trace: Option<ActorTaskTrace>,
         engine_metrics: Option<lumen::PerformanceMetricsSampler>,
     }
@@ -1682,7 +1685,10 @@ mod desktop {
                     // steps follow them. Ordinary timer tasks merely request a
                     // future rendering opportunity when they mutate the page.
                     let finished = if animation_frame {
-                        finish_task_with_ack(&mut page, &events, false)
+                        // The platform already ran scroll steps before rAF.
+                        // Scrolls requested by those callbacks notify on the
+                        // next opportunity, not again at this frame's tail.
+                        finish_task_maybe_render(&mut page, &events, false, true, false)
                     } else {
                         finish_internal_task(&mut page, &events)
                     };
@@ -1972,6 +1978,7 @@ mod desktop {
             boundary_render: HashMap::new(),
             render_environment_dirty: false,
             render_pending: false,
+            pending_form_acknowledgements: Vec::new(),
             task_trace: ActorTaskTrace::enabled(),
             engine_metrics: lumen::PerformanceMetricsSampler::from_env(),
         };
@@ -2730,7 +2737,13 @@ mod desktop {
                     "form input",
                 );
                 checkpoint(page, "form input");
-                finish_task(page, events)
+                // HTML #update-the-rendering is a separate task source. An
+                // input listener is not a request to lay out the entire page
+                // after every character. Preserve every input event/checkpoint,
+                // then publish one presentation for the accumulated edits.
+                page.pending_form_acknowledgements.push(node);
+                page.render_pending = true;
+                finish_internal_task(page, events)
             }
             PageCmd::StepNumber {
                 node,
@@ -3122,14 +3135,14 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         acknowledge_settle: bool,
     ) -> bool {
-        finish_task_maybe_render(page, events, acknowledge_settle, true)
+        finish_task_maybe_render(page, events, acknowledge_settle, true, true)
     }
 
     fn finish_internal_task(
         page: &mut LumenPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
     ) -> bool {
-        finish_task_maybe_render(page, events, false, false)
+        finish_task_maybe_render(page, events, false, false, false)
     }
 
     /// Complete one HTML event-loop task. History/navigation/form/error side
@@ -3142,11 +3155,19 @@ mod desktop {
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         acknowledge_settle: bool,
         render_now: bool,
+        run_scroll_steps: bool,
     ) -> bool {
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
             let _ = events.blocking_send(PageEvt::Trouble(errors));
             return false;
+        }
+        if run_scroll_steps {
+            // CSSOM View #document-run-the-scroll-steps runs in HTML's
+            // rendering update. rAF opportunities run this before callbacks;
+            // this also covers updates with no animation callbacks queued.
+            let _ = trust_number(page, "runScrollSteps");
+            checkpoint(page, "scroll steps");
         }
         for (url, replace) in take_history_updates(page) {
             if events
@@ -3257,6 +3278,17 @@ mod desktop {
                 return false;
             }
             sent_primary = true;
+        }
+        if render_now {
+            for node in page.pending_form_acknowledgements.drain(..) {
+                if events
+                    .blocking_send(PageEvt::FormValueApplied { node })
+                    .is_err()
+                {
+                    return false;
+                }
+                sent_primary = true;
+            }
         }
         for (node, top, left) in scrolls {
             if events
@@ -3487,6 +3519,134 @@ mod desktop {
             })
             .await
             .expect("native keyboard delivery timed out");
+        }
+
+        #[tokio::test]
+        async fn queued_native_edits_preserve_input_checkpoints_and_share_rendering() {
+            let html = r#"<textarea id=editor></textarea><p id=status></p><script>
+                const editor = document.getElementById('editor');
+                const status = document.getElementById('status'); let count = 0;
+                editor.oninput = () => {
+                    if (editor.value.length !== ++count) throw Error('input order');
+                    queueMicrotask(() => status.textContent = 'checkpoint-' + count);
+                };
+            </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                for length in 1..=12 {
+                    handle
+                        .try_send_user(PageCmd::SetValue {
+                            node,
+                            value: "a".repeat(length),
+                            checked: None,
+                        })
+                        .unwrap();
+                }
+                let (mut acknowledgements, mut renders, mut final_checkpoint) = (0, 0, false);
+                while acknowledgements < 12 {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            renders += 1;
+                            final_checkpoint |= html.contains("checkpoint-12");
+                        }
+                        Some(PageEvt::FormValueApplied { node: applied }) => {
+                            assert_eq!(applied, node);
+                            acknowledgements += 1;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("input: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before queued edits were presented"),
+                    }
+                }
+                assert!(
+                    final_checkpoint,
+                    "acknowledged before the final microtask was painted"
+                );
+                assert!(
+                    renders < 12,
+                    "rendered the entire page for every queued character"
+                );
+            })
+            .await
+            .expect("queued native edits timed out");
+        }
+
+        #[tokio::test]
+        async fn native_edit_acknowledges_script_value_and_enter_clear_after_render() {
+            // HTML textarea.value / DOM replace-all, with the input-event
+            // microtask checkpoint before the native presentation acknowledgement.
+            let html = r#"<textarea id=editor></textarea><p id=status>ready</p><script>
+                const editor = document.getElementById('editor');
+                const status = document.getElementById('status');
+                editor.oninput = () => queueMicrotask(() => {
+                    editor.value = editor.value.toUpperCase(); status.textContent = editor.value;
+                });
+                editor.onkeydown = event => {
+                    if (event.key === 'Enter') {
+                        event.preventDefault(); editor.value = ''; status.textContent = 'CLEARED';
+                    }
+                };
+            </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                for enter in [false, true] {
+                    handle
+                        .try_send_user(if enter {
+                            PageCmd::Key {
+                                node: Some(node),
+                                input: crate::core::KeyInput {
+                                    key: crate::core::Key::Enter,
+                                    code: "Enter".into(),
+                                    location: 0,
+                                    state: crate::core::KeyState::Pressed,
+                                    modifiers: Default::default(),
+                                    repeat: false,
+                                    composing: false,
+                                },
+                            }
+                        } else {
+                            PageCmd::SetValue {
+                                node,
+                                value: "hello".into(),
+                                checked: None,
+                            }
+                        })
+                        .unwrap();
+                    let expected = if enter { "CLEARED" } else { "HELLO" };
+                    let mut rendered = false;
+                    loop {
+                        match events.recv().await {
+                            Some(PageEvt::Updated { html, outcome }) => {
+                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                                rendered |= html.contains(expected);
+                            }
+                            Some(PageEvt::Patched { patches, .. }) => {
+                                rendered |=
+                                    patches.iter().any(|patch| patch.html.contains(expected));
+                            }
+                            Some(PageEvt::FormValueApplied { node: applied }) if !enter => {
+                                assert_eq!(applied, node);
+                                assert!(rendered);
+                                break;
+                            }
+                            Some(PageEvt::KeyDefault { prevented }) if enter => {
+                                assert!(prevented && rendered);
+                                break;
+                            }
+                            Some(PageEvt::Trouble(errors)) => panic!("input: {errors:?}"),
+                            Some(_) => {}
+                            None => panic!("page closed before input acknowledgement"),
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("input acknowledgement timed out");
         }
 
         #[tokio::test]
@@ -15839,6 +15999,43 @@ mod tests {
     }
 
     #[test]
+    fn storage_named_properties_share_the_method_map() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            include_str!("fixtures/storage_named_properties.mjs"),
+            "Storage named properties",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "storageNamedResult"), "ok");
+    }
+
+    #[test]
+    fn storage_named_properties_survive_realm_replacement_at_the_same_origin() {
+        let storage = crate::js::WebStorage::default();
+        for (url, expected) in [
+            ("https://storage-navigation.example/a", "missing"),
+            ("https://storage-navigation.example/b", "login|session"),
+            ("https://storage-navigation.example:8443/b", "missing"),
+            ("http://storage-navigation.example/b", "missing"),
+            ("https://other-storage.example/b", "missing"),
+            ("https://storage-navigation.example/c", "login|session"),
+        ] {
+            let mut state = HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            );
+            state.storage = storage.clone();
+            let mut engine = configured_engine(state, url);
+            eval(&mut engine, r#"
+                globalThis.result = localStorage.token === undefined ? 'missing' : localStorage.token + '|' + sessionStorage.token;
+                localStorage.token = 'login'; sessionStorage.token = 'session';
+            "#, "storage navigation").unwrap();
+            assert_eq!(string_value(&mut engine, "result"), expected, "{url}");
+        }
+    }
+
+    #[test]
     fn frame_storage_maps_follow_the_owning_origin_not_the_top_page() {
         // HTML #the-localstorage-attribute / #the-sessionstorage-attribute;
         // Storage #storage-keys: separate origin-keyed maps, including retained
@@ -19829,6 +20026,36 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "String(highResolutionClockResult)"),
             "true"
+        );
+    }
+
+    #[test]
+    fn element_scroll_events_coalesce_before_animation_frame_callbacks() {
+        // CSSOM View #scrolling-events and HTML #update-the-rendering.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.appendChild(html);html.appendChild(body);
+            body.innerHTML='<div id=a style="width:100px;height:30px;overflow:auto"><div style="height:300px">A</div></div><div id=b style="width:100px;height:30px;overflow:auto"><div style="height:300px">B</div></div>';
+            const a=document.getElementById('a'),b=document.getElementById('b');
+            globalThis.scrollOrder=[];
+            for (const e of [a,b]) {
+                e.addEventListener('scroll',()=>scrollOrder.push(e.id+'-scroll'));
+                e.addEventListener('scrollend',()=>scrollOrder.push(e.id+'-end'));
+            }
+            a.scrollTop=10;a.scrollTop=20;b.scrollTop=30;
+            if(scrollOrder.length)throw Error('synchronous scroll notification');
+            requestAnimationFrame(()=>scrollOrder.push('frame'));
+            __trust.tickTo(__trust.nextDeadline());
+            globalThis.scrollPendingAfter=__trust.hasRenderingUpdate();
+        "#, "rendering scroll event ordering").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "scrollOrder.join(',')"),
+            "a-scroll,b-scroll,a-end,b-end,frame"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(scrollPendingAfter)"),
+            "false"
         );
     }
 

@@ -160,7 +160,25 @@ pub enum PaintShape {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GradientStop {
     pub offset: f32,
-    pub color: PaintColor,
+    /// Preserve the original color space and missing components until
+    /// interpolation; mapping stops to sRGB first changes the gradient.
+    pub color: color::DynamicColor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientInterpolation {
+    pub space: color::ColorSpaceTag,
+    pub hue: color::HueDirection,
+}
+
+impl Default for GradientInterpolation {
+    fn default() -> Self {
+        // CSS Images 4 #coloring-gradient-line / CSS Color 4 #interpolation.
+        Self {
+            space: color::ColorSpaceTag::Oklab,
+            hue: color::HueDirection::Shorter,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -170,11 +188,13 @@ pub enum PaintBrush {
         start: CssPoint,
         end: CssPoint,
         stops: Vec<GradientStop>,
+        interpolation: GradientInterpolation,
     },
     RadialGradient {
         center: CssPoint,
         radius: f32,
         stops: Vec<GradientStop>,
+        interpolation: GradientInterpolation,
     },
 }
 
@@ -268,6 +288,7 @@ impl PagePaint {
         let PagePaint {
             width,
             height,
+            user_scroll_size,
             background,
             lines,
             primitives,
@@ -280,7 +301,13 @@ impl PagePaint {
             scroll_containers,
             sticky_constraints,
         } = self;
-        let _ = (width, height, background, fixed_interleaved);
+        let _ = (
+            width,
+            height,
+            user_scroll_size,
+            background,
+            fixed_interleaved,
+        );
         let mut bytes = lines
             .capacity()
             .saturating_mul(std::mem::size_of::<PaintLine>())
@@ -313,6 +340,12 @@ impl PagePaint {
                 scroll_containers
                     .capacity()
                     .saturating_mul(std::mem::size_of::<ScrollContainer>()),
+            )
+            .saturating_add(
+                scroll_containers
+                    .iter()
+                    .map(|c| c.ancestors.capacity() * std::mem::size_of::<usize>())
+                    .sum::<usize>(),
             )
             .saturating_add(
                 sticky_constraints
@@ -721,7 +754,7 @@ pub struct HitRegion {
     pub cursor: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScrollContainer {
     pub node: usize,
     pub actor: Option<usize>,
@@ -730,6 +763,12 @@ pub struct ScrollContainer {
     pub offset: CssPoint,
     pub horizontal: bool,
     pub vertical: bool,
+    /// Attached to the viewport's pinned layer rather than document scroll.
+    pub fixed: bool,
+    /// Nearest-first scrollports in the containing-block chain.
+    pub ancestors: Vec<usize>,
+    /// CSS Overscroll Behavior: suppress chaining on x/y independently.
+    pub contain_overscroll: [bool; 2],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -992,6 +1031,9 @@ pub struct PaintLine {
 pub struct PagePaint {
     pub width: f32,
     pub height: f32,
+    /// User scrolling can be disabled by viewport overflow:hidden while
+    /// programmatic scrolling and CSSOM retain the full scrolling area.
+    pub user_scroll_size: Option<CssSize>,
     /// Page canvas color. HTML currently uses the default white canvas while
     /// protocol and VT adapters supply their own frontend-neutral theme.
     pub background: Option<PaintColor>,
@@ -1590,6 +1632,25 @@ impl Scene {
             .collect()
     }
 
+    /// HTML sequential focus order is independent of paint order. Retain
+    /// transformed, offscreen geometry and one anchor per eligible DOM node.
+    pub fn ordered_focus_hits(&self, order: &[usize]) -> Vec<PageHit> {
+        let states = primitive_states(&self.primitives);
+        let mut hits = std::collections::HashMap::new();
+        for (index, primitive) in self.primitives.iter().enumerate() {
+            if let DisplayCommand::HitRegion(region) = primitive {
+                hits.entry(region.node).or_insert_with(|| PageHit {
+                    rect: transformed_bounds(region.rect, states[index].transform),
+                    node: region.node,
+                    actor: region.actor,
+                    link: region.link.clone(),
+                    cursor: region.cursor.clone(),
+                });
+            }
+        }
+        order.iter().filter_map(|node| hits.remove(node)).collect()
+    }
+
     /// Return the closest Parley cluster boundary under a pointer.
     pub fn text_position_at(&self, point: CssPoint) -> Option<TextPosition> {
         let states = interaction_states(&self.primitives);
@@ -1754,10 +1815,30 @@ impl Scene {
     }
 
     pub fn scroll_container_at(&self, point: CssPoint) -> Option<&ScrollContainer> {
-        self.page_scroll_containers
-            .iter()
-            .rev()
-            .find(|container| container.viewport.contains(point))
+        self.page_scroll_containers.iter().rev().find(|container| {
+            self.content_viewport.contains(point)
+                && container.viewport.contains(point)
+                && container.ancestors.iter().all(|node| {
+                    self.page_scroll_containers
+                        .iter()
+                        .find(|ancestor| ancestor.node == *node)
+                        .is_none_or(|ancestor| ancestor.viewport.contains(point))
+                })
+        })
+    }
+
+    pub fn scroll_chain_at(&self, point: CssPoint) -> Vec<ScrollContainer> {
+        let Some(first) = self.scroll_container_at(point) else {
+            return Vec::new();
+        };
+        std::iter::once(first.clone())
+            .chain(first.ancestors.iter().filter_map(|node| {
+                self.page_scroll_containers
+                    .iter()
+                    .find(|c| c.node == *node)
+                    .cloned()
+            }))
+            .collect()
     }
 
     /// Overlay canonical page paint into the chrome's content viewport.
@@ -1774,15 +1855,29 @@ impl Scene {
                 .iter()
                 .map(|(_, canvas)| (canvas.handle, canvas.clone())),
         );
-        self.page_size = CssSize::new(page.width, page.height);
+        self.page_size = page
+            .user_scroll_size
+            .unwrap_or(CssSize::new(page.width, page.height));
         self.page_scroll_containers = page
             .scroll_containers
             .iter()
             .cloned()
             .map(|mut container| {
+                let ancestor_scroll = container
+                    .ancestors
+                    .iter()
+                    .filter_map(|node| page.scroll_containers.iter().find(|c| c.node == *node))
+                    .fold(CssPoint::default(), |sum, c| {
+                        CssPoint::new(sum.x + c.offset.x, sum.y + c.offset.y)
+                    });
+                let document_scroll = if container.fixed {
+                    CssPoint::default()
+                } else {
+                    scroll
+                };
                 container.viewport = container.viewport.translate(
-                    self.content_viewport.x - scroll.x,
-                    self.content_viewport.y - scroll.y,
+                    self.content_viewport.x - document_scroll.x - ancestor_scroll.x,
+                    self.content_viewport.y - document_scroll.y - ancestor_scroll.y,
                 );
                 container
             })
@@ -3101,6 +3196,61 @@ pub fn paint_rich_editor_overlay(
     primitives.push(Primitive::PopClip);
 }
 
+/// Present only the pending glyphs of a plain editing paragraph. Its CSS
+/// surface remains in the retained scene; rich markup uses canonical paint.
+/// The actor remains authoritative and replaces this preview after input's
+/// microtask checkpoint and rendering acknowledgement (HTML editing model).
+pub fn paint_pending_editor_text(
+    primitives: &mut Vec<Primitive>,
+    text: &str,
+    rect: CssRect,
+    presentation: &crate::layout2::RichEditorPresentation,
+) -> bool {
+    let Some(pending) = &presentation.pending_text else {
+        return false;
+    };
+    if pending.text == text {
+        return false;
+    }
+    primitives.retain(|command| {
+        !matches!(command,
+        Primitive::GlyphRun { node, .. } if pending.nodes.contains(node))
+    });
+    primitives.push(Primitive::PushClip(PaintShape::Rect(rect)));
+    let mut origin = CssPoint::new(
+        rect.x + presentation.origin.x,
+        rect.y + presentation.origin.y,
+    );
+    for shaped in crate::text::wrapped_lines(
+        text,
+        &presentation.style,
+        presentation.width,
+        presentation.width,
+        crate::text::TextBreakStyle {
+            wrap: true,
+            ..Default::default()
+        },
+    ) {
+        let height = shaped.line_height;
+        primitives.push(Primitive::GlyphRun {
+            origin,
+            shaped,
+            color: pending.color,
+            decoration: TextDecorationPaint {
+                color: pending.color,
+                style: DecorationStyle::Solid,
+            },
+            shadows: Vec::new(),
+            clip: None,
+            node: pending.nodes[0],
+            link: None,
+        });
+        origin.y += height;
+    }
+    primitives.push(Primitive::PopClip);
+    true
+}
+
 pub fn paint_text_editor(
     primitives: &mut Vec<Primitive>,
     editor: &EditorVisual,
@@ -3593,6 +3743,7 @@ mod tests {
                 offset: CssPoint::new(0.0, 24.0),
                 horizontal: false,
                 vertical: true,
+                ..Default::default()
             }],
             ..PagePaint::default()
         };
@@ -3905,6 +4056,30 @@ mod tests {
                 .is_none(),
             "the active page clip must constrain hit testing"
         );
+    }
+
+    #[test]
+    fn ordered_focus_hits_include_non_pointer_targets_and_deduplicate_fragments() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
+        let mut scene = desktop_shell(viewport, &snapshot());
+        let mut page = PagePaint::default();
+        for (node, y) in [(7, 2000.0), (8, 0.0), (7, 2010.0), (9, 10.0)] {
+            page.primitives.push(DisplayCommand::HitRegion(HitRegion {
+                rect: CssRect::new(10.0, y, 40.0, 30.0),
+                node,
+                actor: None,
+                link: None,
+                cursor: None,
+            }));
+        }
+        scene.append_page(&page, CssPoint::default());
+        let hits = scene.ordered_focus_hits(&[9, 7, 8]);
+        assert_eq!(
+            hits.iter().map(|hit| hit.node).collect::<Vec<_>>(),
+            [9, 7, 8]
+        );
+        assert_eq!(hits[1].rect.y, 2000.0 + scene.content_viewport.y);
     }
 
     #[test]

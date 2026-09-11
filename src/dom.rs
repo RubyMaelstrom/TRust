@@ -20,6 +20,7 @@ mod class_tokens;
 mod container_queries;
 mod counter_styles;
 pub(crate) mod cssom;
+mod focus;
 mod generated;
 mod input;
 mod invalidation;
@@ -1053,6 +1054,53 @@ impl Dom {
 
     pub fn render_live(&self) -> bool {
         self.render_live
+    }
+
+    /// Necessary candidates for an authored cursor declaration, using the
+    /// same Selectors 4 subject-key proof as ordinary rule matching. Native
+    /// activation discovery still resolves the full cascade on candidates;
+    /// it need not cascade hidden/unrelated nodes merely to find no cursor.
+    pub(crate) fn cursor_style_candidates(&self, nodes: &[NodeId]) -> Vec<NodeId> {
+        let index = self.style_index();
+        let mut candidates = Vec::new();
+        nodes
+            .iter()
+            .copied()
+            .filter(|&id| {
+                if self.tag_name(id).is_none() {
+                    return false;
+                }
+                // Inline CSSOM, host and slotted declarations may bypass the
+                // ordinary tree-scope subject bucket. Preserve their full lookup.
+                let inline_cursor = self.cssom_inline.get(&id).map_or_else(
+                    || {
+                        self.attr(id, "style").is_some_and(|style| {
+                            split_top_level(style, ';')
+                                .into_iter()
+                                .filter_map(parse_decl)
+                                .any(|(name, _, _)| name == "cursor")
+                        })
+                    },
+                    |declarations| declarations.iter().any(|(name, _, _)| name == "cursor"),
+                );
+                if inline_cursor
+                    || self.shadow_roots.contains_key(&id)
+                    || !index.slotted_rules.is_empty()
+                {
+                    return true;
+                }
+                candidates.clear();
+                let scope = self.tree_scope(id);
+                if let Some(buckets) = index.cursor_buckets.get(&scope) {
+                    buckets.candidates(self, id, &mut candidates);
+                }
+                index.scopes.get(&scope).is_some_and(|rules| {
+                    candidates.iter().any(|&rule| {
+                        self.matches_complex(id, &rules[rule as usize].selector.0, None)
+                    })
+                })
+            })
+            .collect()
     }
 
     /// Extend paint markers for a newly serialized incremental boundary while
@@ -5250,6 +5298,18 @@ impl Dom {
             .scopes
             .iter()
             .map(|(scope, rules)| (*scope, RuleBuckets::build(rules)))
+            .collect();
+        index.cursor_buckets = index
+            .scopes
+            .iter()
+            .map(|(scope, rules)| {
+                (
+                    *scope,
+                    RuleBuckets::build_where(rules, |rule| {
+                        rule.decls.iter().any(|(name, _)| name == "cursor")
+                    }),
+                )
+            })
             .collect();
         // CSS Shadow 1 §3.2.4: `::slotted()` rules are evaluated in a
         // shadow-tree stylesheet but apply to the flattened nodes assigned to
@@ -9928,6 +9988,8 @@ const PROPS: &[PropDef] = &[
     prop("overflow", false, true),
     prop("overflow-x", false, true),
     prop("overflow-y", false, true),
+    prop("overscroll-behavior-x", false, true),
+    prop("overscroll-behavior-y", false, true),
     // CSS 2.2 §11.1.2 legacy clipping. It applies only to absolutely
     // positioned boxes and clips the complete border box and descendants.
     prop("clip", false, true),
@@ -10062,6 +10124,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         // CSS UI 4 #pointer-events-control / SVG 2 #PointerEventsProp:
         // inherited, initial auto (also for SVG's extended value grammar).
         "pointer-events" => Some("auto"),
+        "overscroll-behavior-x" | "overscroll-behavior-y" => Some("auto"),
         // CSS Transforms 1 #transform-property: non-inherited, initial none.
         "transform" => Some("none"),
         "position" => Some("static"),
@@ -10403,6 +10466,32 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // legacy alias, not a shorthand).
     if prop == "word-wrap" {
         return vec![("overflow-wrap".to_string(), value.to_string())];
+    }
+    if prop == "overscroll-behavior" {
+        if value.contains("var(") {
+            return ["overscroll-behavior-x", "overscroll-behavior-y"]
+                .into_iter()
+                .map(|p| (p.into(), format!("{PENDING_BOX_SHORTHAND}{prop}:{value}")))
+                .collect();
+        }
+        let values = split_top_level_ws(value);
+        if values.len() != 1 && values.iter().any(|v| wide_keyword(v).is_some()) {
+            return Vec::new();
+        }
+        let (x, y) = match values.as_slice() {
+            [x] => (*x, *x),
+            [x, y] => (*x, *y),
+            _ => return Vec::new(),
+        };
+        if [x, y].into_iter().any(|v| {
+            wide_keyword(v).is_none() && !matches!(v, "auto" | "contain" | "none" | "chain")
+        }) {
+            return Vec::new();
+        }
+        return vec![
+            ("overscroll-behavior-x".into(), x.into()),
+            ("overscroll-behavior-y".into(), y.into()),
+        ];
     }
     if let Some((start, end)) = logical_pair(prop) {
         let toks: Vec<&str> = split_top_level_ws(value);
@@ -11638,6 +11727,7 @@ struct StyleIndex {
     /// element only tests rules that could possibly match it (see
     /// `matched_rules`). Parallel to `scopes`; values index into it.
     buckets: FxHashMap<NodeId, RuleBuckets>,
+    cursor_buckets: FxHashMap<NodeId, RuleBuckets>,
     /// `(shadow-root, rule-index)` entries for `::slotted()` selectors. These
     /// rules are consulted while cascading a light-DOM element assigned to a
     /// slot in the corresponding shadow tree.
@@ -11861,6 +11951,7 @@ impl StyleIndex {
             has_opacity,
             hover_probes,
             hover_buckets,
+            cursor_buckets,
             boxless_content_may_escape,
         } = self;
         let _ = (
@@ -11935,7 +12026,7 @@ impl StyleIndex {
                 }
             }
         }
-        for map in [buckets, hover_buckets] {
+        for map in [buckets, hover_buckets, cursor_buckets] {
             bytes = bytes.saturating_add(
                 map.capacity()
                     .saturating_mul(std::mem::size_of::<(NodeId, RuleBuckets)>()),
@@ -11996,7 +12087,8 @@ impl StyleIndex {
         let opaque = !scopes.is_empty()
             || !buckets.is_empty()
             || !keyframes.is_empty()
-            || !hover_buckets.is_empty();
+            || !hover_buckets.is_empty()
+            || !cursor_buckets.is_empty();
         (bytes, opaque)
     }
 }
@@ -16361,18 +16453,16 @@ mod tests {
                 "hsl(120 50% 50%)",
                 "color(display-p3 0 0 0)",
                 "lab(0% 0 0)",
+                "oklch(0.5 0.1 120)",
+                "oklab(50% 0.1 0.2)",
+                "lch(50% 20 120)",
             ] {
                 assert!(
                     supports_condition(&format!("({property}: {value})")),
                     "supported: {property}: {value}"
                 );
             }
-            for value in [
-                "color(unknown-space 0 0 0)",
-                "lab(0%, 0, 0)",
-                "oklch(0.5 0.1 120)",
-                "not-a-color",
-            ] {
+            for value in ["color(unknown-space 0 0 0)", "lab(0%, 0, 0)", "not-a-color"] {
                 assert!(
                     !supports_condition(&format!("({property}: {value})")),
                     "unsupported: {property}: {value}"

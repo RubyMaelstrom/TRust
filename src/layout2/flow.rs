@@ -200,6 +200,9 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
 /// (§9.9/Appendix E, css-position-3 §2.2, css-transforms-1 §3).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct PaintFlags {
+    /// CSS Lists 3: an outside marker follows the list item's border box,
+    /// rather than scrolling with that item's own contents.
+    pub outside_marker: bool,
     /// Style source for a generated `::before`/`::after` fragment. Its
     /// geometry node remains `NO_NODE`, but it is not paint-anonymous.
     pub pseudo: Option<(NodeId, crate::dom::PseudoEl)>,
@@ -233,6 +236,7 @@ pub(crate) struct PaintFlags {
 impl Default for PaintFlags {
     fn default() -> Self {
         Self {
+            outside_marker: false,
             pseudo: None,
             positioned: false,
             sc: false,
@@ -289,6 +293,7 @@ pub(super) fn fixed_backdrop(
 /// position:static — css-flexbox §4.3).
 pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
     PaintFlags {
+        outside_marker: false,
         pseudo: s.pseudo,
         positioned: s.position.positioned(),
         sc: s.stacking_context(item),
@@ -1631,7 +1636,10 @@ impl Flow<'_> {
             css_size: None,
             content_size: None,
             content_offset: [0.0; 2],
-            paint: PaintFlags::default(),
+            paint: PaintFlags {
+                outside_marker: true,
+                ..PaintFlags::default()
+            },
             clip: None,
             kind: FragKind::Line(LineFrag {
                 pieces,
@@ -1723,7 +1731,15 @@ impl Flow<'_> {
                 }
             }
         };
-        let (ml, w) = solve(spec(&s.width));
+        // HTML Rendering #button-layout: an automatic inline size is
+        // fit-content, including display:block/flow-root buttons. The block
+        // equation still resolves their margins and explicit min/max sizes.
+        let width = spec(&s.width).or_else(|| {
+            (s.width.is_auto() && b.node != NO_NODE && self.dom.tag_name(b.node) == Some("button"))
+                .then(|| self.intrinsic_width_value(&Len::FitContent, b, Some(cb_w), inl))
+                .flatten()
+        });
+        let (ml, w) = solve(width);
         let (ml, w) = if w > max_w {
             solve(Some(max_w))
         } else {

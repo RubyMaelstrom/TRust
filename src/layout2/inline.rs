@@ -1181,7 +1181,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     pub fn block_atom_content(&mut self, a: &Atom, ctx: &InlineStyle) {
         self.position_inline_atoms = false;
         let AtomKind::Control { form, field } = &a.kind else {
-            self.atom(a, ctx);
+            // CSS 2.2 #line-height / #propdef-vertical-align apply a strut
+            // and vertical-align to inline-level boxes. This synthetic line
+            // only carries the pixels of a block-level replaced element; it
+            // must not create a baseline gap or move the image in its box.
+            self.strut = crate::text::ShapedText::default();
+            let mut block_context = ctx.clone();
+            block_context.vertical_align = VerticalAlign::Baseline;
+            self.atom(a, &block_context);
             return;
         };
         let Some(f) = self
@@ -1641,7 +1648,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .iter()
             .map(|p| match p.vertical_align {
                 VerticalAlign::Shift(rise) => p.ascent + rise,
-                VerticalAlign::Middle(half_x) => p.box_height / 2.0 - half_x,
+                VerticalAlign::Middle(half_x) => p.box_height / 2.0 + half_x,
                 _ => p.ascent,
             })
             .fold(strut.baseline, f32::max);
@@ -1649,7 +1656,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .iter()
             .map(|p| match p.vertical_align {
                 VerticalAlign::Shift(rise) => p.descent - rise,
-                VerticalAlign::Middle(half_x) => p.box_height / 2.0 + half_x,
+                VerticalAlign::Middle(half_x) => p.box_height / 2.0 - half_x,
                 _ => p.descent,
             })
             .fold((strut.line_height - strut.baseline).max(0.0), f32::max);
@@ -1661,7 +1668,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 VerticalAlign::Shift(rise) => baseline - p.ascent - rise,
                 VerticalAlign::Top => 0.0,
                 VerticalAlign::Bottom => (height - p.box_height).max(0.0),
-                VerticalAlign::Middle(half_x) => baseline + half_x - p.box_height / 2.0,
+                // CSS 2.2 #valdef-vertical-align-middle: x-height is above
+                // the alphabetic baseline; CSS-pixel y grows downwards.
+                VerticalAlign::Middle(half_x) => baseline - half_x - p.box_height / 2.0,
             };
         }
         // The pen is the line's used extent. A contain-fitted replaced box

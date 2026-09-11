@@ -93,6 +93,37 @@ struct TerminalNodePaint {
 
 impl TerminalPaintModel {
     pub(crate) fn from_dom(dom: &Dom, base: &url::Url, controls: &super::ControlMap) -> Self {
+        Self::from_nodes(dom, base, controls, None)
+    }
+
+    pub(crate) fn from_layout(
+        dom: &Dom,
+        base: &url::Url,
+        controls: &super::ControlMap,
+        boxes: &HashMap<NodeId, super::PxRect>,
+    ) -> Self {
+        // CSS Display 3 #box-tree: terminal adaptation reads only measured
+        // fragments and their flat-tree ancestors (including boxless hosts).
+        // Do not recascade suppressed descendants just to mark them absent.
+        let mut needed = std::collections::HashSet::new();
+        for &node in boxes.keys() {
+            let mut current = Some(node);
+            while let Some(node) = current {
+                if !needed.insert(node) {
+                    break;
+                }
+                current = dom.parent_flat(node);
+            }
+        }
+        Self::from_nodes(dom, base, controls, Some(&needed))
+    }
+
+    fn from_nodes(
+        dom: &Dom,
+        base: &url::Url,
+        controls: &super::ControlMap,
+        needed: Option<&std::collections::HashSet<NodeId>>,
+    ) -> Self {
         let mut links = HashMap::new();
         let mut nodes = Vec::with_capacity(dom.node_count());
         for node in 0..dom.node_count() {
@@ -100,7 +131,12 @@ impl TerminalPaintModel {
             // suppressed flat-tree element generate no boxes. Keep their actor
             // state in the canonical DOM, but do not let newly-created hidden
             // nodes make the retained terminal adapter appear to have changed.
-            if !dom.is_connected(node) || dom.omitted_from_flat_box_tree(node) {
+            if (needed.is_some_and(|needed| !needed.contains(&node))
+                && dom.attr(node, "id").is_none()
+                && !(dom.tag_name(node) == Some("a") && dom.attr(node, "name").is_some()))
+                || !dom.is_connected(node)
+                || dom.omitted_from_flat_box_tree(node)
+            {
                 nodes.push(TerminalNodePaint::default());
                 continue;
             }

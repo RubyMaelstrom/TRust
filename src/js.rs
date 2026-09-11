@@ -406,6 +406,12 @@ pub enum PageEvt {
     KeyDefault {
         prevented: bool,
     },
+    /// The edit and its input-event microtask checkpoint have completed. This
+    /// follows any resulting render, so a native editor can accept script
+    /// changes without overwriting newer edits still queued in the actor.
+    FormValueApplied {
+        node: usize,
+    },
     Scrolled {
         node: usize,
         top: f64,
@@ -668,8 +674,8 @@ pub(crate) fn clickable_set_for_dom(
     let mut candidates: HashSet<usize> = inherent.into_iter().collect();
     candidates.extend(listeners.iter().copied());
     let cursor_started = Instant::now();
-    for &node in &everyone {
-        if dom.computed_style(node, "cursor").as_deref() == Some("pointer") && listens(node) {
+    for node in dom.cursor_style_candidates(&everyone) {
+        if listens(node) && dom.computed_style(node, "cursor").as_deref() == Some("pointer") {
             candidates.insert(node);
         }
     }

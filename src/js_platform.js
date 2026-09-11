@@ -3931,10 +3931,10 @@
     // target inherits this prototype so the `instanceof` check holds.
     const DOMStringMap = function () { throw new TypeError("Illegal constructor"); };
 
-    // CSSOM View §6 queues element scroll notifications on the event loop; it
-    // does not dispatch them synchronously from `scrollLeft`/`scrollBy`. Keep
-    // one task per scrolling box so two-axis writes in one operation coalesce,
-    // and resolve every scroll Promise after the instant scroll completes.
+    // CSSOM View #scrolling-events / HTML #update-the-rendering: scroll
+    // notifications belong to the rendering update, before animation-frame
+    // callbacks. Timer tasks can run at a different point and must not stand
+    // in for these steps. Coalesce notifications per scrolling box.
     // TRust may perform `smooth` instantly (CSSOM View explicitly conditions
     // smooth animation on whether the UA honors the behavior), but completion
     // and event ordering remain the same.
@@ -3945,20 +3945,25 @@
             if (resolve) pending.resolvers.push(resolve);
             return;
         }
-        pending = { element: el, resolvers: resolve ? [resolve] : [] };
+        pending = { element: el, frame: trust.__activeFrame || null, resolvers: resolve ? [resolve] : [] };
         PENDING_ELEMENT_SCROLLS.set(el.__id, pending);
-        g.setTimeout(function () {
-            // Delete first: a scroll handler may initiate a distinct scroll,
-            // which must receive a later task rather than being lost here.
-            PENDING_ELEMENT_SCROLLS.delete(el.__id);
-            trust.fireElementScroll(el.__id);
-            try { dispatch(el, new Event("scrollend"), false); }
+    }
+    trust.runScrollSteps = function () {
+        const entries = Array.from(PENDING_ELEMENT_SCROLLS.values());
+        PENDING_ELEMENT_SCROLLS.clear();
+        for (const pending of entries) {
+            try { runInFrame(pending.frame, () => dispatch(pending.element, new Event("scroll"), false)); }
+            catch (e) { trust.errors.push("element scroll handler: " + ((e && e.message) || e)); }
+        }
+        for (const pending of entries) {
+            try { runInFrame(pending.frame, () => dispatch(pending.element, new Event("scrollend"), false)); }
             catch (e) { trust.errors.push("element scrollend handler: " + ((e && e.message) || e)); }
             for (const done of pending.resolvers) {
                 try { done(); } catch (e) {}
             }
-        }, 0);
-    }
+        }
+        return entries.length;
+    };
 
     function normalizedScrollNumber(v) {
         v = +v;
@@ -10641,7 +10646,7 @@
     const RO = [];
     let roInitialUpdatePending = false;
     trust.hasRenderingUpdate = function () {
-        return ioInitialUpdatePending || roInitialUpdatePending;
+        return ioInitialUpdatePending || roInitialUpdatePending || PENDING_ELEMENT_SCROLLS.size > 0;
     };
     trust.hasResizeObserver = function () { return RO.length > 0; };
     // Parse a rootMargin string into 4 {v, pct} offsets in CSS-margin order
@@ -10917,9 +10922,7 @@
     trust.fireElementScroll = function (node) {
         const el = wrap(node);
         if (!el) return;
-        try { dispatch(el, new Event("scroll"), false); }
-        catch (e) { trust.errors.push("element scroll handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
-        trust.updateIntersections();
+        queueElementScroll(el);
     };
 
     // Does the page have scroll-driven work (so the actor keeps it live at rest
@@ -11559,20 +11562,95 @@
 
     // RAM-only, session-lifetime storage: origin-bucketed maps shared
     // across pages, dead with the process, never disk.
+    const storageBuckets = new WeakMap();
+    function storageBucket(object) {
+        const bucket = storageBuckets.get(object);
+        if (bucket === undefined) throw new TypeError("Illegal Storage invocation");
+        return bucket;
+    }
+    class Storage {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        getItem(key) {
+            const bucket = storageBucket(this);
+            if (!arguments.length) throw new TypeError("Storage key is required");
+            return __storage_get(bucket, domString(key));
+        }
+        setItem(key, value) {
+            const bucket = storageBucket(this);
+            if (arguments.length < 2) throw new TypeError("Storage key and value are required");
+            __storage_set(bucket, domString(key), domString(value));
+        }
+        removeItem(key) {
+            const bucket = storageBucket(this);
+            if (!arguments.length) throw new TypeError("Storage key is required");
+            __storage_remove(bucket, domString(key));
+        }
+        clear() { __storage_clear(storageBucket(this)); }
+        key(index) {
+            const bucket = storageBucket(this);
+            if (!arguments.length) throw new TypeError("Storage index is required");
+            return __storage_key(bucket, index >>> 0);
+        }
+        get length() { return __storage_len(storageBucket(this)); }
+        get [Symbol.toStringTag]() { return "Storage"; }
+    }
+    for (const key of ["getItem", "setItem", "removeItem", "clear", "key", "length"])
+        Object.defineProperty(Storage.prototype, key, {...Object.getOwnPropertyDescriptor(Storage.prototype, key), enumerable: true});
+    g.Storage = Storage;
     function makeStorage(kind, origin) {
         // Storage #storage-keys / HTML #the-localstorage-attribute: the
         // object's map belongs to its creating environment's checked origin,
         // not the caller, a mutable <base> URL, or a later host settings token.
         // Keep this private key with the API object even after frame removal.
         const bucket = kind + ":" + origin;
-        return {
-            getItem: (k) => __storage_get(bucket, String(k)),
-            setItem: (k, v) => { __storage_set(bucket, String(k), String(v)); },
-            removeItem: (k) => { __storage_remove(bucket, String(k)); },
-            clear: () => { __storage_clear(bucket); },
-            key: (i) => __storage_key(bucket, Number(i)),
-            get length() { return __storage_len(bucket); },
-        };
+        const target = Object.create(Storage.prototype);
+        // HTML #the-storage-interface and Web IDL #js-legacy-platform-objects:
+        // named access and the methods share ONE map. Prototype members mask
+        // named getters, but every direct string assignment invokes setItem.
+        const visible = (key) => typeof key === "string" && !(key in target) && __storage_get(bucket, key) !== null;
+        const proxy = new Proxy(target, {
+            get(t, key, receiver) {
+                if (visible(key)) return __storage_get(bucket, key);
+                return Reflect.get(t, key, receiver);
+            },
+            set(t, key, value, receiver) {
+                if (receiver === proxy && typeof key === "string") {
+                    __storage_set(bucket, key, domString(value));
+                    return true;
+                }
+                return Reflect.set(t, key, value, receiver);
+            },
+            has(t, key) { return key in t || visible(key); },
+            deleteProperty(t, key) {
+                if (visible(key)) { __storage_remove(bucket, key); return true; }
+                return Reflect.deleteProperty(t, key);
+            },
+            ownKeys(t) {
+                const keys = [];
+                const length = __storage_len(bucket);
+                for (let index = 0; index < length; index++) {
+                    const key = __storage_key(bucket, index);
+                    if (visible(key)) keys.push(key);
+                }
+                return keys.concat(Reflect.ownKeys(t));
+            },
+            getOwnPropertyDescriptor(t, key) {
+                if (visible(key)) return {value: __storage_get(bucket, key), writable: true, enumerable: true, configurable: true};
+                return Reflect.getOwnPropertyDescriptor(t, key);
+            },
+            defineProperty(t, key, descriptor) {
+                if (typeof key === "string" && !Object.hasOwn(t, key)) {
+                    if (!("value" in descriptor || "writable" in descriptor)) return false;
+                    __storage_set(bucket, key, domString(descriptor.value));
+                    return true;
+                }
+                return Reflect.defineProperty(t, key, descriptor);
+            },
+            preventExtensions() { return false; },
+        });
+        storageBuckets.set(target, bucket);
+        storageBuckets.set(proxy, bucket);
+        return proxy;
     }
     const documentStorageHolders = new WeakMap();
     function windowStorage(kind) {
@@ -11789,6 +11867,7 @@
     pristineAnimationFrameMethods = animationFrameMethods();
     topAnimationFrameMethods = pristineAnimationFrameMethods;
     function runAnimationFrameCallbacks(now) {
+        trust.runScrollSteps();
         // HTML "run the animation frame callbacks": snapshot the callback-map
         // keys, then remove each callback immediately before invoking it. A
         // callback queued during this pass is therefore deferred to the next

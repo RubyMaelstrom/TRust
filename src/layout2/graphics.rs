@@ -14,17 +14,18 @@ use crate::core::{CssPoint, CssSize};
 use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::render::{
     Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
-    CssPaintAnimation, CssRect, DecorationStyle, DisplayCommand, GradientStop, HitRegion, ImageFit,
-    ImageHandle, ImageRequest, ImageSampling, LineCap, MarqueeBehavior, MarqueeDirection,
-    MarqueeScope, PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement,
-    ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint, TextShadowPaint,
-    TopLayerEntry,
+    CssPaintAnimation, CssRect, DecorationStyle, DisplayCommand, GradientInterpolation,
+    GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest, ImageSampling, LineCap,
+    MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint, PaintBrush, PaintColor, PaintLine,
+    PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint,
+    TextShadowPaint, TopLayerEntry,
 };
 
 use super::ImageSizes;
 use super::NO_NODE;
 use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
+use super::overflow::{ScrollAreas, viewport_overflow_disabled, viewport_overflow_source};
 use super::style::{Outline, OutlineStyle, Pos, outline_of};
 use super::value::{Len, Vp};
 
@@ -87,6 +88,7 @@ struct Builder<'a, 't> {
     canvas_images: Vec<(NodeId, crate::render::CanvasImage)>,
     image_handles: HashSet<ImageHandle>,
     scroll_containers: Vec<ScrollContainer>,
+    scrolling: ScrollAreas,
     sticky_constraints: Vec<StickyConstraint>,
     marquee_scopes: HashMap<NodeId, MarqueeScope>,
     /// CSS 2.2 `clip:rect()` regions keyed by the positioned element that
@@ -146,6 +148,7 @@ impl<'a, 't> Builder<'a, 't> {
             canvas_images: Vec::new(),
             image_handles: HashSet::new(),
             scroll_containers: Vec::new(),
+            scrolling: ScrollAreas::new(dom, root),
             sticky_constraints: Vec::new(),
             marquee_scopes: HashMap::new(),
             legacy_clips: HashMap::new(),
@@ -158,7 +161,7 @@ impl<'a, 't> Builder<'a, 't> {
             scroll_nodes: Vec::new(),
         };
         this.collect_legacy_clips(root);
-        this.collect_scroll_containers(root);
+        this.collect_scroll_containers(root, false);
         this.collect_patch_boundaries(root);
         this.collect_sticky(root);
         this.collect_marquees(root);
@@ -168,20 +171,57 @@ impl<'a, 't> Builder<'a, 't> {
         // establish ordinary CSS Overflow scroll containers and interaction
         // boundaries.
         for fixed in fixed {
+            this.scrolling.extend(dom, fixed);
             this.collect_legacy_clips(fixed);
-            this.collect_scroll_containers(fixed);
+            this.collect_scroll_containers(fixed, true);
             this.collect_patch_boundaries(fixed);
             this.collect_sticky(fixed);
             this.collect_marquees(fixed);
         }
         for top in top_layer {
+            this.scrolling.extend(dom, &top.fragment);
             this.collect_legacy_clips(&top.fragment);
-            this.collect_scroll_containers(&top.fragment);
+            this.collect_scroll_containers(&top.fragment, top.fixed);
             this.collect_patch_boundaries(&top.fragment);
             this.collect_sticky(&top.fragment);
             this.collect_marquees(&top.fragment);
         }
+        for index in 0..this.scroll_containers.len() {
+            let node = this.scroll_containers[index].node;
+            this.scroll_containers[index].ancestors = this.scroll_ancestor_nodes(node);
+        }
         this
+    }
+
+    fn scroll_ancestor_nodes(&self, node: NodeId) -> Vec<NodeId> {
+        let mut result = Vec::new();
+        let mut current = Some(node);
+        let mut waiting = None;
+        while let Some(id) = current {
+            let context = self.clip_ancestry.get(&id);
+            if context.is_some_and(|c| match waiting {
+                Some(Pos::Absolute) => c.absolute_cb,
+                Some(Pos::Fixed) => c.fixed_cb,
+                _ => false,
+            }) {
+                waiting = None;
+            }
+            if waiting.is_none() {
+                if id != node && self.scroll_containers.iter().any(|c| c.node == id) {
+                    result.push(id);
+                }
+                if let Some(context) = context {
+                    if context.top_layer {
+                        break;
+                    }
+                    if matches!(context.position, Pos::Absolute | Pos::Fixed) {
+                        waiting = Some(context.position);
+                    }
+                }
+            }
+            current = self.dom.parent_flat(id);
+        }
+        result
     }
 
     /// Emit one descendant paint command inside its nearest marquee's fixed
@@ -488,11 +528,12 @@ impl<'a, 't> Builder<'a, 't> {
         }
     }
 
-    fn collect_scroll_containers(&mut self, fragment: &Frag<'_>) {
+    fn collect_scroll_containers(&mut self, fragment: &Frag<'_>, fixed: bool) {
         let nested_viewport = fragment.node != NO_NODE
             && matches!(self.dom.tag_name(fragment.node), Some("iframe" | "frame"));
         if fragment.node != NO_NODE
-            && !matches!(self.dom.tag_name(fragment.node), Some("html" | "body"))
+            && Some(fragment.node) != viewport_overflow_source(self.dom)
+            && self.dom.document_element() != Some(fragment.node)
             && (self.dom.is_scroll_container(fragment.node)
                 || self.dom.is_hscroll_container(fragment.node)
                 || nested_viewport)
@@ -502,21 +543,14 @@ impl<'a, 't> Builder<'a, 't> {
             } else {
                 padding_box(fragment)
             };
-            let (right, bottom) = if nested_viewport {
-                // The embedding border/padding is outside the child
-                // Document, so it must not manufacture overflow inside it.
-                fragment.children.iter().map(subtree_extent).fold(
-                    (viewport.x + viewport.width, viewport.y + viewport.height),
-                    |(right, bottom), (child_right, child_bottom)| {
-                        (right.max(child_right), bottom.max(child_bottom))
-                    },
-                )
-            } else {
-                subtree_extent(fragment)
-            };
+            let extent = self.scrolling.nodes.get(&fragment.node);
             let content = CssSize::new(
-                (right - viewport.x).max(viewport.width),
-                (bottom - viewport.y).max(viewport.height),
+                extent
+                    .map_or(viewport.width, |r| r.width as f32)
+                    .max(viewport.width),
+                extent
+                    .map_or(viewport.height, |r| r.height as f32)
+                    .max(viewport.height),
             );
             self.scroll_containers.push(ScrollContainer {
                 node: fragment.node,
@@ -541,10 +575,19 @@ impl<'a, 't> Builder<'a, 't> {
                     || (nested_viewport && content.width > viewport.width),
                 vertical: self.dom.is_scroll_container(fragment.node)
                     || (nested_viewport && content.height > viewport.height),
+                ancestors: Vec::new(),
+                fixed,
+                contain_overscroll: ["overscroll-behavior-x", "overscroll-behavior-y"].map(
+                    |property| {
+                        self.dom
+                            .computed_value_resolved(fragment.node, property)
+                            .is_some_and(|v| matches!(v.trim(), "contain" | "none"))
+                    },
+                ),
             });
         }
         for child in &fragment.children {
-            self.collect_scroll_containers(child);
+            self.collect_scroll_containers(child, fixed);
         }
     }
 
@@ -901,9 +944,17 @@ pub(super) fn paint<'t>(
             primitives: builder.commands.split_off(start),
         });
     }
+    let (width, height) = builder.scrolling.document;
+    let width = width.max(viewport_w).max(0.);
+    let height = height.max(flow_bottom).max(viewport_h).max(0.);
+    let locked = viewport_overflow_disabled(dom);
     let paint = PagePaint {
-        width: (root.x + root.w).max(0.0),
-        height: root.max_bottom().max(flow_bottom).max(0.0),
+        width,
+        height,
+        user_scroll_size: Some(CssSize::new(
+            if locked[0] { viewport_w } else { width },
+            if locked[1] { viewport_h } else { height },
+        )),
         background: root_background,
         lines: builder.lines,
         primitives,
@@ -1401,10 +1452,21 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             if let Some(color) = background_color_for_style(builder.dom, style)
                 && !color.is_transparent()
             {
-                builder.commands.push(DisplayCommand::Fill {
-                    shape: shape.clone(),
-                    brush: PaintBrush::Solid(color),
-                });
+                let clip = style
+                    .value(builder.dom, "background-clip")
+                    .unwrap_or_default();
+                let clips = split_top_level(&clip, ',');
+                let images = style
+                    .value(builder.dom, "background-image")
+                    .unwrap_or_else(|| "none".into());
+                let index = split_top_level(&images, ',').len().saturating_sub(1);
+                let color_shape = background_layer_shape(
+                    fragment,
+                    builder.dom,
+                    layer_value(&clips, index, "border-box"),
+                    &shape,
+                );
+                fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
             }
             let origin = CssRect::new(fragment.x + area[0], fragment.y + area[1], area[2], area[3]);
             paint_background_images_for_style(
@@ -1434,10 +1496,21 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             if let Some(color) = background_color_for_style(builder.dom, style)
                 && !color.is_transparent()
             {
-                builder.commands.push(DisplayCommand::Fill {
-                    shape: shape.clone(),
-                    brush: PaintBrush::Solid(color),
-                });
+                let clips = style
+                    .value(builder.dom, "background-clip")
+                    .unwrap_or_default();
+                let clips = split_top_level(&clips, ',');
+                let images = style
+                    .value(builder.dom, "background-image")
+                    .unwrap_or_else(|| "none".into());
+                let index = split_top_level(&images, ',').len().saturating_sub(1);
+                let color_shape = background_layer_shape(
+                    fragment,
+                    builder.dom,
+                    layer_value(&clips, index, "border-box"),
+                    &shape,
+                );
+                fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
             }
             paint_background_images(fragment, shape.clone(), builder, None);
         }
@@ -1528,6 +1601,10 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         for piece in &line.pieces {
             let node = piece.item.node;
             let style_node = piece.item.style_node;
+            // CSS Lists 3 #marker-pseudo: generated markers belong to the list
+            // item even though they have no DOM identity of their own. Use
+            // their style host for paint ancestry, retaining NO_NODE for hits.
+            let paint_node = if node == NO_NODE { style_node } else { node };
             if if let Some((node, pseudo)) = piece.item.pseudo {
                 matches!(
                     builder
@@ -1547,8 +1624,10 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             // the generating DOM node. Use that node for the scrollport chain
             // so inline text/replaced content inside a shadow tree receives
             // the same clip and scroll transform as element fragments.
-            let piece_scroll_depth = if anonymous_line {
-                builder.push_scroll_content_chain(node)
+            let piece_scroll_depth = if fragment.paint.outside_marker {
+                builder.push_scroll_ancestors(paint_node)
+            } else if anonymous_line {
+                builder.push_scroll_content_chain(paint_node)
             } else {
                 0
             };
@@ -1558,7 +1637,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             // scroll transform; a hover-created stacking context must not
             // change which pixels/links survive clipping.
             let piece_clip = anonymous_line
-                .then(|| builder.ancestor_clip(node, fragment.clip))
+                .then(|| builder.ancestor_clip(paint_node, fragment.clip))
                 .flatten()
                 .is_some_and(|clip| builder.push_hard_clip(clip));
             let form_piece = matches!(piece.item.kind, super::ItemKind::Form);
@@ -1582,7 +1661,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     piece.item.link.clone(),
                 );
             }
-            let mut clip = builder.effective_clip(node, fragment.clip);
+            let mut clip = builder.effective_clip(paint_node, fragment.clip);
             if piece_rect.is_some() {
                 // A control's label is clipped to its content paint rectangle,
                 // not merely to the outer border box. This is the same box
@@ -2374,11 +2453,18 @@ fn paint_background_images_for_style(
         if layer.eq_ignore_ascii_case("none") || layer.is_empty() {
             continue;
         }
+        let layer_shape = if canvas.is_some() {
+            shape.clone()
+        } else {
+            background_layer_shape(
+                fragment,
+                builder.dom,
+                layer_value(&clip_layers, index, "border-box"),
+                &shape,
+            )
+        };
         if let Some(brush) = parse_gradient(layer, positioning_override.unwrap_or(border_box)) {
-            builder.commands.push(DisplayCommand::Fill {
-                shape: shape.clone(),
-                brush,
-            });
+            fill_background(builder, layer_shape, brush, &shape);
         } else if let Some(url) = css_url(layer) {
             let source = resolve_image_source(builder.base, &url);
             let handle = builder.image(source.clone());
@@ -2424,6 +2510,7 @@ fn paint_background_images_for_style(
                 // tile fits on an axis, CSS falls back to no-repeat there.
                 let nx = (positioning.width / tile_w).floor() as usize;
                 let ny = (positioning.height / tile_h).floor() as usize;
+                builder.commands.push(DisplayCommand::PushClip(layer_shape));
                 paint_spaced_background(
                     builder,
                     clip,
@@ -2435,8 +2522,10 @@ fn paint_background_images_for_style(
                     nx,
                     ny,
                 );
+                builder.commands.push(DisplayCommand::PopClip);
                 continue;
             }
+            builder.commands.push(DisplayCommand::PushClip(layer_shape));
             builder
                 .commands
                 .push(DisplayCommand::PushClip(background_clip_shape(
@@ -2501,8 +2590,83 @@ fn paint_background_images_for_style(
                 count += 1;
             }
             builder.commands.push(DisplayCommand::PopClip);
+            builder.commands.push(DisplayCommand::PopClip);
         }
     }
+}
+
+// A glyph mask can extend beyond the background border; ordinary background
+// box shapes are already bounded and need no extra stateful clip commands.
+fn fill_background(
+    builder: &mut Builder<'_, '_>,
+    shape: PaintShape,
+    brush: PaintBrush,
+    border: &PaintShape,
+) {
+    let text = matches!(shape, PaintShape::Path(_));
+    if text {
+        builder
+            .commands
+            .push(DisplayCommand::PushClip(border.clone()));
+    }
+    builder.commands.push(DisplayCommand::Fill { shape, brush });
+    if text {
+        builder.commands.push(DisplayCommand::PopClip);
+    }
+}
+
+/// CSS Backgrounds 4 #background-clip (local snapshot 2026-09-06): text
+/// clipping includes in-flow and floated descendants, independently of text
+/// color. Positioned out-of-flow descendants do not contribute to the mask.
+fn background_layer_shape(
+    fragment: &Frag<'_>,
+    dom: &Dom,
+    clip: &str,
+    border: &PaintShape,
+) -> PaintShape {
+    if clip.trim() != "text" {
+        let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+        let padding = padding_box_with_style(fragment);
+        let content = content_box_with_style(dom, fragment, padding);
+        return background_clip_shape(background_box(clip, rect, padding, content), border, rect);
+    }
+    fn collect(f: &Frag<'_>, dom: &Dom, path: &mut Vec<crate::render::PathElement>) {
+        if let FragKind::Line(line) = &f.kind {
+            for piece in &line.pieces {
+                let node = piece.item.style_node;
+                if node != NO_NODE && dom.visibility_hidden(node) {
+                    continue;
+                }
+                let Some(shaped) = &piece.shaped else {
+                    continue;
+                };
+                let mut shaped = shaped.clone();
+                if node != NO_NODE {
+                    (shaped.underline, shaped.strikethrough) = dom.text_decoration(node);
+                }
+                crate::text::append_text_path(
+                    path,
+                    &shaped,
+                    CssPoint::new(f.x + piece.x + piece.paint_x, f.y + piece.y + piece.paint_y),
+                    decoration_style(dom, node),
+                );
+            }
+        }
+        for child in &f.children {
+            if matches!(child.kind, FragKind::Oof(..) | FragKind::Fixed(_))
+                || (child.node != NO_NODE
+                    && dom
+                        .computed_value_resolved(child.node, "position")
+                        .is_some_and(|v| matches!(v.as_str(), "absolute" | "fixed")))
+            {
+                continue;
+            }
+            collect(child, dom, path);
+        }
+    }
+    let mut path = Vec::new();
+    collect(fragment, dom, &mut path);
+    PaintShape::Path(path)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3177,6 +3341,60 @@ fn rounded_shape(rect: CssRect, radii: CornerRadii) -> PaintShape {
     }
 }
 
+/// CSS Images 4 #linear-gradients and CSS Color 4 #color-interpolation-method.
+/// The method and direction can appear in either order, but neither component
+/// may be interleaved. Preserve the selected space and polar hue path.
+fn gradient_interpolation(value: &str) -> Option<(String, GradientInterpolation, bool)> {
+    use color::{ColorSpaceTag as Space, HueDirection as Hue};
+    let lower = value.to_ascii_lowercase();
+    let tokens = split_ws(&lower);
+    let Some(index) = tokens.iter().position(|token| *token == "in") else {
+        return Some((value.trim().into(), GradientInterpolation::default(), false));
+    };
+    let space = match *tokens.get(index + 1)? {
+        "srgb" => Space::Srgb,
+        "srgb-linear" => Space::LinearSrgb,
+        "display-p3" => Space::DisplayP3,
+        "a98-rgb" => Space::A98Rgb,
+        "prophoto-rgb" => Space::ProphotoRgb,
+        "rec2020" => Space::Rec2020,
+        "lab" => Space::Lab,
+        "lch" => Space::Lch,
+        "oklab" => Space::Oklab,
+        "oklch" => Space::Oklch,
+        "hsl" => Space::Hsl,
+        "hwb" => Space::Hwb,
+        "xyz" | "xyz-d65" => Space::XyzD65,
+        "xyz-d50" => Space::XyzD50,
+        _ => return None,
+    };
+    let mut end = index + 2;
+    let mut hue = Hue::Shorter;
+    if let Some(mode) = tokens.get(end).and_then(|token| match *token {
+        "shorter" => Some(Hue::Shorter),
+        "longer" => Some(Hue::Longer),
+        "increasing" => Some(Hue::Increasing),
+        "decreasing" => Some(Hue::Decreasing),
+        _ => None,
+    }) {
+        if !matches!(space, Space::Lch | Space::Oklch | Space::Hsl | Space::Hwb)
+            || tokens.get(end + 1) != Some(&"hue")
+        {
+            return None;
+        }
+        hue = mode;
+        end += 2;
+    }
+    let direction = if index == 0 {
+        tokens[end..].join(" ")
+    } else if end == tokens.len() {
+        tokens[..index].join(" ")
+    } else {
+        return None;
+    };
+    Some((direction, GradientInterpolation { space, hue }, true))
+}
+
 fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
     let lower = value.to_ascii_lowercase();
     let (radial, repeating, body) = if lower.starts_with("linear-gradient(") {
@@ -3195,14 +3413,19 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
         return None;
     }
     let mut angle = PI;
+    let (header, interpolation, explicit_interpolation) = gradient_interpolation(parts[0])?;
     if !radial {
-        if let Some(parsed) = gradient_direction(parts[0]) {
+        if let Some(parsed) = gradient_direction(&header) {
             angle = parsed;
             parts.remove(0);
+        } else if explicit_interpolation {
+            if !header.is_empty() {
+                return None;
+            }
+            parts.remove(0);
         }
-    } else if PaintColor::parse_css(split_ws(parts[0]).first()?).is_none() {
-        // Shape/size/position syntax is retained by the cascade; this first
-        // implementation uses the standards default center/farthest-corner.
+    } else if explicit_interpolation || color::parse_color(split_ws(parts[0]).first()?).is_err() {
+        // Shape/size/position retain the existing default geometry path.
         parts.remove(0);
     }
     let mut stops = parse_stops(&parts)?;
@@ -3217,6 +3440,7 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
             center: CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
             radius: rect.width.hypot(rect.height) / 2.0,
             stops,
+            interpolation,
         })
     } else {
         let center = CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
@@ -3227,6 +3451,7 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
             start: CssPoint::new(center.x - dx * half, center.y - dy * half),
             end: CssPoint::new(center.x + dx * half, center.y + dy * half),
             stops,
+            interpolation,
         })
     }
 }
@@ -3235,7 +3460,7 @@ fn parse_stops(parts: &[&str]) -> Option<Vec<GradientStop>> {
     let mut stops = Vec::new();
     for (index, part) in parts.iter().enumerate() {
         let tokens = split_ws(part);
-        let color = PaintColor::parse_css(tokens.first()?)?;
+        let color = color::parse_color(tokens.first()?).ok()?;
         let offset = tokens
             .get(1)
             .and_then(|v| v.strip_suffix('%'))
@@ -3252,8 +3477,8 @@ fn parse_stops(parts: &[&str]) -> Option<Vec<GradientStop>> {
 
 fn gradient_direction(value: &str) -> Option<f32> {
     let value = value.trim().to_ascii_lowercase();
-    if let Some(deg) = value.strip_suffix("deg") {
-        return deg.trim().parse::<f32>().ok().map(f32::to_radians);
+    if let Some(angle) = angle(&value) {
+        return Some(angle);
     }
     Some(match value.as_str() {
         "to top" => 0.0,
@@ -3562,15 +3787,6 @@ fn blend_mode(value: &str) -> BlendMode {
     }
 }
 
-fn subtree_extent(fragment: &Frag<'_>) -> (f32, f32) {
-    fragment.children.iter().map(subtree_extent).fold(
-        (fragment.x + fragment.w, fragment.y + fragment.h),
-        |(right, bottom), (child_right, child_bottom)| {
-            (right.max(child_right), bottom.max(child_bottom))
-        },
-    )
-}
-
 /// Return a finite rectangle covering all paintable fragment borders. The
 /// fragment clip is applied while finding the extent, so intentionally huge
 /// overflow-hidden probes do not turn an unbounded display-list clip into a
@@ -3734,7 +3950,7 @@ impl PaintColor {
         }
         parse_modern_rgb(value)
             .or_else(|| parse_hsl(value))
-            .or_else(|| parse_display_p3_or_lab(value))
+            .or_else(|| parse_perceptual_or_p3(value))
     }
 
     pub fn is_transparent(self) -> bool {
@@ -3742,14 +3958,15 @@ impl PaintColor {
     }
 }
 
-/// CSS Color 4 #color-function / #lab-colors, using the local 2026-09-06
+/// CSS Color 4 #color-function, #specifying-lab-lch and #specifying-oklab-oklch,
+/// using the local 2026-09-06
 /// CSSWG snapshot (81c27f686901). Display P3 uses D65; Lab uses D50, so the
 /// conversion includes Bradford white-point adaptation. Keep source components
 /// unclipped until actual-value conversion to our sRGB paint surface.
-fn parse_display_p3_or_lab(value: &str) -> Option<PaintColor> {
-    use color::ColorSpaceTag::{DisplayP3, Lab};
+fn parse_perceptual_or_p3(value: &str) -> Option<PaintColor> {
+    use color::ColorSpaceTag::{DisplayP3, Lab, Lch, Oklab, Oklch};
     let origin = color::parse_color(value).ok()?;
-    if !matches!(origin.cs, DisplayP3 | Lab)
+    if !matches!(origin.cs, DisplayP3 | Lab | Lch | Oklab | Oklch)
         || !origin
             .components
             .iter()
@@ -3758,11 +3975,16 @@ fn parse_display_p3_or_lab(value: &str) -> Option<PaintColor> {
         return None;
     }
     let alpha = origin.components[3];
-    // Lab's parsed lightness is clamped to [0, 100]; its endpoints display
-    // as black/white regardless of the other coordinates (CSS Color 4 §9.4).
-    let rgba = if origin.cs == Lab && origin.components[0] <= 0.0 {
+    // Perceptual lightness endpoints display as black/white regardless of
+    // chroma. Lab/LCH use [0,100], Oklab/OkLCh [0,1] (CSS Color 4 §9).
+    let lightness_max = match origin.cs {
+        Lab | Lch => Some(100.0),
+        Oklab | Oklch => Some(1.0),
+        _ => None,
+    };
+    let rgba = if lightness_max.is_some() && origin.components[0] <= 0.0 {
         [0.0, 0.0, 0.0, alpha]
-    } else if origin.cs == Lab && origin.components[0] >= 100.0 {
+    } else if lightness_max.is_some_and(|max| origin.components[0] >= max) {
         [1.0, 1.0, 1.0, alpha]
     } else {
         gamut_map_to_srgb(origin)?
@@ -3934,6 +4156,241 @@ fn alpha_byte(value: &str) -> Option<u8> {
 mod tests {
     use super::*;
 
+    fn render_fixture(html: &str) -> (Dom, crate::layout2::GraphicalLayout) {
+        let mut dom = Dom::parse_document(html);
+        dom.set_render_clickables(Default::default(), true);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        (dom, layout)
+    }
+
+    #[test]
+    fn gradient_interpolation_syntax_preserves_color_space_hue_and_alpha() {
+        use color::{ColorSpaceTag as Space, HueDirection as Hue};
+        let rect = CssRect::new(0., 0., 100., 100.);
+        for header in ["to bottom in oklab", "in oklab to bottom", "in oklab"] {
+            let brush = parse_gradient(&format!("linear-gradient({header},rgba(22,22,22,.9) 0%,rgba(22,22,22,.5) 40%,transparent 97%)"),rect).unwrap();
+            let PaintBrush::LinearGradient {
+                interpolation,
+                start,
+                end,
+                stops,
+            } = brush
+            else {
+                panic!()
+            };
+            assert_eq!(interpolation.space, Space::Oklab);
+            assert!(end.y > start.y);
+            assert_eq!(stops.len(), 3);
+            assert_eq!(
+                stops[0].color,
+                color::parse_color("rgba(22,22,22,.9)").unwrap()
+            );
+        }
+        let PaintBrush::LinearGradient {
+            interpolation,
+            stops,
+            ..
+        } = parse_gradient(
+            "linear-gradient(in oklch longer hue to right,oklch(.6 .4 20),oklch(.7 none 310 / .5))",
+            rect,
+        )
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(interpolation.space, Space::Oklch);
+        assert_eq!(interpolation.hue, Hue::Longer);
+        assert_eq!(
+            stops[1].color,
+            color::parse_color("oklch(.7 none 310 / .5)").unwrap()
+        );
+        for invalid in [
+            "in unknown",
+            "in oklab longer hue",
+            "to in oklab bottom",
+            "in oklch hue",
+            "in oklch longer",
+        ] {
+            assert!(
+                parse_gradient(&format!("linear-gradient({invalid},red,blue)"), rect).is_none(),
+                "{invalid}"
+            );
+        }
+        for (method, expected) in [
+            ("in srgb", 128u8),
+            ("in srgb-linear", 188),
+            ("in oklab", 99),
+        ] {
+            let (_, layout) = render_fixture(&format!(
+                "<style>body{{margin:0}}div{{width:100px;height:20px;background-image:linear-gradient(to right {method},black,white)}}</style><div></div>"
+            ));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let actual = frame.pixels[(10 * 800 + 50) * 4];
+            assert!(
+                actual.abs_diff(expected) <= 3,
+                "{method}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_list_markers_follow_their_scrollport() {
+        let (dom, layout) = render_fixture(
+            r#"<style>body{margin:0} #panel{height:40px;overflow:auto} li{height:30px}</style><ol id=panel><li>one</li><li>two</li><li>three</li></ol>"#,
+        );
+        let panel = dom.get_by_id("panel").unwrap();
+        let mut scrolls = Vec::new();
+        let mut markers = 0;
+        for command in &layout.paint.primitives {
+            match command {
+                DisplayCommand::BeginScroll(node) => scrolls.push(*node),
+                DisplayCommand::EndScroll => {
+                    scrolls.pop();
+                }
+                DisplayCommand::GlyphRun { shaped, node, .. }
+                    if *node == NO_NODE && matches!(shaped.text.trim(), "1." | "2." | "3.") =>
+                {
+                    markers += 1;
+                    assert!(
+                        scrolls.contains(&panel),
+                        "marker must move and clip with its list item"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(markers, 3);
+    }
+
+    #[test]
+    fn text_clipped_background_paints_glyphs_not_a_rectangle() {
+        for background in [
+            "background:linear-gradient(red,blue)",
+            "background-color:red",
+        ] {
+            let (_, layout) = render_fixture(&format!(
+                r#"<style>body{{margin:0;background:white}} #text{{font:32px sans-serif;width:200px;height:80px;{background};background-clip:text;color:transparent}}</style><div id=text>Thinking <span>test</span></div>"#
+            ));
+            assert!(layout.paint.primitives.iter().any(|p| matches!(p,DisplayCommand::Fill{shape:PaintShape::Path(path),..} if !path.is_empty())));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let pixels = &frame.pixels;
+            let at = |x: usize, y: usize| &pixels[(y * 800 + x) * 4..(y * 800 + x) * 4 + 3];
+            assert_eq!(
+                at(190, 70),
+                [255, 255, 255],
+                "background outside glyphs must stay white"
+            );
+            assert!(
+                (0..40).any(|y| (0..190).any(|x| at(x, y) != [255, 255, 255])),
+                "glyph background must remain visible with transparent text"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_scroll_overflow_does_not_inflate_the_page_or_parent_panel() {
+        let (dom, layout) = render_fixture(
+            r#"<style>body{margin:0} #outer{height:200px;overflow:auto} #inner{height:100px;overflow:auto;overscroll-behavior:contain} #tall{height:2000px} #after{height:400px}</style><div id=outer><div id=inner><div id=tall></div></div><div id=after></div></div>"#,
+        );
+        assert_eq!(layout.paint.height, 600.);
+        let get = |id| {
+            layout
+                .paint
+                .scroll_containers
+                .iter()
+                .find(|c| c.node == dom.get_by_id(id).unwrap())
+                .unwrap()
+        };
+        assert_eq!(get("inner").content.height, 2000.);
+        assert_eq!(get("outer").content.height, 500.);
+        assert_eq!(get("inner").ancestors, vec![get("outer").node]);
+        assert_eq!(get("inner").contain_overscroll, [true, true]);
+        let (_, _, scrolling) = crate::layout2::measure_boxes_css(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(scrolling[&get("inner").node].height, 2000.);
+        assert_eq!(scrolling[&get("outer").node].height, 500.);
+    }
+
+    #[test]
+    fn positioned_overflow_bypasses_intervening_scrollports() {
+        for (position, inner_height, document_height) in
+            [("static", 100., 1100.), ("relative", 1100., 600.)]
+        {
+            let (dom, layout) = render_fixture(&format!(
+                r#"<style>
+                body{{margin:0}} #panel{{height:100px;overflow:auto;position:{position}}}
+                #abs{{position:absolute;top:1000px;height:100px;width:10px}}
+                </style><div id=panel><div id=abs></div></div>"#
+            ));
+            let panel = dom.get_by_id("panel").unwrap();
+            assert_eq!(
+                layout
+                    .paint
+                    .scroll_containers
+                    .iter()
+                    .find(|c| c.node == panel)
+                    .unwrap()
+                    .content
+                    .height,
+                inner_height
+            );
+            assert_eq!(layout.paint.height, document_height);
+        }
+        let (dom, layout) = render_fixture(
+            r#"<style>body{margin:0} #panel{height:100px;overflow:auto;border:10px solid;padding:5px} #child{height:200px}</style><div id=panel><div id=child></div></div>"#,
+        );
+        let panel = dom.get_by_id("panel").unwrap();
+        let container = layout
+            .paint
+            .scroll_containers
+            .iter()
+            .find(|c| c.node == panel)
+            .unwrap();
+        assert_eq!(container.viewport.height, 110.);
+        assert_eq!(container.content.height, 210.);
+    }
+
+    #[test]
+    fn viewport_overflow_propagation_preserves_programmatic_area() {
+        for (root, body, expected) in [
+            ("overflow:hidden", "", [true, true]),
+            ("", "overflow:hidden", [true, true]),
+            ("overflow-x:hidden", "", [true, false]),
+            ("overflow:auto", "overflow:hidden", [false, false]),
+            ("contain:layout", "overflow:hidden", [false, false]),
+        ] {
+            let (dom, layout) = render_fixture(&format!(
+                "<html style='{root}'><body style='margin:0;{body}'><div style='height:1200px;width:1600px'></div></body></html>"
+            ));
+            assert_eq!(viewport_overflow_disabled(&dom), expected, "{root}; {body}");
+            let user = layout.paint.user_scroll_size.unwrap();
+            if expected[0] {
+                assert_eq!(user.width, 800.);
+            }
+            if expected[1] {
+                assert_eq!(user.height, 600.);
+                assert_eq!(layout.paint.height, 1200.);
+            }
+        }
+    }
+
     #[test]
     fn css_color4_display_p3_and_lab_convert_to_srgb() {
         for (source, expected) in [
@@ -3968,6 +4425,159 @@ mod tests {
             "lab(50 0 0) trailing",
         ] {
             assert_eq!(PaintColor::parse_css(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn css_color4_oklab_oklch_and_lch_convert_to_srgb() {
+        // CSS Color 4 §9 examples, neutral colors, endpoint clamping and
+        // missing components. Alpha does not participate in gamut mapping.
+        for (source, expected) in [
+            ("oklch(50% 0 0)", [99, 99, 99, 255]),
+            ("oklab(.5 0 0 / 50%)", [99, 99, 99, 128]),
+            ("oklch(40.101% 0.12332 21.555)", [125, 35, 41, 255]),
+            ("oklab(40.101% 0.1147 0.0453)", [125, 35, 41, 255]),
+            ("lch(29.2345% 44.2 27)", [125, 35, 41, 255]),
+            ("OKLCH(50% -1 180deg / 25%)", [99, 99, 99, 64]),
+            ("oklch(50% none none)", [99, 99, 99, 255]),
+            ("oklch(110% .4 40 / .5)", [255, 255, 255, 128]),
+            ("oklab(-1 .3 .4)", [0, 0, 0, 255]),
+            ("lch(100% 200 30 / none)", [255, 255, 255, 0]),
+        ] {
+            let Some(PaintColor::Rgba(r, g, b, a)) = PaintColor::parse_css(source) else {
+                panic!("failed to parse {source}");
+            };
+            for (actual, expected) in [r, g, b, a].into_iter().zip(expected) {
+                assert!(
+                    actual.abs_diff(expected) <= 1,
+                    "{source}: {:?}",
+                    [r, g, b, a]
+                );
+            }
+        }
+        for invalid in [
+            "oklch(50%, 0, 0)",
+            "oklab(50% 0)",
+            "lch(50% 0 bad)",
+            "oklch(50% 0 0 / bad)",
+            "oklab(.5 0 0) trailing",
+        ] {
+            assert_eq!(PaintColor::parse_css(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn block_button_auto_width_is_fit_content_and_explicit_width_is_preserved() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            body{margin:0} button{display:block;padding:2px;border:0}
+            button > div{display:flex;width:100%;gap:8px;align-items:center}
+            svg{display:block;width:16px;height:16px;vertical-align:middle}
+            #wide{width:300px}
+            </style><button id=auto><div><svg viewBox='0 0 16 16'></svg><span>Thinking...</span></div></button>
+            <button id=wide>Explicit</button>"#,
+        );
+        dom.set_render_clickables(Default::default(), true);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let width = layout.boxes[&dom.get_by_id("auto").unwrap()].width;
+        assert!(
+            width > 80. && width < 180.,
+            "automatic button width: {width}"
+        );
+        assert_eq!(layout.boxes[&dom.get_by_id("wide").unwrap()].width, 300.);
+    }
+
+    #[test]
+    fn block_svg_pixels_stay_in_the_content_box_despite_vertical_align() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            body{margin:0} button{display:block;width:32px;height:32px;padding:6px;border:0;box-sizing:border-box}
+            svg{display:block;width:20px;height:20px;vertical-align:middle}
+            </style><button><svg id=icon viewBox='0 0 20 20'><path d='M0 0H20V20H0Z'/></svg></button>"#,
+        );
+        dom.set_render_clickables(Default::default(), true);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let node = dom.get_by_id("icon").unwrap();
+        let image = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|p| match p {
+                DisplayCommand::Image { node: n, rect, .. } if *n == node => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(image, CssRect::new(6., 6., 20., 20.));
+        assert_eq!(layout.boxes[&node].top, 6.);
+    }
+
+    #[test]
+    fn inline_middle_aligns_image_center_above_the_baseline() {
+        let dom = Dom::parse_document(
+            r#"<style>body{margin:0;font:20px sans-serif} img{width:16px;height:16px;vertical-align:middle}</style>
+            <div>Text<img id=icon src='data:image/svg+xml,%3Csvg%20viewBox=%220%200%2016%2016%22/%3E'></div>"#,
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let node = dom.get_by_id("icon").unwrap();
+        let rect = layout.boxes[&node];
+        let baseline = layout.paint.lines[0].baseline;
+        let half_x = crate::text::x_height(&crate::text::TextStyle {
+            size: 20.,
+            ..Default::default()
+        }) / 2.;
+        assert!(((rect.top + rect.height / 2.) as f32 - (baseline - half_x)).abs() < 0.01);
+    }
+
+    #[test]
+    fn perceptual_palette_colors_reach_inherited_text_and_controls() {
+        let dom = Dom::parse_document(
+            r#"<html class=dark><style>
+            @layer theme { :root { --light: oklch(94% 0 0); --surface: oklch(20% 0 0); } }
+            @layer base { a,button { color: inherit } }
+            @layer utilities { .dark .surface { color:var(--light); background-color:var(--surface) } }
+            @supports (color:oklch(50% 0 0)) { #supported { color:oklab(.5 0 0) } }
+            </style><body><div class=surface><p id=text>Readable</p><a id=link href=#>Link</a>
+            <button id=button>Submit</button><span id=supported>Supported</span></div></body></html>"#,
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://colors.example/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &crate::layout2::ControlMap::new(),
+            &ImageSizes::new(),
+        );
+        for id in ["text", "link", "button", "supported"] {
+            let node = dom.get_by_id(id).unwrap();
+            let expected = PaintColor::parse_css(if id == "supported" {
+                "oklab(.5 0 0)"
+            } else {
+                "oklch(94% 0 0)"
+            })
+            .unwrap();
+            assert!(layout.paint.primitives.iter().any(|command| matches!(command,
+                DisplayCommand::GlyphRun { node: painted, color, .. } if *painted == node && *color == expected)), "missing authored color on {id}");
         }
     }
 
