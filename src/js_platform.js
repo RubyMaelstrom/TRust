@@ -10028,37 +10028,75 @@
         if (target[1] === "file:") return current[5] === target[5];
         return current[5] === target[5] && current[6] === target[6];
     };
-    let historyObject;
-    const updateHistoryState = (s, u, replace) => {
+    // HTML #shared-history-push/replace-state-steps starts with THIS History's
+    // relevant global, not the Realm that created the operation. A pristine
+    // method borrowed from an iframe must still update its actual receiver,
+    // even after the iframe supplying that method has been removed. Web IDL
+    // #dfn-create-operation-function checks the receiver before conversions.
+    const historyBinding = g.__history_binding;
+    delete g.__history_binding;
+    const historySlots = historyBinding("slots", new WeakMap());
+    const historyGet = WeakMap.prototype.get.bind(historySlots);
+    const historySet = WeakMap.prototype.set.bind(historySlots);
+    const historyRecord = (receiver) => {
+        const record = historyGet(receiver);
+        if (!record) throw new TypeError("Illegal History invocation");
+        return record;
+    };
+    const activeHistoryRecord = (receiver) => {
+        const record = historyRecord(receiver);
+        if (!historyBinding("active", record.context))
+            throw new DOMException("Document is not fully active", "SecurityError");
+        return record;
+    };
+    const updateHistoryState = (receiver, s, unused, u, replace, count) => {
+            const record = historyRecord(receiver);
+            if (count < 2) throw new TypeError("History state updates require two arguments");
+            domString(unused);
+            u = u == null ? null : domString(u);
+            activeHistoryRecord(receiver);
             // StructuredSerializeForStorage/deserialize gives history.state a
             // detached value and propagates DataCloneError for unsupported
-            // input. `structuredClone` is installed by the time author code
-            // can invoke this method.
-            const state = g.structuredClone(s);
-            let parsed = __url_parse(locState.href, null);
-            if (u !== undefined && u !== null && String(u) !== "") {
-                parsed = __url_parse(String(u), locState.href);
-                const current = __url_parse(locState.href, null);
-                if (!parsed || !canRewriteHistoryURL(current, parsed)) {
+            // input. Deserialize in the receiver's Realm as required by HTML
+            // #restore-the-history-object-state, including borrowed methods.
+            const state = record.clone(s);
+            const current = record.location;
+            let parsed = __url_parse(current.href, null);
+            if (u !== null && u !== "") {
+                parsed = __url_parse(u, record.baseURL());
+                const currentURL = __url_parse(current.href, null);
+                if (!parsed || !canRewriteHistoryURL(currentURL, parsed)) {
                     throw new DOMException(
-                        "History state URL cannot be created in a document with origin '" + locState.origin + "'.",
+                        "History state URL cannot be created in a document with origin '" + current.origin + "'.",
                         "SecurityError");
                 }
             }
             // The current URL is already valid; this is only a defensive guard
             // for synthetic test realms whose configured URL failed parsing.
             if (!parsed) throw new DOMException("Invalid history state URL.", "SecurityError");
-            historyObject.state = state;
-            if (!replace) historyObject.length += 1;
-            setLocParts(parsed);
-            trust.historyUpdates.push({ url: parsed[0], replace: !!replace });
+            record.state = state;
+            if (!replace) record.length += 1;
+            record.commit(parsed, replace);
     };
-    historyObject = {
-        length: 1, state: null, scrollRestoration: "auto",
-        pushState(s, _t, u) { updateHistoryState(s, u, false); },
-        replaceState(s, _t, u) { updateHistoryState(s, u, true); },
+    const historyObject = {
+        get length() { return activeHistoryRecord(this).length; },
+        get state() { return activeHistoryRecord(this).state; },
+        scrollRestoration: "auto",
+        pushState(s, unused, u) { updateHistoryState(this, s, unused, u, false, arguments.length); },
+        replaceState(s, unused, u) { updateHistoryState(this, s, unused, u, true, arguments.length); },
         back() {}, forward() {}, go() {},
     };
+    historySet(historyObject, {
+        context: Number(cfg.hostSettingsContext) || 0,
+        location: locState, length: 1, state: null,
+        baseURL() { return documentBaseURL(realmRootFrame); },
+        clone(value) { return messageDeserialize(messageSerialize(value, true)); },
+        commit(parsed, replace) {
+            setLocParts(parsed);
+            if (realmRootFrame) realmRootFrame.__frameUrl = parsed[0];
+            trust.historyUpdates.push({ url: parsed[0], replace: !!replace });
+        },
+    });
     g.history = historyObject;
     // getComputedStyle is now cascade-backed (read-only): __dom_computed
     // returns the inherited / UA-defaulted value for tracked properties and

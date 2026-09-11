@@ -9,6 +9,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__callback_api", 3),
     ("__invoke_callback", 4),
     ("__permissions_binding", 2),
+    ("__history_binding", 2),
     ("__navigator_binding", 1),
     ("__performance_binding", 1),
     ("__element_slots", 1),
