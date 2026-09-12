@@ -130,7 +130,7 @@ pub(crate) enum FragKind<'t> {
     Block,
     /// A table cell with row/row-group background layers underneath it.
     /// Relative positioning rectangles survive every later fragment offset.
-    TableCell(Box<Vec<(NodeId, [f32; 4])>>),
+    TableCell(Box<[(NodeId, [f32; 4])]>),
     /// A line box with retained typographic metrics in CSS pixels.
     Line(LineFrag),
     /// An out-of-flow box's placeholder, sitting at its STATIC POSITION

@@ -234,7 +234,7 @@ mod tests {
         let pixels = frame.pixels.as_chunks::<4>().0;
         assert_eq!(pixels[240 * 90 + 230], [17, 17, 16, 255]);
         assert!(
-            pixels.iter().any(|pixel| *pixel == [255, 255, 255, 255]),
+            pixels.contains(&[255, 255, 255, 255]),
             "white glyphs must paint over the dark canvas"
         );
     }

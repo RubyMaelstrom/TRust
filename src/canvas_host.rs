@@ -575,8 +575,10 @@ fn rgba_bitmap(width: u32, height: u32, rgba: &[u8]) -> Option<sk::Pixmap> {
     let mut bitmap = sk::Pixmap::new(width, height)?;
     for (out, pixel) in bitmap
         .data_mut()
-        .chunks_exact_mut(4)
-        .zip(rgba.chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(rgba.as_chunks::<4>().0)
     {
         for channel in 0..3 {
             out[channel] = ((pixel[channel] as u32 * pixel[3] as u32 + 127) / 255) as u8;

@@ -95,8 +95,7 @@ impl LayoutFragments {
                     }
                 }
                 flow::FragKind::TableCell(layers) => {
-                    bytes += std::mem::size_of_val(layers.as_ref())
-                        + layers.capacity() * std::mem::size_of::<(NodeId, [f32; 4])>();
+                    bytes += std::mem::size_of_val(layers.as_ref());
                 }
                 _ => {}
             }

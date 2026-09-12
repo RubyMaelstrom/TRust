@@ -9113,13 +9113,14 @@ pub(crate) fn split_top_level_ws(input: &str) -> Vec<&str> {
                 iter.next();
                 digits += 1;
             }
-            if digits == 0 {
-                iter.next();
-            } else if iter
-                .peek()
-                .is_some_and(|(_, c)| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
-                && iter.next().is_some_and(|(_, c)| c == '\r')
-                && iter.peek().is_some_and(|(_, c)| *c == '\n')
+            // CSS Syntax 3 §4.3.7 consumes one whitespace after a hex
+            // escape; §3.3 treats CRLF as one preprocessed newline.
+            if digits == 0
+                || iter
+                    .peek()
+                    .is_some_and(|(_, c)| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+                    && iter.next().is_some_and(|(_, c)| c == '\r')
+                    && iter.peek().is_some_and(|(_, c)| *c == '\n')
             {
                 iter.next();
             }

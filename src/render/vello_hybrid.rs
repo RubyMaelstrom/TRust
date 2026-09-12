@@ -1512,7 +1512,9 @@ mod tests {
                     .expect("bitmap glyph stays on Hybrid");
                 let colored = frame
                     .pixels
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .filter(|p| {
                         p[3] > 0 && p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 50
                     })

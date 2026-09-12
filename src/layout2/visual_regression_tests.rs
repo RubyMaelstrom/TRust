@@ -132,12 +132,16 @@ fn carousel_inline_paint_and_hits_survive_retained_scroll_and_hover() {
     let first = headless::render_paint(&page, viewport).unwrap();
     let red = first
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] > 200 && p[1] < 20 && p[2] < 20)
         .count();
     let blue = first
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[2] > 100 && p[0] < 100 && p[1] < 100)
         .count();
     assert!(
@@ -228,7 +232,9 @@ fn carousel_inline_clips_follow_nested_scroll_coordinates() {
             assert!(
                 first
                     .pixels
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .filter(|p| p[2] > 100 && p[0] < 100 && p[1] < 100)
                     .count()
                     > 30
@@ -329,7 +335,9 @@ fn bitmap_color_emoji_glyphs_have_visible_pixels() {
         .unwrap()
         .pixels;
     let colored = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[3] > 128 && p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]) > 50)
         .count();
     assert!(

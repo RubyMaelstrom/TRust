@@ -3279,7 +3279,15 @@ fn border_radii(dom: &Dom, style: PaintStyle, rect: CssRect) -> CornerRadii {
         // A single percentage is copied as a value, not as its used horizontal
         // length. The vertical percentage basis is the border-box height.
         let y = radius(parts.get(1).unwrap_or(first), rect.height).unwrap_or(0.0);
-        corners[index] = (x.max(0.0).min(f32::MAX), y.max(0.0).min(f32::MAX));
+        // CSS Values 4 #calc-ieee censors NaN to zero before range clamping.
+        let clamp_radius = |radius: f32| {
+            if radius.is_nan() {
+                0.0
+            } else {
+                radius.clamp(0.0, f32::MAX)
+            }
+        };
+        corners[index] = (clamp_radius(x), clamp_radius(y));
     }
     // CSS Backgrounds §5.5: proportionally reduce overlapping radii. CSS
     // Values 4 permits calc(infinity * 1px), clamped to our finite f32 limit.

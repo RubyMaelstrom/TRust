@@ -440,10 +440,7 @@ fn fragment_bytes(fragment: &Frag<'_>) -> usize {
                     .map(super::inline::Piece::retained_bytes)
                     .sum::<usize>()
         }
-        FragKind::TableCell(layers) => {
-            size_of::<Vec<(NodeId, [f32; 4])>>()
-                + layers.capacity() * size_of::<(NodeId, [f32; 4])>()
-        }
+        FragKind::TableCell(layers) => std::mem::size_of_val(layers.as_ref()),
         _ => 0,
     };
     own + fragment.children.capacity() * size_of::<Frag<'_>>()
