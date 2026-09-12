@@ -3623,20 +3623,19 @@ mod tests {
         // iframe content box and the iframe remains a replaced element. Its
         // document must not become an unconstrained parent-document sibling.
         let mut dom = Dom::parse_document(
-            r#"<body style="margin:0"><div style="width:400px">
+            r#"<body style="margin:0;background:white"><div style="width:400px">
                <iframe id=f style="width:50%;height:74px;border:0"></iframe><span>after</span>
                </div></body>"#,
         );
         let frame = dom.get_by_id("f").unwrap();
         dom.install_frame_document(
             frame,
-            r#"<body style="margin:0"><div style="position:relative;width:300px;height:74px">
+            r#"<body style="margin:0"><div style="position:relative;width:300px;height:74px;background:lime">
                <span id=inside style="position:absolute;right:0;bottom:0">nested viewport content</span>
                </div></body>"#,
             "https://frame.test/widget",
         )
         .unwrap();
-        let inside = dom.get_by_id("inside").unwrap();
         let base = Url::parse("https://page.test/").unwrap();
         let layout = lay_out_graphical(
             &dom,
@@ -3649,19 +3648,25 @@ mod tests {
         let geometry = layout.boxes.get(&frame).expect("iframe geometry");
         assert!((geometry.width - 200.0).abs() < 0.1, "{geometry:?}");
         assert!((geometry.height - 74.0).abs() < 0.1, "{geometry:?}");
-        let clip = layout
-            .paint
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                crate::render::DisplayCommand::GlyphRun {
-                    node, shaped, clip, ..
-                } if *node == inside && shaped.text.contains("nested") => *clip,
-                _ => None,
-            });
-        let clip = clip.expect("nested document viewport clip");
-        assert!((clip.width - 200.0).abs() < 0.1, "{clip:?}");
-        assert!((clip.height - 74.0).abs() < 0.1, "{clip:?}");
+        // Check the composited viewport, rather than requiring a clip baked
+        // into each glyph (which would incorrectly move when it scrolls).
+        let raster = crate::render::headless::render_paint(
+            &layout.paint,
+            crate::core::CssSize::new(400., 300.),
+        )
+        .unwrap();
+        let at = |x: usize, y: usize| &raster.pixels[(y * 400 + x) * 4..(y * 400 + x) * 4 + 3];
+        assert_eq!(at(190, 10), [0, 255, 0]);
+        assert_eq!(
+            at(210, 10),
+            [255, 255, 255],
+            "child canvas must end at the viewport edge"
+        );
+        assert_eq!(
+            at(190, 85),
+            [255, 255, 255],
+            "child canvas must end at the viewport bottom"
+        );
     }
 
     #[test]

@@ -25,7 +25,9 @@ use super::ImageSizes;
 use super::NO_NODE;
 use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
-use super::overflow::{ScrollAreas, viewport_overflow_disabled, viewport_overflow_source};
+use super::overflow::{
+    ScrollAreas, overflow_axes, viewport_overflow_disabled, viewport_overflow_source,
+};
 use super::style::{Outline, OutlineStyle, Pos, outline_of};
 use super::value::{Len, Vp};
 
@@ -102,6 +104,10 @@ struct Builder<'a, 't> {
     /// Overflow clips round the padding edge, independently of whether the
     /// box exposes a user scrolling mechanism (hidden/clip do not).
     rounded_overflow_clips: HashMap<NodeId, PaintShape>,
+    /// Keep rectangular overflow clips attached to their generating boxes.
+    /// A flattened fragment clip loses which side of a scroll transform each
+    /// edge belongs on, especially at a child document's viewport boundary.
+    overflow_clips: HashMap<NodeId, Clip>,
     clip_ancestry: HashMap<NodeId, ClipAncestry>,
     patch_boundaries: Vec<super::GraphicalPatchBoundary>,
     boundaries: Vec<super::GraphicalBoundary>,
@@ -154,6 +160,7 @@ impl<'a, 't> Builder<'a, 't> {
             legacy_clips: HashMap::new(),
             replaced_border_boxes: HashMap::new(),
             rounded_overflow_clips: HashMap::new(),
+            overflow_clips: HashMap::new(),
             clip_ancestry: HashMap::new(),
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
@@ -189,6 +196,18 @@ impl<'a, 't> Builder<'a, 't> {
         for index in 0..this.scroll_containers.len() {
             let node = this.scroll_containers[index].node;
             this.scroll_containers[index].ancestors = this.scroll_ancestor_nodes(node);
+        }
+        // Unbounded clip axes must also cover content retained outside an
+        // iframe's initial viewport, ready to be scrolled into view.
+        for container in &this.scroll_containers {
+            this.clip_extent.width = this
+                .clip_extent
+                .width
+                .max(container.viewport.x + container.content.width - this.clip_extent.x);
+            this.clip_extent.height = this
+                .clip_extent
+                .height
+                .max(container.viewport.y + container.content.height - this.clip_extent.y);
         }
         this
     }
@@ -312,7 +331,15 @@ impl<'a, 't> Builder<'a, 't> {
     }
 
     fn clip_chain(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
-        let mut clip = hard.map(|clip| self.clip_rect(clip));
+        // CSS Overflow 3 #scrolling / HTML #the-page: a scrollport clips in
+        // its own coordinate system, before translating the child canvas.
+        // `Frag::clip` flattens those edges for terminal painting/geometry;
+        // applying it again inside BeginScroll permanently hides content
+        // beyond the initial iframe viewport. The scoped overflow chain below
+        // retains each edge at its owner, including clips within the content.
+        let mut clip = hard
+            .filter(|_| !self.scroll_nodes.iter().any(|(_, scroll)| *scroll))
+            .map(|clip| self.clip_rect(clip));
         let mut current = (node != NO_NODE).then_some(node);
         while let Some(id) = current {
             if let Some(rect) = self.legacy_clips.get(&id) {
@@ -328,13 +355,17 @@ impl<'a, 't> Builder<'a, 't> {
             && matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_))
         {
             let node = fragment.node;
-            if fragment.paint.cb_abs || fragment.paint.cb_fixed || self.dom.is_popover_showing(node)
+            let nested_viewport = matches!(self.dom.tag_name(node), Some("iframe" | "frame"));
+            if fragment.paint.cb_abs
+                || fragment.paint.cb_fixed
+                || nested_viewport
+                || self.dom.is_popover_showing(node)
             {
                 self.clip_ancestry.insert(
                     node,
                     ClipAncestry {
                         position: Pos::of(self.dom, node),
-                        absolute_cb: fragment.paint.cb_abs,
+                        absolute_cb: fragment.paint.cb_abs || nested_viewport,
                         fixed_cb: fragment.paint.cb_fixed,
                         top_layer: self.dom.is_popover_showing(node),
                     },
@@ -342,6 +373,9 @@ impl<'a, 't> Builder<'a, 't> {
             }
             if let Some(shape) = rounded_overflow_clip(self.dom, fragment) {
                 self.rounded_overflow_clips.insert(node, shape);
+            }
+            if let Some(clip) = rectangular_overflow_clip(self.dom, fragment) {
+                self.overflow_clips.insert(node, clip);
             }
         }
         if fragment.node != NO_NODE
@@ -467,9 +501,15 @@ impl<'a, 't> Builder<'a, 't> {
                     .scroll_containers
                     .iter()
                     .find(|container| container.node == id);
-                let shape =
-                    self.rounded_overflow_clips.get(&id).cloned().or_else(|| {
-                        container.map(|container| PaintShape::Rect(container.viewport))
+                let shape = self
+                    .rounded_overflow_clips
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| container.map(|container| PaintShape::Rect(container.viewport)))
+                    .or_else(|| {
+                        self.overflow_clips
+                            .get(&id)
+                            .map(|clip| PaintShape::Rect(self.clip_rect(*clip)))
                     });
                 if let Some(shape) = shape {
                     chain.push((id, shape, container.is_some()));
@@ -3219,6 +3259,35 @@ fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
     stroke
 }
 
+fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag<'_>) -> Option<Clip> {
+    if matches!(
+        dom.tag_name(fragment.node),
+        Some("html" | "body" | "iframe" | "frame")
+    ) {
+        return None;
+    }
+    let [x, y] =
+        overflow_axes(dom, fragment.node).map(|value| matches!(value.as_str(), "hidden" | "clip"));
+    if !x && !y {
+        return None;
+    }
+    let padding = padding_box(fragment);
+    Some(Clip {
+        x0: if x { padding.x } else { f32::NEG_INFINITY },
+        x1: if x {
+            padding.x + padding.width
+        } else {
+            f32::INFINITY
+        },
+        y0: if y { padding.y } else { f32::NEG_INFINITY },
+        y1: if y {
+            padding.y + padding.height
+        } else {
+            f32::INFINITY
+        },
+    })
+}
+
 fn rounded_overflow_clip(dom: &Dom, fragment: &Frag<'_>) -> Option<PaintShape> {
     if matches!(dom.tag_name(fragment.node), Some("html" | "body")) {
         return None;
@@ -4176,6 +4245,174 @@ mod tests {
             &Default::default(),
         );
         (dom, layout)
+    }
+
+    #[test]
+    fn iframe_scrolling_reveals_offscreen_text_and_links() {
+        // HTML #the-page and CSS Overflow 3 #scrolling: the child canvas
+        // moves through the iframe's stationary content-box viewport.
+        for overflow in ["", "overflow:auto", "overflow:scroll"] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<body style="margin:0;background:white"><iframe id=f
+                    style="position:absolute;left:20px;top:20px;width:160px;height:80px;
+                    border:3px solid blue;padding:7px;{overflow}"></iframe>"#
+            ));
+            let frame = dom.get_by_id("f").unwrap();
+            dom.install_frame_document(
+                frame,
+                r#"<body style="margin:0;background:white;font:24px/32px monospace">
+                    <div style="height:160px">start</div>
+                    <div style="height:40px;background:lime"><a id=tail href="/end"
+                        style="color:black">END OF POST</a></div></body>"#,
+                "https://frame.test/",
+            )
+            .unwrap();
+            let tail = dom.get_by_id("tail").unwrap();
+            let mut layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://page.test/").unwrap(),
+                crate::layout2::Viewport::new(320., 240.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let viewport = CssSize::new(320., 240.);
+            let port = layout
+                .paint
+                .scroll_containers
+                .iter()
+                .find(|s| s.node == frame)
+                .unwrap()
+                .viewport;
+            assert_eq!(port, CssRect::new(30., 30., 160., 80.));
+            let offset = 120.;
+            for scrolled in [false, true] {
+                layout
+                    .paint
+                    .scroll_containers
+                    .iter_mut()
+                    .find(|s| s.node == frame)
+                    .unwrap()
+                    .offset
+                    .y = if scrolled { offset } else { 0. };
+                let pixels = crate::render::headless::render_paint(&layout.paint, viewport)
+                    .unwrap()
+                    .pixels;
+                let at = |x: usize, y: usize| &pixels[(y * 320 + x) * 4..(y * 320 + x) * 4 + 3];
+                let has_text = (72..101).any(|y| {
+                    (31..185).any(|x| {
+                        let rgb = at(x, y);
+                        rgb.iter().all(|channel| *channel < 100)
+                    })
+                });
+                assert_eq!(
+                    has_text, scrolled,
+                    "{overflow}: lower text, scrolled={scrolled}"
+                );
+                assert_eq!(
+                    at(188, 105),
+                    if scrolled {
+                        [0, 255, 0]
+                    } else {
+                        [255, 255, 255]
+                    }
+                );
+                assert_eq!(
+                    at(195, 100),
+                    [255, 255, 255],
+                    "content must stay inside the frame padding"
+                );
+                assert_eq!(
+                    at(100, 125),
+                    [255, 255, 255],
+                    "content must stay above the frame bottom"
+                );
+                let hits = crate::render::page_element_hits_at(
+                    &layout.paint,
+                    viewport,
+                    CssPoint::default(),
+                    CssPoint::new(40., 80.),
+                );
+                assert_eq!(
+                    hits.iter().any(|hit| hit.node == tail),
+                    scrolled,
+                    "the newly visible link must be clickable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iframe_scrolling_preserves_ancestor_and_descendant_clips() {
+        // CSS Overflow 3 #scrolling and CSS2 #overflow: the outer clip stays
+        // stationary; a clipped block within the child canvas moves with it.
+        for overflow in ["hidden", "clip", "clip visible"] {
+            let mut dom = Dom::parse_document(
+                r#"<body style="margin:0;background:white"><div style="position:absolute;
+                    left:20px;top:20px;width:140px;height:80px;overflow:hidden">
+                    <iframe id=f style="width:160px;height:80px;border:0"></iframe>
+                    </div></body>"#,
+            );
+            let frame = dom.get_by_id("f").unwrap();
+            dom.install_frame_document(
+                frame,
+                &format!(
+                    r#"<body style="margin:0;background:white">
+                    <div style="height:160px"></div>
+                    <div style="width:100px;height:20px;overflow:{overflow}">
+                        <div style="width:200px;height:60px;background:lime;
+                            transform:translateY(0)"></div></div>
+                    <div style="height:100px"></div></body>"#
+                ),
+                "https://frame.test/",
+            )
+            .unwrap();
+            let mut layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://page.test/").unwrap(),
+                crate::layout2::Viewport::new(320., 240.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            layout
+                .paint
+                .scroll_containers
+                .iter_mut()
+                .find(|s| s.node == frame)
+                .unwrap()
+                .offset
+                .y = 140.;
+            let pixels =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(320., 240.))
+                    .unwrap()
+                    .pixels;
+            let at = |x: usize, y: usize| &pixels[(y * 320 + x) * 4..(y * 320 + x) * 4 + 3];
+            assert_eq!(
+                at(40, 45),
+                [0, 255, 0],
+                "{overflow}: scrolled block must paint"
+            );
+            assert_eq!(
+                at(130, 45),
+                [255, 255, 255],
+                "{overflow}: descendant width clip"
+            );
+            assert_eq!(
+                at(40, 70),
+                if overflow == "clip visible" {
+                    [0, 255, 0]
+                } else {
+                    [255, 255, 255]
+                },
+                "{overflow}: descendant height clip"
+            );
+            assert_eq!(
+                at(165, 45),
+                [255, 255, 255],
+                "{overflow}: outer clip must remain stationary"
+            );
+        }
     }
 
     #[test]
