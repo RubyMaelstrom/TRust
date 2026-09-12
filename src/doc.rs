@@ -367,8 +367,11 @@ impl Form {
 }
 
 /// Styling class of a document line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
+    /// Lines added/removed in an explicitly requested reply comparison.
+    Added,
+    Removed,
     /// Plain document text (gopher text files, gemtext paragraphs).
     Text,
     /// Gopher menu info lines.
@@ -439,6 +442,8 @@ pub struct Doc {
     /// The URL this document was fetched from.
     pub url: Link,
     pub lines: Vec<DocLine>,
+    /// Finger view controls and one previous reply for manual comparison.
+    pub finger: Option<crate::finger::View>,
     /// The body bytes as fetched.
     pub raw: Vec<u8>,
     /// Width `lines` was wrapped to.
@@ -543,6 +548,7 @@ impl Doc {
         Doc {
             url,
             lines,
+            finger: None,
             raw,
             wrapped_to,
             cp437,
@@ -623,7 +629,7 @@ pub fn push_wrapped(
     link: Option<Link>,
     width: usize,
 ) {
-    if text.chars().count() <= width {
+    if unicode_width::UnicodeWidthStr::width(text.as_str()) <= width {
         out.push(DocLine { kind, text, link });
         return;
     }
@@ -640,6 +646,18 @@ pub fn push_wrapped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapping_shortcut_measures_terminal_cells_instead_of_scalar_count() {
+        let mut lines = Vec::new();
+        push_wrapped(&mut lines, Kind::Text, "界".repeat(8), None, 10);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line.text.as_str()) <= 10)
+        );
+    }
 
     fn field(name: &str, value: &str, kind: FieldKind) -> Field {
         Field {

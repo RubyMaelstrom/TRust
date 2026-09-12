@@ -546,6 +546,7 @@ pub fn adapt_rendered_terminal(
     Doc {
         url: Link::Http(url.clone()),
         lines: Vec::new(),
+        finger: None,
         raw,
         wrapped_to: viewport.columns,
         cp437: false,
@@ -5252,6 +5253,7 @@ pub fn parse_seeded(
     Doc {
         url: Link::Http(url.clone()),
         lines,
+        finger: None,
         raw: body.to_vec(),
         wrapped_to: width,
         cp437: false,

@@ -118,6 +118,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 );
             }
             let doc = Paragraph::new(browser_lines(g, inner.height as usize, app.find.as_ref()))
+                .scroll((
+                    0,
+                    g.doc
+                        .finger
+                        .as_ref()
+                        .map_or(0, |view| view.horizontal.min(u16::MAX as usize) as u16),
+                ))
                 .block(block);
             frame.render_widget(doc, session_area);
             // Second pass: overlay decoded inline images on their reserved
@@ -396,7 +403,9 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
                     .add_modifier(Modifier::BOLD),
                 (_, Kind::Heading(_)) => Style::new().fg(theme::NEON_CYAN),
                 (_, Kind::Quote) => Style::new().fg(theme::DIM),
-                (_, Kind::Pre) => Style::new().fg(theme::NEON_GREEN),
+                (_, Kind::Pre) if g.doc.finger.is_some() => Style::new().fg(theme::TEXT),
+                (_, Kind::Pre | Kind::Added) => Style::new().fg(theme::NEON_GREEN),
+                (_, Kind::Removed) => Style::new().fg(theme::NEON_PINK),
                 _ => Style::new().fg(theme::TEXT),
             };
             if g.selected == Some(g.scroll + i) && line.link.is_some() {

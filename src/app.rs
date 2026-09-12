@@ -312,6 +312,7 @@ enum Payload {
     /// classified before page JavaScript/layout and delegated on the UI thread.
     Media(url::Url),
     OneShot(Vec<u8>),
+    Finger(crate::finger::Reply),
     /// An internal `about:` page's gemtext source, generated locally (no
     /// network). Rides the fetch pipe so history deep-travel refetches of
     /// `about:` entries flow through the same completion path as the rest.
@@ -809,6 +810,7 @@ pub struct App {
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
     /// Handle to the in-flight fetch task, so Esc can abort it.
     fetch_task: Option<tokio::task::JoinHandle<()>>,
+    finger_fetch_started: bool,
     /// In-flight image decode/encode, if any.
     img_rx: Option<mpsc::Receiver<ImgMsg>>,
     /// A download prompt is presentation state only. Background transfers own
@@ -1056,6 +1058,7 @@ impl App {
             auto_protocol: ProtocolType::Halfblocks,
             fetch_rx: None,
             fetch_task: None,
+            finger_fetch_started: false,
             img_rx: None,
             file_dialog: None,
             last_file_actions: [None; 3],
@@ -2068,10 +2071,19 @@ impl App {
     /// rebuilds matches, picks the nearest one at/after the current scroll,
     /// and scrolls to it.
     fn recompute_find(&mut self) {
+        self.recompute_find_for_document(false);
+    }
+
+    fn recompute_find_for_document(&mut self, changed: bool) {
         let query = self.input.to_ascii_lowercase();
-        if self.find.as_ref().is_some_and(|f| f.last_query == query) {
+        if !changed && self.find.as_ref().is_some_and(|f| f.last_query == query) {
             return;
         }
+        let active = self
+            .find
+            .as_ref()
+            .and_then(|f| f.current.and_then(|i| f.matches.get(i)))
+            .copied();
         let mut matches = Vec::new();
         if let Some(g) = self.browser.as_ref()
             && !query.is_empty()
@@ -2142,18 +2154,25 @@ impl App {
             .as_ref()
             .map(|g| g.doc.regions.as_slice())
             .unwrap_or(&[]);
-        let current = (!matches.is_empty()).then(|| {
-            matches
-                .iter()
-                .position(|m| m.order_row(regions) >= scroll)
-                .unwrap_or(0)
-        });
+        let current = active
+            .filter(|_| changed)
+            .and_then(|old| matches.iter().position(|m| *m == old))
+            .or_else(|| {
+                (!matches.is_empty()).then(|| {
+                    matches
+                        .iter()
+                        .position(|m| m.order_row(regions) >= scroll)
+                        .unwrap_or(0)
+                })
+            });
         if let Some(f) = self.find.as_mut() {
             f.last_query = query;
             f.matches = matches;
             f.current = current;
         }
-        self.scroll_to_current_match();
+        if !changed {
+            self.scroll_to_current_match();
+        }
         self.update_find_status();
     }
 
@@ -2185,11 +2204,11 @@ impl App {
     /// region also scrolls the REGION (`voffset`) so the match's buffer row
     /// is in its window; a fixed-layer match is pinned on screen already.
     fn scroll_to_current_match(&mut self) {
-        let loc = {
+        let matched = {
             let Some(f) = self.find.as_ref() else { return };
             let Some(ci) = f.current else { return };
             match f.matches.get(ci) {
-                Some(m) => m.loc,
+                Some(m) => *m,
                 None => return,
             }
         };
@@ -2198,7 +2217,7 @@ impl App {
             return;
         };
         let mut writeback = None;
-        let line = match loc {
+        let line = match matched.loc {
             FindLoc::Line(l) => l,
             FindLoc::Item { row, .. } => row,
             FindLoc::Region { region, brow, .. } => {
@@ -2222,6 +2241,20 @@ impl App {
         };
         let max_scroll = g.doc.extent().saturating_sub(height.max(1));
         g.scroll = line.saturating_sub(height / 2).min(max_scroll);
+        if let FindLoc::Line(row) = matched.loc
+            && let Some(view) = &mut g.doc.finger
+            && !view.wrap
+            && let Some(line) = g.doc.lines.get(row)
+        {
+            let prefix: String = line.text.chars().take(matched.start).collect();
+            let cells = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+            let width = self.last_inner.0.max(1) as usize;
+            if cells < view.horizontal || cells >= view.horizontal + width / 2 {
+                view.horizontal = cells.saturating_sub(width / 2).min(
+                    unicode_width::UnicodeWidthStr::width(line.text.as_str()).saturating_sub(width),
+                );
+            }
+        }
         if let Some((node, voff)) = writeback {
             self.region_writeback(node, voff);
         }
@@ -2596,25 +2629,22 @@ impl App {
                 }
             }
             Some("help" | "?") => self.open_about("help"),
-            Some("finger" | "f") => match parts.next() {
-                Some(target) => {
-                    let (user, host) = match target.rsplit_once('@') {
-                        Some((user, host)) => (user, host),
-                        None => ("", target),
-                    };
-                    if host.is_empty() {
-                        self.status = String::from("usage: finger [user]@<host>");
+            Some("wrap" | "changes") => {
+                let action = line.split_whitespace().next().unwrap();
+                let value = match parts.next() {
+                    None => None,
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => {
+                        self.status = format!("usage: {action} [on|off]");
                         return;
                     }
-                    let (host, port) = split_host_port(host);
-                    self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
-                        scheme: oneshot::Scheme::Finger,
-                        host: host.to_string(),
-                        port: port.unwrap_or(79),
-                        query: user.to_string(),
-                    }));
-                }
-                None => self.status = String::from("usage: finger [user]@<host>"),
+                };
+                self.finger_view_action(action, value);
+            }
+            Some("finger" | "f") => match parts.next().and_then(crate::finger::command_target) {
+                Some(url) => self.start_fetch(Link::OneShot(url)),
+                None => self.status = String::from("usage: finger [user]@<host>[:port]"),
             },
             Some("whois") => match parts.next() {
                 Some(query) => {
@@ -2803,6 +2833,19 @@ impl App {
     /// HTTP GET). `port` is the explicitly-supplied port, if any; a `host:port`
     /// in the target wins over it.
     fn dispatch_open(&mut self, target: &str, port: Option<u16>) {
+        if target
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
+        {
+            match crate::finger::parse_url(target) {
+                Some(url) => self.start_fetch(Link::OneShot(url)),
+                None => {
+                    self.status = String::from("Invalid Finger address.");
+                    self.notice = true;
+                }
+            }
+            return;
+        }
         // Do this before bare-host dispatch, whose compatibility path appends
         // `/` and would otherwise change a schemeless `watch?v=id` query.
         if let Some(url) = crate::media::youtube_video_url(target) {
@@ -2943,6 +2986,7 @@ impl App {
         referrer: Option<url::Url>,
         navigation_type: http::NavigationType,
     ) {
+        self.retire_fetch("Incomplete reply: request replaced");
         // A new fetch intent supersedes a pending deep-travel completion
         // (the deep-travel path itself re-sets the flag after this call).
         self.pending_travel = None;
@@ -2979,6 +3023,30 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
+            if let Link::OneShot(url) = &target
+                && url.scheme == oneshot::Scheme::Finger
+            {
+                let result = crate::finger::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    let target = target.clone();
+                    async move {
+                        tx.send(FetchMsg {
+                            target,
+                            result: Ok(Payload::Finger(reply)),
+                        })
+                        .await
+                        .is_ok()
+                    }
+                })
+                .await;
+                let _ = tx
+                    .send(FetchMsg {
+                        target,
+                        result: result.map(Payload::Finger),
+                    })
+                    .await;
+                return;
+            }
             let result = if let Some(body) = about {
                 Ok(Payload::About(body))
             } else {
@@ -2988,6 +3056,9 @@ impl App {
                         Ok(Payload::Gemini(response))
                     }
                     Ok(crate::core::FetchedDocument::OneShot(raw)) => Ok(Payload::OneShot(raw)),
+                    Ok(crate::core::FetchedDocument::Finger(page)) => {
+                        Ok(Payload::Finger(page.reply))
+                    }
                     Ok(crate::core::FetchedDocument::Http(mut response)) => {
                         if let Some(timing) = response.timing.as_mut() {
                             timing.navigation_type = navigation_type;
@@ -3015,6 +3086,7 @@ impl App {
             self.start_fetch_opts(Link::Http(url), false, referrer);
             return;
         }
+        self.retire_fetch("Incomplete reply: request replaced");
         self.pending_travel = None;
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
@@ -3360,6 +3432,7 @@ impl App {
         let vh = self.last_inner.1 as usize;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         g.scroll.hash(&mut h);
+        g.doc.finger.as_ref().map(|v| v.horizontal).hash(&mut h);
         g.sel_item.hash(&mut h);
         // The gopher/gemini LINE-model selection: its highlight and the
         // status-bar link preview both render from it, and a selection step
@@ -3395,6 +3468,11 @@ impl App {
         self.status.hash(&mut h);
         self.notice.hash(&mut h);
         self.input.hash(&mut h);
+        for line in g.doc.lines.iter().skip(g.scroll).take(vh) {
+            line.text.hash(&mut h);
+            line.kind.hash(&mut h);
+            line.link.is_some().hash(&mut h);
+        }
         let end = (g.scroll + vh).min(g.doc.rows.len());
         for r in g.scroll..end {
             let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
@@ -3647,7 +3725,113 @@ impl App {
         });
     }
 
+    fn retire_fetch(&mut self, reason: &str) {
+        if let Some(task) = self.fetch_task.take() {
+            task.abort();
+        }
+        self.fetch_rx = None;
+        self.finger_fetch_started = false;
+        if let Some(g) = &mut self.browser
+            && let Some(view) = &mut g.doc.finger
+            && view.loading
+        {
+            view.loading = false;
+            view.notice = Some(reason.to_string());
+            crate::finger::rerender(&mut g.doc, (self.last_inner.0 as usize).max(10));
+        }
+    }
+
+    fn finger_view_action(&mut self, action: &str, enabled: Option<bool>) {
+        let Some(g) = &mut self.browser else {
+            return;
+        };
+        let Some(view) = &mut g.doc.finger else {
+            self.status = String::from("Wrap and changes controls apply to Finger replies.");
+            return;
+        };
+        match crate::finger::view_action(view, action, enabled) {
+            Ok(status) => {
+                self.status = status.to_string();
+                crate::finger::rerender(&mut g.doc, (self.last_inner.0 as usize).max(10));
+                g.scroll = g
+                    .scroll
+                    .min(g.doc.extent().saturating_sub(self.last_inner.1 as usize));
+                g.selected = Self::browser_visible_links(g, self.last_inner.1 as usize)
+                    .first()
+                    .copied();
+            }
+            Err(status) => self.status = status.to_string(),
+        }
+        self.notice = true;
+    }
+
+    fn on_finger_reply(&mut self, url: oneshot::OneShotUrl, reply: crate::finger::Reply) {
+        let finished = reply.finished;
+        let mut view = crate::finger::View::default();
+        if let Some(g) = &self.browser
+            && g.doc.url == Link::OneShot(url.clone())
+            && let Some(old) = &g.doc.finger
+            && (self.finger_fetch_started || self.replace_nav)
+        {
+            view = old.clone();
+            if !self.finger_fetch_started {
+                if !old.loading && old.notice.is_none() {
+                    view.previous = Some(std::sync::Arc::from(g.doc.raw.as_slice()));
+                }
+                if view.previous.is_none() {
+                    view.changes = false;
+                }
+            }
+        }
+        self.status = format!(
+            "{url} — {} bytes{} · W wrap · D changes · Shift+←/→ pan",
+            reply.body.len(),
+            if finished { "" } else { " received …" }
+        );
+        self.notice = reply.notice.is_some();
+        let doc = crate::finger::render(&url, reply, view, (self.last_inner.0 as usize).max(10));
+        if self.finger_fetch_started {
+            if let Some(g) = &mut self.browser {
+                let selected = g
+                    .selected
+                    .and_then(|line| g.doc.lines.get(line))
+                    .and_then(|line| line.link.clone());
+                g.doc = doc;
+                g.scroll = g
+                    .scroll
+                    .min(g.doc.extent().saturating_sub(self.last_inner.1 as usize));
+                g.selected = selected.and_then(|target| {
+                    g.doc
+                        .lines
+                        .iter()
+                        .position(|line| line.link.as_ref() == Some(&target))
+                });
+                if g.selected.is_none() {
+                    g.selected = Self::browser_visible_links(g, self.last_inner.1 as usize)
+                        .first()
+                        .copied();
+                }
+            }
+        } else {
+            self.navigate_to(doc);
+            self.finger_fetch_started = true;
+        }
+        if finished {
+            self.fetch_rx = None;
+            self.fetch_task = None;
+        }
+        if self.mode == Mode::Find {
+            self.recompute_find_for_document(true);
+        }
+    }
+
     fn on_fetch(&mut self, msg: FetchMsg) {
+        if matches!(msg.result, Ok(Payload::Finger(_))) {
+            if let (Ok(Payload::Finger(reply)), Link::OneShot(url)) = (msg.result, msg.target) {
+                self.on_finger_reply(url, reply);
+            }
+            return;
+        }
         self.fetch_rx = None;
         self.fetch_task = None;
         self.notice = false;
@@ -3672,6 +3856,7 @@ impl App {
                 self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
+            (Ok(Payload::Finger(_)), _) => unreachable!("Finger replies handled above"),
             (Ok(Payload::OneShot(raw)), Link::OneShot(url)) => {
                 let doc = oneshot::parse(&url, raw, width);
                 self.status = format!("{url} — {} lines", doc.lines.len());
@@ -4627,10 +4812,7 @@ impl App {
             || !self.imgs_in_flight.is_empty()
             || self.live_page.is_some()
             || self.page_busy;
-        if let Some(task) = self.fetch_task.take() {
-            task.abort();
-        }
-        self.fetch_rx = None;
+        self.retire_fetch("Incomplete reply: stopped");
         self.declarative_refresh = None;
         self.pending_travel = None;
         self.abort_image_loads();
@@ -5807,6 +5989,44 @@ impl App {
     fn browser_nav(&mut self, key: KeyEvent) {
         self.notice = false;
         let page = i64::from(self.last_inner.1.max(2)) - 1;
+        if self
+            .browser
+            .as_ref()
+            .is_some_and(|g| g.doc.finger.is_some())
+        {
+            match key.code {
+                KeyCode::Char('w' | 'W') => {
+                    self.finger_view_action("wrap", None);
+                    return;
+                }
+                KeyCode::Char('d' | 'D') => {
+                    self.finger_view_action("changes", None);
+                    return;
+                }
+                KeyCode::Left | KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if let Some(g) = &mut self.browser {
+                        let max = g
+                            .doc
+                            .lines
+                            .iter()
+                            .map(|line| unicode_width::UnicodeWidthStr::width(line.text.as_str()))
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_sub(self.last_inner.0 as usize);
+                        let view = g.doc.finger.as_mut().unwrap();
+                        if !view.wrap {
+                            view.horizontal = if key.code == KeyCode::Left {
+                                view.horizontal.saturating_sub(8)
+                            } else {
+                                view.horizontal.saturating_add(8).min(max)
+                            };
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Up => self.browser_arrow(-1),
             KeyCode::Down => self.browser_arrow(1),
@@ -6655,6 +6875,7 @@ impl App {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
         let g = self.browser.as_ref()?;
+        let cp437 = cp437 && matches!(g.doc.url, Link::Gopher(_));
         if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
             return None;
         }
@@ -6679,6 +6900,7 @@ impl App {
         let height = self.last_inner.1.max(1) as usize;
         let font = self.picker.font_size();
         let Some(g) = &mut self.browser else { return };
+        let cp437 = cp437 && matches!(g.doc.url, Link::Gopher(_));
         if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
             return;
         }
@@ -6698,6 +6920,7 @@ impl App {
         });
         let mut old_offsets = Vec::new();
         Self::collect_region_offsets(&g.doc.regions, &mut old_offsets);
+        let finger_view = g.doc.finger.take();
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
@@ -6722,7 +6945,19 @@ impl App {
                     &self.image_alpha,
                 )
             }
-            Link::OneShot(url) => oneshot::parse(&url, raw, width),
+            Link::OneShot(url) => match finger_view {
+                Some(view) => crate::finger::render(
+                    &url,
+                    crate::finger::Reply {
+                        body: raw,
+                        finished: !view.loading,
+                        notice: view.notice.clone(),
+                    },
+                    view,
+                    width,
+                ),
+                None => oneshot::parse(&url, raw, width),
+            },
             // Internal pages re-wrap from their raw gemtext source.
             Link::External(s) if s.starts_with("about:") => {
                 let body = String::from_utf8_lossy(&raw).into_owned();
@@ -7393,6 +7628,14 @@ impl App {
     /// and the arriving response completes the travel in `navigate_to` —
     /// until then the trail is untouched, so a failed fetch changes nothing.
     fn browser_travel(&mut self, forward: bool) {
+        if self
+            .browser
+            .as_ref()
+            .is_some_and(|g| !if forward { &g.forward } else { &g.history }.is_empty())
+        {
+            self.retire_fetch("Incomplete reply: left this page");
+            self.replace_nav = false;
+        }
         let js = self.js_enabled;
         // Captured before the drop below: the doc we're leaving should be
         // revived (not restored static) when travelled back onto.
@@ -7604,6 +7847,9 @@ impl App {
     }
 
     fn open(&mut self, host: String, port: u16, use_tls: bool) {
+        self.retire_fetch("Incomplete reply: left this page");
+        self.replace_nav = false;
+        self.pending_travel = None;
         // A fresh telnet session takes the screen; a browser or image
         // viewer left open would hide the connection behind it.
         self.browser = None;
@@ -14009,5 +14255,224 @@ mod tests {
         app.select_menu_mouse(moved(8, 30));
         assert!(app.select_menu.is_some());
         assert_eq!(app.select_menu.as_ref().unwrap().highlight, 2);
+    }
+}
+
+#[cfg(test)]
+mod finger_tests {
+    use super::*;
+    use crate::finger::Reply;
+
+    fn url(user: &str) -> oneshot::OneShotUrl {
+        oneshot::OneShotUrl::parse(&format!("finger://example.test/{user}")).unwrap()
+    }
+    fn reply(body: &str, finished: bool) -> Reply {
+        Reply {
+            body: body.as_bytes().to_vec(),
+            finished,
+            notice: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn finger_encoding_and_resize_settle_without_losing_view_state() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (20, 10);
+        app.on_finger_reply(url("alice"), reply("a\tb\r\n", true));
+        app.encoding = Encoding::Cp437;
+        assert!(app.pending_browser_wrap_target().is_none());
+        app.finger_view_action("wrap", Some(true));
+        app.last_inner = (12, 10);
+        assert!(app.pending_browser_wrap_target().is_some());
+        app.sync_browser_wrap();
+        assert!(app.pending_browser_wrap_target().is_none());
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .finger
+                .as_ref()
+                .unwrap()
+                .wrap
+        );
+        assert_eq!(app.browser.as_ref().unwrap().doc.lines[0].text, "a       b");
+    }
+
+    #[tokio::test]
+    async fn finger_terminal_paints_tabs_wide_text_and_horizontal_pan() {
+        let mut app = App::new(None, 23);
+        app.mode = Mode::Session;
+        app.last_inner = (28, 9);
+        app.on_finger_reply(
+            url("alice"),
+            reply(
+                "Login:\tAlice\r\n界界\r\n012345678901234567890123456789MARK\r\n",
+                true,
+            ),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let screen = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+        let before = screen(&terminal);
+        assert!(before.contains("Login:  Alice"));
+        assert!(before.contains("界 界 "));
+        assert!(!before.contains("MARK"));
+        app.browser_nav(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert!(screen(&terminal).contains("MARK"));
+        app.finger_view_action("wrap", Some(true));
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .finger
+                .as_ref()
+                .unwrap()
+                .horizontal,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_find_reveals_offscreen_text_and_updates_without_jumping() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (28, 9);
+        let first = format!("{}needle\r\n", "x".repeat(40));
+        app.on_finger_reply(url("alice"), reply(&first, false));
+        app.open_find();
+        app.input = "needle".into();
+        app.recompute_find();
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 1);
+        let g = app.browser.as_ref().unwrap();
+        let pan = g.doc.finger.as_ref().unwrap().horizontal;
+        let scroll = g.scroll;
+        assert!(pan > 0);
+        app.on_finger_reply(url("alice"), reply(&format!("{first}needle\r\n"), false));
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 2);
+        assert_eq!(app.find.as_ref().unwrap().current, Some(0));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.scroll, scroll);
+        assert_eq!(g.doc.finger.as_ref().unwrap().horizontal, pan);
+    }
+
+    #[tokio::test]
+    async fn finger_stream_commits_history_once_and_stop_preserves_text() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (80, 10);
+        app.on_finger_reply(url("alice"), reply("old\r\n", true));
+        app.finger_fetch_started = false;
+        app.on_finger_reply(url("bob"), reply("first\r\n", false));
+        app.on_finger_reply(url("bob"), reply("first\r\nsecond\r\n", false));
+        assert_eq!(app.browser.as_ref().unwrap().history.len(), 1);
+        app.stop_loading();
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.raw, b"first\r\nsecond\r\n");
+        assert!(!g.doc.finger.as_ref().unwrap().loading);
+        assert!(g.doc.lines.last().unwrap().text.contains("stopped"));
+        app.browser_back();
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.url,
+            Link::OneShot(url("alice"))
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_manual_refresh_compares_only_the_previous_reply() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (80, 10);
+        for text in ["first\r\n", "second\r\n", "third\r\n"] {
+            app.finger_fetch_started = false;
+            app.replace_nav = app.browser.is_some();
+            app.on_finger_reply(url("alice"), reply(text, true));
+        }
+        let g = app.browser.as_ref().unwrap();
+        assert!(g.history.is_empty());
+        assert_eq!(
+            g.doc.finger.as_ref().unwrap().previous.as_deref(),
+            Some(b"second\r\n".as_slice())
+        );
+        app.finger_view_action("changes", Some(true));
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .lines
+                .iter()
+                .any(|line| line.text == "+ third")
+        );
+        app.mode = Mode::Session;
+        let before = app.browser_frame_sig();
+        assert!(before.is_some());
+        app.browser.as_mut().unwrap().doc.lines[0].text = "same-length edited content".into();
+        assert_ne!(
+            before,
+            app.browser_frame_sig(),
+            "text changes must invalidate the frame"
+        );
+        app.retire_fetch("stopped");
+        app.replace_nav = true;
+        app.on_finger_reply(
+            url("alice"),
+            Reply {
+                notice: Some("Incomplete".into()),
+                ..reply("partial", true)
+            },
+        );
+        app.retire_fetch("stopped");
+        app.replace_nav = true;
+        app.on_finger_reply(url("alice"), reply("complete", true));
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .finger
+                .as_ref()
+                .unwrap()
+                .previous
+                .as_deref(),
+            Some(b"third\r\n".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_replacing_fetch_closes_the_old_socket() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut target = url("alice");
+        target.host = "127.0.0.1".into();
+        target.port = listener.local_addr().unwrap().port();
+        let mut app = App::new(None, 23);
+        app.start_fetch(Link::OneShot(target.clone()));
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = [0; 7];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"alice\r\n");
+        app.start_fetch(Link::OneShot(target));
+        let n = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "superseded request must actually close TCP");
+        app.stop_loading();
     }
 }

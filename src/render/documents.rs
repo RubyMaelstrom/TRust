@@ -43,6 +43,9 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
         (FetchedDocument::OneShot(raw), Link::OneShot(url)) => {
             crate::oneshot::parse(url, raw.clone(), usize::MAX / 4)
         }
+        (FetchedDocument::Finger(page), Link::OneShot(url)) => {
+            crate::finger::render(url, page.reply.clone(), page.view.clone(), usize::MAX / 4)
+        }
         (FetchedDocument::Internal(raw), Link::External(url)) => {
             let lines = crate::gemini::parse_gemtext(raw, usize::MAX / 4, &|target| {
                 crate::gemini::absolute_link(target)
@@ -105,7 +108,13 @@ pub fn paint_doc_selected(
     let mut y = 22.0;
     let mut far_right = viewport_width.max(0.0);
     for (line_index, line) in doc.lines.iter().enumerate() {
-        let (mut style, normal_color) = line_style(line.kind);
+        if doc.finger.is_some() && paint.lines.len() >= crate::finger::MAX_ROWS {
+            break;
+        }
+        let (mut style, mut normal_color) = line_style(line.kind);
+        if doc.finger.is_some() && line.kind == Kind::Pre {
+            normal_color = theme_color(crate::theme::TEXT);
+        }
         let is_selected = selected == Some(line_index) && line.link.is_some();
         if is_selected {
             style.weight = 700.0;
@@ -118,27 +127,68 @@ pub fn paint_doc_selected(
         let line_top = y;
         let mut line_width = 1.0f32;
         let mut remaining = line.text.as_str();
-        loop {
-            let end = if remaining.is_empty() {
-                0
-            } else {
-                text::first_line_end(
+        // Finger's preserved text can contain very long physical lines. Shape
+        // each paragraph once, retaining its joining forms across soft wraps.
+        let mut finger_lines = doc.finger.as_ref().map(|view| {
+            if view.wrap && !remaining.is_empty() {
+                text::wrapped_lines(
                     remaining,
                     &style,
                     width,
+                    width,
                     TextBreakStyle {
-                        wrap: !matches!(line.kind, Kind::Pre),
+                        wrap: true,
+                        overflow_wrap: crate::text::TextOverflowWrap::Anywhere,
                         ..TextBreakStyle::default()
                     },
                 )
-            };
-            let end = if end == 0 && !remaining.is_empty() {
-                remaining.chars().next().map_or(0, char::len_utf8)
             } else {
-                end
+                vec![text::shape(remaining, &style)]
+            }
+            .into_iter()
+            .peekable()
+        });
+        loop {
+            let (end, mut shaped, more) = if let Some(pieces) = &mut finger_lines {
+                let Some(shaped) = pieces.next() else { break };
+                (0, shaped, pieces.peek().is_some())
+            } else {
+                let end = if remaining.is_empty() {
+                    0
+                } else {
+                    text::first_line_end(
+                        remaining,
+                        &style,
+                        width,
+                        TextBreakStyle {
+                            wrap: !matches!(line.kind, Kind::Pre),
+                            ..TextBreakStyle::default()
+                        },
+                    )
+                };
+                let end = if end == 0 && !remaining.is_empty() {
+                    remaining.chars().next().map_or(0, char::len_utf8)
+                } else {
+                    end
+                };
+                (
+                    end,
+                    text::shape(remaining.get(..end).unwrap_or(remaining), &style),
+                    end < remaining.len(),
+                )
             };
-            let piece = remaining.get(..end).unwrap_or(remaining);
-            let shaped = text::shape(piece, &style);
+            let truncated = doc.finger.is_some()
+                && paint.lines.len() >= crate::finger::MAX_ROWS - 1
+                && (more || line_index + 1 < doc.lines.len());
+            if truncated {
+                shaped = text::shape("Display truncated to keep this reply responsive.", &style);
+            }
+            let color = if truncated {
+                theme_color(crate::theme::NEON_PINK)
+            } else {
+                color
+            };
+            let link = if truncated { None } else { line.link.clone() };
             let origin = CssPoint::new(left, y);
             let rect = CssRect::new(
                 origin.x,
@@ -146,7 +196,7 @@ pub fn paint_doc_selected(
                 shaped.advance.max(1.0),
                 shaped.line_height.max(style.size),
             );
-            if is_selected {
+            if is_selected && !truncated {
                 paint.primitives.push(DisplayCommand::FillRect {
                     rect,
                     color: normal_color,
@@ -169,22 +219,24 @@ pub fn paint_doc_selected(
                 shadows: Vec::new(),
                 clip: None,
                 node: line_index + 1,
-                link: line.link.clone(),
+                link: link.clone(),
             });
             paint.primitives.push(DisplayCommand::HitRegion(HitRegion {
                 rect,
                 node: line_index + 1,
                 actor: None,
-                link: line.link.clone(),
+                link,
                 cursor: None,
             }));
             line_width = line_width.max(rect.width);
             far_right = far_right.max(rect.x + rect.width + left);
             y += shaped.line_height.max(style.size * 1.2);
-            if remaining.is_empty() || end >= remaining.len() {
+            if truncated || !more {
                 break;
             }
-            remaining = remaining[end..].trim_start_matches(' ');
+            if finger_lines.is_none() {
+                remaining = remaining[end..].trim_start_matches(' ');
+            }
         }
         lines.push(ProtocolLine {
             rect: CssRect::new(left, line_top, line_width, (y - line_top).max(style.size)),
@@ -225,7 +277,8 @@ fn line_style(kind: Kind) -> (TextStyle, PaintColor) {
         Kind::OtherLink => theme_color(crate::theme::NEON_PINK),
         Kind::Error => theme_color(crate::theme::NEON_PINK),
         Kind::Quote => theme_color(crate::theme::DIM),
-        Kind::Pre => theme_color(crate::theme::NEON_GREEN),
+        Kind::Pre | Kind::Added => theme_color(crate::theme::NEON_GREEN),
+        Kind::Removed => theme_color(crate::theme::NEON_PINK),
         _ => theme_color(crate::theme::TEXT),
     };
     (style, color)
@@ -338,5 +391,46 @@ mod tests {
         let paint = paint_doc(&doc, 160.0);
         assert!(paint.width > 160.0);
         assert_eq!(paint.lines.len(), 1, "Gemtext pre lines do not wrap");
+    }
+
+    #[test]
+    fn finger_native_wrap_preserves_text_and_unwrapped_columns() {
+        let url = crate::finger::parse_url("finger://example.test/alice").unwrap();
+        let mut doc =
+            crate::oneshot::parse(&url, b"  columns\tand    spaces    and more".to_vec(), 80);
+        let original = doc.lines[0].text.clone();
+        let paint = paint_doc(&doc, 100.0);
+        assert_eq!(paint.lines.len(), 1);
+        assert!(paint.width > 100.0);
+        assert!(paint.primitives.iter().any(|p| matches!(p,
+            DisplayCommand::GlyphRun { color, .. } if *color == rgba(crate::theme::TEXT)
+        )));
+        doc.finger.as_mut().unwrap().wrap = true;
+        let paint = paint_doc(&doc, 100.0);
+        assert!(paint.lines.len() > 1);
+        let pieces: String = paint
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                DisplayCommand::GlyphRun { shaped, .. } => Some(shaped.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pieces, original);
+    }
+
+    #[test]
+    fn finger_native_wrapping_bounds_paint_rows() {
+        let url = crate::finger::parse_url("finger://example.test/alice").unwrap();
+        let mut doc = crate::oneshot::parse(&url, "a".repeat(4096).repeat(100).into_bytes(), 80);
+        // Many long physical lines, each requiring hundreds of painted rows.
+        let line = doc.lines[0].clone();
+        doc.lines = vec![line; 100];
+        doc.finger.as_mut().unwrap().wrap = true;
+        let paint = paint_doc(&doc, 100.0);
+        assert!(paint.lines.len() <= crate::finger::MAX_ROWS);
+        assert!(paint.primitives.iter().any(|p| matches!(p,
+            DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("truncated")
+        )));
     }
 }

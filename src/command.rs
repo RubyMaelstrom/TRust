@@ -171,6 +171,8 @@ close                     drop the connection
 reload                    refetch the page on screen
 post <url> [body]         POST a form body to a web URL
 finger [user]@<host>      finger query
+wrap [on|off]            toggle wrapping of a Finger reply
+changes [on|off]         compare with the previous Finger refresh
 whois <domain> [server]   whois lookup
 dict <word> [server]      dictionary lookup
 status                    connection and options report
@@ -206,6 +208,13 @@ Esc            stop loading and page scripts
 
 Mouse: hover selects, click follows, wheel scrolls,
 back/forward side buttons travel history.
+
+## Finger replies
+
+Replies appear as they arrive, with columns and tabs preserved.
+W toggles wrapping; Shift-Left/Right pans an unwrapped reply.
+After `reload`, D toggles changes since the previous successful reply.
+URLs are selectable links. Esc stops loading and keeps the received text.
 
 ## Telnet sessions
 

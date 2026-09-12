@@ -31,6 +31,7 @@ pub mod command;
 pub mod core;
 mod crypto;
 pub mod embed;
+pub mod finger;
 mod referrer_policy;
 pub mod render;
 pub mod responsive_image;
