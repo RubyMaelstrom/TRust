@@ -25,12 +25,13 @@ use trust::doc::{FieldKind, Link};
 use trust::render::vello_cpu::VelloCpuRenderer;
 use trust::render::vello_hybrid::{PresentOutcome, VelloHybridRenderer};
 use trust::render::{
-    ChromeModel, ControlId, CssRect, DisplayCommand, DownloadVisual, EditorVisual, HeartVisual,
-    ImageHandle, ImageResource, ImageStore, PageHit, PaintBrush, PaintColor, PaintShape,
-    RasterBackend, RendererKind, RendererPreference, Scene, SceneDamage, ScrollContainer,
-    ScrollbarAxis, StrokeStyle, TextSelection, desktop_chrome, desktop_heart_image_handle,
-    horizontal_heart_track, paint_desktop_overlay, paint_text_editor, raster_damage, scene_damage,
-    scrollbar_fraction, scrollbar_position, scrollbar_track_fraction, vertical_heart_track,
+    ChromeModel, CommandPanelGeometry, CommandResponse, ControlId, CssRect, DisplayCommand,
+    DownloadVisual, EditorVisual, HeartVisual, ImageHandle, ImageResource, ImageStore, PageHit,
+    PaintBrush, PaintColor, PaintShape, RasterBackend, RendererKind, RendererPreference, Scene,
+    SceneDamage, ScrollContainer, ScrollbarAxis, StrokeStyle, TextSelection, desktop_chrome,
+    desktop_heart_image_handle, horizontal_heart_track, paint_desktop_overlay, paint_text_editor,
+    raster_damage, scene_damage, scrollbar_fraction, scrollbar_position, scrollbar_track_fraction,
+    vertical_heart_track,
 };
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
@@ -613,6 +614,28 @@ enum FocusTarget {
         form: usize,
         field: usize,
     },
+}
+
+impl FocusTarget {
+    fn for_startup(address: Option<&str>) -> Self {
+        if address.is_some() {
+            Self::Page
+        } else {
+            Self::Command
+        }
+    }
+
+    fn viewport(self, size: CssSize) -> CssSize {
+        // COMMAND is an overlay (CSS Values 4 #viewport-variants). In
+        // particular, changing Page <-> Command must not dispatch Resize:
+        // CSSOM View #resizing-viewports fires it only for a changed viewport.
+        let reserved = match self {
+            Self::Download => trust::render::COMMAND_PANEL_HEIGHT,
+            Self::Find => trust::render::FIND_PANEL_HEIGHT,
+            _ => 0.0,
+        };
+        CssSize::new(size.width, (size.height - reserved).max(0.0))
+    }
 }
 
 /// A native key awaiting its resident-page acknowledgement. Page script can
@@ -1484,7 +1507,7 @@ impl DesktopApp {
             custom_cursors: HashMap::new(),
             cursor_hotspots: HashMap::new(),
             modifiers: ModifiersState::empty(),
-            focus: FocusTarget::default(),
+            focus: FocusTarget::for_startup(initial_navigation.as_deref()),
             initial_navigation,
             find: TextEditor::new("", &style, 500.0, false),
             command: TextEditor::new("", &style, 700.0, false),
@@ -2137,17 +2160,7 @@ impl DesktopApp {
     }
 
     fn browser_viewport(&self) -> CssSize {
-        let panel = if matches!(self.focus, FocusTarget::Command | FocusTarget::Download) {
-            trust::render::COMMAND_PANEL_HEIGHT
-        } else if self.focus == FocusTarget::Find {
-            trust::render::FIND_PANEL_HEIGHT
-        } else {
-            0.0
-        };
-        CssSize::new(
-            self.metrics.css.width,
-            (self.metrics.css.height - panel).max(0.0),
-        )
+        self.focus.viewport(self.metrics.css)
     }
 
     fn editor_visual(editor: &mut TextEditor, password: bool) -> EditorVisual {
@@ -2167,8 +2180,10 @@ impl DesktopApp {
     }
 
     fn chrome_model(&mut self, snapshot: &trust::core::BrowserSnapshot) -> ChromeModel {
-        self.command
-            .set_width((self.metrics.css.width - 95.0).max(1.0));
+        if self.focus == FocusTarget::Command {
+            self.command
+                .set_width(CommandPanelGeometry::new(self.metrics.css).editor.width);
+        }
         self.find
             .set_width((self.metrics.css.width - 160.0).max(1.0));
         let find =
@@ -2186,6 +2201,20 @@ impl DesktopApp {
             .flatten();
         ChromeModel {
             command,
+            response: (self.focus == FocusTarget::Command)
+                .then(|| {
+                    self.browser
+                        .current_page()
+                        .and_then(|page| match &page.document {
+                            FetchedDocument::Http(response) => Some(CommandResponse {
+                                status: response.status,
+                                content_type: response.content_type.clone(),
+                                bytes: response.body.len(),
+                            }),
+                            _ => None,
+                        })
+                })
+                .flatten(),
             download,
             status: snapshot.status.clone(),
             status_label: self.status_label(snapshot),
@@ -3005,6 +3034,7 @@ impl DesktopApp {
 
     fn activate_control(&mut self, control: ControlId) {
         match control {
+            ControlId::CommandPanel => {}
             ControlId::Find => self.focus_chrome_editor(FocusTarget::Find, control),
             ControlId::Command => self.focus_chrome_editor(FocusTarget::Command, control),
             ControlId::FileSave => self.activate_file_action(0),
@@ -3028,14 +3058,15 @@ impl DesktopApp {
         self.set_focus(focus);
         if let Some(rect) = rect {
             let point = self.pointer;
+            let command_origin = CommandPanelGeometry::new(self.metrics.css).editor;
             if let Some(editor) = self.active_editor_mut() {
                 let editor_x = match focus {
-                    FocusTarget::Command => 79.0,
+                    FocusTarget::Command => command_origin.x,
                     FocusTarget::Find => 76.0,
                     _ => rect.x + 6.0,
                 };
                 let editor_y = match focus {
-                    FocusTarget::Command => rect.y + 6.0,
+                    FocusTarget::Command => command_origin.y,
                     FocusTarget::Find => rect.y + 6.0,
                     _ => rect.y + 5.0,
                 };
@@ -3750,16 +3781,10 @@ impl DesktopApp {
         let (_, caret, ime) = editor.geometry();
         let area = caret.unwrap_or(ime);
         let origin = match focus {
-            FocusTarget::Command => self
-                .scene
-                .as_ref()
-                .map(|scene| {
-                    CssPoint::new(
-                        79.0,
-                        scene.content_viewport.y + scene.content_viewport.height + 30.0,
-                    )
-                })
-                .unwrap_or_default(),
+            FocusTarget::Command => {
+                let editor = CommandPanelGeometry::new(self.metrics.css).editor;
+                CssPoint::new(editor.x, editor.y)
+            }
             FocusTarget::Find => self
                 .scene
                 .as_ref()
@@ -5136,6 +5161,14 @@ impl DesktopApp {
     }
 
     fn handle_scroll(&mut self, delta: MouseScrollDelta) {
+        if self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.control_at(self.pointer))
+            .is_some_and(|control| matches!(control, ControlId::Command | ControlId::CommandPanel))
+        {
+            return;
+        }
         self.cancel_heart_glide();
         let (dx, dy) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (-x * 40.0, -y * 40.0),
@@ -5417,9 +5450,8 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             return;
         }
         self.update_metrics(None);
-        // Startup focus is the COMMAND editor. Reapply it after the native
-        // window exists so winit enables text/IME input for the visible entry,
-        // not merely the browser's internal focus enum.
+        // Reapply startup focus once the window exists: an explicit address
+        // starts in the page, while an empty launch enables the COMMAND IME.
         self.set_focus(self.focus);
         if let Some(address) = self.initial_navigation.take() {
             self.navigate(address);
@@ -5854,11 +5886,12 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         let mut command = AccessNode::new(AccessRole::TextInput);
         command.set_label("TRust COMMAND");
         command.set_value(value);
+        let input = CommandPanelGeometry::new(metrics.css).input;
         command.set_bounds(AccessRect::new(
-            14.0,
-            f64::from(content_viewport.y + content_viewport.height + 24.0),
-            f64::from(metrics.css.width - 14.0),
-            f64::from(content_viewport.y + content_viewport.height + 55.0),
+            f64::from(input.x),
+            f64::from(input.y),
+            f64::from(input.x + input.width),
+            f64::from(input.y + input.height),
         ));
         command.add_action(AccessAction::Focus);
         command.add_action(AccessAction::SetValue);
@@ -6446,7 +6479,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         move || {
             let _ = proxy.send_event(DesktopEvent::BrowserWake);
         },
-        CssSize::new(960.0, 558.0),
+        CssSize::new(960.0, 640.0),
     );
     let mut app = DesktopApp::new(
         browser,
@@ -6721,8 +6754,69 @@ mod tests {
     }
 
     #[test]
-    fn desktop_starts_with_the_command_editor_focused() {
-        assert_eq!(FocusTarget::default(), FocusTarget::Command);
+    fn desktop_startup_focus_tracks_the_initial_address() {
+        for (args, expected) in [
+            (vec![], FocusTarget::Command),
+            (vec!["--renderer=cpu"], FocusTarget::Command),
+            (vec!["https://example.test/"], FocusTarget::Page),
+            (
+                vec!["--renderer", "hybrid", "gopher://example.test/"],
+                FocusTarget::Page,
+            ),
+        ] {
+            let options = parse_desktop_args(args.iter().map(|arg| arg.to_string())).unwrap();
+            assert_eq!(
+                FocusTarget::for_startup(options.address.as_deref()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn command_focus_preserves_the_browser_viewport() {
+        for size in [CssSize::new(960.0, 640.0), CssSize::new(480.0, 320.0)] {
+            assert_eq!(
+                FocusTarget::Command.viewport(size),
+                FocusTarget::Page.viewport(size)
+            );
+            assert_eq!(FocusTarget::Command.viewport(size), size);
+        }
+    }
+
+    #[test]
+    fn command_accessibility_bounds_match_the_visible_editor_at_device_scale() {
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(1200, 800), ScaleFactor::new(1.25));
+        let update = build_accessibility_update(
+            AccessibilityFrame {
+                metrics,
+                page: None,
+                focus: FocusTarget::Command,
+                content_viewport: CssRect::new(0.0, 0.0, 960.0, 640.0),
+                scroll: CssPoint::default(),
+                keyboard_node: None,
+                command_value: Some("https://example.test/"),
+                find_value: None,
+            },
+            true,
+        );
+        let node = &update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == ACCESS_COMMAND)
+            .unwrap()
+            .1;
+        let input = CommandPanelGeometry::new(metrics.css).input;
+        assert_eq!(
+            node.bounds(),
+            Some(AccessRect::new(
+                input.x as f64,
+                input.y as f64,
+                (input.x + input.width) as f64,
+                (input.y + input.height) as f64
+            ))
+        );
+        assert_eq!(update.focus, ACCESS_COMMAND);
     }
 
     #[test]

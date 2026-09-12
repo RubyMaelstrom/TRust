@@ -13,8 +13,10 @@ use std::sync::{Arc, RwLock};
 use crate::core::{BrowserSnapshot, CssPoint, CssSize, PhysicalSize, ViewportMetrics};
 use crate::doc::Link;
 
+mod command_panel;
 pub mod documents;
 pub mod headless;
+pub use command_panel::{CommandPanelGeometry, CommandResponse};
 pub mod vello_cpu;
 pub mod vello_hybrid;
 
@@ -679,6 +681,25 @@ impl ImageStore {
         self.len() == 0
     }
 
+    /// Decoded pixel payloads charged to the current page's image cache.
+    /// This reads the existing eviction counter and excludes the two browser
+    /// heart assets with fixed lookups. It neither scans images nor touches
+    /// their LRU order. GPU copies, decoder workspaces, canvas snapshots and
+    /// other page allocations are outside this cache's accounting.
+    fn desktop_page_image_bytes(&self) -> usize {
+        let store = self.0.read().expect("image store poisoned");
+        [false, true]
+            .into_iter()
+            .fold(store.bytes, |bytes, active| {
+                bytes.saturating_sub(
+                    store
+                        .entries
+                        .get(&desktop_heart_image_handle(active))
+                        .map_or(0, |entry| entry.image.rgba.len()),
+                )
+            })
+    }
+
     pub fn remove(&self, handle: ImageHandle) -> Option<ImageResource> {
         let mut store = self.0.write().expect("image store poisoned");
         let old = store.entries.remove(&handle)?;
@@ -1064,6 +1085,7 @@ pub struct PagePaint {
 pub enum ControlId {
     Find,
     Command,
+    CommandPanel,
     FileSave,
     FileOpen,
     FileCancel,
@@ -1083,6 +1105,7 @@ pub struct EditorVisual {
 #[derive(Clone, Debug, Default)]
 pub struct ChromeModel {
     pub command: Option<EditorVisual>,
+    pub response: Option<CommandResponse>,
     pub download: Option<DownloadVisual>,
     pub status: String,
     pub status_label: String,
@@ -2556,7 +2579,7 @@ pub(crate) fn is_desktop_heart_image_handle(handle: ImageHandle) -> bool {
 }
 
 /// Build the chrome-free desktop surface. Browse mode gives the page the full
-/// client area; COMMAND/FIND reserve only their solid bottom instrument panel.
+/// client area. COMMAND overlays it; FIND and file actions reserve a panel.
 pub fn desktop_shell(viewport: ViewportMetrics, browser: &BrowserSnapshot) -> Scene {
     desktop_chrome(
         viewport,
@@ -2573,7 +2596,13 @@ pub fn desktop_chrome(
     _browser: &BrowserSnapshot,
     model: &ChromeModel,
 ) -> Scene {
-    let panel_height = if model.command.is_some() || model.download.is_some() {
+    // CSS Values 4 #viewport-variants explicitly permits UA interfaces that
+    // overlay content without affecting viewport units. COMMAND is such an
+    // interface: CSS fixed positioning and CSSOM View retain the page viewport.
+    // Local CSSWG snapshot 81c27f686901 (2026-09-06).
+    let panel_height = if model.command.is_some() {
+        0.0
+    } else if model.download.is_some() {
         COMMAND_PANEL_HEIGHT
     } else if model.find.is_some() {
         FIND_PANEL_HEIGHT
@@ -2606,9 +2635,12 @@ pub fn desktop_chrome(
 /// hearts intentionally derive their range from the same `page_size`, viewport,
 /// and CSS-pixel scroll used by [`Scene::append_page`]. CSSOM View §4 clamps
 /// viewport scrolling to scrolling-area size minus viewport size.
-pub fn paint_desktop_overlay(scene: &mut Scene, _browser: &BrowserSnapshot, model: &ChromeModel) {
+pub fn paint_desktop_overlay(scene: &mut Scene, browser: &BrowserSnapshot, model: &ChromeModel) {
     if let Some(command) = &model.command {
-        paint_command_panel(scene, command, model);
+        // The command surface occludes page scrollbars as well as page paint.
+        paint_heart_scrollbars(scene, model.heart);
+        command_panel::paint(scene, browser, command, model);
+        return;
     } else if let Some(download) = &model.download {
         paint_download_panel(scene, download);
     } else if let Some(find) = &model.find {
@@ -2748,113 +2780,6 @@ pub fn scrollbar_track_fraction(coordinate: f32, start: f32, end: f32) -> f32 {
     } else {
         0.0
     }
-}
-
-fn paint_command_panel(scene: &mut Scene, editor: &EditorVisual, model: &ChromeModel) {
-    let panel = CssRect::new(
-        0.0,
-        scene.content_viewport.y + scene.content_viewport.height,
-        scene.viewport.css.width,
-        COMMAND_PANEL_HEIGHT.min(scene.viewport.css.height),
-    );
-    scene.primitives.push(Primitive::FillRect {
-        rect: panel,
-        color: UI_BG,
-    });
-    let border_y = panel.y + 9.5;
-    scene.primitives.push(Primitive::Stroke {
-        shape: PaintShape::Path(vec![
-            PathElement::MoveTo(CssPoint::new(8.0, border_y)),
-            PathElement::LineTo(CssPoint::new(18.0, border_y)),
-            PathElement::MoveTo(CssPoint::new(118.0, border_y)),
-            PathElement::LineTo(CssPoint::new((panel.width - 8.0).max(118.0), border_y)),
-        ]),
-        brush: PaintBrush::Solid(UI_CYAN),
-        style: StrokeStyle::solid(1.0),
-    });
-    let plate = PaintShape::Path(vec![
-        PathElement::MoveTo(CssPoint::new(18.0, panel.y + 1.0)),
-        PathElement::LineTo(CssPoint::new(111.0, panel.y + 1.0)),
-        PathElement::LineTo(CssPoint::new(118.0, panel.y + 8.0)),
-        PathElement::LineTo(CssPoint::new(111.0, panel.y + 19.0)),
-        PathElement::LineTo(CssPoint::new(18.0, panel.y + 19.0)),
-        PathElement::Close,
-    ]);
-    scene.primitives.push(Primitive::Fill {
-        shape: plate,
-        brush: PaintBrush::Solid(UI_PINK),
-    });
-    paint_ui_text(
-        &mut scene.primitives,
-        "COMMAND",
-        CssPoint::new(29.0, panel.y + 2.5),
-        UI_BG,
-        80.0,
-        command_text_style(),
-    );
-
-    let input_y = panel.y + 27.0;
-    paint_ui_text(
-        &mut scene.primitives,
-        "trust>",
-        CssPoint::new(20.0, input_y + 3.0),
-        UI_CYAN,
-        58.0,
-        command_text_style(),
-    );
-    let input = CssRect::new(79.0, input_y, (panel.width - 95.0).max(1.0), 25.0);
-    scene.controls.push(ControlRegion {
-        id: ControlId::Command,
-        rect: CssRect::new(14.0, input_y - 3.0, (panel.width - 28.0).max(1.0), 31.0),
-        enabled: true,
-    });
-    paint_command_editor(&mut scene.primitives, editor, input);
-
-    let status_y = panel.y + 61.0;
-    let label = if model.status_label.is_empty() {
-        "TRUST"
-    } else {
-        model.status_label.as_str()
-    };
-    let label_width = (label.chars().count() as f32 * 9.5 + 10.0).clamp(46.0, 150.0);
-    scene.primitives.push(Primitive::FillRect {
-        rect: CssRect::new(18.0, status_y - 2.0, label_width, 21.0),
-        color: UI_PINK,
-    });
-    paint_ui_text(
-        &mut scene.primitives,
-        label,
-        CssPoint::new(23.0, status_y),
-        UI_BG,
-        label_width - 8.0,
-        command_text_style(),
-    );
-    paint_ui_text(
-        &mut scene.primitives,
-        &model.status,
-        CssPoint::new(27.0 + label_width, status_y),
-        UI_CYAN,
-        (panel.width - label_width - 48.0).max(1.0),
-        command_text_style(),
-    );
-
-    let keys_y = panel.y + 92.0;
-    paint_ui_text(
-        &mut scene.primitives,
-        "[KEYS]",
-        CssPoint::new(20.0, keys_y),
-        UI_AMBER,
-        62.0,
-        command_text_style(),
-    );
-    paint_ui_text(
-        &mut scene.primitives,
-        "TAB close  ENTER run/open  ↑↓ history  ESC stop  help reference",
-        CssPoint::new(83.0, keys_y),
-        UI_AMBER,
-        (panel.width - 100.0).max(1.0),
-        command_text_style(),
-    );
 }
 
 fn paint_find_panel(scene: &mut Scene, editor: &EditorVisual, count: Option<(usize, usize)>) {
@@ -3493,7 +3418,7 @@ mod tests {
         );
     }
 
-    fn snapshot() -> BrowserSnapshot {
+    pub(super) fn snapshot() -> BrowserSnapshot {
         BrowserSnapshot {
             address: String::from("https://example.com/"),
             status: String::from("Ready"),
@@ -3811,7 +3736,7 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_reserves_only_its_bottom_panel() {
+    fn command_mode_overlays_the_full_page_viewport() {
         let viewport =
             ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
         let model = ChromeModel {
@@ -3820,10 +3745,11 @@ mod tests {
         };
         let mut scene = desktop_chrome(viewport, &snapshot(), &model);
         assert_eq!(scene.content_viewport.y, 0.0);
-        assert_eq!(scene.content_viewport.height, 600.0 - COMMAND_PANEL_HEIGHT);
+        assert_eq!(scene.content_viewport.height, 600.0);
         paint_desktop_overlay(&mut scene, &snapshot(), &model);
+        let input = CommandPanelGeometry::new(viewport.css).input;
         assert_eq!(
-            scene.control_at(CssPoint::new(300.0, 600.0 - COMMAND_PANEL_HEIGHT + 30.0)),
+            scene.control_at(CssPoint::new(input.x + 100.0, input.y + 20.0)),
             Some(ControlId::Command)
         );
     }
@@ -4162,6 +4088,40 @@ mod tests {
     }
 
     #[test]
+    fn command_image_cache_bytes_follow_pixels_and_exclude_chrome() {
+        let store = ImageStore::default();
+        let image = |width, height| ImageResource {
+            width,
+            height,
+            rgba: vec![0; width as usize * height as usize * 4].into(),
+            has_alpha: true,
+        };
+        assert_eq!(store.desktop_page_image_bytes(), 0);
+        for active in [false, true] {
+            store.insert(desktop_heart_image_handle(active), image(30, 30));
+        }
+        assert_eq!(store.desktop_page_image_bytes(), 0);
+        store.insert(ImageHandle(1), image(16, 8));
+        store.insert(ImageHandle(2), image(8, 8));
+        let generation = store.generation();
+        let order = store.0.read().unwrap().order.clone();
+        assert_eq!(store.desktop_page_image_bytes(), 768);
+        assert_eq!(store.generation(), generation);
+        assert_eq!(store.0.read().unwrap().order, order);
+
+        // Animation/redecoding replaces the current cached pixels under the
+        // same handle; an old retained frame is no longer charged here.
+        store.insert(ImageHandle(1), image(16, 16));
+        assert_eq!(store.desktop_page_image_bytes(), 1_280);
+        store.remove(ImageHandle(2));
+        assert_eq!(store.desktop_page_image_bytes(), 1_024);
+        store.remove(desktop_heart_image_handle(true));
+        assert_eq!(store.desktop_page_image_bytes(), 1_024);
+        store.clear();
+        assert_eq!(store.desktop_page_image_bytes(), 0);
+    }
+
+    #[test]
     fn image_store_is_bounded_and_evicts_least_recently_used_resources() {
         let store = ImageStore::default();
         for index in 0..MAX_IMAGE_RESOURCES {
@@ -4175,13 +4135,14 @@ mod tests {
                 },
             );
         }
+        assert_eq!(store.desktop_page_image_bytes(), MAX_IMAGE_RESOURCES * 4);
         assert!(store.get(ImageHandle(0)).is_some(), "get touches the LRU");
         store.insert(
             ImageHandle(MAX_IMAGE_RESOURCES as u64),
             ImageResource {
-                width: 1,
+                width: 2,
                 height: 1,
-                rgba: Arc::from([0, 0, 0, 255]),
+                rgba: Arc::from([0, 0, 0, 255, 0, 0, 0, 255]),
                 has_alpha: false,
             },
         );
@@ -4189,6 +4150,10 @@ mod tests {
         assert!(store.contains(ImageHandle(0)));
         assert!(!store.contains(ImageHandle(1)));
         assert!(store.contains(ImageHandle(MAX_IMAGE_RESOURCES as u64)));
+        assert_eq!(
+            store.desktop_page_image_bytes(),
+            MAX_IMAGE_RESOURCES * 4 + 4
+        );
     }
 
     #[test]
