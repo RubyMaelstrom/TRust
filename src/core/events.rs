@@ -4,6 +4,8 @@
 //! require presenting every intermediate paint. Only consecutive, complete,
 //! diagnostic-free snapshots of the same document may supersede one another.
 //! All other events are FIFO barriers (including patches and task results).
+//! Finger updates likewise contain the complete received prefix. Consecutive
+//! updates can coalesce until the final reply, which remains a FIFO barrier.
 //! https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
 //! https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
 
@@ -146,6 +148,16 @@ impl Drop for Receiver {
 }
 
 fn supersedes(previous: &CoreEvent, next: &CoreEvent) -> bool {
+    if let (
+        CoreEvent::Finger {
+            generation: a,
+            reply: first,
+        },
+        CoreEvent::Finger { generation: b, .. },
+    ) = (previous, next)
+    {
+        return a == b && !first.finished;
+    }
     fn paint_generation(event: &CoreEvent) -> Option<(u64, usize)> {
         match event {
             CoreEvent::Page {
@@ -232,6 +244,37 @@ mod tests {
             panic!("expected FIFO event")
         };
         id.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn finger_updates_coalesce_but_final_replies_and_generations_are_barriers() {
+        let (tx, mut rx, wakes) = counted_channel(4);
+        for (generation, text, finished) in [
+            (1, "a", false),
+            (1, "ab", false),
+            (1, "abc", true),
+            (1, "later", false),
+            (2, "different", false),
+        ] {
+            tx.send(CoreEvent::Finger {
+                generation,
+                reply: crate::finger::Reply {
+                    body: text.as_bytes().to_vec(),
+                    finished,
+                    notice: None,
+                },
+            })
+            .await
+            .unwrap();
+        }
+        for expected in ["abc", "later", "different"] {
+            let Some(CoreEvent::Finger { reply, .. }) = rx.pop() else {
+                panic!()
+            };
+            assert_eq!(reply.body, expected.as_bytes());
+        }
+        assert!(rx.pop().is_none());
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

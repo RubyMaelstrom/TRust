@@ -135,7 +135,9 @@ command nor an address searches DuckDuckGo Lite.
 | `website.com` | with no port defaults to opening using http. If you include a port that isn't one of the standard protocol ports, it assumes telnet. http://website.com:2323 for http w/port, gemini://website.com for gemini sites, etc |
 | `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
 | `post <url> [body]` | HTTP POST, form-urlencoded |
-| `finger [user]@<host>` | who's there / their .plan (RFC 1288) |
+| `finger [user]@<host>[:port]` | who's there / their .plan (RFC 1288); IPv6 accepts `[address]:port` |
+| `wrap [on\|off]` | toggle wrapping of a Finger reply |
+| `changes [on\|off]` | compare a Finger reply with its previous successful refresh |
 | `whois <domain> [server]` | domain lookup via IANA, referral followed (RFC 3912) |
 | `dict <word> [server]` | definitions from dict.org (RFC 2229) |
 | `reload` | re-fetch what's on screen, history untouched |
@@ -147,3 +149,10 @@ command nor an address searches DuckDuckGo Lite.
 | `set js on\|off` | run web-page JavaScript against a real DOM (on by default; `off` opts out) |
 | `toggle crlf` | Enter sends CR LF instead of CR NUL |
 | `status` | connection/options report |
+
+Finger replies appear as they arrive, preserving columns, blank lines, and
+eight-cell tab stops. **W** toggles wrapping; **Shift+Left/Right** pans an
+unwrapped reply. Explicit URLs become selectable links. After `reload`, **D**
+toggles a comparison with the previous successful reply; the original text
+remains available. **Esc** stops loading and keeps the received text. Timeouts,
+interrupted replies, and size limits leave a notice alongside any retained text.

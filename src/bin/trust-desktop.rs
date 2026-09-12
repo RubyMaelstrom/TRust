@@ -795,12 +795,54 @@ struct HeartGlide {
 
 struct ProtocolPageCache {
     generation: u64,
+    revision: u64,
     viewport: CssSize,
     document: trust::doc::Doc,
     layout: trust::render::documents::ProtocolPaint,
     /// Parsed line index highlighted by the Gopherus keyboard model. This is
     /// present only for Gopher/Gemini; one-shot text protocols remain plain.
     selected: Option<usize>,
+}
+
+impl ProtocolPageCache {
+    fn select(&mut self, selected: Option<usize>) -> bool {
+        if self.selected == selected {
+            return false;
+        }
+        self.selected = selected;
+        self.layout = trust::render::documents::paint_doc_selected(
+            &self.document,
+            self.viewport.width,
+            selected,
+        );
+        true
+    }
+
+    fn selected_link(&self) -> Option<&Link> {
+        self.selected
+            .and_then(|line| self.document.lines.get(line))
+            .and_then(|line| line.link.as_ref())
+    }
+
+    fn hover(&mut self, hit: Option<&PageHit>, pointer_owns_selection: bool) -> bool {
+        if !pointer_owns_selection {
+            return false;
+        }
+        let Some(hit) = hit.filter(|hit| hit.actor.is_none() && hit.link.is_some()) else {
+            return false;
+        };
+        // Protocol paint uses one-based line identities, shared by every
+        // wrapped fragment. Equal URLs on separate lines remain distinct.
+        let Some(line) = hit.node.checked_sub(1).filter(|&line| {
+            self.document
+                .lines
+                .get(line)
+                .is_some_and(|line| line.link == hit.link)
+        }) else {
+            return false;
+        };
+        self.select(Some(line))
+    }
 }
 
 /// Per-document image request state. The HTML image processing model keeps a
@@ -1161,6 +1203,9 @@ struct DesktopApp {
     scene: Option<Scene>,
     pointer: CssPoint,
     pointer_inside: bool,
+    /// Pointer hover owns line-page selection until the next keyboard input.
+    /// Re-hit-testing a scene must not undo keyboard navigation under a still mouse.
+    protocol_pointer_selection: bool,
     cursor_icon: CursorIcon,
     cursor_custom: Option<(ImageHandle, u16, u16)>,
     cursor_visible: bool,
@@ -1501,6 +1546,7 @@ impl DesktopApp {
             scene: None,
             pointer: CssPoint::default(),
             pointer_inside: false,
+            protocol_pointer_selection: false,
             cursor_icon: CursorIcon::Default,
             cursor_custom: None,
             cursor_visible: true,
@@ -2239,6 +2285,7 @@ impl DesktopApp {
             Some(FetchedDocument::Gemini(response)) => format!("GEMINI:{}", response.status),
             Some(FetchedDocument::Gopher(_)) => String::from("GOPHER"),
             Some(FetchedDocument::OneShot(_)) => String::from("QUERY"),
+            Some(FetchedDocument::Finger(_)) => String::from("FINGER"),
             Some(FetchedDocument::Internal(_)) => String::from("TRUST:LOCAL"),
             None if snapshot.loading => String::from("LINK:OPENING"),
             None => String::from("LINK:DOWN"),
@@ -2390,35 +2437,49 @@ impl DesktopApp {
         }
 
         if self.page_layout.is_none() {
-            let fresh = self
-                .protocol_page
-                .as_ref()
-                .is_some_and(|cache| cache.generation == generation && cache.viewport == viewport);
+            let fresh = self.protocol_page.as_ref().is_some_and(|cache| {
+                cache.generation == generation
+                    && cache.revision == revision
+                    && cache.viewport == viewport
+            });
             if !fresh {
                 let carried_selection = self
                     .protocol_page
                     .as_ref()
                     .filter(|cache| cache.generation == generation)
-                    .and_then(|cache| cache.selected);
+                    .and_then(|cache| {
+                        cache.selected.and_then(|index| {
+                            cache
+                                .document
+                                .lines
+                                .get(index)
+                                .map(|line| (index, line.link.clone()))
+                        })
+                    });
                 self.protocol_page = self.browser.current_page().and_then(|page| {
                     let document = trust::render::documents::document(page)?;
-                    let gopherus = matches!(document.url, Link::Gopher(_) | Link::Gemini(_));
-                    let mut selected = if gopherus {
-                        carried_selection.filter(|&line| {
+                    let mut selected = carried_selection.and_then(|(index, target)| {
+                        if document.finger.is_some() {
+                            target.and_then(|target| {
+                                document
+                                    .lines
+                                    .iter()
+                                    .position(|line| line.link.as_ref() == Some(&target))
+                            })
+                        } else {
                             document
                                 .lines
-                                .get(line)
-                                .is_some_and(|line| line.link.is_some())
-                        })
-                    } else {
-                        None
-                    };
+                                .get(index)
+                                .filter(|line| line.link.is_some())
+                                .map(|_| index)
+                        }
+                    });
                     let mut layout = trust::render::documents::paint_doc_selected(
                         &document,
                         viewport.width,
                         selected,
                     );
-                    if gopherus && selected.is_none() {
+                    if selected.is_none() {
                         selected = gopherus_visible_links(&layout.lines, 0.0, viewport.height)
                             .first()
                             .copied();
@@ -2432,6 +2493,7 @@ impl DesktopApp {
                     }
                     Some(ProtocolPageCache {
                         generation,
+                        revision,
                         viewport,
                         document,
                         layout,
@@ -2446,6 +2508,23 @@ impl DesktopApp {
                     .and_then(|line| line.link.as_ref())
                     .map(ToString::to_string)
                     .unwrap_or_default();
+                if let Some(cache) = &self.protocol_page
+                    && cache.document.finger.is_some()
+                {
+                    let scroll = self.browser.interaction().scroll;
+                    let clamped = CssPoint::new(
+                        scroll
+                            .x
+                            .min((cache.layout.paint.width - viewport.width).max(0.0)),
+                        scroll
+                            .y
+                            .min((cache.layout.paint.height - viewport.height).max(0.0)),
+                    );
+                    if clamped != scroll {
+                        self.browser
+                            .handle_action(UserAction::SetViewportScroll(clamped));
+                    }
+                }
             }
         } else {
             self.protocol_page = None;
@@ -3227,8 +3306,35 @@ impl DesktopApp {
         let Some(cache) = &self.protocol_page else {
             return false;
         };
-        if !matches!(cache.document.url, Link::Gopher(_) | Link::Gemini(_)) {
-            return false;
+        self.protocol_pointer_selection = false;
+        if cache.document.finger.is_some() {
+            if let Key::Character(key) = &input.key {
+                let action = if key.eq_ignore_ascii_case("w") {
+                    Some("wrap")
+                } else if key.eq_ignore_ascii_case("d") {
+                    Some("changes")
+                } else {
+                    None
+                };
+                if let Some(action) = action {
+                    self.browser.finger_view_action(action, None);
+                    self.request_redraw();
+                    return true;
+                }
+            }
+            if input.modifiers.shift && matches!(input.key, Key::ArrowLeft | Key::ArrowRight) {
+                let mut scroll = self.browser.interaction().scroll;
+                let max = (cache.layout.paint.width - cache.viewport.width).max(0.0);
+                scroll.x = (scroll.x
+                    + if input.key == Key::ArrowLeft {
+                        -64.0
+                    } else {
+                        64.0
+                    })
+                .clamp(0.0, max);
+                self.dispatch(UserAction::SetViewportScroll(scroll));
+                return true;
+            }
         }
 
         match &input.key {
@@ -3356,25 +3462,16 @@ impl DesktopApp {
     }
 
     fn apply_gopherus_position(&mut self, position: GopherusPosition) {
+        self.protocol_pointer_selection = false;
         self.cancel_heart_glide();
         let old_scroll = self.browser.interaction().scroll;
         let (selection_changed, preview) = {
             let Some(cache) = &mut self.protocol_page else {
                 return;
             };
-            let changed = cache.selected != position.selected;
-            cache.selected = position.selected;
-            if changed {
-                cache.layout = trust::render::documents::paint_doc_selected(
-                    &cache.document,
-                    cache.viewport.width,
-                    cache.selected,
-                );
-            }
+            let changed = cache.select(position.selected);
             let preview = cache
-                .selected
-                .and_then(|line| cache.document.lines.get(line))
-                .and_then(|line| line.link.as_ref())
+                .selected_link()
                 .map(ToString::to_string)
                 .unwrap_or_default();
             (changed, preview)
@@ -3394,6 +3491,9 @@ impl DesktopApp {
 
     fn handle_keyboard(&mut self, event: winit::event::KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
+        if pressed {
+            self.protocol_pointer_selection = false;
+        }
         let command = self.modifiers.control_key() || self.modifiers.super_key();
         if pressed
             && command
@@ -3966,24 +4066,32 @@ impl DesktopApp {
                     trust::command::HELP_PAGE.as_bytes().to_vec(),
                 );
             }
+            "wrap" | "changes" => {
+                let action = verb.as_str();
+                let enabled = match parts.next() {
+                    None => None,
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => {
+                        self.browser.set_status(format!("usage: {action} [on|off]"));
+                        return;
+                    }
+                };
+                self.close_command();
+                if !self.browser.finger_view_action(action, enabled) {
+                    self.browser
+                        .set_status("Wrap and changes controls apply to Finger replies.");
+                }
+                self.request_redraw();
+            }
             "finger" | "f" => {
-                let Some(target) = parts.next() else {
-                    self.browser.set_status("usage: finger [user]@<host>");
+                let Some(url) = parts.next().and_then(trust::finger::command_target) else {
+                    self.browser
+                        .set_status("usage: finger [user]@<host>[:port]");
                     return;
                 };
-                let (user, host) = target.rsplit_once('@').unwrap_or(("", target));
-                let (host, port) = trust::command::split_host_port(host);
-                let address = format!(
-                    "finger://{host}{}{path}",
-                    port.map_or_else(String::new, |port| format!(":{port}")),
-                    path = if user.is_empty() {
-                        String::new()
-                    } else {
-                        format!("/{user}")
-                    }
-                );
                 self.close_command();
-                self.navigate(address);
+                self.navigate(url.to_string());
             }
             "whois" => {
                 let Some(query) = parts.next() else {
@@ -4778,6 +4886,9 @@ impl DesktopApp {
     }
 
     fn pointer_moved(&mut self, event_loop: Option<&ActiveEventLoop>, point: CssPoint) {
+        if event_loop.is_some() {
+            self.protocol_pointer_selection = true;
+        }
         self.pointer = point;
         let chrome_owned = self.heart_drag.is_some()
             || self
@@ -4882,11 +4993,23 @@ impl DesktopApp {
                 position: viewport,
             });
         }
-        let link_preview = hit
-            .as_ref()
-            .and_then(|hit| hit.link.as_ref())
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        if let Some(cache) = &mut self.protocol_page
+            && cache.hover(
+                hit.as_ref(),
+                self.protocol_pointer_selection && !self.selecting,
+            )
+        {
+            self.keyboard_target = None;
+            visual_changed = true;
+        }
+        let preview = if !self.protocol_pointer_selection && self.protocol_page.is_some() {
+            self.protocol_page
+                .as_ref()
+                .and_then(ProtocolPageCache::selected_link)
+        } else {
+            hit.as_ref().and_then(|hit| hit.link.as_ref())
+        };
+        let link_preview = preview.map(ToString::to_string).unwrap_or_default();
         if link_preview != self.link_preview {
             self.link_preview = link_preview;
             visual_changed = true;
@@ -5027,7 +5150,8 @@ impl DesktopApp {
                             .take()
                             .zip(released)
                             .and_then(|(pressed, released)| {
-                                let parents = &self.page_layout.as_ref()?.document.parents;
+                                let parents =
+                                    self.page_layout.as_ref().map(|page| &page.document.parents);
                                 click_target_for_hits(&pressed, &released, parents)
                             });
                     if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
@@ -5814,6 +5938,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_inside = false;
+                self.protocol_pointer_selection = false;
                 self.hovered_actor = None;
                 self.link_preview.clear();
                 self.heart_hover = None;
@@ -6081,14 +6206,17 @@ fn resolve_dead_page_href(base: &url::Url, href: &str) -> Option<Link> {
 /// down and up coordinates as different graphical descendants (`line`,
 /// `polyline`, or the containing `svg`); exact-leaf equality incorrectly
 /// cancelled those clicks before DOM dispatch.
+/// Protocol rows have no DOM parent map; matching down/up on the same row
+/// still activates its link, including across wrapped fragments. Pointer
+/// Events local snapshot 49c398264c8d, "Event dispatch" (2026-09-06).
 fn click_target_for_hits(
     pressed: &PageHit,
     released: &PageHit,
-    parents: &HashMap<usize, usize>,
+    parents: Option<&HashMap<usize, usize>>,
 ) -> Option<PageHit> {
     match (pressed.actor, released.actor) {
         (Some(pressed_actor), Some(released_actor)) => {
-            let node = nearest_common_inclusive_ancestor(pressed_actor, released_actor, parents)?;
+            let node = nearest_common_inclusive_ancestor(pressed_actor, released_actor, parents?)?;
             Some(PageHit {
                 rect: released.rect,
                 node,
@@ -6100,7 +6228,11 @@ fn click_target_for_hits(
             })
         }
         (None, None) if pressed.link == released.link => {
-            let node = nearest_common_inclusive_ancestor(pressed.node, released.node, parents)?;
+            let node = if pressed.node == released.node {
+                pressed.node
+            } else {
+                nearest_common_inclusive_ancestor(pressed.node, released.node, parents?)?
+            };
             Some(PageHit {
                 rect: released.rect,
                 node,
@@ -6567,11 +6699,11 @@ mod tests {
             link: None,
             cursor: None,
         };
-        let target = click_target_for_hits(&hit(101), &hit(102), &parents).unwrap();
+        let target = click_target_for_hits(&hit(101), &hit(102), Some(&parents)).unwrap();
         assert_eq!(target.node, 10);
         assert_eq!(target.actor, Some(10));
 
-        let exact = click_target_for_hits(&hit(101), &hit(101), &parents).unwrap();
+        let exact = click_target_for_hits(&hit(101), &hit(101), Some(&parents)).unwrap();
         assert_eq!(exact.actor, Some(101));
     }
 
@@ -7028,6 +7160,260 @@ mod tests {
             gopherus_arrow(&lines[..3], Some(0), 0.0, 60.0, 60.0, 1).selected,
             Some(2)
         );
+    }
+
+    fn protocol_pointer_documents() -> Vec<trust::doc::Doc> {
+        let gemtext = b"=> finger://example.test/alice First link with enough text to wrap across several graphical lines\n=> finger://example.test/bob Second link\n";
+        vec![
+            trust::oneshot::parse(
+                &trust::finger::parse_url("finger://example.test/reader").unwrap(),
+                b"finger://example.test/alice\r\nfinger://example.test/bob\r\n".to_vec(), 80,
+            ),
+            trust::gopher::parse(
+                &trust::gopher::GopherUrl::parse("gopher://example.test/1/").unwrap(),
+                b"hFirst link with enough text to wrap across several graphical lines\tURL:finger://example.test/alice\texample.test\t70\r\nhSecond link\tURL:finger://example.test/bob\texample.test\t70\r\n.\r\n".to_vec(),
+                false, usize::MAX / 4,
+            ),
+            trust::gemini::parse(
+                &trust::gemini::GeminiUrl::parse("gemini://example.test/").unwrap(),
+                "text/gemini", gemtext, usize::MAX / 4,
+            ),
+            trust::doc::Doc::from_lines(
+                Link::External("about:pointer-test".into()),
+                trust::gemini::parse_gemtext(gemtext, usize::MAX / 4, &|target| trust::gemini::absolute_link(target).unwrap()),
+                gemtext.to_vec(), 80, false, None,
+            ),
+        ]
+    }
+
+    fn protocol_pointer_cache(document: trust::doc::Doc) -> ProtocolPageCache {
+        let selected = document.lines.iter().position(|line| line.link.is_some());
+        ProtocolPageCache {
+            generation: 1,
+            revision: 1,
+            viewport: CssSize::new(200.0, 400.0),
+            layout: trust::render::documents::paint_doc_selected(&document, 200.0, selected),
+            document,
+            selected,
+        }
+    }
+
+    fn protocol_pointer_scene(cache: &ProtocolPageCache) -> Scene {
+        let mut scene = Scene {
+            viewport: ViewportMetrics::from_physical(
+                PhysicalSize::new(200, 400),
+                ScaleFactor::default(),
+            ),
+            primitives: Vec::new(),
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 200.0, 400.0),
+            image_store: ImageStore::default(),
+            canvas_images: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::default(),
+        };
+        scene.append_page(&cache.layout.paint, CssPoint::default());
+        scene
+    }
+
+    fn protocol_pointer_hits(cache: &ProtocolPageCache) -> Vec<PageHit> {
+        let scene = protocol_pointer_scene(cache);
+        cache
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| {
+                let DisplayCommand::HitRegion(region) = primitive else {
+                    return None;
+                };
+                region.link.as_ref()?;
+                scene.page_hit_at(CssPoint::new(region.rect.x + 2.0, region.rect.y + 2.0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gopherus_pointer_hover_selects_painted_links_without_repeated_relayout() {
+        for doc in protocol_pointer_documents() {
+            let mut cache = protocol_pointer_cache(doc);
+            let hits = protocol_pointer_hits(&cache);
+            let second = hits.iter().find(|hit| hit.node != hits[0].node).unwrap();
+            assert!(cache.hover(Some(second), true), "{}", cache.document.url);
+            assert_eq!(cache.selected, Some(second.node - 1));
+            assert_eq!(cache.selected_link(), second.link.as_ref());
+            assert!(
+                cache
+                    .layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .any(|primitive| matches!(primitive,
+                        DisplayCommand::GlyphRun { node, color: PaintColor::Rgba(r, g, b, _), .. }
+                            if *node == second.node && [*r, *g, *b] == trust::theme::BG
+                    )),
+                "the hovered link must actually paint in reverse video"
+            );
+            assert!(
+                !cache.hover(Some(second), true),
+                "same-row motion is a no-op"
+            );
+            cache.select(Some(hits[0].node - 1));
+            assert!(
+                !cache.hover(Some(second), false),
+                "stationary mouse must not undo keyboard selection"
+            );
+            assert_eq!(cache.selected, Some(hits[0].node - 1));
+            assert!(
+                cache.hover(Some(second), true),
+                "mouse movement takes selection back"
+            );
+            assert!(
+                !cache.hover(None, true),
+                "blank space keeps the last selected link"
+            );
+        }
+    }
+
+    #[test]
+    fn gopherus_pointer_clicks_work_without_dom_parents_and_across_wrapped_fragments() {
+        for doc in protocol_pointer_documents() {
+            let cache = protocol_pointer_cache(doc);
+            let hits = protocol_pointer_hits(&cache);
+            let first = &hits[0];
+            let last_fragment = hits
+                .iter()
+                .rev()
+                .find(|hit| hit.node == first.node)
+                .unwrap();
+            let target = click_target_for_hits(first, last_fragment, None).unwrap();
+            assert_eq!(page_hit_activation(&target, false), first.link);
+            let second = hits.iter().find(|hit| hit.node != first.node).unwrap();
+            assert!(
+                click_target_for_hits(first, second, None).is_none(),
+                "dragging to another link is not activation"
+            );
+        }
+    }
+
+    #[test]
+    fn gopherus_pointer_duplicate_urls_keep_distinct_row_identities() {
+        let mut doc = protocol_pointer_documents().remove(0);
+        doc.lines[1] = doc.lines[0].clone();
+        let mut cache = protocol_pointer_cache(doc);
+        let hits = protocol_pointer_hits(&cache);
+        assert_eq!(hits[0].link, hits[1].link);
+        assert!(cache.hover(Some(&hits[1]), true));
+        assert_eq!(cache.selected, Some(1));
+        assert!(click_target_for_hits(&hits[0], &hits[1], None).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a private Wayland compositor for the native event-loop proxy"]
+    async fn gopherus_pointer_native_hover_and_click_navigation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        builder.with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        for mut document in protocol_pointer_documents() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            for line in &mut document.lines {
+                if let Some(Link::OneShot(url)) = &mut line.link {
+                    url.host = "127.0.0.1".into();
+                    url.port = listener.local_addr().unwrap().port();
+                }
+            }
+            let browser =
+                BrowserController::new(Handle::current(), || {}, CssSize::new(200.0, 400.0));
+            let mut app = DesktopApp::new(
+                browser,
+                Handle::current(),
+                event_loop.create_proxy(),
+                RendererPreference::Cpu,
+                None,
+            );
+            app.browser
+                .open_internal_gemtext("about:pointer-test", b"Initial page".to_vec());
+            app.focus = FocusTarget::Page;
+            let cache = protocol_pointer_cache(document);
+            let hits = protocol_pointer_hits(&cache);
+            let first = &hits[0];
+            let second = hits.iter().find(|hit| hit.node != first.node).unwrap();
+            let point = CssPoint::new(second.rect.x + 2.0, second.rect.y + 2.0);
+            app.scene = Some(protocol_pointer_scene(&cache));
+            app.protocol_page = Some(cache);
+
+            // Exercise the same handler used by native motion and scene commits.
+            app.protocol_pointer_selection = true;
+            app.pointer_moved(None, point);
+            assert_eq!(
+                app.protocol_page.as_ref().unwrap().selected,
+                Some(second.node - 1)
+            );
+            assert_eq!(app.link_preview, second.link.as_ref().unwrap().to_string());
+            assert!(app.handle_gopherus_key(&KeyInput {
+                key: Key::ArrowUp,
+                code: "ArrowUp".into(),
+                location: 0,
+                state: KeyState::Pressed,
+                modifiers: Default::default(),
+                repeat: false,
+                composing: false,
+            }));
+            app.pointer_moved(None, point);
+            assert_eq!(
+                app.protocol_page.as_ref().unwrap().selected,
+                Some(first.node - 1)
+            );
+            assert_eq!(app.link_preview, first.link.as_ref().unwrap().to_string());
+
+            app.protocol_pointer_selection = true;
+            app.pointer_moved(None, CssPoint::new(first.rect.x + 2.0, first.rect.y + 2.0));
+            app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+            app.pointer_moved(None, point);
+            app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+            assert!(
+                !app.browser.snapshot().loading,
+                "release on another row must not navigate"
+            );
+
+            app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+            assert!(
+                !app.browser.snapshot().loading,
+                "press alone must not navigate"
+            );
+            app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+            assert!(
+                app.browser.snapshot().loading,
+                "native click must start the request without an HTML layout"
+            );
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut query = [0; 5];
+            tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut query))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&query, b"bob\r\n");
+            socket.write_all(b"Arrived\r\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while app.browser.snapshot().loading {
+                    app.browser.process_async_events();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                app.browser.current_page().unwrap().target(),
+                second.link.as_ref().unwrap()
+            );
+        }
     }
 
     fn image_request(index: usize) -> trust::render::ImageRequest {

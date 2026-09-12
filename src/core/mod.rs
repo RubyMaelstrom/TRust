@@ -346,6 +346,7 @@ pub enum FetchedDocument {
     Gemini(gemini::Response),
     Http(Box<http::Response>),
     OneShot(Vec<u8>),
+    Finger(crate::finger::Page),
     /// A trusted, in-process Gemtext document such as `about:help`.
     Internal(Vec<u8>),
 }
@@ -409,7 +410,7 @@ impl NavigationIntent {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingNavigation {
     generation: u64,
     target: Link,
@@ -419,6 +420,10 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    Finger {
+        generation: u64,
+        reply: crate::finger::Reply,
+    },
     UserInputReady {
         generation: u64,
         permit: Option<tokio::sync::mpsc::OwnedPermit<crate::js::PageCmd>>,
@@ -795,6 +800,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.retire_finger("Incomplete reply: left this page");
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
@@ -820,6 +826,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.retire_finger("Incomplete reply: left this page");
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.pending = None;
@@ -1083,6 +1090,9 @@ impl BrowserController {
                         }
                     }
                 }
+                CoreEvent::Finger { generation, reply } => {
+                    changed |= self.update_finger(generation, reply);
+                }
                 CoreEvent::FetchFinished { generation, result } => {
                     changed |= self.finish_fetch(generation, result);
                 }
@@ -1184,6 +1194,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.retire_finger("Incomplete reply: request replaced");
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
@@ -1204,6 +1215,28 @@ impl BrowserController {
         let screen_position = self.screen_position;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
+            if let Link::OneShot(url) = &target
+                && url.scheme == oneshot::Scheme::Finger
+            {
+                let result = crate::finger::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(CoreEvent::Finger { generation, reply })
+                            .await
+                            .is_ok()
+                    }
+                })
+                .await;
+                let event = match result {
+                    Ok(reply) => CoreEvent::Finger { generation, reply },
+                    Err(error) => CoreEvent::FetchFinished {
+                        generation,
+                        result: Err(error),
+                    },
+                };
+                let _ = tx.send(event).await;
+                return;
+            }
             let result = fetch_protocol_interactive(
                 &target,
                 fallback_http,
@@ -1241,6 +1274,8 @@ impl BrowserController {
             if let Some(task) = self.task.take() {
                 task.abort();
             }
+            self.retire_finger("Incomplete reply: request replaced");
+            self.render_is_final = self.live_page.is_none();
             // Ignore a completion already queued by the superseded fetch.
             self.generation = self.generation.wrapping_add(1);
         }
@@ -1275,6 +1310,90 @@ impl BrowserController {
         self.status = format!("Cannot display {}.", offer.content_type);
         self.download_offer = Some(offer);
         self.render_is_final = self.live_page.is_none();
+        true
+    }
+
+    fn retire_finger(&mut self, reason: &str) {
+        if let Some(page) = &mut self.current
+            && let FetchedDocument::Finger(finger) = &mut page.document
+            && !finger.reply.finished
+        {
+            finger.reply.finished = true;
+            finger.reply.notice = Some(reason.to_string());
+            page.revision = page.revision.wrapping_add(1);
+        }
+    }
+
+    pub fn finger_view_action(&mut self, action: &str, enabled: Option<bool>) -> bool {
+        let Some(page) = &mut self.current else {
+            return false;
+        };
+        let FetchedDocument::Finger(finger) = &mut page.document else {
+            return false;
+        };
+        match crate::finger::view_action(&mut finger.view, action, enabled) {
+            Ok(status) => {
+                page.revision = page.revision.wrapping_add(1);
+                self.status = status.to_string();
+                if finger.view.wrap {
+                    self.interaction.scroll.x = 0.0;
+                }
+            }
+            Err(status) => self.status = status.to_string(),
+        }
+        self.invalidation.request_redraw();
+        true
+    }
+
+    fn update_finger(&mut self, generation: u64, reply: crate::finger::Reply) -> bool {
+        let Some(pending) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.generation == generation)
+            .cloned()
+        else {
+            return false;
+        };
+        let finished = reply.finished;
+        if self.document_generation == generation
+            && let Some(page) = &mut self.current
+            && let FetchedDocument::Finger(finger) = &mut page.document
+        {
+            finger.reply = reply;
+            page.status = fetched_status(&page.target, &page.document);
+            self.status = page.status.clone();
+            page.revision = page.revision.wrapping_add(1);
+        } else {
+            let mut finger = crate::finger::Page::new(reply);
+            if pending.intent == NavigationIntent::Reload
+                && let Some(old) = &self.current
+                && old.target == pending.target
+                && let FetchedDocument::Finger(old) = &old.document
+            {
+                finger.view = old.view.clone();
+                if old.reply.finished && old.reply.notice.is_none() {
+                    finger.view.previous = Some(Arc::from(old.reply.body.as_slice()));
+                }
+                if finger.view.previous.is_none() {
+                    finger.view.changes = false;
+                }
+            }
+            // Commit history once, at the first published chunk. Later chunks
+            // update that document while the same cancellable task stays live.
+            let task = self.task.take();
+            let scroll = self.interaction.scroll;
+            self.finish_fetch(generation, Ok(FetchedDocument::Finger(finger)));
+            if pending.intent == NavigationIntent::Reload {
+                self.interaction.scroll = scroll;
+            }
+            self.task = task;
+            self.pending = Some(pending);
+        }
+        self.render_is_final = finished;
+        if finished {
+            self.pending = None;
+            self.task = None;
+        }
         true
     }
 
@@ -1369,6 +1488,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.retire_finger("Incomplete reply: stopped");
         self.drop_live_page();
         self.abort_declarative_refresh();
         self.generation = self.generation.wrapping_add(1);
@@ -1815,6 +1935,9 @@ pub async fn fetch_protocol(
             }?;
             Ok(FetchedDocument::Http(Box::new(response)))
         }
+        Link::OneShot(url) if url.scheme == oneshot::Scheme::Finger => crate::finger::fetch(url)
+            .await
+            .map(|reply| FetchedDocument::Finger(crate::finger::Page::new(reply))),
         Link::OneShot(url) => oneshot::fetch(url).await.map(FetchedDocument::OneShot),
         Link::Telnet { .. } => Err(String::from("terminal target requires a frontend VT view")),
         Link::External(url) => Err(format!("unsupported URL scheme: {url}")),
@@ -1946,6 +2069,15 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
         }
         FetchedDocument::Gopher(bytes) => format!("{target} — {} bytes", bytes.len()),
         FetchedDocument::OneShot(bytes) => format!("{target} — {} bytes", bytes.len()),
+        FetchedDocument::Finger(page) => format!(
+            "{target} — {} bytes{} · W wrap · D changes",
+            page.reply.body.len(),
+            if page.reply.finished {
+                ""
+            } else {
+                " received …"
+            }
+        ),
         FetchedDocument::Internal(_) => target.to_string(),
     }
 }
@@ -1956,6 +2088,14 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
     let address = address.trim();
     if address.is_empty() {
         return Err(String::from("Enter an address."));
+    }
+    if address
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
+    {
+        return crate::finger::parse_url(address)
+            .map(|url| (Link::OneShot(url), false))
+            .ok_or_else(|| String::from("Invalid Finger address."));
     }
     if let Some(url) = gopher::GopherUrl::parse(address) {
         return Ok((Link::Gopher(url), false));
@@ -2997,5 +3137,75 @@ mod tests {
             browser.current_page().unwrap().address(),
             "gopher://old.example/1"
         );
+    }
+}
+
+#[cfg(test)]
+mod finger_tests {
+    use super::*;
+    use crate::finger::Reply;
+    fn reply(text: &str, finished: bool) -> Reply {
+        Reply {
+            body: text.as_bytes().to_vec(),
+            finished,
+            notice: None,
+        }
+    }
+    fn start(browser: &mut BrowserController, name: &str, intent: NavigationIntent) {
+        browser.generation += 1;
+        browser.pending = Some(PendingNavigation {
+            generation: browser.generation,
+            target: Link::OneShot(
+                oneshot::OneShotUrl::parse(&format!("finger://example.test/{name}")).unwrap(),
+            ),
+            fallback_http: false,
+            intent,
+        });
+        browser.task = Some(tokio::spawn(std::future::pending()));
+    }
+    #[tokio::test]
+    async fn finger_stream_history_stop_and_stale_updates() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        start(&mut browser, "alice", NavigationIntent::New);
+        assert!(browser.update_finger(1, reply("old\r\n", true)));
+        start(&mut browser, "bob", NavigationIntent::New);
+        assert!(browser.update_finger(2, reply("partial\r\n", false)));
+        assert_eq!(browser.back.len(), 1);
+        assert!(browser.pending.is_some() && browser.task.is_some());
+        assert!(!browser.render_is_final);
+        let revision = browser.current.as_ref().unwrap().revision;
+        assert!(browser.update_finger(2, reply("partial\r\nmore\r\n", false)));
+        assert_eq!(browser.back.len(), 1);
+        assert!(browser.current.as_ref().unwrap().revision > revision);
+        assert!(browser.stop());
+        assert!(!browser.update_finger(2, reply("late", true)));
+        let FetchedDocument::Finger(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.reply.body, b"partial\r\nmore\r\n");
+        assert!(page.reply.notice.as_ref().unwrap().contains("stopped"));
+    }
+    #[tokio::test]
+    async fn finger_reload_retains_one_comparison_and_view_preferences() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        start(&mut browser, "alice", NavigationIntent::New);
+        browser.update_finger(1, reply("old", true));
+        assert!(browser.finger_view_action("wrap", Some(true)));
+        for (generation, text) in [(2, "new"), (3, "newest")] {
+            start(&mut browser, "alice", NavigationIntent::Reload);
+            browser.update_finger(generation, reply(text, false));
+            browser.update_finger(generation, reply(text, true));
+        }
+        assert!(browser.back.is_empty());
+        let FetchedDocument::Finger(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert!(page.view.wrap);
+        assert_eq!(page.view.previous.as_deref(), Some(b"new".as_slice()));
+        assert!(browser.finger_view_action("changes", Some(true)));
+        let doc = crate::render::documents::document(browser.current.as_ref().unwrap()).unwrap();
+        assert!(doc.lines.iter().any(|line| line.text == "+ newest"));
     }
 }

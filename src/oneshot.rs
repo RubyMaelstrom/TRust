@@ -1,7 +1,6 @@
 //! One-shot query protocols: finger (RFC 1288), WHOIS (RFC 3912), and
-//! DICT (RFC 2229). All three are: connect, send a line, read the
-//! reply, hang up — so they share one exchange helper and render into
-//! the browser panel like any other document.
+//! DICT (RFC 2229). Each renders into the browser panel. Finger's streaming
+//! exchange and preformatted presentation live in `crate::finger`.
 
 use std::fmt;
 use std::time::Duration;
@@ -58,9 +57,12 @@ pub struct OneShotUrl {
 
 impl OneShotUrl {
     pub fn parse(s: &str) -> Option<Self> {
-        let (scheme, rest) = if let Some(r) = s.strip_prefix("finger://") {
-            (Scheme::Finger, r)
-        } else if let Some(r) = s.strip_prefix("whois://") {
+        if s.split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
+        {
+            return crate::finger::parse_url(s);
+        }
+        let (scheme, rest) = if let Some(r) = s.strip_prefix("whois://") {
             (Scheme::Whois, r)
         } else {
             let r = s.strip_prefix("dict://")?;
@@ -98,6 +100,21 @@ impl OneShotUrl {
 
 impl fmt::Display for OneShotUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.scheme == Scheme::Finger {
+            if self.host.contains(':') {
+                write!(f, "finger://[{}]", self.host)?;
+            } else {
+                write!(f, "finger://{}", self.host)?;
+            }
+            if self.port != 79 {
+                write!(f, ":{}", self.port)?;
+            }
+            if !self.query.is_empty() {
+                f.write_str("/")?;
+                crate::finger::encode_query(&self.query, f)?;
+            }
+            return Ok(());
+        }
         write!(f, "{}://{}", self.scheme.name(), self.host)?;
         if self.port != self.scheme.default_port() {
             write!(f, ":{}", self.port)?;
@@ -139,7 +156,7 @@ async fn exchange(host: &str, port: u16, payload: String) -> Result<Vec<u8>, Str
 
 pub async fn fetch(url: &OneShotUrl) -> Result<Vec<u8>, String> {
     match url.scheme {
-        Scheme::Finger => exchange(&url.host, url.port, format!("{}\r\n", url.query)).await,
+        Scheme::Finger => crate::finger::fetch(url).await.map(|reply| reply.body),
         // DEFINE and QUIT pipeline fine, which keeps DICT a one-shot:
         // the server answers everything and closes.
         Scheme::Dict => {
@@ -193,6 +210,18 @@ fn referral(text: &str, asked: &str) -> Option<String> {
 /// Render a reply into a document. Finger and WHOIS are plain text;
 /// DICT gets its protocol lines stripped and definitions styled.
 pub fn parse(url: &OneShotUrl, raw: Vec<u8>, width: usize) -> Doc {
+    if url.scheme == Scheme::Finger {
+        return crate::finger::render(
+            url,
+            crate::finger::Reply {
+                body: raw,
+                finished: true,
+                notice: None,
+            },
+            Default::default(),
+            width,
+        );
+    }
     let width = width.max(10);
     let lines = match url.scheme {
         Scheme::Finger | Scheme::Whois => {

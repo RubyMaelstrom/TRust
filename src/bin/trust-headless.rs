@@ -451,6 +451,7 @@ fn describe_fetch(document: &FetchedDocument) -> String {
         FetchedDocument::Gopher(bytes) | FetchedDocument::OneShot(bytes) => {
             format!("{} bytes", bytes.len())
         }
+        FetchedDocument::Finger(page) => format!("Finger: {} bytes", page.reply.body.len()),
         // The driver prints the address of an in-process document anyway.
         FetchedDocument::Internal(_) => String::from("in-process document"),
     }
