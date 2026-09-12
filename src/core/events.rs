@@ -57,7 +57,10 @@ fn with_capacity(capacity: usize, invalidation: InvalidationHandle) -> (Sender, 
 }
 
 impl Sender {
-    pub(super) async fn send(&self, mut event: CoreEvent) -> Result<(), SendError<CoreEvent>> {
+    pub(super) async fn send(&self, event: CoreEvent) -> Result<(), Box<SendError<CoreEvent>>> {
+        // Keep ownership here across full-queue retries without allocating.
+        // Only a closed receiver needs to return the large event in a box.
+        let mut event = Some(event);
         loop {
             // Register BEFORE checking capacity: another producer can consume
             // the released slot before we retry. Enabling each waiter prevents
@@ -65,31 +68,39 @@ impl Sender {
             let space = self.0.space.notified();
             tokio::pin!(space);
             space.as_mut().enable();
-            match self.try_send(event) {
+            match self.try_send(&mut event) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Closed(event)) => return Err(SendError(event)),
-                Err(TrySendError::Full(pending)) => event = pending,
+                Err(TrySendError::Closed(())) => {
+                    return Err(Box::new(SendError(event.take().expect("pending event"))));
+                }
+                Err(TrySendError::Full(())) => {}
             }
             space.await;
         }
     }
 
-    fn try_send(&self, event: CoreEvent) -> Result<(), TrySendError<CoreEvent>> {
+    fn try_send(&self, event: &mut Option<CoreEvent>) -> Result<(), TrySendError<()>> {
         let (wake, retired) = {
             let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.closed {
-                return Err(TrySendError::Closed(event));
+                return Err(TrySendError::Closed(()));
             }
             if let Some(previous) = state.events.back_mut()
-                && supersedes(previous, &event)
+                && supersedes(previous, event.as_ref().expect("pending event"))
             {
-                (false, Some(std::mem::replace(previous, event)))
+                (
+                    false,
+                    Some(std::mem::replace(
+                        previous,
+                        event.take().expect("pending event"),
+                    )),
+                )
             } else if state.events.len() < self.0.capacity {
                 let wake = state.events.is_empty();
-                state.events.push_back(event);
+                state.events.push_back(event.take().expect("pending event"));
                 (wake, None)
             } else {
-                return Err(TrySendError::Full(event));
+                return Err(TrySendError::Full(()));
             }
         };
         // Large superseded layouts are freed on the forwarding thread, outside
@@ -407,9 +418,22 @@ mod tests {
         assert!(futures::poll!(&mut second).is_pending());
         drop(rx);
         assert!(layout.upgrade().is_none());
-        assert!(first.await.is_err());
-        assert!(second.await.is_err());
-        assert!(tx.send(semantic(3)).await.is_err());
+        for (result, expected) in [
+            (first.await, "1"),
+            (second.await, "2"),
+            (tx.send(semantic(3)).await, "3"),
+        ] {
+            let SendError(event) = *result.unwrap_err();
+            assert!(
+                matches!(
+                    event,
+                    CoreEvent::Page {
+                        event: PageEvt::ScrollToFragment(id), ..
+                    } if id == expected
+                ),
+                "closed sends must return their original event"
+            );
+        }
     }
 
     #[tokio::test]

@@ -71,13 +71,13 @@ impl EmbeddedDocument {
                 this.sizes
                     .insert(request.source, (image.width, image.height));
                 changed = true;
-            } else if let Some(bytes) = crate::img::decode_data_url(&request.source) {
-                if let Ok(image) = crate::img::decode_graphical(&bytes) {
-                    this.sizes
-                        .insert(request.source, (image.width, image.height));
-                    this.resources.insert(request.handle, image);
-                    changed = true;
-                }
+            } else if let Some(bytes) = crate::img::decode_data_url(&request.source)
+                && let Ok(image) = crate::img::decode_graphical(&bytes)
+            {
+                this.sizes
+                    .insert(request.source, (image.width, image.height));
+                this.resources.insert(request.handle, image);
+                changed = true;
             }
         }
         if changed {

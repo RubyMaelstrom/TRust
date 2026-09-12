@@ -338,7 +338,7 @@ impl Flow<'_> {
                 ));
             }
             if !layers.is_empty() {
-                l.frag.kind = FragKind::TableCell(Box::new(layers));
+                l.frag.kind = FragKind::TableCell(layers.into_boxed_slice());
             }
             Flow::offset_frag(&mut l.frag, x, y);
             for (n, ay) in l.anchors {

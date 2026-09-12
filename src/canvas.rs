@@ -316,7 +316,7 @@ impl Canvas {
                 .presentation
                 .as_ref()
                 .map_or(0, crate::render::CanvasImage::retained_bytes)
-            + self.path.elements().len() * std::mem::size_of::<PathEl>()
+            + std::mem::size_of_val(self.path.elements())
             + self.stack.capacity() * std::mem::size_of::<State>()
             + self.state.clip.as_ref().map_or(0, |m| m.data().len())
             + self.document_origin.capacity()
@@ -909,7 +909,7 @@ impl Canvas {
         if !self.alpha
             && let Some(bitmap) = self.bitmap.as_mut()
         {
-            for pixel in bitmap.data_mut().chunks_exact_mut(4) {
+            for pixel in bitmap.data_mut().as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }
@@ -1027,7 +1027,7 @@ impl Canvas {
             return Some(bytes);
         }
         let mut out = Vec::with_capacity(bytes.len() * if half { 2 } else { 1 });
-        for pixel in bytes.chunks_exact(4) {
+        for pixel in bytes.as_chunks::<4>().0 {
             let rgb = convert(
                 [
                     pixel[0] as f32 / 255.,

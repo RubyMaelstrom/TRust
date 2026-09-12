@@ -32,12 +32,13 @@ impl ReferrerPolicy {
     }
 
     pub fn from_headers(headers: &[(String, String)]) -> Option<Self> {
+        // §8.1 keeps the last recognized policy across the header list.
         headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
             .flat_map(|(_, value)| value.split(','))
             .filter_map(|value| Self::parse(value.trim_matches([' ', '\t'])))
-            .last()
+            .next_back()
     }
 
     pub fn determine(self, source: &Url, destination: &Url) -> Option<Url> {
@@ -130,9 +131,9 @@ mod tests {
         assert_eq!(
             ReferrerPolicy::UnsafeUrl
                 .determine(&long, &same)
-                .unwrap()
-                .as_str(),
-            origin.unwrap()
+                .as_ref()
+                .map(Url::as_str),
+            origin
         );
         let loopback = Url::parse("http://127.0.0.1:1234/").unwrap();
         assert!(
