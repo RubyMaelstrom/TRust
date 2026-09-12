@@ -55,6 +55,15 @@ fully supported through a CSS-pixel-to-cell adapter. Tests and developer tools
 can render the identical page pipeline without a window through
 `trust::render::headless`.
 
+Starting `trust-desktop` without an address opens COMMAND; providing an address
+goes straight to the page. COMMAND floats over the page without changing HTML
+layout or the viewport reported to JavaScript. Its console shows response and
+viewport details, with additional document and image-cache readouts when space
+permits. Image-cache RAM uses the existing decoded-pixel byte counter; it
+excludes browser chrome, GPU copies, and other page allocations. Reading it
+adds no background reporting, heap measurement, or refresh timer.
+Ctrl+L opens COMMAND with the current address selected.
+
 ## JavaScript engine
 
 Lumen is the sole JavaScript engine for the terminal, desktop, and headless
