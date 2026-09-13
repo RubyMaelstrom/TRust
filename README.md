@@ -94,6 +94,8 @@ trust <host> [port]          # telnet (port may be a name: smtp, nntp, ...)
 trust gemini://gem.sdf.org   # or gopher://, gophers://, http(s)://, finger://, ...
 trust                        # start at the command prompt
 trust-desktop https://example.com  # native graphical browser
+trust-desktop /path/to/image.png   # local file path
+trust-desktop file:///path/to/page.html  # explicit file URL
 trust-desktop --renderer=auto https://example.com    # default: Hybrid, then CPU fallback
 trust-desktop --renderer=cpu https://example.com     # force reference/software rendering
 trust-desktop --renderer=hybrid https://example.com  # require a present-capable GPU adapter
@@ -121,6 +123,36 @@ current Vello-specific limitations.
 Developer diagnostics, benchmark inputs, ignored live-site gates, and their
 environment-variable reference are collected in
 [`DIAGNOSTICS.md`](DIAGNOSTICS.md).
+
+### Local files
+
+All frontends accept absolute paths, explicit `./` or `../` paths, existing
+relative files, and `file:` URLs. For example:
+
+```sh
+target/release/trust-desktop ~/Pictures/IdleHeart.png
+target/release/trust-desktop "./Pictures/Idle Heart.png"
+target/release/trust file:///home/ruby/Documents/page.html
+```
+
+Paths are converted to URLs with proper escaping; a filename's literal `#`,
+`?`, or `%` is not mistaken for URL syntax. In an explicit file URL, use
+percent-encoding for those filename characters; queries and fragments are
+not part of the filesystem path. The command prompt also accepts whole
+paths containing spaces, with or without `open`.
+
+Local HTML can load relative images, stylesheets (including imports), classic
+scripts, and frames. File documents have opaque origins: Fetch/XHR, modules,
+web fonts, and other CORS-dependent resources need an HTTP(S) origin instead.
+Standalone and inline SVG work; external `file:` SVG sprite references are
+restricted to keep local data out of the shared sprite cache.
+Web pages cannot read or navigate into local files. Local bookmarks and direct
+user navigation remain available.
+
+Only an empty file-URL host or `localhost` is accepted; other authorities are
+not resolved or mounted. Reading uses ordinary filesystem permissions and is
+limited to regular files of at most 512 MiB. Directories, special files, and
+methods other than GET return an error; opening a file never writes to it.
 
 ## Driving it
 
