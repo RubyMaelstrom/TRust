@@ -1811,6 +1811,11 @@ mod desktop {
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(dom.clone(), clock.clone());
         state.base = base.clone();
+        // HTML #document-base-url affects resolution, never the initiating
+        // environment's identity. Retain the top Window just like child
+        // Windows: otherwise a relative base is applied twice to images,
+        // and a remote page's <base href=file:...> could grant file access.
+        state.window_request_urls.insert(0, response_url.clone());
         state.storage = env.storage.clone().unwrap_or_default();
         state.blobs = env.blobs.clone();
         state.viewport.set(viewport);
@@ -2020,10 +2025,16 @@ mod desktop {
             ));
         }
         let resolved = base.join(src).ok()?;
+        let client = url::Url::parse(&env.url).ok()?;
+        if !matches!(resolved.scheme(), "http" | "https" | "file")
+            || !crate::http::subresource_allowed(&client, &resolved)
+        {
+            return None;
+        }
         if (env.net.is_none()
             || env
                 .cache
-                .peek_resource(&resolved, base, "script", credentials)
+                .peek_resource(&resolved, &client, "script", credentials)
                 .is_some())
             && let Some(body) = env
                 .externals
@@ -2045,10 +2056,10 @@ mod desktop {
         let handle = env.net.as_ref()?;
         let fetch = env
             .cache
-            .peek_resource(&resolved, base, "script", credentials)
+            .peek_resource(&resolved, &client, "script", credentials)
             .unwrap_or_else(|| {
                 env.cache
-                    .fetch_resource(handle, resolved.clone(), base, "script", credentials)
+                    .fetch_resource(handle, resolved.clone(), &client, "script", credentials)
             });
         let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
         crate::http::classic_script_response_allowed(
@@ -2531,6 +2542,7 @@ mod desktop {
     /// cache and request policy identical to the other required Lumen subresource paths.
     fn prime_page_svg_sprites(page: &mut LumenPage) {
         let urls = page.dom.borrow().external_svg_use_sheets(&page.base);
+        let client = request_context_url(page.engine.ctx(), 0);
         for url in urls {
             if crate::dom::sprite_sheet_cached(url.as_str()) {
                 continue;
@@ -2538,14 +2550,12 @@ mod desktop {
             let prepared = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
                 let network = state.network.as_ref()?;
                 if !matches!(url.scheme(), "http" | "https")
-                    || !crate::http::subresource_allowed(&state.base, &url)
+                    || !crate::http::subresource_allowed(&client, &url)
                 {
                     return None;
                 }
                 let shared = if let Some(shared) =
-                    network
-                        .cache
-                        .peek_resource(&url, &state.base, "image", None)
+                    network.cache.peek_resource(&url, &client, "image", None)
                 {
                     shared
                 } else {
@@ -2555,7 +2565,7 @@ mod desktop {
                     network.cache.fetch_resource(
                         &network.handle,
                         url.clone(),
-                        &state.base,
+                        &client,
                         "image",
                         None,
                     )
@@ -5422,7 +5432,7 @@ fn prepare_client_request(
 )> {
     let resolved = page.join(target).ok()?;
     let network = state.network.as_mut()?;
-    if !matches!(resolved.scheme(), "http" | "https")
+    if !matches!(resolved.scheme(), "http" | "https" | "file")
         || !crate::http::subresource_allowed(page, &resolved)
     {
         return None;

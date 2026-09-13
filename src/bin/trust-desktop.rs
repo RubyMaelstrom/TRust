@@ -2326,6 +2326,9 @@ impl DesktopApp {
             {
                 response.url.scheme().to_ascii_uppercase()
             }
+            Some(FetchedDocument::Http(response)) if response.url.scheme() == "file" => {
+                format!("FILE:{}", response.status)
+            }
             Some(FetchedDocument::Http(response)) => format!("HTTP:{}", response.status),
             Some(FetchedDocument::Gemini(response)) => format!("GEMINI:{}", response.status),
             Some(FetchedDocument::Gopher(_)) => {
@@ -4214,6 +4217,12 @@ impl DesktopApp {
                 }
             }
             "open" | "o" => {
+                let rest = command
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, rest)| rest.trim_start());
+                if self.navigate_local_input(rest) {
+                    return;
+                }
                 let Some(target) = parts.next() else {
                     self.browser.set_status("usage: open <host|url> [port]");
                     return;
@@ -4433,6 +4442,9 @@ impl DesktopApp {
                 self.request_redraw();
             }
             _ if trust::command::looks_like_address(&verb) => {
+                if self.navigate_local_input(command) {
+                    return;
+                }
                 let target = match parts.next() {
                     Some(value) => match trust::command::parse_port(value) {
                         Some(port) => command_target(&verb, Some(port)),
@@ -4448,11 +4460,26 @@ impl DesktopApp {
                 self.navigate(target);
             }
             _ => {
+                if self.navigate_local_input(command) {
+                    return;
+                }
                 let target = trust::command::search_url(command);
                 self.close_command();
                 self.navigate(target);
             }
         }
+    }
+
+    fn navigate_local_input(&mut self, input: &str) -> bool {
+        match trust::file::url_from_input(input) {
+            Ok(Some(url)) => {
+                self.close_command();
+                self.navigate(url.to_string());
+            }
+            Ok(None) => return false,
+            Err(error) => self.browser.set_status(error),
+        }
+        true
     }
 
     fn open_internal_page(&mut self, address: &str, source: Vec<u8>) {
@@ -6934,7 +6961,7 @@ fn parse_desktop_args(args: impl IntoIterator<Item = String>) -> Result<DesktopO
             return Err(format!("unknown option {argument:?}"));
         } else if options.address.replace(argument).is_some() {
             return Err(String::from(
-                "trust-desktop accepts at most one initial URL",
+                "trust-desktop accepts at most one initial URL or file path",
             ));
         }
     }
@@ -6946,7 +6973,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.help {
         println!(
-            "Usage: {} [--renderer=auto|cpu|hybrid] [URL]",
+            "Usage: {} [--renderer=auto|cpu|hybrid] [URL|FILE]",
             env!("CARGO_BIN_NAME")
         );
         return Ok(());

@@ -2530,22 +2530,31 @@ impl App {
                 }
                 None => self.status = String::from("No connection to close."),
             },
-            Some("open" | "o") => match parts.next() {
-                Some(host) => {
-                    let port = match parts.next() {
-                        Some(p) => match parse_port(p) {
-                            Some(p) => Some(p),
-                            None => {
-                                self.status = format!("bad port or service name: {p}");
-                                return;
-                            }
-                        },
-                        None => None,
-                    };
-                    self.dispatch_open(host, port);
+            Some("open" | "o") => {
+                let rest = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, rest)| rest.trim_start());
+                if self.dispatch_local_input(rest) {
+                    return;
                 }
-                None => self.status = String::from("usage: open <host> [port]"),
-            },
+                match parts.next() {
+                    Some(host) => {
+                        let port = match parts.next() {
+                            Some(p) => match parse_port(p) {
+                                Some(p) => Some(p),
+                                None => {
+                                    self.status = format!("bad port or service name: {p}");
+                                    return;
+                                }
+                            },
+                            None => None,
+                        };
+                        self.dispatch_open(host, port);
+                    }
+                    None => self.status = String::from("usage: open <host> [port]"),
+                }
+            }
             Some("post") => match parts.next().map(str::to_string) {
                 Some(target) => match http::parse_url(&target) {
                     Some(url) => {
@@ -2760,12 +2769,18 @@ impl App {
             // `open` had been typed (the address-bar habit). A schemeless
             // host with no port becomes https (falling back to http).
             Some(target) if crate::command::looks_like_address(target) => {
+                if self.dispatch_local_input(line.trim_start()) {
+                    return;
+                }
                 let port = parts.next().and_then(parse_port);
                 self.dispatch_open(target, port);
             }
             // Address-bar fallback: once command and URL/address recognition
             // have both failed, search the complete entered line.
             Some(_) => {
+                if self.dispatch_local_input(line.trim_start()) {
+                    return;
+                }
                 let target = crate::command::search_url(line.trim());
                 self.dispatch_open(&target, None);
             }
@@ -3034,6 +3049,9 @@ impl App {
             }
             return;
         }
+        if self.dispatch_local_input(target) {
+            return;
+        }
         if target.eq_ignore_ascii_case("about:bookmarks") {
             self.bookmark_command("bookmarks");
             return;
@@ -3146,6 +3164,19 @@ impl App {
         }
     }
 
+    /// Handle a whole local path before command parsing can split its spaces.
+    fn dispatch_local_input(&mut self, target: &str) -> bool {
+        match crate::file::url_from_input(target) {
+            Ok(Some(url)) => self.start_fetch(Link::Http(url)),
+            Ok(None) => return false,
+            Err(error) => {
+                self.status = error;
+                self.notice = true;
+            }
+        }
+        true
+    }
+
     /// Open a bare host as the web. With no port it's https with an http
     /// fallback (a bare hostname typed without a scheme — see
     /// `http::fetch_web_default`); port 443 is https, 80 or any other port is
@@ -3190,7 +3221,9 @@ impl App {
 
     /// The `Referer` source for a navigation that originates from the page on
     /// screen (a followed link, a form submit, a live-page navigation): the
-    /// current document's URL when it's a web page. None for any other source
+    /// current document's URL when it's an HTTP(S) or file page. The native
+    /// client is retained for authorization even when no Referer is sent.
+    /// None for any other source
     /// — a typed URL, the CLI, history back — which carry no referrer, and for
     /// a non-web current page (gopher/gemini have no referer concept).
     fn http_referrer(&self) -> Option<url::Url> {
@@ -3204,13 +3237,38 @@ impl App {
     /// target carries the page's Referer (browser default policy); a foreign
     /// scheme falls back to the plain address-bar dispatch (no referrer).
     fn navigate_from_page(&mut self, target: &str) {
-        match http::parse_url(target) {
+        if let Ok(Some(url)) = crate::file::url_from_input(target) {
+            if self.allow_page_file_navigation(&Link::Http(url.clone())) {
+                self.start_fetch_opts(Link::Http(url), false, self.http_referrer());
+            }
+            return;
+        }
+        match http::parse_url(target).or_else(|| crate::file::parse_url(target)) {
             Some(url) => {
+                if !self.allow_page_file_navigation(&Link::Http(url.clone())) {
+                    return;
+                }
                 let referrer = self.http_referrer();
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
             None => self.dispatch_open(target, None),
         }
+    }
+
+    fn allow_page_file_navigation(&mut self, target: &Link) -> bool {
+        if let Link::Http(url) = target
+            && url.scheme() == "file"
+            && !self.browser.as_ref().is_some_and(|page| {
+                // Bookmarks are trusted browser UI, not a web document.
+                matches!(&page.doc.url, Link::External(address) if address == "about:bookmarks")
+                    || matches!(&page.doc.url, Link::Http(client) if crate::file::allowed_from(client, url))
+            })
+        {
+            self.status = String::from("Local file navigation blocked for this document.");
+            self.notice = true;
+            return false;
+        }
+        true
     }
 
     /// Fetch a document in the background. With `fallback_http`, an https web
@@ -5761,7 +5819,9 @@ impl App {
             // current history slot rather than retaining the intermediary.
             self.replace_nav = replace;
             if reload {
-                if let Some(target) = http::parse_url(&url) {
+                if let Some(target) = http::parse_url(&url).or_else(|| crate::file::parse_url(&url))
+                    && self.allow_page_file_navigation(&Link::Http(target.clone()))
+                {
                     self.start_fetch_with_timing(
                         Link::Http(target),
                         false,
@@ -7886,6 +7946,9 @@ impl App {
     }
 
     fn browser_follow_link(&mut self, link: Link) {
+        if !self.allow_page_file_navigation(&link) {
+            return;
+        }
         if let Some(action) = crate::dict::Action::from_link(&link) {
             let Some(g) = &mut self.browser else {
                 return;
@@ -8418,8 +8481,12 @@ impl App {
         };
         let query = form.encode(submitter);
         let action = form.action.clone();
+        let method = form.method;
+        if !self.allow_page_file_navigation(&Link::Http(action.clone())) {
+            return;
+        }
         let referrer = self.http_referrer();
-        match form.method {
+        match method {
             FormMethod::Get => {
                 let mut url = action;
                 url.set_query((!query.is_empty()).then_some(query.as_str()));
@@ -8436,6 +8503,9 @@ impl App {
         let Ok(mut action) = url::Url::parse(&submission.action) else {
             return;
         };
+        if !self.allow_page_file_navigation(&Link::Http(action.clone())) {
+            return;
+        }
         let referrer = self.http_referrer();
         match submission.method.as_str() {
             "post" => self.start_post(action, submission.body, referrer),
@@ -8992,7 +9062,7 @@ async fn load_one_image(
             has_alpha,
         });
     }
-    let parsed = http::parse_url(url)?;
+    let parsed = http::parse_url(url).or_else(|| crate::file::parse_url(url))?;
     if !http::subresource_allowed(page, &parsed) {
         return None;
     }
@@ -15182,6 +15252,55 @@ mod tests {
             ),
             "got: {}",
             app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn file_terminal_commands_preserve_spaces_and_page_navigation_is_not_a_user_grant() {
+        use url::Url;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Idle Heart.PNG");
+        std::fs::write(&path, include_bytes!("assets/IdleHeart30.png")).unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+        let mut app = super::App::new(None, 23);
+        let mut doc = gopher_doc("remote page");
+        doc.url = Link::Http(Url::parse("https://example.test/").unwrap());
+        app.navigate_to(doc);
+        app.browser_follow_link(Link::Http(url.clone()));
+        assert!(
+            app.status.contains("Local file navigation blocked"),
+            "{}",
+            app.status
+        );
+        assert!(!app.loading());
+        app.navigate_from_page(path.to_str().unwrap());
+        assert!(!app.loading());
+        for command in [
+            path.display().to_string(),
+            format!("open {}", path.display()),
+            url.to_string(),
+        ] {
+            app.execute_command(&command).await;
+            assert!(
+                app.status.starts_with(&format!("Fetching {url}")),
+                "{}",
+                app.status
+            );
+            assert!(app.loading());
+        }
+        let local_page = url.join("index.html").unwrap();
+        let decoded = super::load_one_image(&local_page, url.as_str(), None)
+            .await
+            .expect("terminal local image decodes");
+        assert!(!decoded.raw.is_empty());
+        assert!(
+            super::load_one_image(
+                &Url::parse("https://example.test/").unwrap(),
+                url.as_str(),
+                None
+            )
+            .await
+            .is_none()
         );
     }
 

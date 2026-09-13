@@ -9165,6 +9165,14 @@ const MAX_SPRITE_SHEETS: usize = 16;
 /// `rewrite_inline_svgs` then reads the table. Idempotent: an already-primed
 /// URL is left alone (the sheet is immutable for the session).
 pub fn prime_sprite_sheet(abs_url: &str, text: &str) {
+    // SVG 2 linking.html#processingURL permits UA security restrictions.
+    // This process-wide cache has no document provenance: accepting file
+    // symbols here would let a later web document reuse private local data
+    // without passing the file transport's client check. Keep external file
+    // sprites disabled; standalone/inline SVG uses the normal image path.
+    if crate::file::parse_url(abs_url).is_some() {
+        return;
+    }
     {
         let sheets = SPRITE_SHEETS.lock().unwrap();
         if sheets.contains_key(abs_url) || sheets.len() >= MAX_SPRITE_SHEETS {
@@ -14913,6 +14921,25 @@ mod tests {
         let (raster, _) = crate::img::decode(&crate::img::decode_data_url(&source).unwrap())
             .expect("resolved use rasterizes");
         assert!(raster.to_rgba8().pixels().any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn file_svg_sprites_cannot_leak_through_the_process_cache() {
+        let url = "file:///tmp/trust-private-symbols.svg";
+        prime_sprite_sheet(
+            url,
+            r#"<svg><symbol id="private"><path d="M1 1h2v2z"/></symbol></svg>"#,
+        );
+        assert!(!sprite_sheet_cached(url));
+        assert!(sprite_symbol_markup(url, "private").is_none());
+        let dom = Dom::parse_document(
+            r#"<svg id="icon"><use href="file:///tmp/trust-private-symbols.svg#private"/></svg>"#,
+        );
+        let base = url::Url::parse("https://example.test/").unwrap();
+        assert!(
+            dom.svg_image_data(dom.get_by_id("icon").unwrap(), Some(&base))
+                .is_none()
+        );
     }
 
     #[test]

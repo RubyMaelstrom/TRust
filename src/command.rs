@@ -134,7 +134,7 @@ pub fn looks_like_host(value: &str) -> bool {
 ///
 /// This mirrors the WHATWG URL Standard's scheme start/scheme states: an
 /// ASCII letter, followed by ASCII alphanumerics or `+`, `-`, `.`, then `:`.
-fn has_url_scheme(value: &str) -> bool {
+pub(crate) fn has_url_scheme(value: &str) -> bool {
     let Some((scheme, _)) = value.split_once(':') else {
         return false;
     };
@@ -146,7 +146,11 @@ fn has_url_scheme(value: &str) -> bool {
 /// Whether a bare COMMAND token should be handled as an address instead of a
 /// search query.
 pub fn looks_like_address(value: &str) -> bool {
-    has_url_scheme(value) || looks_like_host(value)
+    has_url_scheme(value)
+        || looks_like_host(value)
+        || value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
 }
 
 /// Build the DuckDuckGo Lite URL used when a COMMAND line is neither a
@@ -395,6 +399,8 @@ mod tests {
         assert!(looks_like_address("https://example.com/path"));
         assert!(looks_like_address("mailto:user@example.com"));
         assert!(looks_like_address("web+demo:value"));
+        assert!(looks_like_address("/tmp/image.png"));
+        assert!(looks_like_address("../image.png"));
         assert!(!looks_like_address("rust ownership"));
         assert!(!looks_like_address("1invalid:value"));
         assert_eq!(parse_port("gemini"), Some(1965));

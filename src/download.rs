@@ -179,13 +179,17 @@ pub fn computed_mime_type(response: &http::Response) -> String {
     if no_sniff {
         return supplied.unwrap();
     }
-    if matches!(
-        response.content_type.as_str(),
-        "text/plain"
-            | "text/plain; charset=ISO-8859-1"
-            | "text/plain; charset=iso-8859-1"
-            | "text/plain; charset=UTF-8"
-    ) {
+    // MIME Sniffing §5.1 only sets the Apache-bug flag for HTTP metadata,
+    // not for a filesystem MIME association that happens to be text/plain.
+    if matches!(response.url.scheme(), "http" | "https")
+        && matches!(
+            response.content_type.as_str(),
+            "text/plain"
+                | "text/plain; charset=ISO-8859-1"
+                | "text/plain; charset=iso-8859-1"
+                | "text/plain; charset=UTF-8"
+        )
+    {
         return distinguish_text_or_binary(&response.body).to_string();
     }
     supplied.unwrap()

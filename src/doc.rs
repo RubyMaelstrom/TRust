@@ -15,6 +15,8 @@ use crate::gopher::GopherUrl;
 pub enum Link {
     Gopher(GopherUrl),
     Gemini(GeminiUrl),
+    /// HTTP(S) or local `file:` document/resource URLs. Both use the shared
+    /// HTML, MIME, image, and download pipeline after transport dispatch.
     Http(url::Url),
     /// finger:// or whois:// one-shot queries.
     OneShot(crate::oneshot::OneShotUrl),

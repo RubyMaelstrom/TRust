@@ -45,6 +45,7 @@ pub mod cp437;
 pub mod doc;
 pub mod dom;
 pub mod download;
+pub mod file;
 mod font_system;
 pub mod gemini;
 pub mod gopher;

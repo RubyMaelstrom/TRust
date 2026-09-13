@@ -11,6 +11,7 @@
     const documentContentTypes = new WeakMap();
     const documentURLs = new WeakMap();
     const frameNavigationURLs = new WeakMap();
+    const frameBlobOrigins = new WeakMap();
     const frameResourceTimings = new WeakMap();
     const configuredReferrer = typeof cfg.referrer === "string" ? cfg.referrer : "";
     const navigateDocument = g.__http_navigate;
@@ -760,6 +761,7 @@
     function destroyFrameNavigable(frame) {
         if (!frame) return;
         frameNavigationURLs.delete(frame);
+        frameBlobOrigins.delete(frame);
         let descendants = [];
         try { descendants = frame.querySelectorAll("iframe, frame"); } catch (e) {}
         for (let i = descendants.length - 1; i >= 0; i--)
@@ -1739,10 +1741,19 @@
     function stripFragment(u) { const i = u.indexOf("#"); return i < 0 ? u : u.slice(0, i); }
     // A frame URL is same-origin with the page (about:blank/about:srcdoc
     // inherit the parent origin, so they count as same-origin).
-    function frameSameOrigin(url) {
+    function frameSameOrigin(url, frame) {
         if (!url || url === "about:srcdoc" || url === "about:blank") return true;
+        const own = windowMessageState(g);
+        const blobOrigin = frame && frameBlobOrigins.get(frame);
+        // URL #concept-url-origin / File API #url-model: a resolved Blob
+        // retains its creator's actual origin, including opaque identity.
+        if (blobOrigin && blobOrigin.url === url)
+            return !!(own && blobOrigin.originKey === own.originKey);
         const u = __url_parse(url, g.location.href);
-        return u ? u[8] === g.location.origin : false;
+        // HTML #same-origin / URL #concept-url-origin: distinct opaque file
+        // origins both serialize as "null", but are not the same origin.
+        // about:blank/srcdoc inherit an origin, not their URL's "null".
+        return !!(own && u && u[8] !== "null" && u[8] === own.origin);
     }
     // Shared attribute processing steps, step 3 — circular-navigation guard: a
     // frame must not load a URL already held by one of its inclusive ancestor
@@ -1883,6 +1894,14 @@
             trust.errors.push("Window Realm: " + ((e && e.message) || e));
         }
         if (!childWindow || !childWindow.__trust) return null;
+        const blobOrigin = frameBlobOrigins.get(frame);
+        if (blobOrigin && blobOrigin.url === frameUrl) {
+            const child = windowMessageState(childWindow);
+            if (child) {
+                child.origin = blobOrigin.origin;
+                child.originKey = blobOrigin.originKey;
+            }
+        }
         frame.__contentRealmWindow = childWindow;
         frame.__contentDoc = childWindow.document;
         rememberFrameViewport(frame, childWindow.innerWidth, childWindow.innerHeight);
@@ -1923,12 +1942,13 @@
     }
     function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "", contentType = "text/html", navigationTiming = null) {
         if (navigationTiming) navigationTiming['legacy:domLoading'] = navigationFloorTime(__clockNow());
+        if (frameBlobOrigins.get(frame)?.url !== frameUrl) frameBlobOrigins.delete(frame);
         frameReferrers.set(frame, referrer);
         ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
         const initialWindow = frame.__trustInitialAboutBlank
             ? frame.__contentRealmWindow : null;
         const reuseInitialWindow = !!(initialWindow && initialWindow.__trust &&
-            frameSameOrigin(frameUrl));
+            frameSameOrigin(frameUrl, frame));
         if (initialWindow) framesWithNonInitialDocuments.add(frame);
         if (!reuseInitialWindow) resetFrameWindowState(frame);
         frame.__trustInitialAboutBlank = false;
@@ -2140,6 +2160,7 @@
             const entry = capturedURL
                 ? __blobURLParts(capturedURL.blob) : __resolveBlobURL(url);
             if (entry) {
+                frameBlobOrigins.set(frame, { url, origin: entry.origin, originKey: entry.originKey });
                 const text = new g.TextDecoder().decode(__latin1ToBytes(entry.bytes));
                 loadFrameResource(frame, text, entry.type || "text/plain", url, generation);
             } else {
@@ -2154,9 +2175,11 @@
             loadFrameMarkup(frame, "", nodeBaseHref(frame), "about:blank", generation);
             return;
         }
-        if (!/^https?:/i.test(url)) { frame.__loadedSrc = undefined; return; }
+        // File navigation shares the native document loader; it retains the
+        // real document client and rejects non-local callers before I/O.
+        if (!/^(?:https?|file):/i.test(url)) { frame.__loadedSrc = undefined; return; }
         if (frameAncestorHasUrl(frame, url)) return; // circular-navigation guard
-        ftrace("processIframeAttributes https src=" + url);
+        ftrace("processIframeAttributes resource src=" + url);
         frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
         const generation = beginFrameLoad(frame, url);
         let r;
@@ -6367,7 +6390,7 @@
             get() {
                 if (!this.isConnected) return null;
                 ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
-                if (this.__frameUrl && !frameSameOrigin(this.__frameUrl)) return null;
+                if (this.__frameUrl && !frameSameOrigin(this.__frameUrl, this)) return null;
                 if (this.__contentRealmWindow) return this.__contentRealmWindow.document;
                 return frameDocument(this);
             } });
@@ -6376,7 +6399,7 @@
                 if (!this.isConnected) return null;
                 ensureFrameProcessed(this);
                 if (this.__contentRealmWindow &&
-                    (!this.__frameUrl || frameSameOrigin(this.__frameUrl))) {
+                    (!this.__frameUrl || frameSameOrigin(this.__frameUrl, this))) {
                     return this.__contentRealmWindow;
                 }
                 if (!this.__contentWin) {
@@ -7227,7 +7250,8 @@
         const href = parentLocation && parentLocation.href || g.location.href;
         const child = __url_parse(inherited ? href : raw, href);
         const parent = __url_parse(href, href);
-        return !!(child && parent && child[8] === parent[8]);
+        return !!(child && parent && (inherited ||
+            (child[8] !== "null" && child[8] === parent[8])));
     }
     // A Window owns its AnimationFrameProvider methods. Until Lumen-backed
     // nested navigables receive independent engine globals, preserve these
@@ -8678,7 +8702,12 @@
         sheet.__children.push(...buildRules(parseCss(text)));
         for (const rule of sheet.__children) attachCssRule(rule, null, sheet);
         if (owner?.localName === "link") {
-            try { sheet.__clean = new URL(owner.href).origin === new URL(owner.ownerDocument.URL).origin; }
+            try {
+                const origin = new URL(owner.href).origin;
+                // CSSOM origin-clean / HTML link processing: no-CORS file
+                // sheets can render, but their rules are not script-readable.
+                sheet.__clean = origin !== "null" && origin === new URL(owner.ownerDocument.URL).origin;
+            }
             catch (_) { sheet.__clean = false; }
         }
         return sheet;
@@ -9766,7 +9795,7 @@
                     seenNames.add(name);
                     // First named child wins even if a later same-origin child
                     // has the same name. Cross-origin child names are filtered.
-                    if (frameSameOrigin(frameURLFor(element))) namedFrames.set(name, element);
+                    if (frameSameOrigin(frameURLFor(element), element)) namedFrames.set(name, element);
                 }
             }
             const id = element.getAttribute('id');
@@ -12775,7 +12804,7 @@
     }
     // --- Blob URL store (File API §"Creating and Revoking a blob URL") ---
     // RAM-only, page-lifetime, per-realm: a map from a minted `blob:` URL string
-    // to its Blob object, kept entirely in this JS realm — zero I/O, like the rest
+    // to its Blob object and private creator origin, kept in this realm — zero I/O, like the rest
     // of TRust's web storage. `createObjectURL` mints a spec-shaped URL + stores
     // the object; `revokeObjectURL` drops it; `fetch`/XHR below resolve a `blob:`
     // URL straight from the store WITHOUT touching the network syscall (a blob URL
@@ -12812,13 +12841,14 @@
         const h = u.indexOf("#"); const key = h >= 0 ? u.slice(0, h) : u;
         return __blobURLParts(__blobURLStore[key]);
     }
-    function __blobURLParts(obj) {
-        if (!obj) return null;
+    function __blobURLParts(entry) {
+        if (!entry) return null;
+        const obj = entry.object;
         // Only Blob-shaped entries carry retrievable bytes; an unmodeled MediaSource
         // still mints a URL but yields no media here (no media pipeline — a
         // documented terminal deviation: we delegate playback to mpv).
-        if (Array.isArray(obj.__parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
-        return { bytes: "", type: "" };
+        return { bytes: Array.isArray(obj.__parts) ? __blobBytes(obj) : "", type: obj.type || "",
+            origin: entry.origin, originKey: entry.originKey };
     }
     class URL {
         // A WHATWG URL is a LIVE object: assigning any component re-serializes
@@ -12865,9 +12895,12 @@
         // `blob:<origin>/<uuid>`; the store is RAM-only (above).
         static createObjectURL(obj) {
             if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
-            const origin = (g.location && g.location.origin) || "null";
+            // File API #unicodeBlobURL uses the settings object's origin,
+            // not Location.origin (about:srcdoc/blank URLs are opaque).
+            const owner = windowMessageState(g);
+            const origin = owner ? owner.origin : "null";
             const u = "blob:" + (origin || "null") + "/" + g.crypto.randomUUID();
-            __blobURLStore[u] = obj;
+            __blobURLStore[u] = { object: obj, origin, originKey: owner ? owner.originKey : Symbol() };
             // Mirror the bytes Rust-side so the APP can decode an
             // `<img src="blob:…">` (Steam's client-generated QR code); only
             // Blob-shaped objects carry bytes (a MediaSource mints a URL but

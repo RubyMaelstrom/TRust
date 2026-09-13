@@ -1164,7 +1164,7 @@ impl BrowserController {
                 CoreEvent::DeclarativeRefresh { generation, url } => {
                     if generation == self.document_generation {
                         self.declarative_refresh_task = None;
-                        self.begin_fetch(Link::Http(url), false, NavigationIntent::Replace);
+                        self.begin_page_fetch(Link::Http(url), false, NavigationIntent::Replace);
                         changed = true;
                     }
                 }
@@ -1195,6 +1195,31 @@ impl BrowserController {
             }
         }
         true
+    }
+
+    fn begin_page_address(&mut self, address: &str, intent: NavigationIntent) -> bool {
+        match parse_navigation_target(address) {
+            Ok((target, fallback)) => self.begin_page_fetch(target, fallback, intent),
+            Err(error) => self.status = error,
+        }
+        true
+    }
+
+    /// A document-directed navigation is not an address-bar filesystem grant.
+    /// Keep this check before retiring the current page or starting any I/O.
+    fn begin_page_fetch(&mut self, target: Link, fallback: bool, intent: NavigationIntent) {
+        if let Link::Http(url) = &target
+            && url.scheme() == "file"
+            && !self.current.as_ref().is_some_and(|page| {
+                (matches!(&page.document, FetchedDocument::Internal(_))
+                    && matches!(&page.target, Link::External(address) if address == "about:bookmarks"))
+                    || matches!(&page.target, Link::Http(client) if crate::file::allowed_from(client, url))
+            })
+        {
+            self.status = String::from("Local file navigation blocked for this document.");
+            return;
+        }
+        self.begin_fetch(target, fallback, intent);
     }
 
     /// Small-net Back/Forward is local while its bounded source is retained.
@@ -2173,7 +2198,7 @@ impl BrowserController {
                 self.begin_fetch(Link::External(url), false, NavigationIntent::New)
             }
             Link::External(url) => self.status = format!("External target: {url}"),
-            target => self.begin_fetch(target, false, NavigationIntent::New),
+            target => self.begin_page_fetch(target, false, NavigationIntent::New),
         }
         true
     }
@@ -2261,9 +2286,11 @@ impl BrowserController {
                 }
                 true
             }
-            PageEvt::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
-            PageEvt::Reload(address) => self.begin_address(&address, NavigationIntent::Reload),
-            PageEvt::Replace(address) => self.begin_address(&address, NavigationIntent::Replace),
+            PageEvt::Navigate(address) => self.begin_page_address(&address, NavigationIntent::New),
+            PageEvt::Reload(address) => self.begin_page_address(&address, NavigationIntent::Reload),
+            PageEvt::Replace(address) => {
+                self.begin_page_address(&address, NavigationIntent::Replace)
+            }
             PageEvt::HistoryUpdate { url, replace } => {
                 self.apply_same_document_history_update(&url, replace)
             }
@@ -2371,7 +2398,7 @@ impl BrowserController {
             FormMethod::Get => {
                 let mut target = form.action;
                 target.set_query((!body.is_empty()).then_some(body.as_str()));
-                self.begin_fetch(Link::Http(target), false, NavigationIntent::New);
+                self.begin_page_fetch(Link::Http(target), false, NavigationIntent::New);
             }
             FormMethod::Post => self.begin_post(form.action, body),
         }
@@ -2386,7 +2413,7 @@ impl BrowserController {
             self.begin_post(action, submission.body);
         } else if !submission.method.eq_ignore_ascii_case("dialog") {
             action.set_query((!submission.body.is_empty()).then_some(&submission.body));
-            self.begin_fetch(Link::Http(action), false, NavigationIntent::New);
+            self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New);
         }
     }
 
@@ -2669,7 +2696,11 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
         }
         FetchedDocument::Http(response) => {
             let media = response.content_type.split(';').next().unwrap_or("").trim();
-            format!("{} — HTTP {} ({media})", response.url, response.status)
+            if response.url.scheme() == "file" {
+                format!("{} — local file ({media})", response.url)
+            } else {
+                format!("{} — HTTP {} ({media})", response.url, response.status)
+            }
         }
         FetchedDocument::Gemini(response) => {
             format!(
@@ -2706,6 +2737,9 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
 /// Parse a typed navigation target into a fetchable protocol target. A bare host is
 /// HTTPS with HTTP fallback, matching the existing terminal address behavior.
 pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
+    if let Some(url) = crate::file::url_from_input(address)? {
+        return Ok((Link::Http(url), false));
+    }
     if let Some((host, port, tls)) = crate::command::telnet_target(address) {
         return Ok((Link::Telnet { host, port, tls }, false));
     }
@@ -3680,6 +3714,15 @@ mod tests {
         assert!(matches!(gopher, Link::Gopher(_)));
         assert!(!fallback);
 
+        let (local, fallback) = parse_navigation_target("/tmp/IdleHeart.png").unwrap();
+        assert!(!fallback);
+        assert!(
+            matches!(local, Link::Http(url) if url.scheme() == "file" && url.path() == "/tmp/IdleHeart.png")
+        );
+        let (file_url, fallback) = parse_navigation_target("file:///tmp/IdleHeart.png").unwrap();
+        assert!(!fallback);
+        assert!(matches!(file_url, Link::Http(url) if url.scheme() == "file"));
+
         assert!(matches!(
             parse_navigation_target("telnet://example.com"),
             Ok((
@@ -3756,6 +3799,83 @@ mod tests {
         )));
         assert!(browser.snapshot().loading);
         assert!(browser.take_external_media().is_none());
+    }
+
+    #[tokio::test]
+    async fn file_desktop_navigation_distinguishes_user_input_from_document_requests() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Idle Heart.PNG");
+        std::fs::write(&path, include_bytes!("../assets/IdleHeart30.png")).unwrap();
+        let target = url::Url::from_file_path(&path).unwrap();
+        let mut browser = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(640.0, 480.0),
+        );
+        let remote = Link::Http(url::Url::parse("https://example.test/").unwrap());
+        browser.current = Some(BrowserPage {
+            target: remote.clone(),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: "Ready".into(),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        });
+        browser.activate(Link::Http(target.clone()));
+        assert!(!browser.snapshot().loading);
+        assert!(
+            browser
+                .snapshot()
+                .status
+                .contains("Local file navigation blocked")
+        );
+        for event in [
+            crate::js::PageEvt::Navigate(target.to_string()),
+            crate::js::PageEvt::Replace(target.to_string()),
+            crate::js::PageEvt::Reload(target.to_string()),
+        ] {
+            browser.handle_page_event(event);
+            assert!(!browser.snapshot().loading);
+            assert_eq!(browser.current_page().unwrap().target, remote);
+        }
+        // The exact desktop CLI path -> Navigate route is a user grant.
+        browser.handle_action(UserAction::Navigate(path.display().to_string()));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                browser.process_async_events();
+                if !browser.snapshot().loading {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let page = browser.current_page().unwrap();
+        assert_eq!(
+            page.target,
+            Link::Http(target.clone()),
+            "{}",
+            browser.snapshot().status
+        );
+        let FetchedDocument::Http(response) = &page.document else {
+            panic!("file image document")
+        };
+        assert_eq!(response.url, target);
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(
+            page.rendered_page().is_some(),
+            "local image has a graphical document"
+        );
+        browser.open_internal_gemtext("about:bookmarks", Vec::new());
+        browser.activate(Link::Http(target));
+        assert!(
+            browser.snapshot().loading,
+            "trusted bookmarks remain a user grant"
+        );
+        browser.stop();
     }
 
     #[test]
