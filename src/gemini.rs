@@ -85,6 +85,9 @@ pub fn absolute_link(target: &str) -> Option<Link> {
     if let Some(url) = crate::gopher::GopherUrl::parse(target) {
         return Some(Link::Gopher(url));
     }
+    if let Some(url) = crate::file::parse_url(target) {
+        return Some(Link::Http(url));
+    }
     if let Some(url) = crate::http::parse_url(target) {
         return Some(Link::Http(url));
     }

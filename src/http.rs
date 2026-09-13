@@ -1582,7 +1582,8 @@ async fn fetch_redirecting(
                     let origin = response.url.origin().ascii_serialization();
                     let all_same_origin =
                         url_list.iter().all(|url| same_origin(url, &response.url));
-                    timing.navigation_cross_origin_redirect = !all_same_origin;
+                    timing.navigation_cross_origin_redirect =
+                        url_list.len() > 1 && !all_same_origin;
                     let navigation_tao = can_use_navigation_tao
                         && navigation_tao_values.iter().all(|values| {
                             values.iter().any(|value| value == "*" || value == &origin)
@@ -2407,8 +2408,15 @@ pub(crate) fn download_referrer(source: &Url, target: &Url) -> Option<String> {
 }
 
 async fn fetch_once(request: &Request) -> Result<Response, String> {
-    let mut timing = crate::performance::FetchTiming::new();
     let url = &request.url;
+    if url.scheme() == "file" {
+        // Fetch includes `file` in its fetch-scheme set but leaves the
+        // dereference algorithm to the user agent. WHATWG URL's file state
+        // plus RFC 8089 §§2–3 are implemented by the local adapter; never
+        // send a file URL through the HTTP authority/dial path.
+        return crate::file::fetch(request).await;
+    }
+    let mut timing = crate::performance::FetchTiming::new();
     let host = url.host_str().ok_or("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(80);
     let key: PoolKey = (url.scheme().to_string(), host.clone(), port);
@@ -3531,7 +3539,10 @@ pub(crate) async fn execute_js_for_window(
             let resolved = doc_base
                 .join(&job.source)
                 .ok()
-                .filter(|u| matches!(u.scheme(), "http" | "https"))
+                .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+                // File symbols must not enter the origin-unpartitioned SVG
+                // sprite cache (see dom::prime_sprite_sheet).
+                .filter(|u| !matches!(job.kind, Kind::Sprite) || u.scheme() != "file")
                 .filter(|u| subresource_allowed(&page_url, u));
             let resp = match &resolved {
                 Some(u) => {
@@ -3806,22 +3817,24 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
 /// Fetch every external stylesheet a page declares concurrently, returning
 /// `(href, css)` in document order. The request pool bounds simultaneous I/O;
 /// no arbitrary declaration-count cutoff is applied to the cascade.
-async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
+async fn fetch_page_sheets(html: &str, page_url: &Url) -> Vec<(String, String)> {
+    let base = base_with_doc_base(html, page_url);
     let jobs = crate::js::external_resources(html)
         .into_iter()
         .filter(|job| job.kind == crate::js::ExternalResourceKind::Sheet);
     let fetched = futures::stream::iter(jobs.map(|job| {
         let base = base.clone();
+        let page_url = page_url.clone();
         async move {
             let resolved = base
                 .join(&job.source)
                 .ok()
-                .filter(|u| matches!(u.scheme(), "http" | "https"))
-                .filter(|u| subresource_allowed(&base, u));
+                .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+                .filter(|u| subresource_allowed(&page_url, u));
             let resp = match &resolved {
                 Some(u) => fetch(&Request::subresource(
                     u.clone(),
-                    &base,
+                    &page_url,
                     "style",
                     job.cors_credentials(),
                 ))
@@ -3846,7 +3859,6 @@ async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
         ))
     })
     .collect::<Vec<_>>();
-    let page_url = base.clone();
     futures::stream::iter(fetched.into_iter().map(|(raw, url, css)| {
         let page_url = page_url.clone();
         async move {
@@ -3908,7 +3920,7 @@ fn expand_stylesheet_imports(
             let Some(url) = sheet_url
                 .join(&import.url)
                 .ok()
-                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
                 .filter(|url| subresource_allowed(&page_url, url))
             else {
                 continue;
@@ -4409,7 +4421,8 @@ fn document_font_faces(
                 .into_iter()
                 .filter_map(|source| document_base.join(&source).ok())
                 .filter(|url| {
-                    matches!(url.scheme(), "http" | "https") && subresource_allowed(page_url, url)
+                    matches!(url.scheme(), "http" | "https" | "file")
+                        && subresource_allowed(page_url, url)
                 })
                 .collect::<Vec<_>>();
             (!sources.is_empty()).then_some((face.family, sources))
@@ -4708,7 +4721,7 @@ fn base_with_doc_base(html: &str, doc_url: &Url) -> Url {
 /// `None` means "don't load".
 fn resolve_frame_src(src: &str, base: &Url, page_url: &Url, ancestors: &[String]) -> Option<Url> {
     let url = base.join(src.trim()).ok()?;
-    if !matches!(url.scheme(), "http" | "https" | "data") {
+    if !matches!(url.scheme(), "http" | "https" | "file" | "data") {
         return None;
     }
     if url.scheme() != "data" && !subresource_allowed(page_url, &url) {
@@ -4960,6 +4973,11 @@ pub(crate) fn is_ad_or_tracker_host(host: &str) -> bool {
 /// always fine (localhost dev included). Known ad/tracker networks are
 /// blocked outright (see `AD_TRACKER_HOSTS`).
 pub(crate) fn subresource_allowed(page: &Url, script: &Url) -> bool {
+    // A shared absent host is not an origin or filesystem permission. In
+    // particular, data:/about: documents must never inherit file access.
+    if script.scheme() == "file" {
+        return crate::file::allowed_from(page, script);
+    }
     if let Some(url::Host::Domain(d)) = script.host()
         && is_ad_or_tracker_host(d)
     {
@@ -5798,7 +5816,7 @@ pub(crate) fn resolve(base: &Url, target: &str) -> Link {
     }
     match base.join(target) {
         Ok(joined) => match joined.scheme() {
-            "http" | "https" => Link::Http(joined),
+            "http" | "https" | "file" => Link::Http(joined),
             "gemini" => crate::gemini::GeminiUrl::parse(joined.as_str())
                 .map(Link::Gemini)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
@@ -6449,6 +6467,62 @@ mod tests {
         );
         cache.cancel();
         assert!(!cache.claim_module_import_scan(&url));
+    }
+
+    #[test]
+    fn file_links_resolve_like_other_url_references() {
+        let base = Url::parse("file:///tmp/site/index.html").unwrap();
+        assert!(matches!(
+            resolve(&base, "../assets/icon.png"),
+            Link::Http(url) if url.as_str() == "file:///tmp/assets/icon.png"
+        ));
+        assert!(matches!(
+            resolve(&base, "file:///tmp/other.html#section"),
+            Link::Http(url) if url.scheme() == "file" && url.fragment() == Some("section")
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_stylesheet_base_imports_and_images_keep_the_real_document_client() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/main.css"),
+            "@import 'more.css'; .main { color: red }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("assets/more.css"),
+            ".imported { background-image: url('icon.png') }",
+        )
+        .unwrap();
+        let page = Url::from_file_path(dir.path().join("index.html")).unwrap();
+        let sheets = fetch_page_sheets(
+            r#"<base href="assets/"><link rel="stylesheet" href="main.css">"#,
+            &page,
+        )
+        .await;
+        assert_eq!(sheets.len(), 1);
+        assert!(sheets[0].1.contains(".imported"));
+        assert!(sheets[0].1.contains(".main"));
+        assert!(
+            sheets[0]
+                .1
+                .contains(page.join("assets/icon.png").unwrap().as_str())
+        );
+
+        let remote = Url::parse("https://example.test/").unwrap();
+        let spoofed_base = format!(
+            r#"<base href="{}"><link rel="stylesheet" href="main.css">"#,
+            page.join("assets/").unwrap()
+        );
+        assert!(fetch_page_sheets(&spoofed_base, &remote).await.is_empty());
+        assert!(resolve_frame_src(page.as_str(), &page, &remote, &[]).is_none());
+        assert!(
+            fetch_graphical_image(&remote, page.as_str(), None)
+                .await
+                .is_err()
+        );
     }
 
     fn refresh_response(url: &str, html: &str) -> Response {

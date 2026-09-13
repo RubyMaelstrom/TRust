@@ -164,10 +164,17 @@ webpki-roots = "1.0.9"
 # Rust (including its default Brotli and DEFLATE backends).
 wuff = "0.2.8"
 
+[target.'cfg(unix)'.dependencies]
+# Safe platform flags for nonblocking local-file opens (including FIFO races).
+# Already part of the native windowing stack; Linux uses Rust syscalls.
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
 parley = { version = "0.11.1", default-features = false, features = ["system", "complex-scripts"] }
 
 [dev-dependencies]
+# RAII cleanup and collision-safe directories for local-file conformance tests.
+tempfile = "3.27.0"
 # Compiles readable `.wat` text into wasm bytes for the WebAssembly test
 # fixtures. Pure-Rust (wasmi ecosystem); NEVER a runtime dependency — the
 # runtime accepts only binary wasm from the web.

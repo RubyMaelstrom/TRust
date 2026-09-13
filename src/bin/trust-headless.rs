@@ -86,7 +86,7 @@ struct Options {
 }
 
 const USAGE: &str = "\
-usage: trust-headless [options] URL
+usage: trust-headless [options] URL|FILE
 
   --width N       CSS viewport width in CSS pixels (default 1024)
   --height N      CSS viewport height in CSS pixels (default 768)
@@ -152,12 +152,12 @@ fn parse_args() -> Result<Option<Options>, String> {
                 return Err(format!("unknown option {other} (try --help)"));
             }
             _ if address.is_none() => address = Some(argument),
-            _ => return Err(String::from("more than one URL was given")),
+            _ => return Err(String::from("more than one URL or file path was given")),
         }
     }
 
     let Some(address) = address else {
-        return Err(String::from("a URL is required (try --help)"));
+        return Err(String::from("a URL or file path is required (try --help)"));
     };
     Ok(Some(Options {
         address,
@@ -443,7 +443,11 @@ fn describe_fetch(document: &FetchedDocument) -> String {
     match document {
         FetchedDocument::Http(response) => {
             let media = response.content_type.split(';').next().unwrap_or("").trim();
-            format!("HTTP {} ({media})", response.status)
+            if response.url.scheme() == "file" {
+                format!("local file ({media})")
+            } else {
+                format!("HTTP {} ({media})", response.status)
+            }
         }
         FetchedDocument::Gemini(response) => {
             format!("Gemini {} {}", response.status, response.meta)
