@@ -117,7 +117,8 @@ pub fn paint_doc_selected(
     selected: Option<usize>,
 ) -> ProtocolPaint {
     let left = 22.0;
-    let width = (viewport_width - left * 2.0).max(40.0);
+    let gopher = doc.gopher.is_some();
+    let width = (viewport_width - left * 2.0).max(if gopher { 1.0 } else { 40.0 });
     let mut paint = PagePaint {
         background: Some(theme_color(crate::theme::BG)),
         ..PagePaint::default()
@@ -125,6 +126,8 @@ pub fn paint_doc_selected(
     let mut lines = Vec::with_capacity(doc.lines.len());
     let mut y = 22.0;
     let mut far_right = viewport_width.max(0.0);
+    let mut widest_line = 0.0f32;
+    let mut soft_wrapped = false;
     for (line_index, line) in doc.lines.iter().enumerate() {
         if doc.text_view().is_some() && paint.lines.len() >= crate::text_reply::MAX_ROWS {
             break;
@@ -196,6 +199,7 @@ pub fn paint_doc_selected(
         let mut continuation = false;
         while let Some(mut shaped) = pieces.next() {
             let more = pieces.peek().is_some();
+            soft_wrapped |= more;
             let truncated = doc.text_view().is_some()
                 && paint.lines.len() >= crate::text_reply::MAX_ROWS - 1
                 && (more || line_index + 1 < doc.lines.len());
@@ -259,6 +263,40 @@ pub fn paint_doc_selected(
             rect: CssRect::new(left, line_top, line_width, (y - line_top).max(style.size)),
             link: line.link.clone(),
         });
+        widest_line = widest_line.max(line_width);
+    }
+    if gopher {
+        // CSS Values 4 #ch: measure the actual monospace zero-glyph advance.
+        // CSS 2 §10.3.3 #blockwidth: distribute spare width equally outside
+        // the reading column, keeping the existing 22px minimum side padding.
+        let preferred = text::shape("0", &line_style(Kind::Text).0).advance
+            * crate::gopher::PREFERRED_COLUMNS as f32;
+        // The column expands to fit authored lines up to the available width.
+        // Wrapping at that available width first gives the same line breaks,
+        // without shaping the document twice just to measure its longest line.
+        let column = if soft_wrapped {
+            width
+        } else {
+            preferred.max(widest_line).min(width)
+        };
+        let offset = (width - column) / 2.0;
+        if offset > 0.0 {
+            for primitive in &mut paint.primitives {
+                match primitive {
+                    DisplayCommand::GlyphRun { origin, .. } => origin.x += offset,
+                    DisplayCommand::FillRect { rect, .. } => rect.x += offset,
+                    DisplayCommand::HitRegion(hit) => hit.rect.x += offset,
+                    _ => {}
+                }
+            }
+            for line in &mut paint.lines {
+                line.rect.x += offset;
+            }
+            for line in &mut lines {
+                line.rect.x += offset;
+            }
+        }
+        // Only fitting content is shifted, so centering cannot add overflow.
     }
     // Gemtext requires preformatted lines to remain unwrapped and recommends
     // horizontal scrolling in graphical clients. Preserve their actual width
@@ -351,6 +389,105 @@ const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gopher_centered_column_moves_text_selection_and_hits_together() {
+        let url = crate::gopher::GopherUrl::parse("gopher://example.test").unwrap();
+        let raw = format!(
+            "0{}\t/a\texample.test\t70\r\n1  Next\t/b\texample.test\t70\r\n.\r\n",
+            "0".repeat(72)
+        );
+        let doc = crate::gopher::parse(&url, raw.into_bytes(), false, usize::MAX / 4);
+        let ch = text::shape("0", &line_style(Kind::Text).0).advance;
+        let viewport = 80.0 * ch + 44.0 + 200.0;
+        let mut layout = paint_doc_selected(&doc, viewport, Some(0));
+        assert_eq!(layout.paint.lines.len(), 2);
+        assert_eq!(
+            layout.paint.width, viewport,
+            "centering must not add scrolling"
+        );
+        for line in &layout.lines {
+            assert!((line.rect.x - 122.0).abs() < 0.01);
+        }
+        for primitive in &layout.paint.primitives {
+            let x = match primitive {
+                DisplayCommand::GlyphRun { origin, .. } => origin.x,
+                DisplayCommand::FillRect { rect, .. } => rect.x,
+                DisplayCommand::HitRegion(hit) => hit.rect.x,
+                _ => continue,
+            };
+            assert!((x - 122.0).abs() < 0.01);
+        }
+        let geometry = layout.lines.clone();
+        select(&mut layout, &doc, Some(1));
+        assert_eq!(layout.lines, geometry);
+        assert!(layout.paint.primitives.iter().any(|p| matches!(p,
+            DisplayCommand::FillRect { rect, .. }
+                if (rect.x - 122.0).abs() < 0.01 && rect.y == layout.lines[1].rect.y
+        )));
+        assert!(
+            layout
+                .paint
+                .lines
+                .iter()
+                .all(|l| (l.rect.x - 122.0).abs() < 0.01)
+        );
+    }
+
+    #[test]
+    fn gopher_centered_column_expands_for_authored_lines_and_wraps_on_resize() {
+        let url = crate::gopher::GopherUrl::parse("gopher://example.test/0/phlog").unwrap();
+        let original = "0".repeat(88);
+        let doc = crate::gopher::parse(&url, original.as_bytes().to_vec(), false, usize::MAX / 4);
+        let style = line_style(Kind::Text).0;
+        let ch = text::shape("0", &style).advance;
+        let viewport = ch * 120.0 + 44.0;
+        let wide = paint_doc_selected(&doc, viewport, None);
+        let actual_width = text::shape(&original, &style).advance;
+        assert_eq!(
+            wide.paint.lines.len(),
+            1,
+            "an 88-column diagram must stay intact"
+        );
+        assert!((wide.lines[0].rect.x - (viewport - actual_width) / 2.0).abs() < 0.1);
+        assert_eq!(wide.paint.width, viewport);
+
+        let narrow = paint_doc_selected(&doc, ch * 60.0 + 44.0, None);
+        assert!(narrow.paint.lines.len() > 1);
+        assert!(narrow.paint.lines.iter().all(|l| l.rect.x == 22.0));
+        let reconstructed: String = narrow
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                DisplayCommand::GlyphRun { shaped, .. } => Some(shaped.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reconstructed, original);
+
+        let mut unwrapped = doc.clone();
+        unwrapped.gopher.as_mut().unwrap().controls.wrap = false;
+        let narrow = paint_doc_selected(&unwrapped, ch * 60.0 + 44.0, None);
+        assert_eq!(narrow.paint.lines.len(), 1);
+        assert_eq!(narrow.lines[0].rect.x, 22.0);
+        assert!(narrow.paint.width > ch * 60.0 + 44.0);
+    }
+
+    #[test]
+    fn gopher_centered_column_keeps_full_width_after_a_soft_wrap() {
+        let url = crate::gopher::GopherUrl::parse("gopher://example.test/0/phlog").unwrap();
+        // Both resulting lines fit in 80 columns, but the physical source line
+        // is wider than the viewport. It must retain the full wrapping width.
+        let raw = format!("{} {}", "0".repeat(70), "0".repeat(70));
+        let doc = crate::gopher::parse(&url, raw.into_bytes(), false, usize::MAX / 4);
+        let ch = text::shape("0", &line_style(Kind::Text).0).advance;
+        let viewport = ch * 100.0 + 44.0;
+        let layout = paint_doc_selected(&doc, viewport, None);
+        assert_eq!(layout.paint.lines.len(), 2);
+        assert!(layout.paint.lines.iter().all(|l| l.rect.x == 22.0));
+        assert_eq!(layout.paint.width, viewport);
+    }
+
     #[test]
     fn gopher_selection_keeps_shaping_and_hit_geometry() {
         let url = crate::gopher::GopherUrl::parse("gopher://e").unwrap();

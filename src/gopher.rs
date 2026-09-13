@@ -237,7 +237,27 @@ pub struct View {
     /// Physical source line and first display row for each wrapped row.
     pub sources: Vec<usize>,
     pub owners: Vec<usize>,
+    /// Widest sanitized display line before wrapping, in terminal cells.
+    /// Retain this during parsing so painting need not rescan the document.
+    pub source_columns: usize,
 }
+
+/// Reading-column preference, not a protocol limit: RFC 1436 §3.9 discusses
+/// 80-column screens and short menu labels, but does not limit text-file width.
+pub const PREFERRED_COLUMNS: usize = 80;
+
+impl View {
+    fn measure_line(&mut self, text: &str) {
+        self.source_columns = self
+            .source_columns
+            .max(unicode_width::UnicodeWidthStr::width(text));
+    }
+
+    pub fn reading_columns(&self, available: usize) -> usize {
+        available.min(PREFERRED_COLUMNS.max(self.source_columns))
+    }
+}
+
 impl Default for View {
     fn default() -> Self {
         Self {
@@ -248,6 +268,7 @@ impl Default for View {
             encoding: Encoding::Auto,
             sources: Vec::new(),
             owners: Vec::new(),
+            source_columns: 0,
         }
     }
 }
@@ -547,6 +568,7 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
     page.view.controls.notice = page.reply.notice.clone();
     page.view.owners.clear();
     page.view.sources.clear();
+    page.view.source_columns = 0;
     let mut lines = Vec::new();
     let mut truncated = false;
     let mut previous_type = None;
@@ -570,6 +592,7 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
             let start = lines.len();
             let (display, clipped) = text_reply::display_text(line.text.as_bytes(), false);
             truncated |= clipped;
+            page.view.measure_line(&display);
             push_wrapped(
                 &mut lines,
                 line.kind,
@@ -659,6 +682,7 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
             let decoded = decode(&label[..label.len().min(MAX_LINE)], page.view.encoding);
             let (display, clipped) = text_reply::display_text(decoded.as_bytes(), false);
             truncated |= clipped;
+            page.view.measure_line(&display);
             let start = lines.len();
             push_wrapped(
                 &mut lines,
@@ -689,6 +713,7 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
         });
         page.view.sources.push(usize::MAX);
         page.view.owners.push(lines.len() - 1);
+        page.view.measure_line(&lines.last().unwrap().text);
     }
     if let Some(notice) = &page.reply.notice {
         lines.push(DocLine {
@@ -698,7 +723,18 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
         });
         page.view.sources.push(usize::MAX);
         page.view.owners.push(lines.len() - 1);
+        page.view.measure_line(notice);
     }
+    // A wider viewport can reveal the entire line after horizontal panning.
+    // Discard the stale offset before the now-fitting page is centered.
+    page.view.controls.horizontal = if page.view.controls.wrap {
+        0
+    } else {
+        page.view
+            .controls
+            .horizontal
+            .min(page.view.source_columns.saturating_sub(width))
+    };
     let mut doc = Doc::from_lines(
         Link::Gopher(url.clone()),
         lines,
@@ -1060,6 +1096,44 @@ mod regression_tests {
         assert!(doc.lines[1..].iter().all(|l| l.link.is_none()));
         // Continuations keep the kind so they style like their item.
         assert!(doc.lines[1..].iter().all(|l| l.kind == Kind::Dir));
+    }
+
+    #[test]
+    fn reading_column_uses_authored_display_cells_before_wrapping() {
+        let url = GopherUrl::parse("gopher://example.test").unwrap();
+        let label = "界".repeat(44);
+        let raw = format!("0{label}\t/{}\texample.test\t70\r\n.\r\n", "s".repeat(200));
+        let mut doc = parse(&url, raw.as_bytes().to_vec(), false, 60);
+        let view = doc.gopher.as_ref().unwrap();
+        assert_eq!(
+            view.source_columns, 88,
+            "measure cells, not bytes or selectors"
+        );
+        assert_eq!(view.reading_columns(120), 88);
+        assert_eq!(view.reading_columns(60), 60);
+        assert!(doc.lines.len() > 1);
+        doc.rerender_reply(120);
+        assert_eq!(doc.lines.len(), 1);
+        assert_eq!(doc.lines[0].text, label);
+        assert_eq!(doc.raw, raw.as_bytes());
+
+        let url = GopherUrl::parse("gopher://example.test/0/phlog").unwrap();
+        let doc = parse(
+            &url,
+            b"  one\ttwo  \r\n\r\n..three\r\n.\r\n".to_vec(),
+            false,
+            120,
+        );
+        assert_eq!(
+            doc.lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            ["  one   two  ", "", ".three"]
+        );
+        let view = doc.gopher.as_ref().unwrap();
+        assert_eq!(view.source_columns, 13);
+        assert_eq!(view.reading_columns(120), 80);
     }
 
     #[test]

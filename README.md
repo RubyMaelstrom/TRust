@@ -175,7 +175,11 @@ reuses its entry; only an explicit title replaces its name. `status` shows the
 storage directories. Existing TLS certificates, pins and DICT preferences keep
 their existing locations. No disk cache or persistent cookies are introduced.
 
-Gopher menus and text appear progressively. **W** toggles wrapping and
+Gopher menus and text appear progressively in a centered, left-aligned
+monospace column. Its preferred width is 80 columns; longer authored lines
+expand it when space permits, preserving line breaks and spacing. The desktop
+keeps at least 22px of padding on each side. Narrow views wrap to fit.
+**W** toggles wrapping and
 **Shift+Left/Right** pans unwrapped text; **E** cycles automatic, UTF-8, Latin-1
 and CP437 display decoding without changing selectors. Automatic mode accepts
 UTF-8 and otherwise uses Latin-1. **S** (or `save`) saves received source bytes.
