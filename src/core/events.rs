@@ -4,7 +4,7 @@
 //! require presenting every intermediate paint. Only consecutive, complete,
 //! diagnostic-free snapshots of the same document may supersede one another.
 //! All other events are FIFO barriers (including patches and task results).
-//! Finger updates likewise contain the complete received prefix. Consecutive
+//! Finger and WHOIS updates contain the complete received prefix. Consecutive
 //! updates can coalesce until the final reply, which remains a FIFO barrier.
 //! https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
 //! https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
@@ -158,6 +158,16 @@ fn supersedes(previous: &CoreEvent, next: &CoreEvent) -> bool {
     {
         return a == b && !first.finished;
     }
+    if let (
+        CoreEvent::Whois {
+            generation: a,
+            reply: first,
+        },
+        CoreEvent::Whois { generation: b, .. },
+    ) = (previous, next)
+    {
+        return a == b && !first.finished;
+    }
     fn paint_generation(event: &CoreEvent) -> Option<(u64, usize)> {
         match event {
             CoreEvent::Page {
@@ -272,6 +282,34 @@ mod tests {
                 panic!()
             };
             assert_eq!(reply.body, expected.as_bytes());
+        }
+        assert!(rx.pop().is_none());
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn whois_updates_coalesce_without_crossing_completion_or_generation() {
+        let (tx, mut rx, wakes) = counted_channel(4);
+        let target = crate::whois::server_target("example.test", "query").unwrap();
+        for (generation, text, finished) in [
+            (1, "a", false),
+            (1, "ab", false),
+            (1, "abc", true),
+            (1, "later", false),
+            (2, "different", false),
+        ] {
+            let mut reply =
+                crate::whois::Reply::from_bytes(target.clone(), text.as_bytes().to_vec());
+            reply.finished = finished;
+            tx.send(CoreEvent::Whois { generation, reply })
+                .await
+                .unwrap();
+        }
+        for expected in ["abc", "later", "different"] {
+            let Some(CoreEvent::Whois { reply, .. }) = rx.pop() else {
+                panic!()
+            };
+            assert_eq!(&*reply.hops[0].body, expected.as_bytes());
         }
         assert!(rx.pop().is_none());
         assert_eq!(wakes.load(Ordering::Relaxed), 1);

@@ -136,9 +136,12 @@ command nor an address searches DuckDuckGo Lite.
 | `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
 | `post <url> [body]` | HTTP POST, form-urlencoded |
 | `finger [user]@<host>[:port]` | who's there / their .plan (RFC 1288); IPv6 accepts `[address]:port` |
-| `wrap [on\|off]` | toggle wrapping of a Finger reply |
-| `changes [on\|off]` | compare a Finger reply with its previous successful refresh |
-| `whois <domain> [server]` | domain lookup via IANA, referral followed (RFC 3912) |
+| `wrap [on\|off]` | toggle wrapping of a Finger, WHOIS or RDAP reply |
+| `changes [on\|off]` | compare a Finger or WHOIS reply with its previous successful refresh |
+| `whois <query> [server[:port]]` | WHOIS lookup via IANA or a chosen server; quote queries containing spaces |
+| `encoding [auto\|utf8\|latin1]` | select WHOIS display encoding without refetching |
+| `save [server-number]` | save original RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
+| `rdap [domain\|IP\|CIDR\|AS-number]` | show the authoritative RDAP record; omitted query uses the current WHOIS lookup |
 | `dict <word> [server]` | definitions from dict.org (RFC 2229) |
 | `reload` | re-fetch what's on screen, history untouched |
 | `close` / `quit` | drop the connection / exit |
@@ -156,3 +159,38 @@ unwrapped reply. Explicit URLs become selectable links. After `reload`, **D**
 toggles a comparison with the previous successful reply; the original text
 remains available. **Esc** stops loading and keeps the received text. Timeouts,
 interrupted replies, and size limits leave a notice alongside any retained text.
+
+WHOIS opens with the requested domain or network record: organization, registrar,
+dates, status, nameservers and DNSSEC where available. IANA discovery records,
+empty fields, duplicate values and repeated privacy placeholders do not fill the
+summary. **Contacts** shows public contact information; **Record details** keeps
+exact timestamps, field sources, disagreements and additional fields. **Full
+server replies** retains each received answer, including comments and legal
+text. Unrecognized formats fall back to a readable transcript.
+
+These views switch locally, including while a referral is still loading. **D**
+compares registration fields after a successful refresh; in the full replies it
+compares the transcript. **W** wraps full replies; **Shift+Left/Right** pans;
+**Esc** stops loading without discarding received data. **E** cycles automatic,
+UTF-8 and Latin-1 decoding. Automatic mode prefers valid UTF-8 and otherwise uses
+Latin-1, a heuristic because WHOIS has no encoding metadata. **S** saves the
+lookup; `save 2` exports server 2's exact bytes, including original line endings
+and encoding. A multi-server export adds headings between the original replies;
+a single-server export is exact.
+
+Use `whois "-r -T inetnum 192.0.2.1" whois.ripe.net` for a server-specific query,
+or `whois -h whois.ripe.net -- "-r -T inetnum 192.0.2.1"`. Server addresses accept
+ports and bracketed IPv6. WHOIS URLs decode their query path once; a `#fragment`
+stays local. Automatic referrals retain every answer, detect cycles, and share
+a four-server, 15-second, 1 MiB transaction budget. IANA's `refer:` is followed;
+its `whois:` service metadata remains a selectable link. Failed referrals, timeouts
+and truncation remain visible beside the received data. Display limits bound rows
+and long lines independently of the bytes available to save.
+
+The **Look up with RDAP** link is an explicit alternative for domains, addresses
+and AS numbers. It uses IANA's RDAP bootstrap registries and prefers HTTPS.
+RDAP has its own readable record view, including nested contacts with their roles,
+registration events, DNSSEC, service notices and errors. Direct HTTP responses
+with `application/rdap+json` use the same view. **Contacts**, **Record details**
+and **Original JSON** switch locally; **S** saves the original JSON bytes.
+Related RDAP links remain RDAP lookups. WHOIS never switches protocols automatically.

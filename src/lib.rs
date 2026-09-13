@@ -72,3 +72,8 @@ pub mod frontend {
         pub use crate::app::{App, TERMINAL_OWNER, parse_port};
     }
 }
+
+pub mod rdap;
+pub mod registration;
+pub mod text_reply;
+pub mod whois;

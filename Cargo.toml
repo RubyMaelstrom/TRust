@@ -68,6 +68,8 @@ flate2 = "1"
 futures = "0.3.34"
 half = "2.7.1"
 html5ever = "0.39"
+# Small pure-Rust HTTP-date parser for RDAP bootstrap cache freshness.
+httpdate = "1.0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 libmudtelnet = "2.0.2"

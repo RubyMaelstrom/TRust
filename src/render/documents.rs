@@ -33,6 +33,12 @@ pub struct ProtocolPaint {
 }
 
 pub fn document(page: &BrowserPage) -> Option<Doc> {
+    document_for_viewport(page, f32::INFINITY)
+}
+
+/// Choose the field presentation in CSS pixels, before graphical shaping.
+/// Compact fields retain whole nameserver values in narrow windows.
+pub fn document_for_viewport(page: &BrowserPage, viewport_width: f32) -> Option<Doc> {
     Some(match (&page.document, page.target()) {
         (FetchedDocument::Gopher(raw), Link::Gopher(url)) => {
             crate::gopher::parse(url, raw.clone(), false, usize::MAX / 4)
@@ -42,6 +48,15 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
         }
         (FetchedDocument::OneShot(raw), Link::OneShot(url)) => {
             crate::oneshot::parse(url, raw.clone(), usize::MAX / 4)
+        }
+        (FetchedDocument::Whois(page), Link::OneShot(url)) => crate::whois::render_with_columns(
+            url,
+            page.clone(),
+            usize::MAX / 4,
+            viewport_width >= 520.0,
+        ),
+        (FetchedDocument::Rdap(page), _) => {
+            crate::rdap::render_with_columns(page.clone(), usize::MAX / 4, viewport_width >= 520.0)
         }
         (FetchedDocument::Finger(page), Link::OneShot(url)) => {
             crate::finger::render(url, page.reply.clone(), page.view.clone(), usize::MAX / 4)
@@ -85,7 +100,7 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
 }
 
 pub fn page(page: &BrowserPage, viewport: CssSize) -> Option<PagePaint> {
-    let doc = document(page)?;
+    let doc = document_for_viewport(page, viewport.width)?;
     Some(paint_doc(&doc, viewport.width))
 }
 
@@ -108,11 +123,11 @@ pub fn paint_doc_selected(
     let mut y = 22.0;
     let mut far_right = viewport_width.max(0.0);
     for (line_index, line) in doc.lines.iter().enumerate() {
-        if doc.finger.is_some() && paint.lines.len() >= crate::finger::MAX_ROWS {
+        if doc.text_view().is_some() && paint.lines.len() >= crate::text_reply::MAX_ROWS {
             break;
         }
         let (mut style, mut normal_color) = line_style(line.kind);
-        if doc.finger.is_some() && line.kind == Kind::Pre {
+        if doc.text_view().is_some() && line.kind == Kind::Pre {
             normal_color = theme_color(crate::theme::TEXT);
         }
         let is_selected = selected == Some(line_index) && line.link.is_some();
@@ -126,59 +141,53 @@ pub fn paint_doc_selected(
         };
         let line_top = y;
         let mut line_width = 1.0f32;
-        let mut remaining = line.text.as_str();
-        // Finger's preserved text can contain very long physical lines. Shape
-        // each paragraph once, retaining its joining forms across soft wraps.
-        let mut finger_lines = doc.finger.as_ref().map(|view| {
-            if view.wrap && !remaining.is_empty() {
-                text::wrapped_lines(
-                    remaining,
-                    &style,
-                    width,
-                    width,
-                    TextBreakStyle {
-                        wrap: true,
-                        overflow_wrap: crate::text::TextOverflowWrap::Anywhere,
-                        ..TextBreakStyle::default()
+        // Shape each physical paragraph once for every line-model protocol.
+        // CSS Text 3 #word-break-shaping (snapshot 81c27f686901): retain
+        // joining forms across soft wraps. Re-shaping each shrinking suffix
+        // also makes a single long reply line quadratic.
+        let wrap = doc
+            .text_view()
+            .map_or(!matches!(line.kind, Kind::Pre), |view| {
+                view.wrap
+                    || doc
+                        .whois
+                        .as_ref()
+                        .is_some_and(|page| page.section != crate::registration::Section::Raw)
+                    || doc
+                        .rdap
+                        .as_ref()
+                        .is_some_and(|page| page.section != crate::registration::Section::Raw)
+                    || (doc.whois.is_some()
+                        && matches!(
+                            line.kind,
+                            Kind::Heading(_) | Kind::Info | Kind::Error | Kind::OtherLink
+                        ))
+            });
+        let mut pieces = if wrap && !line.text.is_empty() {
+            text::wrapped_lines(
+                &line.text,
+                &style,
+                width,
+                width,
+                TextBreakStyle {
+                    wrap: true,
+                    overflow_wrap: if doc.text_view().is_some() {
+                        crate::text::TextOverflowWrap::Anywhere
+                    } else {
+                        crate::text::TextOverflowWrap::Normal
                     },
-                )
-            } else {
-                vec![text::shape(remaining, &style)]
-            }
-            .into_iter()
-            .peekable()
-        });
-        loop {
-            let (end, mut shaped, more) = if let Some(pieces) = &mut finger_lines {
-                let Some(shaped) = pieces.next() else { break };
-                (0, shaped, pieces.peek().is_some())
-            } else {
-                let end = if remaining.is_empty() {
-                    0
-                } else {
-                    text::first_line_end(
-                        remaining,
-                        &style,
-                        width,
-                        TextBreakStyle {
-                            wrap: !matches!(line.kind, Kind::Pre),
-                            ..TextBreakStyle::default()
-                        },
-                    )
-                };
-                let end = if end == 0 && !remaining.is_empty() {
-                    remaining.chars().next().map_or(0, char::len_utf8)
-                } else {
-                    end
-                };
-                (
-                    end,
-                    text::shape(remaining.get(..end).unwrap_or(remaining), &style),
-                    end < remaining.len(),
-                )
-            };
-            let truncated = doc.finger.is_some()
-                && paint.lines.len() >= crate::finger::MAX_ROWS - 1
+                    ..TextBreakStyle::default()
+                },
+            )
+        } else {
+            vec![text::shape(&line.text, &style)]
+        }
+        .into_iter()
+        .peekable();
+        while let Some(mut shaped) = pieces.next() {
+            let more = pieces.peek().is_some();
+            let truncated = doc.text_view().is_some()
+                && paint.lines.len() >= crate::text_reply::MAX_ROWS - 1
                 && (more || line_index + 1 < doc.lines.len());
             if truncated {
                 shaped = text::shape("Display truncated to keep this reply responsive.", &style);
@@ -234,9 +243,6 @@ pub fn paint_doc_selected(
             if truncated || !more {
                 break;
             }
-            if finger_lines.is_none() {
-                remaining = remaining[end..].trim_start_matches(' ');
-            }
         }
         lines.push(ProtocolLine {
             rect: CssRect::new(left, line_top, line_width, (y - line_top).max(style.size)),
@@ -267,7 +273,7 @@ fn line_style(kind: Kind) -> (TextStyle, PaintColor) {
             style.weight = 700.0;
             theme_color(crate::theme::NEON_CYAN)
         }
-        Kind::Heading(_) => theme_color(crate::theme::NEON_CYAN),
+        Kind::Heading(_) | Kind::Field => theme_color(crate::theme::NEON_CYAN),
         Kind::GemLink | Kind::Dir => {
             style.weight = 700.0;
             theme_color(crate::theme::NEON_CYAN)
@@ -428,7 +434,7 @@ mod tests {
         doc.lines = vec![line; 100];
         doc.finger.as_mut().unwrap().wrap = true;
         let paint = paint_doc(&doc, 100.0);
-        assert!(paint.lines.len() <= crate::finger::MAX_ROWS);
+        assert!(paint.lines.len() <= crate::text_reply::MAX_ROWS);
         assert!(paint.primitives.iter().any(|p| matches!(p,
             DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("truncated")
         )));

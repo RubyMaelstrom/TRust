@@ -347,6 +347,8 @@ pub enum FetchedDocument {
     Http(Box<http::Response>),
     OneShot(Vec<u8>),
     Finger(crate::finger::Page),
+    Whois(crate::whois::Page),
+    Rdap(crate::rdap::Page),
     /// A trusted, in-process Gemtext document such as `about:help`.
     Internal(Vec<u8>),
 }
@@ -420,6 +422,10 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    Whois {
+        generation: u64,
+        reply: crate::whois::Reply,
+    },
     Finger {
         generation: u64,
         reply: crate::finger::Reply,
@@ -800,7 +806,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        self.retire_finger("Incomplete reply: left this page");
+        self.retire_query("Incomplete reply: left this page");
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
@@ -826,7 +832,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        self.retire_finger("Incomplete reply: left this page");
+        self.retire_query("Incomplete reply: left this page");
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.pending = None;
@@ -1090,6 +1096,9 @@ impl BrowserController {
                         }
                     }
                 }
+                CoreEvent::Whois { generation, reply } => {
+                    changed |= self.update_whois(generation, reply);
+                }
                 CoreEvent::Finger { generation, reply } => {
                     changed |= self.update_finger(generation, reply);
                 }
@@ -1185,6 +1194,15 @@ impl BrowserController {
     }
 
     fn begin_fetch(&mut self, target: Link, fallback_http: bool, intent: NavigationIntent) {
+        let target = if intent == NavigationIntent::Reload
+            && let Some(page) = &self.current
+            && let FetchedDocument::Rdap(rdap) = &page.document
+            && target == page.target
+        {
+            crate::rdap::direct_action(&rdap.url)
+        } else {
+            target
+        };
         if let Link::Http(url) = &target
             && crate::media::is_youtube_video_url(url)
         {
@@ -1194,7 +1212,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        self.retire_finger("Incomplete reply: request replaced");
+        self.retire_query("Incomplete reply: request replaced");
         self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
@@ -1229,6 +1247,28 @@ impl BrowserController {
                 .await;
                 let event = match result {
                     Ok(reply) => CoreEvent::Finger { generation, reply },
+                    Err(error) => CoreEvent::FetchFinished {
+                        generation,
+                        result: Err(error),
+                    },
+                };
+                let _ = tx.send(event).await;
+                return;
+            }
+            if let Link::OneShot(url) = &target
+                && url.scheme == oneshot::Scheme::Whois
+            {
+                let result = crate::whois::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(CoreEvent::Whois { generation, reply })
+                            .await
+                            .is_ok()
+                    }
+                })
+                .await;
+                let event = match result {
+                    Ok(reply) => CoreEvent::Whois { generation, reply },
                     Err(error) => CoreEvent::FetchFinished {
                         generation,
                         result: Err(error),
@@ -1274,7 +1314,7 @@ impl BrowserController {
             if let Some(task) = self.task.take() {
                 task.abort();
             }
-            self.retire_finger("Incomplete reply: request replaced");
+            self.retire_query("Incomplete reply: request replaced");
             self.render_is_final = self.live_page.is_none();
             // Ignore a completion already queued by the superseded fetch.
             self.generation = self.generation.wrapping_add(1);
@@ -1313,35 +1353,135 @@ impl BrowserController {
         true
     }
 
-    fn retire_finger(&mut self, reason: &str) {
-        if let Some(page) = &mut self.current
-            && let FetchedDocument::Finger(finger) = &mut page.document
-            && !finger.reply.finished
-        {
-            finger.reply.finished = true;
-            finger.reply.notice = Some(reason.to_string());
+    fn retire_query(&mut self, reason: &str) {
+        if let Some(page) = &mut self.current {
+            match &mut page.document {
+                FetchedDocument::Finger(finger) if !finger.reply.finished => {
+                    finger.reply.finished = true;
+                    finger.reply.notice = Some(reason.to_string());
+                }
+                FetchedDocument::Whois(whois) if !whois.reply.finished => whois.stop(reason),
+                _ => return,
+            }
             page.revision = page.revision.wrapping_add(1);
         }
     }
 
-    pub fn finger_view_action(&mut self, action: &str, enabled: Option<bool>) -> bool {
+    pub fn reply_view_action(&mut self, action: &str, enabled: Option<bool>) -> bool {
         let Some(page) = &mut self.current else {
             return false;
         };
-        let FetchedDocument::Finger(finger) = &mut page.document else {
-            return false;
+        let (result, wrap) = match &mut page.document {
+            FetchedDocument::Finger(finger) => (
+                crate::finger::view_action(&mut finger.view, action, enabled),
+                finger.view.wrap,
+            ),
+            FetchedDocument::Whois(whois) => (whois.view_action(action, enabled), whois.view.wrap),
+            FetchedDocument::Rdap(rdap) => (rdap.view_action(action, enabled), rdap.view.wrap),
+            _ => return false,
         };
-        match crate::finger::view_action(&mut finger.view, action, enabled) {
+        match result {
             Ok(status) => {
                 page.revision = page.revision.wrapping_add(1);
                 self.status = status.to_string();
-                if finger.view.wrap {
+                if wrap {
                     self.interaction.scroll.x = 0.0;
                 }
             }
             Err(status) => self.status = status.to_string(),
         }
         self.invalidation.request_redraw();
+        true
+    }
+
+    pub fn offer_whois_export(&mut self, server: Option<usize>) -> bool {
+        let Some(page) = &self.current else {
+            return false;
+        };
+        if let FetchedDocument::Rdap(rdap) = &page.document {
+            if server.is_some() {
+                self.status = "RDAP has one JSON reply; use save without a server number.".into();
+            } else {
+                self.download_offer = Some(rdap.export());
+                self.status = "Save original RDAP JSON.".into();
+            }
+            self.invalidation.request_redraw();
+            return true;
+        }
+        let (FetchedDocument::Whois(whois), Link::OneShot(url)) = (&page.document, &page.target)
+        else {
+            return false;
+        };
+        match whois.export(url, server) {
+            Ok(offer) => {
+                self.download_offer = Some(offer);
+                self.status = "Save received WHOIS reply.".into();
+            }
+            Err(error) => self.status = error,
+        }
+        self.invalidation.request_redraw();
+        true
+    }
+
+    pub fn whois_encoding(&mut self, encoding: Option<crate::whois::Encoding>) -> bool {
+        let Some(page) = &mut self.current else {
+            return false;
+        };
+        let FetchedDocument::Whois(whois) = &mut page.document else {
+            return false;
+        };
+        whois.encoding = encoding.unwrap_or(match whois.encoding {
+            crate::whois::Encoding::Auto => crate::whois::Encoding::Utf8,
+            crate::whois::Encoding::Utf8 => crate::whois::Encoding::Latin1,
+            crate::whois::Encoding::Latin1 => crate::whois::Encoding::Auto,
+        });
+        page.revision = page.revision.wrapping_add(1);
+        self.status = format!("WHOIS encoding: {}", whois.encoding.label());
+        self.invalidation.request_redraw();
+        true
+    }
+
+    fn update_whois(&mut self, generation: u64, reply: crate::whois::Reply) -> bool {
+        let Some(pending) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.generation == generation)
+            .cloned()
+        else {
+            return false;
+        };
+        let finished = reply.finished;
+        if self.document_generation == generation
+            && let Some(page) = &mut self.current
+            && let FetchedDocument::Whois(whois) = &mut page.document
+        {
+            whois.update(reply);
+            page.status = fetched_status(&page.target, &page.document);
+            self.status = page.status.clone();
+            page.revision = page.revision.wrapping_add(1);
+        } else {
+            let mut whois = crate::whois::Page::new(reply);
+            if pending.intent == NavigationIntent::Reload
+                && let Some(old) = &self.current
+                && old.target == pending.target
+                && let FetchedDocument::Whois(old) = &old.document
+            {
+                whois = crate::whois::Page::refreshed(whois.reply, old);
+            }
+            let task = self.task.take();
+            let scroll = self.interaction.scroll;
+            self.finish_fetch(generation, Ok(FetchedDocument::Whois(whois)));
+            if pending.intent == NavigationIntent::Reload {
+                self.interaction.scroll = scroll;
+            }
+            self.task = task;
+            self.pending = Some(pending);
+        }
+        self.render_is_final = finished;
+        if finished {
+            self.pending = None;
+            self.task = None;
+        }
         true
     }
 
@@ -1398,12 +1538,28 @@ impl BrowserController {
     }
 
     fn finish_fetch(&mut self, generation: u64, result: Result<FetchedDocument, String>) -> bool {
-        let Some(pending) = self.pending.take_if(|p| p.generation == generation) else {
+        let Some(mut pending) = self.pending.take_if(|p| p.generation == generation) else {
             return false;
         };
         self.task = None;
         match result {
             Ok(mut document) => {
+                if let FetchedDocument::Rdap(rdap) = &mut document {
+                    pending.target = Link::Http(rdap.url.clone());
+                    if pending.intent == NavigationIntent::Reload
+                        && let Some(old) = &self.current
+                        && let FetchedDocument::Rdap(old) = &old.document
+                        && old.url == rdap.url
+                    {
+                        rdap.section = old.section;
+                        rdap.view = old.view.clone();
+                    }
+                }
+                if matches!(&pending.target, Link::External(address) if crate::rdap::is_action(address))
+                    && let FetchedDocument::Http(response) = &document
+                {
+                    pending.target = Link::Http(response.url.clone());
+                }
                 let (live, declarative_refresh) = match &mut document {
                     FetchedDocument::Http(response) => {
                         (response.live.take(), response.declarative_refresh.take())
@@ -1488,7 +1644,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        self.retire_finger("Incomplete reply: stopped");
+        self.retire_query("Incomplete reply: stopped");
         self.drop_live_page();
         self.abort_declarative_refresh();
         self.generation = self.generation.wrapping_add(1);
@@ -1636,6 +1792,23 @@ impl BrowserController {
     }
 
     fn activate(&mut self, link: Link) -> bool {
+        if let Some(section) = crate::registration::Section::from_link(&link) {
+            let Some(page) = &mut self.current else {
+                return false;
+            };
+            match &mut page.document {
+                FetchedDocument::Whois(whois) => {
+                    whois.section = section;
+                    whois.view.changes = false;
+                }
+                FetchedDocument::Rdap(rdap) => rdap.section = section,
+                _ => return false,
+            }
+            page.revision = page.revision.wrapping_add(1);
+            self.interaction.scroll = CssPoint::default();
+            self.invalidation.request_redraw();
+            return true;
+        }
         match link {
             Link::JsClick { node, href } => {
                 if href.is_empty() {
@@ -1647,6 +1820,9 @@ impl BrowserController {
             }
             Link::Form { .. } => return false,
             Link::Media(url) => self.status = format!("Media: {url}"),
+            Link::External(url) if crate::rdap::is_action(&url) => {
+                self.begin_fetch(Link::External(url), false, NavigationIntent::New)
+            }
             Link::External(url) => self.status = format!("External target: {url}"),
             target => self.begin_fetch(target, false, NavigationIntent::New),
         }
@@ -1933,13 +2109,25 @@ pub async fn fetch_protocol(
                 http::set_navigation_metadata(&mut request, referrer);
                 http::fetch(&request).await
             }?;
-            Ok(FetchedDocument::Http(Box::new(response)))
+            if crate::rdap::is_response(&response) {
+                Ok(FetchedDocument::Rdap(crate::rdap::Page::from_response(
+                    response,
+                )))
+            } else {
+                Ok(FetchedDocument::Http(Box::new(response)))
+            }
         }
         Link::OneShot(url) if url.scheme == oneshot::Scheme::Finger => crate::finger::fetch(url)
             .await
             .map(|reply| FetchedDocument::Finger(crate::finger::Page::new(reply))),
+        Link::OneShot(url) if url.scheme == oneshot::Scheme::Whois => crate::whois::fetch(url)
+            .await
+            .map(|reply| FetchedDocument::Whois(crate::whois::Page::new(reply))),
         Link::OneShot(url) => oneshot::fetch(url).await.map(FetchedDocument::OneShot),
         Link::Telnet { .. } => Err(String::from("terminal target requires a frontend VT view")),
+        Link::External(url) if crate::rdap::is_action(url) => crate::rdap::fetch_action(url)
+            .await
+            .map(|response| FetchedDocument::Rdap(crate::rdap::Page::from_response(response))),
         Link::External(url) => Err(format!("unsupported URL scheme: {url}")),
         Link::Form { .. } | Link::JsClick { .. } | Link::Media(_) => {
             Err(String::from("target is not directly fetchable"))
@@ -1997,6 +2185,11 @@ async fn fetch_protocol_interactive(
         let computed_type = crate::download::computed_mime_type(&response);
         if crate::download::response_needs_download(&response, true) {
             return Ok(InteractiveFetch::Download(Box::new(response)));
+        }
+        if crate::rdap::is_response(&response) {
+            return Ok(InteractiveFetch::Document(FetchedDocument::Rdap(
+                crate::rdap::Page::from_response(response),
+            )));
         }
         if computed_type
             .split(';')
@@ -2069,6 +2262,13 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
         }
         FetchedDocument::Gopher(bytes) => format!("{target} — {} bytes", bytes.len()),
         FetchedDocument::OneShot(bytes) => format!("{target} — {} bytes", bytes.len()),
+        FetchedDocument::Whois(page) => match target {
+            Link::OneShot(url) => crate::whois::status(url, &page.reply),
+            _ => format!("WHOIS — {} bytes", page.reply.bytes()),
+        },
+        FetchedDocument::Rdap(page) => {
+            format!("RDAP · {} · HTTP {}", page.record.title, page.status)
+        }
         FetchedDocument::Finger(page) => format!(
             "{target} — {} bytes{} · W wrap · D changes",
             page.reply.body.len(),
@@ -2089,6 +2289,9 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
     if address.is_empty() {
         return Err(String::from("Enter an address."));
     }
+    if crate::rdap::is_action(address) {
+        return Ok((Link::External(address.to_string()), false));
+    }
     if address
         .split_once(':')
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
@@ -2096,6 +2299,14 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
         return crate::finger::parse_url(address)
             .map(|url| (Link::OneShot(url), false))
             .ok_or_else(|| String::from("Invalid Finger address."));
+    }
+    if address
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("whois"))
+    {
+        return crate::whois::parse_url(address)
+            .map(|url| (Link::OneShot(url), false))
+            .ok_or_else(|| String::from("Invalid WHOIS address."));
     }
     if let Some(url) = gopher::GopherUrl::parse(address) {
         return Ok((Link::Gopher(url), false));
@@ -2814,6 +3025,18 @@ mod tests {
         assert!(!fallback);
 
         assert!(parse_navigation_target("telnet://example.com").is_err());
+        let (whois, fallback) =
+            parse_navigation_target("WHOIS://[::1]:4343/%65xample.com#local").unwrap();
+        assert!(!fallback);
+        assert!(
+            matches!(whois, Link::OneShot(url) if url.host == "::1" && url.query == "example.com")
+        );
+        assert!(parse_navigation_target("WHOIS://host:bad/query").is_err());
+        let action = crate::rdap::action("example.com").unwrap();
+        assert_eq!(
+            parse_navigation_target(&action.to_string()).unwrap(),
+            (action, false)
+        );
     }
 
     #[test]
@@ -3192,7 +3415,7 @@ mod finger_tests {
             BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
         start(&mut browser, "alice", NavigationIntent::New);
         browser.update_finger(1, reply("old", true));
-        assert!(browser.finger_view_action("wrap", Some(true)));
+        assert!(browser.reply_view_action("wrap", Some(true)));
         for (generation, text) in [(2, "new"), (3, "newest")] {
             start(&mut browser, "alice", NavigationIntent::Reload);
             browser.update_finger(generation, reply(text, false));
@@ -3204,8 +3427,217 @@ mod finger_tests {
         };
         assert!(page.view.wrap);
         assert_eq!(page.view.previous.as_deref(), Some(b"new".as_slice()));
-        assert!(browser.finger_view_action("changes", Some(true)));
+        assert!(browser.reply_view_action("changes", Some(true)));
         let doc = crate::render::documents::document(browser.current.as_ref().unwrap()).unwrap();
         assert!(doc.lines.iter().any(|line| line.text == "+ newest"));
+    }
+}
+
+#[cfg(test)]
+mod whois_tests {
+    use super::*;
+
+    fn target(query: &str) -> Link {
+        Link::OneShot(crate::whois::server_target("example.test", query).unwrap())
+    }
+    fn reply(query: &str, bytes: &[u8], finished: bool) -> crate::whois::Reply {
+        let Link::OneShot(url) = target(query) else {
+            unreachable!()
+        };
+        let mut reply = crate::whois::Reply::from_bytes(url, bytes.to_vec());
+        reply.finished = finished;
+        if !finished {
+            reply.hops[0].state = crate::whois::HopState::Receiving;
+        }
+        reply
+    }
+    fn start(browser: &mut BrowserController, query: &str, intent: NavigationIntent) {
+        browser.generation += 1;
+        browser.pending = Some(PendingNavigation {
+            generation: browser.generation,
+            target: target(query),
+            fallback_http: false,
+            intent,
+        });
+        browser.task = Some(tokio::spawn(std::future::pending()));
+    }
+
+    #[tokio::test]
+    async fn whois_local_sections_keep_the_pending_stream_and_history() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        start(&mut browser, "example.com", NavigationIntent::New);
+        browser.update_whois(
+            1,
+            reply(
+                "example.com",
+                b"Domain Name: example.com\nRegistrar: Early\n",
+                false,
+            ),
+        );
+        browser.activate(crate::registration::Section::Raw.action());
+        assert!(browser.pending.is_some() && browser.task.is_some());
+        assert!(browser.back.is_empty());
+        browser.update_whois(
+            1,
+            reply(
+                "example.com",
+                b"Domain Name: example.com\nRegistrar: Later\n",
+                true,
+            ),
+        );
+        let FetchedDocument::Whois(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.section, crate::registration::Section::Raw);
+        assert!(browser.back.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rdap_http_navigation_and_typed_links_use_the_record_presenter() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url =
+            url::Url::parse(&format!("http://{}/record", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for mime in [
+                "application/rdap+json",
+                "application/json",
+                "application/json",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 16384);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = r#"{"objectClassName":"domain","ldhName":"example.test"}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let response = fetch_protocol_interactive(
+            &Link::Http(url.clone()),
+            false,
+            None,
+            CssSize::new(800.0, 600.0),
+            1.0,
+            (0, 0),
+            Default::default(),
+            None,
+            NavigationIntent::New,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            InteractiveFetch::Document(FetchedDocument::Rdap(_))
+        ));
+        let response = fetch_protocol(&crate::rdap::direct_action(&url), false, None)
+            .await
+            .unwrap();
+        assert!(matches!(response, FetchedDocument::Rdap(_)));
+        let response = fetch_protocol(&Link::Http(url), false, None).await.unwrap();
+        assert!(
+            matches!(response, FetchedDocument::Http(_)),
+            "ordinary JSON keeps its normal HTTP presentation"
+        );
+        let requests = server.await.unwrap();
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("accept: application/rdap+json")
+        );
+    }
+
+    #[tokio::test]
+    async fn rdap_sections_save_and_reload_preserve_the_received_record() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        start(&mut browser, "example.test", NavigationIntent::New);
+        let page = crate::rdap::Page::from_response(crate::rdap::tests::response(
+            serde_json::json!({"objectClassName":"domain", "ldhName":"example.test"}),
+        ));
+        let raw = page.raw.clone();
+        browser.finish_fetch(1, Ok(FetchedDocument::Rdap(page.clone())));
+        assert_eq!(
+            browser.current.as_ref().unwrap().target,
+            Link::Http(page.url.clone())
+        );
+        browser.activate(crate::registration::Section::Raw.action());
+        assert!(browser.back.is_empty() && browser.pending.is_none() && browser.task.is_none());
+        assert!(browser.offer_whois_export(None));
+        assert_eq!(browser.download_offer.as_ref().unwrap().body, raw.as_ref());
+        start(&mut browser, "example.test", NavigationIntent::Reload);
+        browser.finish_fetch(2, Ok(FetchedDocument::Rdap(page)));
+        let FetchedDocument::Rdap(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.section, crate::registration::Section::Raw);
+        assert!(browser.back.is_empty());
+    }
+
+    #[tokio::test]
+    async fn whois_stream_history_stop_and_stale_events() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        start(&mut browser, "old", NavigationIntent::New);
+        assert!(browser.update_whois(1, reply("old", b"old", true)));
+        start(&mut browser, "new", NavigationIntent::New);
+        assert!(browser.update_whois(2, reply("new", b"first\n", false)));
+        assert_eq!(browser.back.len(), 1);
+        assert!(!browser.render_is_final);
+        browser.interaction.scroll.y = 20.0;
+        browser.whois_encoding(Some(crate::whois::Encoding::Latin1));
+        browser.reply_view_action("wrap", Some(true));
+        assert!(browser.update_whois(2, reply("new", b"first\nsecond\n", false)));
+        assert_eq!(browser.back.len(), 1);
+        assert_eq!(browser.interaction.scroll.y, 20.0);
+        assert!(browser.pending.is_some() && browser.task.is_some());
+        assert!(browser.stop());
+        assert!(!browser.update_whois(2, reply("new", b"late", true)));
+        let FetchedDocument::Whois(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(&*page.reply.hops[0].body, b"first\nsecond\n");
+        assert!(page.reply.notice.as_ref().unwrap().contains("stopped"));
+        assert_eq!(page.encoding, crate::whois::Encoding::Latin1);
+        assert!(page.view.wrap && !page.view.loading);
+        assert!(browser.offer_whois_export(Some(1)));
+        assert_eq!(
+            browser.download_offer.as_ref().unwrap().body,
+            b"first\nsecond\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn whois_reload_compares_one_success_and_encoding_does_not_fetch() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        start(&mut browser, "same", NavigationIntent::New);
+        browser.update_whois(1, reply("same", b"old", true));
+        browser.whois_encoding(Some(crate::whois::Encoding::Latin1));
+        browser.reply_view_action("wrap", Some(true));
+        for (generation, bytes) in [(2, b"new".as_slice()), (3, b"newest")] {
+            start(&mut browser, "same", NavigationIntent::Reload);
+            browser.update_whois(generation, reply("same", bytes, false));
+            browser.update_whois(generation, reply("same", bytes, true));
+        }
+        assert!(browser.back.is_empty());
+        assert!(browser.pending.is_none());
+        let generation = browser.generation;
+        browser.whois_encoding(None);
+        assert_eq!(browser.generation, generation);
+        assert!(browser.task.is_none());
+        browser.reply_view_action("changes", Some(true));
+        let doc = crate::render::documents::document(browser.current.as_ref().unwrap()).unwrap();
+        assert!(doc.lines.iter().any(|line| line.text == "+ newest"));
+        let page = doc.whois.unwrap();
+        assert_eq!(&*page.previous.unwrap().hops[0].body, b"new");
+        assert!(page.view.wrap);
     }
 }

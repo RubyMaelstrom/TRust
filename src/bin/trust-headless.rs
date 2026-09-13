@@ -448,10 +448,18 @@ fn describe_fetch(document: &FetchedDocument) -> String {
         FetchedDocument::Gemini(response) => {
             format!("Gemini {} {}", response.status, response.meta)
         }
+        FetchedDocument::Whois(page) => format!(
+            "WHOIS: {} bytes, {} servers",
+            page.reply.bytes(),
+            page.reply.hops.len()
+        ),
         FetchedDocument::Gopher(bytes) | FetchedDocument::OneShot(bytes) => {
             format!("{} bytes", bytes.len())
         }
         FetchedDocument::Finger(page) => format!("Finger: {} bytes", page.reply.body.len()),
+        FetchedDocument::Rdap(page) => {
+            format!("RDAP: {} bytes (HTTP {})", page.raw.len(), page.status)
+        }
         // The driver prints the address of an in-process document anyway.
         FetchedDocument::Internal(_) => String::from("in-process document"),
     }
