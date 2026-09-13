@@ -123,9 +123,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     g.doc
                         .text_view()
                         .map_or(0, |view| view.horizontal.min(u16::MAX as usize) as u16),
-                ))
-                .block(block);
-            frame.render_widget(doc, session_area);
+                ));
+            if let Some(view) = &g.doc.gopher {
+                // Equal horizontal margins (CSS 2 §10.3.3 #blockwidth), with
+                // left-aligned lines. Keep last_inner as the full viewport:
+                // wrapping and subsequent HTTP/Telnet navigation still use it.
+                let width = view.reading_columns(inner.width as usize) as u16;
+                let content = Rect::new(
+                    inner.x + (inner.width - width) / 2,
+                    inner.y,
+                    width,
+                    inner.height,
+                );
+                app.last_content_area = content;
+                frame.render_widget(block, session_area);
+                frame.render_widget(doc, content);
+            } else {
+                frame.render_widget(doc.block(block), session_area);
+            }
             // Second pass: overlay decoded inline images on their reserved
             // boxes. Each box encodes once to a `SlicedProtocol`; the renderer
             // clips it to its on-screen slice (sixel bands stripped), so a

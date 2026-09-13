@@ -15188,6 +15188,134 @@ mod tests {
 }
 
 #[cfg(test)]
+mod gopher_column_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn draw_at_width(app: &mut App, width: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        app.sync_browser_wrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal
+    }
+
+    #[tokio::test]
+    async fn gopher_centered_terminal_preserves_labels_and_gutter_hit_testing_on_resize() {
+        let mut app = App::new(None, 23);
+        app.mode = Mode::Session;
+        app.last_inner = (120, 11);
+        let url = gopher::GopherUrl::parse("gopher://example.test").unwrap();
+        let label = "x".repeat(72);
+        let raw = format!("0{label}\t/a\texample.test\t70\r\n1Next\t/b\texample.test\t70\r\n.\r\n");
+        app.on_gopher_reply(
+            url,
+            crate::text_reply::Reply {
+                body: raw.as_bytes().to_vec(),
+                finished: true,
+                notice: None,
+            },
+        );
+        let terminal = draw_at_width(&mut app, 122);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            app.last_inner,
+            (120, 11),
+            "viewport geometry remains full width"
+        );
+        assert_eq!(
+            app.last_content_area,
+            ratatui::layout::Rect::new(21, 1, 80, 11)
+        );
+        assert_eq!(buffer[(20, 1)].symbol(), " ");
+        assert_eq!(buffer[(21, 1)].symbol(), "x");
+        assert_eq!(buffer[(92, 1)].symbol(), "x");
+        assert_eq!(app.gopher_hit_test(20, 1), None);
+        assert_eq!(app.gopher_hit_test(21, 1), Some(0));
+        assert_eq!(app.gopher_hit_test(101, 1), None);
+
+        draw_at_width(&mut app, 66);
+        assert_eq!(app.last_content_area.x, 1);
+        assert_eq!(app.last_content_area.width, 64);
+        assert_eq!(
+            app.gopher_hit_test(2, 2),
+            Some(0),
+            "wrapped rows keep their owner"
+        );
+        assert!(
+            app.pending_browser_wrap_target().is_none(),
+            "resize settles"
+        );
+
+        draw_at_width(&mut app, 143);
+        assert_eq!(app.last_inner.0, 141);
+        assert_eq!(
+            app.last_content_area.x, 31,
+            "odd spare width rounds only at paint"
+        );
+        assert_eq!(app.last_content_area.width, 80);
+        assert_eq!(app.browser.as_ref().unwrap().doc.lines[0].text, label);
+        assert_eq!(app.browser.as_ref().unwrap().doc.raw, raw.as_bytes());
+        assert_eq!(app.browser.as_ref().unwrap().selected, Some(0));
+
+        app.navigate_to(App::about_doc(
+            "about:test".into(),
+            "other protocol".into(),
+            141,
+        ));
+        draw_at_width(&mut app, 143);
+        assert_eq!(app.last_content_area.x, 1);
+        assert_eq!(app.last_content_area.width, 141);
+    }
+
+    #[tokio::test]
+    async fn gopher_centered_terminal_expands_for_wide_text_and_clears_stale_pan() {
+        let mut app = App::new(None, 23);
+        app.mode = Mode::Session;
+        app.last_inner = (60, 11);
+        let url = gopher::GopherUrl::parse("gopher://example.test/0/phlog").unwrap();
+        let raw = format!("  {}MARK\r\n", "x".repeat(82));
+        app.on_gopher_reply(
+            url,
+            crate::text_reply::Reply {
+                body: raw.as_bytes().to_vec(),
+                finished: true,
+                notice: None,
+            },
+        );
+        app.reply_view_action("wrap", Some(false));
+        draw_at_width(&mut app, 62);
+        app.browser_nav(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .text_view()
+                .unwrap()
+                .horizontal,
+            8
+        );
+
+        let terminal = draw_at_width(&mut app, 122);
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.text_view().unwrap().horizontal, 0);
+        assert_eq!(g.doc.lines.len(), 1);
+        assert_eq!(g.doc.lines[0].text, raw.trim_end_matches(['\r', '\n']));
+        assert_eq!(
+            app.last_content_area,
+            ratatui::layout::Rect::new(17, 1, 88, 11)
+        );
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(17, 1)].symbol(), " ");
+        assert_eq!(buffer[(18, 1)].symbol(), " ");
+        assert_eq!(buffer[(19, 1)].symbol(), "x");
+        assert_eq!(buffer[(101, 1)].symbol(), "M");
+        assert_eq!(buffer[(104, 1)].symbol(), "K");
+    }
+}
+
+#[cfg(test)]
 mod finger_tests {
     use super::*;
     use crate::finger::Reply;
