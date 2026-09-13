@@ -192,8 +192,11 @@ Search links prompt for a query in either frontend. A bookmark of the search
 endpoint prompts again; a bookmark containing a query repeats that search.
 Selectors retain their original bytes through copying, navigation and bookmarks,
 including percent escapes, IPv6 hosts and non-default ports. Image items use the
-image display, HTML items use the HTML renderer, and binary/archive items offer
-Save / Open / Cancel before transferring the file. Redundant-server menu entries
+image display and HTML items use the HTML renderer. Generic binary items are
+checked for a supported format: images (including WebP), text and HTML open
+directly in TRust. Unsupported files offer Save / Open / Cancel after a bounded
+type check; files exceeding the page-body limit can also be downloaded.
+Redundant-server menu entries
 inherit the original item's type and can be selected as alternate destinations.
 Gopher+ commands and unimplemented legacy service types report an explicit error.
 

@@ -47,7 +47,8 @@ impl DownloadOffer {
         }
     }
 
-    /// A binary Gopher item is fetched only after Save/Open is chosen.
+    /// Stream a Gopher download after Save/Open is chosen. A bounded type
+    /// check may already have inspected its prefix without retaining the file.
     /// Keep the opaque target independently of the generic URI display record.
     pub fn from_gopher(target: crate::gopher::GopherUrl) -> Result<Self, String> {
         target.request()?;
@@ -188,7 +189,7 @@ pub fn computed_mime_type(response: &http::Response) -> String {
     supplied.unwrap()
 }
 
-fn identify_unknown(bytes: &[u8], sniff_scriptable: bool) -> &'static str {
+pub(crate) fn identify_unknown(bytes: &[u8], sniff_scriptable: bool) -> &'static str {
     let bytes = &bytes[..bytes.len().min(SNIFF_BYTES)];
     let trimmed = bytes
         .iter()
@@ -680,10 +681,12 @@ pub async fn save(offer: &DownloadOffer, destination: &Path) -> Result<u64, Stri
             .unwrap_or("download"),
         std::process::id()
     ));
-    let result = if let Some(target) = &offer.gopher {
-        stream_gopher(target, &partial).await
-    } else if offer.fetch_body {
-        stream_get(&offer.url, offer.referrer.as_ref(), &partial).await
+    let result = if offer.fetch_body {
+        if let Some(target) = &offer.gopher {
+            stream_gopher(target, &partial).await
+        } else {
+            stream_get(&offer.url, offer.referrer.as_ref(), &partial).await
+        }
     } else {
         if offer.body.len() as u64 > MAX_DOWNLOAD_BYTES {
             return Err(String::from("download exceeds 2 GiB limit"));
