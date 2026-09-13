@@ -1866,6 +1866,7 @@ impl BrowserController {
         if let Some(page) = self.live_page.take() {
             page.retire();
         }
+        http::prune_idle_connections();
         self.pending_live_submit = None;
         self.page_key_defaults.clear();
         self.pending_form_values.clear();

@@ -1851,42 +1851,129 @@ impl AsyncWrite for Conn {
 type PoolKey = (String, String, u16); // (scheme, host, port)
 
 struct IdleConn {
-    io: BufReader<Conn>,
+    io: Option<BufReader<Conn>>,
     since: Instant,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for IdleConn {
+    fn drop(&mut self) {
+        let Some(mut io) = self.io.take() else { return };
+        // RFC 9112 §9.5 / RFC 8446 §6.1: close gracefully, including TLS
+        // close_notify. An idle stream normally finishes this in one poll.
+        // The native frontend may evict it outside any entered Tokio runtime.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if std::pin::Pin::new(&mut io)
+            .poll_shutdown(&mut cx)
+            .is_pending()
+            && let Ok(permit) = POOL_CLOSE_SLOTS.clone().try_acquire_owned()
+        {
+            self.runtime.spawn(async move {
+                let _permit = permit;
+                // A blocked/broken peer must not retain an evicted socket or
+                // TLS buffers indefinitely, nor make navigation wait for I/O.
+                let _ = tokio::time::timeout(Duration::from_secs(1), io.shutdown()).await;
+            });
+        }
+    }
 }
 
 /// The keep-alive pool: idle connections per (scheme, host, port),
 /// RAM-only, newest-first reuse. A page load that used to pay a fresh
 /// DNS+TCP+TLS per subresource (~500ms each on the wide net) now pays
 /// it once per host.
-static POOL: std::sync::LazyLock<std::sync::Mutex<HashMap<PoolKey, Vec<IdleConn>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static POOL: std::sync::LazyLock<std::sync::Mutex<ConnectionPool>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ConnectionPool::default()));
 
 /// Servers commonly drop idle connections after ~60s; don't bother
 /// trying one older than this.
 const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 const POOL_MAX_IDLE_PER_KEY: usize = 8;
+const POOL_MAX_IDLE: usize = 32;
+static POOL_CLOSE_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(POOL_MAX_IDLE)));
 
-fn pool_get(key: &PoolKey) -> Option<BufReader<Conn>> {
-    let mut pool = POOL.lock().ok()?;
-    let idle = pool.get_mut(key)?;
-    while let Some(conn) = idle.pop() {
-        if conn.since.elapsed() < POOL_IDLE_TTL {
-            return Some(conn.io);
+#[derive(Default)]
+struct ConnectionPool {
+    idle: HashMap<PoolKey, Vec<IdleConn>>,
+}
+
+impl ConnectionPool {
+    fn prune(&mut self, now: Instant) {
+        // RFC 9112 §§9.3, 9.5: persistence permits reuse, but either peer may
+        // close an idle transport. Visit every origin, including origins that
+        // will never be requested again. Empty buckets must not retain host names.
+        self.idle.retain(|_, connections| {
+            connections.retain(|connection| {
+                now.saturating_duration_since(connection.since) < POOL_IDLE_TTL
+            });
+            !connections.is_empty()
+        });
+        let mut count: usize = self.idle.values().map(Vec::len).sum();
+        while count > POOL_MAX_IDLE {
+            let oldest = self
+                .idle
+                .iter()
+                .flat_map(|(key, connections)| {
+                    connections
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, connection)| (key, index, connection.since))
+                })
+                .min_by_key(|(_, _, since)| *since)
+                .map(|(key, index, _)| (key.clone(), index));
+            let Some((key, index)) = oldest else { break };
+            let connections = self.idle.get_mut(&key).expect("oldest entry exists");
+            connections.remove(index);
+            if connections.is_empty() {
+                self.idle.remove(&key);
+            }
+            count -= 1;
         }
     }
-    None
+
+    fn get(&mut self, key: &PoolKey, now: Instant) -> Option<BufReader<Conn>> {
+        self.prune(now);
+        let connections = self.idle.get_mut(key)?;
+        let connection = connections
+            .pop()
+            .and_then(|mut connection| connection.io.take());
+        if connections.is_empty() {
+            self.idle.remove(key);
+        }
+        connection
+    }
+
+    fn put(&mut self, key: PoolKey, io: BufReader<Conn>, now: Instant) {
+        let connections = self.idle.entry(key).or_default();
+        if connections.len() == POOL_MAX_IDLE_PER_KEY {
+            connections.remove(0);
+        }
+        connections.push(IdleConn {
+            io: Some(io),
+            since: now,
+            runtime: tokio::runtime::Handle::current(),
+        });
+        self.prune(now);
+    }
+}
+
+/// Navigation is an idle-pool maintenance boundary even when the destination
+/// makes no HTTP requests. Recent connections remain reusable across pages;
+/// expired connections and empty origin buckets are released without a timer.
+pub(crate) fn prune_idle_connections() {
+    if let Ok(mut pool) = POOL.lock() {
+        pool.prune(Instant::now());
+    }
+}
+
+fn pool_get(key: &PoolKey) -> Option<BufReader<Conn>> {
+    POOL.lock().ok()?.get(key, Instant::now())
 }
 
 fn pool_put(key: PoolKey, io: BufReader<Conn>) {
     if let Ok(mut pool) = POOL.lock() {
-        let idle = pool.entry(key).or_default();
-        if idle.len() < POOL_MAX_IDLE_PER_KEY {
-            idle.push(IdleConn {
-                io,
-                since: Instant::now(),
-            });
-        }
+        pool.put(key, io, Instant::now());
     }
 }
 
@@ -6113,6 +6200,201 @@ mod resource_timing_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn idle_connection_pair() -> (BufReader<Conn>, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        (
+            BufReader::new(Conn::Plain(client.unwrap())),
+            server.unwrap().0,
+        )
+    }
+
+    async fn assert_idle_peer_closed(peer: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .expect("idle connection closed promptly")
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_connection_pool_prunes_unvisited_origins_at_the_expiry_boundary() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut pool = ConnectionPool::default();
+        let now = Instant::now();
+        let expired = ("http".into(), "old.example".into(), 80);
+        let recent = ("http".into(), "recent.example".into(), 80);
+        let (old_io, mut old_peer) = idle_connection_pair().await;
+        let (recent_io, mut recent_peer) = idle_connection_pair().await;
+        pool.put(expired.clone(), old_io, now - POOL_IDLE_TTL);
+        pool.put(recent.clone(), recent_io, now - Duration::from_secs(1));
+        assert_eq!(pool.idle.len(), 2);
+        // This is the same sweep used by navigation, including navigation to a
+        // non-HTTP document. No request to old.example is needed to expire it.
+        pool.prune(now);
+        assert!(!pool.idle.contains_key(&expired));
+        assert_idle_peer_closed(&mut old_peer).await;
+        let mut reused = pool.get(&recent, now).unwrap();
+        assert!(
+            pool.idle.is_empty(),
+            "taking the last socket removes its key"
+        );
+        recent_peer.write_all(b"usable").await.unwrap();
+        let mut bytes = [0; 6];
+        reused.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"usable");
+    }
+
+    #[tokio::test]
+    async fn idle_connection_pool_bounds_all_origins_and_prefers_recent_sockets() {
+        let mut pool = ConnectionPool::default();
+        let now = Instant::now();
+        let mut peers = Vec::new();
+        for index in 0..=POOL_MAX_IDLE {
+            let (io, peer) = idle_connection_pair().await;
+            pool.put(
+                ("http".into(), format!("host-{index}.example"), 80),
+                io,
+                now + Duration::from_millis(index as u64),
+            );
+            peers.push(peer);
+        }
+        assert_eq!(pool.idle.len(), POOL_MAX_IDLE);
+        assert!(
+            !pool
+                .idle
+                .contains_key(&("http".into(), "host-0.example".into(), 80))
+        );
+        assert_idle_peer_closed(&mut peers[0]).await;
+
+        let key = ("https".into(), "one.example".into(), 443);
+        let mut same_origin_peers = Vec::new();
+        for index in 0..=POOL_MAX_IDLE_PER_KEY {
+            let (io, peer) = idle_connection_pair().await;
+            pool.put(
+                key.clone(),
+                io,
+                now + Duration::from_secs(1) + Duration::from_millis(index as u64),
+            );
+            same_origin_peers.push(peer);
+        }
+        assert_eq!(pool.idle[&key].len(), POOL_MAX_IDLE_PER_KEY);
+        assert_eq!(
+            pool.idle.values().map(Vec::len).sum::<usize>(),
+            POOL_MAX_IDLE
+        );
+        assert_idle_peer_closed(&mut same_origin_peers[0]).await;
+        let newest = pool.get(&key, now + Duration::from_secs(2)).unwrap();
+        drop(newest);
+        assert_idle_peer_closed(same_origin_peers.last_mut().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn idle_connection_pool_access_sweeps_other_origins() {
+        let mut pool = ConnectionPool::default();
+        let now = Instant::now();
+        let old_key = ("http".into(), "old.example".into(), 80);
+        let missing_key = ("http".into(), "new.example".into(), 80);
+        let (io, mut peer) = idle_connection_pair().await;
+        pool.put(old_key.clone(), io, now - POOL_IDLE_TTL);
+        assert!(pool.get(&missing_key, now).is_none());
+        assert!(pool.idle.is_empty());
+        assert_idle_peer_closed(&mut peer).await;
+        let (io, mut peer) = idle_connection_pair().await;
+        pool.put(old_key, io, now - POOL_IDLE_TTL);
+        let (io, _peer) = idle_connection_pair().await;
+        pool.put(missing_key, io, now);
+        assert_eq!(pool.idle.len(), 1);
+        assert_idle_peer_closed(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn idle_connection_pool_is_swept_by_navigation_without_an_http_fetch() {
+        let (io, mut peer) = idle_connection_pair().await;
+        let key = (
+            "http".into(),
+            "navigation-pool-test.invalid".into(),
+            peer.local_addr().unwrap().port(),
+        );
+        POOL.lock()
+            .unwrap()
+            .put(key.clone(), io, Instant::now() - POOL_IDLE_TTL);
+        let mut browser = crate::core::BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            crate::core::CssSize::new(800.0, 600.0),
+        );
+        browser.open_internal_gemtext("about:help", b"# Help\n".to_vec());
+        assert!(!POOL.lock().unwrap().idle.contains_key(&key));
+        assert_idle_peer_closed(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn idle_connection_pool_eviction_sends_tls_close_notify_outside_runtime_context() {
+        use std::sync::Arc;
+        use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
+
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(signed.cert.der().clone()).unwrap();
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let key =
+                rustls::pki_types::PrivateKeyDer::try_from(signed.signing_key.serialize_der())
+                    .unwrap();
+            let server_config = rustls::ServerConfig::builder_with_protocol_versions(&[version])
+                .with_no_client_auth()
+                .with_single_cert(vec![signed.cert.der().clone()], key)
+                .unwrap();
+            let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let (client, server) = idle_connection_pair().await;
+            let Conn::Plain(client) = client.into_inner() else {
+                unreachable!()
+            };
+            let (client, server) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    connector.connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        client
+                    ),
+                    acceptor.accept(server),
+                )
+            })
+            .await
+            .unwrap();
+            let mut server = server.unwrap();
+            let mut pool = ConnectionPool::default();
+            let now = Instant::now();
+            pool.put(
+                ("https".into(), "localhost".into(), 443),
+                BufReader::new(Conn::Tls(Box::new(client.unwrap()))),
+                now - POOL_IDLE_TTL,
+            );
+            // The winit event thread has no entered Tokio context. Pool entries
+            // carry the runtime that owns their transport for a pending flush.
+            std::thread::spawn(move || pool.prune(now)).join().unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), server.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .expect("TLS closure must include close_notify"),
+                0,
+            );
+        }
+    }
 
     #[test]
     fn cached_module_speculation_is_once_per_response_entry() {
