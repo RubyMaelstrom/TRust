@@ -73,6 +73,7 @@ pub mod frontend {
     }
 }
 
+pub mod dict;
 pub mod rdap;
 pub mod registration;
 pub mod text_reply;

@@ -216,6 +216,7 @@ fn parse_menu(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
             Some(
                 crate::http::parse_url(target)
                     .map(Link::Http)
+                    .or_else(|| crate::dict::Target::parse(target).ok().map(Link::Dict))
                     .or_else(|| crate::oneshot::OneShotUrl::parse(target).map(Link::OneShot))
                     .unwrap_or_else(|| Link::External(target.to_string())),
             )

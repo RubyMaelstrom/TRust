@@ -1,195 +1,79 @@
-//! One-shot query protocols: finger (RFC 1288), WHOIS (RFC 3912), and
-//! DICT (RFC 2229). Each renders into the browser panel. Finger's streaming
-//! exchange and preformatted presentation live in `crate::finger`.
-
+//! Compatibility entry points for Finger (RFC 1288) and WHOIS (RFC 3912).
+//! DICT has a structured query and reply model in `crate::dict`.
+use crate::doc::Doc;
 use std::fmt;
-use std::time::Duration;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
-use crate::doc::{Doc, DocLine, Kind, Link, push_wrapped};
-
-const MAX_RESPONSE: usize = 1024 * 1024;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// The canonical WHOIS referral root.
 pub const WHOIS_DEFAULT: &str = "whois.iana.org";
-/// The classic public DICT server.
-pub const DICT_DEFAULT: &str = "dict.org";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheme {
     Finger,
     Whois,
-    Dict,
 }
-
 impl Scheme {
     pub fn default_port(self) -> u16 {
         match self {
-            Scheme::Finger => 79,
-            Scheme::Whois => 43,
-            Scheme::Dict => 2628,
+            Self::Finger => 79,
+            Self::Whois => 43,
         }
     }
-
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Scheme::Finger => "finger",
-            Scheme::Whois => "whois",
-            Scheme::Dict => "dict",
+            Self::Finger => "finger",
+            Self::Whois => "whois",
         }
     }
 }
-
-/// A one-shot query target: `finger://host[:port][/user]`,
-/// `whois://server[:port]/query`, `dict://host[:port]/word`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OneShotUrl {
     pub scheme: Scheme,
     pub host: String,
     pub port: u16,
-    /// The user (finger), domain (whois), or word (dict) queried.
-    /// Finger allows an empty query: "who is logged in".
     pub query: String,
 }
-
 impl OneShotUrl {
-    pub fn parse(s: &str) -> Option<Self> {
-        if s.split_once(':')
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
-        {
-            return crate::finger::parse_url(s);
-        }
-        if s.split_once(':')
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("whois"))
-        {
-            return crate::whois::parse_url(s);
-        }
-        let (scheme, rest) = if let Some(r) = s.strip_prefix("whois://") {
-            (Scheme::Whois, r)
+    pub fn parse(input: &str) -> Option<Self> {
+        let (scheme, _) = input.split_once(':')?;
+        if scheme.eq_ignore_ascii_case("finger") {
+            crate::finger::parse_url(input)
+        } else if scheme.eq_ignore_ascii_case("whois") {
+            crate::whois::parse_url(input)
         } else {
-            let r = s.strip_prefix("dict://")?;
-            (Scheme::Dict, r)
-        };
-        let (authority, query) = match rest.split_once('/') {
-            Some((a, q)) => (a, q),
-            None => (rest, ""),
-        };
-        if authority.is_empty() {
-            return None;
+            None
         }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-                (host, port.parse().ok()?)
-            }
-            _ => (authority, scheme.default_port()),
-        };
-        // RFC 2229 dict URLs spell definitions `/d:word[:database...]`.
-        let query = match scheme {
-            Scheme::Dict => {
-                let q = query.strip_prefix("d:").unwrap_or(query);
-                q.split(':').next().unwrap_or("").to_string()
-            }
-            _ => query.to_string(),
-        };
-        Some(Self {
-            scheme,
-            host: host.to_string(),
-            port,
-            query,
-        })
     }
 }
-
 impl fmt::Display for OneShotUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if matches!(self.scheme, Scheme::Finger | Scheme::Whois) {
-            if self.host.contains(':') {
-                write!(f, "{}://[{}]", self.scheme.name(), self.host)?;
-            } else {
-                write!(f, "{}://{}", self.scheme.name(), self.host)?;
-            }
-            if self.port != self.scheme.default_port() {
-                write!(f, ":{}", self.port)?;
-            }
-            if !self.query.is_empty() {
-                f.write_str("/")?;
-                crate::finger::encode_query(&self.query, f)?;
-            }
-            return Ok(());
+        if self.host.contains(':') {
+            write!(f, "{}://[{}]", self.scheme.name(), self.host)?;
+        } else {
+            write!(f, "{}://{}", self.scheme.name(), self.host)?;
         }
-        write!(f, "{}://{}", self.scheme.name(), self.host)?;
         if self.port != self.scheme.default_port() {
             write!(f, ":{}", self.port)?;
         }
         if !self.query.is_empty() {
-            write!(f, "/{}", self.query)?;
+            f.write_str("/")?;
+            crate::finger::encode_query(&self.query, f)?;
         }
         Ok(())
     }
 }
-
-/// Connect, send `payload`, read to EOF.
-async fn exchange(host: &str, port: u16, payload: String) -> Result<Vec<u8>, String> {
-    let io = async {
-        let mut stream = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| e.to_string())?;
-        stream
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Ok(out);
-            }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > MAX_RESPONSE {
-                return Err(String::from("response exceeds 1 MB cap"));
-            }
-        }
-    };
-    tokio::time::timeout(FETCH_TIMEOUT, io)
-        .await
-        .map_err(|_| String::from("timed out"))?
-}
-
 pub async fn fetch(url: &OneShotUrl) -> Result<Vec<u8>, String> {
     match url.scheme {
         Scheme::Finger => crate::finger::fetch(url).await.map(|reply| reply.body),
-        // DEFINE and QUIT pipeline fine, which keeps DICT a one-shot:
-        // the server answers everything and closes.
-        Scheme::Dict => {
-            exchange(
-                &url.host,
-                url.port,
-                format!("DEFINE * {}\r\nQUIT\r\n", url.query),
-            )
-            .await
-        }
         Scheme::Whois => crate::whois::fetch(url)
             .await
             .map(|reply| reply.transcript()),
     }
 }
-
-/// Render a reply into a document. Finger and WHOIS are plain text;
-/// DICT gets its protocol lines stripped and definitions styled.
 pub fn parse(url: &OneShotUrl, raw: Vec<u8>, width: usize) -> Doc {
-    if url.scheme == Scheme::Whois {
-        return crate::whois::render(
+    match url.scheme {
+        Scheme::Whois => crate::whois::render(
             url,
             crate::whois::Page::new(crate::whois::Reply::from_bytes(url.clone(), raw)),
             width,
-        );
-    }
-    if url.scheme == Scheme::Finger {
-        return crate::finger::render(
+        ),
+        Scheme::Finger => crate::finger::render(
             url,
             crate::finger::Reply {
                 body: raw,
@@ -198,91 +82,9 @@ pub fn parse(url: &OneShotUrl, raw: Vec<u8>, width: usize) -> Doc {
             },
             Default::default(),
             width,
-        );
-    }
-    let width = width.max(10);
-    let lines = match url.scheme {
-        Scheme::Finger | Scheme::Whois => {
-            crate::doc::wrap_plain(&String::from_utf8_lossy(&raw), width)
-        }
-        Scheme::Dict => dict_lines(&String::from_utf8_lossy(&raw), width),
-    };
-    Doc::from_lines(Link::OneShot(url.clone()), lines, raw, width, false, None)
-}
-
-/// Convert a DICT session transcript into document lines: each `151`
-/// definition header becomes a heading, its body (up to the `.`
-/// terminator, dot-unstuffed) plain text; `552` means no match; other
-/// 4xx/5xx errors show as-is. Status chatter (220/150/250/QUIT) drops.
-fn dict_lines(text: &str, width: usize) -> Vec<DocLine> {
-    let mut lines = Vec::new();
-    let mut in_definition = false;
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if in_definition {
-            if line == "." {
-                in_definition = false;
-                lines.push(DocLine {
-                    kind: Kind::Text,
-                    text: String::new(),
-                    link: None,
-                });
-                continue;
-            }
-            // Text lines starting with '.' arrive dot-stuffed.
-            let line = line
-                .strip_prefix('.')
-                .filter(|r| r.starts_with('.'))
-                .unwrap_or(line);
-            push_wrapped(&mut lines, Kind::Text, line.to_string(), None, width);
-        } else if let Some(rest) = line.strip_prefix("151 ") {
-            push_wrapped(
-                &mut lines,
-                Kind::Heading(2),
-                definition_title(rest),
-                None,
-                width,
-            );
-            in_definition = true;
-        } else if line.starts_with("552") {
-            lines.push(DocLine {
-                kind: Kind::Error,
-                text: String::from("No definitions found."),
-                link: None,
-            });
-        } else if line.starts_with('4') || line.starts_with('5') {
-            push_wrapped(&mut lines, Kind::Error, line.to_string(), None, width);
-        }
-    }
-    while lines.last().is_some_and(|l| l.text.is_empty()) {
-        lines.pop();
-    }
-    lines
-}
-
-/// `151 "word" db "description"` → `word — description`.
-fn definition_title(rest: &str) -> String {
-    let (word, rest) = quoted_or_token(rest);
-    let (_db, rest) = quoted_or_token(rest);
-    let (description, _) = quoted_or_token(rest);
-    if description.is_empty() {
-        word.to_string()
-    } else {
-        format!("{word} — {description}")
+        ),
     }
 }
-
-/// Split one field off a 151 line: a quoted string or a bare token.
-fn quoted_or_token(s: &str) -> (&str, &str) {
-    let s = s.trim_start();
-    if let Some(rest) = s.strip_prefix('"')
-        && let Some(end) = rest.find('"')
-    {
-        return (&rest[..end], &rest[end + 1..]);
-    }
-    s.split_once(' ').unwrap_or((s, ""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,57 +104,12 @@ mod tests {
         let url = OneShotUrl::parse("whois://whois.iana.org/example.com").unwrap();
         assert_eq!((url.port, url.query.as_str()), (43, "example.com"));
 
-        // RFC 2229 forms: d: prefix and :database suffix drop away.
-        let url = OneShotUrl::parse("dict://dict.org/d:neon:wn").unwrap();
-        assert_eq!((url.port, url.query.as_str()), (2628, "neon"));
-        assert_eq!(url.to_string(), "dict://dict.org/neon");
-
         let url = OneShotUrl::parse("finger://bbs.example:7979/sysop").unwrap();
         assert_eq!(url.port, 7979);
         assert_eq!(url.to_string(), "finger://bbs.example:7979/sysop");
 
         assert!(OneShotUrl::parse("gopher://x").is_none());
         assert!(OneShotUrl::parse("finger://").is_none());
-    }
-
-    #[test]
-    fn renders_dict_transcripts() {
-        let transcript = "220 dict.org banner <auth.mime>\r\n\
-                          150 2 definitions retrieved\r\n\
-                          151 \"neon\" wn \"WordNet (r) 3.0 (2006)\"\r\n\
-                          neon\r\n    n 1: a colorless element\r\n\
-                          ..literally starts with a dot\r\n\
-                          .\r\n\
-                          151 \"neon\" gcide \"The Collaborative International\"\r\n\
-                          Neon \\Ne\"on\\, n.\r\n\
-                          .\r\n\
-                          250 ok\r\n\
-                          221 bye\r\n";
-        let url = OneShotUrl::parse("dict://dict.org/neon").unwrap();
-        let doc = parse(&url, transcript.as_bytes().to_vec(), 80);
-
-        assert_eq!(doc.lines[0].kind, Kind::Heading(2));
-        assert_eq!(doc.lines[0].text, "neon — WordNet (r) 3.0 (2006)");
-        assert_eq!(doc.lines[1].text, "neon");
-        assert!(
-            doc.lines
-                .iter()
-                .any(|l| l.text == ".literally starts with a dot")
-        );
-        assert!(
-            doc.lines
-                .iter()
-                .filter(|l| l.kind == Kind::Heading(2))
-                .count()
-                == 2,
-            "both definitions render"
-        );
-        assert!(!doc.lines.iter().any(|l| l.text.contains("250")));
-
-        let miss = "220 banner\r\n552 no match\r\n221 bye\r\n";
-        let doc = parse(&url, miss.as_bytes().to_vec(), 80);
-        assert_eq!(doc.lines[0].kind, Kind::Error);
-        assert_eq!(doc.lines[0].text, "No definitions found.");
     }
 
     #[tokio::test]

@@ -549,6 +549,7 @@ pub fn adapt_rendered_terminal(
         finger: None,
         whois: None,
         rdap: None,
+        dict: None,
         raw,
         wrapped_to: viewport.columns,
         cp437: false,
@@ -5258,6 +5259,7 @@ pub fn parse_seeded(
         finger: None,
         whois: None,
         rdap: None,
+        dict: None,
         raw: body.to_vec(),
         wrapped_to: width,
         cp437: false,
@@ -5706,7 +5708,10 @@ pub(crate) fn resolve(base: &Url, target: &str) -> Link {
             "gopher" => crate::gopher::GopherUrl::parse(joined.as_str())
                 .map(Link::Gopher)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
-            "finger" | "whois" | "dict" => crate::oneshot::OneShotUrl::parse(joined.as_str())
+            "dict" => crate::dict::Target::parse(joined.as_str())
+                .map(Link::Dict)
+                .unwrap_or_else(|_| Link::External(joined.to_string())),
+            "finger" | "whois" => crate::oneshot::OneShotUrl::parse(joined.as_str())
                 .map(Link::OneShot)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
             "telnet" | "telnets" => joined.host_str().map_or_else(

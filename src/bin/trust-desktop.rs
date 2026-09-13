@@ -1939,7 +1939,11 @@ impl DesktopApp {
                 | UserAction::Forward
                 | UserAction::Navigate(_)
                 | UserAction::Activate(
-                    Link::Gopher(_) | Link::Gemini(_) | Link::Http(_) | Link::OneShot(_)
+                    Link::Gopher(_)
+                        | Link::Gemini(_)
+                        | Link::Http(_)
+                        | Link::OneShot(_)
+                        | Link::Dict(_)
                 )
         );
         let leaves_keyboard_target = matches!(
@@ -2288,6 +2292,7 @@ impl DesktopApp {
             Some(FetchedDocument::Finger(_)) => String::from("FINGER"),
             Some(FetchedDocument::Whois(_)) => String::from("WHOIS"),
             Some(FetchedDocument::Rdap(_)) => String::from("RDAP"),
+            Some(FetchedDocument::Dict(_)) => String::from("DICT"),
             Some(FetchedDocument::Internal(_)) => String::from("TRUST:LOCAL"),
             None if snapshot.loading => String::from("LINK:OPENING"),
             None => String::from("LINK:DOWN"),
@@ -2485,7 +2490,17 @@ impl DesktopApp {
                     );
                     if let Some(old) = &self.protocol_page
                         && old.generation == generation
-                        && old.document.registration_section().is_some()
+                        && (old.document.registration_section().is_some()
+                            || old.document.dict.is_some())
+                        && old
+                            .document
+                            .dict
+                            .as_ref()
+                            .map(|p| (p.section, p.selected, &p.filter))
+                            == document
+                                .dict
+                                .as_ref()
+                                .map(|p| (p.section, p.selected, &p.filter))
                         && old.document.registration_section() == document.registration_section()
                         && self.browser.interaction().scroll.y > 0.0
                     {
@@ -3341,7 +3356,9 @@ impl DesktopApp {
                     self.request_redraw();
                     return true;
                 }
-                if cache.document.registration_section().is_some() && key.eq_ignore_ascii_case("s")
+                if (cache.document.registration_section().is_some()
+                    || cache.document.dict.is_some())
+                    && key.eq_ignore_ascii_case("s")
                 {
                     self.browser.offer_whois_export(None);
                     if self.browser.download_offer().is_some() {
@@ -4121,7 +4138,7 @@ impl DesktopApp {
                 self.close_command();
                 if !self.browser.reply_view_action(action, enabled) {
                     self.browser
-                        .set_status("Wrap and changes controls apply to Finger and WHOIS replies.");
+                        .set_status("Wrap applies to Finger, WHOIS, RDAP and DICT; changes applies to Finger and WHOIS.");
                 }
                 self.request_redraw();
             }
@@ -4179,7 +4196,7 @@ impl DesktopApp {
                 self.close_command();
                 if !self.browser.offer_whois_export(server) {
                     self.browser
-                        .set_status("Save applies to WHOIS and RDAP replies.");
+                        .set_status("Save applies to WHOIS, RDAP and DICT replies.");
                 }
                 if self.browser.download_offer().is_some() {
                     self.set_focus(FocusTarget::Download);
@@ -4205,18 +4222,27 @@ impl DesktopApp {
                 }
             }
             "dict" | "define" => {
-                let Some(word) = parts.next() else {
-                    self.browser.set_status("usage: dict <word> [server]");
-                    return;
-                };
-                let server = parts.next().unwrap_or(trust::oneshot::DICT_DEFAULT);
-                let (host, port) = trust::command::split_host_port(server);
-                let address = format!(
-                    "dict://{host}{}/d:{word}",
-                    port.map_or_else(String::new, |port| format!(":{port}"))
-                );
+                let arguments = command
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                match trust::dict::command_target(arguments) {
+                    Ok(target) => {
+                        self.close_command();
+                        self.navigate(target.to_string());
+                    }
+                    Err(error) => self.browser.set_status(error),
+                }
+            }
+            "dict-filter" => {
+                let filter = command
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                if !self.browser.dict_filter(filter) {
+                    self.browser
+                        .set_status("Filter applies to dictionary pages.");
+                }
                 self.close_command();
-                self.navigate(address);
+                self.request_redraw();
             }
             _ if trust::command::looks_like_address(&verb) => {
                 let target = match parts.next() {
@@ -4739,6 +4765,23 @@ impl DesktopApp {
     }
 
     fn activate_link(&mut self, link: Link) {
+        if let Some(action) = trust::dict::Action::from_link(&link)
+            && let Some(FetchedDocument::Dict(page)) =
+                self.browser.current_page().map(|p| &p.document)
+        {
+            if let Some(command) = page.command_for(&action) {
+                self.command.set_text(&command);
+                self.set_focus(FocusTarget::Command);
+                self.request_redraw();
+                return;
+            }
+            if action == trust::dict::Action::Save {
+                self.browser.offer_whois_export(None);
+                self.set_focus(FocusTarget::Download);
+                self.request_redraw();
+                return;
+            }
+        }
         // HTML §6.5 activation behavior still applies to page links. The
         // prompt is a browser chrome affordance, not a modal document dialog;
         // keep the retained page usable when the user chooses another link.

@@ -321,10 +321,15 @@ struct HistoryEntry {
     /// Trusted in-process documents have no transport to refetch from.
     /// Retain their small source so Back/Forward uses the same history path.
     internal_source: Option<Vec<u8>>,
+    dict_view: Option<crate::dict::SavedView>,
 }
 
 impl HistoryEntry {
     fn from_page(page: BrowserPage) -> Self {
+        let dict_view = match &page.document {
+            FetchedDocument::Dict(dict) => Some(dict.saved_view()),
+            _ => None,
+        };
         let internal_source = match page.document {
             FetchedDocument::Internal(source) => Some(source),
             _ => None,
@@ -333,6 +338,7 @@ impl HistoryEntry {
             target: page.target,
             fallback_http: page.fallback_http,
             internal_source,
+            dict_view,
         }
     }
 }
@@ -349,6 +355,7 @@ pub enum FetchedDocument {
     Finger(crate::finger::Page),
     Whois(crate::whois::Page),
     Rdap(crate::rdap::Page),
+    Dict(Box<crate::dict::Page>),
     /// A trusted, in-process Gemtext document such as `about:help`.
     Internal(Vec<u8>),
 }
@@ -422,6 +429,10 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    Dict {
+        generation: u64,
+        reply: crate::dict::Reply,
+    },
     Whois {
         generation: u64,
         reply: crate::whois::Reply,
@@ -1096,6 +1107,9 @@ impl BrowserController {
                         }
                     }
                 }
+                CoreEvent::Dict { generation, reply } => {
+                    changed |= self.update_dict(generation, reply);
+                }
                 CoreEvent::Whois { generation, reply } => {
                     changed |= self.update_whois(generation, reply);
                 }
@@ -1233,6 +1247,22 @@ impl BrowserController {
         let screen_position = self.screen_position;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
+            if let Link::Dict(url) = &target {
+                let result = crate::dict::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    async move { tx.send(CoreEvent::Dict { generation, reply }).await.is_ok() }
+                })
+                .await;
+                let event = match result {
+                    Ok(reply) => CoreEvent::Dict { generation, reply },
+                    Err(error) => CoreEvent::FetchFinished {
+                        generation,
+                        result: Err(error),
+                    },
+                };
+                let _ = tx.send(event).await;
+                return;
+            }
             if let Link::OneShot(url) = &target
                 && url.scheme == oneshot::Scheme::Finger
             {
@@ -1361,6 +1391,7 @@ impl BrowserController {
                     finger.reply.notice = Some(reason.to_string());
                 }
                 FetchedDocument::Whois(whois) if !whois.reply.finished => whois.stop(reason),
+                FetchedDocument::Dict(dict) if !dict.reply.finished => dict.stop(reason),
                 _ => return,
             }
             page.revision = page.revision.wrapping_add(1);
@@ -1378,6 +1409,7 @@ impl BrowserController {
             ),
             FetchedDocument::Whois(whois) => (whois.view_action(action, enabled), whois.view.wrap),
             FetchedDocument::Rdap(rdap) => (rdap.view_action(action, enabled), rdap.view.wrap),
+            FetchedDocument::Dict(dict) => (dict.view_action(action, enabled), dict.view.wrap),
             _ => return false,
         };
         match result {
@@ -1398,6 +1430,16 @@ impl BrowserController {
         let Some(page) = &self.current else {
             return false;
         };
+        if let FetchedDocument::Dict(dict) = &page.document {
+            if server.is_some() {
+                self.status = "DICT has one reply; use save without a server number.".into();
+            } else {
+                self.download_offer = Some(dict.export());
+                self.status = "Save original DICT text.".into();
+            }
+            self.invalidation.request_redraw();
+            return true;
+        }
         if let FetchedDocument::Rdap(rdap) = &page.document {
             if server.is_some() {
                 self.status = "RDAP has one JSON reply; use save without a server number.".into();
@@ -1438,6 +1480,53 @@ impl BrowserController {
         page.revision = page.revision.wrapping_add(1);
         self.status = format!("WHOIS encoding: {}", whois.encoding.label());
         self.invalidation.request_redraw();
+        true
+    }
+
+    fn update_dict(&mut self, generation: u64, reply: crate::dict::Reply) -> bool {
+        let Some(pending) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.generation == generation)
+            .cloned()
+        else {
+            return false;
+        };
+        let finished = reply.finished;
+        if self.document_generation == generation
+            && let Some(page) = &mut self.current
+            && let FetchedDocument::Dict(dict) = &mut page.document
+        {
+            dict.update(reply);
+            page.status = fetched_status(&page.target, &page.document);
+            self.status = page.status.clone();
+            page.revision = page.revision.wrapping_add(1);
+        } else {
+            let Link::Dict(target) = &pending.target else {
+                return false;
+            };
+            let mut dict = crate::dict::Page::new(target.clone(), reply);
+            if pending.intent == NavigationIntent::Reload
+                && let Some(old) = &self.current
+                && old.target == pending.target
+                && let FetchedDocument::Dict(old) = &old.document
+            {
+                dict = crate::dict::Page::refreshed(dict.reply, old);
+            }
+            let task = self.task.take();
+            let scroll = self.interaction.scroll;
+            self.finish_fetch(generation, Ok(FetchedDocument::Dict(Box::new(dict))));
+            if pending.intent == NavigationIntent::Reload {
+                self.interaction.scroll = scroll;
+            }
+            self.task = task;
+            self.pending = Some(pending);
+        }
+        self.render_is_final = finished;
+        if finished {
+            self.pending = None;
+            self.task = None;
+        }
         true
     }
 
@@ -1544,6 +1633,16 @@ impl BrowserController {
         self.task = None;
         match result {
             Ok(mut document) => {
+                if let FetchedDocument::Dict(dict) = &mut document {
+                    let entry = match pending.intent {
+                        NavigationIntent::Back => self.back.last(),
+                        NavigationIntent::Forward => self.forward.last(),
+                        _ => None,
+                    };
+                    if let Some(view) = entry.and_then(|entry| entry.dict_view.as_ref()) {
+                        dict.restore_view(view);
+                    }
+                }
                 if let FetchedDocument::Rdap(rdap) = &mut document {
                     pending.target = Link::Http(rdap.url.clone());
                     if pending.intent == NavigationIntent::Reload
@@ -1791,7 +1890,45 @@ impl BrowserController {
         }));
     }
 
+    pub fn dict_filter(&mut self, filter: &str) -> bool {
+        let Some(page) = &mut self.current else {
+            return false;
+        };
+        let FetchedDocument::Dict(dict) = &mut page.document else {
+            return false;
+        };
+        match dict.set_filter(filter) {
+            Ok(()) => {
+                page.revision = page.revision.wrapping_add(1);
+                self.interaction.scroll = CssPoint::default();
+            }
+            Err(error) => self.status = error,
+        }
+        self.invalidation.request_redraw();
+        true
+    }
+
     fn activate(&mut self, link: Link) -> bool {
+        if let Some(action) = crate::dict::Action::from_link(&link) {
+            if action == crate::dict::Action::Save {
+                return self.offer_whois_export(None);
+            }
+            let Some(page) = &mut self.current else {
+                return false;
+            };
+            let FetchedDocument::Dict(dict) = &mut page.document else {
+                return false;
+            };
+            match dict.apply(&action) {
+                Ok(()) => {
+                    page.revision = page.revision.wrapping_add(1);
+                    self.interaction.scroll = CssPoint::default();
+                }
+                Err(error) => self.status = error,
+            }
+            self.invalidation.request_redraw();
+            return true;
+        }
         if let Some(section) = crate::registration::Section::from_link(&link) {
             let Some(page) = &mut self.current else {
                 return false;
@@ -2098,6 +2235,9 @@ pub async fn fetch_protocol(
     match target {
         Link::Gopher(url) => gopher::fetch(url).await.map(FetchedDocument::Gopher),
         Link::Gemini(url) => gemini::fetch(url).await.map(FetchedDocument::Gemini),
+        Link::Dict(url) => crate::dict::fetch(url).await.map(|reply| {
+            FetchedDocument::Dict(Box::new(crate::dict::Page::new(url.clone(), reply)))
+        }),
         Link::Http(url) => {
             let response = if fallback_http {
                 http::fetch_web_default_with_referrer(url, referrer).await
@@ -2266,6 +2406,7 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
             Link::OneShot(url) => crate::whois::status(url, &page.reply),
             _ => format!("WHOIS — {} bytes", page.reply.bytes()),
         },
+        FetchedDocument::Dict(page) => page.status(),
         FetchedDocument::Rdap(page) => {
             format!("RDAP · {} · HTTP {}", page.record.title, page.status)
         }
@@ -2288,6 +2429,9 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
     let address = address.trim();
     if address.is_empty() {
         return Err(String::from("Enter an address."));
+    }
+    if crate::dict::is_address(address) {
+        return crate::dict::Target::parse(address).map(|url| (Link::Dict(url), false));
     }
     if crate::rdap::is_action(address) {
         return Ok((Link::External(address.to_string()), false));
@@ -3639,5 +3783,103 @@ mod whois_tests {
         let page = doc.whois.unwrap();
         assert_eq!(&*page.previous.unwrap().hops[0].body, b"new");
         assert!(page.view.wrap);
+    }
+}
+
+#[cfg(test)]
+mod dict_tests {
+    use super::*;
+    fn target() -> Link {
+        Link::Dict(crate::dict::Target::parse("dict://example.test/d:word:*").unwrap())
+    }
+    fn reply(finished: bool) -> crate::dict::Reply {
+        let mut reply = crate::dict::Reply {
+            raw: std::sync::Arc::new(b"original\r\n".to_vec()),
+            finished,
+            complete: finished,
+            ..Default::default()
+        };
+        for db in ["gcide", "wn"] {
+            reply.definitions.push(crate::dict::Definition {
+                word: "word".into(),
+                database: db.into(),
+                description: db.into(),
+                body: std::sync::Arc::new(format!("{db} definition\n")),
+                complete: true,
+            });
+        }
+        reply
+    }
+    fn start(browser: &mut BrowserController, generation: u64, intent: NavigationIntent) {
+        browser.pending = Some(PendingNavigation {
+            generation,
+            target: target(),
+            fallback_http: false,
+            intent,
+        });
+    }
+    #[tokio::test]
+    async fn dict_local_actions_stream_reload_and_history_preserve_the_reader() {
+        let mut browser = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(800.0, 600.0),
+        );
+        start(&mut browser, 1, NavigationIntent::New);
+        assert!(browser.update_dict(1, reply(false)));
+        browser.activate(crate::dict::Action::Select(1).link());
+        browser.reply_view_action("wrap", Some(false));
+        assert!(browser.pending.is_some());
+        assert!(browser.back.is_empty());
+        browser.update_dict(1, reply(true));
+        let FetchedDocument::Dict(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.selected, 1);
+        assert!(!page.view.wrap);
+        assert!(browser.offer_whois_export(None));
+        assert_eq!(browser.download_offer().unwrap().body, b"original\r\n");
+        browser.dismiss_download_offer();
+        browser.activate(crate::dict::Action::Section(crate::dict::Section::Raw).link());
+        start(&mut browser, 2, NavigationIntent::Reload);
+        browser.update_dict(2, reply(true));
+        let FetchedDocument::Dict(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.section, crate::dict::Section::Raw);
+        assert_eq!(page.selected, 1);
+        browser.open_internal_gemtext("about:help", b"# Help".to_vec());
+        start(&mut browser, 3, NavigationIntent::Back);
+        browser.update_dict(3, reply(true));
+        let FetchedDocument::Dict(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.section, crate::dict::Section::Raw);
+        assert_eq!(page.selected, 1);
+        assert!(!page.view.wrap);
+        assert!(
+            !browser.update_dict(1, reply(false)),
+            "retired generation ignored"
+        );
+    }
+    #[tokio::test]
+    async fn dict_filter_and_stop_preserve_partial_results_without_fetching() {
+        let mut browser = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(800.0, 600.0),
+        );
+        start(&mut browser, 1, NavigationIntent::New);
+        browser.update_dict(1, reply(false));
+        assert!(browser.dict_filter("wn"));
+        assert!(browser.pending.is_some());
+        browser.stop();
+        let FetchedDocument::Dict(page) = &browser.current.as_ref().unwrap().document else {
+            panic!()
+        };
+        assert_eq!(page.filter, "wn");
+        assert!(page.reply.finished && !page.reply.complete);
+        assert_eq!(page.reply.definitions.len(), 2);
+        assert!(page.reply.notice.is_some());
     }
 }
