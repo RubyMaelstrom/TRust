@@ -156,6 +156,16 @@ pub fn split_host_port(value: &str) -> (&str, Option<u16>) {
 /// arguments; backslash quotes a quote, backslash, or whitespace. There is no
 /// interpolation or shell execution. Unclosed quotes are reported, not sent.
 pub fn quoted_arguments(input: &str) -> Result<Vec<String>, String> {
+    arguments(input, true)
+}
+
+/// Dictionary words commonly contain apostrophes. Quotes group an argument
+/// when they begin it; apostrophes inside an unquoted word remain data.
+pub fn word_arguments(input: &str) -> Result<Vec<String>, String> {
+    arguments(input, false)
+}
+
+fn arguments(input: &str, embedded_quotes: bool) -> Result<Vec<String>, String> {
     if input.len() > 32768 || input.contains(['\r', '\n', '\0']) {
         return Err("Command is too long or contains a line break/control character.".into());
     }
@@ -174,7 +184,7 @@ pub fn quoted_arguments(input: &str) -> Result<Vec<String>, String> {
             started = true;
         } else if quote == Some(ch) {
             quote = None;
-        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+        } else if quote.is_none() && (embedded_quotes || !started) && matches!(ch, '\'' | '"') {
             quote = Some(ch);
             started = true;
         } else if quote.is_none() && ch.is_whitespace() {
@@ -218,13 +228,17 @@ close                     drop the connection
 reload                    refetch the page on screen
 post <url> [body]         POST a form body to a web URL
 finger [user]@<host>      finger query
-wrap [on|off]            wrap a Finger, WHOIS or RDAP reply
+wrap [on|off]            wrap a Finger, WHOIS, RDAP or DICT reply
 changes [on|off]         compare with the previous successful refresh
 whois <query> [server]    WHOIS lookup; quote queries containing spaces
 encoding [auto|utf8|latin1]  WHOIS display encoding
-save [server-number]     save WHOIS replies or original RDAP JSON
+save [server-number]     save WHOIS, original RDAP JSON or DICT text
 rdap [domain|IP|CIDR|AS-number]  readable authoritative RDAP record
-dict <word> [server]      dictionary lookup
+dict [--database name] <word> [server]  dictionary lookup; quote phrases
+dict --match strategy <word>  matching words (e.g. prefix)
+dict --databases          browse dictionaries (--server selects server)
+dict --strategies         browse available search modes
+dict-filter <text>        filter the current dictionary/source list
 status                    connection and options report
 help                      this page
 quit                      exit
@@ -276,6 +290,15 @@ Latin-1 decoding. S saves the lookup; `save 2` saves server 2's exact bytes.
 Quote multiword queries: whois \"-r -T inetnum 192.0.2.1\" whois.ripe.net
 Look up with RDAP opens a readable record for domains, IPs and AS numbers.
 RDAP has Contacts, Record details and Original JSON views; S saves exact JSON.
+
+## DICT replies
+
+Definitions arrive progressively. Definitions & sources and Previous/Next
+switch results locally; Browse dictionaries and Search modes discover choices.
+No-definition replies offer spelling suggestions. References are selectable.
+W wraps, S saves exact original text, and Esc stops while retaining received data.
+Use a dictionary by default remembers it for future commands on that server.
+Look up another word opens the command editor with the current lookup settings.
 
 ## Telnet sessions
 

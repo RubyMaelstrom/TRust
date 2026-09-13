@@ -168,6 +168,16 @@ fn supersedes(previous: &CoreEvent, next: &CoreEvent) -> bool {
     {
         return a == b && !first.finished;
     }
+    if let (
+        CoreEvent::Dict {
+            generation: a,
+            reply: first,
+        },
+        CoreEvent::Dict { generation: b, .. },
+    ) = (previous, next)
+    {
+        return a == b && !first.finished;
+    }
     fn paint_generation(event: &CoreEvent) -> Option<(u64, usize)> {
         match event {
             CoreEvent::Page {

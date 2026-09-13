@@ -456,6 +456,7 @@ fn describe_fetch(document: &FetchedDocument) -> String {
         FetchedDocument::Gopher(bytes) | FetchedDocument::OneShot(bytes) => {
             format!("{} bytes", bytes.len())
         }
+        FetchedDocument::Dict(page) => page.status(),
         FetchedDocument::Finger(page) => format!("Finger: {} bytes", page.reply.body.len()),
         FetchedDocument::Rdap(page) => {
             format!("RDAP: {} bytes (HTTP {})", page.raw.len(), page.status)

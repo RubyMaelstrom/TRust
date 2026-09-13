@@ -85,6 +85,9 @@ pub fn absolute_link(target: &str) -> Option<Link> {
     if let Some(url) = crate::http::parse_url(target) {
         return Some(Link::Http(url));
     }
+    if let Ok(url) = crate::dict::Target::parse(target) {
+        return Some(Link::Dict(url));
+    }
     if let Some(url) = crate::oneshot::OneShotUrl::parse(target) {
         return Some(Link::OneShot(url));
     }

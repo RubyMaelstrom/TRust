@@ -136,13 +136,16 @@ command nor an address searches DuckDuckGo Lite.
 | `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
 | `post <url> [body]` | HTTP POST, form-urlencoded |
 | `finger [user]@<host>[:port]` | who's there / their .plan (RFC 1288); IPv6 accepts `[address]:port` |
-| `wrap [on\|off]` | toggle wrapping of a Finger, WHOIS or RDAP reply |
+| `wrap [on\|off]` | toggle wrapping of a Finger, WHOIS, RDAP or DICT reply |
 | `changes [on\|off]` | compare a Finger or WHOIS reply with its previous successful refresh |
 | `whois <query> [server[:port]]` | WHOIS lookup via IANA or a chosen server; quote queries containing spaces |
 | `encoding [auto\|utf8\|latin1]` | select WHOIS display encoding without refetching |
-| `save [server-number]` | save original RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
+| `save [server-number]` | save original DICT text, RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
 | `rdap [domain\|IP\|CIDR\|AS-number]` | show the authoritative RDAP record; omitted query uses the current WHOIS lookup |
-| `dict <word> [server]` | definitions from dict.org (RFC 2229) |
+| `dict [--database name] <word or "phrase"> [server[:port]]` | definitions from dict.org or a chosen server (RFC 2229) |
+| `dict --match strategy <word> [server]` | matching words; `prefix`, `exact`, or a server-advertised strategy |
+| `dict --databases` / `dict --strategies` | browse dictionaries or search modes; `--server` chooses the server |
+| `dict-filter <text>` | filter the current dictionary/source list locally; omit text to clear |
 | `reload` | re-fetch what's on screen, history untouched |
 | `close` / `quit` | drop the connection / exit |
 | `mode character\|line\|auto` | force input mode or follow ECHO |
@@ -194,3 +197,32 @@ registration events, DNSSEC, service notices and errors. Direct HTTP responses
 with `application/rdap+json` use the same view. **Contacts**, **Record details**
 and **Original JSON** switch locally; **S** saves the original JSON bytes.
 Related RDAP links remain RDAP lookups. WHOIS never switches protocols automatically.
+
+
+DICT displays definitions as they arrive, one at a time. **Definitions & sources**
+selects a result locally; **Previous/Next definition** moves through the received
+results in server order. **Browse dictionaries** exposes translation dictionaries,
+thesauri and other sources; **Search modes** lists the server's supported matching
+strategies. **Filter this list** opens a local filter. **Look up another word**
+opens the command editor with the server and dictionary already filled in.
+
+A failed definition lookup requests spelling suggestions from the same server
+and database. Suggestions and common `{word or phrase}` cross-references are
+selectable links with the usual keyboard, hover and click navigation. Definitions
+retain their text, source attribution, numbered senses and hanging indentation.
+**W** toggles wrapping; **Shift+Left/Right** pans unwrapped text. **Original text**
+shows the received protocol transcript; **S** saves those exact bytes, including
+original CRLF line endings. **Esc**, timeouts and failures preserve received data
+and mark incomplete responses. Loading updates are throttled and both reply size
+and display work are bounded.
+
+`dict "ice cream"` accepts phrases, and apostrophes in words such as `can't` remain
+literal. `dict --database wn neon` selects WordNet; `dict --match prefix neo`
+searches for words beginning with `neo`. Commands default to all dictionaries,
+unless **Use <dictionary> by default** has saved a preference for that server in
+`$XDG_CONFIG_HOME/trust/dict.json` (or `~/.config/trust/dict.json`). Explicit URLs
+always honor their database and strategy: `dict://dict.org/d:neon:wn:1` selects
+the first result; `dict://dict.org/m:neo:wn:prefix` requests prefix matches.
+An omitted URL database uses `!` (first matching dictionary), as RFC 2229 specifies.
+URLs decode UTF-8 percent escapes once, accept bracketed IPv6 and keep fragments
+local. Authentication and MIME attachments are not currently implemented.

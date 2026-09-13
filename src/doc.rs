@@ -16,8 +16,10 @@ pub enum Link {
     Gopher(GopherUrl),
     Gemini(GeminiUrl),
     Http(url::Url),
-    /// finger://, whois://, or dict:// one-shot queries.
+    /// finger:// or whois:// one-shot queries.
     OneShot(crate::oneshot::OneShotUrl),
+    /// RFC 2229 DEFINE/MATCH queries and dictionary discovery.
+    Dict(crate::dict::Target),
     /// A VT terminal connection. This remains a cell protocol even though
     /// HTML layout is pixel-native.
     Telnet {
@@ -64,6 +66,13 @@ impl Link {
                 url.host.capacity().saturating_add(url.query.capacity()),
                 false,
             ),
+            Link::Dict(url) => (
+                url.host.capacity()
+                    + url.word.capacity()
+                    + url.database.capacity()
+                    + url.strategy.capacity(),
+                false,
+            ),
             Link::Telnet { host, .. } => (host.capacity(), false),
             Link::JsClick { href, .. } => (href.capacity(), false),
             Link::External(url) => (url.capacity(), false),
@@ -79,6 +88,7 @@ impl fmt::Display for Link {
             Link::Gemini(url) => url.fmt(f),
             Link::Http(url) => url.fmt(f),
             Link::OneShot(url) => url.fmt(f),
+            Link::Dict(url) => url.fmt(f),
             Link::Telnet { host, port, tls } => write!(
                 f,
                 "{}://{host}:{port}",
@@ -450,6 +460,8 @@ pub struct Doc {
     pub whois: Option<crate::whois::Page>,
     /// RDAP registration record and original JSON, independent of HTTP layout.
     pub rdap: Option<crate::rdap::Page>,
+    /// DICT definitions, source selection and original reply bytes.
+    pub dict: Option<crate::dict::Page>,
     /// The body bytes as fetched.
     pub raw: Vec<u8>,
     /// Width `lines` was wrapped to.
@@ -545,15 +557,19 @@ impl Doc {
     }
 
     pub fn text_view(&self) -> Option<&crate::text_reply::View> {
-        self.whois
-            .as_ref()
-            .map(|page| &page.view)
-            .or_else(|| self.rdap.as_ref().map(|page| &page.view))
-            .or_else(|| self.finger.as_ref().map(|view| &view.controls))
+        self.dict.as_ref().map(|page| &page.view).or_else(|| {
+            self.whois
+                .as_ref()
+                .map(|page| &page.view)
+                .or_else(|| self.rdap.as_ref().map(|page| &page.view))
+                .or_else(|| self.finger.as_ref().map(|view| &view.controls))
+        })
     }
 
     pub fn text_view_mut(&mut self) -> Option<&mut crate::text_reply::View> {
-        if let Some(page) = &mut self.whois {
+        if let Some(page) = &mut self.dict {
+            Some(&mut page.view)
+        } else if let Some(page) = &mut self.whois {
             Some(&mut page.view)
         } else if let Some(page) = &mut self.rdap {
             Some(&mut page.view)
@@ -563,7 +579,9 @@ impl Doc {
     }
 
     pub fn rerender_reply(&mut self, width: usize) {
-        if let Some(page) = self.rdap.take() {
+        if let Some(page) = self.dict.take() {
+            *self = crate::dict::render(page, width);
+        } else if let Some(page) = self.rdap.take() {
             *self = crate::rdap::render(page, width);
         } else if let Some(page) = self.whois.take() {
             if let Link::OneShot(url) = &self.url {
@@ -594,6 +612,7 @@ impl Doc {
             finger: None,
             whois: None,
             rdap: None,
+            dict: None,
             raw,
             wrapped_to,
             cp437,

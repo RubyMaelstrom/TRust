@@ -1052,11 +1052,11 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
     match &g.doc.url {
         Link::Gopher(_) => " GOPHER ",
         Link::Gemini(_) => " GEMINI ",
+        Link::Dict(_) => " DICT ",
         Link::Http(_) => " WWW ",
         Link::OneShot(url) => match url.scheme {
             crate::oneshot::Scheme::Finger => " FINGER ",
             crate::oneshot::Scheme::Whois => " WHOIS ",
-            crate::oneshot::Scheme::Dict => " DICT ",
         },
         Link::Telnet { .. } => " TELNET ",
         Link::JsClick { .. } => " WWW ",

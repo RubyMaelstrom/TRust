@@ -49,6 +49,9 @@ pub fn document_for_viewport(page: &BrowserPage, viewport_width: f32) -> Option<
         (FetchedDocument::OneShot(raw), Link::OneShot(url)) => {
             crate::oneshot::parse(url, raw.clone(), usize::MAX / 4)
         }
+        (FetchedDocument::Dict(page), Link::Dict(_)) => {
+            crate::dict::render(page.as_ref().clone(), usize::MAX / 4)
+        }
         (FetchedDocument::Whois(page), Link::OneShot(url)) => crate::whois::render_with_columns(
             url,
             page.clone(),
@@ -157,18 +160,27 @@ pub fn paint_doc_selected(
                         .rdap
                         .as_ref()
                         .is_some_and(|page| page.section != crate::registration::Section::Raw)
+                    || (doc.dict.is_some() && line.kind != Kind::Pre)
                     || (doc.whois.is_some()
                         && matches!(
                             line.kind,
                             Kind::Heading(_) | Kind::Info | Kind::Error | Kind::OtherLink
                         ))
             });
+        let hanging = if doc.dict.is_some() && line.kind == Kind::Pre && wrap {
+            let columns = crate::dict::hanging_indent(&line.text);
+            text::shape(&" ".repeat(columns), &style)
+                .advance
+                .min((width - 40.0).max(0.0))
+        } else {
+            0.0
+        };
         let mut pieces = if wrap && !line.text.is_empty() {
             text::wrapped_lines(
                 &line.text,
                 &style,
                 width,
-                width,
+                width - hanging,
                 TextBreakStyle {
                     wrap: true,
                     overflow_wrap: if doc.text_view().is_some() {
@@ -184,6 +196,7 @@ pub fn paint_doc_selected(
         }
         .into_iter()
         .peekable();
+        let mut continuation = false;
         while let Some(mut shaped) = pieces.next() {
             let more = pieces.peek().is_some();
             let truncated = doc.text_view().is_some()
@@ -198,7 +211,8 @@ pub fn paint_doc_selected(
                 color
             };
             let link = if truncated { None } else { line.link.clone() };
-            let origin = CssPoint::new(left, y);
+            let origin = CssPoint::new(left + if continuation { hanging } else { 0.0 }, y);
+            continuation = true;
             let rect = CssRect::new(
                 origin.x,
                 origin.y,
@@ -237,7 +251,7 @@ pub fn paint_doc_selected(
                 link,
                 cursor: None,
             }));
-            line_width = line_width.max(rect.width);
+            line_width = line_width.max(rect.x - left + rect.width);
             far_right = far_right.max(rect.x + rect.width + left);
             y += shaped.line_height.max(style.size * 1.2);
             if truncated || !more {
@@ -297,6 +311,59 @@ const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dict_native_wrap_retains_hanging_indent_and_bounds_the_scene() {
+        let target = crate::dict::Target::parse("dict://example.test/d:word").unwrap();
+        let mut reply = crate::dict::Reply {
+            finished: true,
+            complete: true,
+            ..Default::default()
+        };
+        reply.definitions.push(crate::dict::Definition {
+            word: "word".into(),
+            database: "wn".into(),
+            description: "Source".into(),
+            body: std::sync::Arc::new(
+                "    n 1: a colorless element in the atmosphere with examples\n".into(),
+            ),
+            complete: true,
+        });
+        let page = crate::dict::Page::new(target, reply);
+        let doc = crate::dict::render(page.clone(), usize::MAX / 4);
+        let source = doc
+            .lines
+            .iter()
+            .position(|line| line.kind == Kind::Pre)
+            .unwrap();
+        let paint = paint_doc(&doc, 240.0);
+        let runs: Vec<_> = paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                DisplayCommand::GlyphRun {
+                    node,
+                    origin,
+                    shaped,
+                    ..
+                } if *node == source + 1 => Some((origin, shaped)),
+                _ => None,
+            })
+            .collect();
+        assert!(runs.len() > 1);
+        assert!(runs[1].0.x > runs[0].0.x);
+        assert!(
+            runs.iter()
+                .all(|(origin, shaped)| origin.x + shaped.advance <= 240.1)
+        );
+        let mut page = page;
+        page.reply.definitions[0].body = std::sync::Arc::new("x\n".repeat(20000));
+        let doc = crate::dict::render(page, usize::MAX / 4);
+        assert!(doc.lines.len() <= crate::text_reply::MAX_ROWS);
+        assert!(doc.lines.iter().any(|l| l.text.contains("Display limited")));
+        let paint = paint_doc(&doc, 240.0);
+        assert!(paint.lines.len() <= crate::text_reply::MAX_ROWS);
+    }
 
     fn rgba(rgb: crate::theme::Rgb) -> PaintColor {
         PaintColor::Rgba(rgb[0], rgb[1], rgb[2], 255)

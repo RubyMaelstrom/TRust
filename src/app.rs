@@ -315,6 +315,7 @@ enum Payload {
     Finger(crate::finger::Reply),
     Whois(crate::whois::Reply),
     Rdap(crate::rdap::Page),
+    Dict(crate::dict::Reply),
     /// An internal `about:` page's gemtext source, generated locally (no
     /// network). Rides the fetch pipe so history deep-travel refetches of
     /// `about:` entries flow through the same completion path as the rest.
@@ -2696,19 +2697,23 @@ impl App {
                     Err(error) => self.status = error,
                 }
             }
-            Some("dict" | "define") => match parts.next() {
-                Some(word) => {
-                    let (host, port) =
-                        split_host_port(parts.next().unwrap_or(oneshot::DICT_DEFAULT));
-                    self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
-                        scheme: oneshot::Scheme::Dict,
-                        host: host.to_string(),
-                        port: port.unwrap_or(2628),
-                        query: word.to_string(),
-                    }));
+            Some("dict" | "define") => {
+                let arguments = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                match crate::dict::command_target(arguments) {
+                    Ok(target) => self.start_fetch(Link::Dict(target)),
+                    Err(error) => self.status = error,
                 }
-                None => self.status = String::from("usage: dict <word> [server]"),
-            },
+            }
+            Some("dict-filter") => {
+                let filter = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                self.dict_filter(filter);
+            }
             // A bare URL — or a bare hostname/IP — opens directly, as if
             // `open` had been typed (the address-bar habit). A schemeless
             // host with no port becomes https (falling back to http).
@@ -2887,6 +2892,16 @@ impl App {
             }
             return;
         }
+        if crate::dict::is_address(target) {
+            match crate::dict::Target::parse(target) {
+                Ok(url) => self.start_fetch(Link::Dict(url)),
+                Err(error) => {
+                    self.status = error;
+                    self.notice = true;
+                }
+            }
+            return;
+        }
         // Do this before bare-host dispatch, whose compatibility path appends
         // `/` and would otherwise change a schemeless `watch?v=id` query.
         if target
@@ -2897,6 +2912,16 @@ impl App {
                 Some(url) => self.start_fetch(Link::OneShot(url)),
                 None => {
                     self.status = String::from("Invalid WHOIS address.");
+                    self.notice = true;
+                }
+            }
+            return;
+        }
+        if crate::dict::is_address(target) {
+            match crate::dict::Target::parse(target) {
+                Ok(url) => self.start_fetch(Link::Dict(url)),
+                Err(error) => {
+                    self.status = error;
                     self.notice = true;
                 }
             }
@@ -3088,6 +3113,28 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
+            if let Link::Dict(url) = &target {
+                let result = crate::dict::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    let target = target.clone();
+                    async move {
+                        tx.send(FetchMsg {
+                            target,
+                            result: Ok(Payload::Dict(reply)),
+                        })
+                        .await
+                        .is_ok()
+                    }
+                })
+                .await;
+                let _ = tx
+                    .send(FetchMsg {
+                        target,
+                        result: result.map(Payload::Dict),
+                    })
+                    .await;
+                return;
+            }
             if let Link::OneShot(url) = &target
                 && url.scheme == oneshot::Scheme::Finger
             {
@@ -3147,6 +3194,7 @@ impl App {
                     Ok(crate::core::FetchedDocument::OneShot(raw)) => Ok(Payload::OneShot(raw)),
                     Ok(crate::core::FetchedDocument::Whois(page)) => Ok(Payload::Whois(page.reply)),
                     Ok(crate::core::FetchedDocument::Rdap(page)) => Ok(Payload::Rdap(page)),
+                    Ok(crate::core::FetchedDocument::Dict(page)) => Ok(Payload::Dict(page.reply)),
                     Ok(crate::core::FetchedDocument::Finger(page)) => {
                         Ok(Payload::Finger(page.reply))
                     }
@@ -3825,7 +3873,9 @@ impl App {
         if let Some(g) = &mut self.browser
             && g.doc.text_view().is_some_and(|view| view.loading)
         {
-            if let Some(page) = &mut g.doc.whois {
+            if let Some(page) = &mut g.doc.dict {
+                page.stop(reason);
+            } else if let Some(page) = &mut g.doc.whois {
                 page.stop(reason);
             } else if let Some(view) = &mut g.doc.finger {
                 view.loading = false;
@@ -3839,15 +3889,18 @@ impl App {
         let Some(g) = &mut self.browser else {
             return;
         };
-        let result = if let Some(page) = &mut g.doc.whois {
+        let result = if let Some(page) = &mut g.doc.dict {
+            page.view_action(action, enabled)
+        } else if let Some(page) = &mut g.doc.whois {
             page.view_action(action, enabled)
         } else if let Some(page) = &mut g.doc.rdap {
             page.view_action(action, enabled)
         } else if let Some(view) = &mut g.doc.finger {
             crate::finger::view_action(view, action, enabled)
         } else {
-            self.status =
-                String::from("Wrap and changes controls apply to Finger and WHOIS replies.");
+            self.status = String::from(
+                "Wrap applies to Finger, WHOIS, RDAP and DICT; changes applies to Finger and WHOIS.",
+            );
             return;
         };
         match result {
@@ -3904,6 +3957,20 @@ impl App {
         let Some(g) = &self.browser else {
             return;
         };
+        if let Some(page) = &g.doc.dict {
+            if server.is_some() {
+                self.status = "DICT has one reply; use save without a server number.".into();
+                return;
+            }
+            self.file_dialog = Some(FileDialog {
+                offer: page.export(),
+                selected: 0,
+            });
+            self.last_file_actions = [None; 3];
+            self.mode = Mode::Session;
+            self.status = "Save original DICT text.".into();
+            return;
+        }
         if let Some(page) = &g.doc.rdap {
             if server.is_some() {
                 self.status = "RDAP has one JSON reply; use save without a server number.".into();
@@ -3919,7 +3986,7 @@ impl App {
             return;
         }
         let (Some(page), Link::OneShot(url)) = (&g.doc.whois, &g.doc.url) else {
-            self.status = "Save applies to WHOIS and RDAP replies.".into();
+            self.status = "Save applies to WHOIS, RDAP and DICT replies.".into();
             return;
         };
         match page.export(url, server) {
@@ -3932,6 +3999,22 @@ impl App {
             Err(error) => self.status = error,
         }
         self.notice = true;
+    }
+
+    fn on_dict_reply(&mut self, target: crate::dict::Target, reply: crate::dict::Reply) {
+        let finished = reply.finished;
+        let mut page = crate::dict::Page::new(target.clone(), reply);
+        if let Some(g) = &self.browser
+            && g.doc.url == Link::Dict(target)
+            && let Some(old) = &g.doc.dict
+            && (self.query_fetch_started || self.replace_nav)
+        {
+            page = crate::dict::Page::refreshed(page.reply, old);
+        }
+        self.status = page.status();
+        self.notice = page.reply.notice.is_some();
+        let doc = crate::dict::render(page, (self.last_inner.0 as usize).max(10));
+        self.on_streamed_document(doc, finished);
     }
 
     fn on_whois_reply(&mut self, url: oneshot::OneShotUrl, reply: crate::whois::Reply) {
@@ -3991,7 +4074,7 @@ impl App {
                     .and_then(|line| g.doc.lines.get(line))
                     .and_then(|line| line.link.clone());
                 if g.scroll > 0
-                    && g.doc.whois.is_some()
+                    && (g.doc.whois.is_some() || g.doc.dict.is_some())
                     && let Some(row) =
                         crate::registration::anchor(&g.doc.lines, &doc.lines, g.scroll)
                 {
@@ -4027,12 +4110,16 @@ impl App {
     }
 
     fn on_fetch(&mut self, msg: FetchMsg) {
-        if matches!(msg.result, Ok(Payload::Finger(_) | Payload::Whois(_))) {
+        if matches!(
+            msg.result,
+            Ok(Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_))
+        ) {
             match (msg.result, msg.target) {
                 (Ok(Payload::Finger(reply)), Link::OneShot(url)) => {
                     self.on_finger_reply(url, reply)
                 }
                 (Ok(Payload::Whois(reply)), Link::OneShot(url)) => self.on_whois_reply(url, reply),
+                (Ok(Payload::Dict(reply)), Link::Dict(url)) => self.on_dict_reply(url, reply),
                 _ => {}
             }
             return;
@@ -4061,7 +4148,7 @@ impl App {
                 self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
-            (Ok(Payload::Finger(_) | Payload::Whois(_)), _) => {
+            (Ok(Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_)), _) => {
                 unreachable!("Streaming replies handled above")
             }
             (Ok(Payload::OneShot(raw)), Link::OneShot(url)) => {
@@ -6220,10 +6307,9 @@ impl App {
                     return;
                 }
                 KeyCode::Char('s' | 'S')
-                    if self
-                        .browser
-                        .as_ref()
-                        .is_some_and(|g| g.doc.registration_section().is_some()) =>
+                    if self.browser.as_ref().is_some_and(|g| {
+                        g.doc.registration_section().is_some() || g.doc.dict.is_some()
+                    }) =>
                 {
                     self.save_whois(None);
                     return;
@@ -7110,7 +7196,9 @@ impl App {
         let cp437 = self.encoding == Encoding::Cp437;
         let g = self.browser.as_ref()?;
         let cp437 = cp437 && matches!(g.doc.url, Link::Gopher(_));
-        if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
+        if (g.doc.raw.is_empty() && g.doc.dict.is_none())
+            || (g.doc.wrapped_to == width && g.doc.cp437 == cp437)
+        {
             return None;
         }
         Some((width, cp437))
@@ -7135,7 +7223,9 @@ impl App {
         let font = self.picker.font_size();
         let Some(g) = &mut self.browser else { return };
         let cp437 = cp437 && matches!(g.doc.url, Link::Gopher(_));
-        if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
+        if (g.doc.raw.is_empty() && g.doc.dict.is_none())
+            || (g.doc.wrapped_to == width && g.doc.cp437 == cp437)
+        {
             return;
         }
         let link_ordinal = g.selected.map(|sel| {
@@ -7157,9 +7247,11 @@ impl App {
         let finger_view = g.doc.finger.take();
         let whois_page = g.doc.whois.take();
         let rdap_page = g.doc.rdap.take();
+        let dict_page = g.doc.dict.take();
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
+            Link::Dict(_) => crate::dict::render(dict_page.expect("DICT page"), width),
             Link::Gopher(url) => gopher::parse(&url, raw, cp437, width),
             Link::Gemini(url) => {
                 let meta = g.doc.meta.clone().unwrap_or_default();
@@ -7330,7 +7422,57 @@ impl App {
         }
     }
 
+    fn dict_filter(&mut self, filter: &str) {
+        let Some(g) = &mut self.browser else {
+            return;
+        };
+        let Some(page) = &mut g.doc.dict else {
+            self.status = "Filter applies to dictionary pages.".into();
+            return;
+        };
+        match page.set_filter(filter) {
+            Ok(()) => {
+                g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+                g.scroll = 0;
+                g.selected = Self::browser_visible_links(g, self.last_inner.1 as usize)
+                    .first()
+                    .copied();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
     fn browser_follow_link(&mut self, link: Link) {
+        if let Some(action) = crate::dict::Action::from_link(&link) {
+            let Some(g) = &mut self.browser else {
+                return;
+            };
+            let Some(page) = &mut g.doc.dict else {
+                return;
+            };
+            if let Some(command) = page.command_for(&action) {
+                self.input = command;
+                self.cursor = self.input.chars().count();
+                self.select_anchor = None;
+                self.mode = Mode::Command;
+                return;
+            }
+            if action == crate::dict::Action::Save {
+                self.save_whois(None);
+                return;
+            }
+            match page.apply(&action) {
+                Ok(()) => {
+                    g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+                    g.scroll = 0;
+                    g.selected = Self::browser_visible_links(g, self.last_inner.1 as usize)
+                        .first()
+                        .copied();
+                }
+                Err(error) => self.status = error,
+            }
+            return;
+        }
         if let Some(section) = crate::registration::Section::from_link(&link) {
             let Some(g) = &mut self.browser else {
                 return;
@@ -7393,6 +7535,7 @@ impl App {
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
             Link::OneShot(url) => self.start_fetch(Link::OneShot(url)),
+            Link::Dict(url) => self.start_fetch(Link::Dict(url)),
             Link::Telnet { host, port, tls } => self.open(host, port, tls),
             // A `<video>`/`<audio>` representation: hand its URL to mpv (a direct
             // file, or — for a streaming player — the page URL that yt-dlp
@@ -7510,6 +7653,7 @@ impl App {
             Link::Gopher(u) => Some(u.to_string()),
             Link::Gemini(u) => Some(u.to_string()),
             Link::OneShot(u) => Some(u.to_string()),
+            Link::Dict(u) => Some(u.to_string()),
             Link::Media(u) => Some(u.to_string()),
             Link::External(s) => Some(s),
             Link::JsClick { href, .. } if !href.is_empty() => Some(href),
@@ -14340,14 +14484,14 @@ mod tests {
         );
         app.execute_command("dict rain").await;
         assert!(
-            app.status.starts_with("Fetching dict://dict.org/rain"),
+            app.status.starts_with("Fetching dict://dict.org/d:rain:*"),
             "got: {}",
             app.status
         );
         // URLs work through open and bare dispatch too.
         app.execute_command("dict://dict.org/d:neon").await;
         assert!(
-            app.status.starts_with("Fetching dict://dict.org/neon"),
+            app.status.starts_with("Fetching dict://dict.org/d:neon:!"),
             "got: {}",
             app.status
         );
@@ -14944,5 +15088,133 @@ mod whois_tests {
             app.browser.as_ref().unwrap().doc.url,
             Link::OneShot(url("old"))
         );
+    }
+}
+
+#[cfg(test)]
+mod dict_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dict_empty_catalog_search_all_prompts_before_sending_a_word() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (60, 20);
+        let target = crate::dict::Target::parse("dict://example.test/d::wn")
+            .unwrap()
+            .catalog(crate::dict::Operation::Databases);
+        app.on_dict_reply(
+            target,
+            crate::dict::Reply {
+                finished: true,
+                complete: true,
+                ..Default::default()
+            },
+        );
+        let link = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .lines
+            .iter()
+            .find(|line| line.text == "Search all dictionaries")
+            .unwrap()
+            .link
+            .clone()
+            .unwrap();
+        app.browser_follow_link(link);
+        assert_eq!(app.mode, Mode::Command);
+        assert!(app.fetch_task.is_none());
+        let command = format!("{}\"ice cream\"", app.input);
+        let lookup = crate::dict::command_target(command.strip_prefix("dict ").unwrap()).unwrap();
+        assert_eq!(lookup.host, "example.test");
+        assert_eq!(lookup.database, "*");
+        assert_eq!(lookup.word, "ice cream");
+    }
+
+    #[tokio::test]
+    async fn dict_terminal_keeps_source_raw_view_and_exports_while_streaming() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (60, 20);
+        let target = crate::dict::Target::parse("dict://example.test/d:word:*").unwrap();
+        let mut reply = crate::dict::Reply {
+            raw: std::sync::Arc::new(b"exact\r\n".to_vec()),
+            ..Default::default()
+        };
+        for db in ["gcide", "wn"] {
+            reply.definitions.push(crate::dict::Definition {
+                word: "word".into(),
+                database: db.into(),
+                description: db.into(),
+                body: std::sync::Arc::new(format!("{db} definition\n")),
+                complete: true,
+            });
+        }
+        app.on_dict_reply(target.clone(), reply.clone());
+        app.browser_follow_link(crate::dict::Action::Select(1).link());
+        app.on_dict_reply(target.clone(), reply.clone());
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .dict
+                .as_ref()
+                .unwrap()
+                .selected,
+            1
+        );
+        app.browser_follow_link(crate::dict::Action::Section(crate::dict::Section::Raw).link());
+        app.on_dict_reply(target.clone(), reply.clone());
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .dict
+                .as_ref()
+                .unwrap()
+                .section,
+            crate::dict::Section::Raw
+        );
+        app.save_whois(None);
+        assert_eq!(app.file_dialog.as_ref().unwrap().offer.body, b"exact\r\n");
+        app.file_dialog = None;
+        app.last_inner = (24, 12);
+        app.sync_browser_wrap();
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .dict
+                .as_ref()
+                .unwrap()
+                .selected,
+            1
+        );
+        app.browser_follow_link(crate::dict::Action::Lookup.link());
+        assert_eq!(app.mode, Mode::Command);
+        assert!(app.input.contains("--server \"example.test\""));
+        app.mode = Mode::Session;
+        app.retire_fetch("Incomplete reply: stopped");
+        let page = app.browser.as_ref().unwrap().doc.dict.as_ref().unwrap();
+        assert!(page.reply.finished && !page.reply.complete);
+        assert_eq!(page.reply.definitions.len(), 2);
+    }
+    #[tokio::test]
+    async fn dict_terminal_command_and_encoded_links_preserve_query_fields() {
+        let mut app = App::new(None, 23);
+        app.execute_command("dict --database wn \"ice cream\" 127.0.0.1:9")
+            .await;
+        assert!(
+            app.status.contains("dict://127.0.0.1:9/d:ice%20cream:wn"),
+            "{}",
+            app.status
+        );
+        app.retire_fetch("stopped");
+        app.execute_command("DICT://127.0.0.1:9/m:neo::prefix")
+            .await;
+        assert!(app.status.contains("/m:neo:!:prefix"), "{}", app.status);
+        app.retire_fetch("stopped");
     }
 }
