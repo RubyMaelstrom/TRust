@@ -14,7 +14,23 @@ use crate::{
     layout2::{self, ControlMap, GraphicalLayout, ImageSizes, Viewport},
     render::{CssRect, ImageRequest, ImageResource, ImageStore, PageHit, Scene},
 };
+use std::{collections::HashMap, sync::Arc};
 use url::Url;
+
+/// An embedding application's resource policy, checked before recursive layout.
+/// HTML's tree-construction introduction permits practical nesting constraints.
+/// https://html.spec.whatwg.org/multipage/parsing.html#tree-construction
+#[derive(Clone, Copy)]
+pub struct DocumentLimits {
+    pub bytes: usize,
+    pub nodes: usize,
+    pub depth: usize,
+}
+
+/// Read-only attributes needed by native decorations and interaction code.
+pub trait EmbeddedAttributes {
+    fn attribute(&self, node: NodeId, name: &str) -> Option<&str>;
+}
 
 /// Install an application-owned set of font resources before creating its
 /// surfaces. This reuses TRust's CSS Fonts 4 §4.1 family override machinery.
@@ -38,11 +54,39 @@ pub struct EmbeddedDocument {
     sizes: ImageSizes,
     forms: Vec<crate::doc::Form>,
     controls: ControlMap,
+    geometry_revision: u64,
 }
 
 impl EmbeddedDocument {
     pub fn new(html: &str, base: Url, viewport: CssSize, resources: ImageStore) -> Self {
-        let mut dom = Dom::parse_document(html);
+        Self::from_dom(Dom::parse_document(html), base, viewport, resources)
+    }
+
+    pub fn try_new(
+        html: &str,
+        base: Url,
+        viewport: CssSize,
+        resources: ImageStore,
+        limits: DocumentLimits,
+    ) -> Result<Self, &'static str> {
+        if html.len() > limits.bytes {
+            return Err("This document is too large to display");
+        }
+        let dom = Dom::parse_document(html);
+        if dom.node_count() > limits.nodes {
+            return Err("This document contains too many elements to display");
+        }
+        let mut depths = vec![0usize; dom.node_count()];
+        for node in dom.descendants(crate::dom::DOCUMENT) {
+            depths[node] = dom.node(node).parent.map_or(0, |p| depths[p] + 1);
+            if depths[node] > limits.depth {
+                return Err("This document is nested too deeply to display");
+            }
+        }
+        Ok(Self::from_dom(dom, base, viewport, resources))
+    }
+
+    fn from_dom(mut dom: Dom, base: Url, viewport: CssSize, resources: ImageStore) -> Self {
         dom.rewrite_inline_svgs(Some(&base));
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
         let sizes = ImageSizes::new();
@@ -63,6 +107,7 @@ impl EmbeddedDocument {
             sizes,
             forms,
             controls,
+            geometry_revision: 1,
         };
         let requests = this.image_requests().to_vec();
         let mut changed = false;
@@ -83,6 +128,8 @@ impl EmbeddedDocument {
         if changed {
             this.relayout();
         }
+        this.dom.take_dirty();
+        this.dom.take_dirty_targets();
         this
     }
     pub fn base(&self) -> &Url {
@@ -110,6 +157,7 @@ impl EmbeddedDocument {
         }
     }
     pub fn relayout(&mut self) {
+        let offsets = self.scroll_offsets();
         self.layout = layout2::lay_out_graphical(
             &self.dom,
             &self.base,
@@ -118,6 +166,32 @@ impl EmbeddedDocument {
             &self.controls,
             &self.sizes,
         );
+        self.geometry_revision += 1;
+        self.restore_scroll_offsets(&offsets);
+        self.dom.take_dirty();
+        self.dom.take_dirty_targets();
+    }
+    fn scroll_offsets(&self) -> HashMap<NodeId, CssPoint> {
+        self.layout
+            .paint
+            .scroll_containers
+            .iter()
+            .map(|c| (c.node, c.offset))
+            .collect()
+    }
+    fn restore_scroll_offsets(&mut self, offsets: &HashMap<NodeId, CssPoint>) {
+        for c in &mut self.layout.paint.scroll_containers {
+            if let Some(offset) = offsets.get(&c.node) {
+                c.offset = CssPoint::new(
+                    offset
+                        .x
+                        .clamp(0.0, (c.content.width - c.viewport.width).max(0.0)),
+                    offset
+                        .y
+                        .clamp(0.0, (c.content.height - c.viewport.height).max(0.0)),
+                );
+            }
+        }
     }
     pub fn set_attribute(&mut self, node: NodeId, name: &str, value: &str) {
         self.dom.set_attr(node, name, value);
@@ -125,26 +199,67 @@ impl EmbeddedDocument {
         self.relayout();
     }
     pub fn supply_image(&mut self, source: &str, image: ImageResource) -> bool {
-        let requests: Vec<_> = self
-            .image_requests()
-            .iter()
-            .filter(|r| r.source == source)
-            .cloned()
-            .collect();
-        if requests.is_empty() {
-            return false;
+        self.supply_images(std::iter::once((source.to_owned(), image))) != 0
+    }
+
+    /// Apply one resource transaction. CSS Images 3 #default-sizing requires
+    /// new natural dimensions to participate in layout; replacing pixels at
+    /// unchanged dimensions needs no new geometry transaction.
+    pub fn supply_images(
+        &mut self,
+        images: impl IntoIterator<Item = (String, ImageResource)>,
+    ) -> usize {
+        let mut requests: HashMap<&str, Vec<_>> = HashMap::new();
+        for request in &self.layout.paint.image_requests {
+            requests
+                .entry(&request.source)
+                .or_default()
+                .push(request.handle);
         }
-        self.sizes
-            .insert(source.to_owned(), (image.width, image.height));
-        for request in requests {
-            self.resources.insert(request.handle, image.clone());
+        let mut supplied = 0;
+        let mut dimensions_changed = false;
+        for (source, image) in images {
+            let Some(handles) = requests.get(source.as_str()) else {
+                continue;
+            };
+            let size = (image.width, image.height);
+            dimensions_changed |= self.sizes.get(&source) != Some(&size);
+            self.sizes.insert(source, size);
+            for handle in handles {
+                self.resources.insert(*handle, image.clone());
+            }
+            supplied += 1;
         }
-        self.relayout();
-        true
+        if dimensions_changed {
+            self.relayout();
+        }
+        supplied
     }
     pub fn hover(&mut self, node: Option<NodeId>) -> bool {
         if self.dom.set_hover_chain(node) {
-            self.relayout();
+            let offsets = self.scroll_offsets();
+            // Selectors 4 #the-hover-pseudo still uses the canonical flat-tree
+            // chain and invalidation. Only the proven paint-only tier can reuse
+            // geometry; :hover width/display/opacity changes take full layout.
+            let paint_only = self.dom.take_dirty_targets().is_some_and(|targets| {
+                !targets.is_empty()
+                    && targets
+                        .iter()
+                        .all(|(_, kind)| matches!(kind, crate::dom::DirtyKind::Paint))
+            });
+            if !paint_only
+                || !layout2::repaint_graphical(
+                    &mut self.layout,
+                    &self.dom,
+                    &self.base,
+                    &self.controls,
+                    &self.sizes,
+                )
+            {
+                self.relayout();
+            }
+            self.restore_scroll_offsets(&offsets);
+            self.dom.take_dirty();
             true
         } else {
             false
@@ -201,12 +316,356 @@ impl EmbeddedDocument {
             focused,
         )
     }
+
+    /// A transferable presentation, never a second mutable DOM or JS realm.
+    /// The document and its Rc-based style/fragment caches stay on their owner
+    /// thread. Native callers send mutations back using these stable node IDs.
+    pub fn snapshot(&self, semantics: bool) -> EmbeddedSnapshot {
+        let mut nodes = vec![SnapshotNode::default(); self.dom.node_count()];
+        for id in self.dom.flat_descendants(crate::dom::DOCUMENT) {
+            let attrs = match &self.dom.node(id).data {
+                crate::dom::NodeData::Element { attrs, .. } => attrs
+                    .iter()
+                    .map(|a| (a.name.local.to_string(), a.value.to_string()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            nodes[id] = SnapshotNode {
+                parent: self.dom.parent_flat(id),
+                children: self.dom.flat_children(id),
+                tag: self.dom.tag_name(id).map(str::to_owned),
+                attrs,
+                opacity: self
+                    .dom
+                    .computed_value(id, "opacity")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1.0),
+            };
+        }
+        nodes[crate::dom::DOCUMENT].children = self.dom.flat_children(crate::dom::DOCUMENT);
+        EmbeddedSnapshot {
+            dom: SnapshotDom { nodes },
+            layout: SnapshotLayout {
+                paint: self.layout.paint.clone(),
+                boxes: self.layout.boxes.clone(),
+            },
+            resources: self.resources.clone(),
+            base: self.base.clone(),
+            viewport: self.viewport,
+            semantics: semantics.then(|| Arc::new(self.semantics(None))),
+            geometry_revision: self.geometry_revision,
+        }
+    }
+}
+
+impl EmbeddedAttributes for EmbeddedDocument {
+    fn attribute(&self, node: NodeId, name: &str) -> Option<&str> {
+        self.dom.attr(node, name)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotNode {
+    pub parent: Option<NodeId>,
+    children: Vec<NodeId>,
+    tag: Option<String>,
+    attrs: Vec<(String, String)>,
+    pub opacity: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotDom {
+    nodes: Vec<SnapshotNode>,
+}
+
+impl SnapshotDom {
+    pub fn is_valid(&self, node: NodeId) -> bool {
+        node < self.nodes.len()
+    }
+    pub fn node(&self, node: NodeId) -> &SnapshotNode {
+        &self.nodes[node]
+    }
+    pub fn attr(&self, node: NodeId, name: &str) -> Option<&str> {
+        self.nodes
+            .get(node)?
+            .attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+    pub fn tag_name(&self, node: NodeId) -> Option<&str> {
+        self.nodes.get(node)?.tag.as_deref()
+    }
+    pub fn descendants(&self, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let mut stack = vec![root];
+        std::iter::from_fn(move || {
+            let node = stack.pop()?;
+            stack.extend(self.nodes.get(node)?.children.iter().rev().copied());
+            Some(node)
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotLayout {
+    pub paint: crate::render::PagePaint,
+    pub boxes: HashMap<NodeId, layout2::PxRect>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedSnapshot {
+    pub dom: SnapshotDom,
+    pub layout: SnapshotLayout,
+    pub resources: ImageStore,
+    pub semantics: Option<Arc<SemanticTree>>,
+    /// Changes only when layout geometry is recalculated. Selection offsets
+    /// into paint text must not outlive the geometry that produced them.
+    pub geometry_revision: u64,
+    base: Url,
+    viewport: CssSize,
+}
+
+impl EmbeddedAttributes for EmbeddedSnapshot {
+    fn attribute(&self, node: NodeId, name: &str) -> Option<&str> {
+        self.dom.attr(node, name)
+    }
+}
+
+impl EmbeddedSnapshot {
+    pub fn base(&self) -> &Url {
+        &self.base
+    }
+    pub fn viewport(&self) -> CssSize {
+        self.viewport
+    }
+    pub fn image_requests(&self) -> &[ImageRequest] {
+        &self.layout.paint.image_requests
+    }
+    pub fn ancestor_attribute(&self, mut node: NodeId, name: &str) -> Option<&str> {
+        loop {
+            if let Some(value) = self.dom.attr(node, name) {
+                return Some(value);
+            }
+            node = self.dom.nodes.get(node)?.parent?;
+        }
+    }
+    pub fn clamp_scroll(&self, point: CssPoint) -> CssPoint {
+        CssPoint::new(
+            point.x.clamp(
+                0.0,
+                (self.layout.paint.width - self.viewport.width).max(0.0),
+            ),
+            point.y.clamp(
+                0.0,
+                (self.layout.paint.height - self.viewport.height).max(0.0),
+            ),
+        )
+    }
+    pub fn scene(
+        &self,
+        metrics: ViewportMetrics,
+        rect: CssRect,
+        scroll: CssPoint,
+        seconds: f32,
+    ) -> Scene {
+        let mut scene = Scene {
+            viewport: metrics,
+            primitives: vec![],
+            controls: vec![],
+            content_viewport: rect,
+            image_store: self.resources.clone(),
+            canvas_images: Default::default(),
+            page_scroll_containers: vec![],
+            page_size: CssSize::default(),
+        };
+        scene.append_page_at(&self.layout.paint, self.clamp_scroll(scroll), seconds);
+        scene
+    }
+    pub fn hit(&self, point: CssPoint, scroll: CssPoint) -> Option<PageHit> {
+        crate::render::page_element_hits_at(
+            &self.layout.paint,
+            self.viewport,
+            self.clamp_scroll(scroll),
+            point,
+        )
+        .into_iter()
+        .next()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::{PhysicalSize, ScaleFactor};
+
+    fn document(html: &str) -> EmbeddedDocument {
+        EmbeddedDocument::new(
+            html,
+            Url::parse("https://example.test/").unwrap(),
+            CssSize::new(320.0, 180.0),
+            ImageStore::default(),
+        )
+    }
+
+    fn solid_image(width: u32, height: u32) -> ImageResource {
+        ImageResource {
+            width,
+            height,
+            rgba: vec![255; (width * height * 4) as usize].into(),
+            has_alpha: false,
+        }
+    }
+
+    #[test]
+    fn embedded_hover_reuses_only_proven_geometry_and_preserves_nested_scroll() {
+        let mut doc = document(
+            "<style>body{margin:0}#color{display:block;width:50px;height:20px;background:red}#color:hover{background:blue}#size{width:50px;height:20px}#size:hover{width:150px}#scroll{width:60px;height:30px;overflow:auto}#wide{width:300px;height:100px}</style><a id='color' href='/story'>link</a><div id='size'></div><div id='scroll'><div id='wide'></div></div>",
+        );
+        let color = doc.dom.get_by_id("color").unwrap();
+        let size = doc.dom.get_by_id("size").unwrap();
+        let scroller = doc.dom.get_by_id("scroll").unwrap();
+        doc.layout
+            .paint
+            .scroll_containers
+            .iter_mut()
+            .find(|c| c.node == scroller)
+            .unwrap()
+            .offset = CssPoint::new(100.0, 25.0);
+        let revision = doc.geometry_revision;
+        let boxes = doc.layout.boxes.clone();
+        assert!(doc.hover(Some(color)));
+        assert_eq!(
+            doc.geometry_revision, revision,
+            "paint hover avoids flow work"
+        );
+        assert_eq!(doc.layout.boxes, boxes);
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(320, 180), ScaleFactor::default());
+        let scene = doc.scene(
+            metrics,
+            CssRect::new(0.0, 0.0, 320.0, 180.0),
+            CssPoint::default(),
+            0.0,
+        );
+        let frame = crate::render::vello_cpu::VelloCpuRenderer::new()
+            .render_rgba(&scene)
+            .unwrap();
+        assert_eq!(
+            &frame.pixels[(10 * 320 + 45) * 4..(10 * 320 + 45) * 4 + 3],
+            &[0, 0, 255]
+        );
+        assert_eq!(
+            doc.layout
+                .paint
+                .scroll_containers
+                .iter()
+                .find(|c| c.node == scroller)
+                .unwrap()
+                .offset,
+            CssPoint::new(100.0, 25.0)
+        );
+        let snapshot = doc.snapshot(true);
+        let hit = snapshot
+            .hit(CssPoint::new(10.0, 10.0), CssPoint::default())
+            .unwrap();
+        assert_eq!(
+            snapshot.ancestor_attribute(hit.node, "href"),
+            Some("/story")
+        );
+        assert!(
+            snapshot
+                .semantics
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|n| n.dom_node == Some(color))
+        );
+        assert!(doc.hover(Some(size)));
+        assert!(
+            doc.geometry_revision > revision,
+            "geometry hover still lays out"
+        );
+        assert_eq!(doc.layout.boxes[&size].width, 150.0);
+        assert_eq!(
+            doc.layout
+                .paint
+                .scroll_containers
+                .iter()
+                .find(|c| c.node == scroller)
+                .unwrap()
+                .offset,
+            CssPoint::new(100.0, 25.0)
+        );
+    }
+
+    #[test]
+    fn embedded_image_batch_updates_natural_sizes_once_and_reuses_unchanged_sizes() {
+        let mut doc = document(
+            "<img id='a' src='/a.png' width='10' height='10'><img id='b' src='/b.png' width='10' height='10'>",
+        );
+        let a = doc.dom.get_by_id("a").unwrap();
+        let b = doc.dom.get_by_id("b").unwrap();
+        // Switch the initially requested placeholders to natural sizing in
+        // the same transaction that supplies their decoded resources.
+        for node in [a, b] {
+            doc.dom.remove_attr(node, "width");
+            doc.dom.remove_attr(node, "height");
+        }
+        let revision = doc.geometry_revision;
+        let batch = || {
+            vec![
+                ("https://example.test/a.png".into(), solid_image(40, 20)),
+                ("https://example.test/b.png".into(), solid_image(70, 30)),
+            ]
+        };
+        assert_eq!(doc.supply_images(batch()), 2);
+        assert_eq!(doc.geometry_revision, revision + 1);
+        assert_eq!(doc.layout.boxes[&a].width, 40.0);
+        assert_eq!(doc.layout.boxes[&b].height, 30.0);
+        assert!(
+            doc.image_requests()
+                .iter()
+                .all(|r| doc.resources.contains(r.handle))
+        );
+        assert_eq!(doc.supply_images(batch()), 2);
+        assert_eq!(
+            doc.geometry_revision,
+            revision + 1,
+            "pixel replacements preserve geometry"
+        );
+        assert!(!doc.supply_image("https://example.test/unrequested.png", solid_image(3, 3)));
+    }
+
+    #[test]
+    fn embedded_resource_limits_reject_before_recursive_layout() {
+        let limits = DocumentLimits {
+            bytes: 1024,
+            nodes: 30,
+            depth: 16,
+        };
+        let prepare = |html: &str| {
+            EmbeddedDocument::try_new(
+                html,
+                Url::parse("https://example.test/").unwrap(),
+                CssSize::new(320.0, 180.0),
+                ImageStore::default(),
+                limits,
+            )
+        };
+        assert_eq!(
+            prepare(&"x".repeat(1025)).err(),
+            Some("This document is too large to display")
+        );
+        assert_eq!(
+            prepare(&"<br>".repeat(40)).err(),
+            Some("This document contains too many elements to display")
+        );
+        assert_eq!(
+            prepare(&format!("{}x{}", "<div>".repeat(20), "</div>".repeat(20))).err(),
+            Some("This document is nested too deeply to display")
+        );
+        assert!(prepare("<p>A readable story</p>").is_ok());
+    }
 
     #[test]
     fn table_background_layers_cover_rowspans_but_not_spacing() {
