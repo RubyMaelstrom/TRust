@@ -308,10 +308,6 @@ pub struct View {
     pub(crate) colors: Vec<Vec<ansi::Span>>,
 }
 
-/// Reading-column preference, not a protocol limit: RFC 1436 §3.9 discusses
-/// 80-column screens and short menu labels, but does not limit text-file width.
-pub const PREFERRED_COLUMNS: usize = 80;
-
 impl View {
     fn measure_line(&mut self, text: &str) {
         self.source_columns = self
@@ -319,8 +315,10 @@ impl View {
             .max(unicode_width::UnicodeWidthStr::width(text));
     }
 
+    /// Fit the authored display width within the viewport. RFC 1436 §3.9
+    /// discusses 80-column screens, but sets no minimum presentation width.
     pub fn reading_columns(&self, available: usize) -> usize {
-        available.min(PREFERRED_COLUMNS.max(self.source_columns))
+        available.min(self.source_columns.max(1))
     }
 }
 
@@ -1525,7 +1523,20 @@ mod regression_tests {
         );
         let view = doc.gopher.as_ref().unwrap();
         assert_eq!(view.source_columns, 13);
-        assert_eq!(view.reading_columns(120), 80);
+        assert_eq!(view.reading_columns(120), 13);
+        assert_eq!(view.reading_columns(10), 10);
+    }
+
+    #[test]
+    fn reading_column_handles_empty_content_and_zero_available_width() {
+        let url = GopherUrl::parse("gopher://example.test/0/empty").unwrap();
+        for raw in [b"".as_slice(), b"\r\n\r\n.\r\n"] {
+            let doc = parse(&url, raw.to_vec(), false, 120);
+            let view = doc.gopher.as_ref().unwrap();
+            assert_eq!(view.source_columns, 0);
+            assert_eq!(view.reading_columns(120), 1);
+            assert_eq!(view.reading_columns(0), 0);
+        }
     }
 
     #[test]

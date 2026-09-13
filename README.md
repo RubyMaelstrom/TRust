@@ -177,9 +177,10 @@ storage directories. Existing TLS certificates, pins and DICT preferences keep
 their existing locations. No disk cache or persistent cookies are introduced.
 
 Gopher menus and text appear progressively in a centered, left-aligned
-monospace column. Its preferred width is 80 columns; longer authored lines
-expand it when space permits, preserving line breaks and spacing. The desktop
-keeps at least 22px of padding on each side. Narrow views wrap to fit.
+monospace column sized to the longest displayed source line, preserving line
+breaks and spacing. Short phlogs get a narrower column; longer authored lines
+expand it when space permits. The desktop keeps at least 22px of padding on
+each side. Narrow views wrap to fit.
 **W** toggles wrapping and
 **Shift+Left/Right** pans unwrapped text; **E** cycles automatic, UTF-8, Latin-1
 and CP437 display decoding without changing selectors. Automatic mode accepts
