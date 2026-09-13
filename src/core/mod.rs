@@ -1321,7 +1321,8 @@ impl BrowserController {
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
             if let Link::Gopher(url) = &target
-                && matches!(url.item_type, '0' | '1' | '7')
+                && url.is_text()
+                && !url.is_html()
             {
                 let result = gopher::fetch_updates(url, |reply| {
                     let tx = tx.clone();
@@ -2457,7 +2458,7 @@ pub async fn fetch_protocol(
                 offer.summary()
             )),
         },
-        Link::Gopher(url) if url.item_type == 'h' => {
+        Link::Gopher(url) if url.is_html() => {
             gopher::representation(url, gopher::fetch(url).await?)
                 .map(|r| FetchedDocument::Http(Box::new(r)))
         }
@@ -2516,7 +2517,7 @@ async fn fetch_protocol_interactive(
     intent: NavigationIntent,
 ) -> Result<InteractiveFetch, String> {
     if let Link::Gopher(url) = target
-        && (url.is_image() || url.item_type == 'h' || url.is_binary_file())
+        && (url.is_image() || url.is_html() || url.is_binary_file())
     {
         let response = if url.is_binary_file() {
             match gopher::fetch_file(url).await? {
@@ -2815,6 +2816,94 @@ fn split_host_port(address: &str) -> (&str, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gopher_plus_desktop_routes_views_and_information_by_representation() {
+        for (kind, command, bytes, expected) in [
+            (
+                '0',
+                b"+text/html".as_slice(),
+                b"<p>A page</p>\r\n.\r\n<p>Still here</p>".to_vec(),
+                "html",
+            ),
+            (
+                '0',
+                b"+image/webp",
+                crate::gopher::file_tests::webp(),
+                "image",
+            ),
+            (
+                '1',
+                b"+text/plain",
+                b"Text view\r\n.\r\nAfter dot".to_vec(),
+                "text",
+            ),
+            (
+                '9',
+                b"!",
+                b"+INFO: 9A file\t/item\te\t70\t+\r\n+VIEWS:\r\n image/webp: <1k>\r\n".to_vec(),
+                "info",
+            ),
+        ] {
+            let response = [format!("+{}\r\n", bytes.len()).as_bytes(), &bytes].concat();
+            let (mut url, server) = crate::gopher::file_tests::serve(response, b"/item").await;
+            url.item_type = kind;
+            let url = url.with_plus(command);
+            let mut browser = BrowserController::new(
+                tokio::runtime::Handle::current(),
+                || {},
+                CssSize::new(800.0, 600.0),
+            );
+            browser.open_internal_gemtext("about:plus-test", b"Previous page".to_vec());
+            let previous = browser.current_page().unwrap().target().clone();
+            browser.handle_action(UserAction::Activate(Link::Gopher(url.clone())));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                browser.task.take().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            browser.process_async_events();
+            assert!(browser.download_offer().is_none());
+            let page = browser.current_page().unwrap();
+            assert_eq!(page.target(), &Link::Gopher(url.clone()));
+            match (&page.document, expected) {
+                (FetchedDocument::Http(response), "html") => {
+                    // The page actor serializes the parsed HTML document.
+                    assert_eq!(response.content_type.split(';').next(), Some("text/html"));
+                    let html = String::from_utf8_lossy(&response.body);
+                    assert!(html.contains("A page") && html.contains("Still here"));
+                }
+                (FetchedDocument::Http(response), "image") => assert!(
+                    String::from_utf8_lossy(&response.body).contains("data:image/webp;base64,")
+                ),
+                (FetchedDocument::Gopher(page), "text") => {
+                    let doc = crate::gopher::render(&url, page.clone(), 80);
+                    assert_eq!(
+                        doc.lines
+                            .iter()
+                            .map(|l| l.text.as_str())
+                            .collect::<Vec<_>>(),
+                        ["Text view", ".", "After dot"]
+                    );
+                }
+                (FetchedDocument::Gopher(page), "info") => {
+                    let doc = crate::gopher::render(&url, page.clone(), 80);
+                    assert!(
+                        doc.lines
+                            .iter()
+                            .any(|l| matches!(&l.link, Some(Link::Gopher(u)) if u.is_image()))
+                    );
+                }
+                _ => panic!("Wrong presentation for {expected}"),
+            }
+            assert_eq!(server.await.unwrap(), url.request().unwrap());
+            browser.handle_action(UserAction::Back);
+            assert_eq!(browser.current_page().unwrap().target(), &previous);
+            assert!(browser.task.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn gopher_generic_menu_files_open_in_the_desktop_and_restore_the_menu() {
         for (bytes, selector, image) in [

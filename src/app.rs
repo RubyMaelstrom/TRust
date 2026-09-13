@@ -2672,6 +2672,11 @@ impl App {
                 }
             }
             Some("help" | "?") => self.open_about("help"),
+            Some("gopher-info") => match (parts.next(), parts.next()) {
+                (None, None) => self.gopher_information(false),
+                (Some("page"), None) => self.gopher_information(true),
+                _ => self.status = "usage: gopher-info [page]".into(),
+            },
             Some("wrap" | "changes") => {
                 let action = line.split_whitespace().next().unwrap();
                 let value = match parts.next() {
@@ -3247,7 +3252,7 @@ impl App {
                 self.notice = true;
                 return;
             }
-            if url.item_type == '8' {
+            if url.item_type == '8' && !url.is_metadata() {
                 let hint = String::from_utf8_lossy(&url.selector).into_owned();
                 self.open(url.host.clone(), url.port, false);
                 if !hint.is_empty() {
@@ -3348,7 +3353,7 @@ impl App {
                 return;
             }
             if let Link::Gopher(url) = &target
-                && url.item_type != 'h'
+                && !url.is_html()
             {
                 let result = gopher::fetch_updates(url, |reply| {
                     let tx = tx.clone();
@@ -4309,6 +4314,26 @@ impl App {
             Err(error) => self.status = error,
         }
         self.notice = true;
+    }
+
+    fn gopher_information(&mut self, page: bool) {
+        let selected = self
+            .viewer
+            .is_none()
+            .then(|| self.selected_link())
+            .flatten();
+        let current = self
+            .viewer
+            .as_ref()
+            .map(|viewer| &viewer.url)
+            .or_else(|| self.browser.as_ref().map(|g| &g.doc.url));
+        match gopher::information_target(selected.as_ref(), current, page) {
+            Ok(link) => self.start_fetch(link),
+            Err(error) => {
+                self.status = error;
+                self.notice = true;
+            }
+        }
     }
 
     fn on_gopher_reply(&mut self, url: GopherUrl, reply: crate::text_reply::Reply) {
@@ -6650,6 +6675,17 @@ impl App {
             .is_some_and(|g| g.doc.text_view().is_some())
         {
             match key.code {
+                KeyCode::Char('i' | 'I')
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) && self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|g| g.doc.gopher.is_some()) =>
+                {
+                    self.gopher_information(false);
+                    return;
+                }
                 KeyCode::Char('e' | 'E')
                     if self
                         .browser
@@ -15357,6 +15393,91 @@ mod tests {
 mod gopher_column_tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[tokio::test]
+    async fn gopher_plus_terminal_information_key_opens_a_view_and_returns_to_details() {
+        use crossterm::event::Event;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bytes = crate::gopher::file_tests::webp();
+        let metadata = format!(
+            "+INFO: 0Picture\t/image\t127.0.0.1\t{port}\t+\r\n+VIEWS:\r\n image/webp: <1k>\r\n"
+        )
+        .into_bytes();
+        let server = tokio::spawn(async move {
+            for (request, body) in [
+                (b"/image\t!\r\n".as_slice(), metadata),
+                (b"/image\t+image/webp\r\n", bytes),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut got = Vec::new();
+                while !got.ends_with(b"\r\n") {
+                    got.push(stream.read_u8().await.unwrap());
+                }
+                assert_eq!(got, request);
+                stream
+                    .write_all(format!("+{}\r\n", body.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let mut app = App::new(None, 23);
+        app.picker = ratatui_image::picker::Picker::halfblocks();
+        app.mode = Mode::Session;
+        app.last_inner = (80, 24);
+        let parent = GopherUrl::parse("gopher://example.test").unwrap();
+        app.navigate_to(gopher::parse(
+            &parent,
+            format!("0Picture\t/image\t127.0.0.1\t{port}\t+\r\n.\r\n").into_bytes(),
+            false,
+            80,
+        ));
+        app.browser_nav(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let message = tokio::time::timeout(
+            Duration::from_secs(3),
+            app.fetch_rx.as_mut().unwrap().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        app.on_fetch(message);
+        let doc = &app.browser.as_ref().unwrap().doc;
+        let details = doc.url.clone();
+        assert!(matches!(&details, Link::Gopher(url) if url.is_metadata()));
+        let view = doc
+            .lines
+            .iter()
+            .find_map(|line| match &line.link {
+                Some(Link::Gopher(url)) if url.is_image() => line.link.clone(),
+                _ => None,
+            })
+            .unwrap();
+        app.browser_follow_link(view.clone());
+        let message = tokio::time::timeout(
+            Duration::from_secs(3),
+            app.fetch_rx.as_mut().unwrap().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        app.on_fetch(message);
+        let image =
+            tokio::time::timeout(Duration::from_secs(3), app.img_rx.as_mut().unwrap().recv())
+                .await
+                .unwrap()
+                .unwrap();
+        app.on_img(image);
+        assert_eq!(app.viewer.as_ref().unwrap().url, view);
+        assert!(app.file_dialog.is_none());
+        app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)))
+            .await;
+        assert!(app.viewer.is_none());
+        assert_eq!(app.browser.as_ref().unwrap().doc.url, details);
+        assert!(app.fetch_task.is_none());
+        server.await.unwrap();
+    }
 
     fn draw_at_width(app: &mut App, width: u16) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();

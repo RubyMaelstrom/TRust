@@ -1,6 +1,10 @@
 //! Gopher transport, opaque URL octets and bounded menu/text presentation.
 //! RFC Editor snapshot 2026-09-06: RFC 1436 §§2, 3.8 and appendix;
-//! RFC 4266 §§2.1–2.3; RFC 3986 §§2.1, 2.4, 3.1, 3.2.2 and 3.5.
+//! RFC 4266 §2; RFC 3986 §§2.1, 2.4, 3.1, 3.2.2 and 3.5.
+
+mod plus;
+pub use plus::information_target;
+pub(crate) use plus::open;
 
 use crate::doc::{Doc, DocLine, Kind, Link, push_wrapped};
 use crate::{gemini, text_reply};
@@ -82,6 +86,10 @@ impl GopherUrl {
         );
         result.query = fields.next().map(<[u8]>::to_vec);
         result.gopher_plus = fields.next().map(<[u8]>::to_vec);
+        // RFC 4266 §2.3 requires an empty search placeholder in plus URLs.
+        if result.gopher_plus.is_some() && result.query.as_deref() == Some(b"") {
+            result.query = None;
+        }
         if fields.next().is_some() || result.validate().is_err() {
             return None;
         }
@@ -109,15 +117,16 @@ impl GopherUrl {
 
     pub fn request(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
-        // Gopher+ has different framing and ASK semantics. Never silently
-        // execute a plus command as an ordinary selector.
-        if self.gopher_plus.is_some() {
-            return Err("Gopher+ requests are not supported yet".into());
-        }
         let mut request = self.selector.clone();
-        if let Some(query) = &self.query {
+        // UMN Gopher+ §2.4 / Appendix II: only index requests require the
+        // search field on the wire. The URL placeholder is independent of it.
+        if self.query.is_some() || (self.gopher_plus.is_some() && self.item_type == '7') {
             request.push(b'\t');
-            request.extend_from_slice(query);
+            request.extend_from_slice(self.query.as_deref().unwrap_or_default());
+        }
+        if let Some(command) = &self.gopher_plus {
+            request.push(b'\t');
+            request.extend_from_slice(&plus::request_command(self, command)?);
         }
         request.extend_from_slice(b"\r\n");
         Ok(request)
@@ -131,21 +140,66 @@ impl GopherUrl {
     }
 
     pub fn needs_query(&self) -> bool {
-        self.item_type == '7' && self.query.is_none()
+        self.item_type == '7' && self.query.is_none() && !self.is_metadata()
+    }
+    pub fn with_plus(&self, command: &[u8]) -> Self {
+        let mut url = self.clone();
+        url.gopher_plus = Some(command.to_vec());
+        url
+    }
+    pub fn is_metadata(&self) -> bool {
+        self.gopher_plus.as_deref().is_some_and(|command| {
+            matches!(command.first(), Some(b'!' | b'$' | b'?'))
+                // UMN §2.9: these multimedia types have no default format.
+                || (command == b"+" && matches!(self.item_type, ':' | ';' | '<'))
+        })
+    }
+    pub(crate) fn view_mime(&self) -> Option<String> {
+        plus::view_mime(self.gopher_plus.as_deref()?)
+    }
+    pub fn is_menu(&self) -> bool {
+        !self.is_metadata()
+            && self.view_mime().map_or_else(
+                || matches!(self.item_type, '1' | '7'),
+                |mime| plus::menu_mime(&mime),
+            )
+    }
+    pub fn is_html(&self) -> bool {
+        !self.is_metadata()
+            && self.view_mime().map_or_else(
+                || self.item_type == 'h',
+                |mime| matches!(mime.as_str(), "text/html" | "application/xhtml+xml"),
+            )
+    }
+    fn legacy_text_framing(&self) -> bool {
+        self.gopher_plus.is_none() && self.is_text()
     }
     pub fn is_image(&self) -> bool {
-        matches!(self.item_type, 'I' | 'g' | 'p')
+        !self.is_metadata()
+            && self.view_mime().map_or_else(
+                || matches!(self.item_type, 'I' | 'g' | 'p'),
+                |mime| mime.starts_with("image/") && file_is_renderable(&mime),
+            )
     }
     pub fn is_download(&self) -> bool {
-        matches!(self.item_type, '4' | '6' | 'd' | 's' | ';')
+        !self.is_metadata()
+            && self.view_mime().map_or_else(
+                || matches!(self.item_type, '4' | '6' | 'd' | 's' | ';' | '<'),
+                |mime| !plus::menu_mime(&mime) && !file_is_renderable(&mime),
+            )
     }
     /// RFC 1436 §3.8 leaves presentation of these binary files to the client.
     /// Their type controls EOF framing, not whether they need a download.
     pub fn is_binary_file(&self) -> bool {
-        matches!(self.item_type, '5' | '9')
+        !self.is_metadata() && self.view_mime().is_none() && matches!(self.item_type, '5' | '9')
     }
     pub fn is_text(&self) -> bool {
-        matches!(self.item_type, '0' | '1' | '7' | 'h')
+        self.is_metadata()
+            || self.is_menu()
+            || self.is_html()
+            || self
+                .view_mime()
+                .map_or_else(|| self.item_type == '0', |mime| file_is_text(&mime))
     }
     pub fn filename(&self) -> String {
         String::from_utf8_lossy(
@@ -202,6 +256,9 @@ impl fmt::Display for GopherUrl {
             encode(query, f)?;
         }
         if let Some(plus) = &self.gopher_plus {
+            if self.query.is_none() {
+                write!(f, "%09")?;
+            }
             write!(f, "%09")?;
             encode(plus, f)?;
         }
@@ -413,7 +470,7 @@ pub async fn fetch_file(url: &GopherUrl) -> Result<FileResponse, String> {
     if !url.is_binary_file() {
         return Err("Gopher file detection requires a generic binary item".into());
     }
-    let mut stream = connect(url).await?;
+    let mut stream = open(url).await?;
     let total = Instant::now() + TOTAL_TIMEOUT;
     let mut deadline = Instant::now() + IDLE_TIMEOUT;
     let mut body = Vec::with_capacity(HEADER_BYTES);
@@ -483,7 +540,7 @@ where
             url.item_type
         ));
     }
-    let mut stream = connect(url).await?;
+    let mut stream = open(url).await?;
     let mut body = Vec::new();
     let mut buf = [0; 8192];
     let total = Instant::now() + TOTAL_TIMEOUT;
@@ -507,7 +564,7 @@ where
                             while scanned < body.len() {
                                 if body[scanned] == b'\n' {
                                     let line = body[line_start..scanned].strip_suffix(b"\r").unwrap_or(&body[line_start..scanned]);
-                                    if line == b"." { body.truncate(scanned + 1); terminated = true; break; }
+                                    if url.legacy_text_framing() && line == b"." { body.truncate(scanned + 1); terminated = true; break; }
                                     complete_prefix = scanned + 1;
                                     line_start = scanned + 1;
                                 }
@@ -554,6 +611,64 @@ pub fn status(url: &GopherUrl, reply: &text_reply::Reply) -> String {
             .map(|s| format!(" · {s}"))
             .unwrap_or_default()
     )
+}
+
+fn menu_item<'a>(
+    line: &'a [u8],
+    previous_type: &mut Option<char>,
+) -> (char, &'a [u8], Option<Link>) {
+    let mut t = 'i';
+    let mut label = line;
+    let mut link = None;
+    let mut fields = line.splitn(5, |&b| b == b'\t');
+    let first = fields.next().unwrap_or_default();
+    if let (Some(&item_type), Some(selector), Some(host), Some(port)) =
+        (first.first(), fields.next(), fields.next(), fields.next())
+    {
+        t = item_type as char;
+        if t == '+' {
+            t = previous_type.unwrap_or('i');
+        } else if !matches!(t, 'i' | '3') {
+            *previous_type = Some(t);
+        }
+        label = &first[1..];
+        let host = std::str::from_utf8(host)
+            .ok()
+            .filter(|h| h.len() <= 1024)
+            .and_then(|h| url::Host::parse(h).ok())
+            .map(|h| h.to_string().trim_matches(['[', ']']).to_string());
+        let port = std::str::from_utf8(port)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok());
+        if t == 'h' && selector.starts_with(b"URL:") && selector.len() <= MAX_REQUEST {
+            link = std::str::from_utf8(&selector[4..]).ok().map(|target| {
+                absolute_link(target).unwrap_or_else(|| Link::External(target.into()))
+            });
+        } else if !matches!(t, 'i' | '3')
+            && selector.len() <= MAX_REQUEST
+            && let (Some(host), Some(port)) = (host, port)
+        {
+            let mut target = GopherUrl::new(host.clone(), port, t, selector.to_vec());
+            // UMN Gopher+ §2.2: capability is per item, in the fifth field.
+            if let Some(capability @ (b"+" | b"?")) =
+                fields.next().and_then(|f| f.split(|b| *b == b'\t').next())
+            {
+                target.gopher_plus = Some(capability.to_vec());
+            }
+            if target.validate().is_ok() {
+                link = Some(if t == '8' {
+                    Link::Telnet {
+                        host,
+                        port,
+                        tls: false,
+                    }
+                } else {
+                    Link::Gopher(target)
+                });
+            }
+        }
+    }
+    (t, label, link)
 }
 
 fn kind_of(t: char) -> Kind {
@@ -680,10 +795,15 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
     let mut lines = Vec::new();
     let mut truncated = false;
     let mut previous_type = None;
-    let menu = matches!(url.item_type, '1' | '7');
-    let gemtext = !menu && url.filename().to_ascii_lowercase().ends_with(".gmi");
-    if gemtext {
-        let body = if url.is_text() {
+    let menu = url.is_menu();
+    let metadata = url.is_metadata() || (menu && page.reply.body.starts_with(b"+INFO:"));
+    let gemtext = !menu
+        && !metadata
+        && (url.view_mime().as_deref() == Some("text/gemini")
+            || (url.view_mime().is_none()
+                && url.filename().to_ascii_lowercase().ends_with(".gmi")));
+    if gemtext || metadata {
+        let body = if url.legacy_text_framing() {
             text_body(&page.reply.body)
         } else {
             page.reply.body.clone()
@@ -700,8 +820,11 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
             bounded.extend_from_slice(&line[..line.len().min(MAX_LINE)]);
             bounded.push(b'\n');
         }
-        let logical =
-            gemini::parse_gemtext(&bounded, usize::MAX / 4, &|target| resolve_gmi(url, target));
+        let logical = if metadata {
+            plus::information_lines(url, &bounded, page.view.encoding)
+        } else {
+            gemini::parse_gemtext(&bounded, usize::MAX / 4, &|target| resolve_gmi(url, target))
+        };
         for (source, line) in logical.into_iter().enumerate() {
             if lines.len() >= MAX_ROWS - 1 {
                 truncated = true;
@@ -735,65 +858,26 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
         }
     } else {
         for (source, line) in split_lines(&page.reply.body).enumerate() {
-            if url.is_text() && line == b"." {
+            if url.legacy_text_framing() && line == b"." {
                 break;
             }
             if lines.len() >= MAX_ROWS - 1 {
                 truncated = true;
                 break;
             }
-            let mut t = 'i';
-            let mut link = None;
-            let mut label = line;
-            if menu {
-                let mut fields = line.splitn(5, |&b| b == b'\t');
-                let first = fields.next().unwrap_or_default();
-                if let (Some(&item_type), Some(selector), Some(host), Some(port)) =
-                    (first.first(), fields.next(), fields.next(), fields.next())
-                {
-                    t = item_type as char;
-                    if t == '+' {
-                        t = previous_type.unwrap_or('i');
-                    } else if !matches!(t, 'i' | '3') {
-                        previous_type = Some(t);
-                    }
-                    label = &first[1..];
-                    let host = std::str::from_utf8(host)
-                        .ok()
-                        .filter(|h| h.len() <= 1024)
-                        .and_then(|h| url::Host::parse(h).ok())
-                        .map(|h| h.to_string().trim_matches(['[', ']']).to_string());
-                    let port = std::str::from_utf8(port)
-                        .ok()
-                        .and_then(|p| p.parse::<u16>().ok());
-                    if t == 'h' && selector.starts_with(b"URL:") && selector.len() <= MAX_REQUEST {
-                        link = std::str::from_utf8(&selector[4..]).ok().map(|target| {
-                            absolute_link(target).unwrap_or_else(|| Link::External(target.into()))
-                        });
-                    } else if !matches!(t, 'i' | '3')
-                        && selector.len() <= MAX_REQUEST
-                        && let (Some(host), Some(port)) = (host, port)
-                    {
-                        let target = GopherUrl::new(host.clone(), port, t, selector.to_vec());
-                        if target.validate().is_ok() {
-                            link = Some(if t == '8' {
-                                Link::Telnet {
-                                    host,
-                                    port,
-                                    tls: false,
-                                }
-                            } else {
-                                Link::Gopher(target)
-                            });
-                        }
-                    }
-                }
+            let (t, label, link) = if menu {
+                menu_item(line, &mut previous_type)
             } else {
-                t = '0';
-                if url.is_text() && line.starts_with(b"..") {
-                    label = &line[1..];
-                }
-            }
+                (
+                    '0',
+                    if url.legacy_text_framing() && line.starts_with(b"..") {
+                        &line[1..]
+                    } else {
+                        line
+                    },
+                    None,
+                )
+            };
             if label.len() > MAX_LINE {
                 truncated = true;
             }
@@ -872,15 +956,18 @@ pub fn representation(url: &GopherUrl, page: Page) -> Result<crate::http::Respon
     if let Some(notice) = page.reply.notice {
         return Err(notice);
     }
-    let mime = if url.is_image() {
+    let view_mime = url.view_mime();
+    let mime = if let Some(mime) = &view_mime {
+        mime.as_str()
+    } else if url.is_image() {
         crate::img::sniff(&page.reply.body).ok_or("Gopher server returned an unrecognized image")?
     } else {
         "text/html"
     };
-    let body = if url.is_image() {
-        page.reply.body
-    } else {
+    let body = if url.legacy_text_framing() {
         text_body(&page.reply.body)
+    } else {
+        page.reply.body
     };
     let response = response(url, body, mime)?;
     Ok(if url.is_image() {
@@ -1111,7 +1198,7 @@ mod tests {
         url.selector.push(b'\n');
         assert!(url.request().is_err());
         let url = GopherUrl::parse("gopher://e/7/s%09q%09+").unwrap();
-        assert!(url.request().unwrap_err().contains("Gopher+"));
+        assert_eq!(url.request().unwrap(), b"/s\tq\t+\r\n");
     }
     #[test]
     fn labels_and_selector_bytes_are_independent_and_mirrors_inherit_type() {
