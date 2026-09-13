@@ -314,6 +314,9 @@ S saves received source. Esc stops while preserving the received prefix.
 Search endpoints prompt; saved query URLs repeat their search.
 Images, HTML and supported generic files open inside TRust.
 Unsupported files offer Save / Open / Cancel.
+Gopher+ pages and alternate formats open here too. I or gopher-info shows
+the selected item's information; gopher-info page shows the current page's.
+Choose a format link to open it. ASK forms are displayed but cannot submit.
 Recent pages stay in bounded RAM history; reload fetches a fresh copy.
 
 ## Bookmarks

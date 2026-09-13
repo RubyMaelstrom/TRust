@@ -63,7 +63,9 @@ impl DownloadOffer {
         }
         Ok(Self {
             url: Url::parse(&target.to_string()).map_err(|e| e.to_string())?,
-            content_type: "application/octet-stream".into(),
+            content_type: target
+                .view_mime()
+                .unwrap_or_else(|| "application/octet-stream".into()),
             suggested_filename: name,
             content_length: None,
             body: Vec::new(),
@@ -638,7 +640,7 @@ fn unique_path(directory: &Path, filename: &str) -> Result<PathBuf, String> {
 /// final name appears.
 /// RFC 1436 appendix: binary data ends at EOF, with no dot unstuffing.
 async fn stream_gopher(target: &crate::gopher::GopherUrl, path: &Path) -> Result<u64, String> {
-    let mut stream = crate::gopher::connect(target).await?;
+    let mut stream = crate::gopher::open(target).await?;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -956,6 +958,39 @@ async fn stream_chunked<R: tokio::io::AsyncBufRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gopher_plus_downloads_save_payload_without_headers_or_trailers() {
+        let expected = b"\0Binary\r\n..dot\r\n";
+        for (index, wire) in [
+            [
+                format!("+{}\r\n", expected.len()).as_bytes(),
+                expected,
+                b"TRAILER",
+            ]
+            .concat(),
+            b"+-1\r\n\0Binary\r\n...dot\r\n.\r\nTRAILER".to_vec(),
+            [b"+-2\r\n".as_slice(), expected].concat(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (url, server) = crate::gopher::file_tests::serve(wire, b"/file.bin").await;
+            let url = url.with_plus(b"+application/octet-stream");
+            let offer = super::DownloadOffer::from_gopher(url.clone()).unwrap();
+            let destination = std::env::temp_dir().join(format!(
+                "trust-gopher-plus-download-{}-{index}.bin",
+                std::process::id()
+            ));
+            assert_eq!(
+                super::save(&offer, &destination).await.unwrap(),
+                expected.len() as u64
+            );
+            assert_eq!(tokio::fs::read(&destination).await.unwrap(), expected);
+            tokio::fs::remove_file(destination).await.unwrap();
+            assert_eq!(server.await.unwrap(), url.request().unwrap());
+        }
+    }
+
     #[tokio::test]
     async fn gopher_binary_download_keeps_dot_lines_and_opaque_selector() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -137,6 +137,7 @@ command nor an address searches DuckDuckGo Lite.
 | `post <url> [body]` | HTTP POST, form-urlencoded |
 | `finger [user]@<host>[:port]` | who's there / their .plan (RFC 1288); IPv6 accepts `[address]:port` |
 | `wrap [on\|off]` | toggle wrapping of a Gopher, Finger, WHOIS, RDAP or DICT reply |
+| `gopher-info [page]` | show Gopher+ item information and available formats; `page` selects the current page |
 | `changes [on\|off]` | compare a Finger or WHOIS reply with its previous successful refresh |
 | `whois <query> [server[:port]]` | WHOIS lookup via IANA or a chosen server; quote queries containing spaces |
 | `encoding [auto\|utf8\|latin1]` | select WHOIS display encoding without refetching |
@@ -198,12 +199,22 @@ directly in TRust. Unsupported files offer Save / Open / Cancel after a bounded
 type check; files exceeding the page-body limit can also be downloaded.
 Redundant-server menu entries
 inherit the original item's type and can be selected as alternate destinations.
-Gopher+ commands and unimplemented legacy service types report an explicit error.
+Gopher+ menus, text, item information and alternate formats are supported.
+**I** (or `gopher-info`) opens information about the selected Gopher link,
+falling back to the current page; `gopher-info page` requests the current page's
+information explicitly. Available formats and languages appear as links;
+supported formats open inside TRust and the chosen view can be bookmarked.
+Information is fetched on demand and uses the existing in-memory page history.
+Gopher+ multimedia items without a default format open their available formats.
+ASK items display their form requirements; interactive form submission is not
+implemented. Unimplemented legacy service types report an explicit error.
 
 Gopher page responses are limited to 2 MiB, and display rows/line widths are
 bounded independently. Downloads stream directly to disk with a 2 GiB ceiling.
 Limits and interrupted replies are reported visibly; receiving a complete dot
-terminator finishes immediately even if the server keeps the socket open.
+terminator or the declared Gopher+ byte count finishes immediately even if the
+server keeps the socket open. Gopher+ framing is removed before displaying or
+saving the content.
 
 Finger replies appear as they arrive, preserving columns, blank lines, and
 eight-cell tab stops. **W** toggles wrapping; **Shift+Left/Right** pans an

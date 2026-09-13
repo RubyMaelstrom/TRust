@@ -3392,6 +3392,10 @@ impl DesktopApp {
         self.protocol_pointer_selection = false;
         if cache.document.text_view().is_some() {
             if let Key::Character(key) = &input.key {
+                if cache.document.gopher.is_some() && key.eq_ignore_ascii_case("i") {
+                    self.gopher_information(false);
+                    return true;
+                }
                 if cache.document.gopher.is_some() && key.eq_ignore_ascii_case("e") {
                     self.browser.gopher_encoding();
                     self.request_redraw();
@@ -4059,6 +4063,22 @@ impl DesktopApp {
         }
     }
 
+    fn gopher_information(&mut self, page: bool) {
+        let selected = self
+            .protocol_page
+            .as_ref()
+            .and_then(ProtocolPageCache::selected_link);
+        let current = self.browser.current_page().map(|page| page.target());
+        match trust::gopher::information_target(selected, current, page) {
+            Ok(link) => {
+                self.close_command();
+                self.activate_link(link);
+            }
+            Err(error) => self.browser.set_status(error),
+        }
+        self.request_redraw();
+    }
+
     fn bookmark_command(&mut self, command: &str) {
         let current = if let Some(terminal) = &self.terminal {
             trust::gopher::absolute_link(&terminal.address)
@@ -4279,6 +4299,11 @@ impl DesktopApp {
                     trust::command::HELP_PAGE.as_bytes().to_vec(),
                 );
             }
+            "gopher-info" => match (parts.next(), parts.next()) {
+                (None, None) => self.gopher_information(false),
+                (Some("page"), None) => self.gopher_information(true),
+                _ => self.browser.set_status("usage: gopher-info [page]"),
+            },
             "wrap" | "changes" => {
                 let action = verb.as_str();
                 let enabled = match parts.next() {
@@ -4930,7 +4955,7 @@ impl DesktopApp {
                     .set_status("Gopher search: enter a query, then Enter");
                 return;
             }
-            if url.item_type == '8' {
+            if url.item_type == '8' && !url.is_metadata() {
                 self.start_terminal(
                     url.host.clone(),
                     url.port,
