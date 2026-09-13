@@ -453,7 +453,8 @@ fn describe_fetch(document: &FetchedDocument) -> String {
             page.reply.bytes(),
             page.reply.hops.len()
         ),
-        FetchedDocument::Gopher(bytes) | FetchedDocument::OneShot(bytes) => {
+        FetchedDocument::Gopher(page) => format!("{} bytes", page.reply.body.len()),
+        FetchedDocument::OneShot(bytes) => {
             format!("{} bytes", bytes.len())
         }
         FetchedDocument::Dict(page) => page.status(),
@@ -842,7 +843,7 @@ mod tests {
         }));
         assert_eq!(describe_fetch(&missing), "HTTP 404 (text/html)");
         assert_eq!(
-            describe_fetch(&FetchedDocument::Gopher(vec![0u8; 7])),
+            describe_fetch(&FetchedDocument::Gopher(vec![0u8; 7].into())),
             "7 bytes"
         );
     }

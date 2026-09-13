@@ -322,23 +322,28 @@ struct HistoryEntry {
     /// Retain their small source so Back/Forward uses the same history path.
     internal_source: Option<Vec<u8>>,
     dict_view: Option<crate::dict::SavedView>,
+    gopher_page: Option<gopher::Page>,
+    scroll: CssPoint,
 }
 
 impl HistoryEntry {
-    fn from_page(page: BrowserPage) -> Self {
+    fn from_page(page: BrowserPage, scroll: CssPoint) -> Self {
         let dict_view = match &page.document {
             FetchedDocument::Dict(dict) => Some(dict.saved_view()),
             _ => None,
         };
-        let internal_source = match page.document {
-            FetchedDocument::Internal(source) => Some(source),
-            _ => None,
+        let (internal_source, gopher_page) = match page.document {
+            FetchedDocument::Internal(source) => (Some(source), None),
+            FetchedDocument::Gopher(page) => (None, Some(page)),
+            _ => (None, None),
         };
         Self {
             target: page.target,
             fallback_http: page.fallback_http,
             internal_source,
             dict_view,
+            gopher_page,
+            scroll,
         }
     }
 }
@@ -348,7 +353,7 @@ impl HistoryEntry {
 /// presentation models can be added without changing navigation or wakeups.
 #[derive(Debug)]
 pub enum FetchedDocument {
-    Gopher(Vec<u8>),
+    Gopher(crate::gopher::Page),
     Gemini(gemini::Response),
     Http(Box<http::Response>),
     OneShot(Vec<u8>),
@@ -429,6 +434,10 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    Gopher {
+        generation: u64,
+        reply: crate::text_reply::Reply,
+    },
     Dict {
         generation: u64,
         reply: crate::dict::Reply,
@@ -802,11 +811,17 @@ impl BrowserController {
         source: impl Into<Vec<u8>>,
     ) -> ActionOutcome {
         let generation_before = self.generation;
-        self.begin_internal_gemtext(
-            Link::External(address.into()),
-            source.into(),
-            NavigationIntent::New,
-        );
+        let address = address.into();
+        let intent = if self
+            .current
+            .as_ref()
+            .is_some_and(|p| p.target == Link::External(address.clone()))
+        {
+            NavigationIntent::Reload
+        } else {
+            NavigationIntent::New
+        };
+        self.begin_internal_gemtext(Link::External(address), source.into(), intent);
         ActionOutcome {
             invalidated: true,
             loading_retired: self.generation != generation_before,
@@ -848,9 +863,11 @@ impl BrowserController {
         self.drop_live_page();
         self.pending = None;
         if let Some(old) = self.current.take() {
-            self.back.push(HistoryEntry::from_page(old));
+            self.back
+                .push(HistoryEntry::from_page(old, self.interaction.scroll));
             self.forward.clear();
         }
+        self.trim_gopher_history();
         self.external_address = Some(address.into());
         self.generation = self.generation.wrapping_add(1);
         self.document_generation = self.generation;
@@ -1107,6 +1124,9 @@ impl BrowserController {
                         }
                     }
                 }
+                CoreEvent::Gopher { generation, reply } => {
+                    changed |= self.update_gopher(generation, reply);
+                }
                 CoreEvent::Dict { generation, reply } => {
                     changed |= self.update_dict(generation, reply);
                 }
@@ -1169,6 +1189,26 @@ impl BrowserController {
         true
     }
 
+    /// Small-net Back/Forward is local while its bounded source is retained.
+    /// This is session RAM, with no persistent response cache.
+    fn trim_gopher_history(&mut self) {
+        let mut bytes = 0usize;
+        let mut count = 0;
+        for stack in [&mut self.back, &mut self.forward] {
+            for entry in stack.iter_mut().rev() {
+                if let Some(page) = &entry.gopher_page {
+                    let size = page.reply.body.capacity() + std::mem::size_of::<gopher::Page>();
+                    if count >= 32 || size > (8 * 1024 * 1024usize).saturating_sub(bytes) {
+                        entry.gopher_page = None;
+                    } else {
+                        bytes += size;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn begin_history(&mut self, forward: bool) -> bool {
         let entry = if forward {
             self.forward.last()
@@ -1183,6 +1223,31 @@ impl BrowserController {
             };
             return true;
         };
+        if let Some(page) = entry.gopher_page {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+            self.retire_query("Incomplete reply: left this page");
+            self.abort_declarative_refresh();
+            self.drop_live_page();
+            self.external_address = None;
+            self.download_offer = None;
+            self.generation = self.generation.wrapping_add(1);
+            let generation = self.generation;
+            self.pending = Some(PendingNavigation {
+                generation,
+                target: entry.target,
+                fallback_http: false,
+                intent: if forward {
+                    NavigationIntent::Forward
+                } else {
+                    NavigationIntent::Back
+                },
+            });
+            self.finish_fetch(generation, Ok(FetchedDocument::Gopher(page)));
+            self.interaction.scroll = entry.scroll;
+            return true;
+        }
         if let Some(source) = entry.internal_source {
             self.begin_internal_gemtext(
                 entry.target,
@@ -1247,6 +1312,28 @@ impl BrowserController {
         let screen_position = self.screen_position;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
+            if let Link::Gopher(url) = &target
+                && matches!(url.item_type, '0' | '1' | '7')
+            {
+                let result = gopher::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(CoreEvent::Gopher { generation, reply })
+                            .await
+                            .is_ok()
+                    }
+                })
+                .await;
+                let event = match result {
+                    Ok(reply) => CoreEvent::Gopher { generation, reply },
+                    Err(error) => CoreEvent::FetchFinished {
+                        generation,
+                        result: Err(error),
+                    },
+                };
+                let _ = tx.send(event).await;
+                return;
+            }
             if let Link::Dict(url) = &target {
                 let result = crate::dict::fetch_updates(url, |reply| {
                     let tx = tx.clone();
@@ -1386,6 +1473,10 @@ impl BrowserController {
     fn retire_query(&mut self, reason: &str) {
         if let Some(page) = &mut self.current {
             match &mut page.document {
+                FetchedDocument::Gopher(gopher) if !gopher.reply.finished => {
+                    gopher.reply.finished = true;
+                    gopher.reply.notice = Some(reason.to_string());
+                }
                 FetchedDocument::Finger(finger) if !finger.reply.finished => {
                     finger.reply.finished = true;
                     finger.reply.notice = Some(reason.to_string());
@@ -1398,11 +1489,41 @@ impl BrowserController {
         }
     }
 
+    pub fn gopher_encoding(&mut self) -> bool {
+        let Some(page) = &mut self.current else {
+            return false;
+        };
+        let FetchedDocument::Gopher(gopher) = &mut page.document else {
+            return false;
+        };
+        gopher.view.encoding = gopher.view.encoding.next();
+        page.revision = page.revision.wrapping_add(1);
+        self.status = format!("Gopher encoding: {}", gopher.view.encoding.label());
+        self.invalidation.request_redraw();
+        true
+    }
+
+    pub fn offer_gopher_download(&mut self, url: &gopher::GopherUrl) {
+        self.stop();
+        match crate::download::DownloadOffer::from_gopher(url.clone()) {
+            Ok(offer) => {
+                self.status = format!("Gopher file · {}", offer.suggested_filename);
+                self.download_offer = Some(offer);
+            }
+            Err(error) => self.status = error,
+        }
+        self.invalidation.request_redraw();
+    }
+
     pub fn reply_view_action(&mut self, action: &str, enabled: Option<bool>) -> bool {
         let Some(page) = &mut self.current else {
             return false;
         };
         let (result, wrap) = match &mut page.document {
+            FetchedDocument::Gopher(gopher) => (
+                crate::text_reply::view_action(&mut gopher.view.controls, action, enabled, false),
+                gopher.view.controls.wrap,
+            ),
             FetchedDocument::Finger(finger) => (
                 crate::finger::view_action(&mut finger.view, action, enabled),
                 finger.view.wrap,
@@ -1430,6 +1551,18 @@ impl BrowserController {
         let Some(page) = &self.current else {
             return false;
         };
+        if let (FetchedDocument::Gopher(gopher), Link::Gopher(url)) = (&page.document, &page.target)
+        {
+            if server.is_none() {
+                self.download_offer = Some(crate::download::DownloadOffer::from_bytes(
+                    url::Url::parse(&url.to_string()).unwrap(),
+                    "gopher-source.txt".into(),
+                    gopher.reply.body.clone(),
+                ));
+                self.status = "Save received Gopher source".into();
+            }
+            return true;
+        }
         if let FetchedDocument::Dict(dict) = &page.document {
             if server.is_some() {
                 self.status = "DICT has one reply; use save without a server number.".into();
@@ -1574,6 +1707,52 @@ impl BrowserController {
         true
     }
 
+    fn update_gopher(&mut self, generation: u64, reply: crate::text_reply::Reply) -> bool {
+        let Some(pending) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.generation == generation)
+            .cloned()
+        else {
+            return false;
+        };
+        let finished = reply.finished;
+        if self.document_generation == generation
+            && let Some(page) = &mut self.current
+            && let FetchedDocument::Gopher(finger) = &mut page.document
+        {
+            finger.reply = reply;
+            page.status = fetched_status(&page.target, &page.document);
+            self.status = page.status.clone();
+            page.revision = page.revision.wrapping_add(1);
+        } else {
+            let mut finger = crate::gopher::Page::new(reply);
+            if pending.intent == NavigationIntent::Reload
+                && let Some(old) = &self.current
+                && old.target == pending.target
+                && let FetchedDocument::Gopher(old) = &old.document
+            {
+                finger.view = old.view.clone();
+            }
+            // Commit history once, at the first published chunk. Later chunks
+            // update that document while the same cancellable task stays live.
+            let task = self.task.take();
+            let scroll = self.interaction.scroll;
+            self.finish_fetch(generation, Ok(FetchedDocument::Gopher(finger)));
+            if pending.intent == NavigationIntent::Reload {
+                self.interaction.scroll = scroll;
+            }
+            self.task = task;
+            self.pending = Some(pending);
+        }
+        self.render_is_final = finished;
+        if finished {
+            self.pending = None;
+            self.task = None;
+        }
+        true
+    }
+
     fn update_finger(&mut self, generation: u64, reply: crate::finger::Reply) -> bool {
         let Some(pending) = self
             .pending
@@ -1686,7 +1865,8 @@ impl BrowserController {
                 match pending.intent {
                     NavigationIntent::New => {
                         if let Some(old) = old {
-                            self.back.push(HistoryEntry::from_page(old));
+                            self.back
+                                .push(HistoryEntry::from_page(old, self.interaction.scroll));
                         }
                         self.forward.clear();
                     }
@@ -1694,16 +1874,19 @@ impl BrowserController {
                     NavigationIntent::Back => {
                         let _ = self.back.pop();
                         if let Some(old) = old {
-                            self.forward.push(HistoryEntry::from_page(old));
+                            self.forward
+                                .push(HistoryEntry::from_page(old, self.interaction.scroll));
                         }
                     }
                     NavigationIntent::Forward => {
                         let _ = self.forward.pop();
                         if let Some(old) = old {
-                            self.back.push(HistoryEntry::from_page(old));
+                            self.back
+                                .push(HistoryEntry::from_page(old, self.interaction.scroll));
                         }
                     }
                 }
+                self.trim_gopher_history();
                 self.interaction.scroll = CssPoint::default();
                 self.interaction.nested_scroll.clear();
                 // A document that gets no resident actor is final the moment it
@@ -2234,6 +2417,10 @@ pub async fn fetch_protocol(
     referrer: Option<&url::Url>,
 ) -> Result<FetchedDocument, String> {
     match target {
+        Link::Gopher(url) if url.item_type == 'h' => {
+            gopher::representation(url, gopher::fetch(url).await?)
+                .map(|r| FetchedDocument::Http(Box::new(r)))
+        }
         Link::Gopher(url) => gopher::fetch(url).await.map(FetchedDocument::Gopher),
         Link::Gemini(url) => gemini::fetch(url).await.map(FetchedDocument::Gemini),
         Link::Dict(url) => crate::dict::fetch(url).await.map(|reply| {
@@ -2288,6 +2475,27 @@ async fn fetch_protocol_interactive(
     post_body: Option<String>,
     intent: NavigationIntent,
 ) -> Result<InteractiveFetch, String> {
+    if let Link::Gopher(url) = target
+        && (url.is_image() || url.item_type == 'h')
+    {
+        let response = gopher::representation(url, gopher::fetch(url).await?)?;
+        let size = (
+            viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
+            viewport.height.round().clamp(1.0, u16::MAX as f32) as u16,
+        );
+        let response = http::execute_js_for_window(
+            response,
+            size,
+            (1, 1),
+            device_pixel_ratio,
+            screen_position,
+            storage,
+        )
+        .await;
+        return Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
+            response,
+        ))));
+    }
     if let Link::Http(url) = target {
         let mut response = if let Some(body) = post_body {
             let mut request = http::Request {
@@ -2391,6 +2599,14 @@ fn layout_viewport(size: CssSize) -> crate::layout2::Viewport {
 
 fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
     match document {
+        FetchedDocument::Http(_) if matches!(target, Link::Gopher(_)) => format!(
+            "{target} · Gopher {}",
+            if matches!(target, Link::Gopher(u) if u.is_image()) {
+                "image"
+            } else {
+                "HTML"
+            }
+        ),
         FetchedDocument::Http(response) => {
             let media = response.content_type.split(';').next().unwrap_or("").trim();
             format!("{} — HTTP {} ({media})", response.url, response.status)
@@ -2401,7 +2617,10 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
                 response.url, response.status, response.meta
             )
         }
-        FetchedDocument::Gopher(bytes) => format!("{target} — {} bytes", bytes.len()),
+        FetchedDocument::Gopher(page) => match target {
+            Link::Gopher(url) => gopher::status(url, &page.reply),
+            _ => format!("{target} — {} bytes", page.reply.body.len()),
+        },
         FetchedDocument::OneShot(bytes) => format!("{target} — {} bytes", bytes.len()),
         FetchedDocument::Whois(page) => match target {
             Link::OneShot(url) => crate::whois::status(url, &page.reply),
@@ -2427,6 +2646,17 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
 /// Parse a typed navigation target into a fetchable protocol target. A bare host is
 /// HTTPS with HTTP fallback, matching the existing terminal address behavior.
 pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
+    if let Some((host, port, tls)) = crate::command::telnet_target(address) {
+        return Ok((Link::Telnet { host, port, tls }, false));
+    }
+    if address
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("gopher"))
+    {
+        return gopher::GopherUrl::parse(address)
+            .map(|url| (Link::Gopher(url), false))
+            .ok_or_else(|| "Invalid Gopher address".into());
+    }
     let address = address.trim();
     if address.is_empty() {
         return Err(String::from("Enter an address."));
@@ -2466,9 +2696,7 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
         return Ok((Link::OneShot(url), false));
     }
     if address.starts_with("telnet://") || address.starts_with("telnets://") {
-        return Err(String::from(
-            "Telnet sessions currently open in the terminal frontend.",
-        ));
+        return Err(String::from("Invalid Telnet address."));
     }
     let (host, port) = split_host_port(address);
     match port {
@@ -2477,7 +2705,9 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
                 host: host.to_string(),
                 port: 70,
                 item_type: '1',
-                selector: String::new(),
+                query: None,
+                gopher_plus: None,
+                selector: Vec::new(),
             }),
             false,
         )),
@@ -2526,6 +2756,51 @@ fn split_host_port(address: &str) -> (&str, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gopher_history_restores_source_and_view_without_network() {
+        let mut browser = super::BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            super::CssSize::new(800.0, 600.0),
+        );
+        for i in 0..3 {
+            let url =
+                crate::gopher::GopherUrl::parse(&format!("gopher://nonexistent.invalid/0/{i}"))
+                    .unwrap();
+            browser.generation += 1;
+            let generation = browser.generation;
+            browser.pending = Some(super::PendingNavigation {
+                generation,
+                target: crate::doc::Link::Gopher(url),
+                fallback_http: false,
+                intent: super::NavigationIntent::New,
+            });
+            let mut page = crate::gopher::Page::from(format!("Page {i}\r\n.\r\n").into_bytes());
+            page.view.controls.wrap = false;
+            assert!(browser.finish_fetch(generation, Ok(super::FetchedDocument::Gopher(page))));
+            browser.interaction.scroll.y = 100.0 + i as f32;
+        }
+        browser.begin_history(false);
+        browser.begin_history(false);
+        assert!(browser.pending.is_none() && browser.task.is_none());
+        let page = browser.current.as_ref().unwrap();
+        assert!(page.target.to_string().ends_with("/0/0"));
+        assert_eq!(browser.interaction.scroll.y, 100.0);
+        assert!(
+            matches!(&page.document, super::FetchedDocument::Gopher(p) if !p.view.controls.wrap && p.reply.body.starts_with(b"Page 0"))
+        );
+        browser.begin_history(true);
+        assert!(
+            browser
+                .current
+                .as_ref()
+                .unwrap()
+                .target
+                .to_string()
+                .ends_with("/0/1")
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3169,7 +3444,17 @@ mod tests {
         assert!(matches!(gopher, Link::Gopher(_)));
         assert!(!fallback);
 
-        assert!(parse_navigation_target("telnet://example.com").is_err());
+        assert!(matches!(
+            parse_navigation_target("telnet://example.com"),
+            Ok((
+                Link::Telnet {
+                    port: 23,
+                    tls: false,
+                    ..
+                },
+                false
+            ))
+        ));
         let (whois, fallback) =
             parse_navigation_target("WHOIS://[::1]:4343/%65xample.com#local").unwrap();
         assert!(!fallback);
@@ -3365,7 +3650,9 @@ mod tests {
                 host: host.to_string(),
                 port: 70,
                 item_type: '1',
-                selector: String::new(),
+                query: None,
+                gopher_plus: None,
+                selector: Vec::new(),
             })
         };
         let arrive = |browser: &mut BrowserController,
@@ -3380,7 +3667,7 @@ mod tests {
             });
             assert!(browser.finish_fetch(
                 generation,
-                Ok(FetchedDocument::Gopher(vec![generation as u8]))
+                Ok(FetchedDocument::Gopher(vec![generation as u8].into()))
             ));
         };
 
@@ -3423,7 +3710,7 @@ mod tests {
             intent: NavigationIntent::Back,
         });
         assert!(browser.snapshot().can_go_back);
-        assert!(browser.finish_fetch(4, Ok(FetchedDocument::Gopher(vec![4]))));
+        assert!(browser.finish_fetch(4, Ok(FetchedDocument::Gopher(vec![4].into()))));
         assert!(!browser.snapshot().can_go_back);
         assert!(browser.snapshot().can_go_forward);
         assert_eq!(
@@ -3473,7 +3760,9 @@ mod tests {
                 host: host.to_string(),
                 port: 70,
                 item_type: '1',
-                selector: String::new(),
+                query: None,
+                gopher_plus: None,
+                selector: Vec::new(),
             })
         };
         browser.generation = 1;
@@ -3483,7 +3772,7 @@ mod tests {
             fallback_http: false,
             intent: NavigationIntent::New,
         });
-        assert!(browser.finish_fetch(1, Ok(FetchedDocument::Gopher(vec![1]))));
+        assert!(browser.finish_fetch(1, Ok(FetchedDocument::Gopher(vec![1].into()))));
         assert_eq!(browser.document_generation(), 1);
 
         let outcome = browser.handle_action(UserAction::Activate(target("next.example")));

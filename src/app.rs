@@ -302,7 +302,7 @@ struct ViewPos {
 
 /// What a background fetch produced, by protocol.
 enum Payload {
-    Gopher(Vec<u8>),
+    Gopher(crate::text_reply::Reply),
     Gemini(gemini::Response),
     Http(Box<http::Response>),
     /// An attachment or unsupported top-level MIME type. The current document
@@ -617,6 +617,11 @@ struct PointerHit {
 }
 
 pub struct App {
+    bookmarks: Option<crate::bookmarks::Worker>,
+    bookmark_filter: String,
+    bookmark_tx: mpsc::UnboundedSender<crate::bookmarks::Completion>,
+    bookmark_rx: mpsc::UnboundedReceiver<crate::bookmarks::Completion>,
+
     pub mode: Mode,
     /// Terminal emulation of the remote byte stream, rendered by tui-term.
     pub vt: Vt,
@@ -1002,6 +1007,7 @@ impl App {
         let (enc_tx, enc_rx) = mpsc::channel(64);
         let (imgs_tx, imgs_rx) = mpsc::channel(64);
         let (download_tx, download_rx) = mpsc::channel(16);
+        let (bookmark_tx, bookmark_rx) = mpsc::unbounded_channel();
         Self {
             mode,
             // In memory only, like the entry histories.
@@ -1070,6 +1076,10 @@ impl App {
             last_file_actions: [None; 3],
             download_tx,
             download_rx,
+            bookmarks: None,
+            bookmark_filter: String::new(),
+            bookmark_tx,
+            bookmark_rx,
             downloads_in_flight: 0,
             image_cache: HashMap::new(),
             image_sizes: crate::layout2::ImageSizes::new(),
@@ -1326,6 +1336,7 @@ impl App {
                     None => self.img_rx = None,
                 },
                 Some(msg) = self.download_rx.recv() => self.on_download(msg),
+                Some(msg) = self.bookmark_rx.recv() => self.on_bookmark(msg),
                 Some(msg) = self.imgs_rx.recv() => self.on_img_load(msg),
                 Some(msg) = self.enc_rx.recv() => self.on_enc(msg),
                 evt = recv_opt(&mut self.page_rx) => match evt {
@@ -1758,10 +1769,8 @@ impl App {
         let local_row = row.saturating_sub(self.last_content_area.y) as usize;
         let line_idx = g.scroll + local_row;
         g.doc
-            .lines
-            .get(line_idx)
-            .filter(|l| l.link.is_some())
-            .map(|_| line_idx)
+            .line_link(line_idx)
+            .map(|_| g.doc.link_owner(line_idx))
     }
 
     async fn on_terminal_event(&mut self, event: TermEvent) {
@@ -1779,6 +1788,19 @@ impl App {
         };
         if key.kind == KeyEventKind::Release {
             return;
+        }
+
+        if !(self.conn.is_some() && self.browser.is_none() && self.viewer.is_none())
+            && matches!(key.code, KeyCode::Char('b' | 'B'))
+        {
+            if key.modifiers == KeyModifiers::CONTROL {
+                self.bookmark_command("bookmark");
+                return;
+            }
+            if key.modifiers == KeyModifiers::ALT {
+                self.bookmark_command("bookmarks");
+                return;
+            }
         }
 
         // Ctrl-] — GNU telnet's escape character — toggles command mode.
@@ -2496,6 +2518,7 @@ impl App {
         match parts.next() {
             None => {}
             Some("quit" | "q" | "exit") => self.quit = true,
+            Some("bookmark" | "bookmarks") => self.bookmark_command(line),
             Some("back") => self.browser_back(),
             Some("forward") => self.browser_forward(),
             Some("reload") => self.reload(),
@@ -2570,10 +2593,22 @@ impl App {
             Some("set") => match (parts.next(), parts.next()) {
                 (Some("encoding"), Some("cp437")) => {
                     self.encoding = Encoding::Cp437;
+                    if let Some(g) = &mut self.browser
+                        && let Some(v) = &mut g.doc.gopher
+                    {
+                        v.encoding = gopher::Encoding::Cp437;
+                        g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+                    }
                     self.status = String::from("Encoding set to CP437 (BBS art mode).");
                 }
                 (Some("encoding"), Some("utf8" | "utf-8")) => {
                     self.encoding = Encoding::Utf8;
+                    if let Some(g) = &mut self.browser
+                        && let Some(v) = &mut g.doc.gopher
+                    {
+                        v.encoding = gopher::Encoding::Utf8;
+                        g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+                    }
                     self.status = String::from("Encoding set to UTF-8.");
                 }
                 (Some("image"), Some(proto)) => self.set_image_protocol(proto),
@@ -2764,8 +2799,102 @@ impl App {
         self.image_encoding.clear();
     }
 
-    /// The `status` report body, one plain-text fact per line — shared by
-    /// the vt session feed print and the `about:status` page.
+    fn bookmark_context(&self) -> crate::bookmarks::Context {
+        let current = if let Some(viewer) = &self.viewer {
+            Some((viewer.url.clone(), viewer.url.to_string()))
+        } else if let Some(g) = &self.browser {
+            Some((g.doc.url.clone(), crate::bookmarks::suggested_title(&g.doc)))
+        } else {
+            self.host.as_ref().map(|host| {
+                let link = Link::Telnet {
+                    host: host.clone(),
+                    port: self.port,
+                    tls: self.tls,
+                };
+                let title = link.to_string();
+                (link, title)
+            })
+        };
+        let selected = self.selected_link().map(|link| {
+            let link = if matches!(link, Link::JsClick { .. }) {
+                self.web_url_for_link(&link)
+                    .and_then(|url| gopher::absolute_link(&url))
+                    .unwrap_or(link)
+            } else {
+                link
+            };
+            let title = self
+                .browser
+                .as_ref()
+                .and_then(|g| g.selected.and_then(|i| g.doc.lines.get(i)))
+                .map(|l| l.text.clone())
+                .unwrap_or_else(|| link.to_string());
+            (link, title)
+        });
+        crate::bookmarks::Context { current, selected }
+    }
+
+    fn bookmark_command(&mut self, command: &str) {
+        let op = match crate::bookmarks::operation(command, &self.bookmark_context()) {
+            Ok(op) => op,
+            Err(error) => {
+                self.status = error;
+                self.notice = true;
+                return;
+            }
+        };
+        if let crate::bookmarks::Operation::List(filter) = &op {
+            self.bookmark_filter = filter.clone();
+        }
+        if self.bookmarks.is_none() {
+            let tx = self.bookmark_tx.clone();
+            self.bookmarks = Some(crate::bookmarks::Worker::start(
+                &tokio::runtime::Handle::current(),
+                move |result| {
+                    let _ = tx.send(result);
+                },
+            ));
+        }
+        self.status = match self.bookmarks.as_ref().unwrap().submit(op) {
+            Ok(()) => "Updating bookmarks…".into(),
+            Err(e) => e,
+        };
+        self.notice = true;
+    }
+
+    fn on_bookmark(&mut self, completion: crate::bookmarks::Completion) {
+        match completion.result {
+            Ok(outcome) => {
+                if let Some(source) = outcome.listing {
+                    self.retire_fetch("Incomplete reply: bookmarks opened");
+                    let doc = Self::about_doc(
+                        "about:bookmarks".into(),
+                        source,
+                        (self.last_inner.0 as usize).max(10),
+                    );
+                    self.replace_nav = self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|g| g.doc.url == Link::External("about:bookmarks".into()));
+                    self.navigate_to(doc);
+                    self.mode = Mode::Session;
+                } else if self
+                    .browser
+                    .as_ref()
+                    .is_some_and(|g| g.doc.url == Link::External("about:bookmarks".into()))
+                    && let Some(worker) = &self.bookmarks
+                {
+                    let _ = worker.submit(crate::bookmarks::Operation::List(
+                        self.bookmark_filter.clone(),
+                    ));
+                }
+                self.status = outcome.message;
+            }
+            Err(error) => self.status = error,
+        }
+        self.notice = true;
+    }
+
     fn status_report(&self) -> String {
         let connection = match (&self.host, self.connected) {
             (Some(host), true) if self.tls => {
@@ -2792,7 +2921,7 @@ impl App {
              JavaScript: {js}\n\
              Cookies: {cookies}\n\
              Remote options (WILL): {remote}\n\
-             Local options (DO): {local}",
+             Local options (DO): {local}\n{paths}",
             eol = if self.crlf { "CR LF" } else { "CR NUL" },
             enc = match self.encoding {
                 Encoding::Utf8 => "UTF-8",
@@ -2804,6 +2933,9 @@ impl App {
             } else {
                 "off"
             },
+            paths = crate::storage::Paths::discover()
+                .map(|p| p.report())
+                .unwrap_or_else(|e| e),
             remote = option_names(&self.remote_opts),
             local = option_names(&self.local_opts),
         )
@@ -2838,8 +2970,11 @@ impl App {
     /// and `sync_browser_wrap` re-wraps from the raw gemtext on resize.
     fn about_doc(url: String, body: String, width: usize) -> Doc {
         let width = width.max(10);
-        let lines =
-            gemini::parse_gemtext(body.as_bytes(), width, &|t| Link::External(t.to_string()));
+        // RFC 3986 §4: absolute destinations keep their scheme even on an
+        // internal page. Bookmarks must resolve like other Gemtext links.
+        let lines = gemini::parse_gemtext(body.as_bytes(), width, &|target| {
+            gemini::absolute_link(target).unwrap_or_else(|| Link::External(target.to_string()))
+        });
         Doc::from_lines(
             Link::External(url),
             lines,
@@ -2875,6 +3010,27 @@ impl App {
     /// HTTP GET). `port` is the explicitly-supplied port, if any; a `host:port`
     /// in the target wins over it.
     fn dispatch_open(&mut self, target: &str, port: Option<u16>) {
+        if let Some((host, target_port, tls)) = crate::command::telnet_target(target) {
+            self.open(host, port.unwrap_or(target_port), tls);
+            return;
+        }
+        if target
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("gopher"))
+        {
+            match GopherUrl::parse(target) {
+                Some(url) => self.start_fetch(Link::Gopher(url)),
+                None => {
+                    self.status = "Invalid Gopher address".into();
+                    self.notice = true;
+                }
+            }
+            return;
+        }
+        if target.eq_ignore_ascii_case("about:bookmarks") {
+            self.bookmark_command("bookmarks");
+            return;
+        }
         if crate::rdap::is_action(target) {
             self.start_fetch(Link::External(target.to_string()));
             return;
@@ -2959,7 +3115,9 @@ impl App {
                     host: host.to_string(),
                     port: 70,
                     item_type: '1',
-                    selector: String::new(),
+                    query: None,
+                    gopher_plus: None,
+                    selector: Vec::new(),
                 })),
                 Some(1965) => self.start_fetch(Link::Gemini(GeminiUrl {
                     host: host.to_string(),
@@ -3067,6 +3225,57 @@ impl App {
         referrer: Option<url::Url>,
         navigation_type: http::NavigationType,
     ) {
+        // Deep history can evict the local page, but bookmarks still reload
+        // from disk through their worker rather than the network dispatcher.
+        if matches!(&target, Link::External(address) if address == "about:bookmarks") {
+            self.retire_fetch("Incomplete reply: bookmarks opened");
+            self.bookmark_command("bookmarks");
+            return;
+        }
+        if let Link::Gopher(url) = &target {
+            if url.needs_query() {
+                self.retire_fetch("Incomplete reply: search opened");
+                self.search_target = Some(target);
+                self.masked_input = false;
+                self.mode = Mode::Search;
+                self.input.clear();
+                self.cursor = 0;
+                self.select_anchor = None;
+                self.status = "Gopher search: enter a query".into();
+                self.notice = true;
+                return;
+            }
+            if url.item_type == '8' {
+                let hint = String::from_utf8_lossy(&url.selector).into_owned();
+                self.open(url.host.clone(), url.port, false);
+                if !hint.is_empty() {
+                    self.status = format!("Telnet login hint: {hint}");
+                    self.notice = true;
+                }
+                return;
+            }
+            if url.is_download() {
+                self.retire_fetch("Incomplete reply: download opened");
+                match crate::download::DownloadOffer::from_gopher(url.clone()) {
+                    Ok(offer) => {
+                        self.file_dialog = Some(FileDialog { offer, selected: 0 });
+                        self.mode = Mode::Session;
+                        self.status = "Gopher file · Save / Open / Cancel".into();
+                    }
+                    Err(error) => self.status = error,
+                }
+                self.notice = true;
+                return;
+            }
+            if !(url.is_text() || url.is_image()) {
+                self.status = format!(
+                    "Gopher item type '{}' needs a client TRust does not yet provide",
+                    url.item_type
+                );
+                self.notice = true;
+                return;
+            }
+        }
         let target = if self.replace_nav
             && let Some(g) = &self.browser
             && let Some(rdap) = &g.doc.rdap
@@ -3113,6 +3322,30 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
+            if let Link::Gopher(url) = &target
+                && url.item_type != 'h'
+            {
+                let result = gopher::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    let target = target.clone();
+                    async move {
+                        tx.send(FetchMsg {
+                            target,
+                            result: Ok(Payload::Gopher(reply)),
+                        })
+                        .await
+                        .is_ok()
+                    }
+                })
+                .await;
+                let _ = tx
+                    .send(FetchMsg {
+                        target,
+                        result: result.map(Payload::Gopher),
+                    })
+                    .await;
+                return;
+            }
             if let Link::Dict(url) = &target {
                 let result = crate::dict::fetch_updates(url, |reply| {
                     let tx = tx.clone();
@@ -3187,7 +3420,7 @@ impl App {
                 Ok(Payload::About(body))
             } else {
                 match crate::core::fetch_protocol(&target, fallback_http, referrer.as_ref()).await {
-                    Ok(crate::core::FetchedDocument::Gopher(raw)) => Ok(Payload::Gopher(raw)),
+                    Ok(crate::core::FetchedDocument::Gopher(raw)) => Ok(Payload::Gopher(raw.reply)),
                     Ok(crate::core::FetchedDocument::Gemini(response)) => {
                         Ok(Payload::Gemini(response))
                     }
@@ -3873,7 +4106,10 @@ impl App {
         if let Some(g) = &mut self.browser
             && g.doc.text_view().is_some_and(|view| view.loading)
         {
-            if let Some(page) = &mut g.doc.dict {
+            if let Some(view) = &mut g.doc.gopher {
+                view.controls.loading = false;
+                view.controls.notice = Some(reason.into());
+            } else if let Some(page) = &mut g.doc.dict {
                 page.stop(reason);
             } else if let Some(page) = &mut g.doc.whois {
                 page.stop(reason);
@@ -3889,7 +4125,16 @@ impl App {
         let Some(g) = &mut self.browser else {
             return;
         };
-        let result = if let Some(page) = &mut g.doc.dict {
+        let source = g
+            .doc
+            .gopher
+            .as_ref()
+            .and_then(|v| v.sources.get(g.scroll))
+            .copied();
+        let selected = g.selected.and_then(|i| g.doc.line_link(i)).cloned();
+        let result = if let Some(view) = &mut g.doc.gopher {
+            crate::text_reply::view_action(&mut view.controls, action, enabled, false)
+        } else if let Some(page) = &mut g.doc.dict {
             page.view_action(action, enabled)
         } else if let Some(page) = &mut g.doc.whois {
             page.view_action(action, enabled)
@@ -3907,16 +4152,42 @@ impl App {
             Ok(status) => {
                 self.status = status.to_string();
                 g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+                if let Some(source) = source
+                    && let Some(view) = &g.doc.gopher
+                {
+                    g.scroll = view.sources.iter().position(|&n| n >= source).unwrap_or(0);
+                }
                 g.scroll = g
                     .scroll
                     .min(g.doc.extent().saturating_sub(self.last_inner.1 as usize));
                 g.selected = Self::browser_visible_links(g, self.last_inner.1 as usize)
                     .first()
                     .copied();
+                if let Some(selected) = selected {
+                    g.selected = g
+                        .doc
+                        .lines
+                        .iter()
+                        .position(|l| l.link.as_ref() == Some(&selected))
+                        .or(g.selected);
+                }
             }
             Err(status) => self.status = status.to_string(),
         }
         self.notice = true;
+    }
+
+    fn gopher_encoding(&mut self) {
+        let Some(g) = &mut self.browser else {
+            return;
+        };
+        let Some(view) = &mut g.doc.gopher else {
+            return;
+        };
+        view.encoding = view.encoding.next();
+        self.status = format!("Gopher encoding: {}", view.encoding.label());
+        self.notice = true;
+        g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
     }
 
     fn whois_encoding(&mut self, encoding: Option<crate::whois::Encoding>) {
@@ -3957,6 +4228,20 @@ impl App {
         let Some(g) = &self.browser else {
             return;
         };
+        if g.doc.gopher.is_some() && server.is_none() {
+            self.file_dialog = Some(FileDialog {
+                offer: crate::download::DownloadOffer::from_bytes(
+                    url::Url::parse(&g.doc.url.to_string()).unwrap(),
+                    "gopher-source.txt".into(),
+                    g.doc.raw.clone(),
+                ),
+                selected: 0,
+            });
+            self.mode = Mode::Session;
+            self.status = "Save received Gopher source".into();
+            self.notice = true;
+            return;
+        }
         if let Some(page) = &g.doc.dict {
             if server.is_some() {
                 self.status = "DICT has one reply; use save without a server number.".into();
@@ -3999,6 +4284,38 @@ impl App {
             Err(error) => self.status = error,
         }
         self.notice = true;
+    }
+
+    fn on_gopher_reply(&mut self, url: GopherUrl, reply: crate::text_reply::Reply) {
+        if url.is_image() {
+            if reply.finished {
+                self.fetch_rx = None;
+                self.fetch_task = None;
+                if let Some(error) = reply.notice {
+                    self.status = error;
+                    self.notice = true;
+                } else {
+                    self.open_image(Link::Gopher(url), reply.body);
+                }
+            }
+            return;
+        }
+        let finished = reply.finished;
+        self.status = gopher::status(&url, &reply);
+        self.notice = reply.notice.is_some();
+        let mut page = gopher::Page::new(reply);
+        if self.encoding == Encoding::Cp437 {
+            page.view.encoding = gopher::Encoding::Cp437;
+        }
+        if let Some(g) = &self.browser
+            && g.doc.url == Link::Gopher(url.clone())
+            && (self.query_fetch_started || self.replace_nav)
+            && let Some(view) = &g.doc.gopher
+        {
+            page.view = view.clone();
+        }
+        let doc = gopher::render(&url, page, (self.last_inner.0 as usize).max(10));
+        self.on_streamed_document(doc, finished);
     }
 
     fn on_dict_reply(&mut self, target: crate::dict::Target, reply: crate::dict::Reply) {
@@ -4112,9 +4429,10 @@ impl App {
     fn on_fetch(&mut self, msg: FetchMsg) {
         if matches!(
             msg.result,
-            Ok(Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_))
+            Ok(Payload::Gopher(_) | Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_))
         ) {
             match (msg.result, msg.target) {
+                (Ok(Payload::Gopher(reply)), Link::Gopher(url)) => self.on_gopher_reply(url, reply),
                 (Ok(Payload::Finger(reply)), Link::OneShot(url)) => {
                     self.on_finger_reply(url, reply)
                 }
@@ -4136,19 +4454,10 @@ impl App {
         }
         let width = (self.last_inner.0 as usize).max(10);
         match (msg.result, msg.target) {
-            (Ok(Payload::Gopher(raw)), Link::Gopher(url)) => {
-                // Image item types go to the viewer, not the document
-                // parser ('I' any image, 'g' GIF, 'p' PNG).
-                if matches!(url.item_type, 'I' | 'g' | 'p') {
-                    self.open_image(Link::Gopher(url), raw);
-                    return;
-                }
-                let cp437 = self.encoding == Encoding::Cp437;
-                let doc = gopher::parse(&url, raw, cp437, width);
-                self.status = format!("{url} — {} lines", doc.lines.len());
-                self.navigate_to(doc);
-            }
-            (Ok(Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_)), _) => {
+            (
+                Ok(Payload::Gopher(_) | Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_)),
+                _,
+            ) => {
                 unreachable!("Streaming replies handled above")
             }
             (Ok(Payload::OneShot(raw)), Link::OneShot(url)) => {
@@ -4435,6 +4744,9 @@ impl App {
         };
         // A direct POST result's trail entry is exempt from doc eviction
         // (refetching would re-POST); navigate_to consumes this.
+        if let Some(url) = GopherUrl::parse(response.url.as_str()) {
+            doc.url = Link::Gopher(url);
+        }
         self.nav_from_post = response.from_post;
         self.navigate_to(doc);
         // navigate_to dropped the previous living page; install this one.
@@ -6302,6 +6614,15 @@ impl App {
         {
             match key.code {
                 KeyCode::Char('e' | 'E')
+                    if self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|g| g.doc.gopher.is_some()) =>
+                {
+                    self.gopher_encoding();
+                    return;
+                }
+                KeyCode::Char('e' | 'E')
                     if self.browser.as_ref().is_some_and(|g| g.doc.whois.is_some()) =>
                 {
                     self.whois_encoding(None);
@@ -6309,7 +6630,9 @@ impl App {
                 }
                 KeyCode::Char('s' | 'S')
                     if self.browser.as_ref().is_some_and(|g| {
-                        g.doc.registration_section().is_some() || g.doc.dict.is_some()
+                        g.doc.registration_section().is_some()
+                            || g.doc.dict.is_some()
+                            || g.doc.gopher.is_some()
                     }) =>
                 {
                     self.save_whois(None);
@@ -7196,7 +7519,13 @@ impl App {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
         let g = self.browser.as_ref()?;
-        let cp437 = cp437 && matches!(g.doc.url, Link::Gopher(_));
+        let cp437 = g
+            .doc
+            .gopher
+            .as_ref()
+            .map_or(cp437 && matches!(g.doc.url, Link::Gopher(_)), |v| {
+                v.encoding == gopher::Encoding::Cp437
+            });
         if (g.doc.raw.is_empty() && g.doc.dict.is_none())
             || (g.doc.wrapped_to == width && g.doc.cp437 == cp437)
         {
@@ -7223,7 +7552,13 @@ impl App {
         let height = self.last_inner.1.max(1) as usize;
         let font = self.picker.font_size();
         let Some(g) = &mut self.browser else { return };
-        let cp437 = cp437 && matches!(g.doc.url, Link::Gopher(_));
+        let cp437 = g
+            .doc
+            .gopher
+            .as_ref()
+            .map_or(cp437 && matches!(g.doc.url, Link::Gopher(_)), |v| {
+                v.encoding == gopher::Encoding::Cp437
+            });
         if (g.doc.raw.is_empty() && g.doc.dict.is_none())
             || (g.doc.wrapped_to == width && g.doc.cp437 == cp437)
         {
@@ -7245,6 +7580,13 @@ impl App {
         });
         let mut old_offsets = Vec::new();
         Self::collect_region_offsets(&g.doc.regions, &mut old_offsets);
+        let source_row = g
+            .doc
+            .gopher
+            .as_ref()
+            .and_then(|v| v.sources.get(g.scroll))
+            .copied();
+        let gopher_view = g.doc.gopher.take();
         let finger_view = g.doc.finger.take();
         let whois_page = g.doc.whois.take();
         let rdap_page = g.doc.rdap.take();
@@ -7253,7 +7595,28 @@ impl App {
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
             Link::Dict(_) => crate::dict::render(dict_page.expect("DICT page"), width),
-            Link::Gopher(url) => gopher::parse(&url, raw, cp437, width),
+            Link::Gopher(url) if url.item_type == 'h' => {
+                let mut doc = http::parse_terminal(
+                    &url::Url::parse(&url.to_string()).unwrap(),
+                    "text/html",
+                    &raw,
+                    width,
+                    height,
+                    (font.width, font.height),
+                    &self.image_sizes,
+                );
+                doc.url = Link::Gopher(url);
+                doc
+            }
+            Link::Gopher(url) => {
+                let view = gopher_view.unwrap_or_default();
+                let reply = crate::text_reply::Reply {
+                    body: raw,
+                    finished: !view.controls.loading,
+                    notice: view.controls.notice.clone(),
+                };
+                gopher::render(&url, gopher::Page { reply, view }, width)
+            }
             Link::Gemini(url) => {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 gemini::parse(&url, &meta, &raw, width)
@@ -7302,6 +7665,11 @@ impl App {
             Link::Media(_) => return,
         };
         // Same page, same blob mirror (a re-wrap must not orphan blob: images).
+        if let Some(source) = source_row
+            && let Some(view) = &g.doc.gopher
+        {
+            g.scroll = view.sources.iter().position(|&n| n >= source).unwrap_or(0);
+        }
         g.doc.blobs = blobs;
         if g.doc.laid_out() {
             // Re-flow at the new width re-laid the rows; re-anchor the
@@ -7504,18 +7872,7 @@ impl App {
             return;
         }
         match link {
-            Link::Gopher(url) => match url.item_type {
-                '0' | '1' | 'I' | 'g' | 'p' => self.start_fetch(Link::Gopher(url)),
-                '7' => {
-                    self.search_target = Some(Link::Gopher(url));
-                    self.masked_input = false;
-                    self.mode = Mode::Search;
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.select_anchor = None;
-                }
-                other => self.status = format!("item type '{other}' not supported yet"),
-            },
+            Link::Gopher(url) => self.start_fetch(Link::Gopher(url)),
             Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
             Link::Http(url) => {
                 // A same-document `#fragment` link scrolls to the anchor instead
@@ -7547,8 +7904,12 @@ impl App {
             Link::External(target) if crate::rdap::is_action(&target) => {
                 self.start_fetch(Link::External(target))
             }
+            Link::External(target) if target == "about:bookmarks" => {
+                self.bookmark_command("bookmarks")
+            }
             Link::External(target) => {
                 self.status = format!("external link: {target}");
+                self.notice = true;
             }
         }
     }
@@ -8022,6 +8383,18 @@ impl App {
     }
 
     fn browser_back(&mut self) {
+        if self.conn.is_some()
+            && self.browser.as_ref().is_some_and(|g| {
+                g.history.is_empty() && g.doc.url == Link::External("about:bookmarks".into())
+            })
+        {
+            self.retire_fetch("Incomplete reply: returned to Telnet");
+            self.browser = None;
+            self.mode = Mode::Session;
+            self.status = "Returned to Telnet".into();
+            return;
+        }
+
         self.browser_travel(false);
     }
 
@@ -8129,16 +8502,43 @@ impl App {
         }
     }
 
-    /// Depth-1 doc retention: drop the parsed doc of every trail entry
-    /// that is not the top of its stack (not one step from the shown
-    /// page), except POST results (see `HistEntry`). Idempotent; runs
-    /// after every trail mutation.
+    /// Keep adjacent documents and POST results, plus a bounded 8 MiB/32-page
+    /// Gopher reading trail. Small-net Back should not normally need a server.
     fn enforce_retention(g: &mut BrowserView) {
+        let mut bytes = 0usize;
+        let mut count = 0;
         for stack in [&mut g.history, &mut g.forward] {
             let top = stack.len().saturating_sub(1);
-            for e in stack.iter_mut().take(top) {
-                if !e.post {
-                    e.doc = None;
+            for (i, entry) in stack.iter_mut().enumerate().rev() {
+                let gopher_size = entry.doc.as_ref().filter(|d| d.gopher.is_some()).map(|d| {
+                    d.raw.capacity()
+                        + d.lines.capacity() * std::mem::size_of::<crate::doc::DocLine>()
+                        + d.lines
+                            .iter()
+                            .map(|line| {
+                                line.text.capacity()
+                                    + line
+                                        .link
+                                        .as_ref()
+                                        .map_or(0, |link| link.retained_memory().0)
+                            })
+                            .sum::<usize>()
+                        + d.gopher.as_ref().map_or(0, |v| {
+                            (v.sources.capacity() + v.owners.capacity())
+                                * std::mem::size_of::<usize>()
+                        })
+                });
+                let retain = gopher_size.is_some_and(|size| {
+                    if count >= 32 || size > (8 * 1024 * 1024usize).saturating_sub(bytes) {
+                        false
+                    } else {
+                        bytes += size;
+                        count += 1;
+                        true
+                    }
+                });
+                if i != top && !entry.post && !retain {
+                    entry.doc = None;
                 }
             }
         }
@@ -8197,13 +8597,13 @@ impl App {
             return;
         }
         match self.search_target.take() {
-            Some(Link::Gopher(base)) => {
-                let url = GopherUrl {
-                    selector: format!("{}\t{}", base.selector, query),
-                    ..base
-                };
-                self.start_fetch(Link::Gopher(url));
-            }
+            Some(Link::Gopher(base)) => match base.with_query(query) {
+                Ok(url) => self.start_fetch(Link::Gopher(url)),
+                Err(error) => {
+                    self.status = error;
+                    self.notice = true;
+                }
+            },
             Some(Link::Gemini(base)) => {
                 let path = base.path.split('?').next().unwrap_or("/").to_string();
                 let url = GeminiUrl {
@@ -8592,7 +8992,7 @@ fn natural_cell_box_dimensions(
 
 /// Translate a key event into the bytes a character-mode telnet client sends.
 fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
-    let bytes = match key.code {
+    let mut bytes = match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Ctrl-A..Ctrl-Z and friends map onto the C0 control range.
             let upper = c.to_ascii_uppercase();
@@ -8646,11 +9046,128 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
         },
         _ => return None,
     };
+    // xterm altSendsEscape convention: Alt-character input is ESC-prefixed.
+    // https://invisible-island.net/xterm/manpage/xterm.html (altSendsEscape)
+    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char(_)) {
+        bytes.insert(0, 0x1b);
+    }
     Some(bytes)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmark_page_resolves_every_protocol_when_opened_and_rewrapped() {
+        let addresses = [
+            "http://example.test/",
+            "https://example.test/",
+            "gopher://example.test/7/a/../search%FF%09rust%20lang",
+            "gemini://example.test/",
+            "finger://example.test/alice",
+            "whois://example.test/example.test",
+            "dict://example.test/d:hello",
+            "telnet://[::1]:23",
+            "telnets://example.test:992",
+        ];
+        let entries: Vec<_> = addresses
+            .iter()
+            .enumerate()
+            .map(|(i, address)| crate::bookmarks::Entry {
+                id: i as u64 + 1,
+                title: format!("Destination {i} with a title long enough to wrap"),
+                url: (*address).into(),
+            })
+            .collect();
+        let source = crate::bookmarks::listing(&entries, "");
+        for width in [100, 20] {
+            let doc = super::App::about_doc("about:bookmarks".into(), source.clone(), width);
+            let links: Vec<_> = doc
+                .lines
+                .iter()
+                .filter_map(|line| line.link.clone())
+                .collect();
+            let expected: Vec<_> = addresses
+                .iter()
+                .map(|address| crate::gopher::absolute_link(address).unwrap())
+                .collect();
+            assert_eq!(links, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bookmark_shortcuts_save_current_page_and_preserve_telnet_bytes() {
+        let mut app = super::App::new(None, 23);
+        let (worker, mut requests) = crate::bookmarks::Worker::test_channel();
+        app.bookmarks = Some(worker);
+        let url = crate::gopher::GopherUrl::parse("gopher://e/7/search%09rust%20lang").unwrap();
+        app.navigate_to(crate::gopher::parse(
+            &url,
+            b"iHi\t\te\t70\r\n.\r\n".to_vec(),
+            false,
+            80,
+        ));
+        app.mode = super::Mode::Session;
+        app.on_terminal_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('b'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ))
+        .await;
+        assert!(
+            matches!(requests.try_recv().unwrap(), crate::bookmarks::Operation::Add { url: saved, .. } if saved == url.to_string())
+        );
+        app.on_terminal_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('b'),
+                crossterm::event::KeyModifiers::ALT,
+            ),
+        ))
+        .await;
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            crate::bookmarks::Operation::List(_)
+        ));
+        app.browser = None;
+        app.connected = true;
+        app.mode_override = Some(super::InputMode::Character);
+        let (commands, mut remote) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle { commands });
+        for (modifier, expected) in [
+            (crossterm::event::KeyModifiers::CONTROL, b"\x02".as_slice()),
+            (crossterm::event::KeyModifiers::ALT, b"\x1bb".as_slice()),
+        ] {
+            app.on_terminal_event(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('b'), modifier),
+            ))
+            .await;
+            assert!(
+                matches!(remote.try_recv().unwrap(), crate::telnet::Command::Send(bytes) if bytes == expected)
+            );
+            assert!(requests.try_recv().is_err());
+        }
+        app.host = Some("bbs.example".into());
+        app.port = 992;
+        app.tls = true;
+        app.execute_command("bookmark").await;
+        assert!(
+            matches!(requests.try_recv().unwrap(), crate::bookmarks::Operation::Add { url, .. } if url == "telnets://bbs.example:992")
+        );
+    }
+
+    #[tokio::test]
+    async fn gopher_typed_search_prompts_but_saved_query_fetches_and_binary_offers_download() {
+        let mut app = super::App::new(None, 23);
+        app.dispatch_open("gopher://e/7/search", None);
+        assert_eq!(app.mode, super::Mode::Search);
+        assert!(app.fetch_task.is_none());
+        app.dispatch_open("gopher://e/7/search%09rust%20lang", None);
+        assert!(app.fetch_task.is_some());
+        app.dispatch_open("gopher://e/9/archive.zip", None);
+        assert!(app.file_dialog.is_some());
+        assert!(app.fetch_task.is_none());
+    }
+
     use super::{HISTORY_CAP, History};
     use crate::doc::Link;
 
@@ -8663,6 +9180,7 @@ mod tests {
             body: b"%PDF-1.7".to_vec(),
             referrer: None,
             fetch_body: false,
+            gopher: None,
         }
     }
 
@@ -9434,7 +9952,9 @@ mod tests {
                         host: String::from("test.host"),
                         port: 70,
                         item_type: '1',
-                        selector: format!("/{i}"),
+                        query: None,
+                        gopher_plus: None,
+                        selector: format!("/{i}").into_bytes(),
                     })
                 }),
             })
@@ -14162,7 +14682,9 @@ mod tests {
             host: String::from("test.host"),
             port: 70,
             item_type: 'p',
-            selector: String::from("/cat.png"),
+            query: None,
+            gopher_plus: None,
+            selector: b"/cat.png".to_vec(),
         }));
         app.navigate_to(doc);
         app.browser_follow();

@@ -24,6 +24,7 @@ pub fn release_allocator_memory() {
 }
 
 pub mod accessibility;
+pub mod bookmarks;
 mod canvas;
 mod canvas_shadow;
 mod canvas_text;
@@ -35,6 +36,7 @@ pub mod finger;
 mod referrer_policy;
 pub mod render;
 pub mod responsive_image;
+pub mod storage;
 
 // These are the existing engine modules. They are declared exactly once here;
 // binaries import this library rather than compiling private copies with `mod`.

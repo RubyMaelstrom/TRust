@@ -67,6 +67,33 @@ impl History {
     }
 }
 
+/// RFC 4248 §2 / RFC 3986 §3.2.2: a Telnet destination has an
+/// authority and optional final slash. Login hints never become remote input.
+pub fn telnet_target(input: &str) -> Option<(String, u16, bool)> {
+    if input.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = url::Url::parse(input).ok()?;
+    let tls = match parsed.scheme() {
+        "telnet" => false,
+        "telnets" | "telnet+tls" => true,
+        _ => return None,
+    };
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() {
+        return None;
+    }
+    let host = match parsed.host()? {
+        url::Host::Ipv6(ip) => ip.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Domain(host) => url::Host::parse(host).ok()?.to_string(),
+    };
+    Some((
+        host,
+        parsed.port().unwrap_or(if tls { 992 } else { 23 }),
+        tls,
+    ))
+}
+
 /// Resolve a port argument: a number, or a compact set of well-known service
 /// names, matching TRust's established GNU-telnet-style command behavior.
 pub fn parse_port(value: &str) -> Option<u16> {
@@ -239,6 +266,10 @@ dict --match strategy <word>  matching words (e.g. prefix)
 dict --databases          browse dictionaries (--server selects server)
 dict --strategies         browse available search modes
 dict-filter <text>        filter the current dictionary/source list
+bookmark [add|link] [title]  save current destination or selected link
+bookmarks [filter]        view bookmarks for every protocol
+bookmark rename <id> <title>
+bookmark remove <id>      remove (bookmark undo restores it)
 status                    connection and options report
 help                      this page
 quit                      exit
@@ -264,6 +295,8 @@ Up/Down        move the selection (page scrolls along)
 Enter/Right    follow the selected link
 Left/Backspace back · Alt-Left/Alt-Right back/forward
 PgUp/PgDn      page · Home/End top/bottom
+Ctrl-B         bookmark current destination (except Telnet)
+Alt-B          view bookmarks (except Telnet)
 Ctrl-F         find in page (Enter next, Shift-Enter prev)
 v              play the selected link in mpv
 y              copy the selected link URL (OSC 52)
@@ -272,6 +305,23 @@ Esc            stop loading and page scripts
 
 Mouse: hover selects, click follows, wheel scrolls,
 back/forward side buttons travel history.
+
+## Gopher
+
+Menus/text arrive progressively. W toggles wrap; Shift-Left/Right pans.
+E cycles auto / UTF-8 / Latin-1 / CP437; selectors always keep their bytes.
+S saves received source. Esc stops while preserving the received prefix.
+Search endpoints prompt; saved query URLs repeat their search.
+Images and HTML render; binary/archive items offer Save / Open / Cancel.
+Recent pages stay in bounded RAM history; reload fetches a fresh copy.
+
+## Bookmarks
+
+Ctrl-B saves the current destination; Alt-B opens about:bookmarks.
+Use bookmark and bookmarks during Telnet: Ctrl-B and Alt-B keep their
+remote meanings. Back from the bookmark list returns to the live session.
+Bookmarks use XDG_DATA_HOME/trust/bookmarks.json (~/.local/share/trust by
+default); status shows the path. Every protocol uses the same store.
 
 ## Finger replies
 
