@@ -15493,7 +15493,7 @@ mod gopher_column_tests {
         app.mode = Mode::Session;
         app.last_inner = (120, 11);
         let url = gopher::GopherUrl::parse("gopher://example.test").unwrap();
-        let label = "x".repeat(72);
+        let label = "x".repeat(34);
         let raw = format!("0{label}\t/a\texample.test\t70\r\n1Next\t/b\texample.test\t70\r\n.\r\n");
         app.on_gopher_reply(
             url,
@@ -15512,18 +15512,18 @@ mod gopher_column_tests {
         );
         assert_eq!(
             app.last_content_area,
-            ratatui::layout::Rect::new(21, 1, 80, 11)
+            ratatui::layout::Rect::new(44, 1, 34, 11)
         );
-        assert_eq!(buffer[(20, 1)].symbol(), " ");
-        assert_eq!(buffer[(21, 1)].symbol(), "x");
-        assert_eq!(buffer[(92, 1)].symbol(), "x");
-        assert_eq!(app.gopher_hit_test(20, 1), None);
-        assert_eq!(app.gopher_hit_test(21, 1), Some(0));
-        assert_eq!(app.gopher_hit_test(101, 1), None);
+        assert_eq!(buffer[(43, 1)].symbol(), " ");
+        assert_eq!(buffer[(44, 1)].symbol(), "x");
+        assert_eq!(buffer[(77, 1)].symbol(), "x");
+        assert_eq!(app.gopher_hit_test(43, 1), None);
+        assert_eq!(app.gopher_hit_test(44, 1), Some(0));
+        assert_eq!(app.gopher_hit_test(78, 1), None);
 
-        draw_at_width(&mut app, 66);
+        draw_at_width(&mut app, 26);
         assert_eq!(app.last_content_area.x, 1);
-        assert_eq!(app.last_content_area.width, 64);
+        assert_eq!(app.last_content_area.width, 24);
         assert_eq!(
             app.gopher_hit_test(2, 2),
             Some(0),
@@ -15537,10 +15537,10 @@ mod gopher_column_tests {
         draw_at_width(&mut app, 143);
         assert_eq!(app.last_inner.0, 141);
         assert_eq!(
-            app.last_content_area.x, 31,
+            app.last_content_area.x, 54,
             "odd spare width rounds only at paint"
         );
-        assert_eq!(app.last_content_area.width, 80);
+        assert_eq!(app.last_content_area.width, 34);
         assert_eq!(app.browser.as_ref().unwrap().doc.lines[0].text, label);
         assert_eq!(app.browser.as_ref().unwrap().doc.raw, raw.as_bytes());
         assert_eq!(app.browser.as_ref().unwrap().selected, Some(0));

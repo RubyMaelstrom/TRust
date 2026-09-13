@@ -299,18 +299,17 @@ pub fn paint_doc_selected(
         widest_line = widest_line.max(line_width);
     }
     if gopher {
-        // CSS Values 4 #ch: measure the actual monospace zero-glyph advance.
+        // CSS Sizing 3 #auto-box-sizes: fit the column to its content within
+        // the available width, without a minimum that leaves short phlogs
+        // off-center. This is a presentation choice for Gopher, not a wire rule.
         // CSS 2 §10.3.3 #blockwidth: distribute spare width equally outside
         // the reading column, keeping the existing 22px minimum side padding.
-        let preferred = text::shape("0", &line_style(Kind::Text).0).advance
-            * crate::gopher::PREFERRED_COLUMNS as f32;
-        // The column expands to fit authored lines up to the available width.
         // Wrapping at that available width first gives the same line breaks,
         // without shaping the document twice just to measure its longest line.
         let column = if soft_wrapped {
             width
         } else {
-            preferred.max(widest_line).min(width)
+            widest_line.min(width)
         };
         let offset = (width - column) / 2.0;
         if offset > 0.0 {
@@ -654,13 +653,12 @@ mod tests {
     #[test]
     fn gopher_centered_column_moves_text_selection_and_hits_together() {
         let url = crate::gopher::GopherUrl::parse("gopher://example.test").unwrap();
-        let raw = format!(
-            "0{}\t/a\texample.test\t70\r\n1  Next\t/b\texample.test\t70\r\n.\r\n",
-            "0".repeat(72)
-        );
+        let label = "0".repeat(34);
+        let raw =
+            format!("0{label}\t/a\texample.test\t70\r\n1  Next\t/b\texample.test\t70\r\n.\r\n");
         let doc = crate::gopher::parse(&url, raw.into_bytes(), false, usize::MAX / 4);
-        let ch = text::shape("0", &line_style(Kind::Text).0).advance;
-        let viewport = 80.0 * ch + 44.0 + 200.0;
+        let viewport = 1200.0;
+        let left = (viewport - text::shape(&label, &line_style(Kind::Text).0).advance) / 2.0;
         let mut layout = paint_doc_selected(&doc, viewport, Some(0));
         assert_eq!(layout.paint.lines.len(), 2);
         assert_eq!(
@@ -668,7 +666,7 @@ mod tests {
             "centering must not add scrolling"
         );
         for line in &layout.lines {
-            assert!((line.rect.x - 122.0).abs() < 0.01);
+            assert!((line.rect.x - left).abs() < 0.01);
         }
         for primitive in &layout.paint.primitives {
             let x = match primitive {
@@ -677,22 +675,64 @@ mod tests {
                 DisplayCommand::HitRegion(hit) => hit.rect.x,
                 _ => continue,
             };
-            assert!((x - 122.0).abs() < 0.01);
+            assert!((x - left).abs() < 0.01);
         }
         let geometry = layout.lines.clone();
         select(&mut layout, &doc, Some(1));
         assert_eq!(layout.lines, geometry);
         assert!(layout.paint.primitives.iter().any(|p| matches!(p,
             DisplayCommand::FillRect { rect, .. }
-                if (rect.x - 122.0).abs() < 0.01 && rect.y == layout.lines[1].rect.y
+                if (rect.x - left).abs() < 0.01 && rect.y == layout.lines[1].rect.y
         )));
         assert!(
             layout
                 .paint
                 .lines
                 .iter()
-                .all(|l| (l.rect.x - 122.0).abs() < 0.01)
+                .all(|l| (l.rect.x - left).abs() < 0.01)
         );
+    }
+
+    #[test]
+    fn gopher_centered_column_fits_short_text_without_reflow() {
+        let url = crate::gopher::GopherUrl::parse("gopher://example.test/0/phlog").unwrap();
+        let raw = b"  Quiet morning.\r\nRain at the window.\r\n\r\n  Time to go.  \r\n.\r\n";
+        let mut doc = crate::gopher::parse(&url, raw.to_vec(), false, usize::MAX / 4);
+        let longest = text::shape("Rain at the window.", &line_style(Kind::Text).0).advance;
+        for wrap in [true, false] {
+            doc.gopher.as_mut().unwrap().controls.wrap = wrap;
+            for viewport in [700.0, 1200.0] {
+                let layout = paint_doc_selected(&doc, viewport, None);
+                let left = (viewport - longest) / 2.0;
+                assert_eq!(layout.paint.width, viewport);
+                assert_eq!(layout.paint.lines.len(), 4);
+                assert!(
+                    layout
+                        .paint
+                        .lines
+                        .iter()
+                        .all(|line| (line.rect.x - left).abs() < 0.01)
+                );
+                let text: Vec<_> = layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        DisplayCommand::GlyphRun { shaped, .. } => Some(shaped.text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    text,
+                    [
+                        "  Quiet morning.",
+                        "Rain at the window.",
+                        "",
+                        "  Time to go.  "
+                    ]
+                );
+            }
+        }
     }
 
     #[test]
