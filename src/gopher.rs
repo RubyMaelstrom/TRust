@@ -2,6 +2,7 @@
 //! RFC Editor snapshot 2026-09-06: RFC 1436 §§2, 3.8 and appendix;
 //! RFC 4266 §2; RFC 3986 §§2.1, 2.4, 3.1, 3.2.2 and 3.5.
 
+pub(crate) mod ansi;
 mod plus;
 pub use plus::information_target;
 pub(crate) use plus::open;
@@ -302,6 +303,9 @@ pub struct View {
     /// Widest sanitized display line before wrapping, in terminal cells.
     /// Retain this during parsing so painting need not rescan the document.
     pub source_columns: usize,
+    /// Desktop-only, indexed by unwrapped DocLine. Terminal parsing leaves
+    /// this empty and continues to use its fixed semantic palette.
+    pub(crate) colors: Vec<Vec<ansi::Span>>,
 }
 
 /// Reading-column preference, not a protocol limit: RFC 1436 §3.9 discusses
@@ -331,6 +335,7 @@ impl Default for View {
             sources: Vec::new(),
             owners: Vec::new(),
             source_columns: 0,
+            colors: Vec::new(),
         }
     }
 }
@@ -779,7 +784,16 @@ pub fn parse(url: &GopherUrl, raw: Vec<u8>, cp437: bool, width: usize) -> Doc {
     render(url, page, width)
 }
 
-pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
+pub fn render(url: &GopherUrl, page: Page, width: usize) -> Doc {
+    render_impl(url, page, width, false)
+}
+
+pub(crate) fn render_desktop(url: &GopherUrl, page: Page) -> Doc {
+    // Desktop wraps whole paragraphs in CSS pixels after parsing.
+    render_impl(url, page, usize::MAX / 4, true)
+}
+
+fn render_impl(url: &GopherUrl, mut page: Page, width: usize, colors: bool) -> Doc {
     let width = width.max(10);
     let wrap = if page.view.controls.wrap {
         width
@@ -792,6 +806,8 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
     page.view.owners.clear();
     page.view.sources.clear();
     page.view.source_columns = 0;
+    page.view.colors.clear();
+    let mut ansi = colors.then(ansi::Parser::default);
     let mut lines = Vec::new();
     let mut truncated = false;
     let mut previous_type = None;
@@ -831,7 +847,13 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
                 break;
             }
             let start = lines.len();
-            let (display, clipped) = text_reply::display_text(line.text.as_bytes(), false);
+            let (display, clipped) = if let Some(ansi) = &mut ansi {
+                let (text, clipped, colors) = ansi.line(line.text.as_bytes());
+                page.view.colors.push(colors);
+                (text, clipped)
+            } else {
+                text_reply::display_text(line.text.as_bytes(), false)
+            };
             truncated |= clipped;
             page.view.measure_line(&display);
             push_wrapped(
@@ -882,7 +904,13 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
                 truncated = true;
             }
             let decoded = decode(&label[..label.len().min(MAX_LINE)], page.view.encoding);
-            let (display, clipped) = text_reply::display_text(decoded.as_bytes(), false);
+            let (display, clipped) = if let Some(ansi) = &mut ansi {
+                let (text, clipped, colors) = ansi.line(decoded.as_bytes());
+                page.view.colors.push(colors);
+                (text, clipped)
+            } else {
+                text_reply::display_text(decoded.as_bytes(), false)
+            };
             truncated |= clipped;
             page.view.measure_line(&display);
             let start = lines.len();
