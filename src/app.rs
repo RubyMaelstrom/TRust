@@ -4493,6 +4493,7 @@ impl App {
         if let Some(page) = self.live_page.take() {
             page.retire();
         }
+        http::prune_idle_connections();
         self.page_rx = None;
         self.last_scroll_sent = None;
         self.image_sizes_sent = None;
