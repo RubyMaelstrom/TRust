@@ -249,7 +249,7 @@ Anything else searches DuckDuckGo Lite.
 
 ```
 open <host> [port]        web by default; ports select a known service/telnet
-open <url>                gopher gemini http(s) finger telnet …
+open <url>                gopher(s) gemini http(s) finger telnet …
 back / forward            travel browser history
 close                     drop the connection
 reload                    refetch the page on screen
@@ -318,6 +318,9 @@ Gopher+ pages and alternate formats open here too. I or gopher-info shows
 the selected item's information; gopher-info page shows the current page's.
 Choose a format link to open it. ASK forms are displayed but cannot submit.
 Recent pages stay in bounded RAM history; reload fetches a fresh copy.
+Use gophers:// for TLS (default port 70); same-server links retain TLS.
+Gophers and Gemini accept server certificates, including replacements,
+without pinning or server-identity checks. Gemini client identities still work.
 
 ## Bookmarks
 

@@ -1,13 +1,11 @@
-//! TLS support built for the small net: rustls with trust-on-first-use.
+//! TLS transport with protocol-specific certificate policies.
 //!
-//! Geminispace and TLS-enabled BBSes overwhelmingly run self-signed
-//! certificates, which WebPKI validation would reject outright. Instead
-//! we follow the Gemini community convention: accept whatever certificate
-//! a host presents the first time, pin its SHA-256 fingerprint, and
-//! refuse the connection if the same host:port later presents a
-//! different one. Pins persist in `~/.config/trust/known_hosts`
-//! (overridable via `TRUST_KNOWN_HOSTS` — the tests point it at a temp
-//! file); remove a line there to re-trust a host whose cert changed.
+//! HTTPS uses WebPKI. Gemini and Gophers accept unpinned server certificates,
+//! including replacements, by the user's explicit policy: traffic is encrypted
+//! but the server's identity is not verified. TLS handshake signatures are
+//! still checked (RFC 8446 §4.4.3). Gemini client identities remain independent.
+//! Telnet TLS uses trust-on-first-use, storing host:port fingerprints in
+//! `~/.config/trust/known_hosts` (overridable via `TRUST_KNOWN_HOSTS`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -115,15 +113,16 @@ fn hex(fp: &[u8; 32]) -> String {
 }
 
 #[derive(Debug)]
-struct Tofu {
+struct ServerVerifier {
     /// `host:port` this connection dialed — the pin key. The verifier
     /// callback only sees the SNI name, which lacks the port, so the
     /// key is baked in per connection.
-    key: String,
+    /// None accepts the server certificate without consulting or writing pins.
+    pin: Option<String>,
     schemes: Vec<SignatureScheme>,
 }
 
-impl ServerCertVerifier for Tofu {
+impl ServerCertVerifier for ServerVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -132,11 +131,14 @@ impl ServerCertVerifier for Tofu {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
+        let Some(key) = &self.pin else {
+            return Ok(ServerCertVerified::assertion());
+        };
         let fp = fingerprint(end_entity);
         let mut store = store().lock().unwrap();
-        match store.pins.get(&self.key) {
+        match store.pins.get(key) {
             None => {
-                store.pins.insert(self.key.clone(), fp);
+                store.pins.insert(key.clone(), fp);
                 save(&store);
                 Ok(ServerCertVerified::assertion())
             }
@@ -150,7 +152,7 @@ impl ServerCertVerifier for Tofu {
                 Err(Error::General(format!(
                     "certificate for {} changed since first use \
                      (pinned sha256:{}.., got sha256:{}..){file}",
-                    self.key,
+                    key,
                     &hex(pinned)[..16],
                     &hex(&fp)[..16],
                 )))
@@ -158,8 +160,8 @@ impl ServerCertVerifier for Tofu {
         }
     }
 
-    // The signatures themselves are still verified; only the trust
-    // anchor check is replaced by the fingerprint pin above.
+    // RFC 8446 §4.4.3: verify proof of possession even when certificate
+    // identity checks are disabled. Never bypass TLS handshake integrity.
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -212,8 +214,7 @@ pub fn ensure_provider() -> Arc<CryptoProvider> {
 
 /// A TLS connector with standard WebPKI validation against the bundled
 /// Mozilla roots — for the public web, where certificates rotate
-/// constantly and TOFU pinning would only cry wolf. The small net
-/// (gemini, telnets) keeps the TOFU `connector` below.
+/// constantly. Telnet TLS keeps the TOFU `connector` below.
 pub fn webpki_connector() -> TlsConnector {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     let config = CONFIG.get_or_init(|| {
@@ -237,12 +238,34 @@ pub fn connector(host: &str, port: u16) -> TlsConnector {
         .supported_schemes();
     let config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Tofu {
-            key: format!("{host}:{port}"),
+        .with_custom_certificate_verifier(Arc::new(ServerVerifier {
+            pin: Some(format!("{host}:{port}")),
             schemes,
         }))
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+}
+
+/// Encrypted transport with no server-identity or certificate-pin checks.
+/// User-selected policy for Gophers and Gemini; never used for HTTPS/Telnet.
+/// Reuse the configuration and rustls's bounded session cache across requests.
+pub fn unverified_connector() -> TlsConnector {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let provider = ensure_provider();
+        Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(ServerVerifier {
+                    pin: None,
+                    schemes: provider
+                        .signature_verification_algorithms
+                        .supported_schemes(),
+                }))
+                .with_no_client_auth(),
+        )
+    });
+    TlsConnector::from(config.clone())
 }
 
 /// Where client identities live: one `<host>.pem` per capsule, holding
@@ -290,29 +313,22 @@ fn load_identity(host: &str) -> Result<Option<Identity>, String> {
     Ok(Some((certs, key)))
 }
 
-/// TLS for gemini: the TOFU verifier plus the host's client identity
+/// TLS for Gemini: unpinned server certificates plus the host's client identity
 /// when one is on file. The bool reports whether one was presented.
-pub fn gemini_connector(host: &str, port: u16) -> Result<(TlsConnector, bool), String> {
+pub fn gemini_connector(host: &str, _port: u16) -> Result<(TlsConnector, bool), String> {
+    let Some((certs, key)) = load_identity(host)? else {
+        return Ok((unverified_connector(), false));
+    };
     let provider = ensure_provider();
     let schemes = provider
         .signature_verification_algorithms
         .supported_schemes();
-    let builder = ClientConfig::builder()
+    let config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Tofu {
-            key: format!("{host}:{port}"),
-            schemes,
-        }));
-    let (config, identity) = match load_identity(host)? {
-        Some((certs, key)) => (
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| format!("client certificate: {e}"))?,
-            true,
-        ),
-        None => (builder.with_no_client_auth(), false),
-    };
-    Ok((TlsConnector::from(Arc::new(config)), identity))
+        .with_custom_certificate_verifier(Arc::new(ServerVerifier { pin: None, schemes }))
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| format!("client certificate: {e}"))?;
+    Ok((TlsConnector::from(Arc::new(config)), true))
 }
 
 /// Mint a self-signed client identity (CN = `name`) for a host and
@@ -364,19 +380,41 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Every call has a new key and an expired, self-signed certificate for a
+    /// different name. Shared by the Gemini/Gophers transport regressions.
+    pub(crate) fn unverified_acceptor(
+        versions: &[&'static tokio_rustls::rustls::SupportedProtocolVersion],
+    ) -> tokio_rustls::TlsAcceptor {
+        ensure_provider();
+        let mut params = rcgen::CertificateParams::new(vec!["unrelated.invalid".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let config = tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(versions)
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                key.serialize_der().try_into().unwrap(),
+            )
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
 
     #[test]
     fn connectors_advertise_ml_dsa_in_client_hello() {
         use tokio_rustls::rustls::{ClientConnection, server::Acceptor};
 
         // RFC 9846 §4.3.3: the ClientHello advertises the signatures the
-        // client can verify. Exercise both WebPKI and our custom TOFU
+        // client can verify. Exercise WebPKI and both custom policies so
         // verifier so rustls's ML-DSA defaults reach the actual wire.
         for (name, connector) in [
             ("WebPKI", webpki_connector()),
             ("TOFU", connector("localhost", 1965)),
+            ("Unverified", unverified_connector()),
         ] {
             let mut client = ClientConnection::new(
                 connector.config().clone(),
@@ -406,6 +444,101 @@ mod tests {
                     "{name} ClientHello did not advertise {scheme:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_tls_accepts_certificate_replacement_expiry_and_name_mismatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::version;
+
+        for (protocol, connector) in [
+            ("Gophers", unverified_connector()),
+            (
+                "Gemini",
+                gemini_connector("accept-certificate.invalid", 1965)
+                    .unwrap()
+                    .0,
+            ),
+        ] {
+            for version in [&version::TLS12, &version::TLS13] {
+                for _ in 0..2 {
+                    let acceptor = unverified_acceptor(&[version]);
+                    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                    let (client, server) =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                            tokio::join!(
+                                connector.connect(
+                                    server_name("accept-certificate.invalid").unwrap(),
+                                    client_io
+                                ),
+                                acceptor.accept(server_io),
+                            )
+                        })
+                        .await
+                        .unwrap();
+                    let mut client =
+                        client.unwrap_or_else(|e| panic!("{protocol} {version:?}: {e}"));
+                    let mut server = server.unwrap();
+                    let mut bytes = [0; 5];
+                    let (written, read) = tokio::join!(
+                        async {
+                            client.write_all(b"hello").await?;
+                            client.flush().await
+                        },
+                        server.read_exact(&mut bytes),
+                    );
+                    written.unwrap();
+                    read.unwrap();
+                    assert_eq!(&bytes, b"hello");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_tls_still_rejects_invalid_handshake_signatures() {
+        use tokio_rustls::rustls::{
+            ServerConfig,
+            server::{ClientHello, ResolvesServerCert},
+            sign::CertifiedKey,
+            version,
+        };
+
+        #[derive(Debug)]
+        struct WrongKey(Arc<CertifiedKey>);
+        impl ResolvesServerCert for WrongKey {
+            fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let provider = ensure_provider();
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let different_key = rcgen::KeyPair::generate().unwrap();
+        let key = provider
+            .key_provider
+            .load_private_key(different_key.serialize_der().try_into().unwrap())
+            .unwrap();
+        let certificate = Arc::new(CertifiedKey::new(vec![signed.cert.der().clone()], key));
+        for version in [&version::TLS12, &version::TLS13] {
+            let config = ServerConfig::builder_with_protocol_versions(&[version])
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(WrongKey(certificate.clone())));
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (client, _) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(
+                    unverified_connector().connect(server_name("localhost").unwrap(), client_io),
+                    acceptor.accept(server_io),
+                )
+            })
+            .await
+            .unwrap();
+            assert!(
+                client.is_err(),
+                "{version:?}: accepted a signature from the wrong private key"
+            );
         }
     }
 

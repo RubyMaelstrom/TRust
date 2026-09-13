@@ -1066,7 +1066,13 @@ fn render_carousel_scrollbars(
 /// Status-bar / strip badge for the active browser protocol.
 fn protocol_badge(g: &BrowserView) -> &'static str {
     match &g.doc.url {
-        Link::Gopher(_) => " GOPHER ",
+        Link::Gopher(url) => {
+            if url.tls {
+                " GOPHERS "
+            } else {
+                " GOPHER "
+            }
+        }
         Link::Gemini(_) => " GEMINI ",
         Link::Dict(_) => " DICT ",
         Link::Http(_) => " WWW ",

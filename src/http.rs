@@ -5780,7 +5780,7 @@ fn resolve_css_image_source(base: &Url, source: &str) -> Option<String> {
 pub(crate) fn resolve(base: &Url, target: &str) -> Link {
     if target
         .split_once(':')
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("gopher"))
+        .is_some_and(|(scheme, _)| crate::gopher::is_scheme(scheme))
     {
         return crate::gopher::GopherUrl::parse(target)
             .map(Link::Gopher)
@@ -5802,7 +5802,7 @@ pub(crate) fn resolve(base: &Url, target: &str) -> Link {
             "gemini" => crate::gemini::GeminiUrl::parse(joined.as_str())
                 .map(Link::Gemini)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
-            "gopher" => crate::gopher::GopherUrl::parse(joined.as_str())
+            "gopher" | "gophers" => crate::gopher::GopherUrl::parse(joined.as_str())
                 .map(Link::Gopher)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
             "dict" => crate::dict::Target::parse(joined.as_str())

@@ -1,6 +1,6 @@
 //! Gemini protocol: one TLS request/response, gemtext documents.
 //!
-//! A transaction is: TLS-connect (SNI required, TOFU certs — see
+//! A transaction is: TLS-connect (SNI, unpinned server certificates — see
 //! `tls.rs`), send `gemini://host/path\r\n`, read a `<status> <meta>`
 //! header line, then for 2x responses the body until close. Redirects
 //! (3x) are followed here in the fetch task, capped to avoid loops.
@@ -371,25 +371,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn fetches_over_tls_with_redirects_and_input() {
-        use std::sync::Arc;
+    async fn fetches_over_unverified_tls_with_rotating_certificates_redirects_and_input() {
         use tokio::io::AsyncWriteExt as _;
-        use tokio_rustls::TlsAcceptor;
-        use tokio_rustls::rustls::ServerConfig;
-        use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
-        unsafe {
-            std::env::set_var(
-                "TRUST_KNOWN_HOSTS",
-                std::env::temp_dir().join(format!("trust-test-kh-{}", std::process::id())),
-            );
-        }
-        tls::ensure_provider();
-
-        // One certificate for the whole test so the TOFU pin stays happy.
-        // Host is the dedicated loopback 127.0.0.2 (all of 127.0.0.0/8 is
-        // loopback): it keeps this test off both the telnet TLS test's
-        // "localhost" pin AND — crucially — off `status_60`'s host. Both
+        // Dedicated loopback 127.0.0.2 keeps this off `status_60`'s host. Both
         // share the process-global TRUST_IDENTITIES dir, and `status_60`
         // does `create_identity("127.0.0.1")`, which create_new's an EMPTY
         // <host>.pem before writing it. Were we also on 127.0.0.1, our
@@ -397,14 +382,6 @@ mod tests {
         // read that file mid-creation ("no CERTIFICATE block") and fail —
         // a real, load-dependent flake. On 127.0.0.2 we read 127.0.0.2.pem,
         // which nothing ever writes, so load_identity is always Ok(None).
-        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.2".into()]).unwrap();
-        let key = PrivateKeyDer::try_from(signed.signing_key.serialize_der()).unwrap();
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![signed.cert.der().clone()], key)
-            .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(config));
-
         let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -414,6 +391,9 @@ mod tests {
                 let Ok((sock, _)) = listener.accept().await else {
                     return;
                 };
+                // Renew even between redirect hops, using an expired,
+                // self-signed certificate whose name doesn't match the URL.
+                let acceptor = tls::tests::unverified_acceptor(tokio_rustls::rustls::ALL_VERSIONS);
                 let Ok(mut stream) = acceptor.accept(sock).await else {
                     continue;
                 };

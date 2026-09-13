@@ -2321,12 +2321,20 @@ impl DesktopApp {
             };
         }
         match self.browser.current_page().map(|page| &page.document) {
-            Some(FetchedDocument::Http(_)) if snapshot.address.starts_with("gopher:") => {
-                String::from("GOPHER")
+            Some(FetchedDocument::Http(response))
+                if trust::gopher::is_scheme(response.url.scheme()) =>
+            {
+                response.url.scheme().to_ascii_uppercase()
             }
             Some(FetchedDocument::Http(response)) => format!("HTTP:{}", response.status),
             Some(FetchedDocument::Gemini(response)) => format!("GEMINI:{}", response.status),
-            Some(FetchedDocument::Gopher(_)) => String::from("GOPHER"),
+            Some(FetchedDocument::Gopher(_)) => {
+                String::from(if snapshot.address.starts_with("gophers:") {
+                    "GOPHERS"
+                } else {
+                    "GOPHER"
+                })
+            }
             Some(FetchedDocument::OneShot(_)) => String::from("QUERY"),
             Some(FetchedDocument::Finger(_)) => String::from("FINGER"),
             Some(FetchedDocument::Whois(_)) => String::from("WHOIS"),
