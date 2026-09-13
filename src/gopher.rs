@@ -137,7 +137,12 @@ impl GopherUrl {
         matches!(self.item_type, 'I' | 'g' | 'p')
     }
     pub fn is_download(&self) -> bool {
-        matches!(self.item_type, '4' | '5' | '6' | '9' | 'd' | 's' | ';')
+        matches!(self.item_type, '4' | '6' | 'd' | 's' | ';')
+    }
+    /// RFC 1436 §3.8 leaves presentation of these binary files to the client.
+    /// Their type controls EOF framing, not whether they need a download.
+    pub fn is_binary_file(&self) -> bool {
+        matches!(self.item_type, '5' | '9')
     }
     pub fn is_text(&self) -> bool {
         matches!(self.item_type, '0' | '1' | '7' | 'h')
@@ -361,6 +366,109 @@ pub async fn fetch(url: &GopherUrl) -> Result<Page, String> {
     fetch_updates(url, |_| async { true }).await.map(Page::new)
 }
 
+pub enum FileResponse {
+    Document(Box<crate::http::Response>),
+    Download(Box<crate::download::DownloadOffer>),
+}
+
+fn file_mime(url: &GopherUrl, header: &[u8]) -> &'static str {
+    let detected = crate::download::identify_unknown(header, true);
+    // RFC 1436 §3.8 permits filename extensions for generic binary items.
+    // Use them to distinguish markup from plain text; binary signatures take
+    // precedence. No extension is needed to recognize PNG/JPEG/WebP/etc.
+    if matches!(detected, "text/plain" | "text/xml") {
+        let name = url.filename().to_ascii_lowercase();
+        match name.rsplit('.').next().unwrap_or("") {
+            "html" | "htm" => return "text/html",
+            "xhtml" | "xht" => return "application/xhtml+xml",
+            "svg" if crate::img::sniff(header) == Some("image/svg+xml") => return "image/svg+xml",
+            _ => {}
+        }
+    }
+    detected
+}
+
+fn file_is_renderable(mime: &str) -> bool {
+    if mime.starts_with("image/") {
+        mime == "image/svg+xml"
+            || image::ImageFormat::from_mime_type(mime).is_some_and(|f| f.reading_enabled())
+    } else {
+        crate::download::mime_is_renderable(mime, false)
+    }
+}
+
+pub(crate) fn file_is_text(mime: &str) -> bool {
+    !mime.starts_with("image/")
+        && !matches!(mime, "text/html" | "application/xhtml+xml")
+        && crate::download::mime_is_renderable(mime, false)
+}
+
+/// Inspect a bounded prefix before choosing a built-in viewer or a download.
+/// RFC 1436 §3.8/appendix: binary items end at EOF, including text carried as
+/// type 9. MIME Sniffing §5.2: inspect up to 1445 bytes or a reasonable delay
+/// (250ms after the first bytes). Unsupported files never enter the page-body
+/// budget; a supported file continues on the same connection up to that limit.
+pub async fn fetch_file(url: &GopherUrl) -> Result<FileResponse, String> {
+    const HEADER_BYTES: usize = 1445;
+    if !url.is_binary_file() {
+        return Err("Gopher file detection requires a generic binary item".into());
+    }
+    let mut stream = connect(url).await?;
+    let total = Instant::now() + TOTAL_TIMEOUT;
+    let mut deadline = Instant::now() + IDLE_TIMEOUT;
+    let mut body = Vec::with_capacity(HEADER_BYTES);
+    let mut buffer = [0; 8192];
+    let mut finished = false;
+    while body.len() < HEADER_BYTES {
+        let room = HEADER_BYTES - body.len();
+        match tokio::time::timeout_at(deadline, stream.read(&mut buffer[..room])).await {
+            Ok(Ok(0)) => {
+                finished = true;
+                break;
+            }
+            Ok(Ok(n)) => {
+                if body.is_empty() {
+                    deadline = Instant::now() + Duration::from_millis(250);
+                }
+                body.extend_from_slice(&buffer[..n]);
+            }
+            Err(_) if !body.is_empty() => break,
+            Err(_) => return Err("Gopher file timed out before any data arrived".into()),
+            Ok(Err(error)) => return Err(format!("Gopher file failed: {error}")),
+        }
+    }
+    let mime = file_mime(url, &body);
+    if file_is_renderable(mime) {
+        while !finished {
+            let room = (MAX_RESPONSE + 1 - body.len()).min(buffer.len());
+            let deadline = total.min(Instant::now() + IDLE_TIMEOUT);
+            let n = tokio::time::timeout_at(deadline, stream.read(&mut buffer[..room]))
+                .await
+                .map_err(|_| "Incomplete Gopher file: server timed out".to_string())?
+                .map_err(|error| format!("Incomplete Gopher file: {error}"))?;
+            if n == 0 {
+                finished = true;
+                break;
+            }
+            body.extend_from_slice(&buffer[..n]);
+            if body.len() > MAX_RESPONSE {
+                break;
+            }
+        }
+        if finished {
+            return response(url, body, mime).map(|r| FileResponse::Document(Box::new(r)));
+        }
+    }
+    let mut offer = crate::download::DownloadOffer::from_gopher(url.clone())?;
+    offer.content_type = mime.into();
+    if finished {
+        offer.content_length = Some(body.len() as u64);
+        offer.body = body;
+        offer.fetch_body = false;
+    }
+    Ok(FileResponse::Download(Box::new(offer)))
+}
+
 pub async fn fetch_updates<F, Fut>(
     url: &GopherUrl,
     mut publish: F,
@@ -575,15 +683,25 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
     let menu = matches!(url.item_type, '1' | '7');
     let gemtext = !menu && url.filename().to_ascii_lowercase().ends_with(".gmi");
     if gemtext {
-        let body = text_body(&page.reply.body);
-        // Bound input BEFORE handing it to the richer parser.
-        let bounded: Vec<u8> = split_lines(&body)
-            .take(MAX_ROWS)
-            .flat_map(|l| l[..l.len().min(MAX_LINE)].iter().copied().chain(*b"\n"))
-            .collect();
+        let body = if url.is_text() {
+            text_body(&page.reply.body)
+        } else {
+            page.reply.body.clone()
+        };
+        // Bound input BEFORE handing it to the richer parser. Normalizing
+        // CRLF to LF does not count as clipping received content.
+        let mut bounded = Vec::new();
+        for (row, line) in split_lines(&body).enumerate() {
+            if row >= MAX_ROWS {
+                truncated = true;
+                break;
+            }
+            truncated |= line.len() > MAX_LINE;
+            bounded.extend_from_slice(&line[..line.len().min(MAX_LINE)]);
+            bounded.push(b'\n');
+        }
         let logical =
             gemini::parse_gemtext(&bounded, usize::MAX / 4, &|target| resolve_gmi(url, target));
-        truncated = bounded.len() < body.len();
         for (source, line) in logical.into_iter().enumerate() {
             if lines.len() >= MAX_ROWS - 1 {
                 truncated = true;
@@ -617,7 +735,7 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
         }
     } else {
         for (source, line) in split_lines(&page.reply.body).enumerate() {
-            if line == b"." {
+            if url.is_text() && line == b"." {
                 break;
             }
             if lines.len() >= MAX_ROWS - 1 {
@@ -672,7 +790,7 @@ pub fn render(url: &GopherUrl, mut page: Page, width: usize) -> Doc {
                 }
             } else {
                 t = '0';
-                if line.starts_with(b"..") {
+                if url.is_text() && line.starts_with(b"..") {
                     label = &line[1..];
                 }
             }
@@ -759,16 +877,26 @@ pub fn representation(url: &GopherUrl, page: Page) -> Result<crate::http::Respon
     } else {
         "text/html"
     };
-    let response = crate::http::Response {
+    let body = if url.is_image() {
+        page.reply.body
+    } else {
+        text_body(&page.reply.body)
+    };
+    let response = response(url, body, mime)?;
+    Ok(if url.is_image() {
+        crate::http::image_navigation_response(response, mime)
+    } else {
+        response
+    })
+}
+
+fn response(url: &GopherUrl, body: Vec<u8>, mime: &str) -> Result<crate::http::Response, String> {
+    Ok(crate::http::Response {
         url: url::Url::parse(&url.to_string()).map_err(|e| e.to_string())?,
         status: 200,
         content_type: mime.into(),
         headers: Vec::new(),
-        body: if url.is_image() {
-            page.reply.body
-        } else {
-            text_body(&page.reply.body)
-        },
+        body,
         rendered: None,
         js: None,
         blobs: None,
@@ -777,12 +905,161 @@ pub fn representation(url: &GopherUrl, page: Page) -> Result<crate::http::Respon
         challenge: None,
         from_post: false,
         timing: None,
-    };
-    Ok(if url.is_image() {
-        crate::http::image_navigation_response(response, mime)
-    } else {
-        response
     })
+}
+
+#[cfg(test)]
+pub(crate) mod file_tests {
+    use super::*;
+
+    pub(crate) fn webp() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut out, image::ImageFormat::WebP)
+            .unwrap();
+        out.into_inner()
+    }
+
+    pub(crate) async fn serve(
+        body: Vec<u8>,
+        selector: &[u8],
+    ) -> (GopherUrl, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = GopherUrl::new(
+            "127.0.0.1".into(),
+            listener.local_addr().unwrap().port(),
+            '9',
+            selector.to_vec(),
+        );
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            stream.write_all(&body).await.unwrap();
+            request
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_images_open_by_signature_with_opaque_selectors() {
+        let bytes = webp();
+        for selector in [b"/comic panel 1.webp".as_slice(), b"/a/../\xff.bin"] {
+            let (url, server) = serve(bytes.clone(), selector).await;
+            assert!(!url.is_download());
+            let FileResponse::Document(response) = fetch_file(&url).await.unwrap() else {
+                panic!("a supported WebP must open directly");
+            };
+            assert_eq!(response.content_type, "image/webp");
+            assert_eq!(response.body, bytes);
+            assert_eq!(server.await.unwrap(), url.request().unwrap());
+        }
+        assert!(file_is_renderable("image/webp"));
+        assert!(
+            !file_is_renderable("image/tiff"),
+            "uncompiled decoders need a download"
+        );
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_text_and_html_preserve_binary_framing() {
+        for selector in [b"/plain.txt".as_slice(), b"/post.gmi"] {
+            let raw = b"before\r\n.\r\n..after\r\n";
+            let (url, server) = serve(raw.to_vec(), selector).await;
+            let FileResponse::Document(response) = fetch_file(&url).await.unwrap() else {
+                panic!("plain text must open directly");
+            };
+            assert_eq!(response.body, raw);
+            let doc = render(&url, response.body.into(), 80);
+            assert_eq!(
+                doc.lines
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["before", ".", "..after"]
+            );
+            server.await.unwrap();
+        }
+        let raw = b"<main>Hello</main>\r\n.\r\n..after\r\n";
+        let (mut url, server) = serve(raw.to_vec(), b"/file.html").await;
+        url.item_type = '5';
+        let FileResponse::Document(response) = fetch_file(&url).await.unwrap() else {
+            panic!("HTML must open directly");
+        };
+        assert_eq!(response.content_type, "text/html");
+        assert_eq!(response.body, raw);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_download_reuses_complete_bytes_without_refetching() {
+        let bytes = b"PK\x03\x04\0\r\n.\r\n..data";
+        let (url, server) = serve(bytes.to_vec(), b"/archive.png").await;
+        let FileResponse::Download(offer) = fetch_file(&url).await.unwrap() else {
+            panic!("an archive named .png is still an archive");
+        };
+        server.await.unwrap(); // listener is now closed: saving must not reconnect
+        assert!(!offer.fetch_body);
+        assert_eq!(offer.content_type, "application/zip");
+        assert_eq!(offer.body, bytes);
+        let path = std::env::temp_dir().join(format!(
+            "trust-gopher-sniff-{}-{}.zip",
+            std::process::id(),
+            url.port
+        ));
+        crate::download::save(&offer, &path).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_download_does_not_wait_for_an_unsupported_file_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = GopherUrl::new(
+            "127.0.0.1".into(),
+            listener.local_addr().unwrap().port(),
+            '9',
+            b"/archive".to_vec(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            while byte[0] != b'\n' {
+                stream.read_exact(&mut byte).await.unwrap();
+            }
+            // Less than 1445 bytes, and deliberately no EOF. The resource-header
+            // time bound must make the download prompt available anyway.
+            stream.write_all(b"PK\x03\x04\0archive").await.unwrap();
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        });
+        let FileResponse::Download(offer) = timeout(Duration::from_secs(2), fetch_file(&url))
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("unsupported file should be offered for download");
+        };
+        assert!(offer.fetch_body && offer.body.is_empty());
+        assert_eq!(offer.gopher.as_ref(), Some(&url));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_supported_files_over_the_display_limit_offer_a_full_download() {
+        let mut bytes = webp();
+        bytes.resize(MAX_RESPONSE + 1, 0);
+        let (url, server) = serve(bytes, b"/large.webp").await;
+        let FileResponse::Download(offer) = fetch_file(&url).await.unwrap() else {
+            panic!("an oversized image must not become a truncated page");
+        };
+        assert!(offer.fetch_body && offer.body.is_empty());
+        assert_eq!(offer.content_type, "image/webp");
+        server.await.unwrap();
+    }
 }
 
 #[cfg(test)]

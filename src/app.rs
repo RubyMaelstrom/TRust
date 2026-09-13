@@ -303,6 +303,8 @@ struct ViewPos {
 /// What a background fetch produced, by protocol.
 enum Payload {
     Gopher(crate::text_reply::Reply),
+    GopherImage(Vec<u8>),
+    GopherDownload(Box<crate::download::DownloadOffer>),
     Gemini(gemini::Response),
     Http(Box<http::Response>),
     /// An attachment or unsupported top-level MIME type. The current document
@@ -3267,7 +3269,7 @@ impl App {
                 self.notice = true;
                 return;
             }
-            if !(url.is_text() || url.is_image()) {
+            if !(url.is_text() || url.is_image() || url.is_binary_file()) {
                 self.status = format!(
                     "Gopher item type '{}' needs a client TRust does not yet provide",
                     url.item_type
@@ -3322,6 +3324,29 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
+            if let Link::Gopher(url) = &target
+                && url.is_binary_file()
+            {
+                let result = match gopher::fetch_file(url).await {
+                    Ok(gopher::FileResponse::Download(offer)) => Ok(Payload::GopherDownload(offer)),
+                    Ok(gopher::FileResponse::Document(response)) => {
+                        Ok(if response.content_type.starts_with("image/") {
+                            Payload::GopherImage(response.body)
+                        } else if gopher::file_is_text(&response.content_type) {
+                            Payload::Gopher(crate::text_reply::Reply {
+                                body: response.body,
+                                finished: true,
+                                notice: None,
+                            })
+                        } else {
+                            prepare_http_payload(*response, viewport, cell_px, storage, js_on).await
+                        })
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = tx.send(FetchMsg { target, result }).await;
+                return;
+            }
             if let Link::Gopher(url) = &target
                 && url.item_type != 'h'
             {
@@ -4454,6 +4479,18 @@ impl App {
         }
         let width = (self.last_inner.0 as usize).max(10);
         match (msg.result, msg.target) {
+            (Ok(Payload::GopherImage(raw)), target) => self.open_image(target, raw),
+            (Ok(Payload::GopherDownload(offer)), _) => {
+                self.status = format!("Gopher file · {}", offer.summary());
+                self.notice = true;
+                self.mode = Mode::Session;
+                self.file_dialog = Some(FileDialog {
+                    offer: *offer,
+                    selected: 0,
+                });
+                self.replace_nav = false;
+                self.nav_from_post = false;
+            }
             (
                 Ok(Payload::Gopher(_) | Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_)),
                 _,
@@ -7595,10 +7632,10 @@ impl App {
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
             Link::Dict(_) => crate::dict::render(dict_page.expect("DICT page"), width),
-            Link::Gopher(url) if url.item_type == 'h' => {
+            Link::Gopher(url) if gopher_view.is_none() && g.doc.meta.is_some() => {
                 let mut doc = http::parse_terminal(
                     &url::Url::parse(&url.to_string()).unwrap(),
-                    "text/html",
+                    g.doc.meta.as_deref().unwrap(),
                     &raw,
                     width,
                     height,
@@ -9156,7 +9193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gopher_typed_search_prompts_but_saved_query_fetches_and_binary_offers_download() {
+    async fn gopher_search_and_file_types_choose_their_handlers() {
         let mut app = super::App::new(None, 23);
         app.dispatch_open("gopher://e/7/search", None);
         assert_eq!(app.mode, super::Mode::Search);
@@ -9164,6 +9201,12 @@ mod tests {
         app.dispatch_open("gopher://e/7/search%09rust%20lang", None);
         assert!(app.fetch_task.is_some());
         app.dispatch_open("gopher://e/9/archive.zip", None);
+        assert!(app.file_dialog.is_none());
+        assert!(
+            app.fetch_task.is_some(),
+            "generic files need a content check"
+        );
+        app.dispatch_open("gopher://e/6/archive.uu", None);
         assert!(app.file_dialog.is_some());
         assert!(app.fetch_task.is_none());
     }
@@ -14491,6 +14534,129 @@ mod tests {
                 .is_none()
         );
         assert!(super::load_one_image(&page, blob_url, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_menu_files_open_in_the_terminal_and_restore_the_menu() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        for (bytes, selector, image) in [
+            (
+                crate::gopher::file_tests::webp(),
+                b"/comic panel 1.webp".as_slice(),
+                true,
+            ),
+            (
+                b"PK\x03\x04\0archive".to_vec(),
+                b"/archive.zip".as_slice(),
+                false,
+            ),
+        ] {
+            let (url, server) = crate::gopher::file_tests::serve(bytes.clone(), selector).await;
+            let parent = crate::gopher::GopherUrl::parse("gopher://example.test/1/menu").unwrap();
+            let menu = format!(
+                "9File\t{}\t{}\t{}\r\n.\r\n",
+                String::from_utf8_lossy(selector),
+                url.host,
+                url.port
+            );
+            let mut app = super::App::new(None, 23);
+            app.picker = ratatui_image::picker::Picker::halfblocks();
+            app.last_inner = (80, 24);
+            app.mode = super::Mode::Session;
+            app.navigate_to(crate::gopher::render(&parent, menu.into_bytes().into(), 80));
+            let target = app
+                .browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .lines
+                .iter()
+                .find_map(|line| line.link.clone())
+                .unwrap();
+            assert_eq!(target, Link::Gopher(url.clone()));
+            app.browser_follow_link(target.clone());
+            assert!(
+                app.file_dialog.is_none(),
+                "generic files must first be identified"
+            );
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.fetch_rx.as_mut().unwrap().recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            app.on_fetch(message);
+            assert_eq!(server.await.unwrap(), url.request().unwrap());
+            if image {
+                let message = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    app.img_rx.as_mut().expect("image decode started").recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                app.on_img(message);
+                let viewer = app.viewer.as_ref().expect("WebP opened in TRust");
+                assert_eq!(viewer.url, target);
+                assert_eq!(viewer.raw.as_ref(), bytes.as_slice());
+                assert!(viewer.info.contains("2×2 image/webp"), "{}", viewer.info);
+                assert!(app.file_dialog.is_none());
+                app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)))
+                    .await;
+                assert!(app.viewer.is_none());
+            } else {
+                assert!(app.viewer.is_none());
+                assert_eq!(
+                    app.file_dialog.as_ref().unwrap().offer.content_type,
+                    "application/zip"
+                );
+                app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+                    .await;
+                assert!(app.file_dialog.is_none());
+            }
+            assert_eq!(app.browser.as_ref().unwrap().doc.url, Link::Gopher(parent));
+            assert!(
+                app.fetch_task.is_none(),
+                "returning to the menu must not refetch it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gopher_generic_html_stays_html_when_the_terminal_resizes() {
+        let raw = b"<main><h1>A file</h1><p>Hello</p></main>\r\n.\r\n..after\r\n";
+        let (url, server) = crate::gopher::file_tests::serve(raw.to_vec(), b"/file.html").await;
+        let mut app = super::App::new(None, 23);
+        app.js_enabled = false;
+        app.last_inner = (80, 24);
+        app.browser_follow_link(Link::Gopher(url.clone()));
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.fetch_rx.as_mut().unwrap().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        app.on_fetch(message);
+        server.await.unwrap();
+        assert!(app.file_dialog.is_none());
+        for width in [80, 40] {
+            app.last_inner.0 = width;
+            app.sync_browser_wrap();
+            let doc = &app.browser.as_ref().unwrap().doc;
+            assert_eq!(doc.url, Link::Gopher(url.clone()));
+            // The HTML pipeline serializes the DOM, but binary Gopher framing
+            // must leave the literal dot lines in the document's text.
+            assert!(String::from_utf8_lossy(&doc.raw).contains("\n.\n..after\n"));
+            assert_eq!(
+                doc.meta.as_deref().unwrap().split(';').next(),
+                Some("text/html")
+            );
+            assert!(doc.laid_out() && doc.gopher.is_none());
+            assert_eq!(doc.wrapped_to, usize::from(width));
+        }
     }
 
     #[tokio::test]

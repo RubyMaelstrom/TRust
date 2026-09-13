@@ -466,6 +466,10 @@ enum CoreEvent {
         generation: u64,
         response: Box<http::Response>,
     },
+    GopherDownload {
+        generation: u64,
+        offer: Box<crate::download::DownloadOffer>,
+    },
     Page {
         generation: u64,
         event: crate::js::PageEvt,
@@ -480,6 +484,7 @@ enum InteractiveFetch {
     Document(FetchedDocument),
     ExternalMedia(url::Url),
     Download(Box<http::Response>),
+    GopherDownload(Box<crate::download::DownloadOffer>),
 }
 
 /// Read-only state used by graphical chrome.
@@ -1148,6 +1153,9 @@ impl BrowserController {
                 } => {
                     changed |= self.finish_download(generation, *response);
                 }
+                CoreEvent::GopherDownload { generation, offer } => {
+                    changed |= self.finish_gopher_download(generation, *offer);
+                }
                 CoreEvent::Page { generation, event } => {
                     if generation == self.generation {
                         changed |= self.handle_page_event(event);
@@ -1465,6 +1473,25 @@ impl BrowserController {
         });
         let offer = crate::download::DownloadOffer::from_response(response, referrer);
         self.status = format!("Cannot display {}.", offer.content_type);
+        self.download_offer = Some(offer);
+        self.render_is_final = self.live_page.is_none();
+        true
+    }
+
+    fn finish_gopher_download(
+        &mut self,
+        generation: u64,
+        offer: crate::download::DownloadOffer,
+    ) -> bool {
+        if self
+            .pending
+            .take_if(|p| p.generation == generation)
+            .is_none()
+        {
+            return false;
+        }
+        self.task = None;
+        self.status = format!("Gopher file · {}", offer.summary());
         self.download_offer = Some(offer);
         self.render_is_final = self.live_page.is_none();
         true
@@ -2417,6 +2444,19 @@ pub async fn fetch_protocol(
     referrer: Option<&url::Url>,
 ) -> Result<FetchedDocument, String> {
     match target {
+        Link::Gopher(url) if url.is_binary_file() => match gopher::fetch_file(url).await? {
+            gopher::FileResponse::Document(response) => {
+                if gopher::file_is_text(&response.content_type) {
+                    Ok(FetchedDocument::Gopher(response.body.into()))
+                } else {
+                    Ok(FetchedDocument::Http(response))
+                }
+            }
+            gopher::FileResponse::Download(offer) => Err(format!(
+                "Gopher file requires a download: {}",
+                offer.summary()
+            )),
+        },
         Link::Gopher(url) if url.item_type == 'h' => {
             gopher::representation(url, gopher::fetch(url).await?)
                 .map(|r| FetchedDocument::Http(Box::new(r)))
@@ -2476,9 +2516,30 @@ async fn fetch_protocol_interactive(
     intent: NavigationIntent,
 ) -> Result<InteractiveFetch, String> {
     if let Link::Gopher(url) = target
-        && (url.is_image() || url.item_type == 'h')
+        && (url.is_image() || url.item_type == 'h' || url.is_binary_file())
     {
-        let response = gopher::representation(url, gopher::fetch(url).await?)?;
+        let response = if url.is_binary_file() {
+            match gopher::fetch_file(url).await? {
+                gopher::FileResponse::Download(offer) => {
+                    return Ok(InteractiveFetch::GopherDownload(offer));
+                }
+                gopher::FileResponse::Document(response) => {
+                    let mime = response.content_type.clone();
+                    if gopher::file_is_text(&mime) {
+                        return Ok(InteractiveFetch::Document(FetchedDocument::Gopher(
+                            response.body.into(),
+                        )));
+                    }
+                    if mime.starts_with("image/") {
+                        http::image_navigation_response(*response, &mime)
+                    } else {
+                        *response
+                    }
+                }
+            }
+        } else {
+            gopher::representation(url, gopher::fetch(url).await?)?
+        };
         let size = (
             viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
             viewport.height.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -2586,6 +2647,9 @@ fn interactive_fetch_event(generation: u64, result: Result<InteractiveFetch, Str
             generation,
             response,
         },
+        Ok(InteractiveFetch::GopherDownload(offer)) => {
+            CoreEvent::GopherDownload { generation, offer }
+        }
         Err(error) => CoreEvent::FetchFinished {
             generation,
             result: Err(error),
@@ -2599,14 +2663,9 @@ fn layout_viewport(size: CssSize) -> crate::layout2::Viewport {
 
 fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
     match document {
-        FetchedDocument::Http(_) if matches!(target, Link::Gopher(_)) => format!(
-            "{target} · Gopher {}",
-            if matches!(target, Link::Gopher(u) if u.is_image()) {
-                "image"
-            } else {
-                "HTML"
-            }
-        ),
+        FetchedDocument::Http(_) if matches!(target, Link::Gopher(_)) => {
+            format!("{target} · Gopher document")
+        }
         FetchedDocument::Http(response) => {
             let media = response.content_type.split(';').next().unwrap_or("").trim();
             format!("{} — HTTP {} ({media})", response.url, response.status)
@@ -2756,6 +2815,83 @@ fn split_host_port(address: &str) -> (&str, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gopher_generic_menu_files_open_in_the_desktop_and_restore_the_menu() {
+        for (bytes, selector, image) in [
+            (
+                crate::gopher::file_tests::webp(),
+                b"/comic panel 1.webp".as_slice(),
+                true,
+            ),
+            (
+                b"PK\x03\x04\0archive".to_vec(),
+                b"/archive.zip".as_slice(),
+                false,
+            ),
+        ] {
+            let (url, server) = crate::gopher::file_tests::serve(bytes, selector).await;
+            let parent = crate::gopher::GopherUrl::parse("gopher://example.test/1/menu").unwrap();
+            let menu = format!(
+                "9File\t{}\t{}\t{}\r\n.\r\n",
+                String::from_utf8_lossy(selector),
+                url.host,
+                url.port
+            );
+            let mut browser = BrowserController::new(
+                tokio::runtime::Handle::current(),
+                || {},
+                CssSize::new(800.0, 600.0),
+            );
+            browser.pending = Some(PendingNavigation {
+                generation: 0,
+                target: Link::Gopher(parent.clone()),
+                fallback_http: false,
+                intent: NavigationIntent::New,
+            });
+            assert!(browser.finish_fetch(0, Ok(FetchedDocument::Gopher(menu.into_bytes().into()))));
+            let target = Link::Gopher(url.clone());
+            browser.handle_action(UserAction::Activate(target.clone()));
+            assert!(browser.download_offer().is_none());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                browser.task.take().expect("file fetch started"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            browser.process_async_events();
+            assert_eq!(server.await.unwrap(), url.request().unwrap());
+            assert!(browser.pending.is_none());
+            if image {
+                assert!(browser.download_offer().is_none());
+                let page = browser.current_page().unwrap();
+                assert_eq!(page.target(), &target);
+                let FetchedDocument::Http(response) = &page.document else {
+                    panic!("WebP needs a native image document");
+                };
+                assert_eq!(response.content_type, "text/html; charset=utf-8");
+                assert!(
+                    String::from_utf8_lossy(&response.body).contains("data:image/webp;base64,")
+                );
+                browser.handle_action(UserAction::Back);
+            } else {
+                assert_eq!(
+                    browser.download_offer().unwrap().content_type,
+                    "application/zip"
+                );
+                browser.dismiss_download_offer();
+            }
+            assert_eq!(
+                browser.current_page().unwrap().target(),
+                &Link::Gopher(parent)
+            );
+            assert!(
+                browser.task.is_none(),
+                "returning to the menu must not refetch it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn gopher_history_restores_source_and_view_without_network() {
         let mut browser = super::BrowserController::new(

@@ -312,7 +312,8 @@ Menus/text arrive progressively. W toggles wrap; Shift-Left/Right pans.
 E cycles auto / UTF-8 / Latin-1 / CP437; selectors always keep their bytes.
 S saves received source. Esc stops while preserving the received prefix.
 Search endpoints prompt; saved query URLs repeat their search.
-Images and HTML render; binary/archive items offer Save / Open / Cancel.
+Images, HTML and supported generic files open inside TRust.
+Unsupported files offer Save / Open / Cancel.
 Recent pages stay in bounded RAM history; reload fetches a fresh copy.
 
 ## Bookmarks
