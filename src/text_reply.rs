@@ -226,6 +226,27 @@ where
 /// Escape sequences are discarded as units so their parameters do not litter
 /// the reply. Both bytes and display geometry are bounded before shaping.
 pub(crate) fn display_text(raw: &[u8], loading: bool) -> (String, bool) {
+    display_text_observed(raw, loading, |_| {})
+}
+
+/// Optional presentation observations; the plain-text/terminal caller uses a
+/// no-op observer. Offsets refer to filtered UTF-8 before and after tab expansion.
+pub(crate) enum DisplayEvent<'a> {
+    Sgr {
+        offset: usize,
+        parameters: &'a str,
+    },
+    Grapheme {
+        source: usize,
+        output: std::ops::Range<usize>,
+    },
+}
+
+pub(crate) fn display_text_observed(
+    raw: &[u8],
+    loading: bool,
+    mut observe: impl FnMut(DisplayEvent<'_>),
+) -> (String, bool) {
     let raw = if loading {
         match std::str::from_utf8(raw) {
             Err(e) if e.error_len().is_none() => &raw[..e.valid_up_to()],
@@ -235,31 +256,37 @@ pub(crate) fn display_text(raw: &[u8], loading: bool) -> (String, bool) {
         raw
     };
     let decoded = String::from_utf8_lossy(raw);
-    let mut chars = decoded.chars().peekable();
+    let mut chars = decoded.char_indices().peekable();
     let mut filtered = String::new();
     let mut line_bytes = 0;
     let mut rows = 1;
     let mut clipped = false;
-    while let Some(ch) = chars.next() {
+    while let Some((_, ch)) = chars.next() {
         if filtered.len() + ch.len_utf8() > MAX_RESPONSE || rows > MAX_ROWS {
             clipped = true;
             break;
         }
         if ch == '\x1b' {
             match chars.next() {
-                Some('[') => {
-                    for c in chars.by_ref() {
+                Some((start, '[')) => {
+                    for (end, c) in chars.by_ref() {
                         if ('@'..='~').contains(&c) {
+                            if c == 'm' {
+                                observe(DisplayEvent::Sgr {
+                                    offset: filtered.len(),
+                                    parameters: &decoded[start + 1..end],
+                                });
+                            }
                             break;
                         }
                     }
                 }
-                Some(']' | 'P' | '_' | '^' | 'X') => {
-                    while let Some(c) = chars.next() {
+                Some((_, ']' | 'P' | '_' | '^' | 'X')) => {
+                    while let Some((_, c)) = chars.next() {
                         if c == '\x07' {
                             break;
                         }
-                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        if c == '\x1b' && chars.peek().is_some_and(|(_, c)| *c == '\\') {
                             chars.next();
                             break;
                         }
@@ -270,7 +297,7 @@ pub(crate) fn display_text(raw: &[u8], loading: bool) -> (String, bool) {
             continue;
         }
         match ch {
-            '\r' if chars.peek() == Some(&'\n') => continue,
+            '\r' if chars.peek().is_some_and(|(_, c)| *c == '\n') => continue,
             '\r' | '\n' => {
                 filtered.push('\n');
                 line_bytes = 0;
@@ -292,7 +319,7 @@ pub(crate) fn display_text(raw: &[u8], loading: bool) -> (String, bool) {
     let mut text = String::new();
     let mut column = 0;
     let mut line_full = false;
-    for grapheme in filtered.graphemes(true) {
+    for (source, grapheme) in filtered.grapheme_indices(true) {
         if grapheme == "\n" {
             if text.len() == MAX_RESPONSE {
                 clipped = true;
@@ -325,12 +352,17 @@ pub(crate) fn display_text(raw: &[u8], loading: bool) -> (String, bool) {
             line_full = true;
             continue;
         }
+        let start = text.len();
         if grapheme == "\t" {
             text.extend(std::iter::repeat_n(' ', width));
         } else {
             text.push_str(grapheme);
         }
         column += width;
+        observe(DisplayEvent::Grapheme {
+            source,
+            output: start..text.len(),
+        });
     }
     (text, clipped)
 }

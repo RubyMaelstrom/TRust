@@ -199,6 +199,14 @@ directly in TRust. Unsupported files offer Save / Open / Cancel after a bounded
 type check; files exceeding the page-body limit can also be downloaded.
 Redundant-server menu entries
 inherit the original item's type and can be selected as alternate destinations.
+
+Desktop Gopher menus and text honor ANSI SGR foreground/background colors,
+including bright colors, the 256-color palette, and truecolor RGB. Color resets
+restore TRust's palette; selected links keep TRust's highlight. Wrapping, search,
+and copying use the plain text. The terminal frontend keeps its fixed colors.
+Cursor movement, screen clearing, and other terminal commands are discarded;
+color detail is bounded so dense artwork remains responsive.
+
 Gopher+ menus, text, item information and alternate formats are supported.
 **I** (or `gopher-info`) opens information about the selected Gopher link,
 falling back to the current page; `gopher-info page` requests the current page's

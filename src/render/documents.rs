@@ -7,7 +7,8 @@
 //! distinguish Gopher item types for users, and Gemtext 0.24.1 deliberately
 //! leaves presentation to the user agent while requiring preformatted lines
 //! to retain monowidth spacing. The semantic palette below is therefore the
-//! same one used by TRust's terminal frontend, not author-controlled styling.
+//! same one used by TRust's terminal frontend. Desktop Gopher additionally
+//! honors color-only ANSI SGR annotations in menu labels and text.
 
 use crate::core::{BrowserPage, CssPoint, CssSize, FetchedDocument};
 use crate::doc::{Doc, DocLine, Kind, Link};
@@ -30,6 +31,16 @@ pub struct ProtocolPaint {
     /// One entry per parsed line, preserving Gopherus document order while
     /// carrying graphical CSS-pixel bounds for desktop navigation.
     pub lines: Vec<ProtocolLine>,
+    /// Original colors per painted paragraph piece, retained so selection
+    /// changes do not reshape text or lose author colors/backgrounds.
+    colors: Vec<RowColors>,
+}
+
+#[derive(Clone, Debug)]
+struct RowColors {
+    normal: PaintColor,
+    foregrounds: Vec<Option<[u8; 3]>>,
+    backgrounds: Vec<(CssRect, PaintColor)>,
 }
 
 pub fn document(page: &BrowserPage) -> Option<Doc> {
@@ -41,7 +52,7 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
 pub fn document_for_viewport(page: &BrowserPage, viewport_width: f32) -> Option<Doc> {
     Some(match (&page.document, page.target()) {
         (FetchedDocument::Gopher(raw), Link::Gopher(url)) => {
-            crate::gopher::render(url, raw.clone(), usize::MAX / 4)
+            crate::gopher::render_desktop(url, raw.clone())
         }
         (FetchedDocument::Gemini(response), Link::Gemini(url)) => {
             crate::gemini::parse(url, &response.meta, &response.body, usize::MAX / 4)
@@ -124,6 +135,7 @@ pub fn paint_doc_selected(
         ..PagePaint::default()
     };
     let mut lines = Vec::with_capacity(doc.lines.len());
+    let mut row_colors = Vec::new();
     let mut y = 22.0;
     let mut far_right = viewport_width.max(0.0);
     let mut widest_line = 0.0f32;
@@ -136,12 +148,12 @@ pub fn paint_doc_selected(
         if doc.text_view().is_some() && line.kind == Kind::Pre {
             normal_color = theme_color(crate::theme::TEXT);
         }
-        let is_selected = selected == Some(line_index) && line.link.is_some();
-        let color = if is_selected {
-            theme_color(crate::theme::BG)
-        } else {
-            normal_color
-        };
+        let color = normal_color;
+        let spans = doc
+            .gopher
+            .as_ref()
+            .and_then(|view| view.colors.get(line_index))
+            .map_or(&[][..], Vec::as_slice);
         let line_top = y;
         let mut line_width = 1.0f32;
         // Shape each physical paragraph once for every line-model protocol.
@@ -175,7 +187,22 @@ pub fn paint_doc_selected(
         } else {
             0.0
         };
-        let mut pieces = if wrap && !line.text.is_empty() {
+        let mut pieces = if !line.text.is_empty()
+            && spans
+                .iter()
+                .any(|s| s.colors.foreground.is_some() || s.colors.inverse)
+        {
+            text::colored_lines(
+                &line.text,
+                &style,
+                wrap.then_some(width),
+                spans.iter().filter_map(|span| {
+                    span_colors(span.colors, normal_color)
+                        .0
+                        .map(|color| (span.range.clone(), color))
+                }),
+            )
+        } else if wrap && !line.text.is_empty() {
             text::wrapped_lines(
                 &line.text,
                 &style,
@@ -197,6 +224,7 @@ pub fn paint_doc_selected(
         .into_iter()
         .peekable();
         let mut continuation = false;
+        let mut paragraph_offset = 0;
         while let Some(mut shaped) = pieces.next() {
             let more = pieces.peek().is_some();
             soft_wrapped |= more;
@@ -220,12 +248,17 @@ pub fn paint_doc_selected(
                 shaped.advance.max(1.0),
                 shaped.line_height.max(style.size),
             );
-            if is_selected && !truncated {
-                paint.primitives.push(DisplayCommand::FillRect {
-                    rect,
-                    color: normal_color,
-                });
-            }
+            let backgrounds = if truncated {
+                Vec::new()
+            } else {
+                color_backgrounds(&shaped, origin, paragraph_offset, spans, normal_color)
+            };
+            row_colors.push(RowColors {
+                normal: color,
+                foregrounds: shaped.runs.iter().map(|run| run.color).collect(),
+                backgrounds,
+            });
+            paragraph_offset += shaped.text.len();
             paint.lines.push(PaintLine {
                 rect,
                 baseline: y + shaped.baseline,
@@ -295,6 +328,11 @@ pub fn paint_doc_selected(
             for line in &mut lines {
                 line.rect.x += offset;
             }
+            for row in &mut row_colors {
+                for (rect, _) in &mut row.backgrounds {
+                    rect.x += offset;
+                }
+            }
         }
         // Only fitting content is shifted, so centering cannot add overflow.
     }
@@ -303,17 +341,24 @@ pub fn paint_doc_selected(
     // in the page extent instead of clipping it to the viewport.
     paint.width = far_right;
     paint.height = y + 22.0;
-    ProtocolPaint { paint, lines }
+    let mut layout = ProtocolPaint {
+        paint,
+        lines,
+        colors: row_colors,
+    };
+    select(&mut layout, doc, selected);
+    layout
 }
 
 /// Change selection colors using retained glyph geometry. Navigation must
 /// not reshape the entire menu or move lines when the selection changes.
-pub fn select(layout: &mut ProtocolPaint, doc: &Doc, selected: Option<usize>) {
+pub fn select(layout: &mut ProtocolPaint, _doc: &Doc, selected: Option<usize>) {
     layout
         .paint
         .primitives
         .retain(|p| !matches!(p, DisplayCommand::FillRect { .. }));
     let mut backgrounds = Vec::new();
+    let mut colors = layout.colors.iter();
     for primitive in &mut layout.paint.primitives {
         if let DisplayCommand::GlyphRun {
             node,
@@ -321,15 +366,16 @@ pub fn select(layout: &mut ProtocolPaint, doc: &Doc, selected: Option<usize>) {
             origin,
             shaped,
             link,
+            decoration,
             ..
         } = primitive
-            && let Some(line) = node.checked_sub(1).and_then(|i| doc.lines.get(i))
+            && let Some(row) = colors.next()
         {
-            let (_, mut normal) = line_style(line.kind);
-            if doc.text_view().is_some() && line.kind == Kind::Pre {
-                normal = theme_color(crate::theme::TEXT);
+            let is_selected = selected == node.checked_sub(1) && link.is_some();
+            for (run, original) in shaped.runs.iter_mut().zip(&row.foregrounds) {
+                run.color = if is_selected { None } else { *original };
             }
-            if selected == node.checked_sub(1) && link.is_some() {
+            if is_selected {
                 *color = theme_color(crate::theme::BG);
                 backgrounds.push(DisplayCommand::FillRect {
                     rect: CssRect::new(
@@ -340,14 +386,79 @@ pub fn select(layout: &mut ProtocolPaint, doc: &Doc, selected: Option<usize>) {
                             .line_height
                             .max(crate::theme::TERMINAL_FONT_SIZE_CSS_PX),
                     ),
-                    color: normal,
+                    color: row.normal,
                 });
             } else {
-                *color = normal;
+                *color = row.normal;
+                backgrounds.extend(
+                    row.backgrounds
+                        .iter()
+                        .map(|&(rect, color)| DisplayCommand::FillRect { rect, color }),
+                );
             }
+            decoration.color = *color;
         }
     }
     layout.paint.primitives.splice(0..0, backgrounds);
+}
+
+fn span_colors(
+    colors: crate::gopher::ansi::Colors,
+    normal: PaintColor,
+) -> (Option<[u8; 3]>, Option<[u8; 3]>) {
+    if colors.inverse {
+        let PaintColor::Rgba(r, g, b, _) = normal else {
+            unreachable!("protocol palette is RGB")
+        };
+        (
+            Some(colors.background.unwrap_or(crate::theme::BG)),
+            Some(colors.foreground.unwrap_or([r, g, b])),
+        )
+    } else {
+        (colors.foreground, colors.background)
+    }
+}
+
+fn color_backgrounds(
+    shaped: &text::ShapedText,
+    origin: CssPoint,
+    paragraph_offset: usize,
+    spans: &[crate::gopher::ansi::Span],
+    normal: PaintColor,
+) -> Vec<(CssRect, PaintColor)> {
+    let mut backgrounds: Vec<(CssRect, PaintColor)> = Vec::new();
+    if !spans
+        .iter()
+        .any(|s| s.colors.background.is_some() || s.colors.inverse)
+    {
+        return backgrounds;
+    }
+    for cluster in &shaped.clusters {
+        let source = paragraph_offset + cluster.text_range.start;
+        let index = spans.partition_point(|span| span.range.end <= source);
+        let Some(span) = spans.get(index).filter(|span| span.range.start <= source) else {
+            continue;
+        };
+        let Some(color) = span_colors(span.colors, normal).1 else {
+            continue;
+        };
+        let color = theme_color(color);
+        let rect = CssRect::new(
+            origin.x + cluster.x,
+            origin.y,
+            cluster.advance,
+            shaped.line_height,
+        );
+        if let Some((previous, previous_color)) = backgrounds.last_mut()
+            && *previous_color == color
+            && (previous.x + previous.width - rect.x).abs() < 0.01
+        {
+            previous.width += rect.width;
+        } else {
+            backgrounds.push((rect, color));
+        }
+    }
+    backgrounds
 }
 
 fn line_style(kind: Kind) -> (TextStyle, PaintColor) {
@@ -389,6 +500,157 @@ const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
 
 #[cfg(test)]
 mod tests {
+    fn scene(paint: &PagePaint) -> crate::render::Scene {
+        let viewport = crate::core::ViewportMetrics::from_physical(
+            crate::core::PhysicalSize::new(1200, 800),
+            crate::core::ScaleFactor::default(),
+        );
+        let mut scene = crate::render::Scene {
+            viewport,
+            primitives: Vec::new(),
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0., 0., 1200., 800.),
+            image_store: Default::default(),
+            canvas_images: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::default(),
+        };
+        scene.append_page(paint, CssPoint::default());
+        scene
+    }
+
+    fn colored_gopher(raw: &str, item_type: char) -> Doc {
+        let url = crate::gopher::GopherUrl::new("example.test".into(), 70, item_type, Vec::new());
+        crate::gopher::render_desktop(&url, raw.as_bytes().to_vec().into())
+    }
+
+    #[test]
+    fn gopher_ansi_paint_preserves_wrapping_shaping_search_and_copy() {
+        let doc = colored_gopher(
+            "co\x1b[38;2;27;75;105mlor\x1b[0m and سا\x1b[31mلام\x1b[0m  e\u{301}  end",
+            '0',
+        );
+        let mut plain = doc.clone();
+        plain.gopher.as_mut().unwrap().colors.clear();
+        for width in [1200.0, 110.0] {
+            let colored = paint_doc_selected(&doc, width, None);
+            let plain = paint_doc_selected(&plain, width, None);
+            assert_eq!(colored.lines, plain.lines);
+            assert_eq!(colored.paint.lines, plain.paint.lines);
+            let glyphs = |paint: &PagePaint| {
+                paint
+                    .primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        DisplayCommand::GlyphRun { shaped, .. } => Some(
+                            shaped
+                                .runs
+                                .iter()
+                                .flat_map(|r| r.glyphs.iter().map(|g| (r.font.resource_id(), *g)))
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let colored_glyphs = glyphs(&colored.paint);
+            let plain_glyphs = glyphs(&plain.paint);
+            assert_eq!(colored_glyphs.len(), plain_glyphs.len());
+            for (colored, plain) in colored_glyphs.iter().zip(&plain_glyphs) {
+                assert_eq!(colored.len(), plain.len());
+                for ((cf, c), (pf, p)) in colored.iter().zip(plain) {
+                    assert_eq!((cf, c.id), (pf, p.id), "colors must not break joining");
+                    assert!(
+                        (c.x - p.x).abs() < 0.001
+                            && (c.y - p.y).abs() < 0.001
+                            && (c.advance - p.advance).abs() < 0.001,
+                        "colors must not move glyphs"
+                    );
+                }
+            }
+            let scene = scene(&colored.paint);
+            let matches = scene.find_text("color");
+            assert_eq!(matches.len(), 1);
+            assert_eq!(scene.selected_text(matches[0]), "color");
+        }
+    }
+
+    #[test]
+    fn gopher_ansi_selection_restores_colors_and_centered_backgrounds() {
+        let doc = colored_gopher(
+            "0co\x1b[31;44mlor\x1b[0m link\t/a\texample.test\t70\r\n.\r\n",
+            '1',
+        );
+        let mut layout = paint_doc_selected(&doc, 1200.0, None);
+        let original = layout.paint.clone();
+        let lines = layout.lines.clone();
+        assert!(original.primitives.iter().any(|p| matches!(p, DisplayCommand::FillRect { color: PaintColor::Rgba(0, 0, 170, 255), rect } if rect.x > lines[0].rect.x)));
+        select(&mut layout, &doc, Some(0));
+        for primitive in &layout.paint.primitives {
+            if let DisplayCommand::GlyphRun { shaped, color, .. } = primitive {
+                assert_eq!(*color, theme_color(crate::theme::BG));
+                assert!(shaped.runs.iter().all(|run| run.color.is_none()));
+            }
+        }
+        assert_eq!(layout.lines, lines);
+        assert_eq!(
+            scene(&layout.paint).interactive_hits(),
+            scene(&original).interactive_hits()
+        );
+        select(&mut layout, &doc, None);
+        assert_eq!(layout.paint.primitives, original.primitives);
+        assert_eq!(layout.paint.lines, original.lines);
+    }
+
+    #[test]
+    fn gopher_ansi_wrapped_backgrounds_follow_their_text() {
+        let doc = colored_gopher("\x1b[44mabcdefghijklmno\x1b[49mXYZ", '0');
+        let layout = paint_doc_selected(&doc, 100.0, None);
+        assert!(layout.paint.lines.len() > 1);
+        let backgrounds: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                DisplayCommand::FillRect {
+                    rect,
+                    color: PaintColor::Rgba(0, 0, 170, 255),
+                } => Some(rect),
+                _ => None,
+            })
+            .collect();
+        assert!(backgrounds.len() > 1);
+        for rect in backgrounds {
+            assert!(layout.paint.lines.iter().any(|line| line.rect.y == rect.y
+                && rect.x >= line.rect.x
+                && rect.x + rect.width <= line.rect.x + line.rect.width + 0.01));
+        }
+    }
+
+    #[test]
+    fn gopher_ansi_truecolor_reaches_desktop_pixels() {
+        let doc = colored_gopher(
+            "\x1b[38;2;250;10;20m██\x1b[38;2;10;20;250m██\x1b[0m  \x1b[48;2;10;240;20m   \x1b[0m",
+            '0',
+        );
+        let paint = paint_doc(&doc, 400.0);
+        let frame =
+            crate::render::headless::render_paint(&paint, CssSize::new(400.0, 100.0)).unwrap();
+        for color in [[250, 10, 20, 255], [10, 20, 250, 255], [10, 240, 20, 255]] {
+            assert!(
+                frame
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|pixel| **pixel == color)
+                    .count()
+                    > 5,
+                "missing raster color {color:?}"
+            );
+        }
+    }
+
     #[test]
     fn gopher_centered_column_moves_text_selection_and_hits_together() {
         let url = crate::gopher::GopherUrl::parse("gopher://example.test").unwrap();

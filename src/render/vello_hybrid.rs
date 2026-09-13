@@ -925,11 +925,23 @@ impl VelloHybridRenderer {
                         let shadow_origin =
                             CssPoint::new(origin.x + shadow.offset.x, origin.y + shadow.offset.y);
                         target.set_paint(vello_color(shadow.color));
-                        paint_glyphs(&mut target, &mut self.resources, shadow_origin, shaped);
+                        paint_glyphs(
+                            &mut target,
+                            &mut self.resources,
+                            shadow_origin,
+                            shaped,
+                            None,
+                        );
                         paint_decorations(&mut target, shadow_origin, shaped, decoration.style);
                     }
                     target.set_paint(vello_color(*color));
-                    paint_glyphs(&mut target, &mut self.resources, *origin, shaped);
+                    paint_glyphs(
+                        &mut target,
+                        &mut self.resources,
+                        *origin,
+                        shaped,
+                        Some(*color),
+                    );
                     target.set_paint(vello_color(decoration.color));
                     paint_decorations(&mut target, *origin, shaped, decoration.style);
                     if clip.is_some() {
@@ -1379,8 +1391,15 @@ fn paint_glyphs(
     resources: &mut Resources,
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
+    color: Option<PaintColor>,
 ) {
     for run in &shaped.runs {
+        if let Some(default) = color {
+            target.set_paint(vello_color(
+                run.color
+                    .map_or(default, |[r, g, b]| PaintColor::Rgba(r, g, b, 255)),
+            ));
+        }
         let glyphs = run.glyphs.iter().map(|glyph| glifo::Glyph {
             id: glyph.id,
             x: origin.x + glyph.x,

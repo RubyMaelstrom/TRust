@@ -244,7 +244,7 @@ const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
     PaintColor::Rgba(rgb[0], rgb[1], rgb[2], 255)
 }
 
-fn ansi_color(index: u8) -> (u8, u8, u8) {
+pub(crate) fn ansi_color(index: u8) -> (u8, u8, u8) {
     const ANSI: [(u8, u8, u8); 16] = [
         (0, 0, 0),
         (170, 0, 0),

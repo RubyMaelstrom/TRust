@@ -325,6 +325,7 @@ impl VelloCpuRenderer {
                             &mut self.resources,
                             shadow_origin,
                             shaped,
+                            None,
                         );
                         paint_decorations(
                             &mut self.context,
@@ -334,7 +335,13 @@ impl VelloCpuRenderer {
                         );
                     }
                     self.context.set_paint(vello_color(*color));
-                    paint_glyphs(&mut self.context, &mut self.resources, *origin, shaped);
+                    paint_glyphs(
+                        &mut self.context,
+                        &mut self.resources,
+                        *origin,
+                        shaped,
+                        Some(*color),
+                    );
                     self.context.set_paint(vello_color(decoration.color));
                     paint_decorations(&mut self.context, *origin, shaped, decoration.style);
                     if clip.is_some() {
@@ -605,8 +612,15 @@ fn paint_glyphs(
     resources: &mut Resources,
     origin: crate::core::CssPoint,
     shaped: &crate::text::ShapedText,
+    color: Option<PaintColor>,
 ) {
     for run in &shaped.runs {
+        if let Some(default) = color {
+            context.set_paint(vello_color(
+                run.color
+                    .map_or(default, |[r, g, b]| PaintColor::Rgba(r, g, b, 255)),
+            ));
+        }
         let glyphs: Vec<vello_cpu::Glyph> = run
             .glyphs
             .iter()

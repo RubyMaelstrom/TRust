@@ -132,6 +132,8 @@ pub struct ShapedGlyph {
 pub struct ShapedRun {
     pub font: FontFace,
     pub font_size: f32,
+    /// Optional desktop text color; glyph geometry and searchable text stay intact.
+    pub color: Option<[u8; 3]>,
     pub normalized_coords: Vec<i16>,
     pub glyphs: Vec<ShapedGlyph>,
     pub text_range: Range<usize>,
@@ -514,6 +516,7 @@ fn editor_rect(rect: parley::BoundingBox) -> EditorRect {
 struct TextSystem {
     fonts: FontContext,
     layouts: LayoutContext<()>,
+    color_layouts: LayoutContext<Option<[u8; 3]>>,
     page_font_epoch: u64,
     /// Shaping is pure for a fixed system-font collection and CSS text style.
     /// Inline layout asks for the same spaces, words, labels, and intrinsic
@@ -600,6 +603,7 @@ impl TextSystem {
         Self {
             fonts: crate::font_system::font_context(),
             layouts: LayoutContext::new(),
+            color_layouts: LayoutContext::new(),
             page_font_epoch: crate::font_system::page_font_epoch(),
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
@@ -684,44 +688,7 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, quantize);
-        let family = font_family_source(&style.family);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
-        builder.push_default(StyleProperty::Locale(text_language(style)));
-        builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
-        builder.push_default(StyleProperty::FontWeight(FontWeight::new(
-            style.weight.clamp(1.0, 1000.0),
-        )));
-        builder.push_default(StyleProperty::FontStyle(if style.italic {
-            FontStyle::Italic
-        } else {
-            FontStyle::Normal
-        }));
-        builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
-        builder.push_default(StyleProperty::WordSpacing(style.word_spacing));
-        builder.push_default(StyleProperty::LineHeight(match style.line_height {
-            CssLineHeight::Normal => LineHeight::default(),
-            CssLineHeight::Number(number) => LineHeight::FontSizeRelative(number.max(0.0)),
-            CssLineHeight::Length(px) => LineHeight::Absolute(px.max(0.0)),
-        }));
-        builder.push_default(StyleProperty::Underline(style.underline));
-        builder.push_default(StyleProperty::Strikethrough(style.strikethrough));
-        if let Some(breaks) = breaks {
-            builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
-                TextWordBreak::Normal => WordBreak::Normal,
-                TextWordBreak::BreakAll => WordBreak::BreakAll,
-                TextWordBreak::KeepAll => WordBreak::KeepAll,
-            }));
-            builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
-                TextOverflowWrap::Normal => OverflowWrap::Normal,
-                TextOverflowWrap::Anywhere => OverflowWrap::Anywhere,
-                TextOverflowWrap::BreakWord => OverflowWrap::BreakWord,
-            }));
-            builder.push_default(StyleProperty::TextWrapMode(if breaks.wrap {
-                TextWrapMode::Wrap
-            } else {
-                TextWrapMode::NoWrap
-            }));
-        }
+        configure_layout(&mut builder, style, breaks);
         builder.build(text)
     }
 
@@ -835,11 +802,57 @@ impl TextSystem {
         }
         self.fonts = crate::font_system::font_context();
         self.layouts = LayoutContext::new();
+        self.color_layouts = LayoutContext::new();
         self.shape_cache.clear();
         self.shape_order.clear();
         self.shape_cache_bytes = 0;
         self.layout_cache = Default::default();
         self.page_font_epoch = epoch;
+    }
+}
+
+fn configure_layout<B: parley::Brush>(
+    builder: &mut parley::RangedBuilder<'_, B>,
+    style: &TextStyle,
+    breaks: Option<TextBreakStyle>,
+) {
+    let family = font_family_source(&style.family);
+    builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
+    builder.push_default(StyleProperty::Locale(text_language(style)));
+    builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
+    builder.push_default(StyleProperty::FontWeight(FontWeight::new(
+        style.weight.clamp(1.0, 1000.0),
+    )));
+    builder.push_default(StyleProperty::FontStyle(if style.italic {
+        FontStyle::Italic
+    } else {
+        FontStyle::Normal
+    }));
+    builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
+    builder.push_default(StyleProperty::WordSpacing(style.word_spacing));
+    builder.push_default(StyleProperty::LineHeight(match style.line_height {
+        CssLineHeight::Normal => LineHeight::default(),
+        CssLineHeight::Number(number) => LineHeight::FontSizeRelative(number.max(0.0)),
+        CssLineHeight::Length(px) => LineHeight::Absolute(px.max(0.0)),
+    }));
+    builder.push_default(StyleProperty::Underline(style.underline));
+    builder.push_default(StyleProperty::Strikethrough(style.strikethrough));
+    if let Some(breaks) = breaks {
+        builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
+            TextWordBreak::Normal => WordBreak::Normal,
+            TextWordBreak::BreakAll => WordBreak::BreakAll,
+            TextWordBreak::KeepAll => WordBreak::KeepAll,
+        }));
+        builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
+            TextOverflowWrap::Normal => OverflowWrap::Normal,
+            TextOverflowWrap::Anywhere => OverflowWrap::Anywhere,
+            TextOverflowWrap::BreakWord => OverflowWrap::BreakWord,
+        }));
+        builder.push_default(StyleProperty::TextWrapMode(if breaks.wrap {
+            TextWrapMode::Wrap
+        } else {
+            TextWrapMode::NoWrap
+        }));
     }
 }
 
@@ -879,6 +892,62 @@ thread_local! {
 /// Shape one unbroken text piece at CSS-pixel scale.
 pub fn shape(text: &str, style: &TextStyle) -> ShapedText {
     TEXT.with_borrow_mut(|system| system.shape(text, style))
+}
+
+/// Color-only ranges share a whole-paragraph shaping pass, preserving bidi,
+/// joining, ligatures, wrapping, and the single searchable/copyable string.
+/// CSS Text 3 #boundary-shaping / #word-break-shaping (81c27f686901).
+pub(crate) fn colored_lines(
+    text: &str,
+    style: &TextStyle,
+    width: Option<f32>,
+    colors: impl Iterator<Item = (Range<usize>, [u8; 3])>,
+) -> Vec<ShapedText> {
+    TEXT.with_borrow_mut(|system| {
+        system.refresh_page_fonts();
+        let mut builder = system
+            .color_layouts
+            .ranged_builder(&mut system.fonts, text, 1.0, true);
+        configure_layout(
+            &mut builder,
+            style,
+            Some(TextBreakStyle {
+                wrap: width.is_some(),
+                overflow_wrap: TextOverflowWrap::Anywhere,
+                ..TextBreakStyle::default()
+            }),
+        );
+        for (range, color) in colors {
+            builder.push(StyleProperty::Brush(Some(color)), range);
+        }
+        let mut layout = builder.build(text);
+        layout.break_all_lines(width.map(|w| w.max(0.01)));
+        layout
+            .lines()
+            .take(if width.is_some() { usize::MAX } else { 1 })
+            .map(|line| {
+                let mut shaped = retain_line(text, &line);
+                if width.is_none() {
+                    // Match shape()/retain_first_line for unwrapped text.
+                    shaped.text = text.to_string();
+                }
+                for (run, item) in
+                    shaped
+                        .runs
+                        .iter_mut()
+                        .zip(line.items().filter_map(|item| match item {
+                            PositionedLayoutItem::GlyphRun(run) => Some(run),
+                            _ => None,
+                        }))
+                {
+                    run.color = item.style().brush;
+                }
+                shaped.underline = style.underline;
+                shaped.strikethrough = style.strikethrough;
+                shaped
+            })
+            .collect()
+    })
 }
 
 /// Canvas metrics stay in fractional CSS pixels, regardless of bitmap/device
@@ -931,7 +1000,7 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
     shaped
 }
 
-fn retain_line(text: &str, line: &parley::Line<'_, ()>) -> ShapedText {
+fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> ShapedText {
     let range = line.text_range();
     let line_text = &text[range.clone()];
     let metrics = line.metrics();
@@ -985,6 +1054,7 @@ fn retain_line(text: &str, line: &parley::Line<'_, ()>) -> ShapedText {
         runs.push(ShapedRun {
             font: FontFace(run.font().clone()),
             font_size: run.font_size(),
+            color: None,
             normalized_coords: run.normalized_coords().to_vec(),
             glyphs: glyph_run
                 .positioned_glyphs()
