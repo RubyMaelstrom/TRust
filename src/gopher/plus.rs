@@ -81,7 +81,7 @@ enum DotState {
 /// `read` is cancellation safe: partially recognized dot prefixes are kept
 /// here, and after producing bytes it never awaits an empty socket buffer.
 pub(crate) struct Transfer {
-    stream: BufReader<TcpStream>,
+    stream: BufReader<transport::Connection>,
     framing: Framing,
     dot_state: DotState,
     pending: VecDeque<u8>,
@@ -258,7 +258,7 @@ pub fn information_target(
 ) -> Result<Link, String> {
     let as_gopher = |link: &Link| match link {
         Link::Gopher(url) => Some(url.clone()),
-        Link::Http(url) if url.scheme() == "gopher" => GopherUrl::parse(url.as_str()),
+        Link::Http(url) if is_scheme(url.scheme()) => GopherUrl::parse(url.as_str()),
         _ => None,
     };
     let target = if page {
@@ -286,7 +286,7 @@ pub(super) fn information_lines(url: &GopherUrl, body: &[u8], encoding: Encoding
     while let Some(raw) = source.next() {
         if let Some(info) = raw.strip_prefix(b"+INFO:") {
             let (_, label, mut link) =
-                menu_item(info.strip_prefix(b" ").unwrap_or(info), &mut None);
+                menu_item(url, info.strip_prefix(b" ").unwrap_or(info), &mut None);
             target = if let Some(Link::Gopher(item)) = &link {
                 let mut item = item.clone();
                 if item.host == url.host && item.port == url.port && item.selector == url.selector {
@@ -336,7 +336,7 @@ pub(super) fn information_lines(url: &GopherUrl, body: &[u8], encoding: Encoding
                 .strip_prefix(b" ")
                 .unwrap_or(&raw[colon + 1..]);
             if !rest.is_empty() {
-                let (_, label, link) = menu_item(rest, &mut None);
+                let (_, label, link) = menu_item(url, rest, &mut None);
                 // UMN §2.5: an explicit attribute value takes precedence
                 // over a reference to a separate attribute document.
                 if link.is_none() || !source.peek().is_some_and(|next| next.starts_with(b" ")) {

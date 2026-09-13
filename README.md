@@ -91,7 +91,7 @@ it is not a separate browser backend and is omitted from ordinary builds.
 
 ```
 trust <host> [port]          # telnet (port may be a name: smtp, nntp, ...)
-trust gemini://gem.sdf.org   # or gopher://, http(s)://, finger://, ...
+trust gemini://gem.sdf.org   # or gopher://, gophers://, http(s)://, finger://, ...
 trust                        # start at the command prompt
 trust-desktop https://example.com  # native graphical browser
 trust-desktop --renderer=auto https://example.com    # default: Hybrid, then CPU fallback
@@ -189,6 +189,17 @@ UTF-8 and otherwise uses Latin-1. **S** (or `save`) saves received source bytes.
 Wrapped menu entries remain clickable on every row, with one keyboard stop.
 Recent Gopher pages and view settings remain in a bounded in-memory reading
 history; `reload` explicitly requests a fresh copy.
+
+`gophers://` uses Gopher over TLS, on port 70 unless a port is specified.
+Links to the same host and port retain TLS, including searches and Gopher+
+formats. Explicit `gophers://` requests require TLS and never fall back to
+unencrypted Gopher. Bookmarks retain the chosen scheme.
+
+Gophers and Gemini accept server certificates without CA, hostname, expiry or
+fingerprint-pin checks, including certificate replacements. Traffic is
+encrypted, but the server's identity is not verified. Existing Gemini server
+pins are ignored; Gemini client identities still work. HTTPS uses WebPKI and
+Telnet TLS keeps its existing `known_hosts` pinning.
 
 Search links prompt for a query in either frontend. A bookmark of the search
 endpoint prompts again; a bookmark containing a query repeats that search.

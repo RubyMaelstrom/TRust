@@ -433,6 +433,7 @@ mod tests {
         let f = Fixture::new();
         for url in [
             "gopher://e/7/s%09rust%20lang",
+            "gophers://e/7/s%09rust%20lang",
             "https://e/path?q=1#part",
             "http://e/path",
             "gemini://e/path",
@@ -454,7 +455,7 @@ mod tests {
                 url
             );
         }
-        assert_eq!(entries(&read(&f.path()).unwrap()).unwrap().len(), 9);
+        assert_eq!(entries(&read(&f.path()).unwrap()).unwrap().len(), 10);
     }
     #[test]
     fn edits_and_undo_preserve_concurrent_additions_and_unknown_fields() {

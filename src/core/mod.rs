@@ -2711,7 +2711,7 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
     }
     if address
         .split_once(':')
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("gopher"))
+        .is_some_and(|(scheme, _)| gopher::is_scheme(scheme))
     {
         return gopher::GopherUrl::parse(address)
             .map(|url| (Link::Gopher(url), false))
@@ -2764,6 +2764,7 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
             Link::Gopher(gopher::GopherUrl {
                 host: host.to_string(),
                 port: 70,
+                tls: false,
                 item_type: '1',
                 query: None,
                 gopher_plus: None,
@@ -2818,7 +2819,7 @@ fn split_host_port(address: &str) -> (&str, Option<u16>) {
 mod tests {
     #[tokio::test]
     async fn gopher_plus_desktop_routes_views_and_information_by_representation() {
-        for (kind, command, bytes, expected) in [
+        for (tls, (kind, command, bytes, expected)) in [
             (
                 '0',
                 b"+text/html".as_slice(),
@@ -2843,9 +2844,13 @@ mod tests {
                 b"+INFO: 9A file\t/item\te\t70\t+\r\n+VIEWS:\r\n image/webp: <1k>\r\n".to_vec(),
                 "info",
             ),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [(false, case.clone()), (true, case)])
+        {
             let response = [format!("+{}\r\n", bytes.len()).as_bytes(), &bytes].concat();
-            let (mut url, server) = crate::gopher::file_tests::serve(response, b"/item").await;
+            let (mut url, server) =
+                crate::gopher::file_tests::serve_transport(response, b"/item", tls).await;
             url.item_type = kind;
             let url = url.with_plus(command);
             let mut browser = BrowserController::new(
@@ -2906,7 +2911,7 @@ mod tests {
 
     #[tokio::test]
     async fn gopher_generic_menu_files_open_in_the_desktop_and_restore_the_menu() {
-        for (bytes, selector, image) in [
+        for (tls, (bytes, selector, image)) in [
             (
                 crate::gopher::file_tests::webp(),
                 b"/comic panel 1.webp".as_slice(),
@@ -2917,9 +2922,15 @@ mod tests {
                 b"/archive.zip".as_slice(),
                 false,
             ),
-        ] {
-            let (url, server) = crate::gopher::file_tests::serve(bytes, selector).await;
-            let parent = crate::gopher::GopherUrl::parse("gopher://example.test/1/menu").unwrap();
+        ]
+        .into_iter()
+        .flat_map(|case| [(false, case.clone()), (true, case)])
+        {
+            let (url, server) =
+                crate::gopher::file_tests::serve_transport(bytes, selector, tls).await;
+            let mut parent = url.clone();
+            parent.item_type = '1';
+            parent.selector = b"/menu".to_vec();
             let menu = format!(
                 "9File\t{}\t{}\t{}\r\n.\r\n",
                 String::from_utf8_lossy(selector),
@@ -3874,6 +3885,7 @@ mod tests {
             Link::Gopher(gopher::GopherUrl {
                 host: host.to_string(),
                 port: 70,
+                tls: false,
                 item_type: '1',
                 query: None,
                 gopher_plus: None,
@@ -3984,6 +3996,7 @@ mod tests {
             Link::Gopher(gopher::GopherUrl {
                 host: host.to_string(),
                 port: 70,
+                tls: false,
                 item_type: '1',
                 query: None,
                 gopher_plus: None,

@@ -4,13 +4,19 @@
 
 pub(crate) mod ansi;
 mod plus;
+#[cfg(test)]
+pub(crate) mod tls_tests;
+mod transport;
 pub use plus::information_target;
 pub(crate) use plus::open;
+pub(crate) use transport::connect;
 
 use crate::doc::{Doc, DocLine, Kind, Link, push_wrapped};
 use crate::{gemini, text_reply};
 use std::{fmt, future::Future, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep_until, timeout};
 
@@ -27,6 +33,7 @@ const UPDATE_INTERVAL: Duration = Duration::from_millis(150);
 pub struct GopherUrl {
     pub host: String,
     pub port: u16,
+    pub tls: bool,
     pub item_type: char,
     /// Opaque protocol octets: display encoding must never change a selector.
     pub selector: Vec<u8>,
@@ -39,6 +46,7 @@ impl GopherUrl {
         Self {
             host,
             port,
+            tls: false,
             item_type,
             selector,
             query: None,
@@ -51,7 +59,7 @@ impl GopherUrl {
             return None;
         }
         let (scheme, rest) = input.split_once("://")?;
-        if !scheme.eq_ignore_ascii_case("gopher") {
+        if !is_scheme(scheme) {
             return None;
         }
         // Split BEFORE percent decoding. Generic URL path normalization would
@@ -85,6 +93,7 @@ impl GopherUrl {
             item_type,
             fields.next()?.to_vec(),
         );
+        result.tls = scheme.eq_ignore_ascii_case("gophers");
         result.query = fields.next().map(<[u8]>::to_vec);
         result.gopher_plus = fields.next().map(<[u8]>::to_vec);
         // RFC 4266 §2.3 requires an empty search placeholder in plus URLs.
@@ -138,6 +147,10 @@ impl GopherUrl {
         result.query = Some(query.as_bytes().to_vec());
         result.validate()?;
         Ok(result)
+    }
+
+    pub fn scheme(&self) -> &'static str {
+        if self.tls { "gophers" } else { "gopher" }
     }
 
     pub fn needs_query(&self) -> bool {
@@ -213,6 +226,12 @@ impl GopherUrl {
     }
 }
 
+/// Gophers uses the RFC 4266 URL form over TLS, conventionally on port 70
+/// (curl URL syntax, GOPHERS). The selector remains opaque in either scheme.
+pub fn is_scheme(scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("gopher") || scheme.eq_ignore_ascii_case("gophers")
+}
+
 fn percent_decode(value: &str) -> Option<Vec<u8>> {
     let mut result = Vec::with_capacity(value.len());
     let mut bytes = value.bytes();
@@ -243,9 +262,9 @@ fn encode(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
 impl fmt::Display for GopherUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.host.contains(':') {
-            write!(f, "gopher://[{}]", self.host)?;
+            write!(f, "{}://[{}]", self.scheme(), self.host)?;
         } else {
-            write!(f, "gopher://{}", self.host)?;
+            write!(f, "{}://{}", self.scheme(), self.host)?;
         }
         if self.port != 70 {
             write!(f, ":{}", self.port)?;
@@ -407,19 +426,6 @@ async fn connect_addresses(host: &str, port: u16) -> std::io::Result<TcpStream> 
             }
         }
     }
-}
-
-pub async fn connect(url: &GopherUrl) -> Result<TcpStream, String> {
-    let request = url.request()?;
-    let mut stream = timeout(CONNECT_TIMEOUT, connect_addresses(&url.host, url.port))
-        .await
-        .map_err(|_| "Gopher connection timed out".to_string())?
-        .map_err(|e| format!("Gopher connection failed: {e}"))?;
-    timeout(CONNECT_TIMEOUT, stream.write_all(&request))
-        .await
-        .map_err(|_| "Gopher request timed out".to_string())?
-        .map_err(|e| format!("Gopher request failed: {e}"))?;
-    Ok(stream)
 }
 
 pub async fn fetch(url: &GopherUrl) -> Result<Page, String> {
@@ -617,6 +623,7 @@ pub fn status(url: &GopherUrl, reply: &text_reply::Reply) -> String {
 }
 
 fn menu_item<'a>(
+    base: &GopherUrl,
     line: &'a [u8],
     previous_type: &mut Option<char>,
 ) -> (char, &'a [u8], Option<Link>) {
@@ -652,6 +659,9 @@ fn menu_item<'a>(
             && let (Some(host), Some(port)) = (host, port)
         {
             let mut target = GopherUrl::new(host.clone(), port, t, selector.to_vec());
+            // RFC 1436 descriptors have no scheme. Retain TLS for the same
+            // endpoint; other endpoints need an explicit URL: gophers link.
+            target.tls = base.tls && target.host == base.host && target.port == base.port;
             // UMN Gopher+ §2.2: capability is per item, in the fifth field.
             if let Some(capability @ (b"+" | b"?")) =
                 fields.next().and_then(|f| f.split(|b| *b == b'\t').next())
@@ -691,6 +701,7 @@ pub fn absolute_link(target: &str) -> Option<Link> {
         matches!(
             s.to_ascii_lowercase().as_str(),
             "gopher"
+                | "gophers"
                 | "gemini"
                 | "http"
                 | "https"
@@ -715,7 +726,7 @@ fn resolve_gmi(base: &GopherUrl, target: &str) -> Link {
         return link;
     }
     if let Some(rest) = target.strip_prefix("//") {
-        return GopherUrl::parse(&format!("gopher://{rest}"))
+        return GopherUrl::parse(&format!("{}://{rest}", base.scheme()))
             .map(Link::Gopher)
             .unwrap_or_else(|| Link::External(target.into()));
     }
@@ -733,12 +744,15 @@ fn resolve_gmi(base: &GopherUrl, target: &str) -> Link {
         gemini::normalize(&format!("{dir}{target}"))
     };
     let t = if selector.ends_with('/') { '1' } else { '0' };
-    Link::Gopher(GopherUrl::new(
+    let mut url = GopherUrl::new(
         base.host.clone(),
         base.port,
         t,
         percent_decode(&selector).unwrap_or_else(|| selector.into_bytes()),
-    ))
+    );
+    // RFC 3986 §5.2.2: relative references inherit their base's scheme.
+    url.tls = base.tls;
+    Link::Gopher(url)
 }
 
 fn decode(bytes: &[u8], encoding: Encoding) -> String {
@@ -886,7 +900,7 @@ fn render_impl(url: &GopherUrl, mut page: Page, width: usize, colors: bool) -> D
                 break;
             }
             let (t, label, link) = if menu {
-                menu_item(line, &mut previous_type)
+                menu_item(url, line, &mut previous_type)
             } else {
                 (
                     '0',
@@ -1037,23 +1051,43 @@ pub(crate) mod file_tests {
         body: Vec<u8>,
         selector: &[u8],
     ) -> (GopherUrl, tokio::task::JoinHandle<Vec<u8>>) {
+        serve_transport(body, selector, false).await
+    }
+
+    pub(crate) async fn serve_transport(
+        body: Vec<u8>,
+        selector: &[u8],
+        tls: bool,
+    ) -> (GopherUrl, tokio::task::JoinHandle<Vec<u8>>) {
+        async fn respond(
+            mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+            body: Vec<u8>,
+        ) -> Vec<u8> {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() <= MAX_REQUEST + 2);
+            }
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+            request
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = GopherUrl::new(
+        let mut url = GopherUrl::new(
             "127.0.0.1".into(),
             listener.local_addr().unwrap().port(),
             '9',
             selector.to_vec(),
         );
+        url.tls = tls;
         let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0];
-            while !request.ends_with(b"\r\n") {
-                stream.read_exact(&mut byte).await.unwrap();
-                request.push(byte[0]);
+            let (stream, _) = listener.accept().await.unwrap();
+            if tls {
+                let stream = tls_tests::acceptor().accept(stream).await.unwrap();
+                respond(stream, body).await
+            } else {
+                respond(stream, body).await
             }
-            stream.write_all(&body).await.unwrap();
-            request
         });
         (url, task)
     }

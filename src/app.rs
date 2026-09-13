@@ -3006,7 +3006,7 @@ impl App {
         self.navigate_to(doc);
     }
 
-    /// Route an open target to the right protocol: gopher:// and
+    /// Route an open target to the right protocol: gopher(s):// and
     /// gemini:// URLs (or ports 70/1965) get the browser, everything
     /// else is telnet (TLS for telnets:// / port 992).
     /// Open a target. An explicit scheme always wins. With no scheme, a bare
@@ -3023,7 +3023,7 @@ impl App {
         }
         if target
             .split_once(':')
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("gopher"))
+            .is_some_and(|(scheme, _)| gopher::is_scheme(scheme))
         {
             match GopherUrl::parse(target) {
                 Some(url) => self.start_fetch(Link::Gopher(url)),
@@ -3121,6 +3121,7 @@ impl App {
                 Some(70) => self.start_fetch(Link::Gopher(GopherUrl {
                     host: host.to_string(),
                     port: 70,
+                    tls: false,
                     item_type: '1',
                     query: None,
                     gopher_plus: None,
@@ -9135,6 +9136,7 @@ mod tests {
             "http://example.test/",
             "https://example.test/",
             "gopher://example.test/7/a/../search%FF%09rust%20lang",
+            "gophers://example.test/7/a/../search%FF%09rust%20lang",
             "gemini://example.test/",
             "finger://example.test/alice",
             "whois://example.test/example.test",
@@ -10030,6 +10032,7 @@ mod tests {
                     Link::Gopher(crate::gopher::GopherUrl {
                         host: String::from("test.host"),
                         port: 70,
+                        tls: false,
                         item_type: '1',
                         query: None,
                         gopher_plus: None,
@@ -14576,7 +14579,7 @@ mod tests {
     async fn gopher_generic_menu_files_open_in_the_terminal_and_restore_the_menu() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-        for (bytes, selector, image) in [
+        for (tls, (bytes, selector, image)) in [
             (
                 crate::gopher::file_tests::webp(),
                 b"/comic panel 1.webp".as_slice(),
@@ -14587,9 +14590,15 @@ mod tests {
                 b"/archive.zip".as_slice(),
                 false,
             ),
-        ] {
-            let (url, server) = crate::gopher::file_tests::serve(bytes.clone(), selector).await;
-            let parent = crate::gopher::GopherUrl::parse("gopher://example.test/1/menu").unwrap();
+        ]
+        .into_iter()
+        .flat_map(|case| [(false, case.clone()), (true, case)])
+        {
+            let (url, server) =
+                crate::gopher::file_tests::serve_transport(bytes.clone(), selector, tls).await;
+            let mut parent = url.clone();
+            parent.item_type = '1';
+            parent.selector = b"/menu".to_vec();
             let menu = format!(
                 "9File\t{}\t{}\t{}\r\n.\r\n",
                 String::from_utf8_lossy(selector),
@@ -14883,6 +14892,7 @@ mod tests {
         doc.lines[0].link = Some(Link::Gopher(crate::gopher::GopherUrl {
             host: String::from("test.host"),
             port: 70,
+            tls: false,
             item_type: 'p',
             query: None,
             gopher_plus: None,
