@@ -121,6 +121,7 @@ fn ensure_embedded_heart_assets(store: &ImageStore) -> Result<(), String> {
 
 #[derive(Debug)]
 enum DesktopEvent {
+    Bookmarks(trust::bookmarks::Completion),
     BrowserWake,
     ChromeTick,
     ImageLoaded {
@@ -810,11 +811,7 @@ impl ProtocolPageCache {
             return false;
         }
         self.selected = selected;
-        self.layout = trust::render::documents::paint_doc_selected(
-            &self.document,
-            self.viewport.width,
-            selected,
-        );
+        trust::render::documents::select(&mut self.layout, &self.document, selected);
         true
     }
 
@@ -1112,6 +1109,7 @@ fn collect_visible_image_handles(
 }
 
 struct TerminalSession {
+    address: String,
     view: trust::terminal_view::TerminalView,
     handle: trust::telnet::Handle,
     cols: u16,
@@ -1255,6 +1253,10 @@ struct DesktopApp {
     clipboard: Option<arboard::Clipboard>,
     exit_requested: bool,
     terminal: Option<TerminalSession>,
+    bookmark_terminal: Option<TerminalSession>,
+    bookmarks: Option<trust::bookmarks::Worker>,
+    bookmark_filter: String,
+    gopher_query: Option<trust::gopher::GopherUrl>,
     pending_page_keys: VecDeque<PendingPageKey>,
     keyboard_target: Option<PageHit>,
     pressed_hit: Option<PageHit>,
@@ -1590,6 +1592,10 @@ impl DesktopApp {
             clipboard: arboard::Clipboard::new().ok(),
             exit_requested: false,
             terminal: None,
+            bookmark_terminal: None,
+            bookmarks: None,
+            bookmark_filter: String::new(),
+            gopher_query: None,
             pending_page_keys: VecDeque::new(),
             keyboard_target: None,
             pressed_hit: None,
@@ -1933,6 +1939,19 @@ impl DesktopApp {
     }
 
     fn dispatch(&mut self, action: UserAction) {
+        if matches!(action, UserAction::Back)
+            && self.bookmark_terminal.is_some()
+            && self.browser.snapshot().address == "about:bookmarks"
+        {
+            self.terminal = self.bookmark_terminal.take();
+            let address = self.terminal.as_ref().unwrap().address.clone();
+            self.browser.open_external_session(address);
+            self.protocol_page = None;
+            self.set_focus(FocusTarget::Page);
+            self.request_redraw();
+            return;
+        }
+
         let leaves_terminal = matches!(
             &action,
             UserAction::Back
@@ -2126,6 +2145,16 @@ impl DesktopApp {
     }
 
     fn navigate(&mut self, address: String) {
+        if let Some(url) = trust::gopher::GopherUrl::parse(&address)
+            && (url.needs_query() || url.item_type == '8' || url.is_download())
+        {
+            self.activate_link(Link::Gopher(url));
+            return;
+        }
+        if address.eq_ignore_ascii_case("about:bookmarks") {
+            self.bookmark_command("bookmarks");
+            return;
+        }
         if let Some((host, port, tls)) = parse_telnet_target(&address) {
             self.start_terminal(host, port, tls, address);
         } else {
@@ -2140,6 +2169,12 @@ impl DesktopApp {
     }
 
     fn start_terminal(&mut self, host: String, port: u16, tls: bool, address: String) {
+        if let Some(session) = self.bookmark_terminal.take() {
+            let _ = session
+                .handle
+                .commands
+                .try_send(trust::telnet::Command::Close);
+        }
         if let Some(session) = self.terminal.take() {
             let _ = session
                 .handle
@@ -2166,6 +2201,7 @@ impl DesktopApp {
         self.page_layout = None;
         self.protocol_page = None;
         self.terminal = Some(TerminalSession {
+            address,
             view,
             handle,
             cols: 80,
@@ -2285,6 +2321,9 @@ impl DesktopApp {
             };
         }
         match self.browser.current_page().map(|page| &page.document) {
+            Some(FetchedDocument::Http(_)) if snapshot.address.starts_with("gopher:") => {
+                String::from("GOPHER")
+            }
             Some(FetchedDocument::Http(response)) => format!("HTTP:{}", response.status),
             Some(FetchedDocument::Gemini(response)) => format!("GEMINI:{}", response.status),
             Some(FetchedDocument::Gopher(_)) => String::from("GOPHER"),
@@ -3066,6 +3105,7 @@ impl DesktopApp {
     }
 
     fn open_command(&mut self, replace_with_address: bool) {
+        self.gopher_query = None;
         if self.focus == FocusTarget::Download {
             self.browser.dismiss_download_offer();
         }
@@ -3078,6 +3118,7 @@ impl DesktopApp {
     }
 
     fn close_command(&mut self) {
+        self.gopher_query = None;
         self.set_focus(if self.browser.download_offer().is_some() {
             FocusTarget::Download
         } else {
@@ -3351,13 +3392,19 @@ impl DesktopApp {
         self.protocol_pointer_selection = false;
         if cache.document.text_view().is_some() {
             if let Key::Character(key) = &input.key {
+                if cache.document.gopher.is_some() && key.eq_ignore_ascii_case("e") {
+                    self.browser.gopher_encoding();
+                    self.request_redraw();
+                    return true;
+                }
                 if cache.document.whois.is_some() && key.eq_ignore_ascii_case("e") {
                     self.browser.whois_encoding(None);
                     self.request_redraw();
                     return true;
                 }
                 if (cache.document.registration_section().is_some()
-                    || cache.document.dict.is_some())
+                    || cache.document.dict.is_some()
+                    || cache.document.gopher.is_some())
                     && key.eq_ignore_ascii_case("s")
                 {
                     self.browser.offer_whois_export(None);
@@ -3551,6 +3598,21 @@ impl DesktopApp {
         let pressed = event.state == ElementState::Pressed;
         if pressed {
             self.protocol_pointer_selection = false;
+        }
+        if pressed
+            && self.terminal.is_none()
+            && !self.modifiers.super_key()
+            && let WinitKey::Character(character) = &event.logical_key
+            && character.eq_ignore_ascii_case("b")
+        {
+            if self.modifiers.control_key() && !self.modifiers.alt_key() {
+                self.bookmark_command("bookmark");
+                return;
+            }
+            if self.modifiers.alt_key() && !self.modifiers.control_key() {
+                self.bookmark_command("bookmarks");
+                return;
+            }
         }
         let command = self.modifiers.control_key() || self.modifiers.super_key();
         if pressed
@@ -3997,14 +4059,107 @@ impl DesktopApp {
         }
     }
 
+    fn bookmark_command(&mut self, command: &str) {
+        let current = if let Some(terminal) = &self.terminal {
+            trust::gopher::absolute_link(&terminal.address)
+                .map(|link| (link, terminal.address.clone()))
+        } else {
+            self.browser.current_page().map(|page| {
+                let title = self
+                    .protocol_page
+                    .as_ref()
+                    .map(|cache| trust::bookmarks::suggested_title(&cache.document))
+                    .unwrap_or_else(|| page.target().to_string());
+                (page.target().clone(), title)
+            })
+        };
+        let selected = self
+            .protocol_page
+            .as_ref()
+            .and_then(|cache| {
+                cache.selected_link().map(|link| {
+                    let title = cache
+                        .selected
+                        .and_then(|i| cache.document.lines.get(i))
+                        .map(|l| l.text.clone())
+                        .unwrap_or_else(|| link.to_string());
+                    (link.clone(), title)
+                })
+            })
+            .or_else(|| {
+                trust::gopher::absolute_link(&self.link_preview).map(|link| {
+                    let title = link.to_string();
+                    (link, title)
+                })
+            });
+        let context = trust::bookmarks::Context { current, selected };
+        let result = trust::bookmarks::operation(command, &context).and_then(|operation| {
+            if let trust::bookmarks::Operation::List(filter) = &operation {
+                self.bookmark_filter = filter.clone();
+            }
+            if self.bookmarks.is_none() {
+                let proxy = self.event_proxy.clone();
+                self.bookmarks = Some(trust::bookmarks::Worker::start(
+                    &self.runtime,
+                    move |completion| {
+                        let _ = proxy.send_event(DesktopEvent::Bookmarks(completion));
+                    },
+                ));
+            }
+            self.bookmarks.as_ref().unwrap().submit(operation)
+        });
+        self.browser.set_status(match result {
+            Ok(()) => "Updating bookmarks…".into(),
+            Err(e) => e,
+        });
+        self.request_redraw();
+    }
+
+    fn on_bookmark(&mut self, completion: trust::bookmarks::Completion) {
+        match completion.result {
+            Ok(outcome) => {
+                if let Some(source) = outcome.listing {
+                    if self.terminal.is_some() {
+                        self.bookmark_terminal = self.terminal.take();
+                    }
+                    self.open_internal_page("about:bookmarks", source.into_bytes());
+                    self.close_command();
+                } else if self.browser.snapshot().address == "about:bookmarks"
+                    && let Some(worker) = &self.bookmarks
+                {
+                    let _ = worker.submit(trust::bookmarks::Operation::List(
+                        self.bookmark_filter.clone(),
+                    ));
+                }
+                self.browser.set_status(outcome.message);
+            }
+            Err(error) => self.browser.set_status(error),
+        }
+        self.request_redraw();
+    }
+
     fn execute_command(&mut self) {
         let line = self.command.text();
+        if let Some(base) = self.gopher_query.take() {
+            match base.with_query(&line) {
+                Ok(url) => {
+                    self.close_command();
+                    self.navigate(url.to_string());
+                }
+                Err(error) => self.browser.set_status(error),
+            }
+            return;
+        }
         let command = line.trim();
         self.command_history.push(command);
         let mut parts = command.split_whitespace();
         let verb = parts.next().unwrap_or("").to_ascii_lowercase();
         match verb.as_str() {
             "" => self.close_command(),
+            "bookmark" | "bookmarks" => {
+                self.bookmark_command(command);
+                self.close_command();
+            }
             "q" | "quit" | "exit" => self.exit_requested = true,
             "back" => {
                 self.close_command();
@@ -4286,7 +4441,8 @@ impl DesktopApp {
             .map(|renderer| renderer.kind().name())
             .unwrap_or("uninitialized");
         format!(
-            "# TRust status\n\n```\nAddress: {address}\nState: {status}\nRenderer: {renderer}\nViewport: {vw:.0} × {vh:.0} CSS px\nDevice scale: {scale:.2}\nScroll: {sx:.0}, {sy:.0} CSS px\n```\n",
+            "# TRust status\n\n```\nAddress: {address}\nState: {status}\nRenderer: {renderer}\nViewport: {vw:.0} × {vh:.0} CSS px\nDevice scale: {scale:.2}\nScroll: {sx:.0}, {sy:.0} CSS px\n{paths}\n```\n",
+            paths = trust::storage::Paths::discover().map(|p| p.report()).unwrap_or_else(|e| e),
             address = snapshot.address,
             status = snapshot.status,
             vw = self.browser_viewport().width,
@@ -4765,6 +4921,36 @@ impl DesktopApp {
     }
 
     fn activate_link(&mut self, link: Link) {
+        if let Link::Gopher(url) = &link {
+            if url.needs_query() {
+                self.gopher_query = Some(url.clone());
+                self.command.set_text("");
+                self.set_focus(FocusTarget::Command);
+                self.browser
+                    .set_status("Gopher search: enter a query, then Enter");
+                return;
+            }
+            if url.item_type == '8' {
+                self.start_terminal(
+                    url.host.clone(),
+                    url.port,
+                    false,
+                    Link::Telnet {
+                        host: url.host.clone(),
+                        port: url.port,
+                        tls: false,
+                    }
+                    .to_string(),
+                );
+                return;
+            }
+            if url.is_download() {
+                self.browser.offer_gopher_download(url);
+                self.set_focus(FocusTarget::Download);
+                self.request_redraw();
+                return;
+            }
+        }
         if let Some(action) = trust::dict::Action::from_link(&link)
             && let Some(FetchedDocument::Dict(page)) =
                 self.browser.current_page().map(|p| &p.document)
@@ -5736,6 +5922,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopEvent) {
         match event {
+            DesktopEvent::Bookmarks(completion) => self.on_bookmark(completion),
             DesktopEvent::BrowserWake => {
                 let outcome = self.process_browser_events();
                 if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
@@ -5935,7 +6122,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             DesktopEvent::Telnet(event) => {
                 match event {
                     trust::telnet::Event::Connected { peer, tls } => {
-                        if let Some(terminal) = &mut self.terminal {
+                        if let Some(terminal) =
+                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
+                        {
                             terminal.connected = true;
                         }
                         self.browser.set_status(format!(
@@ -5944,7 +6133,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                         ));
                     }
                     trust::telnet::Event::Data(data) => {
-                        if let Some(terminal) = &mut self.terminal {
+                        if let Some(terminal) =
+                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
+                        {
                             for reply in terminal.view.process(&data) {
                                 let _ = terminal
                                     .handle
@@ -5954,7 +6145,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                         }
                     }
                     trust::telnet::Event::LineMode { active, edit } => {
-                        if let Some(terminal) = &mut self.terminal {
+                        if let Some(terminal) =
+                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
+                        {
                             terminal.linemode_active = active;
                             terminal.linemode_edit = edit;
                         }
@@ -5968,7 +6161,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                         ));
                     }
                     trust::telnet::Event::Closed(reason) => {
-                        if let Some(terminal) = &mut self.terminal {
+                        if let Some(terminal) =
+                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
+                        {
                             terminal.connected = false;
                             terminal.remote_echo = false;
                             terminal.linemode_active = false;
@@ -5980,7 +6175,8 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                     }
                     trust::telnet::Event::Negotiation { command, option } => {
                         if option == libmudtelnet::telnet::op_option::ECHO
-                            && let Some(terminal) = &mut self.terminal
+                            && let Some(terminal) =
+                                self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
                         {
                             terminal.remote_echo =
                                 command == libmudtelnet::telnet::op_command::WILL;
@@ -6596,15 +6792,7 @@ fn terminal_text_style() -> TextStyle {
 }
 
 fn parse_telnet_target(address: &str) -> Option<(String, u16, bool)> {
-    let address = address.trim();
-    let tls = address.starts_with("telnets://");
-    if !tls && !address.starts_with("telnet://") {
-        return None;
-    }
-    let parsed = url::Url::parse(address).ok()?;
-    let host = parsed.host_str()?.to_string();
-    let port = parsed.port().unwrap_or(if tls { 992 } else { 23 });
-    Some((host, port, tls))
+    trust::command::telnet_target(address)
 }
 
 /// Translate the established `open host [service]` form into the graphical

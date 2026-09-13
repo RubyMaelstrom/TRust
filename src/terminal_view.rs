@@ -186,7 +186,7 @@ impl TerminalView {
         if input.state != KeyState::Pressed {
             return None;
         }
-        let bytes = match &input.key {
+        let mut bytes = match &input.key {
             Key::Character(text) if input.modifiers.control => {
                 let character = text.bytes().next()?;
                 vec![character.to_ascii_uppercase() & 0x1f]
@@ -207,6 +207,11 @@ impl TerminalView {
             Key::PageDown => b"\x1b[6~".to_vec(),
             _ => return None,
         };
+        // xterm altSendsEscape convention; preserve remote Alt+B/Alt+F editing.
+        // https://invisible-island.net/xterm/manpage/xterm.html (altSendsEscape)
+        if input.modifiers.alt && matches!(input.key, Key::Character(_)) {
+            bytes.insert(0, 0x1b);
+        }
         Some(bytes)
     }
 }
@@ -320,6 +325,26 @@ mod tests {
             DisplayCommand::GlyphRun { shaped, color, .. }
                 if shaped.text == "x" && *color == PaintColor::Rgba(170, 0, 0, 255)
         )));
+    }
+
+    #[test]
+    fn telnet_bookmark_keys_keep_control_and_alt_characters() {
+        let mut input = KeyInput {
+            key: Key::Character("b".into()),
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        input.modifiers.control = true;
+        assert_eq!(TerminalView::encode_key(&input), Some(b"\x02".to_vec()));
+        input.modifiers.control = false;
+        input.modifiers.alt = true;
+        assert_eq!(TerminalView::encode_key(&input), Some(b"\x1bb".to_vec()));
+        input.modifiers.control = true;
+        assert_eq!(TerminalView::encode_key(&input), Some(b"\x1b\x02".to_vec()));
     }
 
     #[test]

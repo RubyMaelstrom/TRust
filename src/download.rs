@@ -28,6 +28,7 @@ pub struct DownloadOffer {
     pub body: Vec<u8>,
     pub referrer: Option<Url>,
     pub(crate) fetch_body: bool,
+    pub(crate) gopher: Option<crate::gopher::GopherUrl>,
 }
 
 impl DownloadOffer {
@@ -42,7 +43,33 @@ impl DownloadOffer {
             body,
             referrer: None,
             fetch_body: false,
+            gopher: None,
         }
+    }
+
+    /// A binary Gopher item is fetched only after Save/Open is chosen.
+    /// Keep the opaque target independently of the generic URI display record.
+    pub fn from_gopher(target: crate::gopher::GopherUrl) -> Result<Self, String> {
+        target.request()?;
+        let mut name = target
+            .filename()
+            .chars()
+            .filter(|c| !c.is_control() && !matches!(c, '/' | '\\'))
+            .take(180)
+            .collect::<String>();
+        if name.is_empty() || name == "." || name == ".." {
+            name = "gopher-download.bin".into();
+        }
+        Ok(Self {
+            url: Url::parse(&target.to_string()).map_err(|e| e.to_string())?,
+            content_type: "application/octet-stream".into(),
+            suggested_filename: name,
+            content_length: None,
+            body: Vec::new(),
+            referrer: None,
+            fetch_body: true,
+            gopher: Some(target),
+        })
     }
 
     pub fn from_response(mut response: http::Response, referrer: Option<Url>) -> Self {
@@ -63,6 +90,7 @@ impl DownloadOffer {
             body: std::mem::take(&mut response.body),
             referrer,
             fetch_body,
+            gopher: None,
         }
     }
 
@@ -607,6 +635,40 @@ fn unique_path(directory: &Path, filename: &str) -> Result<PathBuf, String> {
 /// Save a buffered response or stream a fresh authenticated GET directly to a
 /// `.part` file. Publishing the completed file is the only point at which the
 /// final name appears.
+/// RFC 1436 appendix: binary data ends at EOF, with no dot unstuffing.
+async fn stream_gopher(target: &crate::gopher::GopherUrl, path: &Path) -> Result<u64, String> {
+    let mut stream = crate::gopher::connect(target).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut count = 0u64;
+    let mut bytes = [0; 65536];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1800);
+    loop {
+        let idle = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let n = tokio::time::timeout_at(deadline.min(idle), stream.read(&mut bytes))
+            .await
+            .map_err(|_| "Gopher download timed out")?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        count += n as u64;
+        if count > MAX_DOWNLOAD_BYTES {
+            return Err("Download exceeds 2 GiB limit".into());
+        }
+        file.write_all(&bytes[..n])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    file.flush().await.map_err(|e| e.to_string())?;
+    file.sync_all().await.map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
 pub async fn save(offer: &DownloadOffer, destination: &Path) -> Result<u64, String> {
     static PART_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let part_id = PART_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -618,7 +680,9 @@ pub async fn save(offer: &DownloadOffer, destination: &Path) -> Result<u64, Stri
             .unwrap_or("download"),
         std::process::id()
     ));
-    let result = if offer.fetch_body {
+    let result = if let Some(target) = &offer.gopher {
+        stream_gopher(target, &partial).await
+    } else if offer.fetch_body {
         stream_get(&offer.url, offer.referrer.as_ref(), &partial).await
     } else {
         if offer.body.len() as u64 > MAX_DOWNLOAD_BYTES {
@@ -889,6 +953,44 @@ async fn stream_chunked<R: tokio::io::AsyncBufRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gopher_binary_download_keeps_dot_lines_and_opaque_selector() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = crate::gopher::GopherUrl::parse(&format!(
+            "gopher://127.0.0.1:{}/9/a/../%FF.bin",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while stream.read_exact(&mut byte).await.is_ok() {
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            assert_eq!(request, b"/a/../\xff.bin\r\n");
+            stream
+                .write_all(b"\0binary\r\n.\r\n..dots\xff")
+                .await
+                .unwrap();
+        });
+        let offer = super::DownloadOffer::from_gopher(url).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("trust-gopher-binary-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        super::save(&offer, &path).await.unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\0binary\r\n.\r\n..dots\xff"
+        );
+        std::fs::remove_file(path).unwrap();
+        server.await.unwrap();
+    }
+
     use super::*;
 
     fn temporary_path(name: &str) -> PathBuf {
@@ -1024,6 +1126,7 @@ mod tests {
             body: Vec::new(),
             referrer: None,
             fetch_body: true,
+            gopher: None,
         };
 
         assert_eq!(save(&offer, &destination).await.unwrap(), 8);
@@ -1044,6 +1147,7 @@ mod tests {
             body: b"new".to_vec(),
             referrer: None,
             fetch_body: false,
+            gopher: None,
         };
 
         assert!(save(&offer, &destination).await.is_err());

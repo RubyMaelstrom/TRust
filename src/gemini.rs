@@ -76,6 +76,9 @@ impl GeminiUrl {
 /// gemini/gopher links are followable, everything else (`http:`,
 /// `mailto:`, ...) is External. Relative references return None.
 pub fn absolute_link(target: &str) -> Option<Link> {
+    if let Some((host, port, tls)) = crate::command::telnet_target(target) {
+        return Some(Link::Telnet { host, port, tls });
+    }
     if let Some(url) = GeminiUrl::parse(target) {
         return Some(Link::Gemini(url));
     }

@@ -41,7 +41,7 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
 pub fn document_for_viewport(page: &BrowserPage, viewport_width: f32) -> Option<Doc> {
     Some(match (&page.document, page.target()) {
         (FetchedDocument::Gopher(raw), Link::Gopher(url)) => {
-            crate::gopher::parse(url, raw.clone(), false, usize::MAX / 4)
+            crate::gopher::render(url, raw.clone(), usize::MAX / 4)
         }
         (FetchedDocument::Gemini(response), Link::Gemini(url)) => {
             crate::gemini::parse(url, &response.meta, &response.body, usize::MAX / 4)
@@ -129,14 +129,11 @@ pub fn paint_doc_selected(
         if doc.text_view().is_some() && paint.lines.len() >= crate::text_reply::MAX_ROWS {
             break;
         }
-        let (mut style, mut normal_color) = line_style(line.kind);
+        let (style, mut normal_color) = line_style(line.kind);
         if doc.text_view().is_some() && line.kind == Kind::Pre {
             normal_color = theme_color(crate::theme::TEXT);
         }
         let is_selected = selected == Some(line_index) && line.link.is_some();
-        if is_selected {
-            style.weight = 700.0;
-        }
         let color = if is_selected {
             theme_color(crate::theme::BG)
         } else {
@@ -271,6 +268,50 @@ pub fn paint_doc_selected(
     ProtocolPaint { paint, lines }
 }
 
+/// Change selection colors using retained glyph geometry. Navigation must
+/// not reshape the entire menu or move lines when the selection changes.
+pub fn select(layout: &mut ProtocolPaint, doc: &Doc, selected: Option<usize>) {
+    layout
+        .paint
+        .primitives
+        .retain(|p| !matches!(p, DisplayCommand::FillRect { .. }));
+    let mut backgrounds = Vec::new();
+    for primitive in &mut layout.paint.primitives {
+        if let DisplayCommand::GlyphRun {
+            node,
+            color,
+            origin,
+            shaped,
+            link,
+            ..
+        } = primitive
+            && let Some(line) = node.checked_sub(1).and_then(|i| doc.lines.get(i))
+        {
+            let (_, mut normal) = line_style(line.kind);
+            if doc.text_view().is_some() && line.kind == Kind::Pre {
+                normal = theme_color(crate::theme::TEXT);
+            }
+            if selected == node.checked_sub(1) && link.is_some() {
+                *color = theme_color(crate::theme::BG);
+                backgrounds.push(DisplayCommand::FillRect {
+                    rect: CssRect::new(
+                        origin.x,
+                        origin.y,
+                        shaped.advance.max(1.0),
+                        shaped
+                            .line_height
+                            .max(crate::theme::TERMINAL_FONT_SIZE_CSS_PX),
+                    ),
+                    color: normal,
+                });
+            } else {
+                *color = normal;
+            }
+        }
+    }
+    layout.paint.primitives.splice(0..0, backgrounds);
+}
+
 fn line_style(kind: Kind) -> (TextStyle, PaintColor) {
     let mut style = TextStyle {
         family: String::from(crate::theme::TERMINAL_FONT_FAMILY),
@@ -310,6 +351,41 @@ const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gopher_selection_keeps_shaping_and_hit_geometry() {
+        let url = crate::gopher::GopherUrl::parse("gopher://e").unwrap();
+        let doc = crate::gopher::parse(&url, b"0A long text link that should wrap into more than one row\t/a\te\t70\r\n1Next menu\t/b\te\t70\r\n.\r\n".to_vec(), false, usize::MAX / 4);
+        let mut layout = super::paint_doc_selected(&doc, 160.0, Some(0));
+        let geometry = layout.lines.clone();
+        let before = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|p| {
+                if let super::DisplayCommand::GlyphRun { shaped, .. } = p {
+                    Some(shaped.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        super::select(&mut layout, &doc, Some(1));
+        assert_eq!(layout.lines, geometry);
+        let after = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|p| {
+                if let super::DisplayCommand::GlyphRun { shaped, .. } = p {
+                    Some(shaped.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+    }
+
     use super::*;
 
     #[test]

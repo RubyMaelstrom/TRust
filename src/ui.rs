@@ -386,7 +386,8 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
         .iter()
         .enumerate()
         .map(|(i, line)| {
-            let mut style = match (line.link.is_some(), line.kind) {
+            let linked = g.doc.line_link(g.scroll + i).is_some();
+            let mut style = match (linked, line.kind) {
                 (true, Kind::Dir | Kind::GemLink) => Style::new()
                     .fg(theme::NEON_CYAN)
                     .add_modifier(Modifier::BOLD),
@@ -407,7 +408,7 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
                 (_, Kind::Removed) => Style::new().fg(theme::NEON_PINK),
                 _ => Style::new().fg(theme::TEXT),
             };
-            if g.selected == Some(g.scroll + i) && line.link.is_some() {
+            if g.selected == Some(g.doc.link_owner(g.scroll + i)) && linked {
                 style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
             let ranges = find_ranges(find, FindLoc::Line(g.scroll + i));

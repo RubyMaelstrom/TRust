@@ -54,7 +54,11 @@ impl Link {
     pub(crate) fn retained_memory(&self) -> (usize, bool) {
         match self {
             Link::Gopher(url) => (
-                url.host.capacity().saturating_add(url.selector.capacity()),
+                url.host
+                    .capacity()
+                    .saturating_add(url.selector.capacity())
+                    .saturating_add(url.query.as_ref().map_or(0, Vec::capacity))
+                    .saturating_add(url.gopher_plus.as_ref().map_or(0, Vec::capacity)),
                 false,
             ),
             Link::Gemini(url) => (
@@ -91,8 +95,13 @@ impl fmt::Display for Link {
             Link::Dict(url) => url.fmt(f),
             Link::Telnet { host, port, tls } => write!(
                 f,
-                "{}://{host}:{port}",
-                if *tls { "telnets" } else { "telnet" }
+                "{}://{}:{port}",
+                if *tls { "telnets" } else { "telnet" },
+                if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]")
+                } else {
+                    host.clone()
+                }
             ),
             Link::Form { .. } => f.write_str("form control"),
             Link::JsClick { href, .. } if !href.is_empty() => f.write_str(href),
@@ -456,6 +465,7 @@ pub struct Doc {
     pub lines: Vec<DocLine>,
     /// Finger view controls and one previous reply for manual comparison.
     pub finger: Option<crate::finger::View>,
+    pub gopher: Option<crate::gopher::View>,
     /// Per-server WHOIS bytes, view controls, and one successful comparison.
     pub whois: Option<crate::whois::Page>,
     /// RDAP registration record and original JSON, independent of HTTP layout.
@@ -549,6 +559,20 @@ pub struct Doc {
 }
 
 impl Doc {
+    /// Continuation rows activate their logical menu item, with one keyboard stop.
+    pub fn link_owner(&self, row: usize) -> usize {
+        self.gopher
+            .as_ref()
+            .and_then(|v| v.owners.get(row))
+            .copied()
+            .unwrap_or(row)
+    }
+    pub fn line_link(&self, row: usize) -> Option<&Link> {
+        self.lines
+            .get(self.link_owner(row))
+            .and_then(|line| line.link.as_ref())
+    }
+
     pub fn registration_section(&self) -> Option<crate::registration::Section> {
         self.whois
             .as_ref()
@@ -563,11 +587,14 @@ impl Doc {
                 .map(|page| &page.view)
                 .or_else(|| self.rdap.as_ref().map(|page| &page.view))
                 .or_else(|| self.finger.as_ref().map(|view| &view.controls))
+                .or_else(|| self.gopher.as_ref().map(|view| &view.controls))
         })
     }
 
     pub fn text_view_mut(&mut self) -> Option<&mut crate::text_reply::View> {
-        if let Some(page) = &mut self.dict {
+        if let Some(view) = &mut self.gopher {
+            Some(&mut view.controls)
+        } else if let Some(page) = &mut self.dict {
             Some(&mut page.view)
         } else if let Some(page) = &mut self.whois {
             Some(&mut page.view)
@@ -579,7 +606,16 @@ impl Doc {
     }
 
     pub fn rerender_reply(&mut self, width: usize) {
-        if let Some(page) = self.dict.take() {
+        if let Some(view) = self.gopher.take() {
+            if let Link::Gopher(url) = &self.url {
+                let reply = crate::text_reply::Reply {
+                    body: std::mem::take(&mut self.raw),
+                    finished: !view.controls.loading,
+                    notice: view.controls.notice.clone(),
+                };
+                *self = crate::gopher::render(url, crate::gopher::Page { reply, view }, width);
+            }
+        } else if let Some(page) = self.dict.take() {
             *self = crate::dict::render(page, width);
         } else if let Some(page) = self.rdap.take() {
             *self = crate::rdap::render(page, width);
@@ -610,6 +646,7 @@ impl Doc {
             url,
             lines,
             finger: None,
+            gopher: None,
             whois: None,
             rdap: None,
             dict: None,

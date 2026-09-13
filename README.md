@@ -136,16 +136,21 @@ command nor an address searches DuckDuckGo Lite.
 | `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
 | `post <url> [body]` | HTTP POST, form-urlencoded |
 | `finger [user]@<host>[:port]` | who's there / their .plan (RFC 1288); IPv6 accepts `[address]:port` |
-| `wrap [on\|off]` | toggle wrapping of a Finger, WHOIS, RDAP or DICT reply |
+| `wrap [on\|off]` | toggle wrapping of a Gopher, Finger, WHOIS, RDAP or DICT reply |
 | `changes [on\|off]` | compare a Finger or WHOIS reply with its previous successful refresh |
 | `whois <query> [server[:port]]` | WHOIS lookup via IANA or a chosen server; quote queries containing spaces |
 | `encoding [auto\|utf8\|latin1]` | select WHOIS display encoding without refetching |
-| `save [server-number]` | save original DICT text, RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
+| `save [server-number]` | save received Gopher source, original DICT text, RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
 | `rdap [domain\|IP\|CIDR\|AS-number]` | show the authoritative RDAP record; omitted query uses the current WHOIS lookup |
 | `dict [--database name] <word or "phrase"> [server[:port]]` | definitions from dict.org or a chosen server (RFC 2229) |
 | `dict --match strategy <word> [server]` | matching words; `prefix`, `exact`, or a server-advertised strategy |
 | `dict --databases` / `dict --strategies` | browse dictionaries or search modes; `--server` chooses the server |
 | `dict-filter <text>` | filter the current dictionary/source list locally; omit text to clear |
+| `bookmark` / `bookmark add [title]` | bookmark the current destination, for any protocol |
+| `bookmark link [title]` | bookmark the selected link without fetching it |
+| `bookmarks [filter]` | open the local bookmark list; filter titles and addresses |
+| `bookmark rename <id> <title>` | rename an entry using its displayed ID |
+| `bookmark remove <id>` / `bookmark undo` | remove an entry / undo the last removal in this session |
 | `reload` | re-fetch what's on screen, history untouched |
 | `close` / `quit` | drop the connection / exit |
 | `mode character\|line\|auto` | force input mode or follow ECHO |
@@ -155,6 +160,43 @@ command nor an address searches DuckDuckGo Lite.
 | `set js on\|off` | run web-page JavaScript against a real DOM (on by default; `off` opts out) |
 | `toggle crlf` | Enter sends CR LF instead of CR NUL |
 | `status` | connection/options report |
+
+**Ctrl+B** bookmarks the current destination; **Alt+B** opens bookmarks.
+During Telnet sessions both shortcuts retain their remote meanings (Ctrl+B is
+STX; Alt+B sends Escape then B). Use `bookmark` and `bookmarks` from the command
+prompt there. Opening bookmarks keeps the Telnet session connected; Back returns
+to it. Elsewhere the shortcuts also work in input fields and the image viewer.
+
+Bookmarks are shared by the terminal and desktop browsers, stored as versioned
+JSON in `$XDG_DATA_HOME/trust/bookmarks.json` (default
+`~/.local/share/trust/bookmarks.json`). They load only when needed. Saves are
+atomic and coordinate between running instances. Saving an existing destination
+reuses its entry; only an explicit title replaces its name. `status` shows the
+storage directories. Existing TLS certificates, pins and DICT preferences keep
+their existing locations. No disk cache or persistent cookies are introduced.
+
+Gopher menus and text appear progressively. **W** toggles wrapping and
+**Shift+Left/Right** pans unwrapped text; **E** cycles automatic, UTF-8, Latin-1
+and CP437 display decoding without changing selectors. Automatic mode accepts
+UTF-8 and otherwise uses Latin-1. **S** (or `save`) saves received source bytes.
+**Esc** stops loading and preserves the displayed prefix, marked incomplete.
+Wrapped menu entries remain clickable on every row, with one keyboard stop.
+Recent Gopher pages and view settings remain in a bounded in-memory reading
+history; `reload` explicitly requests a fresh copy.
+
+Search links prompt for a query in either frontend. A bookmark of the search
+endpoint prompts again; a bookmark containing a query repeats that search.
+Selectors retain their original bytes through copying, navigation and bookmarks,
+including percent escapes, IPv6 hosts and non-default ports. Image items use the
+image display, HTML items use the HTML renderer, and binary/archive items offer
+Save / Open / Cancel before transferring the file. Redundant-server menu entries
+inherit the original item's type and can be selected as alternate destinations.
+Gopher+ commands and unimplemented legacy service types report an explicit error.
+
+Gopher page responses are limited to 2 MiB, and display rows/line widths are
+bounded independently. Downloads stream directly to disk with a 2 GiB ceiling.
+Limits and interrupted replies are reported visibly; receiving a complete dot
+terminator finishes immediately even if the server keeps the socket open.
 
 Finger replies appear as they arrive, preserving columns, blank lines, and
 eight-cell tab stops. **W** toggles wrapping; **Shift+Left/Right** pans an

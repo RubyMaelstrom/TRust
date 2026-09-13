@@ -547,6 +547,7 @@ pub fn adapt_rendered_terminal(
         url: Link::Http(url.clone()),
         lines: Vec::new(),
         finger: None,
+        gopher: None,
         whois: None,
         rdap: None,
         dict: None,
@@ -5344,6 +5345,7 @@ pub fn parse_seeded(
         url: Link::Http(url.clone()),
         lines,
         finger: None,
+        gopher: None,
         whois: None,
         rdap: None,
         dict: None,
@@ -5776,6 +5778,14 @@ fn resolve_css_image_source(base: &Url, source: &str) -> Option<String> {
 
 /// Resolve an href against the page, mapping schemes to our link types.
 pub(crate) fn resolve(base: &Url, target: &str) -> Link {
+    if target
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("gopher"))
+    {
+        return crate::gopher::GopherUrl::parse(target)
+            .map(Link::Gopher)
+            .unwrap_or_else(|| Link::External(target.into()));
+    }
     // Living-page click markers: `x-trust-js:<node>:<original-href>`.
     if let Some(rest) = target.strip_prefix("x-trust-js:")
         && let Some((node, href)) = rest.split_once(':')
