@@ -313,6 +313,8 @@ enum Payload {
     Media(url::Url),
     OneShot(Vec<u8>),
     Finger(crate::finger::Reply),
+    Whois(crate::whois::Reply),
+    Rdap(crate::rdap::Page),
     /// An internal `about:` page's gemtext source, generated locally (no
     /// network). Rides the fetch pipe so history deep-travel refetches of
     /// `about:` entries flow through the same completion path as the rest.
@@ -336,6 +338,9 @@ async fn prepare_http_payload(
         return Payload::Download(Box::new(response));
     }
     response.content_type = computed_type;
+    if crate::rdap::is_response(&response) {
+        return Payload::Rdap(crate::rdap::Page::from_response(response));
+    }
     // JS on: full transform. JS off: still bake the page's CSS so it lays out
     // per its own stylesheets.
     Payload::Http(Box::new(if js_on {
@@ -810,7 +815,7 @@ pub struct App {
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
     /// Handle to the in-flight fetch task, so Esc can abort it.
     fetch_task: Option<tokio::task::JoinHandle<()>>,
-    finger_fetch_started: bool,
+    query_fetch_started: bool,
     /// In-flight image decode/encode, if any.
     img_rx: Option<mpsc::Receiver<ImgMsg>>,
     /// A download prompt is presentation state only. Background transfers own
@@ -1058,7 +1063,7 @@ impl App {
             auto_protocol: ProtocolType::Halfblocks,
             fetch_rx: None,
             fetch_task: None,
-            finger_fetch_started: false,
+            query_fetch_started: false,
             img_rx: None,
             file_dialog: None,
             last_file_actions: [None; 3],
@@ -2242,17 +2247,17 @@ impl App {
         let max_scroll = g.doc.extent().saturating_sub(height.max(1));
         g.scroll = line.saturating_sub(height / 2).min(max_scroll);
         if let FindLoc::Line(row) = matched.loc
-            && let Some(view) = &mut g.doc.finger
-            && !view.wrap
+            && g.doc.text_view().is_some_and(|view| !view.wrap)
             && let Some(line) = g.doc.lines.get(row)
         {
             let prefix: String = line.text.chars().take(matched.start).collect();
             let cells = unicode_width::UnicodeWidthStr::width(prefix.as_str());
             let width = self.last_inner.0.max(1) as usize;
+            let max_pan =
+                unicode_width::UnicodeWidthStr::width(line.text.as_str()).saturating_sub(width);
+            let view = g.doc.text_view_mut().expect("reply view");
             if cells < view.horizontal || cells >= view.horizontal + width / 2 {
-                view.horizontal = cells.saturating_sub(width / 2).min(
-                    unicode_width::UnicodeWidthStr::width(line.text.as_str()).saturating_sub(width),
-                );
+                view.horizontal = cells.saturating_sub(width / 2).min(max_pan);
             }
         }
         if let Some((node, voff)) = writeback {
@@ -2640,25 +2645,57 @@ impl App {
                         return;
                     }
                 };
-                self.finger_view_action(action, value);
+                self.reply_view_action(action, value);
+            }
+            Some("rdap") => {
+                let current = self.browser.as_ref().and_then(|g| match &g.doc.url {
+                    Link::OneShot(url) if url.scheme == oneshot::Scheme::Whois => {
+                        Some(url.query.as_str())
+                    }
+                    _ => None,
+                });
+                match crate::rdap::command_target(line.trim_start().get(4..).unwrap_or(""), current)
+                {
+                    Ok(link) => self.start_fetch(link),
+                    Err(error) => self.status = error,
+                }
+            }
+            Some("encoding") => {
+                let value = match parts.next() {
+                    None => None,
+                    Some(value) => match crate::whois::Encoding::parse(value) {
+                        Some(encoding) => Some(encoding),
+                        None => {
+                            self.status = "usage: encoding [auto|utf8|latin1]".into();
+                            return;
+                        }
+                    },
+                };
+                self.whois_encoding(value);
+            }
+            Some("save") => {
+                let server = match parts.next() {
+                    None => None,
+                    Some(value) => match value.parse::<usize>() {
+                        Ok(index) => Some(index),
+                        Err(_) => {
+                            self.status = "usage: save [server-number]".into();
+                            return;
+                        }
+                    },
+                };
+                self.save_whois(server);
             }
             Some("finger" | "f") => match parts.next().and_then(crate::finger::command_target) {
                 Some(url) => self.start_fetch(Link::OneShot(url)),
                 None => self.status = String::from("usage: finger [user]@<host>[:port]"),
             },
-            Some("whois") => match parts.next() {
-                Some(query) => {
-                    let (host, port) =
-                        split_host_port(parts.next().unwrap_or(oneshot::WHOIS_DEFAULT));
-                    self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
-                        scheme: oneshot::Scheme::Whois,
-                        host: host.to_string(),
-                        port: port.unwrap_or(43),
-                        query: query.to_string(),
-                    }));
+            Some("whois") => {
+                match crate::whois::command_target(line.trim_start().get(5..).unwrap_or("")) {
+                    Ok(url) => self.start_fetch(Link::OneShot(url)),
+                    Err(error) => self.status = error,
                 }
-                None => self.status = String::from("usage: whois <domain> [server]"),
-            },
+            }
             Some("dict" | "define") => match parts.next() {
                 Some(word) => {
                     let (host, port) =
@@ -2833,6 +2870,10 @@ impl App {
     /// HTTP GET). `port` is the explicitly-supplied port, if any; a `host:port`
     /// in the target wins over it.
     fn dispatch_open(&mut self, target: &str, port: Option<u16>) {
+        if crate::rdap::is_action(target) {
+            self.start_fetch(Link::External(target.to_string()));
+            return;
+        }
         if target
             .split_once(':')
             .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
@@ -2841,6 +2882,21 @@ impl App {
                 Some(url) => self.start_fetch(Link::OneShot(url)),
                 None => {
                     self.status = String::from("Invalid Finger address.");
+                    self.notice = true;
+                }
+            }
+            return;
+        }
+        // Do this before bare-host dispatch, whose compatibility path appends
+        // `/` and would otherwise change a schemeless `watch?v=id` query.
+        if target
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("whois"))
+        {
+            match crate::whois::parse_url(target) {
+                Some(url) => self.start_fetch(Link::OneShot(url)),
+                None => {
+                    self.status = String::from("Invalid WHOIS address.");
                     self.notice = true;
                 }
             }
@@ -2986,6 +3042,15 @@ impl App {
         referrer: Option<url::Url>,
         navigation_type: http::NavigationType,
     ) {
+        let target = if self.replace_nav
+            && let Some(g) = &self.browser
+            && let Some(rdap) = &g.doc.rdap
+            && target == g.doc.url
+        {
+            crate::rdap::direct_action(&rdap.url)
+        } else {
+            target
+        };
         self.retire_fetch("Incomplete reply: request replaced");
         // A new fetch intent supersedes a pending deep-travel completion
         // (the deep-travel path itself re-sets the flag after this call).
@@ -3047,6 +3112,30 @@ impl App {
                     .await;
                 return;
             }
+            if let Link::OneShot(url) = &target
+                && url.scheme == oneshot::Scheme::Whois
+            {
+                let result = crate::whois::fetch_updates(url, |reply| {
+                    let tx = tx.clone();
+                    let target = target.clone();
+                    async move {
+                        tx.send(FetchMsg {
+                            target,
+                            result: Ok(Payload::Whois(reply)),
+                        })
+                        .await
+                        .is_ok()
+                    }
+                })
+                .await;
+                let _ = tx
+                    .send(FetchMsg {
+                        target,
+                        result: result.map(Payload::Whois),
+                    })
+                    .await;
+                return;
+            }
             let result = if let Some(body) = about {
                 Ok(Payload::About(body))
             } else {
@@ -3056,6 +3145,8 @@ impl App {
                         Ok(Payload::Gemini(response))
                     }
                     Ok(crate::core::FetchedDocument::OneShot(raw)) => Ok(Payload::OneShot(raw)),
+                    Ok(crate::core::FetchedDocument::Whois(page)) => Ok(Payload::Whois(page.reply)),
+                    Ok(crate::core::FetchedDocument::Rdap(page)) => Ok(Payload::Rdap(page)),
                     Ok(crate::core::FetchedDocument::Finger(page)) => {
                         Ok(Payload::Finger(page.reply))
                     }
@@ -3432,7 +3523,7 @@ impl App {
         let vh = self.last_inner.1 as usize;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         g.scroll.hash(&mut h);
-        g.doc.finger.as_ref().map(|v| v.horizontal).hash(&mut h);
+        g.doc.text_view().map(|v| v.horizontal).hash(&mut h);
         g.sel_item.hash(&mut h);
         // The gopher/gemini LINE-model selection: its highlight and the
         // status-bar link preview both render from it, and a selection step
@@ -3730,29 +3821,39 @@ impl App {
             task.abort();
         }
         self.fetch_rx = None;
-        self.finger_fetch_started = false;
+        self.query_fetch_started = false;
         if let Some(g) = &mut self.browser
-            && let Some(view) = &mut g.doc.finger
-            && view.loading
+            && g.doc.text_view().is_some_and(|view| view.loading)
         {
-            view.loading = false;
-            view.notice = Some(reason.to_string());
-            crate::finger::rerender(&mut g.doc, (self.last_inner.0 as usize).max(10));
+            if let Some(page) = &mut g.doc.whois {
+                page.stop(reason);
+            } else if let Some(view) = &mut g.doc.finger {
+                view.loading = false;
+                view.notice = Some(reason.to_string());
+            }
+            g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
         }
     }
 
-    fn finger_view_action(&mut self, action: &str, enabled: Option<bool>) {
+    fn reply_view_action(&mut self, action: &str, enabled: Option<bool>) {
         let Some(g) = &mut self.browser else {
             return;
         };
-        let Some(view) = &mut g.doc.finger else {
-            self.status = String::from("Wrap and changes controls apply to Finger replies.");
+        let result = if let Some(page) = &mut g.doc.whois {
+            page.view_action(action, enabled)
+        } else if let Some(page) = &mut g.doc.rdap {
+            page.view_action(action, enabled)
+        } else if let Some(view) = &mut g.doc.finger {
+            crate::finger::view_action(view, action, enabled)
+        } else {
+            self.status =
+                String::from("Wrap and changes controls apply to Finger and WHOIS replies.");
             return;
         };
-        match crate::finger::view_action(view, action, enabled) {
+        match result {
             Ok(status) => {
                 self.status = status.to_string();
-                crate::finger::rerender(&mut g.doc, (self.last_inner.0 as usize).max(10));
+                g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
                 g.scroll = g
                     .scroll
                     .min(g.doc.extent().saturating_sub(self.last_inner.1 as usize));
@@ -3765,16 +3866,105 @@ impl App {
         self.notice = true;
     }
 
+    fn whois_encoding(&mut self, encoding: Option<crate::whois::Encoding>) {
+        let Some(g) = &mut self.browser else {
+            return;
+        };
+        let Some(page) = &mut g.doc.whois else {
+            self.status = "Encoding controls apply to WHOIS replies.".into();
+            return;
+        };
+        page.encoding = encoding.unwrap_or(match page.encoding {
+            crate::whois::Encoding::Auto => crate::whois::Encoding::Utf8,
+            crate::whois::Encoding::Utf8 => crate::whois::Encoding::Latin1,
+            crate::whois::Encoding::Latin1 => crate::whois::Encoding::Auto,
+        });
+        self.status = format!("WHOIS encoding: {}", page.encoding.label());
+        let selected = g
+            .selected
+            .and_then(|row| g.doc.lines.get(row))
+            .and_then(|line| line.link.clone());
+        g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+        g.scroll = g
+            .scroll
+            .min(g.doc.extent().saturating_sub(self.last_inner.1 as usize));
+        g.selected = selected.and_then(|target| {
+            g.doc
+                .lines
+                .iter()
+                .position(|line| line.link.as_ref() == Some(&target))
+        });
+        self.notice = true;
+        if self.mode == Mode::Find {
+            self.recompute_find_for_document(true);
+        }
+    }
+
+    fn save_whois(&mut self, server: Option<usize>) {
+        let Some(g) = &self.browser else {
+            return;
+        };
+        if let Some(page) = &g.doc.rdap {
+            if server.is_some() {
+                self.status = "RDAP has one JSON reply; use save without a server number.".into();
+                return;
+            }
+            self.file_dialog = Some(FileDialog {
+                offer: page.export(),
+                selected: 0,
+            });
+            self.last_file_actions = [None; 3];
+            self.mode = Mode::Session;
+            self.status = "Save original RDAP JSON.".into();
+            return;
+        }
+        let (Some(page), Link::OneShot(url)) = (&g.doc.whois, &g.doc.url) else {
+            self.status = "Save applies to WHOIS and RDAP replies.".into();
+            return;
+        };
+        match page.export(url, server) {
+            Ok(offer) => {
+                self.file_dialog = Some(FileDialog { offer, selected: 0 });
+                self.last_file_actions = [None; 3];
+                self.mode = Mode::Session;
+                self.status = "Save received WHOIS reply.".into();
+            }
+            Err(error) => self.status = error,
+        }
+        self.notice = true;
+    }
+
+    fn on_whois_reply(&mut self, url: oneshot::OneShotUrl, reply: crate::whois::Reply) {
+        let finished = reply.finished;
+        self.status = crate::whois::status(&url, &reply);
+        self.notice = reply.notice.is_some();
+        let mut page = crate::whois::Page::new(reply);
+        if let Some(g) = &self.browser
+            && g.doc.url == Link::OneShot(url.clone())
+            && let Some(old) = &g.doc.whois
+        {
+            if self.query_fetch_started {
+                let reply = page.reply;
+                page = old.clone();
+                page.update(reply);
+            } else if self.replace_nav {
+                page = crate::whois::Page::refreshed(page.reply, old);
+            }
+        }
+        let doc = crate::whois::render(&url, page, (self.last_inner.0 as usize).max(10));
+        self.on_streamed_document(doc, finished);
+    }
+
     fn on_finger_reply(&mut self, url: oneshot::OneShotUrl, reply: crate::finger::Reply) {
         let finished = reply.finished;
         let mut view = crate::finger::View::default();
         if let Some(g) = &self.browser
             && g.doc.url == Link::OneShot(url.clone())
             && let Some(old) = &g.doc.finger
-            && (self.finger_fetch_started || self.replace_nav)
+            && (self.query_fetch_started || self.replace_nav)
         {
             view = old.clone();
-            if !self.finger_fetch_started {
+            if !self.query_fetch_started {
                 if !old.loading && old.notice.is_none() {
                     view.previous = Some(std::sync::Arc::from(g.doc.raw.as_slice()));
                 }
@@ -3790,12 +3980,23 @@ impl App {
         );
         self.notice = reply.notice.is_some();
         let doc = crate::finger::render(&url, reply, view, (self.last_inner.0 as usize).max(10));
-        if self.finger_fetch_started {
+        self.on_streamed_document(doc, finished);
+    }
+
+    fn on_streamed_document(&mut self, doc: Doc, finished: bool) {
+        if self.query_fetch_started {
             if let Some(g) = &mut self.browser {
                 let selected = g
                     .selected
                     .and_then(|line| g.doc.lines.get(line))
                     .and_then(|line| line.link.clone());
+                if g.scroll > 0
+                    && g.doc.whois.is_some()
+                    && let Some(row) =
+                        crate::registration::anchor(&g.doc.lines, &doc.lines, g.scroll)
+                {
+                    g.scroll = row;
+                }
                 g.doc = doc;
                 g.scroll = g
                     .scroll
@@ -3814,7 +4015,7 @@ impl App {
             }
         } else {
             self.navigate_to(doc);
-            self.finger_fetch_started = true;
+            self.query_fetch_started = true;
         }
         if finished {
             self.fetch_rx = None;
@@ -3826,9 +4027,13 @@ impl App {
     }
 
     fn on_fetch(&mut self, msg: FetchMsg) {
-        if matches!(msg.result, Ok(Payload::Finger(_))) {
-            if let (Ok(Payload::Finger(reply)), Link::OneShot(url)) = (msg.result, msg.target) {
-                self.on_finger_reply(url, reply);
+        if matches!(msg.result, Ok(Payload::Finger(_) | Payload::Whois(_))) {
+            match (msg.result, msg.target) {
+                (Ok(Payload::Finger(reply)), Link::OneShot(url)) => {
+                    self.on_finger_reply(url, reply)
+                }
+                (Ok(Payload::Whois(reply)), Link::OneShot(url)) => self.on_whois_reply(url, reply),
+                _ => {}
             }
             return;
         }
@@ -3856,13 +4061,26 @@ impl App {
                 self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
-            (Ok(Payload::Finger(_)), _) => unreachable!("Finger replies handled above"),
+            (Ok(Payload::Finger(_) | Payload::Whois(_)), _) => {
+                unreachable!("Streaming replies handled above")
+            }
             (Ok(Payload::OneShot(raw)), Link::OneShot(url)) => {
                 let doc = oneshot::parse(&url, raw, width);
                 self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
+            (Ok(Payload::Rdap(mut page)), _) => {
+                if self.replace_nav
+                    && let Some(old) = self.browser.as_ref().and_then(|g| g.doc.rdap.as_ref())
+                    && old.url == page.url
+                {
+                    page.section = old.section;
+                    page.view = old.view.clone();
+                }
+                self.status = format!("RDAP · {}", page.record.title);
+                self.navigate_to(crate::rdap::render(page, width));
+            }
             (Ok(Payload::Http(response)), _) => self.on_http_response(*response, width),
             (Ok(Payload::Download(response)), _) => {
                 let referrer = self.http_referrer();
@@ -5992,15 +6210,31 @@ impl App {
         if self
             .browser
             .as_ref()
-            .is_some_and(|g| g.doc.finger.is_some())
+            .is_some_and(|g| g.doc.text_view().is_some())
         {
             match key.code {
+                KeyCode::Char('e' | 'E')
+                    if self.browser.as_ref().is_some_and(|g| g.doc.whois.is_some()) =>
+                {
+                    self.whois_encoding(None);
+                    return;
+                }
+                KeyCode::Char('s' | 'S')
+                    if self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|g| g.doc.registration_section().is_some()) =>
+                {
+                    self.save_whois(None);
+                    return;
+                }
+
                 KeyCode::Char('w' | 'W') => {
-                    self.finger_view_action("wrap", None);
+                    self.reply_view_action("wrap", None);
                     return;
                 }
                 KeyCode::Char('d' | 'D') => {
-                    self.finger_view_action("changes", None);
+                    self.reply_view_action("changes", None);
                     return;
                 }
                 KeyCode::Left | KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -6013,7 +6247,7 @@ impl App {
                             .max()
                             .unwrap_or(0)
                             .saturating_sub(self.last_inner.0 as usize);
-                        let view = g.doc.finger.as_mut().unwrap();
+                        let view = g.doc.text_view_mut().unwrap();
                         if !view.wrap {
                             view.horizontal = if key.code == KeyCode::Left {
                                 view.horizontal.saturating_sub(8)
@@ -6921,6 +7155,8 @@ impl App {
         let mut old_offsets = Vec::new();
         Self::collect_region_offsets(&g.doc.regions, &mut old_offsets);
         let finger_view = g.doc.finger.take();
+        let whois_page = g.doc.whois.take();
+        let rdap_page = g.doc.rdap.take();
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
@@ -6929,6 +7165,7 @@ impl App {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 gemini::parse(&url, &meta, &raw, width)
             }
+            Link::Http(_) if rdap_page.is_some() => crate::rdap::render(rdap_page.unwrap(), width),
             Link::Http(url) => {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 // Seed so typed-in form values survive the re-parse.
@@ -6944,6 +7181,9 @@ impl App {
                     &self.image_sizes,
                     &self.image_alpha,
                 )
+            }
+            Link::OneShot(url) if whois_page.is_some() => {
+                crate::whois::render(&url, whois_page.unwrap(), width)
             }
             Link::OneShot(url) => match finger_view {
                 Some(view) => crate::finger::render(
@@ -7091,6 +7331,25 @@ impl App {
     }
 
     fn browser_follow_link(&mut self, link: Link) {
+        if let Some(section) = crate::registration::Section::from_link(&link) {
+            let Some(g) = &mut self.browser else {
+                return;
+            };
+            if let Some(page) = &mut g.doc.whois {
+                page.section = section;
+                page.view.changes = false;
+            } else if let Some(page) = &mut g.doc.rdap {
+                page.section = section;
+            } else {
+                return;
+            }
+            g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
+            g.scroll = 0;
+            g.selected = Self::browser_visible_links(g, self.last_inner.1 as usize)
+                .first()
+                .copied();
+            return;
+        }
         // Concrete YouTube player pages remain an explicit media integration.
         // Direct files must be fetched and classified from response metadata so
         // unsupported media receives the same Save / Open / Cancel choice as
@@ -7141,6 +7400,9 @@ impl App {
             Link::Media(url) => self.launch_mpv(url.to_string()),
             Link::Form { form, field } => self.form_interact(form, field),
             Link::JsClick { node, href } => self.dispatch_click(node, !href.is_empty()),
+            Link::External(target) if crate::rdap::is_action(&target) => {
+                self.start_fetch(Link::External(target))
+            }
             Link::External(target) => {
                 self.status = format!("external link: {target}");
             }
@@ -14281,7 +14543,7 @@ mod finger_tests {
         app.on_finger_reply(url("alice"), reply("a\tb\r\n", true));
         app.encoding = Encoding::Cp437;
         assert!(app.pending_browser_wrap_target().is_none());
-        app.finger_view_action("wrap", Some(true));
+        app.reply_view_action("wrap", Some(true));
         app.last_inner = (12, 10);
         assert!(app.pending_browser_wrap_target().is_some());
         app.sync_browser_wrap();
@@ -14334,7 +14596,7 @@ mod finger_tests {
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
         assert!(screen(&terminal).contains("MARK"));
-        app.finger_view_action("wrap", Some(true));
+        app.reply_view_action("wrap", Some(true));
         assert_eq!(
             app.browser
                 .as_ref()
@@ -14375,7 +14637,7 @@ mod finger_tests {
         let mut app = App::new(None, 23);
         app.last_inner = (80, 10);
         app.on_finger_reply(url("alice"), reply("old\r\n", true));
-        app.finger_fetch_started = false;
+        app.query_fetch_started = false;
         app.on_finger_reply(url("bob"), reply("first\r\n", false));
         app.on_finger_reply(url("bob"), reply("first\r\nsecond\r\n", false));
         assert_eq!(app.browser.as_ref().unwrap().history.len(), 1);
@@ -14396,7 +14658,7 @@ mod finger_tests {
         let mut app = App::new(None, 23);
         app.last_inner = (80, 10);
         for text in ["first\r\n", "second\r\n", "third\r\n"] {
-            app.finger_fetch_started = false;
+            app.query_fetch_started = false;
             app.replace_nav = app.browser.is_some();
             app.on_finger_reply(url("alice"), reply(text, true));
         }
@@ -14406,7 +14668,7 @@ mod finger_tests {
             g.doc.finger.as_ref().unwrap().previous.as_deref(),
             Some(b"second\r\n".as_slice())
         );
-        app.finger_view_action("changes", Some(true));
+        app.reply_view_action("changes", Some(true));
         assert!(
             app.browser
                 .as_ref()
@@ -14474,5 +14736,213 @@ mod finger_tests {
             .unwrap();
         assert_eq!(n, 0, "superseded request must actually close TCP");
         app.stop_loading();
+    }
+}
+
+#[cfg(test)]
+mod whois_tests {
+    use super::*;
+
+    fn url(query: &str) -> oneshot::OneShotUrl {
+        crate::whois::server_target("example.test", query).unwrap()
+    }
+    fn reply(query: &str, bytes: &[u8], finished: bool) -> crate::whois::Reply {
+        let mut reply = crate::whois::Reply::from_bytes(url(query), bytes.to_vec());
+        reply.finished = finished;
+        if !finished {
+            reply.hops[0].state = crate::whois::HopState::Receiving;
+        }
+        reply
+    }
+
+    #[tokio::test]
+    async fn whois_summary_insertion_anchors_scroll_and_local_sections_do_not_fetch() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (80, 6);
+        let first = "Domain Name: example.com\nRegistrar: Example Registrar\nCreation Date: 2001-01-01\nName Server: ns.example.com\n";
+        app.on_whois_reply(
+            url("example.com"),
+            reply("example.com", first.as_bytes(), false),
+        );
+        let g = app.browser.as_mut().unwrap();
+        let anchor = g
+            .doc
+            .lines
+            .iter()
+            .position(|line| line.text.starts_with("Registered"))
+            .unwrap();
+        g.scroll = anchor;
+        let anchor_text = g.doc.lines[anchor].text.clone();
+        let next =
+            format!("{first}Registrant Organization: Later Organization\nRegistrant Country: NL\n");
+        app.on_whois_reply(
+            url("example.com"),
+            reply("example.com", next.as_bytes(), true),
+        );
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.lines[g.scroll].text, anchor_text);
+        app.browser_follow_link(crate::registration::Section::Raw.action());
+        assert!(app.fetch_task.is_none() && app.fetch_rx.is_none());
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .whois
+                .as_ref()
+                .unwrap()
+                .section,
+            crate::registration::Section::Raw
+        );
+        app.browser_follow_link(crate::registration::Section::Summary.action());
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Later Organization"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rdap_terminal_uses_record_view_and_exports_original_json() {
+        let response = crate::rdap::tests::response(
+            serde_json::json!({"objectClassName":"domain", "ldhName":"example.test", "secureDNS":{"delegationSigned":true}}),
+        );
+        let raw = response.body.clone();
+        let payload =
+            prepare_http_payload(response, (80, 24), (8, 16), Default::default(), true).await;
+        let Payload::Rdap(page) = payload else {
+            panic!("RDAP must not enter HTML/JS layout")
+        };
+        let mut app = App::new(None, 23);
+        app.last_inner = (80, 24);
+        app.navigate_to(crate::rdap::render(page, 80));
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Signed delegation"))
+        );
+        app.browser_follow_link(crate::registration::Section::Raw.action());
+        assert!(app.fetch_task.is_none());
+        app.save_whois(None);
+        assert_eq!(app.file_dialog.as_ref().unwrap().offer.body, raw);
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .rdap
+                .as_ref()
+                .unwrap()
+                .section,
+            crate::registration::Section::Raw
+        );
+    }
+
+    #[tokio::test]
+    async fn whois_terminal_stream_preserves_find_pan_selection_and_save_bytes() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (38, 8);
+        let first = format!("{}needle\r\nURL: https://example.test/\r\n", "x".repeat(60));
+        app.on_whois_reply(
+            url("example.com"),
+            reply("example.com", first.as_bytes(), false),
+        );
+        app.open_find();
+        app.input = "needle".into();
+        app.recompute_find();
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 1);
+        let g = app.browser.as_ref().unwrap();
+        let pan = g.doc.text_view().unwrap().horizontal;
+        let scroll = g.scroll;
+        assert!(pan > 0);
+        let selected = g
+            .doc
+            .lines
+            .iter()
+            .position(|line| matches!(&line.link, Some(Link::Http(_))))
+            .unwrap();
+        let selected_link = g.doc.lines[selected].link.clone();
+        app.browser.as_mut().unwrap().selected = Some(selected);
+        let second = format!("{first}needle\r\n");
+        app.on_whois_reply(
+            url("example.com"),
+            reply("example.com", second.as_bytes(), false),
+        );
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.scroll, scroll);
+        assert_eq!(g.doc.text_view().unwrap().horizontal, pan);
+        assert_eq!(g.doc.lines[g.selected.unwrap()].link, selected_link);
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 2);
+        app.whois_encoding(Some(crate::whois::Encoding::Latin1));
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 2);
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.lines[g.selected.unwrap()].link, selected_link);
+        app.stop_loading();
+        let page = app.browser.as_ref().unwrap().doc.whois.as_ref().unwrap();
+        assert_eq!(&*page.reply.hops[0].body, second.as_bytes());
+        assert!(page.reply.finished && page.reply.notice.is_some());
+        app.save_whois(Some(1));
+        assert_eq!(
+            app.file_dialog.as_ref().unwrap().offer.body,
+            second.as_bytes()
+        );
+        assert!(!app.file_dialog.as_ref().unwrap().offer.fetch_body);
+    }
+
+    #[tokio::test]
+    async fn whois_terminal_history_refresh_wrap_and_encoding_keep_originals() {
+        let mut app = App::new(None, 23);
+        app.last_inner = (80, 10);
+        app.on_whois_reply(url("old"), reply("old", b"old", true));
+        app.query_fetch_started = false;
+        app.on_whois_reply(url("new"), reply("new", b"name:\tAndr\xe9\r\n", false));
+        app.on_whois_reply(url("new"), reply("new", b"name:\tAndr\xe9\r\n", true));
+        assert_eq!(app.browser.as_ref().unwrap().history.len(), 1);
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .lines
+                .iter()
+                .any(|line| line.text == "name:   André")
+        );
+        app.reply_view_action("wrap", Some(true));
+        app.whois_encoding(Some(crate::whois::Encoding::Latin1));
+        app.last_inner = (20, 10);
+        app.sync_browser_wrap();
+        assert!(app.pending_browser_wrap_target().is_none());
+        app.query_fetch_started = false;
+        app.replace_nav = true;
+        app.on_whois_reply(url("new"), reply("new", b"name: changed\r\n", true));
+        app.reply_view_action("changes", Some(true));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.history.len(), 1);
+        assert!(
+            g.doc
+                .lines
+                .iter()
+                .any(|line| line.text == "+ name: changed")
+        );
+        let page = g.doc.whois.as_ref().unwrap();
+        assert!(page.view.wrap);
+        assert_eq!(page.encoding, crate::whois::Encoding::Latin1);
+        assert_eq!(
+            &*page.previous.as_ref().unwrap().hops[0].body,
+            b"name:\tAndr\xe9\r\n"
+        );
+        app.browser_back();
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.url,
+            Link::OneShot(url("old"))
+        );
     }
 }

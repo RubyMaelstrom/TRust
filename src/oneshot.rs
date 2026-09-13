@@ -34,7 +34,7 @@ impl Scheme {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Scheme::Finger => "finger",
             Scheme::Whois => "whois",
@@ -61,6 +61,11 @@ impl OneShotUrl {
             .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("finger"))
         {
             return crate::finger::parse_url(s);
+        }
+        if s.split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("whois"))
+        {
+            return crate::whois::parse_url(s);
         }
         let (scheme, rest) = if let Some(r) = s.strip_prefix("whois://") {
             (Scheme::Whois, r)
@@ -100,13 +105,13 @@ impl OneShotUrl {
 
 impl fmt::Display for OneShotUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.scheme == Scheme::Finger {
+        if matches!(self.scheme, Scheme::Finger | Scheme::Whois) {
             if self.host.contains(':') {
-                write!(f, "finger://[{}]", self.host)?;
+                write!(f, "{}://[{}]", self.scheme.name(), self.host)?;
             } else {
-                write!(f, "finger://{}", self.host)?;
+                write!(f, "{}://{}", self.scheme.name(), self.host)?;
             }
-            if self.port != 79 {
+            if self.port != self.scheme.default_port() {
                 write!(f, ":{}", self.port)?;
             }
             if !self.query.is_empty() {
@@ -167,49 +172,22 @@ pub async fn fetch(url: &OneShotUrl) -> Result<Vec<u8>, String> {
             )
             .await
         }
-        Scheme::Whois => {
-            let body = exchange(&url.host, url.port, format!("{}\r\n", url.query)).await?;
-            // Registries answer with a referral (IANA always does);
-            // follow it one hop, the way whois(1) would.
-            let Some(server) = referral(&String::from_utf8_lossy(&body), &url.host) else {
-                return Ok(body);
-            };
-            let (host, port) = match server.rsplit_once(':') {
-                Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-                    (h.to_string(), p.parse().unwrap_or(43))
-                }
-                _ => (server, 43),
-            };
-            match exchange(&host, port, format!("{}\r\n", url.query)).await {
-                Ok(referred) => {
-                    let mut out =
-                        format!("% Referred by {} to {host}\r\n\r\n", url.host).into_bytes();
-                    out.extend_from_slice(&referred);
-                    Ok(out)
-                }
-                // A dead referral target still leaves the first answer.
-                Err(_) => Ok(body),
-            }
-        }
+        Scheme::Whois => crate::whois::fetch(url)
+            .await
+            .map(|reply| reply.transcript()),
     }
-}
-
-/// The `refer:`/`whois:` server out of a WHOIS reply, if any.
-fn referral(text: &str, asked: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let line = line.trim();
-        let server = line
-            .strip_prefix("refer:")
-            .or_else(|| line.strip_prefix("whois:"))?
-            .trim();
-        (!server.is_empty() && !server.contains(' ') && server.contains('.') && server != asked)
-            .then(|| server.to_string())
-    })
 }
 
 /// Render a reply into a document. Finger and WHOIS are plain text;
 /// DICT gets its protocol lines stripped and definitions styled.
 pub fn parse(url: &OneShotUrl, raw: Vec<u8>, width: usize) -> Doc {
+    if url.scheme == Scheme::Whois {
+        return crate::whois::render(
+            url,
+            crate::whois::Page::new(crate::whois::Reply::from_bytes(url.clone(), raw)),
+            width,
+        );
+    }
     if url.scheme == Scheme::Finger {
         return crate::finger::render(
             url,
@@ -338,19 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_whois_referrals() {
-        let iana = "refer:        whois.verisign-grs.com\n\ndomain: EXAMPLE.COM\n";
-        assert_eq!(
-            referral(iana, "whois.iana.org"),
-            Some(String::from("whois.verisign-grs.com"))
-        );
-        // No self-referrals, no garbage.
-        assert_eq!(referral("refer: whois.iana.org\n", "whois.iana.org"), None);
-        assert_eq!(referral("refer: not a host\n", "x"), None);
-        assert_eq!(referral("domain: EXAMPLE.COM\n", "x"), None);
-    }
-
-    #[test]
     fn renders_dict_transcripts() {
         let transcript = "220 dict.org banner <auth.mime>\r\n\
                           150 2 definitions retrieved\r\n\
@@ -446,7 +411,11 @@ mod tests {
             query: String::from("example.com"),
         };
         let body = String::from_utf8_lossy(&fetch(&url).await.unwrap()).into_owned();
-        assert!(body.contains("Referred by 127.0.0.1"), "got: {body}");
+        assert!(body.contains("% WHOIS whois://127.0.0.1"), "got: {body}");
+        assert!(
+            body.contains("refer: 127.0.0.1"),
+            "original answer retained"
+        );
         assert!(body.contains("status: ACTIVE"), "followed the referral");
     }
 }

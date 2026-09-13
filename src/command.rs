@@ -152,6 +152,53 @@ pub fn split_host_port(value: &str) -> (&str, Option<u16>) {
     (value, None)
 }
 
+/// Small literal command tokenizer shared by both frontends. Quotes group
+/// arguments; backslash quotes a quote, backslash, or whitespace. There is no
+/// interpolation or shell execution. Unclosed quotes are reported, not sent.
+pub fn quoted_arguments(input: &str) -> Result<Vec<String>, String> {
+    if input.len() > 32768 || input.contains(['\r', '\n', '\0']) {
+        return Err("Command is too long or contains a line break/control character.".into());
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && chars
+                .peek()
+                .is_some_and(|next| matches!(next, '\\' | '\'' | '"') || next.is_whitespace())
+        {
+            word.push(chars.next().expect("escaped character"));
+            started = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            started = true;
+        } else if quote.is_none() && ch.is_whitespace() {
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
+            }
+        } else {
+            word.push(ch);
+            started = true;
+        }
+        if words.len() > 16 {
+            return Err("Too many command arguments.".into());
+        }
+    }
+    if quote.is_some() {
+        return Err("Unclosed quote in command.".into());
+    }
+    if started {
+        words.push(word);
+    }
+    Ok(words)
+}
+
 /// The single `about:help` source used by terminal and graphical TRust.
 /// Command lines are preformatted so their alignment survives any viewport.
 pub const HELP_PAGE: &str = "\
@@ -171,9 +218,12 @@ close                     drop the connection
 reload                    refetch the page on screen
 post <url> [body]         POST a form body to a web URL
 finger [user]@<host>      finger query
-wrap [on|off]            toggle wrapping of a Finger reply
-changes [on|off]         compare with the previous Finger refresh
-whois <domain> [server]   whois lookup
+wrap [on|off]            wrap a Finger, WHOIS or RDAP reply
+changes [on|off]         compare with the previous successful refresh
+whois <query> [server]    WHOIS lookup; quote queries containing spaces
+encoding [auto|utf8|latin1]  WHOIS display encoding
+save [server-number]     save WHOIS replies or original RDAP JSON
+rdap [domain|IP|CIDR|AS-number]  readable authoritative RDAP record
 dict <word> [server]      dictionary lookup
 status                    connection and options report
 help                      this page
@@ -215,6 +265,17 @@ Replies appear as they arrive, with columns and tabs preserved.
 W toggles wrapping; Shift-Left/Right pans an unwrapped reply.
 After `reload`, D toggles changes since the previous successful reply.
 URLs are selectable links. Esc stops loading and keeps the received text.
+
+## WHOIS replies
+
+The requested record appears first. Contacts and Record details show more;
+Full server replies retains every answer, including discovery and legal text.
+Sources and conflicting values remain available in Record details.
+W, D, Shift-Left/Right and Esc work as for Finger. E cycles auto, UTF-8 and
+Latin-1 decoding. S saves the lookup; `save 2` saves server 2's exact bytes.
+Quote multiword queries: whois \"-r -T inetnum 192.0.2.1\" whois.ripe.net
+Look up with RDAP opens a readable record for domains, IPs and AS numbers.
+RDAP has Contacts, Record details and Original JSON views; S saves exact JSON.
 
 ## Telnet sessions
 

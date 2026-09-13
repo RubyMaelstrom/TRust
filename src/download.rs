@@ -31,6 +31,20 @@ pub struct DownloadOffer {
 }
 
 impl DownloadOffer {
+    /// Offer bytes already owned by a protocol page. Saving this snapshot
+    /// never opens another connection, including when the snapshot is empty.
+    pub fn from_bytes(url: Url, suggested_filename: String, body: Vec<u8>) -> Self {
+        Self {
+            url,
+            content_type: "text/plain".into(),
+            suggested_filename,
+            content_length: Some(body.len() as u64),
+            body,
+            referrer: None,
+            fetch_body: false,
+        }
+    }
+
     pub fn from_response(mut response: http::Response, referrer: Option<Url>) -> Self {
         let content_type = computed_mime_type(&response);
         let suggested_filename = suggested_filename(&response, &content_type);

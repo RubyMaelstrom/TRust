@@ -121,8 +121,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .scroll((
                     0,
                     g.doc
-                        .finger
-                        .as_ref()
+                        .text_view()
                         .map_or(0, |view| view.horizontal.min(u16::MAX as usize) as u16),
                 ))
                 .block(block);
@@ -401,9 +400,9 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
                 (_, Kind::Heading(2)) => Style::new()
                     .fg(theme::NEON_CYAN)
                     .add_modifier(Modifier::BOLD),
-                (_, Kind::Heading(_)) => Style::new().fg(theme::NEON_CYAN),
+                (_, Kind::Heading(_) | Kind::Field) => Style::new().fg(theme::NEON_CYAN),
                 (_, Kind::Quote) => Style::new().fg(theme::DIM),
-                (_, Kind::Pre) if g.doc.finger.is_some() => Style::new().fg(theme::TEXT),
+                (_, Kind::Pre) if g.doc.text_view().is_some() => Style::new().fg(theme::TEXT),
                 (_, Kind::Pre | Kind::Added) => Style::new().fg(theme::NEON_GREEN),
                 (_, Kind::Removed) => Style::new().fg(theme::NEON_PINK),
                 _ => Style::new().fg(theme::TEXT),

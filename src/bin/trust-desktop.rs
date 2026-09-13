@@ -2286,6 +2286,8 @@ impl DesktopApp {
             Some(FetchedDocument::Gopher(_)) => String::from("GOPHER"),
             Some(FetchedDocument::OneShot(_)) => String::from("QUERY"),
             Some(FetchedDocument::Finger(_)) => String::from("FINGER"),
+            Some(FetchedDocument::Whois(_)) => String::from("WHOIS"),
+            Some(FetchedDocument::Rdap(_)) => String::from("RDAP"),
             Some(FetchedDocument::Internal(_)) => String::from("TRUST:LOCAL"),
             None if snapshot.loading => String::from("LINK:OPENING"),
             None => String::from("LINK:DOWN"),
@@ -2443,6 +2445,7 @@ impl DesktopApp {
                     && cache.viewport == viewport
             });
             if !fresh {
+                let mut anchored_y = None;
                 let carried_selection = self
                     .protocol_page
                     .as_ref()
@@ -2457,9 +2460,10 @@ impl DesktopApp {
                         })
                     });
                 self.protocol_page = self.browser.current_page().and_then(|page| {
-                    let document = trust::render::documents::document(page)?;
+                    let document =
+                        trust::render::documents::document_for_viewport(page, viewport.width)?;
                     let mut selected = carried_selection.and_then(|(index, target)| {
-                        if document.finger.is_some() {
+                        if document.text_view().is_some() {
                             target.and_then(|target| {
                                 document
                                     .lines
@@ -2479,6 +2483,29 @@ impl DesktopApp {
                         viewport.width,
                         selected,
                     );
+                    if let Some(old) = &self.protocol_page
+                        && old.generation == generation
+                        && old.document.registration_section().is_some()
+                        && old.document.registration_section() == document.registration_section()
+                        && self.browser.interaction().scroll.y > 0.0
+                    {
+                        let y = self.browser.interaction().scroll.y;
+                        if let Some(row) = old
+                            .layout
+                            .lines
+                            .iter()
+                            .position(|line| line.rect.y + line.rect.height > y)
+                            && let Some(next) = trust::registration::anchor(
+                                &old.document.lines,
+                                &document.lines,
+                                row,
+                            )
+                            && let Some(next) = layout.lines.get(next)
+                        {
+                            anchored_y =
+                                Some((next.rect.y + y - old.layout.lines[row].rect.y).max(0.0));
+                        }
+                    }
                     if selected.is_none() {
                         selected = gopherus_visible_links(&layout.lines, 0.0, viewport.height)
                             .first()
@@ -2509,15 +2536,15 @@ impl DesktopApp {
                     .map(ToString::to_string)
                     .unwrap_or_default();
                 if let Some(cache) = &self.protocol_page
-                    && cache.document.finger.is_some()
+                    && cache.document.text_view().is_some()
                 {
                     let scroll = self.browser.interaction().scroll;
                     let clamped = CssPoint::new(
                         scroll
                             .x
                             .min((cache.layout.paint.width - viewport.width).max(0.0)),
-                        scroll
-                            .y
+                        anchored_y
+                            .unwrap_or(scroll.y)
                             .min((cache.layout.paint.height - viewport.height).max(0.0)),
                     );
                     if clamped != scroll {
@@ -3307,8 +3334,22 @@ impl DesktopApp {
             return false;
         };
         self.protocol_pointer_selection = false;
-        if cache.document.finger.is_some() {
+        if cache.document.text_view().is_some() {
             if let Key::Character(key) = &input.key {
+                if cache.document.whois.is_some() && key.eq_ignore_ascii_case("e") {
+                    self.browser.whois_encoding(None);
+                    self.request_redraw();
+                    return true;
+                }
+                if cache.document.registration_section().is_some() && key.eq_ignore_ascii_case("s")
+                {
+                    self.browser.offer_whois_export(None);
+                    if self.browser.download_offer().is_some() {
+                        self.set_focus(FocusTarget::Download);
+                    }
+                    self.request_redraw();
+                    return true;
+                }
                 let action = if key.eq_ignore_ascii_case("w") {
                     Some("wrap")
                 } else if key.eq_ignore_ascii_case("d") {
@@ -3317,7 +3358,7 @@ impl DesktopApp {
                     None
                 };
                 if let Some(action) = action {
-                    self.browser.finger_view_action(action, None);
+                    self.browser.reply_view_action(action, None);
                     self.request_redraw();
                     return true;
                 }
@@ -4078,9 +4119,70 @@ impl DesktopApp {
                     }
                 };
                 self.close_command();
-                if !self.browser.finger_view_action(action, enabled) {
+                if !self.browser.reply_view_action(action, enabled) {
                     self.browser
-                        .set_status("Wrap and changes controls apply to Finger replies.");
+                        .set_status("Wrap and changes controls apply to Finger and WHOIS replies.");
+                }
+                self.request_redraw();
+            }
+            "rdap" => {
+                let current = self
+                    .browser
+                    .current_page()
+                    .and_then(|page| match page.target() {
+                        Link::OneShot(url) if url.scheme == trust::oneshot::Scheme::Whois => {
+                            Some(url.query.as_str())
+                        }
+                        _ => None,
+                    });
+                match trust::rdap::command_target(
+                    command.trim_start().get(4..).unwrap_or(""),
+                    current,
+                ) {
+                    Ok(link) => {
+                        self.close_command();
+                        self.activate_link(link);
+                    }
+                    Err(error) => self.browser.set_status(error),
+                }
+            }
+            "encoding" => {
+                let encoding = match parts.next() {
+                    None => None,
+                    Some(value) => match trust::whois::Encoding::parse(value) {
+                        Some(encoding) => Some(encoding),
+                        None => {
+                            self.browser
+                                .set_status("usage: encoding [auto|utf8|latin1]");
+                            return;
+                        }
+                    },
+                };
+                self.close_command();
+                if !self.browser.whois_encoding(encoding) {
+                    self.browser
+                        .set_status("Encoding controls apply to WHOIS replies.");
+                }
+                self.request_redraw();
+            }
+            "save" => {
+                let server = match parts.next() {
+                    None => None,
+                    Some(value) => match value.parse::<usize>() {
+                        Ok(index) => Some(index),
+                        Err(_) => {
+                            self.browser.set_status("usage: save [server-number]");
+                            return;
+                        }
+                    },
+                };
+                self.close_command();
+                if !self.browser.offer_whois_export(server) {
+                    self.browser
+                        .set_status("Save applies to WHOIS and RDAP replies.");
+                }
+                if self.browser.download_offer().is_some() {
+                    self.set_focus(FocusTarget::Download);
                 }
                 self.request_redraw();
             }
@@ -4094,18 +4196,13 @@ impl DesktopApp {
                 self.navigate(url.to_string());
             }
             "whois" => {
-                let Some(query) = parts.next() else {
-                    self.browser.set_status("usage: whois <domain> [server]");
-                    return;
-                };
-                let server = parts.next().unwrap_or(trust::oneshot::WHOIS_DEFAULT);
-                let (host, port) = trust::command::split_host_port(server);
-                let address = format!(
-                    "whois://{host}{}/{query}",
-                    port.map_or_else(String::new, |port| format!(":{port}"))
-                );
-                self.close_command();
-                self.navigate(address);
+                match trust::whois::command_target(command.trim_start().get(5..).unwrap_or("")) {
+                    Ok(url) => {
+                        self.close_command();
+                        self.navigate(url.to_string());
+                    }
+                    Err(error) => self.browser.set_status(error),
+                }
             }
             "dict" | "define" => {
                 let Some(word) = parts.next() else {
@@ -7183,6 +7280,12 @@ mod tests {
                 trust::gemini::parse_gemtext(gemtext, usize::MAX / 4, &|target| trust::gemini::absolute_link(target).unwrap()),
                 gemtext.to_vec(), 80, false, None,
             ),
+            {
+                let url = trust::whois::server_target("example.test", "bob").unwrap();
+                let mut page = trust::whois::Page::new(trust::whois::Reply::from_bytes(url.clone(), b"Domain name: bob\r\nurl: finger://example.test/alice finger://example.test/bob\r\n".to_vec()));
+                page.section = trust::registration::Section::Raw;
+                trust::whois::render(&url, page, usize::MAX / 4)
+            },
         ]
     }
 
@@ -7318,6 +7421,9 @@ mod tests {
         builder.with_any_thread(true);
         let event_loop = builder.build().unwrap();
         for mut document in protocol_pointer_documents() {
+            // This case exercises outgoing Finger links through native input.
+            // Local registration view controls have separate controller tests.
+            document.lines.retain(|line| matches!(&line.link, Some(Link::OneShot(url)) if url.scheme == trust::oneshot::Scheme::Finger));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             for line in &mut document.lines {
                 if let Some(Link::OneShot(url)) = &mut line.link {
@@ -7338,7 +7444,7 @@ mod tests {
                 .open_internal_gemtext("about:pointer-test", b"Initial page".to_vec());
             app.focus = FocusTarget::Page;
             let cache = protocol_pointer_cache(document);
-            let hits = protocol_pointer_hits(&cache);
+            let hits: Vec<_> = protocol_pointer_hits(&cache).into_iter().filter(|hit| matches!(&hit.link, Some(Link::OneShot(url)) if url.scheme == trust::oneshot::Scheme::Finger)).collect();
             let first = &hits[0];
             let second = hits.iter().find(|hit| hit.node != first.node).unwrap();
             let point = CssPoint::new(second.rect.x + 2.0, second.rect.y + 2.0);

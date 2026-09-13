@@ -369,6 +369,8 @@ impl Form {
 /// Styling class of a document line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
+    /// A recognized field in a human-readable registration record.
+    Field,
     /// Lines added/removed in an explicitly requested reply comparison.
     Added,
     Removed,
@@ -444,6 +446,10 @@ pub struct Doc {
     pub lines: Vec<DocLine>,
     /// Finger view controls and one previous reply for manual comparison.
     pub finger: Option<crate::finger::View>,
+    /// Per-server WHOIS bytes, view controls, and one successful comparison.
+    pub whois: Option<crate::whois::Page>,
+    /// RDAP registration record and original JSON, independent of HTTP layout.
+    pub rdap: Option<crate::rdap::Page>,
     /// The body bytes as fetched.
     pub raw: Vec<u8>,
     /// Width `lines` was wrapped to.
@@ -531,6 +537,43 @@ pub struct Doc {
 }
 
 impl Doc {
+    pub fn registration_section(&self) -> Option<crate::registration::Section> {
+        self.whois
+            .as_ref()
+            .map(|page| page.section)
+            .or_else(|| self.rdap.as_ref().map(|page| page.section))
+    }
+
+    pub fn text_view(&self) -> Option<&crate::text_reply::View> {
+        self.whois
+            .as_ref()
+            .map(|page| &page.view)
+            .or_else(|| self.rdap.as_ref().map(|page| &page.view))
+            .or_else(|| self.finger.as_ref().map(|view| &view.controls))
+    }
+
+    pub fn text_view_mut(&mut self) -> Option<&mut crate::text_reply::View> {
+        if let Some(page) = &mut self.whois {
+            Some(&mut page.view)
+        } else if let Some(page) = &mut self.rdap {
+            Some(&mut page.view)
+        } else {
+            self.finger.as_mut().map(|view| &mut view.controls)
+        }
+    }
+
+    pub fn rerender_reply(&mut self, width: usize) {
+        if let Some(page) = self.rdap.take() {
+            *self = crate::rdap::render(page, width);
+        } else if let Some(page) = self.whois.take() {
+            if let Link::OneShot(url) = &self.url {
+                *self = crate::whois::render(url, page, width);
+            }
+        } else {
+            crate::finger::rerender(self, width);
+        }
+    }
+
     /// A line-model document (gopher / gemini / oneshot / plain text): only
     /// `lines` is populated; the 2D-layout artifacts (`rows`, `image_urls`,
     /// `carousels`, `fixed`, `regions`, `scroll_clips`, `boundaries`) and
@@ -549,6 +592,8 @@ impl Doc {
             url,
             lines,
             finger: None,
+            whois: None,
+            rdap: None,
             raw,
             wrapped_to,
             cp437,
