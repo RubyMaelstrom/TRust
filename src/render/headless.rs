@@ -206,6 +206,28 @@ mod tests {
     "#;
 
     #[test]
+    fn legacy_html_colors_reach_desktop_pixels_without_a_stylesheet() {
+        // HTML #the-page / #phrasing-content-3: these hints must reach the
+        // same cascade and canvas painting path as authored CSS.
+        let html = r##"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 2.0//EN">
+            <body bgcolor="#2d2d2d" text="#ffffff" link="#ff69b4">
+              <font color="#4a90d9" size=7>News</font>
+              <p>Readable text</p><a href=/news>Headlines</a>
+            </body>"##;
+        let base = Url::parse("https://example.test/").unwrap();
+        let frame = render_html(html, &base, CssSize::new(320., 240.)).unwrap();
+        let pixels = frame.pixels.as_chunks::<4>().0;
+        assert_eq!(pixels[320 * 230 + 310], [45, 45, 45, 255]);
+        for color in [
+            [74, 144, 217, 255],
+            [255, 255, 255, 255],
+            [255, 105, 180, 255],
+        ] {
+            assert!(pixels.contains(&color), "missing authored color {color:?}");
+        }
+    }
+
+    #[test]
     fn css_color4_queries_paint_dark_theme_pixels() {
         // CSS Conditional 3 #support-definition, nested inside a media rule
         // and assigning custom properties as modern compiled stylesheets do.
