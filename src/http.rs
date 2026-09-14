@@ -132,14 +132,23 @@ pub(crate) fn request_cookies(request: &Request) -> String {
 }
 
 pub(crate) fn response_cookie(request: &Request, line: &str) {
-    if credentials_included(request)
-        && request
-            .cookie_context
-            .as_ref()
-            .is_some_and(|c| c.allows(&request.url))
-    {
-        store_cookie(&request.url, line, false);
+    // RFC6265bis #third-party-cookies permits this policy, independently of
+    // Fetch credentials. Record refusals at this gate as well as parser/store
+    // failures, so a received Set-Cookie cannot silently disappear in a trace.
+    let denied = if !credentials_included(request) {
+        Some("response-denied-credentials")
+    } else {
+        match &request.cookie_context {
+            None => Some("response-denied-context"),
+            Some(context) if !context.allows(&request.url) => Some("response-denied-third-party"),
+            Some(_) => None,
+        }
+    };
+    if let Some(reason) = denied {
+        trace_cookie_line(reason, &request.url, line);
+        return;
     }
+    store_cookie(&request.url, line, false);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2641,7 +2650,7 @@ fn trace_cookie_counts(event: &'static str, url: &Url, status: u16, counts: (usi
     );
 }
 
-fn trace_cookie_line(event: &'static str, url: &Url, line: &str) {
+pub(crate) fn trace_cookie_line(event: &'static str, url: &Url, line: &str) {
     if cookie_trace_enabled() {
         trace_cookie_counts(event, url, 0, cookie_trace_counts(std::iter::once(line)));
     }
@@ -3208,10 +3217,8 @@ fn finish_response(
             cookie_trace_counts(set_cookies.iter().map(String::as_str)),
         );
     }
-    if credentials_included(request) {
-        for line in &set_cookies {
-            response_cookie(request, line);
-        }
+    for line in &set_cookies {
+        response_cookie(request, line);
     }
     // Redirect processing also consumes response headers (notably
     // Referrer-Policy). Preserve those while still hiding Set-Cookie.
@@ -3371,10 +3378,18 @@ async fn exchange(
     let cookie = request_cookies(request);
     if cookie_trace_enabled() {
         trace_cookie_counts(
-            if credentials_included(request) {
-                "request"
-            } else {
+            if !credentials_included(request) {
                 "request-credentials-excluded"
+            } else if request.cookie_context.is_none() {
+                "request-denied-context"
+            } else if request
+                .cookie_context
+                .as_ref()
+                .is_some_and(|context| !context.allows(url))
+            {
+                "request-denied-third-party"
+            } else {
+                "request"
             },
             url,
             0,
