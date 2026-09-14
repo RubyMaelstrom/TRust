@@ -1127,12 +1127,20 @@ fn size_tracks_constrained(
                     _ => None,
                 })
                 .sum();
-            let denom = factors.max(1.0);
+            // CSS Grid 2 #algo-spanning-flex-items: below a total factor of
+            // one, distribute the remaining proportion equally. Clamping the
+            // denominator alone loses part of the minimum contribution (a
+            // lone .25fr track would receive only 25% of its item's minimum).
+            let count = tracks[c.tracks.clone()]
+                .iter()
+                .filter(|t| growable(t))
+                .count();
+            let equal = (1.0 - factors).max(0.0) / count.max(1) as f32;
             for t in tracks[c.tracks.clone()].iter_mut() {
                 if growable(t)
                     && let TrackFn::Fr(f) = t.size.max
                 {
-                    t.base = t.base.max(space * (f / denom));
+                    t.base = t.base.max(space * (f / factors.max(1.0) + equal));
                 }
             }
         }
@@ -2680,6 +2688,36 @@ mod tests {
         // A bare `var()` around a whole track works too.
         let t = tpl("var(--a, 100px) var(--b, 1fr)", 640.0, 0.0);
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn fractional_tracks_keep_the_full_intrinsic_minimum() {
+        // CSS Grid 2 #algo-spanning-flex-items distributes the part below
+        // one equally; a .25fr track still receives its item's whole minimum.
+        for (template, range, expected) in [
+            ("1fr .25fr", 1..2, vec![658.0, 250.0]),
+            (".25fr .5fr", 0..2, vec![135.0, 225.0]),
+            ("0fr 0fr", 0..2, vec![180.0, 180.0]),
+        ] {
+            let mut tracks = tpl(template, 908.0, 0.0);
+            let minimum = if range.len() == 1 { 250.0 } else { 360.0 };
+            let items = [Contrib {
+                tracks: range,
+                minimum,
+                min: minimum,
+                max: minimum,
+            }];
+            size_tracks_constrained(
+                &mut tracks,
+                &items,
+                (template == "1fr .25fr").then_some(908.0),
+                0.0,
+                false,
+                template != "1fr .25fr",
+            );
+            let sizes: Vec<_> = tracks.iter().map(|track| track.base).collect();
+            assert_eq!(sizes, expected, "{template}");
+        }
     }
 
     #[test]
