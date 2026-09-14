@@ -1447,6 +1447,9 @@ fn collect_positioned<'a, 'tree>(
 }
 
 fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+    if fragment.flow.hidden {
+        return;
+    }
     let style = PaintStyle::of(fragment);
     if style.is_some_and(|style| {
         matches!(
@@ -1966,6 +1969,7 @@ fn paint_atomic_control_box(
         },
     );
     let control = Frag {
+        flow: Default::default(),
         node,
         x: rect.x,
         y: rect.y,
@@ -2169,6 +2173,9 @@ fn paint_color_is_light(color: PaintColor) -> bool {
 /// end of this fragment's paint keeps it visible over the fragment's own text
 /// while preserving the surrounding Appendix E traversal.
 fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+    if fragment.flow.hidden {
+        return;
+    }
     let Some(style) = PaintStyle::of(fragment) else {
         return;
     };

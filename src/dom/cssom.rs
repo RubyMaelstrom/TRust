@@ -360,7 +360,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
     let one_of = |values: &str| values.split_ascii_whitespace().any(|v| v == value);
     match property {
         "display" => one_of(
-            "none contents block inline inline-block flow-root list-item flex inline-flex grid inline-grid table inline-table table-caption table-cell table-row table-row-group table-header-group table-footer-group table-column table-column-group",
+            "none contents block inline inline-block flow-root list-item flex inline-flex grid inline-grid table inline-table table-caption table-cell table-row table-row-group table-header-group table-footer-group table-column table-column-group -webkit-box -webkit-inline-box",
         ),
         "position" => one_of("static relative absolute fixed sticky"),
         "visibility" => one_of("visible hidden collapse"),
@@ -388,6 +388,8 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "text-transform" => one_of("none uppercase lowercase capitalize"),
         "text-align" => one_of("start end left right center justify match-parent"),
         "text-overflow" => one_of("clip ellipsis"),
+        "-webkit-line-clamp" => value == "none" || value.parse::<usize>().is_ok_and(|n| n > 0),
+        "-webkit-box-orient" => one_of("horizontal vertical inline-axis block-axis"),
         "object-fit" => one_of("fill contain cover none scale-down"),
         "image-rendering" => one_of("auto smooth high-quality crisp-edges pixelated"),
         "table-layout" => one_of("auto fixed"),

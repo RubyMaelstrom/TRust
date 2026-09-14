@@ -71,7 +71,17 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     let cv = |prop: &str| dom.computed_value_resolved(id, prop);
     // flex-direction / flex-wrap, with `flex-flow` as their shorthand.
     let flow = cv("flex-flow").unwrap_or_default();
-    let dir = cv("flex-direction").unwrap_or_else(|| flow.clone());
+    let dir = cv("flex-direction").unwrap_or_else(|| {
+        if matches!(
+            dom.computed_display(id).as_deref(),
+            Some("-webkit-box" | "-webkit-inline-box")
+        ) && cv("-webkit-box-orient").as_deref() == Some("vertical")
+        {
+            "column".into()
+        } else {
+            flow.clone()
+        }
+    });
     let dir = dir.to_ascii_lowercase();
     let (row, reverse) = if dir.contains("column-reverse") {
         (false, true)

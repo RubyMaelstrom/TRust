@@ -260,6 +260,9 @@ pub(crate) struct AtomBoxPlace {
 /// One finished line box.
 #[derive(Debug)]
 pub(crate) struct LineOut {
+    pub atom_boxes: Vec<Piece>,
+    pub alignment_offset: f32,
+    pub justification: f32,
     pub pieces: Vec<Piece>,
     /// The line includes an atomic inline box whose independently laid
     /// fragment must stay beside the remaining inline content.
@@ -1745,6 +1748,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let width = (self.pen - self.line_left).max(0.0);
         let contains_atomic_inline = pieces.iter().any(|piece| piece.atom_box);
         let mut line = LineOut {
+            atom_boxes: Vec::new(),
+            alignment_offset: 0.0,
+            justification: 0.0,
             pieces,
             contains_atomic_inline,
             height,
@@ -1766,6 +1772,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 Align2::Left | Align2::Justify => 0.0,
             };
             if off > 0.0 {
+                line.alignment_offset = off;
                 for p in &mut line.pieces {
                     p.x += off;
                 }
@@ -1779,6 +1786,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             let li = self.lines.len();
             for p in &line.pieces {
                 if p.atom_box {
+                    line.atom_boxes.push(p.clone());
                     self.atom_places.push(AtomBoxPlace {
                         node: p.item.node,
                         line: li,
@@ -1963,6 +1971,122 @@ fn composed_contains(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
     false
 }
 
+/// Insert the block ellipsis into the last visible line of clamped content.
+pub(super) fn block_ellipsis(
+    line: &mut super::flow::LineFrag,
+    dom: &Dom,
+    base: &Url,
+    root: &InlineStyle,
+) {
+    // CSS Overflow 4 #block-ellipsis: insert an anonymous root-inline child,
+    // displacing content at a soft wrap opportunity before text alignment.
+    // Its zero line-height must not enlarge the line or move it past a float.
+    let shaped = crate::text::shape("…", &root.text_style());
+    let available = line.band[1] - shaped.advance;
+    // Atomic inline fragments are stored beside the line after placement.
+    // Their placeholders must still participate in ellipsis fitting; retained
+    // replacements below let flow move or suppress the corresponding boxes.
+    line.pieces.append(&mut line.atom_boxes);
+    line.pieces.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let slots = line.pieces.iter().filter(|p| p.space_before).count();
+    let per_slot = if slots == 0 {
+        0.0
+    } else {
+        line.justification / slots as f32
+    };
+    let mut shift = line.alignment_offset;
+    for piece in &mut line.pieces {
+        if piece.space_before {
+            shift += per_slot;
+        }
+        piece.x -= shift;
+    }
+    while let Some(piece) = line.pieces.last_mut() {
+        if let Some(style) = piece.text_style.as_ref() {
+            let mut text = piece.item.text.trim_end_matches(char::is_whitespace);
+            if piece.x + crate::text::shape(text, style).advance > available {
+                let context = InlineStyle::derive(dom, piece.item.style_node, root, base);
+                let word_break = if context.keep_all {
+                    crate::text::TextWordBreak::KeepAll
+                } else if context.brk == super::style::WordBrk::BreakAll {
+                    crate::text::TextWordBreak::BreakAll
+                } else {
+                    crate::text::TextWordBreak::Normal
+                };
+                let end = crate::text::first_line_end(
+                    text,
+                    style,
+                    (available - piece.x).max(0.0),
+                    crate::text::TextBreakStyle {
+                        wrap: true,
+                        word_break,
+                        // Ellipsis placement ignores overflow-wrap's extra
+                        // opportunities, and white-space's nowrap suppression.
+                        overflow_wrap: crate::text::TextOverflowWrap::Normal,
+                    },
+                );
+                text = text[..end].trim_end_matches(char::is_whitespace);
+            }
+            let shortened = crate::text::shape(text, style);
+            if !text.is_empty() && piece.x + shortened.advance <= available + 0.01 {
+                piece.item.text = text.to_owned();
+                piece.box_width = shortened.advance;
+                piece.paint_width = shortened.advance;
+                piece.shaped = Some(shortened);
+                break;
+            }
+        } else if piece.x + piece.box_width <= available {
+            break;
+        }
+        line.pieces.pop();
+    }
+    let end = line
+        .pieces
+        .last()
+        .map_or(line.band[0], |p| p.x + p.box_width);
+    let mut ellipsis = Piece::shaped(
+        InlineItem {
+            text: "…".into(),
+            terminal_text: None,
+            kind: ItemKind::Text,
+            graphical_image: None,
+            image: None,
+            emph: root.emph,
+            style_node: root.node,
+            pseudo: root.pseudo,
+            node: NO_NODE,
+            link: None,
+            crop: false,
+            pixelated: false,
+            invisible: root.invisible,
+        },
+        shaped,
+    );
+    ellipsis.x = end;
+    ellipsis.y = line.baseline - ellipsis.ascent;
+    line.width = end + ellipsis.box_width - line.band[0];
+    line.pieces.push(ellipsis);
+    let free = (line.band[1] - line.band[0] - line.width).max(0.0);
+    line.alignment_offset = match super::style::block_align(dom, root.node) {
+        Align2::Center => free / 2.0,
+        Align2::Right => free,
+        _ => 0.0,
+    };
+    line.justification = 0.0;
+    for piece in &mut line.pieces {
+        piece.x += line.alignment_offset;
+    }
+    line.pieces.retain(|piece| {
+        if piece.atom_box {
+            line.atom_boxes.push(piece.clone());
+            false
+        } else {
+            true
+        }
+    });
+    line.contains_atomic_inline = !line.atom_boxes.is_empty();
+}
+
 /// CSS Text §7.3 justification in CSS pixels. Collapsed spaces are retained
 /// as explicit gaps between pieces, so expansion changes geometry without
 /// manufacturing extra U+0020 characters or reshaping glyph runs.
@@ -1987,6 +2111,7 @@ fn justify(line: &mut LineOut, extra: f32) {
         piece.x += shift;
     }
     line.width += extra;
+    line.justification = extra;
 }
 
 /// The playable URL of a media element and the chosen `<source>` node (for

@@ -39,6 +39,7 @@
 //! always-correct full-relayout path.
 
 mod boundary;
+mod clamp;
 pub(crate) mod clip_path;
 mod contract;
 mod flex;
@@ -52,12 +53,12 @@ mod intrinsic;
 mod measure;
 mod memo;
 mod overflow;
-// The legacy Row/Item output is now explicitly a terminal compatibility
-// adapter. Its source filename is retained to keep this refactor reviewable.
 mod replaced;
 mod session;
 mod style;
 mod table;
+// The legacy Row/Item output is now explicitly a terminal compatibility
+// adapter. Its source filename is retained to keep this refactor reviewable.
 #[path = "paint.rs"]
 mod terminal;
 mod tree;

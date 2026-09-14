@@ -3639,9 +3639,48 @@ impl Dom {
     /// formatting context off a bare HTML `<table>` with no CSS at all.
     pub fn effective_display(&self, id: NodeId) -> Option<String> {
         if let Some(d) = self.computed_display(id) {
+            // CSS Overflow 4 #continue: the legacy vertical line-clamp
+            // combination computes to an independent block formatting context.
+            if matches!(d.as_str(), "-webkit-box" | "-webkit-inline-box")
+                && self.legacy_line_clamp(id).is_some()
+            {
+                return Some(
+                    if d == "-webkit-box" {
+                        "flow-root"
+                    } else {
+                        "inline-block"
+                    }
+                    .into(),
+                );
+            }
+            // WHATWG Compatibility #css-keyword-mappings; the special
+            // line-clamp computation above takes precedence.
+            if d == "-webkit-box" {
+                return Some("flex".into());
+            }
+            if d == "-webkit-inline-box" {
+                return Some("inline-flex".into());
+            }
             return Some(d);
         }
         Some(ua_display(self.tag_name(id)?).to_string())
+    }
+
+    pub(crate) fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
+        if !matches!(
+            self.computed_display(id).as_deref(),
+            Some("-webkit-box" | "-webkit-inline-box")
+        ) || self
+            .computed_value_resolved(id, "-webkit-box-orient")
+            .as_deref()
+            != Some("vertical")
+        {
+            return None;
+        }
+        self.computed_value_resolved(id, "-webkit-line-clamp")?
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
     }
 
     /// True when `id` must establish a table formatting context for its
@@ -3958,6 +3997,9 @@ impl Dom {
     /// initial values for the implemented positioning, sizing and interaction
     /// surface so script does not mistake an empty sentinel for a CSS value.
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
+        if name == "display" {
+            return self.effective_display(id);
+        }
         // CSS Fonts 4 §2.5 defines the computed value of `font-size` as an
         // absolute length. Do not expose the authored percentage/relative
         // token (or the internal `None` used for initial `medium`) through
@@ -9835,6 +9877,10 @@ const PROPS: &[PropDef] = &[
     // CSS Overflow 3 §5.1 — chooses ellipsis vs plain clip at a nowrap
     // truncation. NOT inherited (applies to the clipping block itself).
     prop("text-overflow", false, true),
+    // CSS Overflow 4 #webkit-line-clamp. Preserve the legacy combination in
+    // live snapshots as well as the canonical cascade.
+    prop("-webkit-line-clamp", false, true),
+    prop("-webkit-box-orient", false, true),
     // CSS Text 3 §5.2/§5.5: within-word break opportunities (`word-wrap` is
     // the legacy alias of `overflow-wrap`, normalized at shorthand expansion)
     // and §3 tab advance in preserved modes. All inherited per spec.
@@ -10041,6 +10087,8 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "list-style-type" => Some("disc"),
         "opacity" => Some("1"),
         "clip-path" => Some("none"),
+        "-webkit-line-clamp" => Some("none"),
+        "-webkit-box-orient" => Some("horizontal"),
         _ => None,
     }
 }
@@ -12313,6 +12361,20 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     // CSS Conditional 3 #support-definition: an unsupported color value is
     // also invalid in ordinary declarations, preserving earlier fallbacks.
     if is_color_property(&k) && !supports_color_value(&value) {
+        return None;
+    }
+    if matches!(k.as_str(), "-webkit-line-clamp" | "-webkit-box-orient")
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && if k == "-webkit-line-clamp" {
+            value != "none" && !value.parse::<usize>().is_ok_and(|n| n > 0)
+        } else {
+            !matches!(
+                value.as_str(),
+                "horizontal" | "vertical" | "inline-axis" | "block-axis"
+            )
+        }
+    {
         return None;
     }
     if matches!(
