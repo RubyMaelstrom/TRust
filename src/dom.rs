@@ -5931,6 +5931,28 @@ impl Dom {
         None
     }
 
+    /// HTML #document-base-url / #updating-the-image-data: a resource uses
+    /// its node Document's base, including after script inserts or changes
+    /// relative attributes in a nested document. Installed frame URLs also
+    /// retain redirects and the inherited base of about:srcdoc documents.
+    pub(crate) fn resource_base_url(&self, id: NodeId, page_url: &url::Url) -> url::Url {
+        let owner = self.frame_owner(id);
+        let root = owner.unwrap_or(DOCUMENT);
+        let fallback = self
+            .properties
+            .document_bases
+            .get(&root)
+            .unwrap_or(page_url);
+        let first_base = self.descendants(root).find(|&node| {
+            self.tag_name(node) == Some("base")
+                && self.attr(node, "href").is_some()
+                && self.frame_owner(node) == owner
+        });
+        first_base
+            .and_then(|node| fallback.join(self.attr(node, "href")?.trim()).ok())
+            .unwrap_or_else(|| fallback.clone())
+    }
+
     fn serialized_frame_wrapper_style(&self, id: NodeId) -> String {
         let display = match self.effective_display(id).as_deref() {
             Some("none") => "none",

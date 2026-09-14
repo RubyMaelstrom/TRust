@@ -56,7 +56,7 @@ pub fn select(
     if dom.tag_name(img) != Some("img") {
         return None;
     }
-    let base = document_base(dom, page_url);
+    let base = dom.resource_base_url(img, page_url);
     let (mut candidates, dimension_source) =
         update_source_set(dom, img, viewport, device_pixel_ratio);
     if candidates.is_empty() {
@@ -631,17 +631,6 @@ fn supported_image_mime(input: &str) -> bool {
     )
 }
 
-fn document_base(dom: &Dom, page_url: &Url) -> Url {
-    dom.descendants(crate::dom::DOCUMENT)
-        .find_map(|id| {
-            (dom.tag_name(id) == Some("base"))
-                .then(|| dom.attr(id, "href"))
-                .flatten()
-                .and_then(|href| page_url.join(href.trim()).ok())
-        })
-        .unwrap_or_else(|| page_url.clone())
-}
-
 fn resolve_url(base: &Url, raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -656,6 +645,50 @@ fn resolve_url(base: &Url, raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_selection_keeps_dynamic_frame_urls_in_the_owning_document() {
+        let page = Url::parse("https://parent.test/page").unwrap();
+        let mut dom = Dom::parse_document("<img id=root src='root.png'><iframe id=frame></iframe>");
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            "<head><base href='/assets/'></head><body><img id=child><iframe id=nested></iframe>",
+            "https://child.test/redirected/document",
+        );
+        let child = dom.get_by_id("child").unwrap();
+        let nested = dom.get_by_id("nested").unwrap();
+        dom.install_frame_document(nested, "<img id=inner>", "https://nested.test/final/");
+        let inner = dom.get_by_id("inner").unwrap();
+        // These assignments happen after frame installation, as with an Image
+        // created by script. They must not depend on initial URL rewriting.
+        dom.set_attr(child, "src", "/probe.png");
+        dom.set_attr(inner, "src", "inner.png");
+        let viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let selected = |dom: &Dom, id| select(dom, id, &page, viewport, 1.0).unwrap().source;
+        assert_eq!(selected(&dom, child), "https://child.test/probe.png");
+        assert_eq!(selected(&dom, inner), "https://nested.test/final/inner.png");
+        assert_eq!(
+            selected(&dom, dom.get_by_id("root").unwrap()),
+            "https://parent.test/root.png"
+        );
+        dom.set_attr(child, "srcset", "small.png 1x, large.png 2x");
+        assert_eq!(selected(&dom, child), "https://child.test/assets/small.png");
+        let base = dom
+            .descendants(frame)
+            .find(|&id| dom.tag_name(id) == Some("base"))
+            .unwrap();
+        dom.set_attr(base, "href", "https://images.test/new/");
+        assert_eq!(selected(&dom, child), "https://images.test/new/small.png");
+        dom.set_attr(base, "href", "http://[");
+        assert_eq!(
+            selected(&dom, child),
+            "https://child.test/redirected/small.png"
+        );
+    }
 
     fn dom(html: &str) -> Dom {
         Dom::parse_document(html)
