@@ -43,7 +43,6 @@
     const configuredReferrer = typeof cfg.referrer === "string" ? cfg.referrer : "";
     const navigateDocument = g.__http_navigate;
     delete g.__http_navigate;
-    const fetchClassicResource = g.__dom_fetch_classic_script;
     delete g.__dom_fetch_classic_script;
     const makeWindowMessageBinding = g.__window_message_binding;
     delete g.__window_message_binding;
@@ -1919,13 +1918,13 @@
     // nested inside it. The circular-navigation guard prevents only the
     // recursive URL cycle required by HTML; navigation itself has no arbitrary
     // depth/count cutoff.
-    function beginFrameLoad(frame, timingURL = null) {
+    function beginFrameLoad(frame, timingURL = null, timingStart = null) {
         const generation = (frame.__trustLoadGeneration || 0) + 1;
         frame.__trustLoadGeneration = generation;
         frameResourceTimings.delete(frame);
         if (timingURL !== null && frame.localName === 'iframe') {
             frameResourceTimings.set(frame,{generation,url:timingURL,
-                start:navigationFloorTime(__clockNow()*10)/10});
+                start:timingStart ?? navigationFloorTime(__clockNow()*10)/10});
         }
         return generation;
     }
@@ -2238,22 +2237,27 @@
         if (frameAncestorHasUrl(frame, url)) return; // circular-navigation guard
         ftrace("processIframeAttributes resource src=" + url);
         frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
-        const generation = beginFrameLoad(frame, url);
+        const timingStart = navigationFloorTime(__clockNow()*10)/10;
         let r;
         try { r = navigateDocument(url, frame.ownerDocument.URL, frame.referrerPolicy || "", frame.__id); } catch (e) { r = null; }
         ftrace("frame fetch -> " + (r ? r[0] + " " + r[1] + " len=" + String(r[2] || "").length : "null"));
+        // HTML #process-a-navigate-response / #read-html: HTTP error responses
+        // are documents too. Only 204/205 abort without replacing the active
+        // Document or firing its load events; a network error is handled below.
+        // Do not begin a new load generation for an aborted navigation, so the
+        // existing Document can finish loading and the queued reservation retires.
+        if (r && (r[0] === 204 || r[0] === 205)) {
+            if (r[8]) trust.recordResourceTiming(r[8]);
+            return;
+        }
+        const generation = beginFrameLoad(frame, url, timingStart);
         if (!r) { fireFrameLoad(frame, generation); return; }
         if (r[8]) {
             frameResourceTimings.delete(frame);
             trust.recordResourceTiming(r[8]);
         }
-        const status = r[0] | 0;
-        if (status >= 200 && status < 300) {
-            const finalURL = r[5] || url;
-            loadFrameResource(frame, r[2] || "", r[1], finalURL, generation, r[6] || "", r[7]);
-        } else {
-            fireFrameLoad(frame, generation);
-        }
+        const finalURL = r[5] || url;
+        loadFrameResource(frame, r[2] || "", r[1], finalURL, generation, r[6] || "", r[7]);
     }
     // Process every frame within `root` (the document at load, or a freshly
     // installed frame document for nested frames). Idempotent (the __loaded*
@@ -7794,24 +7798,6 @@
         loadFrameStyles(realmRootFrame, done);
         return true;
     };
-    // HTML's classic-script fetch checks the response status and, when
-    // `nosniff` is present, its JavaScript MIME essence. The page prelude's
-    // worker loader has the same rule, but frame parser scripts use this local
-    // helper because they execute synchronously while the nested document is
-    // being installed.
-    function frameClassicScriptResponseOK(response) {
-        if (!response || response[0] < 200 || response[0] >= 300) return false;
-        const lines = String(response[4] || "").split("\n");
-        let nosniff = false;
-        for (let i = 0; i + 1 < lines.length; i += 2) {
-            if (lines[i].toLowerCase() === "x-content-type-options") {
-                nosniff = lines[i + 1].split(",", 1)[0].trim().toLowerCase() === "nosniff";
-                break;
-            }
-        }
-        if (!nosniff) return true;
-        return /^(application|text)\/(java|ecma)script(?:$|;)/i.test(String(response[1] || "").trim());
-    }
     function runFrameScripts(frame, parserDone, allDone) {
         parserDone = typeof parserDone === "function" ? parserDone : function () {};
         allDone = typeof allDone === "function" ? allDone : function () {};
@@ -7820,92 +7806,110 @@
             try { scripts = frameDocument(frame).querySelectorAll("script"); }
             catch (e) { parserDone(); allDone(); return; }
             ftrace("runFrameScripts found=" + scripts.length);
+            const generation = frame.__trustLoadGeneration;
             const orderedScripts = [];
-            const asyncModules = [];
-            function runClassic(script) {
-                SCRIPTS_STARTED.add(script.__id);
-                let source = script.textContent || "";
-                const src = script.getAttribute("src");
-                try {
-                    let name = g.location.href;
-                    if (src) {
-                        name = frameResourceURL(script);
-                        const response = fetchClassicResource(script.__id);
-                        if (!frameClassicScriptResponseOK(response)) {
-                            trust.scriptEvent(script.__id, "error");
-                            return;
-                        }
-                        source = response[2] || "";
-                    }
-                    // HTML "run a classic script", not indirect eval: keep
-                    // declarations in the Realm's persistent GlobalEnv.
-                    __dom_run_classic_script(script.__id, source, name);
-                    if (src) trust.scriptEvent(script.__id, "load");
-                } catch (e) {
-                    trust.errors.push("frame script: " + ((e && e.message) || e));
-                    if (src) trust.scriptEvent(script.__id, "error");
-                }
+            let pendingResources = 0, parserFinished = false, loadFinished = false;
+            function active() { return generation === frame.__trustLoadGeneration; }
+            function finishLoad() {
+                if (!active() || loadFinished || !parserFinished || pendingResources) return;
+                loadFinished = true;
+                allDone();
             }
-            for (const script of scripts) {
-                if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id)) continue;
-                const ty = (script.getAttribute("type") || "").trim().toLowerCase();
-                if (ty === "module") {
-                    (script.hasAttribute("async") ? asyncModules : orderedScripts).push(script);
-                    continue;
-                }
-                if (ty && ty !== "text/javascript" && ty !== "application/javascript" &&
-                    ty !== "text/ecmascript") continue;
-                if (script.hasAttribute("nomodule")) continue;
-                if (script.hasAttribute("src") && script.hasAttribute("defer") &&
-                    !script.hasAttribute("async")) orderedScripts.push(script);
-                else runClassic(script);
-            }
-
-            // HTML #the-end: the readiness transition precedes the ordered
-            // post-parser list, including external classic `defer` scripts.
-            if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
-            else frame.__trustReadyState = "interactive";
-
-            // Parser-created modules fetch in parallel when `async`; modules
-            // without it execute in tree order after parsing. Lumen's injected
-            // module completion event follows the evaluation promise, so it is
-            // also the load-delay boundary (including top-level await).
-            let remaining = orderedScripts.length + asyncModules.length;
-            let parserFinished = false;
             function finishParser() {
-                if (parserFinished) return;
+                if (!active() || parserFinished) return;
                 parserFinished = true;
                 parserDone();
+                finishLoad();
             }
-            function finishOne() {
-                remaining--;
-                if (remaining === 0) allDone();
-            }
-            function startModule(script, settled) {
+            function startResource(script, settled) {
                 SCRIPTS_STARTED.add(script.__id);
+                pendingResources++;
                 waitForFrameResource(script, function () {
                     __dom_run_injected_script(script.__id);
                 }, function () {
+                    pendingResources--;
+                    if (!active()) return;
                     settled();
-                    finishOne();
+                    finishLoad();
                 });
             }
-            for (const script of asyncModules) startModule(script, function () {});
-            function startOrdered(index) {
-                if (index >= orderedScripts.length) { finishParser(); return; }
-                const script = orderedScripts[index];
-                if ((script.getAttribute('type') || '').trim().toLowerCase() !== 'module') {
-                    runClassic(script);
-                    startOrdered(index + 1);
-                    finishOne();
-                    return;
+            function runInline(script) {
+                SCRIPTS_STARTED.add(script.__id);
+                try {
+                    // ScriptEvaluation retains the Realm's global lexical
+                    // environment across sibling classic script elements.
+                    __dom_run_classic_script(script.__id, script.textContent || "", g.location.href);
+                } catch (e) {
+                    trust.errors.push("frame script: " + ((e && e.message) || e));
                 }
-                // HTML §4.12.1.1's `already started` flag permits exactly
-                // one preparation/start for this parser-created script.
-                startModule(script, function () { startOrdered(index + 1); });
             }
-            startOrdered(0);
-            if (remaining === 0) allDone();
+            function startOrdered(index) {
+                if (!active()) return;
+                if (index >= orderedScripts.length) { finishParser(); return; }
+                startResource(orderedScripts[index], function () { startOrdered(index + 1); });
+            }
+            function parseNext(index) {
+                if (!active()) return;
+                for (; index < scripts.length; index++) {
+                    const script = scripts[index];
+                    if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id)) continue;
+                    const type = (script.getAttribute("type") || "").trim().toLowerCase();
+                    const module = type === "module";
+                    if (!module && type && type !== "text/javascript" && type !== "application/javascript" &&
+                        type !== "text/ecmascript") continue;
+                    if (!module && script.hasAttribute("nomodule")) continue;
+                    const external = script.hasAttribute("src");
+                    if ((module || external) && script.hasAttribute("async")) {
+                        startResource(script, function () {});
+                    } else if (module || (external && script.hasAttribute("defer"))) {
+                        orderedScripts.push(script);
+                    } else if (external) {
+                        // HTML #scriptTagParserResumes: fetching a pending
+                        // parsing-blocking script spins the event loop. Pause
+                        // this parser, allowing messages and other tasks to run;
+                        // continue only after its load/error resource task.
+                        // The native resource loader applies script status/MIME
+                        // checks and executes in the element's relevant Realm.
+                        startResource(script, function () { parseNext(index + 1); });
+                        return;
+                    } else runInline(script);
+                    if (!active()) return;
+                }
+                // HTML #the-end: interactive precedes the ordered defer/module
+                // list. DOMContentLoaded waits for that list; load also waits
+                // for every asynchronous classic or module script.
+                if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
+                else frame.__trustReadyState = "interactive";
+                startOrdered(0);
+            }
+            // Empty/text documents and inline-only fragments never suspend
+            // their parser. Keep their completion on this stack, without the
+            // continuation chain needed around an external resource wait.
+            let needsResourceTasks = false;
+            for (const script of scripts) {
+                if (script.hasAttribute('src') ||
+                    (script.getAttribute('type') || '').trim().toLowerCase() === 'module') {
+                    needsResourceTasks = true;
+                    break;
+                }
+            }
+            if (!needsResourceTasks) {
+                for (const script of scripts) {
+                    if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id) ||
+                        script.hasAttribute('nomodule')) continue;
+                    const type = (script.getAttribute('type') || '').trim().toLowerCase();
+                    if (type && type !== 'text/javascript' && type !== 'application/javascript' &&
+                        type !== 'text/ecmascript') continue;
+                    runInline(script);
+                    if (!active()) return;
+                }
+                if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
+                else frame.__trustReadyState = 'interactive';
+                parserDone();
+                allDone();
+                return;
+            }
+            parseNext(0);
         });
     }
 

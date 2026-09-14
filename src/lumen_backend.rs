@@ -1473,6 +1473,7 @@ mod desktop {
         let wall_origin = Instant::now();
         let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
         let mut prefer_timer = false;
+        let mut prefer_platform = false;
         let mut deferred_host_task = None;
         let mut render_deadline = None;
 
@@ -1520,6 +1521,11 @@ mod desktop {
                 immediate = Some(Wake::Cmd(Some(command)));
             } else if render_due {
                 immediate = Some(Wake::Render);
+            } else if platform_ready && prefer_platform && (!timer_due || !prefer_timer) {
+                // HTML #event-loop-processing-model permits queue selection
+                // policy, but a stream of ready resource completions must not
+                // starve posted messages or other runnable platform tasks.
+                immediate = Some(Wake::Platform);
             } else if let Some(task) = deferred_host_task
                 .take()
                 .or_else(|| host_rx.try_recv().ok())
@@ -1645,6 +1651,9 @@ mod desktop {
                         }
                         checkpoint(&mut page, "host task");
                         next = host_rx.try_recv().ok();
+                        if trust_bool(&mut page, "hasPlatformTask") {
+                            break;
+                        }
                     }
                     // The bounded burst may have already removed one more task from the
                     // channel. Preserve it for the next event-loop turn instead of dropping
@@ -1655,9 +1664,11 @@ mod desktop {
                     }
                     prefer_timer = true;
                     prefer_command = true;
+                    prefer_platform = true;
                 }
                 Wake::Host(None) => break,
                 Wake::Platform => {
+                    prefer_platform = false;
                     prepare_unbounded_task(&interrupt);
                     if page.task_trace.is_some() {
                         let queues = call_trust(&mut page, "taskQueueState", &[], "task trace")
@@ -4775,6 +4786,148 @@ mod desktop {
                 loaded.is_ok(),
                 "parent load did not follow initial iframe load task"
             );
+        }
+
+        #[tokio::test]
+        async fn posted_messages_progress_while_script_completions_are_ready() {
+            // HTML #event-loop-processing-model allows UA queue selection.
+            // Protect bounded progress for posted messages alongside a ready
+            // resource queue, preserving each script task's microtasks.
+            let html = r#"<!doctype html><body><output id="result">waiting</output><script>
+                let completed = 0, microtasks = 0, seen = null;
+                function finish() {
+                    if (completed === 24 && seen !== null)
+                        document.querySelector('output').textContent =
+                            seen < 24 && microtasks === completed ? 'fair' : 'starved';
+                }
+                addEventListener('message', event => {
+                    if (event.data !== 'progress') return;
+                    seen = completed;
+                    if (microtasks !== completed) throw Error('missing microtask checkpoint');
+                    finish();
+                });
+                postMessage('progress', '*');
+                for (let i = 0; i < 24; i++) {
+                    const script = document.createElement('script');
+                    script.src = 'data:text/javascript,' + encodeURIComponent(
+                        'completed++;queueMicrotask(()=>{microtasks++;finish();});//' + i);
+                    document.body.appendChild(script);
+                }
+            </script>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(!html.contains(">starved</output>"), "{html}");
+                            if html.contains(">fair</output>") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before posted-message progress"),
+                    }
+                }
+            })
+            .await
+            .expect("posted message was starved by resource completions");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn iframe_parser_wait_yields_to_messages_and_load_waits_for_async_script() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // HTML #scriptTagParserResumes / #the-end: a blocked child parser
+            // must allow its parent's posted message to run. DOMContentLoaded
+            // waits for defer/module scripts; load additionally waits for async.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}/", listener.local_addr().unwrap());
+            let (release_parser, parser_gate) = tokio::sync::watch::channel(false);
+            let (release_async, async_gate) = tokio::sync::watch::channel(false);
+            let child = r#"<!doctype html><body><script>
+                window.steps = ['inline:' + document.readyState];
+                document.addEventListener('DOMContentLoaded', () => {
+                    steps.push('dcl:' + document.readyState);
+                    parent.postMessage('parsed', '*');
+                });
+                addEventListener('error', event => {
+                    if (event.target.localName === 'script') steps.push('error');
+                }, true);
+                parent.postMessage('ready', '*');
+                </script><script src="/slow.js"></script>
+                <script>steps.push('after:' + frameLexical + ':' + document.readyState);</script>
+                <script src="/missing.js"></script>
+                <script async src="/async.js"></script>
+                <script defer src="data:text/javascript,steps.push('defer:'%2Bdocument.readyState)"></script>
+                <script type="module">await Promise.resolve(); steps.push('module:' + document.readyState);</script>"#;
+            let server = tokio::spawn(async move {
+                let mut tasks = tokio::task::JoinSet::new();
+                for _ in 0..4 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut parser_gate = parser_gate.clone();
+                    let mut async_gate = async_gate.clone();
+                    tasks.spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buffer = [0; 2048];
+                        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                            let n = stream.read(&mut buffer).await.unwrap();
+                            assert_ne!(n, 0);
+                            request.extend_from_slice(&buffer[..n]);
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        let (status, kind, body) = if request.starts_with("GET /frame ") {
+                            ("429 Too Many Requests", "text/html", child)
+                        } else if request.starts_with("GET /slow.js ") {
+                            parser_gate.wait_for(|ready| *ready).await.unwrap();
+                            ("200 OK", "text/javascript", "let frameLexical=7; steps.push('external:'+document.readyState);")
+                        } else if request.starts_with("GET /async.js ") {
+                            async_gate.wait_for(|ready| *ready).await.unwrap();
+                            ("200 OK", "text/javascript", "steps.push('async:'+document.readyState);")
+                        } else {
+                            assert!(request.starts_with("GET /missing.js "), "{request}");
+                            ("404 Not Found", "text/javascript", "steps.push('unexpected-execution')")
+                        };
+                        stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    });
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            });
+            let html = r#"<!doctype html><body><output id="result">waiting</output><script>
+                const frame = document.createElement('iframe');
+                addEventListener('message', event => {
+                    if (event.source === frame.contentWindow)
+                        document.querySelector('output').textContent = event.data;
+                });
+                frame.onload = () => { document.querySelector('output').textContent =
+                    'done:' + frame.contentWindow.steps.join('|') + ':' + frame.contentDocument.readyState; };
+                frame.src = '/frame';
+                document.body.appendChild(frame);
+            </script>"#;
+            let mut env = PageEnv::bare(&origin);
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains(">ready</output>") { release_parser.send(true).unwrap(); }
+                            if html.contains(">parsed</output>") { release_async.send(true).unwrap(); }
+                            if html.contains(">done:") {
+                                assert!(html.contains("done:inline:loading|external:loading|after:7:loading|error|defer:interactive|module:interactive|dcl:interactive|async:interactive:complete"), "{html}");
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before child script lifecycle completed"),
+                    }
+                }
+            }).await.expect("iframe parser blocked its parent or load finished too early");
+            server.await.unwrap();
         }
 
         #[tokio::test]
@@ -11762,6 +11915,46 @@ mod tests {
                 "true"
             );
         }
+    }
+
+    #[test]
+    fn iframe_http_error_documents_load_but_no_content_preserves_document() {
+        // Nested Window bootstrap in forced execution tiers needs more native
+        // stack than Rust's default test thread, as does the resident page actor.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                    let mut engine = configured_engine_before_prelude(
+                        HostState::new(
+                            Rc::new(RefCell::new(Dom::new())),
+                            Rc::new(RealmClock::new()),
+                        ),
+                        DEFAULT_URL,
+                    );
+                    eval(
+                        &mut engine,
+                        "globalThis.frameNavigationResponses = Object.create(null); \
+                 globalThis.__http_navigate = url => frameNavigationResponses[url] || null;",
+                        "HTTP navigation response fixture",
+                    )
+                    .unwrap();
+                    eval_platform_prelude(&mut engine).unwrap();
+                    engine.set_tier(tier);
+                    engine.set_tier_threshold(0);
+                    assert_eq!(
+                        string_value(
+                            &mut engine,
+                            include_str!("fixtures/frame_http_documents.mjs")
+                        ),
+                        "frame-http-documents-ok",
+                        "{tier:?}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
