@@ -3799,78 +3799,6 @@ impl Dom {
         })
     }
 
-    /// Whether `id` CLIPS `label` out of view: a definite `width` under
-    /// horizontal `overflow:hidden/clip` narrower than the label's display
-    /// width. The accessible-name fallback in `serialize_live_node` uses this to
-    /// honor an author's icon-sized clip box — a control clipped to its icon
-    /// never paints its `aria-label` (CSS Overflow §overflow). `width:auto`/`%`
-    /// (`css_length_px` → `None`) is not a clip box, so the name shows.
-    fn name_is_clipped_out(&self, id: NodeId, label: &str) -> bool {
-        // Resolve `var()` — the live (pre-bake) cascade stores raw values, and a
-        // styled-components control sizes its icon box with a custom property
-        // (`width:var(--button-size-default)`). `computed_value_resolved`
-        // substitutes it (`→ 3.2rem`); the raw `computed_style` would not, so the
-        // clip would never be detected. Horizontal clip: the `overflow-x`
-        // longhand else the `overflow` shorthand's first token (mirrors
-        // `layout::axis_overflow`).
-        let overflow_x = self.computed_value_resolved(id, "overflow-x").or_else(|| {
-            self.computed_value_resolved(id, "overflow")
-                .and_then(|s| s.split_whitespace().next().map(str::to_owned))
-        });
-        if !matches!(
-            overflow_x.as_deref().map(str::trim),
-            Some("hidden") | Some("clip")
-        ) {
-            return false;
-        }
-        let u = crate::layout2::Units::of(self, id);
-        let Some(width_px) = self
-            .computed_value_resolved(id, "width")
-            .and_then(|v| crate::layout2::css_length_px(&v, u))
-        else {
-            return false;
-        };
-        let style = crate::text::TextStyle {
-            family: self
-                .computed_value(id, "font-family")
-                .unwrap_or_else(|| String::from("sans-serif")),
-            size: u.fs,
-            weight: self
-                .computed_value(id, "font-weight")
-                .as_deref()
-                .and_then(crate::layout2::css_font_weight)
-                .unwrap_or(400.0),
-            italic: self
-                .computed_value(id, "font-style")
-                .as_deref()
-                .is_some_and(crate::layout2::css_is_italic),
-            ..crate::text::TextStyle::default()
-        };
-        crate::text::shape(label, &style).advance > width_px
-    }
-
-    /// Whether `id` is a content-less full-area POSITIONED OVERLAY — a click
-    /// SCRIM (a click-to-play / click-to-dismiss hit target) that fills its
-    /// containing block. A browser paints nothing for it, so its accessible name
-    /// must not be surfaced as a clickable HANDLE (the live serializer) or a
-    /// LABEL (`layout::icon_only_label`): either would float phantom body text
-    /// over the content the scrim covers. (Twitch's player carries a full-bleed
-    /// `<button aria-label="Play" style="position:absolute;width:100%;
-    /// height:100%">`.) Emptiness is the caller's precondition — both callers
-    /// only reach here for a control with no text and no icon glyph. `var()` is
-    /// resolved so a styled-components size still reads as `100%`.
-    pub(crate) fn is_overlay_scrim(&self, id: NodeId) -> bool {
-        let pos = self.computed_value_resolved(id, "position");
-        if !matches!(pos.as_deref().map(str::trim), Some("absolute" | "fixed")) {
-            return false;
-        }
-        let fills = |prop: &str, full: &[&str]| {
-            self.computed_value_resolved(id, prop)
-                .is_some_and(|v| full.contains(&v.trim()))
-        };
-        fills("width", &["100%", "100vw"]) && fills("height", &["100%", "100vh"])
-    }
-
     /// The computed value of a property — the single inheritance authority.
     /// For an inherited property (per the registry) an element that doesn't
     /// set it resolves to the parent's computed value; otherwise this is the
@@ -6931,15 +6859,12 @@ impl Dom {
         {
             return None;
         }
-        if let Some(glyph) = self.icon_glyph(id) {
-            return Some(glyph.to_string());
-        }
-        self.attr(id, "aria-label")
-            .or_else(|| self.attr(id, "title"))
-            .or_else(|| self.attr(id, "value"))
-            .filter(|label| !self.name_is_clipped_out(id, label))
-            .filter(|_| !self.is_overlay_scrim(id))
-            .map(|label| format!("[{label}]"))
+        // WAI-ARIA #aria-label / AccName #comp_label name the accessibility
+        // object. Keep that metadata out of ordinary CSS content, even for
+        // empty controls: a CSS-drawn pagination dot still has its own box and
+        // activation target. Explicit content:attr(aria-label) is handled by
+        // the pseudo-element path (CSS Pseudo 4 #generated-content).
+        self.icon_glyph(id).map(str::to_string)
     }
 
     /// If this `<svg>`'s geometry lives in an EXTERNAL sprite sheet — a
@@ -7348,50 +7273,17 @@ impl Dom {
         let child_in_anchor = in_anchor || is_anchor || is_click;
         if wrap {
             out.push_str(&format!("<a href=\"x-trust-js:{id}:\">"));
-            // An icon-only clickable would render as an empty (and so
-            // unselectable) link: give it a visible handle WHEN it carries
-            // meaning. An icon control (an `<svg>`/`<use>` Font-Awesome-style
-            // glyph — the dominant web icon idiom) shows the icon's GLYPH; a
-            // named-but-glyphless one shows its accessible name. An element with
-            // NO text, NO icon glyph, and NO accessible name (aria-label/title/
-            // value) conveys nothing to a text reader — its meaning lived only
-            // in CSS (a carousel's pagination dots are click `<div>`s drawn as
-            // background-coloured pills; Steam paints ~12 per carousel). Render
-            // NOTHING rather than a marker per anonymous control: the empty
-            // wrapper yields no layout item, so it neither shows nor steals a
-            // selection stop. (Was a `·` marker — fine for a lone control,
-            // debris in a group.) A clickable whose icon actually PAINTS (a
-            // visible `<img>`, or an `<svg>` the layout parse rewrites into
-            // one) needs no handle either — injecting one doubles the control
-            // (ChatGPT's composer grew a `[Start dictation]` label beside the
-            // rendered mic icon once sprite icons started rasterizing).
+            // Retain a recognized icon's compact fallback when its resource
+            // cannot paint. Accessible names and advisory titles stay in the
+            // authored attributes, matching render_clickable_fallback above.
+            // CSS-only controls keep their painted boxes and click markers;
+            // synthesizing a name here adds text outside those boxes.
             if !self.subtree_has_text(id)
                 && !self.subtree_paints_icon(id)
                 && !self.subtree_paints_native_control(id)
+                && let Some(glyph) = self.icon_glyph(id)
             {
-                if let Some(glyph) = self.icon_glyph(id) {
-                    out.push_str(glyph);
-                } else if let Some(label) = self
-                    .attr(id, "aria-label")
-                    .or_else(|| self.attr(id, "title"))
-                    .or_else(|| self.attr(id, "value"))
-                    // A control the author CLIPPED to an icon-sized box never
-                    // paints its accessible NAME — a browser shows only the icon.
-                    // Honoring that clip (don't surface a name wider than its
-                    // definite `width` under `overflow:hidden/clip`) is what stops
-                    // Twitch's per-message reply button — `aria-label="Click to
-                    // reply to @user"` in a `width:3.2rem;overflow:hidden` box —
-                    // from spamming every chat line. The empty wrapper then yields
-                    // no layout item (same as an anonymous control).
-                    .filter(|l| !self.name_is_clipped_out(id, l))
-                    // A full-bleed positioned scrim (a click-to-play overlay)
-                    // paints nothing in a browser — don't surface its name.
-                    .filter(|_| !self.is_overlay_scrim(id))
-                {
-                    out.push('[');
-                    out.push_str(&escape_text(label));
-                    out.push(']');
-                }
+                out.push_str(glyph);
             }
         }
         out.push('<');
@@ -13647,7 +13539,7 @@ fn icon_token_name(tok: &str) -> Option<&str> {
 
 /// The Unicode glyph for a recognized icon name (Font-Awesome vocabulary, the
 /// de-facto web icon naming). Covers the common UI/nav set; an unknown name
-/// returns `None` (the caller falls back to the accessible name, then a marker).
+/// returns `None`, leaving the authored content and accessible name intact.
 fn icon_glyph_for(name: &str) -> Option<&'static str> {
     Some(match name {
         "ellipsis" | "ellipsis-h" => "⋯",
@@ -17176,6 +17068,38 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("href=\"/normal\""), "{html}");
+    }
+
+    #[test]
+    fn clickable_accessible_names_remain_metadata_in_live_snapshots() {
+        // WAI-ARIA #aria-label and AccName #comp_label: the name describes
+        // the control to accessibility APIs. It is not an extra text child,
+        // whether the author paints a CSS dot, clips it, or leaves it empty.
+        let dom = Dom::parse_document(
+            r#"<body>
+                <div id=dot role=button aria-label="Show slide 1 of 8"
+                     style="width:8px;height:8px;background:gray"></div>
+                <span id=empty role=button aria-label="Open filters"></span>
+                <div id=clipped role=button aria-label="Show slide 2 of 8"
+                     style="width:8px;overflow:hidden"></div>
+                <span id=titled role=button title="Show slide 3 of 8"></span>
+                <div id=valued value="internal-action"></div>
+            </body>"#,
+        );
+        let ids = ["dot", "empty", "clipped", "titled", "valued"]
+            .map(|name| dom.get_by_id(name).unwrap());
+        let clickable = ids.into_iter().collect();
+        let html = dom.serialize_live(DOCUMENT, &clickable);
+        let snapshot = Dom::parse_document(&html);
+        assert_eq!(snapshot.text_content(DOCUMENT).trim(), "", "{html}");
+        for id in ids {
+            let name = dom.attr(id, "id").unwrap();
+            let copied = snapshot.get_by_id(name).unwrap();
+            for attr in ["role", "aria-label", "title", "value"] {
+                assert_eq!(snapshot.attr(copied, attr), dom.attr(id, attr));
+            }
+            assert!(html.contains(&format!("x-trust-js:{id}:")), "{html}");
+        }
     }
 
     #[test]
