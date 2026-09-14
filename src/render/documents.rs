@@ -155,7 +155,19 @@ pub fn paint_doc_selected(
         if doc.text_view().is_some() && paint.lines.len() >= crate::text_reply::MAX_ROWS {
             break;
         }
-        let (style, mut normal_color) = line_style(line.kind);
+        let (mut style, mut normal_color) = line_style(line.kind);
+        if doc.gemini.is_some()
+            && let Kind::Heading(level) = line.kind
+        {
+            // Gemtext 0.24.1, Heading lines: convey the three semantic
+            // levels through font size, using the ordinary text color.
+            style.size *= match level {
+                1 => 1.8,
+                2 => 1.5,
+                _ => 1.25,
+            };
+            normal_color = theme_color(crate::theme::TEXT);
+        }
         if doc.text_view().is_some() && line.kind == Kind::Pre {
             normal_color = theme_color(crate::theme::TEXT);
         }
@@ -190,7 +202,11 @@ pub fn paint_doc_selected(
                             Kind::Heading(_) | Kind::Info | Kind::Error | Kind::OtherLink
                         ))
             });
-        let hanging = if doc.dict.is_some() && line.kind == Kind::Pre && wrap {
+        let hanging = if line.kind == Kind::List && wrap {
+            // Gemtext 0.24.1, List items: wrapped text aligns after the
+            // bullet. Measure it with this frontend's actual font metrics.
+            text::shape(crate::gemini::LIST_MARKER, &style).advance
+        } else if doc.dict.is_some() && line.kind == Kind::Pre && wrap {
             let columns = crate::dict::hanging_indent(&line.text);
             text::shape(&" ".repeat(columns), &style)
                 .advance
@@ -990,6 +1006,82 @@ mod tests {
         let paint = paint_doc(&doc, 160.0);
         assert!(paint.width > 160.0);
         assert_eq!(paint.lines.len(), 1, "Gemtext pre lines do not wrap");
+    }
+
+    #[test]
+    fn gemtext_native_lists_paint_one_bullet_and_align_wrapped_text() {
+        let url = crate::gemini::GeminiUrl::parse("gemini://example.org/").unwrap();
+        let body = b"* An item long enough to wrap across several visible lines\n* Next item\n=> /server Server\n";
+        let doc = crate::gemini::parse(&url, "text/gemini", body, usize::MAX / 4);
+        for width in [180.0, 260.0] {
+            let paint = paint_doc(&doc, width);
+            let pieces: Vec<_> = paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    DisplayCommand::GlyphRun {
+                        origin,
+                        shaped,
+                        node: 1,
+                        ..
+                    } => Some((origin, shaped)),
+                    _ => None,
+                })
+                .collect();
+            assert!(pieces.len() > 1);
+            assert!(pieces[0].1.text.starts_with("• "));
+            let indent = text::shape(crate::gemini::LIST_MARKER, &line_style(Kind::List).0).advance;
+            for (origin, shaped) in &pieces[1..] {
+                assert!((origin.x - pieces[0].0.x - indent).abs() < 0.01);
+                assert!(!shaped.text.contains('•'));
+            }
+            assert_eq!(
+                paint
+                    .primitives
+                    .iter()
+                    .filter(|command| matches!(command,
+                        DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains('•')
+                    ))
+                    .count(),
+                2
+            );
+            assert!(paint.primitives.iter().any(|command| matches!(command,
+                DisplayCommand::GlyphRun { link: Some(_), origin, shaped, .. }
+                    if shaped.text == "Server" && (origin.x - pieces[0].0.x).abs() < 0.01
+            )));
+        }
+        assert_eq!(doc.raw, body);
+    }
+
+    #[test]
+    fn gemtext_native_headings_use_three_larger_sizes_and_the_text_color() {
+        let url = crate::gemini::GeminiUrl::parse("gemini://example.org/").unwrap();
+        let doc = crate::gemini::parse(
+            &url,
+            "text/gemini",
+            b"# Heading\n## Heading\n### Heading\nHeading\n",
+            usize::MAX / 4,
+        );
+        let paint = paint_doc(&doc, 400.0);
+        let runs: Vec<_> = paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::GlyphRun { shaped, color, .. } => {
+                    assert_eq!(*color, theme_color(crate::theme::TEXT));
+                    Some(shaped)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 4);
+        for pair in runs.windows(2) {
+            assert!(pair[0].advance > pair[1].advance);
+            assert!(pair[0].line_height > pair[1].line_height);
+        }
+        for pair in paint.lines.windows(2) {
+            assert!(pair[1].rect.y >= pair[0].rect.y + pair[0].rect.height);
+        }
     }
 
     #[test]
