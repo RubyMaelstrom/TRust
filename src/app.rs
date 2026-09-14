@@ -11566,35 +11566,24 @@ mod tests {
         );
     }
 
-    // IGNORED under the P9 flip (2026-07-07): layout2 (now the default engine)
-    // does NOT emit sub-box (flex/grid-ITEM) boundaries — a documented v1 cut
-    // (see layout2 architecture P7: such a mutation takes the always-correct
-    // full-relayout path instead of a Tier-2 splice). This is a perf deferral,
-    // not a correctness gap; the whole test body is preserved to re-enable when
-    // the incremental-layout arc adds sub-box boundaries to layout2. (Can't A/B
-    // the old engine here: the engine switch is process-global and parallel
-    // tests would race on it.)
     #[test]
-    #[ignore = "layout2 defers sub-box (flex/grid-item) boundaries — incremental-layout arc"]
-    fn a_sub_box_boundary_patch_splices_like_a_full_relayout() {
-        // incremental-layout contract §14 (the widening): a flex-COLUMN ITEM (a
-        // sub-box, re-laid with subtree_root) that grows is patched into Doc.rows
-        // byte-for-byte the same as a full re-layout — the sibling flex item below
-        // it ("after") and the FOOTER are identity-shifted, never re-laid.
+    fn live_flex_item_growth_and_shrink_match_full_layout() {
+        // CSS Flexbox #layout-algorithm (81c27f686901): implementation choices
+        // must preserve the specified layout result. Exercise the production
+        // typed-update path, not the retired, test-only HTML subtree splicer.
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
         let url = url::Url::parse("https://example.com/").unwrap();
+        let contents =
+            |rows: usize| -> String { (0..rows).map(|i| format!("<div>row{i}</div>")).collect() };
         let page = |rows: usize| -> String {
-            let mut s = String::from(
-                r#"<html><body><p>HEADER</p><div style="display:flex;flex-direction:column"><div>before</div><div data-trust-node="42">"#,
-            );
-            for i in 0..rows {
-                s.push_str(&format!("<div>row{i}</div>"));
-            }
-            s.push_str(r#"</div><div>after</div></div><p>FOOTER</p></body></html>"#);
-            s
+            format!(
+                r#"<html><body><p>HEADER</p><div style="display:flex;flex-direction:column"><div>before</div><div id="changing">{}</div><div>after</div></div><p>FOOTER</p></body></html>"#,
+                contents(rows)
+            )
         };
+        let images = crate::layout2::ImageSizes::new();
         app.navigate_to(parse_for_app(
             &app,
             &url,
@@ -11602,49 +11591,51 @@ mod tests {
             page(2).as_bytes(),
             80,
             10,
-            &Default::default(),
+            &images,
         ));
-        let cached = app
-            .browser
-            .as_ref()
-            .unwrap()
-            .doc
-            .boundaries
-            .iter()
-            .find(|b| b.node == 42)
-            .cloned();
-        assert!(
-            cached.as_ref().is_some_and(|b| b.sub_box),
-            "the flex-column item was captured as a sub-box boundary"
+        let font = app.picker.font_size();
+        let viewport = crate::layout2::Viewport::new(
+            80.0 * f32::from(font.width.max(1)),
+            10.0 * f32::from(font.height.max(1)),
         );
-        // Patch: the item grew from 2 to 4 rows (same width → Tier-2 shift).
-        let frag = r#"<div data-trust-frag=""><div data-trust-node="42"><div>row0</div><div>row1</div><div>row2</div><div>row3</div></div></div>"#;
-        let patch = crate::js::SubtreePatch {
-            node: 42,
-            html: frag.to_string(),
-            tier: crate::js::BoundaryTier::WidthStable,
-        };
-        assert!(app.patch_live_doc(&patch), "the sub-box patch applies");
-        let full = crate::http::parse(
-            &url,
-            "text/html",
-            page(4).as_bytes(),
-            80,
-            10,
-            &Default::default(),
-        );
-        let got = &app.browser.as_ref().unwrap().doc.rows;
-        assert_eq!(
-            got.len(),
-            full.rows.len(),
-            "row count matches a full relayout"
-        );
-        for (i, (g, f)) in got.iter().zip(full.rows.iter()).enumerate() {
-            assert_eq!(
-                crate::layout2::render_row(g),
-                crate::layout2::render_row(f),
-                "spliced row {i} matches the full relayout"
+        let mut dom = crate::dom::Dom::parse_document(&page(2));
+        dom.set_render_clickables(Default::default(), true);
+        let changing = dom.get_by_id("changing").unwrap();
+        for rows in [4, 1, 5, 2] {
+            let children = dom.parse_fragment_into("div", &contents(rows));
+            dom.replace_all_children(changing, children);
+            let rendered = crate::http::render_arena(&dom, &url, viewport, 1.0, None, &images);
+            app.replace_live_rendered(rendered);
+            let got: Vec<_> = app
+                .browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .rows
+                .iter()
+                .map(crate::layout2::render_row)
+                .collect();
+            let fresh = parse_for_app(
+                &app,
+                &url,
+                "text/html",
+                page(rows).as_bytes(),
+                80,
+                10,
+                &images,
             );
+            let expected: Vec<_> = fresh.rows.iter().map(crate::layout2::render_row).collect();
+            assert_eq!(
+                got, expected,
+                "live flex item with {rows} children matches a fresh document"
+            );
+            for child in 0..5 {
+                assert_eq!(
+                    got.iter().any(|row| row.contains(&format!("row{child}"))),
+                    child < rows,
+                    "live update must insert and remove the changed item's content"
+                );
+            }
         }
     }
 
