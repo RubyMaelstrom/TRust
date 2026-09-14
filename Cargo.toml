@@ -49,7 +49,9 @@ lumen-spike = []
 [dependencies]
 accesskit = "0.24.1"
 accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
-aes = "0.8.4"
+# Web Crypto AES-GCM, including its standardized 32/64-bit tags. Reuse the
+# re-exported AES primitive for CTR; OS randomness comes from our host API.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "hazmat", "zeroize"] }
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 bytes = "1.12.1"
 # Already used by the raster stack; CSS Color 4 parsing, white-point adaptation
@@ -181,6 +183,9 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# Web Crypto accepts runtime-sized IVs. This fork exposes RustCrypto's
+# existing GCM operation for byte-slice nonces; see README.trust.txt.
+aes-gcm = { path = "vendor/aes-gcm-0.11.1" }
 # Expose Glifo's light hinting policy to both desktop raster backends. Native
 # TrueType hints round fractional ppem and visibly stretch small terminal text.
 glifo = { path = "vendor/glifo-0.3.0" }

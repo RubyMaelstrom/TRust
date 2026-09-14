@@ -1,11 +1,12 @@
 //! Small cryptographic primitives used by the browser platform.
 //!
-//! The Web Cryptography API's AES-CTR operation is deliberately kept behind
-//! this narrow adapter.  The API layer owns Web IDL normalization and Promise
-//! behavior; this module owns only AES-CTR's byte operation.
+//! Web Crypto's AES operations stay behind this narrow adapter. The API
+//! layer owns Web IDL normalization and Promise behavior; RustCrypto owns
+//! AES and GCM's authentication, including constant-time tag verification.
 
-use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-use aes::{Aes128, Aes192, Aes256};
+use aes_gcm::AesGcm;
+use aes_gcm::aes::cipher::{BlockCipherEncrypt, KeyInit, array::Array, consts};
+use aes_gcm::aes::{Aes128, Aes192, Aes256};
 
 /// Perform the Web Crypto AES-CTR operation for a copied raw key, counter, and
 /// input byte sequence.
@@ -31,11 +32,17 @@ pub(crate) fn aes_ctr_crypt(
     counter_block.copy_from_slice(counter);
     let mut output = input.to_vec();
     for chunk in output.chunks_mut(16) {
-        let mut encrypted_counter = GenericArray::clone_from_slice(&counter_block);
+        let mut encrypted_counter = Array::from(counter_block);
         match key.len() {
-            16 => Aes128::new(GenericArray::from_slice(key)).encrypt_block(&mut encrypted_counter),
-            24 => Aes192::new(GenericArray::from_slice(key)).encrypt_block(&mut encrypted_counter),
-            32 => Aes256::new(GenericArray::from_slice(key)).encrypt_block(&mut encrypted_counter),
+            16 => Aes128::new_from_slice(key)
+                .ok()?
+                .encrypt_block(&mut encrypted_counter),
+            24 => Aes192::new_from_slice(key)
+                .ok()?
+                .encrypt_block(&mut encrypted_counter),
+            32 => Aes256::new_from_slice(key)
+                .ok()?
+                .encrypt_block(&mut encrypted_counter),
             _ => unreachable!("AES key length validated above"),
         }
         for (byte, mask) in chunk.iter_mut().zip(encrypted_counter.iter()) {
@@ -44,6 +51,84 @@ pub(crate) fn aes_ctr_crypt(
         increment_counter(&mut counter_block, counter_bits);
     }
     Some(output)
+}
+
+/// Web Crypto #aes-gcm-operations: ciphertext is C || T. Dispatch all three
+/// AES key sizes and all seven tag sizes to RustCrypto. Decryption returns
+/// bytes only after RustCrypto has authenticated the IV, AAD, and ciphertext.
+pub(crate) fn aes_gcm_crypt(
+    key: &[u8],
+    iv: &[u8],
+    additional_data: &[u8],
+    tag_bits: u8,
+    input: &[u8],
+    decrypt: bool,
+) -> Option<Vec<u8>> {
+    // Validate lengths before allocating the result; NIST SP 800-38D
+    // §5.2.1.1 bounds the bit lengths used by GCM's length encoding.
+    let plaintext_len = if decrypt {
+        input.len().checked_sub(usize::from(tag_bits / 8))?
+    } else {
+        input.len()
+    };
+    if iv.is_empty()
+        || iv.len() as u64 > u64::MAX / 8
+        || additional_data.len() as u64 > aes_gcm::A_MAX
+        || plaintext_len as u64 > aes_gcm::P_MAX
+    {
+        return None;
+    }
+    macro_rules! crypt {
+        ($aes:ty, $tag:ty) => {{
+            let cipher = AesGcm::<$aes, consts::U12, $tag>::new_from_slice(key).ok()?;
+            let tag_bytes = usize::from(tag_bits / 8);
+            if decrypt {
+                let split = input.len().checked_sub(tag_bytes)?;
+                let (ciphertext, tag) = input.split_at(split);
+                let mut output = ciphertext.to_vec();
+                cipher
+                    .decrypt_inout_detached_with_nonce(
+                        iv,
+                        additional_data,
+                        output.as_mut_slice().into(),
+                        tag.try_into().ok()?,
+                    )
+                    .ok()?;
+                Some(output)
+            } else {
+                let mut output = input.to_vec();
+                let tag = cipher
+                    .encrypt_inout_detached_with_nonce(
+                        iv,
+                        additional_data,
+                        output.as_mut_slice().into(),
+                    )
+                    .ok()?;
+                output.extend_from_slice(&tag);
+                Some(output)
+            }
+        }};
+    }
+    macro_rules! dispatch_tag {
+        ($aes:ty) => {
+            match tag_bits {
+                32 => crypt!($aes, consts::U4),
+                64 => crypt!($aes, consts::U8),
+                96 => crypt!($aes, consts::U12),
+                104 => crypt!($aes, consts::U13),
+                112 => crypt!($aes, consts::U14),
+                120 => crypt!($aes, consts::U15),
+                128 => crypt!($aes, consts::U16),
+                _ => None,
+            }
+        };
+    }
+    match key.len() {
+        16 => dispatch_tag!(Aes128),
+        24 => dispatch_tag!(Aes192),
+        32 => dispatch_tag!(Aes256),
+        _ => None,
+    }
 }
 
 fn increment_counter(counter: &mut [u8; 16], counter_bits: u8) {
@@ -73,7 +158,92 @@ fn increment_counter(counter: &mut [u8; 16], counter_bits: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{aes_ctr_crypt, increment_counter};
+    use super::{aes_ctr_crypt, aes_gcm_crypt, increment_counter};
+
+    #[test]
+    fn aes_gcm_nist_vectors_all_keys_tags_and_iv_lengths() {
+        // NIST CAVS gcmEncryptExtIV{128,192,256}.rsp, Count=0 for
+        // each selected parameter set. SP 800-38D §7.1 takes MSB_t(T),
+        // so the full-tag known answers also verify every shorter tag.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/webcrypto/aes-gcm-nist.json"
+        ))
+        .unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 15);
+        for vector in vectors {
+            let bytes = |name| hex(vector[name].as_str().unwrap());
+            let key = bytes("key");
+            let iv = bytes("iv");
+            let plaintext = bytes("pt");
+            let aad = bytes("aad");
+            let ciphertext = bytes("ct");
+            let tag = bytes("tag");
+            for tag_bits in [32, 64, 96, 104, 112, 120, 128] {
+                let mut expected = ciphertext.clone();
+                expected.extend_from_slice(&tag[..usize::from(tag_bits / 8)]);
+                assert_eq!(
+                    aes_gcm_crypt(&key, &iv, &aad, tag_bits, &plaintext, false),
+                    Some(expected.clone()),
+                    "encrypt: {} tag={tag_bits}",
+                    vector["source"]
+                );
+                assert_eq!(
+                    aes_gcm_crypt(&key, &iv, &aad, tag_bits, &expected, true),
+                    Some(plaintext.clone()),
+                    "decrypt: {} tag={tag_bits}",
+                    vector["source"]
+                );
+
+                // Every input to authentication must be checked, including
+                // truncated tags and IVs that need GHASH instead of J0's fast path.
+                let mut wrong_key = key.clone();
+                wrong_key[0] ^= 1;
+                let mut wrong_iv = iv.clone();
+                wrong_iv[0] ^= 1;
+                let mut wrong_aad = aad.clone();
+                wrong_aad.push(1);
+                for (k, v, a) in [
+                    (&wrong_key, &iv, &aad),
+                    (&key, &wrong_iv, &aad),
+                    (&key, &iv, &wrong_aad),
+                ] {
+                    assert!(aes_gcm_crypt(k, v, a, tag_bits, &expected, true).is_none());
+                }
+                for index in [0, expected.len() - 1] {
+                    let mut altered = expected.clone();
+                    altered[index] ^= 1;
+                    assert!(aes_gcm_crypt(&key, &iv, &aad, tag_bits, &altered, true).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aes_gcm_invalid_lengths_and_incomplete_tags_fail() {
+        let key = [0; 32];
+        let iv = [0; 12];
+        for key_length in [0, 15, 17, 23, 25, 31, 33] {
+            assert!(aes_gcm_crypt(&vec![0; key_length], &iv, &[], 128, &[], false).is_none());
+        }
+        assert!(aes_gcm_crypt(&key, &[], &[], 128, &[], false).is_none());
+        for tag_bits in [0, 8, 31, 33, 63, 65, 95, 97, 129, 255] {
+            assert!(aes_gcm_crypt(&key, &iv, &[], tag_bits, &[], false).is_none());
+        }
+        for tag_bits in [32, 64, 96, 104, 112, 120, 128] {
+            assert!(
+                aes_gcm_crypt(
+                    &key,
+                    &iv,
+                    &[],
+                    tag_bits,
+                    &vec![0; usize::from(tag_bits / 8) - 1],
+                    true
+                )
+                .is_none()
+            );
+        }
+    }
 
     #[test]
     fn aes_ctr_matches_nist_sp800_38a_f_5_1() {

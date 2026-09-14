@@ -5010,6 +5010,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__crypto_random_bytes", 1, host_crypto_random_bytes),
     ("__crypto_hmac", 4, host_crypto_hmac),
     ("__crypto_aes_ctr", 4, host_crypto_aes_ctr),
+    ("__crypto_aes_gcm", 6, host_crypto_aes_gcm),
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
     ("__body_buffer", 1, host_body_buffer),
@@ -6959,6 +6960,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             host_crypto_sha256_digest as NativeFn,
         ),
         ("__crypto_aes_ctr", 4, host_crypto_aes_ctr as NativeFn),
+        ("__crypto_aes_gcm", 6, host_crypto_aes_gcm as NativeFn),
         ("__crypto_digest", 2, host_crypto_digest as NativeFn),
         (
             "__crypto_random_bytes",
@@ -10089,6 +10091,34 @@ fn host_crypto_aes_ctr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     host_resolved_promise(ctx, buffer)
 }
 
+/// Web Crypto #aes-gcm-operations. RustCrypto authenticates before releasing
+/// plaintext. Null signals an operation failure so the prelude can construct
+/// the invoking realm's DOMException (Lumen itself owns ECMAScript errors).
+fn host_crypto_aes_gcm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let mut bytes = Vec::with_capacity(4);
+    for index in [0, 1, 2, 4] {
+        bytes.push(
+            args.get(index)
+                .and_then(|value| ctx.buffer_source_bytes(value, false))
+                .ok_or_else(|| ctx.make_error("TypeError", "Expected AES-GCM BufferSource"))?,
+        );
+    }
+    let tag_bits = args
+        .get(3)
+        .and_then(Value::as_num_opt)
+        .filter(|n| n.is_finite() && n.fract() == 0.0 && (0.0..=255.0).contains(n))
+        .ok_or_else(|| ctx.make_error("TypeError", "Invalid native AES-GCM tag length"))?
+        as u8;
+    let decrypt = matches!(args.get(5), Some(Value::Bool(true)));
+    let Some(output) = crate::crypto::aes_gcm_crypt(
+        &bytes[0], &bytes[1], &bytes[2], tag_bits, &bytes[3], decrypt,
+    ) else {
+        return Ok(Value::Null);
+    };
+    let view = ctx.make_uint8array(&output)?;
+    ctx.member_get(&view, "buffer")
+}
+
 /// Compression Streams §4's compression operation. The JavaScript TransformStream owns chunking
 /// and invokes this once with the copied, bounded aggregate at flush time.
 fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -11147,7 +11177,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 147, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 148, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -11158,7 +11188,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 147);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 148);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -16670,6 +16700,222 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "randomResult"),
             "true|true|true|true|true|TypeMismatchError|TypeMismatchError|TypeMismatchError|QuotaExceededError"
+        );
+    }
+
+    #[test]
+    fn web_crypto_aes_gcm_vectors_views_and_key_lifecycle() {
+        // Web Crypto #aes-gcm-operations and #algorithm-normalization:
+        // BufferSources copy their selected bytes before returning, key
+        // metadata cannot change private permissions, and results are buffers.
+        let mut engine = platform_engine();
+        let vectors = include_str!("../tests/fixtures/webcrypto/aes-gcm-nist.json");
+        let source = format!("const fixture = {vectors};\n")
+            + r#"
+        globalThis.gcmResult = 'pending';
+        (async () => {
+            const assert = (ok, label) => { if (!ok) throw Error(label); };
+            const hex = b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, '0')).join('');
+            const fromHex = s => Uint8Array.from(s.match(/../g) || [], p => parseInt(p, 16));
+            const padded = s => fromHex('aa' + s + 'bb');
+            for (const vector of fixture.vectors) {
+                const keyData = padded(vector.key);
+                const pendingKey = crypto.subtle.importKey('raw', new DataView(keyData.buffer, 1, keyData.length - 2),
+                    {name:'aEs-gCm'}, true, ['decrypt', 'encrypt', 'encrypt']);
+                keyData.fill(0);
+                const key = await pendingKey;
+                assert(key instanceof CryptoKey && key.type === 'secret', 'CryptoKey');
+                assert(key.algorithm.name === 'AES-GCM' && key.algorithm.length === vector.key.length * 4, 'algorithm');
+                assert(key.usages.join(',') === 'encrypt,decrypt' && Object.isFrozen(key.usages), 'usages');
+                assert(hex(await crypto.subtle.exportKey('raw', key)) === vector.key, 'key copy');
+                const jwk = await crypto.subtle.exportKey('jwk', key);
+                assert(jwk.alg === 'A' + vector.key.length * 4 + 'GCM' && jwk.ext && jwk.kty === 'oct', 'JWK');
+                const imported = await crypto.subtle.importKey('jwk', jwk, 'AES-GCM', true, ['encrypt', 'decrypt']);
+                assert(hex(await crypto.subtle.exportKey('raw', imported)) === vector.key, 'JWK roundtrip');
+                key.algorithm.name = 'AES-CTR'; key.algorithm.length = 7;
+                for (const tagLength of [32, 64, 96, 104, 112, 120, undefined]) {
+                    const iv = padded(vector.iv), aad = padded(vector.aad), plain = padded(vector.pt);
+                    const params = {name:'AES-GCM', iv:new DataView(iv.buffer, 1, iv.length - 2),
+                        additionalData:aad.subarray(1, aad.length - 1), tagLength};
+                    const pending = crypto.subtle.encrypt(params, key, plain.subarray(1, plain.length - 1));
+                    iv.fill(0); aad.fill(0); plain.fill(0); params.tagLength = 8;
+                    const result = await pending;
+                    assert(result instanceof ArrayBuffer, 'ArrayBuffer result');
+                    assert(hex(result) === vector.ct + vector.tag.slice(0, (tagLength || 128) / 4), 'known answer');
+                    const decrypted = await crypto.subtle.decrypt({name:'AES-GCM', iv:fromHex(vector.iv),
+                        additionalData:fromHex(vector.aad), tagLength}, imported, result);
+                    assert(hex(decrypted) === vector.pt, 'decrypt');
+                }
+            }
+            for (const length of [128, 192, 256]) {
+                const key = await crypto.subtle.generateKey({name:'AES-GCM', length:length + .9}, true, ['encrypt', 'decrypt']);
+                const raw = await crypto.subtle.exportKey('raw', key);
+                assert(raw.byteLength === length / 8 && new Uint8Array(raw).some(x => x !== 0), 'generated key');
+                new Uint8Array(raw).fill(0);
+                assert(new Uint8Array(await crypto.subtle.exportKey('raw', key)).some(x => x !== 0), 'export copy');
+            }
+            gcmResult = 'ok';
+        })().catch(e => gcmResult = e.name + ':' + e.message);
+        "#;
+        eval(&mut engine, &source, "Web Crypto AES-GCM vectors and keys").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(string_value(&mut engine, "gcmResult"), "ok");
+    }
+
+    #[test]
+    fn web_crypto_aes_gcm_rejects_bad_parameters_and_authentication() {
+        // Web Crypto #aes-gcm-operations: validation errors are rejected
+        // promises with the specified types; bad authentication exposes no data.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+        globalThis.gcmErrors = 'pending';
+        (async () => {
+            const assert = (ok, label) => { if (!ok) throw Error(label); };
+            const reject = async (name, fn) => {
+                const promise = fn();
+                assert(promise instanceof Promise, 'must return Promise');
+                try { await promise; } catch (error) {
+                    assert(error.name === name, 'expected ' + name + ', got ' + error.name);
+                    assert(name === 'TypeError' || error instanceof DOMException, 'DOMException');
+                    return;
+                }
+                throw Error('expected rejection: ' + name);
+            };
+            const raw = new Uint8Array(32), iv = new Uint8Array(12), data = new Uint8Array([1,2,3]);
+            const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', true, ['encrypt', 'decrypt']);
+            const encryptionKey = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
+            const ctrKey = await crypto.subtle.importKey('raw', raw, 'AES-CTR', false, ['encrypt']);
+            const params = {name:'AES-GCM', iv};
+            for (const bad of [0, 8, 31, 33, 65, 127, 129, 255, null]) {
+                await reject('OperationError', () => crypto.subtle.encrypt({...params, tagLength:bad}, key, data));
+            }
+            for (const bad of [-1, 256, NaN, Infinity, 128n, {valueOf:() => 128n}]) {
+                await reject('TypeError', () => crypto.subtle.encrypt({...params, tagLength:bad}, key, data));
+            }
+            for (const algorithm of ['AES-GCM', {name:'AES-GCM'}, {...params, iv:null}, {...params, additionalData:null}]) {
+                await reject('TypeError', () => crypto.subtle.encrypt(algorithm, key, data));
+            }
+            await reject('TypeError', () => crypto.subtle.encrypt(params, key, {}));
+            await reject('OperationError', () => crypto.subtle.encrypt({...params, iv:new Uint8Array(0)}, key, data));
+            await reject('InvalidAccessError', () => crypto.subtle.encrypt(params, ctrKey, data));
+            await reject('InvalidAccessError', () => crypto.subtle.decrypt(params, encryptionKey, data));
+            await reject('InvalidAccessError', () => crypto.subtle.exportKey('raw', encryptionKey));
+            await reject('InvalidAccessError', () => crypto.subtle.exportKey('jwk', encryptionKey));
+            for (const tagLength of [32, 64, 96, 104, 112, 120, 128]) {
+                const algorithm = {...params, additionalData:data, tagLength};
+                const encrypted = new Uint8Array(await crypto.subtle.encrypt(algorithm, key, data));
+                const changedIv = iv.slice(); changedIv[0] = 1;
+                await reject('OperationError', () => crypto.subtle.decrypt({...algorithm, iv:changedIv}, key, encrypted));
+                await reject('OperationError', () => crypto.subtle.decrypt({...algorithm, additionalData:new Uint8Array(0)}, key, encrypted));
+                for (const index of [0, encrypted.length - 1]) {
+                    const damaged = encrypted.slice(); damaged[index] ^= 1;
+                    await reject('OperationError', () => crypto.subtle.decrypt(algorithm, key, damaged));
+                }
+                await reject('OperationError', () => crypto.subtle.decrypt(algorithm, key, encrypted.slice(0, tagLength / 8 - 1)));
+            }
+            for (const length of [0, 15, 17, 23, 25, 31, 33]) {
+                await reject('DataError', () => crypto.subtle.importKey('raw', new Uint8Array(length), 'AES-GCM', false, ['encrypt']));
+            }
+            await reject('SyntaxError', () => crypto.subtle.importKey('raw', raw, 'AES-GCM', false, []));
+            await reject('SyntaxError', () => crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['sign']));
+            await reject('TypeError', () => crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['invalid']));
+            await reject('NotSupportedError', () => crypto.subtle.importKey('spki', raw, 'AES-GCM', false, ['encrypt']));
+            await reject('NotSupportedError', () => crypto.subtle.exportKey('spki', key));
+            await reject('OperationError', () => crypto.subtle.generateKey({name:'AES-GCM', length:129}, false, ['encrypt']));
+            await reject('TypeError', () => crypto.subtle.generateKey({name:'AES-GCM'}, false, ['encrypt']));
+            await reject('TypeError', () => crypto.subtle.generateKey({name:'AES-GCM', length:65536}, false, ['encrypt']));
+            await reject('SyntaxError', () => crypto.subtle.generateKey({name:'AES-GCM', length:128}, false, []));
+            const jwk = await crypto.subtle.exportKey('jwk', key);
+            for (const change of [{kty:'RSA'}, {k:'!'}, {k:'A'}, {k:''}, {alg:'A128GCM'}, {use:'sig'},
+                {ext:false}, {key_ops:['decrypt']}, {key_ops:['encrypt','encrypt']}]) {
+                await reject('DataError', () => crypto.subtle.importKey('jwk', {...jwk,...change}, 'AES-GCM', true, ['encrypt']));
+            }
+            await reject('TypeError', () => crypto.subtle.importKey('jwk', {...jwk,key_ops:7}, 'AES-GCM', true, ['encrypt']));
+            const iterable = await crypto.subtle.importKey('jwk', {...jwk, key_ops:new Set(['encrypt'])}, 'AES-GCM', false, ['encrypt']);
+            assert(iterable.usages.join(',') === 'encrypt', 'JWK iterable');
+            gcmErrors = 'ok';
+        })().catch(e => gcmErrors = e.name + ':' + e.message);
+        "#, "Web Crypto AES-GCM rejection semantics").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(string_value(&mut engine, "gcmErrors"), "ok");
+    }
+
+    #[test]
+    fn web_crypto_aes_gcm_worker_boundary_and_buffer_brands() {
+        let mut engine = lumen::Engine::new();
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ));
+        install_lumen_worker_boundary(&mut engine);
+        eval(
+            &mut engine,
+            crate::js::worker_prelude(),
+            "AES-GCM worker prelude",
+        )
+        .unwrap();
+        eval(&mut engine, r#"
+        globalThis.workerGcm = 'pending';
+        (async () => {
+            const keyBytes = new Uint8Array(16), iv = new Uint8Array(12), data = new Uint8Array(0);
+            for (const view of [keyBytes, iv, data]) {
+                for (const property of ['buffer','byteOffset','byteLength']) {
+                    Object.defineProperty(view, property, {get() { throw Error('author buffer property read'); }});
+                }
+            }
+            const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt','decrypt']);
+            const encrypted = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, data);
+            const hex = Array.from(new Uint8Array(encrypted), x => x.toString(16).padStart(2,'0')).join('');
+            const decrypted = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, encrypted);
+            const shared = new Uint8Array(new SharedArrayBuffer(12));
+            let errors = [];
+            for (const fn of [() => crypto.subtle.encrypt({name:'AES-GCM', iv:shared}, key, data),
+                () => crypto.subtle.encrypt({name:'AES-GCM', iv}, key, shared)]) {
+                try { await fn(); errors.push('missing'); } catch (e) { errors.push(e.name); }
+            }
+            const detached = new ArrayBuffer(16); detached.transfer();
+            try { await crypto.subtle.importKey('raw', detached, 'AES-GCM', false, ['encrypt']); }
+            catch (e) { errors.push(e.name); }
+            workerGcm = hex + '|' + decrypted.byteLength + '|' + errors.join(',');
+        })().catch(e => workerGcm = e.name + ':' + e.message);
+        "#, "AES-GCM worker and BufferSource conversions").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "workerGcm"),
+            "58e2fccefa7e3061367f1d57a4e7455a|0|TypeError,TypeError,TypeError"
+        );
+    }
+
+    #[test]
+    fn web_crypto_aes_gcm_normalizes_before_key_checks_and_copies_after_getters() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+        globalThis.gcmOrder = 'pending';
+        (async () => {
+            const events = [], iv = new Uint8Array(12), aad = new Uint8Array([1]);
+            const key = await crypto.subtle.importKey('raw', new Uint8Array(16), 'AES-GCM', false, ['encrypt']);
+            const algorithm = {
+                get name() { events.push('name'); return 'AES-GCM'; },
+                get additionalData() { events.push('aad'); return aad; },
+                get iv() { events.push('iv'); return iv; },
+                get tagLength() { events.push('tag'); iv[0] = 1; aad[0] = 2; return 128.9; }
+            };
+            const result = await crypto.subtle.encrypt(algorithm, key, new Uint8Array(0));
+            const expected = await crypto.subtle.encrypt({name:'AES-GCM', iv, additionalData:aad}, key, new Uint8Array(0));
+            const same = Array.from(new Uint8Array(result)).join(',') === Array.from(new Uint8Array(expected)).join(',');
+            let error;
+            try { await crypto.subtle.encrypt({name:'AES-GCM', iv, tagLength:256}, {}, new Uint8Array(0)); }
+            catch (e) { error = e.name; }
+            gcmOrder = events.join(',') + '|' + same + '|' + error;
+        })().catch(e => gcmOrder = e.name + ':' + e.message);
+        "#, "AES-GCM normalization ordering").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "gcmOrder"),
+            "name,name,aad,iv,tag|true|TypeError"
         );
     }
 
