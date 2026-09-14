@@ -548,6 +548,7 @@ pub fn adapt_rendered_terminal(
         lines: Vec::new(),
         finger: None,
         gopher: None,
+        gemini: None,
         whois: None,
         rdap: None,
         dict: None,
@@ -5416,6 +5417,15 @@ pub fn parse_seeded(
     let mut hover_ids = std::collections::HashMap::new();
     let mut anchor_rows = std::collections::HashMap::new();
     let mut composites = std::collections::HashMap::new();
+    if media == "text/gemini" {
+        return crate::gemini::render(
+            Link::Http(url.clone()),
+            content_type,
+            body,
+            width,
+            Default::default(),
+        );
+    }
     let lines = if media == "text/html" || media == "application/xhtml+xml" {
         let html = decode_body(content_type, body);
         // The HTTP renderer: our own arena DOM laid out into rows of
@@ -5516,6 +5526,7 @@ pub fn parse_seeded(
         lines,
         finger: None,
         gopher: None,
+        gemini: None,
         whois: None,
         rdap: None,
         dict: None,

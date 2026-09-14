@@ -29,6 +29,7 @@ pub struct DownloadOffer {
     pub referrer: Option<Url>,
     pub(crate) fetch_body: bool,
     pub(crate) gopher: Option<crate::gopher::GopherUrl>,
+    pub(crate) gemini: Option<std::sync::Arc<tokio::sync::Mutex<Option<crate::gemini::Transfer>>>>,
 }
 
 impl DownloadOffer {
@@ -44,6 +45,7 @@ impl DownloadOffer {
             referrer: None,
             fetch_body: false,
             gopher: None,
+            gemini: None,
         }
     }
 
@@ -72,6 +74,28 @@ impl DownloadOffer {
             referrer: None,
             fetch_body: true,
             gopher: Some(target),
+            gemini: None,
+        })
+    }
+
+    pub(crate) fn from_gemini(
+        target: &crate::gemini::GeminiUrl,
+        media: &str,
+        transfer: crate::gemini::Transfer,
+    ) -> Result<Self, String> {
+        let url = Url::parse(&target.public_url().to_string()).map_err(|e| e.to_string())?;
+        let name = target.path.rsplit('/').next().unwrap_or("");
+        let name = sanitize_filename(name, media);
+        Ok(Self {
+            url,
+            content_type: media.into(),
+            suggested_filename: name,
+            content_length: None,
+            body: Vec::new(),
+            referrer: None,
+            fetch_body: true,
+            gopher: None,
+            gemini: Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(transfer)))),
         })
     }
 
@@ -94,6 +118,7 @@ impl DownloadOffer {
             referrer,
             fetch_body,
             gopher: None,
+            gemini: None,
         }
     }
 
@@ -688,7 +713,12 @@ pub async fn save(offer: &DownloadOffer, destination: &Path) -> Result<u64, Stri
         std::process::id()
     ));
     let result = if offer.fetch_body {
-        if let Some(target) = &offer.gopher {
+        if let Some(transfer) = &offer.gemini {
+            match transfer.lock().await.take() {
+                Some(transfer) => transfer.save(&partial).await,
+                None => Err("This Gemini response has already been saved or its transfer attempted. Reload to request it again.".into()),
+            }
+        } else if let Some(target) = &offer.gopher {
             stream_gopher(target, &partial).await
         } else {
             stream_get(&offer.url, offer.referrer.as_ref(), &partial).await
@@ -1169,6 +1199,7 @@ mod tests {
             referrer: None,
             fetch_body: true,
             gopher: None,
+            gemini: None,
         };
 
         assert_eq!(save(&offer, &destination).await.unwrap(), 8);
@@ -1190,6 +1221,7 @@ mod tests {
             referrer: None,
             fetch_body: false,
             gopher: None,
+            gemini: None,
         };
 
         assert!(save(&offer, &destination).await.is_err());

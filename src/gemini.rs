@@ -5,72 +5,22 @@
 //! header line, then for 2x responses the body until close. Redirects
 //! (3x) are followed here in the fetch task, capped to avoid loops.
 
-use std::fmt;
-use std::time::Duration;
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
-use crate::doc::{Doc, DocLine, Kind, Link, push_wrapped};
+#[cfg(test)]
+use crate::doc::Kind;
+use crate::doc::{Doc, Link};
+#[cfg(test)]
 use crate::tls;
 
-const MAX_BODY: usize = 2 * 1024 * 1024;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_REDIRECTS: usize = 5;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GeminiUrl {
-    pub host: String,
-    pub port: u16,
-    /// Absolute path, always starting with `/`; may carry a `?query`.
-    pub path: String,
-}
-
-impl fmt::Display for GeminiUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "gemini://{}", self.host)?;
-        if self.port != 1965 {
-            write!(f, ":{}", self.port)?;
-        }
-        f.write_str(&self.path)
-    }
-}
-
-impl GeminiUrl {
-    /// Parse an absolute `gemini://host[:port][/path][?query]` URL.
-    pub fn parse(s: &str) -> Option<Self> {
-        let rest = s.strip_prefix("gemini://")?;
-        let (authority, path) = match rest.find(['/', '?']) {
-            Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
-            Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
-            None => (rest, String::from("/")),
-        };
-        if authority.is_empty() {
-            return None;
-        }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-                (host, port.parse().ok()?)
-            }
-            _ => (authority, 1965),
-        };
-        Some(Self {
-            host: host.to_string(),
-            port,
-            path,
-        })
-    }
-
-    /// The directory part of the path (through the final `/`), with any
-    /// query stripped — the base for relative references.
-    fn directory(&self) -> &str {
-        let path = self.path.split('?').next().unwrap_or("/");
-        match path.rfind('/') {
-            Some(i) => &path[..=i],
-            None => "/",
-        }
-    }
-}
+mod media;
+mod transport;
+mod url;
+pub use media::MediaType;
+pub(crate) use transport::Transfer;
+pub use transport::{fetch, fetch_updates};
+pub use url::GeminiUrl;
 
 /// Interpret a target as an absolute URL of any scheme, if it is one:
 /// gemini/gopher links are followable, everything else (`http:`,
@@ -97,70 +47,47 @@ pub fn absolute_link(target: &str) -> Option<Link> {
     if let Some(url) = crate::oneshot::OneShotUrl::parse(target) {
         return Some(Link::OneShot(url));
     }
-    let colon = target.find(':')?;
-    let scheme = &target[..colon];
-    let valid_scheme = !scheme.is_empty()
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-        && !scheme.contains('/');
-    // `scheme://...` is always absolute; `scheme:...` (mailto:) counts
-    // when the colon comes before any slash.
-    if valid_scheme && (target[colon..].starts_with("://") || !target[..colon].contains('.')) {
-        return Some(Link::External(target.to_string()));
+    let (scheme, _) = target.split_once(':')?;
+    let mut bytes = scheme.bytes();
+    if bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        Some(Link::External(target.to_string()))
+    } else {
+        None
     }
-    None
 }
 
-/// Resolve a gemtext link or redirect target against the current page,
-/// per the RFC 3986 relative-reference rules gemini borrows.
+/// RFC 3986 §5.2, including empty/query/fragment-only references.
 pub fn resolve(base: &GeminiUrl, target: &str) -> Link {
-    if let Some(link) = absolute_link(target) {
+    resolve_reference(base, target, false)
+}
+
+fn resolve_reference(base: &GeminiUrl, target: &str, redirect: bool) -> Link {
+    if let Some(mut link) = absolute_link(target) {
+        if let Link::Gemini(url) = &mut link {
+            url.path = url::normalize(&url.path);
+            if redirect {
+                url.inherit_sensitivity(base);
+            }
+        }
         return link;
     }
-
-    let mut url = base.clone();
-    if let Some(rest) = target.strip_prefix("//") {
-        // Network-path reference: new authority, same scheme.
-        return match GeminiUrl::parse(&format!("gemini://{rest}")) {
-            Some(url) => Link::Gemini(url),
-            None => Link::External(target.to_string()),
-        };
-    }
-    url.path = if let Some(target) = target.strip_prefix('/') {
-        normalize(&format!("/{target}"))
-    } else {
-        normalize(&format!("{}{}", base.directory(), target))
-    };
-    Link::Gemini(url)
+    base.resolve(target, redirect)
+        .map(|mut url| {
+            if redirect {
+                url.inherit_sensitivity(base);
+            }
+            Link::Gemini(url)
+        })
+        .unwrap_or_else(|| Link::External(target.to_string()))
 }
 
-/// Remove `.` and `..` segments (RFC 3986 §5.2.4), preserving a query.
 pub(crate) fn normalize(path: &str) -> String {
-    let (path, query) = match path.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (path, None),
-    };
-    let mut out: Vec<&str> = Vec::new();
-    let trailing_slash = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            seg => out.push(seg),
-        }
-    }
-    let mut result = format!("/{}", out.join("/"));
-    if trailing_slash && result.len() > 1 {
-        result.push('/');
-    }
-    if let Some(query) = query {
-        result.push('?');
-        result.push_str(query);
-    }
-    result
+    url::normalize(path)
+}
+pub(crate) fn normalize_path(path: &str) -> String {
+    url::remove_dot_segments(path)
 }
 
 /// Percent-encode a user query for a 1x input prompt.
@@ -178,7 +105,7 @@ pub fn encode_query(query: &str) -> String {
 }
 
 /// A gemini response: header (always) plus body (2x only).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Response {
     /// The URL that finally answered, after redirects.
     pub url: GeminiUrl,
@@ -187,187 +114,200 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Whether a client identity was presented for this request.
     pub identity: bool,
+    /// A usable, scoped identity was configured, independently of TLS selection.
+    pub identity_configured: bool,
+    pub finished: bool,
+    pub notice: Option<String>,
+    pub download: Option<crate::download::DownloadOffer>,
+    pub view: View,
 }
 
-/// Fetch a URL, following up to `MAX_REDIRECTS` 3x redirects.
-pub async fn fetch(url: &GeminiUrl) -> Result<Response, String> {
-    let mut url = url.clone();
-    for _ in 0..=MAX_REDIRECTS {
-        let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(&url))
-            .await
-            .map_err(|_| String::from("timed out"))??;
-        if (30..40).contains(&response.status) {
-            match resolve(&url, response.meta.trim()) {
-                Link::Gemini(next) => {
-                    url = next;
-                    continue;
-                }
-                other => return Err(format!("redirect leaves geminispace: {other}")),
-            }
+impl Response {
+    pub fn new(url: GeminiUrl, status: u8, meta: String) -> Self {
+        Self {
+            url: url.public_url(),
+            status,
+            meta,
+            body: Vec::new(),
+            identity: false,
+            identity_configured: false,
+            finished: true,
+            notice: None,
+            download: None,
+            view: View::default(),
         }
-        return Ok(response);
     }
-    Err(format!("too many redirects (>{MAX_REDIRECTS})"))
+    pub fn media_type(&self) -> Result<MediaType, String> {
+        MediaType::parse(&self.meta)
+    }
+    pub fn status_text(&self) -> String {
+        let name = status_name(self.status);
+        let id = if self.identity { " · ID" } else { "" };
+        let note = self
+            .notice
+            .as_deref()
+            .unwrap_or(if self.finished { "" } else { "Loading…" });
+        let meta = if self.meta.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", self.meta)
+        };
+        format!(
+            "{} — {name} ({}){meta}{id}{}",
+            self.url,
+            self.status,
+            if note.is_empty() {
+                String::new()
+            } else {
+                format!(" · {note}")
+            }
+        )
+    }
+    pub fn certificate_prompt(&self) -> bool {
+        self.status >= 60
+            && self.status <= 69
+            && !matches!(self.status, 61 | 62)
+            && !self.identity
+            && !self.identity_configured
+    }
 }
 
-async fn fetch_once(url: &GeminiUrl) -> Result<Response, String> {
-    let stream = TcpStream::connect((url.host.as_str(), url.port))
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = stream.set_nodelay(true);
-    let name = tls::server_name(&url.host)?;
-    // The host's client identity rides along when one is on file.
-    let (connector, identity) = tls::gemini_connector(&url.host, url.port)?;
-    let mut stream = connector
-        .connect(name, stream)
-        .await
-        .map_err(|e| format!("TLS: {e}"))?;
-
-    stream
-        .write_all(format!("{url}\r\n").as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Header: `<status><SP><meta>\r\n`, at most 1024 bytes of meta.
-    let mut header = Vec::new();
-    let mut byte = [0u8; 1];
-    while !header.ends_with(b"\r\n") {
-        if header.len() > 1100 {
-            return Err(String::from("malformed response header (too long)"));
-        }
-        match stream.read(&mut byte).await.map_err(|e| e.to_string())? {
-            0 => return Err(String::from("connection closed before header")),
-            _ => header.push(byte[0]),
-        }
+pub fn status_name(status: u8) -> &'static str {
+    match status {
+        11 => "Sensitive input",
+        10..=19 => "Input requested",
+        20..=29 => "Success",
+        31 => "Moved permanently",
+        30..=39 => "Redirect",
+        41 => "Server unavailable",
+        42 => "Server application error",
+        43 => "Proxy error",
+        44 => "Slow down; wait before retrying",
+        40..=49 => "Temporary failure",
+        51 => "Not found",
+        52 => "Gone",
+        53 => "Proxy request refused",
+        59 => "Bad request",
+        50..=59 => "Permanent failure",
+        61 => "Certificate not authorized",
+        62 => "Certificate not valid",
+        60..=69 => "Client certificate required",
+        _ => "Invalid status",
     }
-    let header = String::from_utf8_lossy(&header[..header.len() - 2]).into_owned();
-    let (status, meta) = match header.split_once(' ') {
-        Some((s, meta)) => (s, meta.trim().to_string()),
-        None => (header.as_str(), String::new()),
-    };
-    let status: u8 = status
-        .parse()
-        .map_err(|_| format!("malformed status line: {header:?}"))?;
+}
 
-    let mut body = Vec::new();
-    if (20..30).contains(&status) {
-        let mut buf = [0u8; 8192];
-        loop {
-            // Plenty of real servers close without a TLS close_notify;
-            // treat that as EOF rather than an error.
-            let n = match stream.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-                Err(e) => return Err(e.to_string()),
-            };
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&buf[..n]);
-            if body.len() > MAX_BODY {
-                return Err(String::from("response exceeds 2 MB cap"));
-            }
-        }
-    }
-    Ok(Response {
-        url: url.clone(),
-        status,
+mod presentation;
+pub use presentation::{View, heading_row, parse_gemtext, render, source_offer};
+
+pub fn parse(url: &GeminiUrl, meta: &str, body: &[u8], width: usize) -> Doc {
+    render(
+        Link::Gemini(url.public_url()),
         meta,
         body,
-        identity,
-    })
-}
-
-/// Parse a successful response body into a document. Gemtext gets full
-/// treatment; other text/* render as plain text; anything else gets a
-/// placeholder line.
-pub fn parse(url: &GeminiUrl, meta: &str, body: &[u8], width: usize) -> Doc {
-    let width = width.max(10);
-    let media = meta.split(';').next().unwrap_or("").trim();
-    let lines = if media.is_empty() || media == "text/gemini" {
-        parse_gemtext(body, width, &|target| resolve(url, target))
-    } else if media.starts_with("text/") {
-        crate::doc::wrap_plain(&String::from_utf8_lossy(body), width)
-    } else {
-        vec![DocLine {
-            kind: Kind::Error,
-            text: format!("unsupported media type: {meta}"),
-            link: None,
-        }]
-    };
-    Doc::from_lines(
-        Link::Gemini(url.clone()),
-        lines,
-        body.to_vec(),
         width,
-        false,
-        Some(meta.to_string()),
+        View::default(),
     )
 }
 
-/// Parse gemtext into document lines. The resolver maps `=>` targets to
-/// links — gemini pages resolve against their own URL, while `.gmi`
-/// files served over gopher resolve relative targets to gopher
-/// selectors (see `gopher::parse`).
-pub fn parse_gemtext(
-    body: &[u8],
-    width: usize,
-    resolve_link: &dyn Fn(&str) -> Link,
-) -> Vec<DocLine> {
-    let text = String::from_utf8_lossy(body);
-    let mut lines = Vec::new();
-    let mut pre = false;
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with("```") {
-            // Toggle lines themselves are not rendered (alt text ignored).
-            pre = !pre;
-            continue;
-        }
-        if pre {
-            // Preformatted content: never wrapped, never linked.
-            lines.push(DocLine {
-                kind: Kind::Pre,
-                text: line.to_string(),
-                link: None,
-            });
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("=>") {
-            let rest = rest.trim_start();
-            let (target, label) = match rest.split_once(char::is_whitespace) {
-                Some((t, l)) => (t, l.trim()),
-                None => (rest, ""),
-            };
-            if target.is_empty() {
-                continue;
-            }
-            let link = resolve_link(target);
-            let text = if label.is_empty() {
-                target.to_string()
-            } else {
-                label.to_string()
-            };
-            push_wrapped(&mut lines, Kind::GemLink, text, Some(link), width);
-            continue;
-        }
-        let (kind, text) = if let Some(rest) = line.strip_prefix("###") {
-            (Kind::Heading(3), rest.trim().to_string())
-        } else if let Some(rest) = line.strip_prefix("##") {
-            (Kind::Heading(2), rest.trim().to_string())
-        } else if let Some(rest) = line.strip_prefix('#') {
-            (Kind::Heading(1), rest.trim().to_string())
-        } else if let Some(rest) = line.strip_prefix("* ") {
-            (Kind::List, format!("• {}", rest.trim()))
-        } else if let Some(rest) = line.strip_prefix('>') {
-            (Kind::Quote, format!("▌ {}", rest.trim()))
-        } else {
-            (Kind::Text, line.to_string())
-        };
-        push_wrapped(&mut lines, kind, text, None, width);
-    }
-    lines
+/// Shared prompt data; neither browser chrome nor history stores submitted secrets.
+#[derive(Clone, Debug)]
+pub struct Prompt {
+    pub url: GeminiUrl,
+    pub meta: String,
+    pub certificate: bool,
+    pub sensitive: bool,
 }
+impl Prompt {
+    pub fn from_response(response: &Response) -> Option<Self> {
+        if !(10..20).contains(&response.status) && !response.certificate_prompt() {
+            return None;
+        }
+        Some(Self {
+            url: response.url.public_url(),
+            meta: response.meta.clone(),
+            certificate: response.certificate_prompt(),
+            sensitive: response.status == 11,
+        })
+    }
+    pub fn label(&self) -> String {
+        if !self.certificate {
+            return self.meta.clone();
+        }
+        let existing = crate::tls::identity_path(&self.url.host).is_some_and(|p| p.exists());
+        format!(
+            "{} — {}. Enter {} for this path and its descendants.",
+            self.url,
+            self.meta,
+            if existing {
+                "authorizes the existing identity"
+            } else {
+                "creates and authorizes an identity with this name"
+            }
+        )
+    }
+    pub fn submit(&self, text: &str) -> Result<GeminiUrl, String> {
+        if self.certificate {
+            crate::tls::authorize_identity(
+                &self.url,
+                if text.trim().is_empty() {
+                    "anonymous"
+                } else {
+                    text.trim()
+                },
+            )?;
+            Ok(self.url.clone())
+        } else {
+            self.url.with_input(text, self.sensitive)
+        }
+    }
+}
+
+pub fn view_action(
+    view: &mut View,
+    action: &str,
+    enabled: Option<bool>,
+) -> Result<&'static str, &'static str> {
+    if action == "outline" {
+        view.outline = enabled.unwrap_or(!view.outline);
+        Ok(if view.outline {
+            "Heading outline — use heading N to jump."
+        } else {
+            "Reading the full page."
+        })
+    } else if action == "alt" {
+        view.show_alt = enabled.unwrap_or(!view.show_alt);
+        Ok(if view.show_alt {
+            "Preformatted descriptions on."
+        } else {
+            "Preformatted descriptions off."
+        })
+    } else {
+        crate::text_reply::view_action(&mut view.controls, action, enabled, false)
+    }
+}
+
+pub(crate) fn image_response(response: Response) -> Result<crate::http::Response, String> {
+    let mime = response.media_type()?.essence;
+    let response = crate::http::Response {
+        url: ::url::Url::parse(&response.url.public_url().to_string())
+            .map_err(|e| e.to_string())?,
+        status: 200,
+        content_type: mime.clone(),
+        body: response.body,
+        headers: Vec::new(),
+        rendered: None,
+        js: None,
+        blobs: None,
+        live: None,
+        declarative_refresh: None,
+        challenge: None,
+        from_post: false,
+        timing: None,
+    };
+    Ok(crate::http::image_navigation_response(response, &mime))
+}
+
+pub const HELP: &str = "# Gemini in TRust\n\nOpen a gemini:// URL, follow links with Enter, and use Back/Forward to navigate. Local .gmi, .gemini and .gemtext files open as Gemtext previews.\n\n## Reading\n* W or wrap [on|off] controls ordinary text wrapping. Preformatted blocks keep their spacing.\n* Shift+Left/Right pans wide preformatted lines.\n* S or save saves the received source bytes. A stopped or limited response saves its received prefix.\n* gemini-width 20..240 sets the reading column (default 96 characters).\n* outline toggles the numbered heading list.\n* heading next, heading previous or heading N jumps to a heading.\n* gemini-alt [on|off] shows preformatted block descriptions.\n\n## Input and identity\nInput prompts submit with Enter; Escape cancels. Sensitive input is masked, excluded from command history and removed from stored page addresses. A sensitive query is never replayed by history or reload.\n\nWhen a capsule requests a client identity, Enter explicitly authorizes the displayed path and its descendants at that host and port. Existing identity files are reused; new names create an identity only when none exists. Rejected certificates display the server's explanation.\n\n## Files and redirects\nImages open in the viewer. Other files offer Save or Open. The download uses the original response connection; choosing Open launches the saved file. Gemini redirects are limited to five hops. A redirect to another protocol shows a link for you to follow.\n\n## Limits\nText arrives progressively. Stop keeps received content. The display buffers up to 2 MiB and bounds rows, columns and active links; notices explain incomplete responses. Saves retain original bytes before display filtering. Supported text encodings are UTF-8, ASCII and ISO-8859-1; unknown charsets show a source-saving message.\n";
 
 #[cfg(test)]
 mod tests {
@@ -426,11 +366,7 @@ mod tests {
             }
         });
 
-        let url = |path: &str| GeminiUrl {
-            host: String::from("127.0.0.2"),
-            port,
-            path: path.to_string(),
-        };
+        let url = |path: &str| GeminiUrl::new("127.0.0.2", port, path);
 
         // Success: header parsed, gemtext body delivered.
         let response = fetch(&url("/")).await.unwrap();
@@ -581,11 +517,7 @@ mod tests {
             }
         });
 
-        let url = GeminiUrl {
-            host: String::from("127.0.0.1"),
-            port,
-            path: String::from("/garden"),
-        };
+        let url = GeminiUrl::new("127.0.0.1", port, "/garden");
         // Anonymous visit: turned away with a 60.
         let response = fetch(&url).await.unwrap();
         assert_eq!((response.status, response.identity), (60, false));
@@ -593,7 +525,7 @@ mod tests {
 
         // Mint the identity (what the status-60 prompt does), retry:
         // recognized, and the response records that a cert was sent.
-        tls::create_identity("127.0.0.1", "talkie").unwrap();
+        tls::authorize_identity(&url, "talkie").unwrap();
         let response = fetch(&url).await.unwrap();
         assert_eq!((response.status, response.identity), (20, true));
         assert_eq!(response.body, b"Welcome back, certified user.\n");
@@ -606,7 +538,10 @@ mod tests {
         let url = GeminiUrl::parse("gemini://example.org").unwrap();
         assert_eq!((url.port, url.path.as_str()), (1965, "/"));
         let url = GeminiUrl::parse("gemini://example.org:1966/foo/bar?q").unwrap();
-        assert_eq!((url.port, url.path.as_str()), (1966, "/foo/bar?q"));
+        assert_eq!(
+            (url.port, url.path.as_str(), url.query()),
+            (1966, "/foo/bar", Some("q"))
+        );
         assert!(GeminiUrl::parse("gopher://example.org").is_none());
         assert!(GeminiUrl::parse("gemini://").is_none());
     }

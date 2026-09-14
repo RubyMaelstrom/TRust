@@ -468,6 +468,7 @@ pub struct Doc {
     /// Finger view controls and one previous reply for manual comparison.
     pub finger: Option<crate::finger::View>,
     pub gopher: Option<crate::gopher::View>,
+    pub gemini: Option<crate::gemini::View>,
     /// Per-server WHOIS bytes, view controls, and one successful comparison.
     pub whois: Option<crate::whois::Page>,
     /// RDAP registration record and original JSON, independent of HTTP layout.
@@ -566,6 +567,7 @@ impl Doc {
         self.gopher
             .as_ref()
             .and_then(|v| v.owners.get(row))
+            .or_else(|| self.gemini.as_ref().and_then(|v| v.owners.get(row)))
             .copied()
             .unwrap_or(row)
     }
@@ -590,11 +592,14 @@ impl Doc {
                 .or_else(|| self.rdap.as_ref().map(|page| &page.view))
                 .or_else(|| self.finger.as_ref().map(|view| &view.controls))
                 .or_else(|| self.gopher.as_ref().map(|view| &view.controls))
+                .or_else(|| self.gemini.as_ref().map(|view| &view.controls))
         })
     }
 
     pub fn text_view_mut(&mut self) -> Option<&mut crate::text_reply::View> {
-        if let Some(view) = &mut self.gopher {
+        if let Some(view) = &mut self.gemini {
+            Some(&mut view.controls)
+        } else if let Some(view) = &mut self.gopher {
             Some(&mut view.controls)
         } else if let Some(page) = &mut self.dict {
             Some(&mut page.view)
@@ -608,7 +613,15 @@ impl Doc {
     }
 
     pub fn rerender_reply(&mut self, width: usize) {
-        if let Some(view) = self.gopher.take() {
+        if let Some(view) = self.gemini.take() {
+            *self = crate::gemini::render(
+                self.url.clone(),
+                self.meta.as_deref().unwrap_or("text/gemini"),
+                &self.raw,
+                width,
+                view,
+            );
+        } else if let Some(view) = self.gopher.take() {
             if let Link::Gopher(url) = &self.url {
                 let reply = crate::text_reply::Reply {
                     body: std::mem::take(&mut self.raw),
@@ -649,6 +662,7 @@ impl Doc {
             lines,
             finger: None,
             gopher: None,
+            gemini: None,
             whois: None,
             rdap: None,
             dict: None,

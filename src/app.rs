@@ -305,7 +305,7 @@ enum Payload {
     Gopher(crate::text_reply::Reply),
     GopherImage(Vec<u8>),
     GopherDownload(Box<crate::download::DownloadOffer>),
-    Gemini(gemini::Response),
+    Gemini(Box<gemini::Response>),
     Http(Box<http::Response>),
     /// An attachment or unsupported top-level MIME type. The current document
     /// remains active while the frontend presents Save / Open / Cancel.
@@ -1672,7 +1672,22 @@ impl App {
     }
 
     /// Open the command console (the same state Tab/Ctrl-] enters).
+    fn clear_gemini_input(&mut self) {
+        if self.masked_input
+            || matches!(self.search_target, Some(Link::Gemini(_)))
+            || self.cert_for.is_some()
+        {
+            self.input.clear();
+            self.cursor = 0;
+            self.select_anchor = None;
+            self.search_target = None;
+            self.cert_for = None;
+            self.masked_input = false;
+        }
+    }
+
     fn open_command(&mut self) {
+        self.clear_gemini_input();
         // UA bottom sheets never stack. Dismissing this view does not touch a
         // transfer already moved into background ownership.
         self.file_dialog = None;
@@ -1712,6 +1727,7 @@ impl App {
     /// From find it dismisses the find box (clearing its query) on the way
     /// to the console; any pending identity prompt or dropdown is cancelled.
     fn toggle_command_mode(&mut self) {
+        self.clear_gemini_input();
         if self.mode == Mode::Find {
             self.input.clear();
             self.cursor = 0;
@@ -1953,6 +1969,7 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc if matches!(self.mode, Mode::Command | Mode::Search) => {
+                self.clear_gemini_input();
                 self.mode = Mode::Session;
                 self.search_target = None;
                 self.cert_for = None;
@@ -1969,7 +1986,9 @@ impl App {
                 let line = std::mem::take(&mut self.input);
                 self.cursor = 0;
                 self.select_anchor = None;
-                self.active_history().push(&line);
+                if !self.masked_input {
+                    self.active_history().push(&line);
+                }
                 match self.mode {
                     Mode::Session => self.send_line(&line).await,
                     Mode::Command => {
@@ -2013,7 +2032,7 @@ impl App {
                 self.input.remove(self.byte_cursor());
                 self.active_history().detach();
             }
-            KeyCode::Up => {
+            KeyCode::Up if !self.masked_input => {
                 let current = self.input.clone();
                 if let Some(text) = self.active_history().up(&current) {
                     self.cursor = text.chars().count();
@@ -2021,7 +2040,7 @@ impl App {
                     self.select_anchor = None;
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down if !self.masked_input => {
                 if let Some(text) = self.active_history().down() {
                     self.cursor = text.chars().count();
                     self.input = text;
@@ -2077,6 +2096,7 @@ impl App {
 
     /// Open in-page find over the current browser doc (Ctrl-F).
     fn open_find(&mut self) {
+        self.clear_gemini_input();
         self.input.clear();
         self.cursor = 0;
         self.select_anchor = None;
@@ -2681,6 +2701,16 @@ impl App {
                 }
             }
             Some("help" | "?") => self.open_about("help"),
+            Some("gemini-help") => self.open_about("gemini"),
+            Some("outline") => self.reply_view_action("outline", None),
+            Some("heading") => self.gemini_heading(parts.next().unwrap_or("next")),
+            Some("gemini-width") => self.gemini_width(parts.next()),
+            Some("gemini-alt") => match parts.next() {
+                None => self.reply_view_action("alt", None),
+                Some("on") => self.reply_view_action("alt", Some(true)),
+                Some("off") => self.reply_view_action("alt", Some(false)),
+                _ => self.status = "usage: gemini-alt [on|off]".into(),
+            },
             Some("gopher-info") => match (parts.next(), parts.next()) {
                 (None, None) => self.gopher_information(false),
                 (Some("page"), None) => self.gopher_information(true),
@@ -2981,6 +3011,7 @@ impl App {
     fn about_body(&self, page: &str) -> Option<String> {
         match page {
             "help" => Some(String::from(HELP_PAGE)),
+            "gemini" => Some(String::from(gemini::HELP)),
             "status" => Some(format!("# TRust status\n\n{}\n", self.status_report())),
             _ => None,
         }
@@ -3145,11 +3176,9 @@ impl App {
                     gopher_plus: None,
                     selector: Vec::new(),
                 })),
-                Some(1965) => self.start_fetch(Link::Gemini(GeminiUrl {
-                    host: host.to_string(),
-                    port: 1965,
-                    path: String::from("/"),
-                })),
+                Some(1965) => {
+                    self.start_fetch(Link::Gemini(crate::gemini::GeminiUrl::new(host, 1965, "/")))
+                }
                 // Finger with an empty query: who is logged in.
                 Some(79) => self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
                     scheme: oneshot::Scheme::Finger,
@@ -3291,6 +3320,7 @@ impl App {
         referrer: Option<url::Url>,
         navigation_type: http::NavigationType,
     ) {
+        self.clear_gemini_input();
         // Deep history can evict the local page, but bookmarks still reload
         // from disk through their worker rather than the network dispatcher.
         if matches!(&target, Link::External(address) if address == "about:bookmarks") {
@@ -3388,6 +3418,28 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
+            if let Link::Gemini(url) = &target {
+                let result = gemini::fetch_updates(url, |response| {
+                    let tx = tx.clone();
+                    let target = target.clone();
+                    async move {
+                        tx.send(FetchMsg {
+                            target,
+                            result: Ok(Payload::Gemini(Box::new(response))),
+                        })
+                        .await
+                        .is_ok()
+                    }
+                })
+                .await;
+                let _ = tx
+                    .send(FetchMsg {
+                        target,
+                        result: result.map(|response| Payload::Gemini(Box::new(response))),
+                    })
+                    .await;
+                return;
+            }
             if let Link::Gopher(url) = &target
                 && url.is_binary_file()
             {
@@ -4195,7 +4247,10 @@ impl App {
         if let Some(g) = &mut self.browser
             && g.doc.text_view().is_some_and(|view| view.loading)
         {
-            if let Some(view) = &mut g.doc.gopher {
+            if let Some(view) = &mut g.doc.gemini {
+                view.controls.loading = false;
+                view.controls.notice = Some(reason.into());
+            } else if let Some(view) = &mut g.doc.gopher {
                 view.controls.loading = false;
                 view.controls.notice = Some(reason.into());
             } else if let Some(page) = &mut g.doc.dict {
@@ -4219,9 +4274,12 @@ impl App {
             .gopher
             .as_ref()
             .and_then(|v| v.sources.get(g.scroll))
+            .or_else(|| g.doc.gemini.as_ref().and_then(|v| v.sources.get(g.scroll)))
             .copied();
         let selected = g.selected.and_then(|i| g.doc.line_link(i)).cloned();
-        let result = if let Some(view) = &mut g.doc.gopher {
+        let result = if let Some(view) = &mut g.doc.gemini {
+            gemini::view_action(view, action, enabled)
+        } else if let Some(view) = &mut g.doc.gopher {
             crate::text_reply::view_action(&mut view.controls, action, enabled, false)
         } else if let Some(page) = &mut g.doc.dict {
             page.view_action(action, enabled)
@@ -4241,10 +4299,16 @@ impl App {
             Ok(status) => {
                 self.status = status.to_string();
                 g.doc.rerender_reply((self.last_inner.0 as usize).max(10));
-                if let Some(source) = source
-                    && let Some(view) = &g.doc.gopher
+                if action != "outline"
+                    && let Some(source) = source
+                    && let Some(sources) = g
+                        .doc
+                        .gopher
+                        .as_ref()
+                        .map(|v| &v.sources)
+                        .or_else(|| g.doc.gemini.as_ref().map(|v| &v.sources))
                 {
-                    g.scroll = view.sources.iter().position(|&n| n >= source).unwrap_or(0);
+                    g.scroll = sources.iter().position(|&n| n >= source).unwrap_or(0);
                 }
                 g.scroll = g
                     .scroll
@@ -4264,6 +4328,51 @@ impl App {
             Err(status) => self.status = status.to_string(),
         }
         self.notice = true;
+    }
+
+    fn gemini_heading(&mut self, which: &str) {
+        let Some(g) = &mut self.browser else {
+            return;
+        };
+        let Some(view) = &mut g.doc.gemini else {
+            self.status = "Heading navigation applies to Gemtext.".into();
+            return;
+        };
+        let current = if view.outline { 0 } else { g.scroll };
+        view.outline = false;
+        g.doc.rerender_reply(self.last_inner.0 as usize);
+        match gemini::heading_row(g.doc.gemini.as_ref().unwrap(), current, which) {
+            Ok(row) => {
+                g.scroll = row;
+                g.selected = None;
+                self.status = "Heading selected.".into();
+            }
+            Err(error) => self.status = error.into(),
+        }
+        self.notice = true;
+    }
+
+    fn gemini_width(&mut self, value: Option<&str>) {
+        let columns = value
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (20..=240).contains(n));
+        let Some(columns) = columns else {
+            self.status = "usage: gemini-width 20..240".into();
+            return;
+        };
+        if let Some(g) = &mut self.browser
+            && let Some(view) = &mut g.doc.gemini
+        {
+            view.reading_columns = columns;
+            view.controls.horizontal = 0;
+            g.doc.rerender_reply(self.last_inner.0 as usize);
+            g.scroll = g
+                .scroll
+                .min(g.doc.extent().saturating_sub(self.last_inner.1 as usize));
+            self.status = format!("Gemini reading width: {columns} columns.");
+        } else {
+            self.status = "Reading width applies to Gemtext.".into();
+        }
     }
 
     fn gopher_encoding(&mut self) {
@@ -4317,6 +4426,17 @@ impl App {
         let Some(g) = &self.browser else {
             return;
         };
+        if g.doc.gemini.is_some() && server.is_none() {
+            match gemini::source_offer(&g.doc) {
+                Ok(offer) => {
+                    self.file_dialog = Some(FileDialog { offer, selected: 0 });
+                    self.mode = Mode::Session;
+                    self.status = "Save received Gemini source".into();
+                }
+                Err(error) => self.status = error,
+            }
+            return;
+        }
         if g.doc.gopher.is_some() && server.is_none() {
             self.file_dialog = Some(FileDialog {
                 offer: crate::download::DownloadOffer::from_bytes(
@@ -4538,9 +4658,16 @@ impl App {
     fn on_fetch(&mut self, msg: FetchMsg) {
         if matches!(
             msg.result,
-            Ok(Payload::Gopher(_) | Payload::Finger(_) | Payload::Whois(_) | Payload::Dict(_))
+            Ok(Payload::Gemini(_)
+                | Payload::Gopher(_)
+                | Payload::Finger(_)
+                | Payload::Whois(_)
+                | Payload::Dict(_))
         ) {
             match (msg.result, msg.target) {
+                (Ok(Payload::Gemini(response)), _) => {
+                    self.on_gemini_response(*response, (self.last_inner.0 as usize).max(10))
+                }
                 (Ok(Payload::Gopher(reply)), Link::Gopher(url)) => self.on_gopher_reply(url, reply),
                 (Ok(Payload::Finger(reply)), Link::OneShot(url)) => {
                     self.on_finger_reply(url, reply)
@@ -4586,7 +4713,7 @@ impl App {
                 self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
-            (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
+            (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(*response, width),
             (Ok(Payload::Rdap(mut page)), _) => {
                 if self.replace_nav
                     && let Some(old) = self.browser.as_ref().and_then(|g| g.doc.rdap.as_ref())
@@ -4704,31 +4831,51 @@ impl App {
 
     /// Act on a gemini response by status class. 3x redirects were
     /// already followed inside the fetch task.
-    fn on_gemini_response(&mut self, response: gemini::Response, width: usize) {
+    fn on_gemini_response(&mut self, mut response: gemini::Response, width: usize) {
+        self.status = response.status_text();
+        self.notice = response.notice.is_some();
+        if response.finished {
+            self.fetch_rx = None;
+            self.fetch_task = None;
+        }
+        if let Some(offer) = response.download.take() {
+            self.status = format!(
+                "Gemini file · {}{}",
+                offer.summary(),
+                response
+                    .notice
+                    .as_ref()
+                    .map_or(String::new(), |note| format!(" · {note}"))
+            );
+            self.file_dialog = Some(FileDialog { offer, selected: 0 });
+            self.mode = Mode::Session;
+            self.replace_nav = false;
+            return;
+        }
         match response.status {
             20..=29 => {
-                if response.meta.starts_with("image/") {
+                if response.media_type().is_ok_and(|media| media.is_image()) {
+                    let notice = response.notice.clone();
                     self.open_image(Link::Gemini(response.url), response.body);
+                    if let Some(notice) = notice {
+                        self.status = notice;
+                        self.notice = true;
+                    }
                     return;
                 }
-                let doc = gemini::parse(&response.url, &response.meta, &response.body, width);
-                let media = if response.meta.is_empty() {
-                    "text/gemini"
-                } else {
-                    response.meta.as_str()
-                };
-                let id = if response.identity { " · ID" } else { "" };
-                self.status = format!("{} — {media}{id}", response.url);
-                self.navigate_to(doc);
+                if let Some(g) = &self.browser
+                    && g.doc.url == Link::Gemini(response.url.clone())
+                    && (self.query_fetch_started || self.replace_nav)
+                    && let Some(view) = &g.doc.gemini
+                {
+                    response.view = view.clone();
+                }
+                let doc = response.document(width);
+                self.on_streamed_document(doc, response.finished);
             }
-            // 1x: the server wants input; reuse the search prompt.
-            // 11 is "sensitive input" — the UI masks the typed text.
             10..=19 => {
-                self.status = if response.meta.is_empty() {
-                    String::from("Input requested.")
-                } else {
-                    response.meta.clone()
-                };
+                self.clear_gemini_input();
+                self.status = response.meta;
                 self.search_target = Some(Link::Gemini(response.url));
                 self.masked_input = response.status == 11;
                 self.mode = Mode::Search;
@@ -4736,36 +4883,32 @@ impl App {
                 self.cursor = 0;
                 self.select_anchor = None;
             }
-            // 60 with nothing on file: offer to mint an identity right
-            // there. Everything else in the 6x class (61/62, or a 60
-            // even though we presented one) shows the server's words,
-            // plus which file spoke for us.
-            60..=69 => {
-                if response.status == 60 && !response.identity {
-                    self.input = std::env::var("USER").unwrap_or_default();
-                    self.cursor = self.input.chars().count();
-                    self.select_anchor = None;
-                    self.cert_for = Some(response.url.clone());
-                    self.masked_input = false;
-                    self.mode = Mode::Search;
-                    self.status = format!(
-                        "{} requests an identity — Enter mints a certificate with that name.",
-                        response.url
-                    );
+            _ if response.certificate_prompt() => {
+                self.clear_gemini_input();
+                let existing = tls::identity_path(&response.url.host).is_some_and(|p| p.exists());
+                self.input = if existing {
+                    String::new()
                 } else {
-                    let sent = tls::identity_path(&response.url.host)
-                        .filter(|_| response.identity)
-                        .map(|p| format!(" (sent {})", p.display()))
-                        .unwrap_or_default();
-                    self.status = format!(
-                        "{}: {} {}{sent}",
-                        response.url, response.status, response.meta
-                    );
-                    self.notice = true;
-                }
+                    std::env::var("USER").unwrap_or_default()
+                };
+                self.cursor = self.input.chars().count();
+                self.select_anchor = None;
+                self.cert_for = Some(response.url.clone());
+                self.masked_input = false;
+                self.mode = Mode::Search;
+                self.status = format!(
+                    "{} — {}. Enter {} for this path and its descendants.",
+                    response.url,
+                    response.meta,
+                    if existing {
+                        "authorizes the existing identity"
+                    } else {
+                        "creates and authorizes an identity with this name"
+                    }
+                );
             }
-            status => {
-                self.status = format!("{}: {} {}", response.url, status, response.meta);
+            _ => {
+                self.navigate_to(response.document(width));
                 self.notice = true;
             }
         }
@@ -6790,9 +6933,17 @@ impl App {
                             .map(|line| unicode_width::UnicodeWidthStr::width(line.text.as_str()))
                             .max()
                             .unwrap_or(0)
-                            .saturating_sub(self.last_inner.0 as usize);
+                            .saturating_sub(
+                                g.doc
+                                    .gemini
+                                    .as_ref()
+                                    .map_or(self.last_inner.0 as usize, |v| {
+                                        v.reading_columns.min(self.last_inner.0 as usize)
+                                    }),
+                            );
+                        let gemini = g.doc.gemini.is_some();
                         let view = g.doc.text_view_mut().unwrap();
-                        if !view.wrap {
+                        if !view.wrap || gemini {
                             view.horizontal = if key.code == KeyCode::Left {
                                 view.horizontal.saturating_sub(8)
                             } else {
@@ -7719,7 +7870,9 @@ impl App {
             .gopher
             .as_ref()
             .and_then(|v| v.sources.get(g.scroll))
+            .or_else(|| g.doc.gemini.as_ref().and_then(|v| v.sources.get(g.scroll)))
             .copied();
+        let gemini_view = g.doc.gemini.take();
         let gopher_view = g.doc.gopher.take();
         let finger_view = g.doc.finger.take();
         let whois_page = g.doc.whois.take();
@@ -7728,6 +7881,13 @@ impl App {
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
+            url if gemini_view.is_some() => gemini::render(
+                url,
+                g.doc.meta.as_deref().unwrap_or("text/gemini"),
+                &raw,
+                width,
+                gemini_view.unwrap(),
+            ),
             Link::Dict(_) => crate::dict::render(dict_page.expect("DICT page"), width),
             Link::Gopher(url) if gopher_view.is_none() && g.doc.meta.is_some() => {
                 let mut doc = http::parse_terminal(
@@ -7800,9 +7960,14 @@ impl App {
         };
         // Same page, same blob mirror (a re-wrap must not orphan blob: images).
         if let Some(source) = source_row
-            && let Some(view) = &g.doc.gopher
+            && let Some(sources) = g
+                .doc
+                .gopher
+                .as_ref()
+                .map(|v| &v.sources)
+                .or_else(|| g.doc.gemini.as_ref().map(|v| &v.sources))
         {
-            g.scroll = view.sources.iter().position(|&n| n >= source).unwrap_or(0);
+            g.scroll = sources.iter().position(|&n| n >= source).unwrap_or(0);
         }
         g.doc.blobs = blobs;
         if g.doc.laid_out() {
@@ -8728,7 +8893,7 @@ impl App {
         if let Some(url) = self.cert_for.take() {
             let name = query.trim();
             let name = if name.is_empty() { "anonymous" } else { name };
-            match tls::create_identity(&url.host, name) {
+            match tls::authorize_identity(&url, name) {
                 Ok(path) => {
                     self.status = format!("Identity '{name}' saved to {}.", path.display());
                     self.start_fetch(Link::Gemini(url));
@@ -8749,12 +8914,14 @@ impl App {
                 }
             },
             Some(Link::Gemini(base)) => {
-                let path = base.path.split('?').next().unwrap_or("/").to_string();
-                let url = GeminiUrl {
-                    path: format!("{path}?{}", gemini::encode_query(query)),
-                    ..base
-                };
-                self.start_fetch(Link::Gemini(url));
+                match base.with_input(query, self.masked_input) {
+                    Ok(url) => self.start_fetch(Link::Gemini(url)),
+                    Err(error) => {
+                        self.status = error;
+                        self.notice = true;
+                    }
+                }
+                self.masked_input = false;
             }
             // A form field edit: living pages receive input/change in
             // the DOM; static pages store the value in Doc.forms.
@@ -9332,6 +9499,7 @@ mod tests {
             referrer: None,
             fetch_body: false,
             gopher: None,
+            gemini: None,
         }
     }
 
@@ -13299,6 +13467,73 @@ mod tests {
         assert_eq!(app.cursor, 5);
     }
 
+    #[tokio::test]
+    async fn gemini_sensitive_input_clears_on_cancel_mode_switch_and_submit() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        for code in [KeyCode::Esc, KeyCode::Tab, KeyCode::Enter] {
+            let mut app = super::App::new(None, 23);
+            app.last_inner = (80, 10);
+            let url = crate::gemini::GeminiUrl::new("127.0.0.9", 1, "/password");
+            app.on_gemini_response(crate::gemini::Response::new(url, 11, "Password".into()), 80);
+            app.input = "private value".into();
+            app.cursor = 13;
+            app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+                .await;
+            assert_eq!(app.input, "private value");
+            app.on_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await;
+            assert!(app.input.is_empty());
+            assert!(!app.masked_input);
+            assert!(!app.status.contains("private"));
+            assert!(app.active_history().up("").is_none());
+            app.retire_fetch("test complete");
+        }
+    }
+
+    #[test]
+    fn gemini_streaming_reading_controls_and_saved_source_survive_stop() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 10);
+        let url = crate::gemini::GeminiUrl::new("example.org", 1965, "/document");
+        let mut response = crate::gemini::Response::new(url, 20, "text/gemini".into());
+        response.body = b"# First\n=> /a A long link label that spans many rows\n```chart\nABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\n```\n## Second\n".to_vec();
+        response.finished = false;
+        app.on_gemini_response(response.clone(), 40);
+        app.reply_view_action("alt", Some(true));
+        app.on_gemini_response(response, 40);
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .gemini
+                .as_ref()
+                .unwrap()
+                .show_alt
+        );
+        app.gemini_heading("2");
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.lines[app.browser.as_ref().unwrap().scroll].text,
+            "Second"
+        );
+        app.retire_fetch("Incomplete reply: stopped");
+        let doc = &app.browser.as_ref().unwrap().doc;
+        assert!(!doc.gemini.as_ref().unwrap().controls.loading);
+        assert!(
+            doc.gemini
+                .as_ref()
+                .unwrap()
+                .controls
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("stopped")
+        );
+        let source = doc.raw.clone();
+        app.save_whois(None);
+        assert_eq!(app.file_dialog.unwrap().offer.body, source);
+    }
+
     #[test]
     fn gemini_sensitive_input_masks_the_prompt() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -13312,6 +13547,11 @@ mod tests {
                 meta: String::from("Password"),
                 body: Vec::new(),
                 identity: false,
+                identity_configured: false,
+                finished: true,
+                notice: None,
+                download: None,
+                view: Default::default(),
             },
             80,
         );
@@ -13342,6 +13582,11 @@ mod tests {
                 meta: String::from("Search term"),
                 body: Vec::new(),
                 identity: false,
+                identity_configured: false,
+                finished: true,
+                notice: None,
+                download: None,
+                view: Default::default(),
             },
             80,
         );
@@ -15381,6 +15626,11 @@ mod tests {
                 meta: String::from("Certificate required"),
                 body: Vec::new(),
                 identity: false,
+                identity_configured: false,
+                finished: true,
+                notice: None,
+                download: None,
+                view: Default::default(),
             },
             80,
         );

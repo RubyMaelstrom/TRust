@@ -1283,6 +1283,7 @@ struct DesktopApp {
     bookmarks: Option<trust::bookmarks::Worker>,
     bookmark_filter: String,
     gopher_query: Option<trust::gopher::GopherUrl>,
+    gemini_input: bool,
     pending_page_keys: VecDeque<PendingPageKey>,
     keyboard_target: Option<PageHit>,
     pressed_hit: Option<PageHit>,
@@ -1622,6 +1623,7 @@ impl DesktopApp {
             bookmarks: None,
             bookmark_filter: String::new(),
             gopher_query: None,
+            gemini_input: false,
             pending_page_keys: VecDeque::new(),
             keyboard_target: None,
             pressed_hit: None,
@@ -2166,6 +2168,16 @@ impl DesktopApp {
         if self.focus == FocusTarget::Download && self.browser.download_offer().is_none() {
             self.set_focus(FocusTarget::Page);
         }
+        if self.browser.gemini_prompt().is_some() && !self.gemini_input {
+            self.gopher_query = None;
+            self.gemini_input = true;
+            self.command.set_text("");
+            self.set_focus(FocusTarget::Command);
+        } else if self.browser.gemini_prompt().is_none() && self.gemini_input {
+            self.gemini_input = false;
+            self.command.set_text("");
+            self.set_focus(FocusTarget::Page);
+        }
         self.apply_page_key_defaults();
         outcome
     }
@@ -2175,6 +2187,10 @@ impl DesktopApp {
             && (url.needs_query() || url.item_type == '8' || url.is_download())
         {
             self.activate_link(Link::Gopher(url));
+            return;
+        }
+        if address.eq_ignore_ascii_case("about:gemini") {
+            self.open_internal_page("about:gemini", trust::gemini::HELP.as_bytes().to_vec());
             return;
         }
         if address.eq_ignore_ascii_case("about:bookmarks") {
@@ -2300,13 +2316,17 @@ impl DesktopApp {
             .set_width((self.metrics.css.width - 160.0).max(1.0));
         let find =
             (self.focus == FocusTarget::Find).then(|| Self::editor_visual(&mut self.find, false));
-        let command = (self.focus == FocusTarget::Command)
-            .then(|| Self::editor_visual(&mut self.command, false));
+        let command = (self.focus == FocusTarget::Command).then(|| {
+            Self::editor_visual(
+                &mut self.command,
+                self.browser.gemini_prompt().is_some_and(|p| p.sensitive),
+            )
+        });
         let download = (self.focus == FocusTarget::Download)
             .then(|| {
                 self.browser.download_offer().map(|offer| DownloadVisual {
                     summary: offer.summary(),
-                    origin: offer.url.origin().ascii_serialization(),
+                    origin: offer.url[..url::Position::BeforePath].to_string(),
                     selected: self.file_action_selected,
                 })
             })
@@ -2339,6 +2359,16 @@ impl DesktopApp {
     }
 
     fn status_label(&self, snapshot: &trust::core::BrowserSnapshot) -> String {
+        if let Some(prompt) = self.browser.gemini_prompt() {
+            return if prompt.sensitive {
+                "GEMINI:SECRET"
+            } else if prompt.certificate {
+                "GEMINI:IDENTITY"
+            } else {
+                "GEMINI:INPUT"
+            }
+            .into();
+        }
         if self.terminal.is_some() {
             return if snapshot.loading {
                 String::from("LINK:OPENING")
@@ -3102,7 +3132,19 @@ impl DesktopApp {
         });
     }
 
+    fn clear_gemini_input(&mut self) {
+        if self.gemini_input {
+            self.gemini_input = false;
+            self.command.set_text("");
+            self.composing = false;
+            self.browser.cancel_gemini_prompt();
+        }
+    }
+
     fn set_focus(&mut self, focus: FocusTarget) {
+        if focus != FocusTarget::Command {
+            self.clear_gemini_input();
+        }
         let old_viewport = self.browser_viewport();
         self.focus = focus;
         if focus != FocusTarget::Page {
@@ -3131,7 +3173,9 @@ impl DesktopApp {
                 .is_some_and(|terminal| !terminal.char_mode()),
         };
         if let Some(window) = &self.window {
-            window.set_ime_allowed(editable);
+            window.set_ime_allowed(
+                editable && !self.browser.gemini_prompt().is_some_and(|p| p.sensitive),
+            );
         }
         let new_viewport = self.browser_viewport();
         if new_viewport != old_viewport {
@@ -3142,6 +3186,7 @@ impl DesktopApp {
     }
 
     fn open_command(&mut self, replace_with_address: bool) {
+        self.clear_gemini_input();
         self.gopher_query = None;
         if self.focus == FocusTarget::Download {
             self.browser.dismiss_download_offer();
@@ -3382,6 +3427,9 @@ impl DesktopApp {
     }
 
     fn copy(&mut self, cut: bool) {
+        if self.gemini_input && self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
+            return;
+        }
         let selected = self
             .active_editor_mut()
             .and_then(|editor| editor.selected_text().map(str::to_string))
@@ -3445,7 +3493,8 @@ impl DesktopApp {
                 }
                 if (cache.document.registration_section().is_some()
                     || cache.document.dict.is_some()
-                    || cache.document.gopher.is_some())
+                    || cache.document.gopher.is_some()
+                    || cache.document.gemini.is_some())
                     && key.eq_ignore_ascii_case("s")
                 {
                     self.browser.offer_whois_export(None);
@@ -3839,6 +3888,9 @@ impl DesktopApp {
                     return;
                 }
                 (FocusTarget::Command, Key::ArrowUp | Key::ArrowDown) => {
+                    if self.gemini_input {
+                        return;
+                    }
                     let current = self.command.text();
                     let recalled = if input.key == Key::ArrowUp {
                         self.command_history.up(&current)
@@ -4195,8 +4247,52 @@ impl DesktopApp {
         self.request_redraw();
     }
 
+    fn gemini_heading(&mut self, which: &str) {
+        self.browser.reply_view_action("outline", Some(false));
+        let Some(page) = self.browser.current_page() else {
+            return;
+        };
+        let Some(doc) = trust::render::documents::document(page) else {
+            return;
+        };
+        let Some(view) = &doc.gemini else {
+            self.browser
+                .set_status("Heading navigation applies to Gemini.");
+            return;
+        };
+        let layout =
+            trust::render::documents::paint_doc_selected(&doc, self.browser_viewport().width, None);
+        let current = layout
+            .lines
+            .iter()
+            .rposition(|l| l.rect.y <= self.browser.interaction().scroll.y + 1.0)
+            .unwrap_or(0);
+        match trust::gemini::heading_row(view, current, which) {
+            Ok(row) => {
+                if let Some(line) = layout.lines.get(row) {
+                    self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
+                        0.0,
+                        line.rect.y,
+                    )));
+                }
+            }
+            Err(error) => self.browser.set_status(error),
+        }
+        self.request_redraw();
+    }
+
     fn execute_command(&mut self) {
         let line = self.command.text();
+        if self.gemini_input {
+            self.command.set_text("");
+            self.browser.submit_gemini_prompt(&line);
+            if self.browser.gemini_prompt().is_none() {
+                self.gemini_input = false;
+                self.set_focus(FocusTarget::Page);
+            }
+            self.request_redraw();
+            return;
+        }
         if let Some(base) = self.gopher_query.take() {
             match base.with_query(&line) {
                 Ok(url) => {
@@ -4341,6 +4437,39 @@ impl DesktopApp {
                     "about:help",
                     trust::command::HELP_PAGE.as_bytes().to_vec(),
                 );
+            }
+            "gemini-help" => {
+                self.close_command();
+                self.open_internal_page("about:gemini", trust::gemini::HELP.as_bytes().to_vec());
+            }
+            "outline" => {
+                self.close_command();
+                self.browser.reply_view_action("outline", None);
+                self.request_redraw();
+            }
+            "heading" => {
+                self.close_command();
+                self.gemini_heading(parts.next().unwrap_or("next"));
+            }
+            "gemini-width" => {
+                self.close_command();
+                self.browser
+                    .gemini_width(parts.next().and_then(|v| v.parse().ok()).unwrap_or(0));
+                self.request_redraw();
+            }
+            "gemini-alt" => {
+                let value = match parts.next() {
+                    None => None,
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => {
+                        self.browser.set_status("usage: gemini-alt [on|off]");
+                        return;
+                    }
+                };
+                self.close_command();
+                self.browser.reply_view_action("alt", value);
+                self.request_redraw();
             }
             "gopher-info" => match (parts.next(), parts.next()) {
                 (None, None) => self.gopher_information(false),
@@ -5834,8 +5963,14 @@ impl DesktopApp {
                 content_viewport: viewport,
                 scroll,
                 keyboard_node: self.keyboard_target.as_ref().map(|target| target.node),
-                command_value: (self.focus == FocusTarget::Command)
-                    .then(|| self.command.raw_text()),
+                command_prompt: self.browser.gemini_prompt(),
+                command_value: (self.focus == FocusTarget::Command).then(|| {
+                    if self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
+                        "Sensitive Gemini input"
+                    } else {
+                        self.command.raw_text()
+                    }
+                }),
                 find_value: (self.focus == FocusTarget::Find).then(|| self.find.raw_text()),
             },
             initial,
@@ -5849,7 +5984,13 @@ impl DesktopApp {
     fn handle_access_action(&mut self, request: ActionRequest) {
         match request.target_node {
             ACCESS_COMMAND => match request.action {
-                AccessAction::Focus | AccessAction::Click => self.open_command(false),
+                AccessAction::Focus | AccessAction::Click => {
+                    if self.gemini_input {
+                        self.set_focus(FocusTarget::Command);
+                    } else {
+                        self.open_command(false);
+                    }
+                }
                 AccessAction::SetValue | AccessAction::ReplaceSelectedText => {
                     if let Some(ActionData::Value(value)) = request.data {
                         self.command.set_text(&value);
@@ -6402,6 +6543,7 @@ struct AccessibilityFrame<'a> {
     scroll: CssPoint,
     keyboard_node: Option<usize>,
     command_value: Option<&'a str>,
+    command_prompt: Option<&'a trust::gemini::Prompt>,
     find_value: Option<&'a str>,
 }
 
@@ -6414,6 +6556,7 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         scroll,
         keyboard_node,
         command_value,
+        command_prompt,
         find_value,
     } = frame;
     let mut nodes = Vec::new();
@@ -6430,9 +6573,17 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
     );
     let mut children = Vec::new();
     if let Some(value) = command_value {
-        let mut command = AccessNode::new(AccessRole::TextInput);
-        command.set_label("TRust COMMAND");
-        command.set_value(value);
+        let mut command = AccessNode::new(if command_prompt.is_some_and(|p| p.sensitive) {
+            AccessRole::PasswordInput
+        } else {
+            AccessRole::TextInput
+        });
+        command.set_label(command_prompt.map_or_else(|| "TRust COMMAND".into(), |p| p.label()));
+        command.set_value(if command_prompt.is_some_and(|p| p.sensitive) {
+            ""
+        } else {
+            value
+        });
         let input = CommandPanelGeometry::new(metrics.css).input;
         command.set_bounds(AccessRect::new(
             f64::from(input.x),
@@ -7330,6 +7481,46 @@ mod tests {
     }
 
     #[test]
+    fn gemini_sensitive_prompt_masks_visual_and_accessibility_values() {
+        let prompt = trust::gemini::Prompt {
+            url: trust::gemini::GeminiUrl::new("example.org", 1965, "/login"),
+            meta: "Password".into(),
+            certificate: false,
+            sensitive: true,
+        };
+        let mut editor = TextEditor::new("private value", &TextStyle::default(), 640.0, false);
+        let visual = DesktopApp::editor_visual(&mut editor, true);
+        assert_eq!(visual.text, "•".repeat(13));
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::new(1.0));
+        let update = build_accessibility_update(
+            AccessibilityFrame {
+                metrics,
+                page: None,
+                focus: FocusTarget::Command,
+                content_viewport: CssRect::new(0.0, 0.0, 800.0, 600.0),
+                scroll: CssPoint::default(),
+                keyboard_node: None,
+                command_value: Some("private value"),
+                command_prompt: Some(&prompt),
+                find_value: None,
+            },
+            true,
+        );
+        let node = &update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == ACCESS_COMMAND)
+            .unwrap()
+            .1;
+        assert_eq!(node.role(), AccessRole::PasswordInput);
+        assert_eq!(node.value(), Some(""));
+        assert_eq!(node.label(), Some("Password"));
+        editor.set_text("");
+        assert!(editor.text().is_empty());
+    }
+
+    #[test]
     fn command_accessibility_bounds_match_the_visible_editor_at_device_scale() {
         let metrics =
             ViewportMetrics::from_physical(PhysicalSize::new(1200, 800), ScaleFactor::new(1.25));
@@ -7342,6 +7533,7 @@ mod tests {
                 scroll: CssPoint::default(),
                 keyboard_node: None,
                 command_value: Some("https://example.test/"),
+                command_prompt: None,
                 find_value: None,
             },
             true,
