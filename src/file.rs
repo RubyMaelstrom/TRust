@@ -224,6 +224,7 @@ fn mime_type_for_path(path: &Path) -> Option<&'static str> {
     Some(match extension.as_str() {
         "html" | "htm" => "text/html",
         "xhtml" => "application/xhtml+xml",
+        "gmi" | "gemini" | "gemtext" | "gmni" => "text/gemini",
         "css" => "text/css",
         "js" | "mjs" | "cjs" => "text/javascript",
         "json" | "map" => "application/json",
@@ -518,6 +519,24 @@ mod tests {
                 assert!(result.is_err(), "{mode:?} must not expose a local file");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn gemini_local_preview_resolves_relative_files_and_preserves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.gmi");
+        let source = b"\xef\xbb\xbf# Local preview\n=> child.gmi Child\n";
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(mime_type_for_path(&path), Some("text/gemini"));
+        let url = Url::from_file_path(&path).unwrap();
+        let doc = crate::http::parse(&url, "text/gemini", source, 80, 24, &Default::default());
+        assert_eq!(doc.lines[0].text, "Local preview");
+        assert_eq!(doc.raw, source);
+        assert_eq!(
+            doc.lines[1].link,
+            Some(crate::doc::Link::Http(url.join("child.gmi").unwrap()))
+        );
+        assert!(doc.gemini.is_some());
     }
 
     #[tokio::test]

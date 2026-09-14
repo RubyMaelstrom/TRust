@@ -313,22 +313,146 @@ fn load_identity(host: &str) -> Result<Option<Identity>, String> {
     Ok(Some((certs, key)))
 }
 
-/// TLS for Gemini: unpinned server certificates plus the host's client identity
-/// when one is on file. The bool reports whether one was presented.
-pub fn gemini_connector(host: &str, _port: u16) -> Result<(TlsConnector, bool), String> {
-    let Some((certs, key)) = load_identity(host)? else {
-        return Ok((unverified_connector(), false));
+/// Gemini 0.24.1, Client certificates: consent is scoped to an origin and
+/// path subtree. Legacy PEM files remain intact and require an explicit first
+/// authorization; possession of a key is not consent to disclose it everywhere.
+pub fn identity_authorized(url: &crate::gemini::GeminiUrl) -> bool {
+    let Some(path) = identity_path(&url.host) else {
+        return false;
+    };
+    let scopes_path = path.with_extension("scopes");
+    if !std::fs::metadata(&scopes_path).is_ok_and(|m| m.len() <= 1024 * 1024) {
+        return false;
+    }
+    let Ok(scopes) = std::fs::read_to_string(scopes_path) else {
+        return false;
+    };
+    scopes
+        .lines()
+        .filter_map(crate::gemini::GeminiUrl::parse)
+        .any(|scope| {
+            scope.host == url.host
+                && scope.port == url.port
+                && scope_contains(&scope.path, &url.path)
+        })
+}
+
+fn scope_contains(scope: &str, path: &str) -> bool {
+    // Conservative decoding prevents an encoded traversal from widening consent.
+    // Compare both URI paths and decoded paths; ambiguous escapes never grant it.
+    fn canonical(path: &str) -> Option<String> {
+        let mut bytes = Vec::new();
+        let mut iter = path.bytes();
+        while let Some(byte) = iter.next() {
+            bytes.push(if byte == b'%' {
+                ((iter.next()? as char).to_digit(16)? * 16 + (iter.next()? as char).to_digit(16)?)
+                    as u8
+            } else {
+                byte
+            });
+        }
+        let decoded = String::from_utf8(bytes).ok()?;
+        if decoded.contains(['%', '\\']) || decoded.chars().any(char::is_control) {
+            return None;
+        }
+        Some(crate::gemini::normalize_path(&decoded))
+    }
+    fn contains(scope: &str, path: &str) -> bool {
+        path == scope || path.starts_with(&format!("{}/", scope.trim_end_matches('/')))
+    }
+    if !contains(
+        &crate::gemini::normalize_path(scope),
+        &crate::gemini::normalize_path(path),
+    ) {
+        return false;
+    }
+    let (Some(scope), Some(path)) = (canonical(scope), canonical(path)) else {
+        return false;
+    };
+    contains(&scope, &path)
+}
+
+/// Reuse an existing identity, or mint one, and explicitly authorize this subtree.
+pub fn authorize_identity(url: &crate::gemini::GeminiUrl, name: &str) -> Result<PathBuf, String> {
+    url.request()?;
+    if !scope_contains(&url.path, &url.path) {
+        return Err("Cannot safely authorize this ambiguous Gemini path.".into());
+    }
+    let path = if load_identity(&url.host)?.is_some() {
+        identity_path(&url.host).ok_or("no home directory")?
+    } else {
+        create_identity(&url.host, name)?
+    };
+    if !identity_authorized(url) {
+        if std::fs::metadata(path.with_extension("scopes"))
+            .is_ok_and(|m| m.len() > 1024 * 1024 - 2048)
+        {
+            return Err("Gemini identity scope file exceeds its 1 MiB limit.".into());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        let scope = crate::gemini::GeminiUrl::new(&url.host, url.port, &url.path);
+        let mut file = options
+            .open(path.with_extension("scopes"))
+            .map_err(|e| e.to_string())?;
+        writeln!(file, "{scope}").map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+    }
+    Ok(path)
+}
+
+#[derive(Debug)]
+struct PresentedIdentity {
+    inner: Arc<dyn tokio_rustls::rustls::client::ResolvesClientCert>,
+    presented: Arc<std::sync::atomic::AtomicBool>,
+}
+impl tokio_rustls::rustls::client::ResolvesClientCert for PresentedIdentity {
+    fn resolve(
+        &self,
+        hints: &[&[u8]],
+        schemes: &[SignatureScheme],
+    ) -> Option<Arc<tokio_rustls::rustls::sign::CertifiedKey>> {
+        let key = self.inner.resolve(hints, schemes);
+        self.presented
+            .store(key.is_some(), std::sync::atomic::Ordering::Relaxed);
+        key
+    }
+    fn has_certs(&self) -> bool {
+        self.inner.has_certs()
+    }
+}
+
+/// The flag becomes true only when TLS actually selects a client certificate.
+pub fn gemini_connector(
+    url: &crate::gemini::GeminiUrl,
+) -> Result<(TlsConnector, Arc<std::sync::atomic::AtomicBool>), String> {
+    let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if !identity_authorized(url) {
+        return Ok((unverified_connector(), presented));
+    }
+    let Some((certs, key)) = load_identity(&url.host)? else {
+        return Ok((unverified_connector(), presented));
     };
     let provider = ensure_provider();
     let schemes = provider
         .signature_verification_algorithms
         .supported_schemes();
-    let config = ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(ServerVerifier { pin: None, schemes }))
         .with_client_auth_cert(certs, key)
         .map_err(|e| format!("client certificate: {e}"))?;
-    Ok((TlsConnector::from(Arc::new(config)), true))
+    config.client_auth_cert_resolver = Arc::new(PresentedIdentity {
+        inner: config.client_auth_cert_resolver.clone(),
+        presented: presented.clone(),
+    });
+    Ok((TlsConnector::from(Arc::new(config)), presented))
 }
 
 /// Mint a self-signed client identity (CN = `name`) for a host and
@@ -456,9 +580,13 @@ pub(crate) mod tests {
             ("Gophers", unverified_connector()),
             (
                 "Gemini",
-                gemini_connector("accept-certificate.invalid", 1965)
-                    .unwrap()
-                    .0,
+                gemini_connector(&crate::gemini::GeminiUrl::new(
+                    "accept-certificate.invalid",
+                    1965,
+                    "/",
+                ))
+                .unwrap()
+                .0,
             ),
         ] {
             for version in [&version::TLS12, &version::TLS13] {
@@ -598,8 +726,9 @@ pub(crate) mod tests {
         }
 
         // Nothing on file: anonymous connection.
-        let (_, presented) = gemini_connector("capsule.test", 1965).unwrap();
-        assert!(!presented);
+        let (_, presented) =
+            gemini_connector(&crate::gemini::GeminiUrl::new("capsule.test", 1965, "/")).unwrap();
+        assert!(!presented.load(std::sync::atomic::Ordering::Relaxed));
 
         // Mint one — private, both blocks present — and it gets used.
         let path = create_identity("capsule.test", "ruby").unwrap();
@@ -611,8 +740,29 @@ pub(crate) mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "key file is owner-only");
         }
-        let (_, presented) = gemini_connector("capsule.test", 1965).unwrap();
-        assert!(presented);
+        let (_, presented) =
+            gemini_connector(&crate::gemini::GeminiUrl::new("capsule.test", 1965, "/")).unwrap();
+        assert!(!presented.load(std::sync::atomic::Ordering::Relaxed));
+        let scope = crate::gemini::GeminiUrl::new("capsule.test", 1965, "/account");
+        authorize_identity(&scope, "ignored").unwrap();
+        assert!(identity_authorized(&scope));
+        assert!(identity_authorized(&crate::gemini::GeminiUrl::new(
+            "capsule.test",
+            1965,
+            "/account/edit"
+        )));
+        for (port, path) in [
+            (1966, "/account"),
+            (1965, "/accounts"),
+            (1965, "/account/%2e%2e/private"),
+        ] {
+            assert!(!identity_authorized(&crate::gemini::GeminiUrl::new(
+                "capsule.test",
+                port,
+                path
+            )));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pem);
 
         // Never overwrite: the capsule pinned this certificate.
         assert!(create_identity("capsule.test", "someone-else").is_err());
@@ -621,12 +771,23 @@ pub(crate) mod tests {
         let key_start = pem.find("-----BEGIN PRIVATE KEY-----").unwrap();
         let reversed = format!("{}{}", &pem[key_start..], &pem[..key_start]);
         std::fs::write(dir.join("reversed.test.pem"), reversed).unwrap();
-        let (_, presented) = gemini_connector("reversed.test", 1965).unwrap();
-        assert!(presented, "key-before-cert PEM loads fine");
+        let (_, presented) =
+            gemini_connector(&crate::gemini::GeminiUrl::new("reversed.test", 1965, "/")).unwrap();
+        assert!(!presented.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            load_identity("reversed.test").unwrap().is_some(),
+            "key-before-cert PEM loads fine"
+        );
 
         // A broken file is an error, never a silent anonymous visit.
         std::fs::write(dir.join("broken.test.pem"), "not pem at all").unwrap();
-        assert!(gemini_connector("broken.test", 1965).is_err());
+        assert!(
+            authorize_identity(
+                &crate::gemini::GeminiUrl::new("broken.test", 1965, "/"),
+                "ruby"
+            )
+            .is_err()
+        );
     }
 
     #[test]

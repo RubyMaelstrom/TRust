@@ -326,6 +326,16 @@ Use gophers:// for TLS (default port 70); same-server links retain TLS.
 Gophers and Gemini accept server certificates, including replacements,
 without pinning or server-identity checks. Gemini client identities still work.
 
+## Gemini
+
+Gemini text arrives progressively. W toggles ordinary text wrapping;
+Shift-Left/Right pans preformatted blocks, and S saves received source.
+Use gemini-width 20..240, outline, heading next|previous|N, and gemini-alt
+[on|off] to adjust reading. Local .gmi files open as Gemtext previews.
+Gemini prompts submit with Enter and cancel with Escape. Sensitive input is
+masked and excluded from command history and stored page addresses.
+=> about:gemini Gemini guide (also gemini-help)
+
 ## Bookmarks
 
 Ctrl-B saves the current destination; Alt-B opens about:bookmarks.

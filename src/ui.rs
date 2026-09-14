@@ -120,15 +120,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let doc = Paragraph::new(browser_lines(g, inner.height as usize, app.find.as_ref()))
                 .scroll((
                     0,
-                    g.doc
-                        .text_view()
-                        .map_or(0, |view| view.horizontal.min(u16::MAX as usize) as u16),
+                    g.doc.text_view().map_or(0, |view| {
+                        if g.doc.gemini.is_some() && view.wrap {
+                            0
+                        } else {
+                            view.horizontal.min(u16::MAX as usize) as u16
+                        }
+                    }),
                 ));
-            if let Some(view) = &g.doc.gopher {
+            if g.doc.gopher.is_some() || g.doc.gemini.is_some() {
                 // Equal horizontal margins (CSS 2 §10.3.3 #blockwidth), with
                 // left-aligned lines. Keep last_inner as the full viewport:
                 // wrapping and subsequent HTTP/Telnet navigation still use it.
-                let width = view.reading_columns(inner.width as usize) as u16;
+                let width = g.doc.gopher.as_ref().map_or_else(
+                    || {
+                        g.doc
+                            .gemini
+                            .as_ref()
+                            .unwrap()
+                            .reading_columns
+                            .min(inner.width as usize)
+                    },
+                    |view| view.reading_columns(inner.width as usize),
+                ) as u16;
                 let content = Rect::new(
                     inner.x + (inner.width - width) / 2,
                     inner.y,
@@ -427,6 +441,25 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
                 style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
             let ranges = find_ranges(find, FindLoc::Line(g.scroll + i));
+            if line.kind == Kind::Pre
+                && let Some(view) = &g.doc.gemini
+                && view.controls.wrap
+                && view.controls.horizontal > 0
+            {
+                use unicode_segmentation::UnicodeSegmentation;
+                let mut column = 0;
+                let mut text = String::new();
+                for grapheme in line.text.graphemes(true) {
+                    let width = unicode_width::UnicodeWidthStr::width(grapheme);
+                    if column >= view.controls.horizontal {
+                        text.push_str(grapheme);
+                    } else if column + width > view.controls.horizontal {
+                        text.push_str(&" ".repeat(column + width - view.controls.horizontal));
+                    }
+                    column += width;
+                }
+                return Line::styled(text, style);
+            }
             if ranges.is_empty() {
                 Line::styled(line.text.as_str(), style)
             } else {

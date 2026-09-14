@@ -323,6 +323,7 @@ struct HistoryEntry {
     internal_source: Option<Vec<u8>>,
     dict_view: Option<crate::dict::SavedView>,
     gopher_page: Option<gopher::Page>,
+    gemini_page: Option<Box<gemini::Response>>,
     scroll: CssPoint,
 }
 
@@ -332,10 +333,11 @@ impl HistoryEntry {
             FetchedDocument::Dict(dict) => Some(dict.saved_view()),
             _ => None,
         };
-        let (internal_source, gopher_page) = match page.document {
-            FetchedDocument::Internal(source) => (Some(source), None),
-            FetchedDocument::Gopher(page) => (None, Some(page)),
-            _ => (None, None),
+        let (internal_source, gopher_page, gemini_page) = match page.document {
+            FetchedDocument::Internal(source) => (Some(source), None, None),
+            FetchedDocument::Gopher(page) => (None, Some(page), None),
+            FetchedDocument::Gemini(response) => (None, None, Some(response)),
+            _ => (None, None, None),
         };
         Self {
             target: page.target,
@@ -343,6 +345,7 @@ impl HistoryEntry {
             internal_source,
             dict_view,
             gopher_page,
+            gemini_page,
             scroll,
         }
     }
@@ -354,7 +357,7 @@ impl HistoryEntry {
 #[derive(Debug)]
 pub enum FetchedDocument {
     Gopher(crate::gopher::Page),
-    Gemini(gemini::Response),
+    Gemini(Box<gemini::Response>),
     Http(Box<http::Response>),
     OneShot(Vec<u8>),
     Finger(crate::finger::Page),
@@ -434,6 +437,16 @@ struct PendingNavigation {
 
 #[derive(Debug)]
 enum CoreEvent {
+    Gemini {
+        generation: u64,
+        response: Box<crate::gemini::Response>,
+    },
+    GeminiImage {
+        generation: u64,
+        url: gemini::GeminiUrl,
+        response: Box<http::Response>,
+        status: String,
+    },
     Gopher {
         generation: u64,
         reply: crate::text_reply::Reply,
@@ -552,6 +565,7 @@ pub struct BrowserController {
     pending_fragment: Option<String>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
+    gemini_prompt: Option<crate::gemini::Prompt>,
     storage: crate::js::WebStorage,
     external_address: Option<String>,
     generation: u64,
@@ -612,6 +626,7 @@ impl BrowserController {
             pending_fragment: None,
             external_media: VecDeque::new(),
             download_offer: None,
+            gemini_prompt: None,
             storage: Default::default(),
             external_address: None,
             generation: 0,
@@ -625,6 +640,27 @@ impl BrowserController {
             live_boundaries: Vec::new(),
             last_js_outcome: None,
         }
+    }
+
+    pub fn gemini_prompt(&self) -> Option<&crate::gemini::Prompt> {
+        self.gemini_prompt.as_ref()
+    }
+    pub fn cancel_gemini_prompt(&mut self) {
+        self.gemini_prompt = None;
+    }
+    pub fn submit_gemini_prompt(&mut self, text: &str) -> bool {
+        let Some(prompt) = self.gemini_prompt.take() else {
+            return false;
+        };
+        match prompt.submit(text) {
+            Ok(url) => self.begin_fetch(Link::Gemini(url), false, NavigationIntent::New),
+            Err(error) => {
+                self.status = error;
+                self.gemini_prompt = Some(prompt);
+            }
+        }
+        self.invalidation.request_redraw();
+        true
     }
 
     pub fn snapshot(&self) -> BrowserSnapshot {
@@ -834,6 +870,8 @@ impl BrowserController {
     }
 
     fn begin_internal_gemtext(&mut self, target: Link, source: Vec<u8>, intent: NavigationIntent) {
+        self.gemini_prompt = None;
+        self.download_offer = None;
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -1129,6 +1167,31 @@ impl BrowserController {
                         }
                     }
                 }
+                CoreEvent::GeminiImage {
+                    generation,
+                    url,
+                    response,
+                    status,
+                } => {
+                    if let Some(pending) = &mut self.pending
+                        && pending.generation == generation
+                    {
+                        pending.target = Link::Gemini(url);
+                    }
+                    if self.finish_fetch(generation, Ok(FetchedDocument::Http(response))) {
+                        if let Some(page) = &mut self.current {
+                            page.status = status.clone();
+                        }
+                        self.status = status;
+                        changed = true;
+                    }
+                }
+                CoreEvent::Gemini {
+                    generation,
+                    response,
+                } => {
+                    changed |= self.update_gemini(generation, *response);
+                }
                 CoreEvent::Gopher { generation, reply } => {
                     changed |= self.update_gopher(generation, reply);
                 }
@@ -1229,6 +1292,15 @@ impl BrowserController {
         let mut count = 0;
         for stack in [&mut self.back, &mut self.forward] {
             for entry in stack.iter_mut().rev() {
+                if let Some(response) = &entry.gemini_page {
+                    let size = response.body.capacity() + std::mem::size_of::<gemini::Response>();
+                    if count >= 32 || size > (8 * 1024 * 1024usize).saturating_sub(bytes) {
+                        entry.gemini_page = None;
+                    } else {
+                        bytes += size;
+                        count += 1;
+                    }
+                }
                 if let Some(page) = &entry.gopher_page {
                     let size = page.reply.body.capacity() + std::mem::size_of::<gopher::Page>();
                     if count >= 32 || size > (8 * 1024 * 1024usize).saturating_sub(bytes) {
@@ -1248,6 +1320,7 @@ impl BrowserController {
         } else {
             self.back.last()
         };
+        self.gemini_prompt = None;
         let Some(entry) = entry.cloned() else {
             self.status = if forward {
                 String::from("Nothing forward in history.")
@@ -1256,7 +1329,11 @@ impl BrowserController {
             };
             return true;
         };
-        if let Some(page) = entry.gopher_page {
+        if let Some(document) = entry
+            .gemini_page
+            .map(FetchedDocument::Gemini)
+            .or_else(|| entry.gopher_page.map(FetchedDocument::Gopher))
+        {
             if let Some(task) = self.task.take() {
                 task.abort();
             }
@@ -1277,7 +1354,7 @@ impl BrowserController {
                     NavigationIntent::Back
                 },
             });
-            self.finish_fetch(generation, Ok(FetchedDocument::Gopher(page)));
+            self.finish_fetch(generation, Ok(document));
             self.interaction.scroll = entry.scroll;
             return true;
         }
@@ -1306,6 +1383,7 @@ impl BrowserController {
     }
 
     fn begin_fetch(&mut self, target: Link, fallback_http: bool, intent: NavigationIntent) {
+        self.gemini_prompt = None;
         let target = if intent == NavigationIntent::Reload
             && let Some(page) = &self.current
             && let FetchedDocument::Rdap(rdap) = &page.document
@@ -1324,6 +1402,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.gemini_prompt = None;
         self.retire_query("Incomplete reply: request replaced");
         self.abort_declarative_refresh();
         self.drop_live_page();
@@ -1345,6 +1424,67 @@ impl BrowserController {
         let screen_position = self.screen_position;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
+            if let Link::Gemini(url) = &target {
+                let result = gemini::fetch_updates(url, |response| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(CoreEvent::Gemini {
+                            generation,
+                            response: Box::new(response),
+                        })
+                        .await
+                        .is_ok()
+                    }
+                })
+                .await;
+                let event = match result {
+                    Ok(response)
+                        if response.download.is_none()
+                            && (20..30).contains(&response.status)
+                            && response.media_type().is_ok_and(|m| m.is_image()) =>
+                    {
+                        let status = response.status_text();
+                        let final_url = response.url.public_url();
+                        match gemini::image_response(response) {
+                            Ok(response) => {
+                                let size = (
+                                    viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
+                                    viewport.height.round().clamp(1.0, u16::MAX as f32) as u16,
+                                );
+                                let response = http::execute_js_for_window(
+                                    response,
+                                    size,
+                                    (1, 1),
+                                    device_pixel_ratio,
+                                    screen_position,
+                                    storage,
+                                )
+                                .await;
+                                CoreEvent::GeminiImage {
+                                    generation,
+                                    url: final_url,
+                                    response: Box::new(response),
+                                    status,
+                                }
+                            }
+                            Err(error) => CoreEvent::FetchFinished {
+                                generation,
+                                result: Err(error),
+                            },
+                        }
+                    }
+                    Ok(response) => CoreEvent::Gemini {
+                        generation,
+                        response: Box::new(response),
+                    },
+                    Err(error) => CoreEvent::FetchFinished {
+                        generation,
+                        result: Err(error),
+                    },
+                };
+                let _ = tx.send(event).await;
+                return;
+            }
             if let Link::Gopher(url) = &target
                 && url.is_text()
                 && !url.is_html()
@@ -1465,6 +1605,7 @@ impl BrowserController {
             if let Some(task) = self.task.take() {
                 task.abort();
             }
+            self.gemini_prompt = None;
             self.retire_query("Incomplete reply: request replaced");
             self.render_is_final = self.live_page.is_none();
             // Ignore a completion already queued by the superseded fetch.
@@ -1526,6 +1667,10 @@ impl BrowserController {
     fn retire_query(&mut self, reason: &str) {
         if let Some(page) = &mut self.current {
             match &mut page.document {
+                FetchedDocument::Gemini(response) if !response.finished => {
+                    response.finished = true;
+                    response.notice = Some(reason.into());
+                }
                 FetchedDocument::Gopher(gopher) if !gopher.reply.finished => {
                     gopher.reply.finished = true;
                     gopher.reply.notice = Some(reason.to_string());
@@ -1540,6 +1685,25 @@ impl BrowserController {
             }
             page.revision = page.revision.wrapping_add(1);
         }
+    }
+
+    pub fn gemini_width(&mut self, columns: usize) -> bool {
+        if !(20..=240).contains(&columns) {
+            self.status = "usage: gemini-width 20..240".into();
+            return true;
+        }
+        let Some(page) = &mut self.current else {
+            return false;
+        };
+        let FetchedDocument::Gemini(response) = &mut page.document else {
+            return false;
+        };
+        response.view.reading_columns = columns;
+        page.revision = page.revision.wrapping_add(1);
+        self.interaction.scroll.x = 0.0;
+        self.status = format!("Gemini reading width: {columns} columns.");
+        self.invalidation.request_redraw();
+        true
     }
 
     pub fn gopher_encoding(&mut self) -> bool {
@@ -1573,6 +1737,10 @@ impl BrowserController {
             return false;
         };
         let (result, wrap) = match &mut page.document {
+            FetchedDocument::Gemini(response) => (
+                gemini::view_action(&mut response.view, action, enabled),
+                response.view.controls.wrap,
+            ),
             FetchedDocument::Gopher(gopher) => (
                 crate::text_reply::view_action(&mut gopher.view.controls, action, enabled, false),
                 gopher.view.controls.wrap,
@@ -1604,6 +1772,33 @@ impl BrowserController {
         let Some(page) = &self.current else {
             return false;
         };
+        if let FetchedDocument::Http(response) = &page.document
+            && gemini::MediaType::parse(&response.content_type)
+                .is_ok_and(|m| m.essence == "text/gemini")
+            && server.is_none()
+        {
+            self.download_offer = Some(crate::download::DownloadOffer::from_bytes(
+                response.url.clone(),
+                "gemini-source.gmi".into(),
+                response.body.clone(),
+            ));
+            self.status = "Save received Gemtext source".into();
+            self.invalidation.request_redraw();
+            return true;
+        }
+        if let FetchedDocument::Gemini(response) = &page.document {
+            if server.is_none() {
+                match gemini::source_offer(&response.document(80)) {
+                    Ok(offer) => {
+                        self.download_offer = Some(offer);
+                        self.status = "Save received Gemini source".into();
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            self.invalidation.request_redraw();
+            return true;
+        }
         if let (FetchedDocument::Gopher(gopher), Link::Gopher(url)) = (&page.document, &page.target)
         {
             if server.is_none() {
@@ -1760,6 +1955,74 @@ impl BrowserController {
         true
     }
 
+    fn update_gemini(&mut self, generation: u64, mut response: gemini::Response) -> bool {
+        let Some(mut pending) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.generation == generation)
+            .cloned()
+        else {
+            return false;
+        };
+        if let Some(offer) = response.download.take() {
+            self.pending = None;
+            self.task = None;
+            self.render_is_final = true;
+            self.status = format!(
+                "Gemini file · {}{}",
+                offer.summary(),
+                response
+                    .notice
+                    .as_ref()
+                    .map_or(String::new(), |note| format!(" · {note}"))
+            );
+            self.download_offer = Some(offer);
+            return true;
+        }
+        if let Some(prompt) = gemini::Prompt::from_response(&response) {
+            self.pending = None;
+            self.task = None;
+            self.render_is_final = true;
+            self.status = prompt.label();
+            self.gemini_prompt = Some(prompt);
+            return true;
+        }
+        pending.target = Link::Gemini(response.url.public_url());
+        let finished = response.finished;
+        if self.document_generation == generation
+            && let Some(page) = &mut self.current
+            && let FetchedDocument::Gemini(old) = &page.document
+        {
+            response.view = old.view.clone();
+            page.document = FetchedDocument::Gemini(Box::new(response));
+            page.status = fetched_status(&page.target, &page.document);
+            self.status = page.status.clone();
+            page.revision = page.revision.wrapping_add(1);
+        } else {
+            if pending.intent == NavigationIntent::Reload
+                && let Some(page) = &self.current
+                && page.target == pending.target
+                && let FetchedDocument::Gemini(old) = &page.document
+            {
+                response.view = old.view.clone();
+            }
+            let task = self.task.take();
+            let scroll = self.interaction.scroll;
+            self.finish_fetch(generation, Ok(FetchedDocument::Gemini(Box::new(response))));
+            if pending.intent == NavigationIntent::Reload {
+                self.interaction.scroll = scroll;
+            }
+            self.task = task;
+            self.pending = Some(pending);
+        }
+        self.render_is_final = finished;
+        if finished {
+            self.pending = None;
+            self.task = None;
+        }
+        true
+    }
+
     fn update_gopher(&mut self, generation: u64, reply: crate::text_reply::Reply) -> bool {
         let Some(pending) = self
             .pending
@@ -1865,6 +2128,9 @@ impl BrowserController {
         self.task = None;
         match result {
             Ok(mut document) => {
+                if let FetchedDocument::Gemini(response) = &document {
+                    pending.target = Link::Gemini(response.url.public_url());
+                }
                 if let FetchedDocument::Dict(dict) = &mut document {
                     let entry = match pending.intent {
                         NavigationIntent::Back => self.back.last(),
@@ -1970,6 +2236,10 @@ impl BrowserController {
     }
 
     fn stop(&mut self) -> bool {
+        if self.gemini_prompt.take().is_some() {
+            self.status = "Gemini input cancelled".into();
+            return true;
+        }
         let pending = self.pending.take();
         let had_live_page = self.live_page.is_some() || self.live_task.is_some();
         let had_refresh = self.declarative_refresh_task.is_some();
@@ -2490,7 +2760,9 @@ pub async fn fetch_protocol(
                 .map(|r| FetchedDocument::Http(Box::new(r)))
         }
         Link::Gopher(url) => gopher::fetch(url).await.map(FetchedDocument::Gopher),
-        Link::Gemini(url) => gemini::fetch(url).await.map(FetchedDocument::Gemini),
+        Link::Gemini(url) => gemini::fetch(url)
+            .await
+            .map(|response| FetchedDocument::Gemini(Box::new(response))),
         Link::Dict(url) => crate::dict::fetch(url).await.map(|reply| {
             FetchedDocument::Dict(Box::new(crate::dict::Page::new(url.clone(), reply)))
         }),
@@ -2702,12 +2974,7 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
                 format!("{} — HTTP {} ({media})", response.url, response.status)
             }
         }
-        FetchedDocument::Gemini(response) => {
-            format!(
-                "{} — Gemini {} {}",
-                response.url, response.status, response.meta
-            )
-        }
+        FetchedDocument::Gemini(response) => response.status_text(),
         FetchedDocument::Gopher(page) => match target {
             Link::Gopher(url) => gopher::status(url, &page.reply),
             _ => format!("{target} — {} bytes", page.reply.body.len()),
@@ -2807,11 +3074,7 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
             false,
         )),
         Some(1965) => Ok((
-            Link::Gemini(gemini::GeminiUrl {
-                host: host.to_string(),
-                port: 1965,
-                path: String::from("/"),
-            }),
+            Link::Gemini(crate::gemini::GeminiUrl::new(host, 1965, "/")),
             false,
         )),
         Some(79) => Ok((
@@ -4074,6 +4337,93 @@ mod tests {
             browser.current_page().unwrap().address(),
             "gopher://one.example/1"
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_image_handoff_keeps_encoded_path_and_completion_notice() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        let url = gemini::GeminiUrl::new("127.0.0.8", 1, "/dir/%2e/image.png");
+        browser.begin_fetch(Link::Gemini(url.clone()), false, NavigationIntent::New);
+        browser.task.take().unwrap().abort();
+        let mut response = gemini::Response::new(url.clone(), 20, "image/png".into());
+        response.body = include_bytes!("../assets/IdleHeart30.png").to_vec();
+        response.notice = Some("Incomplete response".into());
+        let status = response.status_text();
+        browser
+            .tx
+            .send(CoreEvent::GeminiImage {
+                generation: browser.generation,
+                url: url.clone(),
+                response: Box::new(gemini::image_response(response).unwrap()),
+                status,
+            })
+            .await
+            .unwrap();
+        browser.process_async_events();
+        assert_eq!(browser.current_page().unwrap().target(), &Link::Gemini(url));
+        assert!(browser.snapshot().status.contains("Incomplete"));
+        assert!(
+            matches!(&browser.current_page().unwrap().document, FetchedDocument::Http(r) if r.body.starts_with(b"<!doctype html>"))
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_controller_prompts_final_urls_progress_errors_and_history() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        let original = gemini::GeminiUrl::new("127.0.0.8", 1, "/original");
+        browser.begin_fetch(Link::Gemini(original.clone()), false, NavigationIntent::New);
+        browser.task.take().unwrap().abort();
+        let final_url = gemini::GeminiUrl::new("127.0.0.8", 1, "/final/page");
+        let mut response = gemini::Response::new(final_url.clone(), 20, "text/gemini".into());
+        response.body = b"# Heading\n=> sibling Relative link\n".to_vec();
+        response.finished = false;
+        assert!(browser.update_gemini(browser.generation, response.clone()));
+        assert_eq!(
+            browser.current_page().unwrap().address(),
+            final_url.to_string()
+        );
+        let doc = crate::render::documents::document(browser.current_page().unwrap()).unwrap();
+        assert_eq!(
+            doc.lines[1].link,
+            Some(Link::Gemini(gemini::GeminiUrl::new(
+                "127.0.0.8",
+                1,
+                "/final/sibling"
+            )))
+        );
+        browser.reply_view_action("alt", Some(true));
+        response.finished = true;
+        browser.update_gemini(browser.generation, response);
+        assert!(browser.back.is_empty());
+        browser.begin_fetch(Link::Gemini(original.clone()), false, NavigationIntent::New);
+        browser.task.take().unwrap().abort();
+        browser.update_gemini(
+            browser.generation,
+            gemini::Response::new(original.clone(), 11, "Password".into()),
+        );
+        assert!(browser.gemini_prompt().unwrap().sensitive);
+        browser.submit_gemini_prompt("private value");
+        browser.task.take().unwrap().abort();
+        assert!(!browser.snapshot().address.contains("private"));
+        let secret = original.with_input("private value", true).unwrap();
+        browser.update_gemini(
+            browser.generation,
+            gemini::Response::new(secret, 51, "Not found".into()),
+        );
+        assert!(browser.gemini_prompt().is_none());
+        let doc = crate::render::documents::document(browser.current_page().unwrap()).unwrap();
+        assert_eq!(doc.lines[0].text, "Not found");
+        assert!(!browser.snapshot().address.contains('?'));
+        browser.begin_history(false);
+        let page = browser.current_page().unwrap();
+        assert_eq!(page.address(), final_url.to_string());
+        let FetchedDocument::Gemini(response) = &page.document else {
+            panic!("Gemini history lost")
+        };
+        assert!(response.view.show_alt);
+        assert!(browser.task.is_none());
     }
 
     #[test]

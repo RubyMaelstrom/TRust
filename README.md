@@ -168,12 +168,12 @@ command nor an address searches DuckDuckGo Lite.
 | `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
 | `post <url> [body]` | HTTP POST, form-urlencoded |
 | `finger [user]@<host>[:port]` | who's there / their .plan (RFC 1288); IPv6 accepts `[address]:port` |
-| `wrap [on\|off]` | toggle wrapping of a Gopher, Finger, WHOIS, RDAP or DICT reply |
+| `wrap [on\|off]` | toggle wrapping of a Gemini, Gopher, Finger, WHOIS, RDAP or DICT reply |
 | `gopher-info [page]` | show Gopher+ item information and available formats; `page` selects the current page |
 | `changes [on\|off]` | compare a Finger or WHOIS reply with its previous successful refresh |
 | `whois <query> [server[:port]]` | WHOIS lookup via IANA or a chosen server; quote queries containing spaces |
 | `encoding [auto\|utf8\|latin1]` | select WHOIS display encoding without refetching |
-| `save [server-number]` | save received Gopher source, original DICT text, RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
+| `save [server-number]` | save received Gemini/Gopher source, original DICT text, RDAP JSON, the WHOIS transcript, or one WHOIS server's exact bytes |
 | `rdap [domain\|IP\|CIDR\|AS-number]` | show the authoritative RDAP record; omitted query uses the current WHOIS lookup |
 | `dict [--database name] <word or "phrase"> [server[:port]]` | definitions from dict.org or a chosen server (RFC 2229) |
 | `dict --match strategy <word> [server]` | matching words; `prefix`, `exact`, or a server-advertised strategy |
@@ -227,10 +227,28 @@ Links to the same host and port retain TLS, including searches and Gopher+
 formats. Explicit `gophers://` requests require TLS and never fall back to
 unencrypted Gopher. Bookmarks retain the chosen scheme.
 
+Gemini text also arrives progressively, in a reading column of 96 characters.
+Use **W** or `wrap` for ordinary text, **Shift+Left/Right** to pan preformatted
+blocks, and **S** or `save` to save the received source. `gemini-width 20..240`
+adjusts the column, `outline` lists numbered headings, `heading next|previous|N`
+jumps to one, and `gemini-alt [on|off]` shows preformatted descriptions.
+`gemini-help` (or `about:gemini`) opens the dedicated guide. Local `.gmi`,
+`.gemini`, `.gemtext` and `.gmni` files open as Gemtext previews.
+
+Both frontends support Gemini input and certificate prompts, images, and binary
+Save/Open offers. Sensitive input is masked, excluded from command history,
+and removed from stored page addresses. Certificate consent covers the requested
+host, port and path subtree; existing PEM identities are retained and explicitly
+authorized when first needed. A binary save consumes the original response
+connection, avoiding a second input submission. Cross-protocol redirects show an
+explicit link. Stop, timeouts and display limits preserve received text with a
+notice; source saving retains its original bytes. Text decoding supports UTF-8,
+ASCII and ISO-8859-1, with an explicit message for unsupported charsets.
+
 Gophers and Gemini accept server certificates without CA, hostname, expiry or
 fingerprint-pin checks, including certificate replacements. Traffic is
 encrypted, but the server's identity is not verified. Existing Gemini server
-pins are ignored; Gemini client identities still work. HTTPS uses WebPKI and
+pins are ignored; Gemini client identities use explicit scope authorization. HTTPS uses WebPKI and
 Telnet TLS keeps its existing `known_hosts` pinning.
 
 Search links prompt for a query in either frontend. A bookmark of the search

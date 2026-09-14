@@ -54,9 +54,7 @@ pub fn document_for_viewport(page: &BrowserPage, viewport_width: f32) -> Option<
         (FetchedDocument::Gopher(raw), Link::Gopher(url)) => {
             crate::gopher::render_desktop(url, raw.clone())
         }
-        (FetchedDocument::Gemini(response), Link::Gemini(url)) => {
-            crate::gemini::parse(url, &response.meta, &response.body, usize::MAX / 4)
-        }
+        (FetchedDocument::Gemini(response), Link::Gemini(_)) => response.document(usize::MAX / 4),
         (FetchedDocument::OneShot(raw), Link::OneShot(url)) => {
             crate::oneshot::parse(url, raw.clone(), usize::MAX / 4)
         }
@@ -93,6 +91,17 @@ pub fn document_for_viewport(page: &BrowserPage, viewport_width: f32) -> Option<
             if !crate::download::mime_is_renderable(&response.content_type, false) {
                 return None;
             }
+            if crate::gemini::MediaType::parse(&response.content_type)
+                .is_ok_and(|m| m.essence == "text/gemini")
+            {
+                return Some(crate::gemini::render(
+                    Link::Http(url.clone()),
+                    &response.content_type,
+                    &response.body,
+                    usize::MAX / 4,
+                    Default::default(),
+                ));
+            }
             let text = String::from_utf8_lossy(&response.body);
             Doc::from_lines(
                 Link::Http(url.clone()),
@@ -127,7 +136,9 @@ pub fn paint_doc_selected(
     viewport_width: f32,
     selected: Option<usize>,
 ) -> ProtocolPaint {
-    let left = 22.0;
+    let left = doc.gemini.as_ref().map_or(22.0, |view| {
+        ((viewport_width - view.reading_columns as f32 * 9.0) / 2.0).max(22.0)
+    });
     let gopher = doc.gopher.is_some();
     let width = (viewport_width - left * 2.0).max(if gopher { 1.0 } else { 40.0 });
     let mut paint = PagePaint {
@@ -163,7 +174,7 @@ pub fn paint_doc_selected(
         let wrap = doc
             .text_view()
             .map_or(!matches!(line.kind, Kind::Pre), |view| {
-                view.wrap
+                (view.wrap && !(doc.gemini.is_some() && line.kind == Kind::Pre))
                     || doc
                         .whois
                         .as_ref()

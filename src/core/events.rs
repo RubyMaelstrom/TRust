@@ -149,6 +149,16 @@ impl Drop for Receiver {
 
 fn supersedes(previous: &CoreEvent, next: &CoreEvent) -> bool {
     if let (
+        CoreEvent::Gemini {
+            generation: a,
+            response: first,
+        },
+        CoreEvent::Gemini { generation: b, .. },
+    ) = (previous, next)
+    {
+        return a == b && !first.finished;
+    }
+    if let (
         CoreEvent::Finger {
             generation: a,
             reply: first,
