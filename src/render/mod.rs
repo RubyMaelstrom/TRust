@@ -20,6 +20,9 @@ pub use command_panel::{CommandPanelGeometry, CommandResponse};
 pub mod vello_cpu;
 pub mod vello_hybrid;
 
+#[cfg(test)]
+mod text_raster_tests;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CssRect {
     pub x: f32,

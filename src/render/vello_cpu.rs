@@ -25,6 +25,15 @@ use crate::core::{CssPoint, PhysicalSize};
 
 pub(super) const MAX_REGISTERED_IMAGES: usize = 256;
 
+// CSS Fonts 4 §2.5 scales the font's em; §5.2 allows raster-size tolerance.
+// Keep CSS geometry fractional, and use slight vertical hinting in both
+// painters. Native TrueType instructions can round 11pt (14.667px) to 15ppem
+// and stretch JetBrains Mono capitals from 10 to 12 pixels. FreeType's light
+// target preserves their proportions without changing the shaper's advances.
+// https://drafts.csswg.org/css-fonts-4/#font-size-prop
+// https://freetype.org/freetype2/docs/reference/ft2-glyph_retrieval.html#ft_load_target_xxx
+pub(super) const TEXT_HINTING_MODE: glifo::HintingMode = glifo::HintingMode::Light;
+
 struct CachedImage {
     source: ImageSource,
     width: u32,
@@ -633,6 +642,7 @@ fn paint_glyphs(
         let mut glyphs_builder = context
             .glyph_run(resources, run.font.data())
             .font_size(run.font_size)
+            .hinting_mode(TEXT_HINTING_MODE)
             .normalized_coords(&run.normalized_coords);
         if run.synth_bold {
             let amount = f64::from(run.font_size) * 0.025;

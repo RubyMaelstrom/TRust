@@ -181,6 +181,9 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# Expose Glifo's light hinting policy to both desktop raster backends. Native
+# TrueType hints round fractional ppem and visibly stretch small terminal text.
+glifo = { path = "vendor/glifo-0.3.0" }
 fontique = { path = "vendor/fontique-0.11.1" }
 crossterm = { path = "vendor/crossterm-0.29.0" }
 # image-webp 0.2.4 indexes an always-RGBA animation canvas with a three-byte

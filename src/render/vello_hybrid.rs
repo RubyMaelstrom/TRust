@@ -1408,6 +1408,7 @@ fn paint_glyphs(
         let mut builder = target
             .glyph_run(resources, run.font.data())
             .font_size(run.font_size)
+            .hinting_mode(super::vello_cpu::TEXT_HINTING_MODE)
             .normalized_coords(&run.normalized_coords);
         if run.synth_bold {
             let amount = f64::from(run.font_size) * 0.025;

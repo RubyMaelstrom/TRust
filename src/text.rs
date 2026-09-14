@@ -104,6 +104,11 @@ pub enum TextOverflowWrap {
 pub struct FontFace(parley::FontData);
 
 impl FontFace {
+    #[cfg(test)]
+    pub(crate) fn from_test_data(data: parley::FontData) -> Self {
+        Self(data)
+    }
+
     pub(crate) fn data(&self) -> &parley::FontData {
         &self.0
     }
