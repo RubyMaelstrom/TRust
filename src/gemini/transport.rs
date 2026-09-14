@@ -310,7 +310,16 @@ mod tests {
         let (url, server) = serve(b"20 text/plain\r\npartial".to_vec(), vec![], true).await;
         let response = fetch(&url).await.unwrap();
         assert_eq!(response.body, b"partial");
-        assert!(response.notice.as_deref().unwrap().contains("Incomplete"));
+        let notice = response.notice.as_deref().unwrap();
+        assert!(notice.contains("Incomplete"));
+        assert!(response.status_text().contains(notice));
+        let mut doc = response.document(80);
+        for width in [80, 40] {
+            doc.rerender_reply(width);
+            assert_eq!(doc.raw, b"partial");
+            assert_eq!(doc.lines.len(), 1);
+            assert_eq!(doc.lines[0].text, "partial");
+        }
         server.await.unwrap();
     }
 

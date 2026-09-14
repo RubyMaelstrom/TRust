@@ -244,6 +244,7 @@ connection, avoiding a second input submission. Cross-protocol redirects show an
 explicit link. Stop, timeouts and display limits preserve received text with a
 notice; source saving retains its original bytes. Text decoding supports UTF-8,
 ASCII and ISO-8859-1, with an explicit message for unsupported charsets.
+Connection warnings appear in the COMMAND status.
 
 Gophers and Gemini accept server certificates without CA, hostname, expiry or
 fingerprint-pin checks, including certificate replacements. Traffic is
