@@ -249,6 +249,7 @@ struct HostState {
     permission_slots: Option<Value>,
     history_slots: Option<Value>,
     navigator_slots: Option<Value>,
+    screen_slots: Option<Value>,
     performance_slots: Option<Value>,
     element_slots: Option<Value>,
     pointer_event_slots: Option<Value>,
@@ -296,6 +297,7 @@ impl HostState {
             permission_slots: None,
             history_slots: None,
             navigator_slots: None,
+            screen_slots: None,
             performance_slots: None,
             element_slots: None,
             pointer_event_slots: None,
@@ -473,6 +475,7 @@ impl RetainedMemory for HostState {
             permission_slots,
             history_slots,
             navigator_slots,
+            screen_slots,
             performance_slots,
             element_slots,
             pointer_event_slots,
@@ -763,6 +766,9 @@ impl RetainedMemory for HostState {
             visitor.value(value);
         }
         if let Some(value) = navigator_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = screen_slots {
             visitor.value(value);
         }
         if let Some(value) = performance_slots {
@@ -4996,6 +5002,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__permissions_binding", 2, host_permissions_binding),
     ("__history_binding", 2, host_history_binding),
     ("__navigator_binding", 1, host_navigator_binding),
+    ("__screen_binding", 1, host_screen_binding),
     ("__performance_binding", 1, host_performance_binding),
     ("__element_slots", 1, host_element_slots),
     ("__pointer_event_slots", 1, host_pointer_event_slots),
@@ -5228,6 +5235,16 @@ fn host_navigator_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
         .host_mut::<HostState>()
         .expect("Navigator requires HostState");
     Ok(state.navigator_slots.get_or_insert(value).clone())
+}
+
+/// CSSOM View/Web IDL brands shared by Window Realms, retaining the private
+/// WeakMap rather than its Screen and Window keys.
+fn host_screen_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("Screen requires HostState");
+    Ok(state.screen_slots.get_or_insert(value).clone())
 }
 
 /// Web IDL interface conversion uses platform identity, not mutable properties
@@ -10975,6 +10992,20 @@ mod tests {
     }
 
     #[test]
+    fn screen_and_window_dimensions_have_webidl_bindings_and_live_geometry() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/screen_interfaces.mjs")),
+                "screen-interfaces-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn window_screen_coordinates_are_live_replaceable_and_shared_with_frames() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
@@ -11555,7 +11586,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 149, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 150, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -11566,7 +11597,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 149);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 150);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

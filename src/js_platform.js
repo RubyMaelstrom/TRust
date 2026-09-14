@@ -29,6 +29,9 @@
     // boundary: Window.frameElement and the parent's element reference must
     // retain object identity for a same-origin child.
     const realmRootFrame = cfg.frameElement || null;
+    // The viewport belongs to the browsing context, not to the replaceable
+    // Window.innerWidth/innerHeight properties exposed to author JavaScript.
+    let windowViewportWidth = cfg.width, windowViewportHeight = cfg.height;
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
     const storageOpaque = !!cfg.cookieOpaque;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
@@ -4865,12 +4868,12 @@
         // root element's client box IS the viewport (CSSOM View); its
         // scrollHeight is the full document height (its rect, via the fallback).
         get clientWidth() {
-            if (this.localName === "html") return g.innerWidth;
+            if (this.localName === "html") return Math.round(windowViewportDimension("width"));
             const v = __dom_scroll_get(this.__id, 5);
             return v !== null ? v : this.__rect().width;
         }
         get clientHeight() {
-            if (this.localName === "html") return g.innerHeight;
+            if (this.localName === "html") return Math.round(windowViewportDimension("height"));
             const v = __dom_scroll_get(this.__id, 4);
             return v !== null ? v : this.__rect().height;
         }
@@ -6470,6 +6473,11 @@
         try { content = __dom_rect(frame.__id, true); } catch (_) {}
         return content ? (axis === "width" ? content[2] : content[3]) : 0;
     }
+    function windowViewportDimension(axis) {
+        const frame = trust.__activeFrame || realmRootFrame;
+        return frame ? frameViewportDimension(frame, axis) :
+            (axis === "width" ? windowViewportWidth : windowViewportHeight);
+    }
     function frameContentClientRect(frame) {
         // HTML #the-page / CSSOM View: input into a child viewport starts at
         // the used content-box origin. clientLeft/Top only include the border
@@ -7186,8 +7194,8 @@
         const frame = doc && doc.__frame || null;
         // DOMParser-created/detached Documents have no associated viewport.
         if (!frame && doc.__id !== 0) return [];
-        const width = frame ? frameViewportDimension(frame, "width") : +g.innerWidth;
-        const height = frame ? frameViewportDimension(frame, "height") : +g.innerHeight;
+        const width = frame ? frameViewportDimension(frame, "width") : windowViewportDimension("width");
+        const height = frame ? frameViewportDimension(frame, "height") : windowViewportDimension("height");
         if (x < 0 || y < 0 || x > width || y > height) return [];
 
         const ids = __dom_elements_from_point(
@@ -7602,7 +7610,7 @@
             location: Object.getOwnPropertyDescriptor(g, "location"),
             parent: g.parent, top: g.top, frames: g.frames, frameElement: frameElementState,
             cfgUrl: g.__trust_cfg && g.__trust_cfg.url,
-            innerWidth: g.innerWidth, innerHeight: g.innerHeight,
+            innerWidth: windowViewportWidth, innerHeight: windowViewportHeight,
             pageXOffset: g.pageXOffset, pageYOffset: g.pageYOffset,
             scrollX: g.scrollX, scrollY: g.scrollY, base: baseHrefCache,
         };
@@ -7613,7 +7621,7 @@
         g.parent = state.parent; g.top = state.top; g.frames = state.frames;
         frameElementState = state.frameElement;
         if (g.__trust_cfg) g.__trust_cfg.url = state.cfgUrl;
-        g.innerWidth = state.innerWidth; g.innerHeight = state.innerHeight;
+        windowViewportWidth = state.innerWidth; windowViewportHeight = state.innerHeight;
         g.pageXOffset = state.pageXOffset; g.pageYOffset = state.pageYOffset;
         g.scrollX = state.scrollX; g.scrollY = state.scrollY;
         baseHrefCache = state.base;
@@ -7675,7 +7683,7 @@
         g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
         frameElementState = frame;
         if (g.__trust_cfg) g.__trust_cfg.url = url;
-        g.innerWidth = frameWidth; g.innerHeight = frameHeight;
+        windowViewportWidth = frameWidth; windowViewportHeight = frameHeight;
         restoreAnimationFrameMethods(frame);
         baseHrefCache = null;
         trust.__activeFrame = frame;
@@ -10281,10 +10289,78 @@
         g.Permissions = Permissions;
     })();
     /*__PERMISSIONS_END__*/
-    g.screen = { width: cfg.width, height: cfg.height, availWidth: cfg.width, availHeight: cfg.height, colorDepth: 24, pixelDepth: 24 };
-    g.innerWidth = realmRootFrame ? frameViewportDimension(realmRootFrame, "width") : cfg.width;
-    g.innerHeight = realmRootFrame ? frameViewportDimension(realmRootFrame, "height") : cfg.height;
-    g.outerWidth = cfg.width; g.outerHeight = cfg.height;
+    windowViewportWidth = windowViewportDimension("width");
+    windowViewportHeight = windowViewportDimension("height");
+    (() => {
+        "use strict";
+        // CSSOM View #the-screen-interface, #web-exposed-screen-information
+        // and #extensions-to-the-window-interface; Web IDL #js-attributes and
+        // #Replaceable. Screen attributes are branded readonly prototype
+        // getters. Window attributes have replaceable own accessors.
+        const binding = g.__screen_binding;
+        delete g.__screen_binding;
+        const slots = binding(new WeakMap()), apply = Reflect.apply;
+        const get = WeakMap.prototype.get, set = WeakMap.prototype.set;
+        const define = Object.defineProperty, TypeErrorCtor = TypeError, round = Math.round;
+        const read = object => apply(get, slots, [object]);
+        const named = (fn, name) => {
+            define(fn, "name", {value: name, configurable: true});
+            return fn;
+        };
+        class Screen {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+        }
+        define(Screen.prototype, Symbol.toStringTag, {value: "Screen", configurable: true});
+        const screen = Object.create(Screen.prototype);
+        // Use CSSOM View's permitted viewport-sized screen area, consistently
+        // with TRust's device-width/device-height media features. This remains
+        // live for both top-level and nested viewports; RGB depth is 24 bits.
+        apply(set, slots, [screen, {screen: true, dimension: windowViewportDimension}]);
+        for (const name of ["availWidth", "availHeight", "width", "height", "colorDepth", "pixelDepth"]) {
+            define(Screen.prototype, name, {configurable: true, enumerable: true,
+                get: named({get() {
+                    const state = read(this);
+                    if (!state || state.screen !== true) {
+                        const window = windowMessageState(this);
+                        if (window && window.originKey !== windowMessageState(g).originKey)
+                            throw new DOMException("Cross-origin Window access", "SecurityError");
+                        throw new TypeErrorCtor("Illegal Screen invocation");
+                    }
+                    return name === "colorDepth" || name === "pixelDepth" ? 24 :
+                        round(state.dimension(name === "width" || name === "availWidth" ? "width" : "height"));
+                }}.get, "get " + name)});
+        }
+        g.Screen = Screen;
+        apply(set, slots, [g, {screen, dimension: windowViewportDimension,
+            outerWidth: cfg.width, outerHeight: cfg.height}]);
+        function windowRecord(receiver) {
+            if (receiver === null || receiver === undefined) receiver = g;
+            if (receiver === g) return read(g);
+            const state = windowMessageState(receiver);
+            if (!state) throw new TypeErrorCtor("Illegal Window invocation");
+            // HTML #integration-with-idl: borrowed Window accessors must
+            // check the receiver's origin before exposing any of its state.
+            if (state.originKey !== windowMessageState(g).originKey)
+                throw new DOMException("Cross-origin Window access", "SecurityError");
+            const record = read(state.window);
+            if (!record || !record.dimension) throw new TypeErrorCtor("Illegal Window invocation");
+            return record;
+        }
+        for (const name of ["screen", "innerWidth", "innerHeight", "outerWidth", "outerHeight"]) {
+            define(g, name, {configurable: true, enumerable: true,
+                get: named({get() {
+                    const record = windowRecord(this);
+                    if (name === "screen") return record.screen;
+                    return round(name === "innerWidth" || name === "innerHeight" ?
+                        record.dimension(name === "innerWidth" ? "width" : "height") : record[name]);
+                }}.get, "get " + name),
+                set: named({set(value) {
+                    windowRecord(this);
+                    define(this === null || this === undefined ? g : this, name,
+                        {value, writable: true, enumerable: true, configurable: true});
+                }}.set, "set " + name)});
+        }
+    })();
     // CSSOM View #dom-window-screenx/#dom-window-screeny and Web IDL
     // #Replaceable: these are live, replaceable Window attributes, not mouse
     // coordinates or iframe offsets. The host owns one client-window origin
@@ -10471,7 +10547,7 @@
     // Listener plumbing stays inert — TRust re-evaluates media only on reload
     // (a breakpoint-crossing resize reloads), so there is no change event to fire.
     g.matchMedia = (m) => mediaQueryListForViewport(m, function () {
-        return [g.innerWidth, g.innerHeight];
+        return [windowViewportDimension("width"), windowViewportDimension("height")];
     });
     // window.CSS — feature detection (used across the web, not just
     // css3test). `supports("selector(…)")` runs the real selector engine
@@ -10581,7 +10657,7 @@
         insertNode(node) { const c = this.startContainer; if (c && c.insertBefore) c.insertBefore(node, (c.childNodes && c.childNodes[this.startOffset]) || null); }
         surroundContents(node) { this.insertNode(node); }
         createContextualFragment(html) { const tpl = g.document.createElement("template"); tpl.innerHTML = String(html); return tpl.content; }
-        getBoundingClientRect() { return new DOMRect(0, 0, g.innerWidth, g.innerHeight); }
+        getBoundingClientRect() { return new DOMRect(0, 0, windowViewportDimension("width"), windowViewportDimension("height")); }
         getClientRects() { return [this.getBoundingClientRect()]; }
         detach() {}
         toString() { return ""; }
@@ -10832,7 +10908,7 @@
         takeRecords() { const r = this.__records; this.__records = []; return r; }
     };
     g.__viewportRect = () => {
-        const vw = g.innerWidth, vh = g.innerHeight;
+        const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
         return { x: 0, y: 0, left: 0, top: 0, right: vw, bottom: vh, width: vw, height: vh };
     };
     // IntersectionObserver — HONEST viewport intersection (W3C Intersection
@@ -11012,7 +11088,7 @@
         if (!IO.length) return 0;
         let queued = 0;
         const sx = g.scrollX || 0, sy = g.scrollY || 0;
-        const vw = g.innerWidth, vh = g.innerHeight;
+        const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
         const observers = IO.slice();
         for (let oi = 0; oi < observers.length; oi++) {
             const o = observers[oi];
@@ -11094,9 +11170,9 @@
         // sentinel sits — instead of a few rows short of it.
         const de = g.document.documentElement;
         if (de) {
-            const maxY = Math.max(0, de.scrollHeight - (g.innerHeight || 0));
+            const maxY = Math.max(0, de.scrollHeight - windowViewportDimension("height"));
             if (y > maxY) y = maxY;
-            const maxX = Math.max(0, de.scrollWidth - (g.innerWidth || 0));
+            const maxX = Math.max(0, de.scrollWidth - windowViewportDimension("width"));
             if (x > maxX) x = maxX;
         }
         if (x === (g.scrollX || 0) && y === (g.scrollY || 0)) return;
@@ -11127,8 +11203,8 @@
         // HTML #the-page: a non-rendered child navigable has a zero-size
         // viewport. Do not retain its former dimensions when it is hidden.
         if (!Number.isFinite(w) || !Number.isFinite(h) || w < 0 || h < 0) return;
-        if (w === g.innerWidth && h === g.innerHeight) return;
-        g.innerWidth = w; g.innerHeight = h;
+        if (w === windowViewportWidth && h === windowViewportHeight) return;
+        windowViewportWidth = w; windowViewportHeight = h;
         try { dispatch(g, new Event("resize"), false); }
         catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         // HTML's next rendering opportunity recalculates layout before CSSOM
