@@ -3994,6 +3994,18 @@ impl Flow<'_> {
                 (frag, anchors) = self.item_frag(ab, content_w, cb_w, Some(clamped), parent_inl);
             }
         }
+        // CSS Transforms 1 #transform-rendering and CSS Position 3
+        // #relpos-insets: visual offsets move the atomic inline's fragment,
+        // descendants, and anchors, but not its margin-box space on the line.
+        // `item_frag` returns unshifted geometry, just as for flex items and
+        // floats. Apply the same offset here before placing it on its line.
+        let (dx, dy) = self.paint_offset(s, cb_w, cb_h, frag.w, frag.h);
+        if dx != 0.0 || dy != 0.0 {
+            Self::offset_frag(&mut frag, dx, dy);
+            for anchor in &mut anchors {
+                anchor.1 += dy;
+            }
+        }
         PrelaidAtom {
             node: ab.node,
             mw: m[LEFT] + frag.w + m[RIGHT],

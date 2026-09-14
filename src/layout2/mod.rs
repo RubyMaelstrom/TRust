@@ -1829,6 +1829,66 @@ mod tests {
     }
 
     #[test]
+    fn inline_image_vertical_margins_size_the_line_without_changing_its_border_box() {
+        // CSS 2 #line-height and #propdef-vertical-align use the replaced
+        // element's margin box. CSSOM View still measures its border box.
+        let base = Url::parse("https://example.test/").unwrap();
+        for (margins, image_top, line_height) in [
+            ("10px 0 6px", 10.0, 116.0),
+            ("-17px 0 0", -17.0, 83.0),
+            ("10% 0 auto", 20.0, 120.0),
+        ] {
+            for align in ["top", "middle", "bottom"] {
+                let dom = Dom::parse_document(&format!(
+                    "<style>body{{margin:0;font:14px/20px sans-serif}}\
+                     #line{{width:200px}}img{{width:80px;height:100px;\
+                     margin:{margins};vertical-align:{align}}}</style>\
+                     <div id=line><img id=picture src=photo.png></div>\
+                     <div id=after>After</div>"
+                ));
+                let layout = lay_out_graphical(
+                    &dom,
+                    &base,
+                    Viewport::new(400.0, 400.0),
+                    &[],
+                    &Default::default(),
+                    &Default::default(),
+                );
+                let picture = layout.boxes[&dom.get_by_id("picture").unwrap()];
+                let line = layout.boxes[&dom.get_by_id("line").unwrap()];
+                let after = layout.boxes[&dom.get_by_id("after").unwrap()];
+                assert!(
+                    (picture.top - image_top).abs() < 0.1,
+                    "{margins} {align}: {picture:?}"
+                );
+                assert!((picture.height - 100.0).abs() < 0.1, "{picture:?}");
+                assert!(
+                    (line.height - line_height).abs() < 0.1,
+                    "{margins} {align}: {line:?}"
+                );
+                assert!((after.top - line_height).abs() < 0.1, "{after:?}");
+                let painted = layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .find_map(|primitive| {
+                        if let crate::render::DisplayCommand::Image { rect, .. } = primitive {
+                            Some(*rect)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert!(
+                    (f64::from(painted.y) - image_top).abs() < 0.1,
+                    "{painted:?}"
+                );
+                assert!((painted.height - 100.0).abs() < 0.1, "{painted:?}");
+            }
+        }
+    }
+
+    #[test]
     fn transparent_gradient_background_does_not_erase_content() {
         // A gradient with a transparent stop is a scrim/edge fade: a browser
         // shows the content beneath it, so it must not stamp an opaque fill
@@ -4460,6 +4520,175 @@ mod tests {
         assert_eq!((ra, a.col), (0, 0));
         assert!(rb > ra, "the second box wraps to the next line");
         assert_eq!(b.col, 0, "and starts at the line's left edge");
+    }
+
+    #[test]
+    fn atomic_inline_wrapping_uses_the_surrounding_white_space() {
+        // CSS Text 3 #white-space-property / #line-breaking-scope: the
+        // surrounding line controls wrapping between atomic inline boxes;
+        // each box's own white-space controls its independent contents.
+        for display in ["inline-block", "inline-flex", "inline-grid", "inline-table"] {
+            for (white_space, wraps) in [
+                ("normal", true),
+                ("nowrap", false),
+                ("pre", false),
+                ("pre-wrap", true),
+                ("pre-line", true),
+                ("break-spaces", true),
+                ("normal;text-wrap-mode:nowrap", false),
+                ("nowrap;text-wrap-mode:wrap", true),
+            ] {
+                let inner = if wraps { "nowrap" } else { "normal" };
+                let html = format!(
+                    "<style>body{{margin:0}}#line{{width:80px;line-height:0;white-space:{white_space}}}
+                     .box{{display:{display};width:80px;height:32px;white-space:{inner};font:16px/16px sans-serif}}
+                     </style><div id=line><span><span id=a class=box>A</span><span id=b class=box>B</span></span></div><div id=after>After</div>"
+                );
+                let (dom, boxes) = measure(&html, 80, 40);
+                let a = rect(&dom, &boxes, "a");
+                let b = rect(&dom, &boxes, "b");
+                let after = rect(&dom, &boxes, "after");
+                assert_eq!(
+                    b.top > a.top,
+                    wraps,
+                    "{display}, {white_space}: {a:?}, {b:?}"
+                );
+                assert_eq!(b.left, if wraps { a.left } else { a.left + a.width });
+                assert_eq!(after.top, if wraps { 64.0 } else { 32.0 });
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_inline_nowrap_keeps_forced_breaks_and_inner_text_wrapping() {
+        for (white_space, separator) in [("nowrap", "<br>"), ("pre", "<br>"), ("pre", "\n")] {
+            let html = format!(
+                "<style>body{{margin:0}}#line{{width:80px;line-height:0;white-space:{white_space}}}
+                 .box{{display:inline-block;width:80px;white-space:normal;font:16px/16px monospace}}
+                 </style><div id=line><span id=a class=box><span id=text>hello world</span></span><span id=b class=box>B</span>{separator}<span id=c class=box>C</span></div>"
+            );
+            let (dom, boxes) = measure(&html, 80, 40);
+            let a = rect(&dom, &boxes, "a");
+            let b = rect(&dom, &boxes, "b");
+            let c = rect(&dom, &boxes, "c");
+            assert_eq!(a.height, 32.0, "the slide's own normal text still wraps");
+            assert_eq!(b.left, 80.0, "the next slide stays on the surrounding line");
+            assert_eq!(c.left, 0.0, "a forced break starts a new line");
+            assert!(c.top >= a.top + a.height && c.top > b.top);
+        }
+    }
+
+    #[test]
+    fn atomic_inline_nowrap_also_applies_to_replaced_images() {
+        for (white_space, wraps) in [("nowrap", false), ("pre", false), ("normal", true)] {
+            let inner = if wraps { "nowrap" } else { "normal" };
+            let html = format!(
+                "<style>body{{margin:0}}#line{{width:80px;line-height:0;white-space:{white_space}}}
+                 img{{width:80px;height:32px;vertical-align:top;white-space:{inner}}}
+                 </style><div id=line><img id=a src=a.png><img id=b src=b.png></div><div id=after>After</div>"
+            );
+            let (dom, boxes) = measure(&html, 80, 40);
+            let a = rect(&dom, &boxes, "a");
+            let b = rect(&dom, &boxes, "b");
+            assert_eq!(b.top > a.top, wraps, "{white_space}: {a:?}, {b:?}");
+            assert_eq!(b.left, if wraps { 0.0 } else { 80.0 });
+            assert_eq!(
+                rect(&dom, &boxes, "after").top,
+                if wraps { 64.0 } else { 32.0 }
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_inline_nowrap_carousel_reserves_one_slide_height_in_both_frontends() {
+        for (active, label, translation) in [
+            ("first", "First", "0px"),
+            ("second", "Second", "-320px"),
+            ("third", "Third", "-200%"),
+        ] {
+            let html = format!(
+                r#"<style>
+                body {{ margin:0 }}
+                #mask {{ width:320px; white-space:nowrap; line-height:0; overflow:hidden }}
+                .slide {{ display:inline-block; width:100%; height:96px; white-space:normal; font:16px/16px sans-serif; visibility:hidden }}
+                #{active} {{ visibility:visible; transform:translateX({translation}) }}
+                </style><div id=mask><div class=slide id=first>First</div><div class=slide id=second>Second</div><div class=slide id=third>Third</div></div><div id=after>After</div>"#
+            );
+            let out = lay(&html, 80);
+            let (row, _) = find(&out, "After");
+            assert_eq!(row, 6, "terminal content follows one 96px slide");
+            let (row, item) = find(&out, label);
+            assert_eq!(
+                (row, item.col),
+                (0, 0),
+                "the active slide occupies the mask"
+            );
+            let graphical = lay_graphical(&html, 640.0, &HashMap::new());
+            let (_, y, _) = graphical_text(&graphical, "After");
+            assert!(
+                y >= 96.0 && y < 128.0,
+                "desktop content follows one slide: {y}"
+            );
+            let (x, y, _) = graphical_text(&graphical, label);
+            assert!(
+                x.abs() < 0.01 && (0.0..32.0).contains(&y),
+                "active slide: {x}, {y}"
+            );
+            let dom = Dom::parse_document(&html);
+            assert_eq!(rect(&dom, &graphical.boxes, "mask").height, 96.0);
+            assert_eq!(rect(&dom, &graphical.boxes, "after").top, 96.0);
+            assert_eq!(rect(&dom, &graphical.boxes, active).left, 0.0);
+        }
+    }
+
+    #[test]
+    fn atomic_inline_visual_offsets_preserve_line_placement() {
+        // Transforms and relative positioning shift the box and descendants
+        // (including CSSOM View bounds), while its siblings keep flowing from
+        // the unshifted margin box. Percentage translations use the box size.
+        for display in ["inline-block", "inline-flex", "inline-grid"] {
+            let html = format!(
+                "<style>body{{margin:0}}#line{{line-height:0}}
+                 .box{{display:{display};width:80px;height:32px;font:16px/16px sans-serif}}
+                 #a{{position:relative;left:8px;top:16px;transform:translate(50%,25%)}}
+                 </style><div id=line><span id=a class=box><span id=child>AAA</span></span><span id=b class=box>BBB</span></div><div id=after>After</div>"
+            );
+            let (dom, boxes) = measure(&html, 80, 40);
+            let a = rect(&dom, &boxes, "a");
+            let child = rect(&dom, &boxes, "child");
+            let b = rect(&dom, &boxes, "b");
+            assert_eq!((a.left, a.top), (48.0, 24.0), "{display}: {a:?}");
+            assert_eq!((child.left, child.top), (48.0, 24.0));
+            assert_eq!((b.left, b.top), (80.0, 0.0));
+            assert_eq!(rect(&dom, &boxes, "after").top, 32.0);
+        }
+    }
+
+    #[test]
+    fn atomic_inline_boxes_use_their_own_vertical_alignment() {
+        for display in ["inline-block", "inline-flex", "inline-grid", "inline-table"] {
+            for (alignment, short_top) in [("top", 0.0), ("bottom", 32.0)] {
+                let html = format!(
+                    "<style>body{{margin:0}}#line{{width:80px;white-space:nowrap;font:16px/24px sans-serif}}
+                     .box{{display:{display};width:80px;height:64px;white-space:normal;vertical-align:{alignment}}}
+                     #short{{height:32px}}
+                     </style><div id=line><span id=tall class=box>Tall</span><span id=short class=box>Short</span></div><div id=after>After</div>"
+                );
+                let (dom, boxes) = measure(&html, 80, 40);
+                assert_eq!(
+                    rect(&dom, &boxes, "tall").top,
+                    0.0,
+                    "{display}, {alignment}"
+                );
+                assert_eq!(
+                    rect(&dom, &boxes, "short").top,
+                    short_top,
+                    "{display}, {alignment}"
+                );
+                assert_eq!(rect(&dom, &boxes, "short").left, 80.0);
+                assert_eq!(rect(&dom, &boxes, "after").top, 64.0);
+            }
+        }
     }
 
     #[test]
