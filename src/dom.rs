@@ -2377,6 +2377,33 @@ impl Dom {
         self.is_valid(id).then_some(self.nodes[id].owner_document)
     }
 
+    pub(crate) fn set_frame_cookie_restriction(&mut self, frame: NodeId, restricted: bool) {
+        self.properties
+            .document_cookie_restrictions
+            .insert(frame, restricted);
+    }
+
+    /// RFC6265bis #document-requests: presentation fetches must retain the
+    /// entire ancestor restriction. Unknown/synthetic frame contexts cannot
+    /// authorize cookies; a later canonical render supplies their context.
+    pub(crate) fn resource_cookies_restricted(&self, node: NodeId) -> bool {
+        let mut parent = self.parent_flat(node);
+        while let Some(id) = parent {
+            if matches!(self.tag_name(id), Some("iframe" | "frame"))
+                && self
+                    .properties
+                    .document_cookie_restrictions
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(true)
+            {
+                return true;
+            }
+            parent = self.parent_flat(id);
+        }
+        false
+    }
+
     pub fn is_valid(&self, id: NodeId) -> bool {
         id < self.nodes.len()
     }
@@ -6944,8 +6971,15 @@ impl Dom {
     /// document before deriving the next pixel layout. Resolution uses the
     /// document base URL, including HTML's first `<base href>`.
     pub fn external_svg_use_sheets(&self, base: &url::Url) -> Vec<url::Url> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
+        self.external_svg_use_sheet_requests(base)
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect()
+    }
+
+    pub(crate) fn external_svg_use_sheet_requests(&self, base: &url::Url) -> Vec<(url::Url, bool)> {
+        let mut seen = std::collections::HashMap::<String, usize>::new();
+        let mut out: Vec<(url::Url, bool)> = Vec::new();
         for id in self.flat_descendants(DOCUMENT) {
             if self.tag_name(id) != Some("use") {
                 continue;
@@ -6967,8 +7001,12 @@ impl Dom {
             let Some(url) = base.join(file).ok() else {
                 continue;
             };
-            if seen.insert(url.to_string()) {
-                out.push(url);
+            let restricted = self.resource_cookies_restricted(id);
+            if let Some(&index) = seen.get(url.as_str()) {
+                out[index].1 |= restricted;
+            } else {
+                seen.insert(url.to_string(), out.len());
+                out.push((url, restricted));
             }
         }
         out

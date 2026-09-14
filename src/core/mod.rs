@@ -627,7 +627,7 @@ impl BrowserController {
             external_media: VecDeque::new(),
             download_offer: None,
             gemini_prompt: None,
-            storage: Default::default(),
+            storage: crate::site_storage::web_storage(),
             external_address: None,
             generation: 0,
             document_generation: 0,
@@ -824,7 +824,7 @@ impl BrowserController {
     pub fn set_cookies_enabled(&mut self, enabled: bool) {
         http::set_cookies_enabled(enabled);
         self.set_status(if enabled {
-            "Cookies on: RAM-only, exact-host only."
+            "Cookies on: first-party access; bookmarked sites may remember cookies."
         } else {
             "Cookies off."
         });
@@ -1149,6 +1149,9 @@ impl BrowserController {
     /// Drain all async completions currently queued. Returns whether visible
     /// state changed and therefore a redraw should be requested.
     pub fn process_async_events(&mut self) -> ActionOutcome {
+        if let Some(error) = crate::site_storage::take_notice() {
+            self.set_status(error);
+        }
         let generation_before = self.generation;
         let mut changed = false;
         while let Some(event) = self.rx.pop() {
@@ -2868,6 +2871,7 @@ async fn fetch_protocol_interactive(
                 )),
                 headers: Vec::new(),
                 fetch_metadata: None,
+                cookie_context: None,
                 timing_client: None,
                 fetch_policy: None,
             };

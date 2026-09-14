@@ -36,6 +36,7 @@ pub mod finger;
 mod referrer_policy;
 pub mod render;
 pub mod responsive_image;
+pub mod site_storage;
 pub mod storage;
 
 // These are the existing engine modules. They are declared exactly once here;

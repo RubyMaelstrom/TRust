@@ -145,7 +145,7 @@ impl Worker {
     }
 }
 
-fn entries(data: &Value) -> Result<Vec<Entry>, String> {
+pub(crate) fn entries(data: &Value) -> Result<Vec<Entry>, String> {
     if data.get("version").and_then(Value::as_u64) != Some(1) {
         return Err("Unsupported bookmarks file version; file left untouched".into());
     }
@@ -184,7 +184,7 @@ fn entries(data: &Value) -> Result<Vec<Entry>, String> {
         })
         .collect()
 }
-fn read(path: &Path) -> Result<Value, String> {
+pub(crate) fn read(path: &Path) -> Result<Value, String> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -232,17 +232,7 @@ fn write(path: &Path, data: &Value) -> Result<(), String> {
     }
     result.map_err(|e| format!("Cannot save {}: {e}", path.display()))
 }
-fn apply(
-    path: &Path,
-    operation: Operation,
-    removed: &mut Option<Value>,
-) -> Result<Outcome, String> {
-    if let Operation::List(filter) = &operation {
-        return Ok(Outcome {
-            message: "Bookmarks".into(),
-            listing: Some(listing(&entries(&read(path)?)?, filter)),
-        });
-    }
+pub(crate) fn lock(path: &Path) -> Result<fs::File, String> {
     crate::storage::create_private_dir(path.parent().ok_or("Invalid bookmark path")?)
         .map_err(|e| e.to_string())?;
     // Lock a stable inode, not the JSON inode that atomic replacement changes.
@@ -263,7 +253,23 @@ fn apply(
             Err(e) => return Err(format!("Bookmark store is locked or unavailable: {e}")),
         }
     }
+    Ok(lock)
+}
+
+fn apply(
+    path: &Path,
+    operation: Operation,
+    removed: &mut Option<Value>,
+) -> Result<Outcome, String> {
+    if let Operation::List(filter) = &operation {
+        return Ok(Outcome {
+            message: "Bookmarks".into(),
+            listing: Some(listing(&entries(&read(path)?)?, filter)),
+        });
+    }
+    let store_lock = lock(path)?;
     let mut data = read(path)?;
+    let before = data.clone();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -355,8 +361,12 @@ fn apply(
         Operation::List(_) => unreachable!(),
     };
     entries(&data)?;
+    crate::site_storage::before_bookmarks_write(path, &before, &data)?;
     write(path, &data)?;
     *removed = new_removed;
+    crate::site_storage::after_bookmarks_write(path, &before, &data)?;
+    drop(store_lock);
+    crate::site_storage::flush()?;
     Ok(Outcome {
         message,
         listing: None,

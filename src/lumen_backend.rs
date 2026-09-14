@@ -98,7 +98,14 @@ enum LumenHostTask {
         timing: Option<LumenResourceTiming>,
         external: bool,
     },
+    DynamicModuleStart {
+        request_id: u64,
+        context: u64,
+        specifier: String,
+        referrer: String,
+    },
     DynamicModule {
+        context: u64,
         request_id: u64,
         result: Option<(String, String)>,
     },
@@ -139,7 +146,9 @@ struct LumenDynamicModuleNetwork {
 
 #[derive(Clone)]
 struct LumenDynamicModuleLoader {
+    context: u64,
     page: url::Url,
+    cookie_context: crate::http::CookieContext,
     events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     network: Option<LumenDynamicModuleNetwork>,
 }
@@ -198,6 +207,7 @@ enum LumenWorkerKind {
 struct LumenWorkerLaunch {
     id: usize,
     owner_page: url::Url,
+    cookie_context: crate::http::CookieContext,
     script_url: url::Url,
     kind: LumenWorkerKind,
     name: String,
@@ -230,6 +240,7 @@ struct HostState {
     /// Fetch/XHR's client settings belong to the initiating Window, not its
     /// embedding page. about:blank/srcdoc inherit their creator's origin.
     window_request_urls: HashMap<u64, url::Url>,
+    window_cookie_contexts: HashMap<u64, (usize, url::Url, crate::http::CookieContext)>,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
@@ -278,6 +289,7 @@ impl HostState {
             next_window_context: 1,
             window_realms: HashMap::new(),
             window_request_urls: HashMap::new(),
+            window_cookie_contexts: HashMap::new(),
             image_data_slots: None,
             canvas_gradient_slots: None,
             canvas_text_metrics_slots: None,
@@ -344,12 +356,28 @@ impl HostState {
     fn configure_module_loading(&self, engine: &mut lumen::Engine) {
         engine.set_import_base(self.base.as_str());
         if let Some(network) = self.network.as_ref() {
-            let page = self.base.clone();
+            let page = self
+                .window_request_urls
+                .get(&0)
+                .unwrap_or(&self.base)
+                .clone();
+            let cookie_context = self.window_cookie_contexts.get(&0).map_or_else(
+                || crate::http::CookieContext::subresource(&page),
+                |(_, _, c)| c.clone(),
+            );
             let handle = network.handle.clone();
             let cache = network.cache.clone();
             let fetched = network.fetched.clone();
             engine.set_module_loader(move |specifier, referrer| {
-                module_dependency_loader(&page, &handle, &cache, &fetched, specifier, referrer)
+                module_dependency_loader(
+                    &page,
+                    &cookie_context,
+                    &handle,
+                    &cache,
+                    &fetched,
+                    specifier,
+                    referrer,
+                )
             });
         }
 
@@ -360,22 +388,15 @@ impl HostState {
             return;
         };
         let pending_dynamic_modules = self.pending_dynamic_modules.clone();
-        let loader = LumenDynamicModuleLoader {
-            page: self.base.clone(),
-            events,
-            network: self
-                .network
-                .as_ref()
-                .map(|network| LumenDynamicModuleNetwork {
-                    handle: network.handle.clone(),
-                    cache: network.cache.clone(),
-                    fetched: network.fetched.clone(),
-                }),
-        };
-        engine.set_async_dynamic_module_loader(
-            move |request_id, specifier, referrer, _attribute_type| {
+        engine.set_async_dynamic_module_loader_with_context(
+            move |request_id, context, specifier, referrer, _attribute_type| {
                 pending_dynamic_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                queue_dynamic_module_load(&loader, request_id, specifier, referrer);
+                let _ = events.send(LumenHostTask::DynamicModuleStart {
+                    request_id,
+                    context,
+                    specifier: specifier.into(),
+                    referrer: referrer.into(),
+                });
                 true
             },
         );
@@ -445,6 +466,7 @@ impl RetainedMemory for HostState {
             next_window_context,
             window_realms,
             window_request_urls,
+            window_cookie_contexts,
             image_data_slots,
             canvas_gradient_slots,
             canvas_text_metrics_slots,
@@ -760,6 +782,22 @@ impl RetainedMemory for HostState {
         }
         if let Some(value) = wasm_module_slots {
             visitor.value(value);
+        }
+        if !window_cookie_contexts.is_empty() {
+            visitor.opaque_storage();
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.cookie-contexts",
+                window_cookie_contexts as *const _ as usize,
+                window_cookie_contexts.capacity()
+                    * std::mem::size_of::<(u64, (usize, url::Url, crate::http::CookieContext))>()
+                    + window_cookie_contexts
+                        .values()
+                        .map(|(_, url, context)| {
+                            url.as_str().len()
+                                + context.client.as_ref().map_or(0, |u| u.as_str().len())
+                        })
+                        .sum::<usize>(),
+            ));
         }
         if !window_request_urls.is_empty() {
             visitor.opaque_storage();
@@ -2098,12 +2136,13 @@ mod desktop {
             });
         }
         let handle = env.net.as_ref()?;
+        let client = url::Url::parse(&env.url).ok()?;
         let fetch = env
             .cache
-            .peek_resource(&resolved, base, "script", credentials)
+            .peek_resource(&resolved, &client, "script", credentials)
             .unwrap_or_else(|| {
                 env.cache
-                    .fetch_resource(handle, resolved.clone(), base, "script", credentials)
+                    .fetch_resource(handle, resolved.clone(), &client, "script", credentials)
             });
         let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
         crate::http::module_script_response_allowed(response.status, &response.content_type).then(
@@ -2541,9 +2580,12 @@ mod desktop {
     /// resource document before the use-element shadow tree can be rendered. Keep the resource
     /// cache and request policy identical to the other required Lumen subresource paths.
     fn prime_page_svg_sprites(page: &mut LumenPage) {
-        let urls = page.dom.borrow().external_svg_use_sheets(&page.base);
+        let urls = page
+            .dom
+            .borrow()
+            .external_svg_use_sheet_requests(&page.base);
         let client = request_context_url(page.engine.ctx(), 0);
-        for url in urls {
+        for (url, restricted) in urls {
             if crate::dom::sprite_sheet_cached(url.as_str()) {
                 continue;
             }
@@ -2554,20 +2596,24 @@ mod desktop {
                 {
                     return None;
                 }
-                let shared = if let Some(shared) =
-                    network.cache.peek_resource(&url, &client, "image", None)
+                let shared = if let Some(shared) = (!restricted)
+                    .then(|| network.cache.peek_resource(&url, &client, "image", None))
+                    .flatten()
                 {
                     shared
                 } else {
                     network
                         .fetched
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    network.cache.fetch_resource(
+                    let mut context = crate::http::CookieContext::subresource(&client);
+                    context.cross_site_ancestor = restricted;
+                    network.cache.fetch_resource_with_cookies(
                         &network.handle,
                         url.clone(),
                         &client,
                         "image",
                         None,
+                        context,
                     )
                 };
                 Some((network.handle.clone(), shared))
@@ -4994,10 +5040,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_scroll_get", 2, host_scroll_get),
     ("__dom_scroll_set", 3, host_scroll_set),
     ("__dom_load_frame", 3, host_load_frame),
-    ("__cookie_get", 0, host_cookie_get),
-    ("__cookie_set", 1, host_cookie_set),
+    ("__cookie_get", 3, host_cookie_get),
+    ("__cookie_set", 4, host_cookie_set),
     ("__clock_now", 0, host_clock_now),
     ("__clock_set", 1, host_clock_set),
+    ("__storage_allowed", 1, host_storage_allowed),
     ("__storage_get", 2, host_storage_get),
     ("__storage_set", 3, host_storage_set),
     ("__storage_remove", 2, host_storage_remove),
@@ -5415,6 +5462,25 @@ fn request_context_url(ctx: &mut Ctx, context: u64) -> url::Url {
         .clone()
 }
 
+fn request_cookie_context(ctx: &mut Ctx) -> crate::http::CookieContext {
+    let id = ctx.host_job_context();
+    cookie_context_for_id(ctx, id)
+}
+
+fn cookie_context_for_id(ctx: &mut Ctx, id: u64) -> crate::http::CookieContext {
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("cookie settings require HostState");
+    if let Some((_, _, context)) = state.window_cookie_contexts.get(&id) {
+        return context.clone();
+    }
+    let mut context = crate::http::CookieContext::subresource(
+        state.window_request_urls.get(&0).unwrap_or(&state.base),
+    );
+    context.cross_site_ancestor = id != 0;
+    context
+}
+
 // Fetch §5.4 and XHR §3.5.6 assign the request client from the API object's
 // relevant environment settings. In particular a child Window's own-origin
 // request must not acquire the embedder's Origin/CORS/credentials context.
@@ -5455,6 +5521,7 @@ fn prepare_client_request(
         body,
         headers,
         fetch_metadata: None,
+        cookie_context: None,
         timing_client: None,
         fetch_policy: fetch_policy.map(|(mode, credentials)| crate::http::FetchPolicy {
             origin: page.clone(),
@@ -5465,6 +5532,16 @@ fn prepare_client_request(
     let mode = fetch_policy.map_or(crate::http::RequestMode::NoCors, |(mode, _)| mode);
     crate::http::set_fetch_metadata(&mut request, page, "empty", mode.as_str());
     crate::http::set_referrer(&mut request, page);
+    if let Some(context) = request.cookie_context.as_mut() {
+        context.cross_site_ancestor = state
+            .window_cookie_contexts
+            .values()
+            .any(|(_, _, c)| c.client.as_ref() == Some(page) && c.cross_site_ancestor)
+            || !crate::site_storage::same_site(
+                state.window_request_urls.get(&0).unwrap_or(&state.base),
+                page,
+            );
+    }
     Some((network.handle.clone(), network.cache.clone(), request))
 }
 
@@ -5587,11 +5664,17 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
     let initiator = resource_initiator(ctx, args);
     let client = request_client_url(ctx);
+    let cookie_context = request_cookie_context(ctx);
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!("[fetch-trace] sync {method} {target}");
     }
     let work = ctx.host_mut::<HostState>().and_then(|state| {
-        prepare_client_request(state, &client, &target, method, body, headers, policy)
+        prepare_client_request(state, &client, &target, method, body, headers, policy).map(
+            |(handle, cache, mut request)| {
+                request.cookie_context = Some(cookie_context);
+                (handle, cache, request)
+            },
+        )
     });
     let (result, timing) = match work {
         Some((handle, cache, request)) => {
@@ -5624,6 +5707,10 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
         Some(node) => element_request_client_url(ctx, node),
         None => request_client_url(ctx),
     };
+    let cookie_context = match node {
+        Some(node) => element_cookie_context(ctx, node),
+        None => request_cookie_context(ctx),
+    };
     let destination =
         if node.is_some_and(|node| host_dom(ctx).borrow().tag_name(node) == Some("frame")) {
             "frame"
@@ -5644,6 +5731,7 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     let details = match work {
         Some((handle, cache, mut request)) => {
             crate::http::set_fetch_metadata(&mut request, &client, destination, "navigate");
+            request.cookie_context = Some(cookie_context);
             request
                 .headers
                 .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
@@ -5784,6 +5872,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     let initiator = resource_initiator(ctx, args);
     let started = crate::performance::now_ms();
     let client = request_client_url(ctx);
+    let cookie_context = request_cookie_context(ctx);
     let resource_name = client
         .join(&target)
         .map_or_else(|_| String::new(), |url| url.to_string());
@@ -5808,7 +5897,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 .join(&target)
                 .ok()
                 .is_some_and(|url| crate::http::same_origin_for_host(&client, &url));
-        let cached = if cache_safe_for_policy {
+        let cached = if cache_safe_for_policy && !cookie_context.cross_site_ancestor {
             state.network.as_ref().and_then(|network| {
                 (method.eq_ignore_ascii_case("GET") && body.is_none())
                     .then(|| client.join(&target).ok())
@@ -5832,7 +5921,10 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         let source = match cached {
             Some(shared) => Some(AsyncFetchSource::Cached(shared)),
             None => prepare_client_request(state, &client, &target, method, body, headers, policy)
-                .map(|(_, _, request)| AsyncFetchSource::Request(Box::new(request))),
+                .map(|(_, _, mut request)| {
+                    request.cookie_context = Some(cookie_context);
+                    AsyncFetchSource::Request(Box::new(request))
+                }),
         };
         let events = state.task_events.clone();
         match (state.network.as_mut(), source, events) {
@@ -5998,6 +6090,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     };
 
     let url = host_arg_string(ctx, args, 2);
+    let parent_cookie_context = request_cookie_context(ctx);
     let creator_url = request_client_url(ctx);
     let parsed_url = url::Url::parse(&url).unwrap_or_else(|_| creator_url.clone());
     let client_url =
@@ -6006,6 +6099,14 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         } else {
             parsed_url
         };
+    let cookie_opaque = host_dom(ctx)
+        .borrow()
+        .attr(frame_id, "sandbox")
+        .is_some_and(|flags| {
+            !flags
+                .split_ascii_whitespace()
+                .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
+        });
     let source_config = args.get(3).cloned().unwrap_or(Value::Undefined);
     let parent_window = args.get(4).cloned().unwrap_or(Value::Undefined);
     let top_window = args.get(5).cloned().unwrap_or(Value::Undefined);
@@ -6048,6 +6149,36 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // published through the iframe element.
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.insert(context, realm.clone());
+        let mut cookie_context = crate::http::CookieContext::subresource(&client_url);
+        cookie_context.cross_site_ancestor = parent_cookie_context.cross_site_ancestor
+            || parent_cookie_context
+                .client
+                .as_ref()
+                .is_none_or(|parent| !crate::site_storage::same_site(parent, &client_url));
+        if state
+            .dom
+            .borrow()
+            .attr(frame_id, "sandbox")
+            .is_some_and(|flags| {
+                !flags
+                    .split_ascii_whitespace()
+                    .any(|flag| flag.eq_ignore_ascii_case("allow-same-origin"))
+            })
+        {
+            cookie_context.cross_site_ancestor = true;
+        }
+        state
+            .dom
+            .borrow_mut()
+            .set_frame_cookie_restriction(frame_id, cookie_context.cross_site_ancestor);
+        state.window_cookie_contexts.insert(
+            context,
+            (
+                frame_id,
+                url::Url::parse(&url).unwrap_or_else(|_| client_url.clone()),
+                cookie_context,
+            ),
+        );
         state.window_request_urls.insert(context, client_url);
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
@@ -6073,6 +6204,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 realm_ctx.member_set(&config, name, value)?;
             }
         }
+        realm_ctx.member_set(&config, "cookieOpaque", Value::Bool(cookie_opaque))?;
         realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
         realm_ctx.member_set(&config, "referrer", Value::from_string(referrer.clone()))?;
         realm_ctx.member_set(&config, "navigationTiming", navigation_timing.clone())?;
@@ -6114,6 +6246,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.window_realms.remove(&context);
                 state.window_request_urls.remove(&context);
+                state.window_cookie_contexts.remove(&context);
             }
             return Err(error);
         }
@@ -6143,6 +6276,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.remove(&context);
         state.window_request_urls.remove(&context);
+        state.window_cookie_contexts.remove(&context);
         if let Some(network) = state.network.as_mut() {
             network
                 .pending_fetches
@@ -6184,6 +6318,14 @@ fn element_request_client_url(ctx: &mut Ctx, node: usize) -> url::Url {
     request_context_url(ctx, context)
 }
 
+fn element_cookie_context(ctx: &mut Ctx, node: usize) -> crate::http::CookieContext {
+    let id = host_call_trust(ctx, "resourceClientContext", &[Value::Num(node as f64)])
+        .ok()
+        .and_then(|v| v.as_num_opt())
+        .map_or(u64::MAX, |v| v as u64);
+    cookie_context_for_id(ctx, id)
+}
+
 fn prepare_element_request(
     ctx: &mut Ctx,
     node: usize,
@@ -6192,6 +6334,7 @@ fn prepare_element_request(
     module: bool,
 ) -> Option<crate::http::Request> {
     let client = element_request_client_url(ctx, node);
+    let cookie_context = element_cookie_context(ctx, node);
     let (credentials, referrer_policy) = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -6222,6 +6365,7 @@ fn prepare_element_request(
             "no-cors"
         },
     );
+    request.cookie_context = Some(cookie_context);
     request
         .headers
         .retain(|(key, _)| !key.eq_ignore_ascii_case("referer"));
@@ -6677,9 +6821,11 @@ fn host_ws_open(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     let Some(protocols) = crate::ws::parse_protocols(&protocols) else {
         return Ok(Value::Num(-1.0));
     };
+    let cookie_context = request_cookie_context(ctx);
+    let client = request_client_url(ctx);
     let connection = ctx.host_mut::<HostState>().and_then(|state| {
         let sockets = state.websockets.as_mut()?;
-        let resolved = sockets.page.join(&target).ok()?;
+        let resolved = client.join(&target).ok()?;
         if !matches!(resolved.scheme(), "ws" | "wss") || resolved.fragment().is_some() {
             return None;
         }
@@ -6696,13 +6842,14 @@ fn host_ws_open(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
         }
         let id = sockets.next_id;
         sockets.next_id += 1;
-        let origin = sockets.page.origin().ascii_serialization();
-        let cookie = crate::http::cookies_for_request(&http_equivalent);
+        let origin = client.origin().ascii_serialization();
+        let mut cookie_request = crate::http::Request::get(http_equivalent);
+        cookie_request.cookie_context = Some(cookie_context);
         let (sender, task) = crate::ws::connect(
             resolved,
             protocols,
             origin,
-            (!cookie.is_empty()).then_some(cookie),
+            Some(cookie_request),
             &sockets.handle,
             id,
             sockets.events.clone(),
@@ -6799,6 +6946,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         .map(|_| host_latin1_bytes(ctx, args, 3));
     let context = ctx.host_job_context();
     let owner_page = request_client_url(ctx);
+    let cookie_context = request_cookie_context(ctx);
 
     let agent_cluster = ctx
         .host_mut::<HostState>()
@@ -6820,6 +6968,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
                 LumenWorkerLaunch {
                     id,
                     owner_page: owner_page.clone(),
+                    cookie_context: cookie_context.clone(),
                     script_url,
                     kind,
                     name,
@@ -7091,6 +7240,7 @@ struct LumenWorkerScript {
 
 struct LumenWorkerModuleFetch {
     page: url::Url,
+    cookie_context: crate::http::CookieContext,
     handle: tokio::runtime::Handle,
     cache: Arc<crate::http::PageCache>,
     fetched: Arc<std::sync::atomic::AtomicUsize>,
@@ -7132,6 +7282,7 @@ fn fetch_lumen_worker_script(
 
     let mut request = crate::http::Request::get(launch.script_url.clone());
     crate::http::set_fetch_metadata(&mut request, &launch.owner_page, "worker", "same-origin");
+    request.cookie_context = Some(launch.cookie_context.clone());
     crate::http::set_referrer(&mut request, &launch.owner_page);
     request.fetch_policy = Some(crate::http::FetchPolicy {
         origin: launch.owner_page.clone(),
@@ -7244,6 +7395,7 @@ fn eval_lumen_worker_module(
     id: usize,
 ) -> bool {
     let loader_page = fetch.page;
+    let cookie_context = fetch.cookie_context;
     let loader_handle = fetch.handle;
     let loader_cache = fetch.cache;
     let loader_fetched = fetch.fetched;
@@ -7253,6 +7405,7 @@ fn eval_lumen_worker_module(
         move |specifier, referrer, _attributes| {
             module_dependency_loader(
                 &loader_page,
+                &cookie_context,
                 &loader_handle,
                 &loader_cache,
                 &loader_fetched,
@@ -7359,6 +7512,14 @@ fn run_lumen_worker(
     let clock = Rc::new(RealmClock::new());
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
     state.base = launch.script_url.clone();
+    state.window_cookie_contexts.insert(
+        0,
+        (
+            DOCUMENT,
+            launch.script_url.clone(),
+            launch.cookie_context.clone(),
+        ),
+    );
     state.agent_cluster = launch.agent_cluster;
     state.network = Some(LumenNetwork {
         handle: handle.clone(),
@@ -7448,6 +7609,7 @@ fn run_lumen_worker(
                 &script,
                 LumenWorkerModuleFetch {
                     page: launch.owner_page.clone(),
+                    cookie_context: launch.cookie_context.clone(),
                     handle: handle.clone(),
                     cache: cache.clone(),
                     fetched,
@@ -7527,8 +7689,33 @@ fn run_lumen_worker(
     }
 }
 
+fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
+    let page = request_context_url(engine.ctx(), context);
+    let cookie_context = cookie_context_for_id(engine.ctx(), context);
+    let work = engine.ctx().host_mut::<HostState>().and_then(|state| {
+        state
+            .network
+            .as_ref()
+            .map(|n| (n.handle.clone(), n.cache.clone(), n.fetched.clone()))
+    });
+    if let Some((handle, cache, fetched)) = work {
+        engine.set_module_loader(move |specifier, referrer| {
+            module_dependency_loader(
+                &page,
+                &cookie_context,
+                &handle,
+                &cache,
+                &fetched,
+                specifier,
+                referrer,
+            )
+        });
+    }
+}
+
 fn module_dependency_loader(
     page: &url::Url,
+    cookie_context: &crate::http::CookieContext,
     handle: &tokio::runtime::Handle,
     cache: &Arc<crate::http::PageCache>,
     fetched: &std::sync::atomic::AtomicUsize,
@@ -7552,29 +7739,35 @@ fn module_dependency_loader(
     {
         return None;
     }
-    let response = if let Some(shared) = cache.peek_resource(
-        &resolved,
-        page,
-        "script",
-        Some(crate::http::CredentialsMode::SameOrigin),
-    ) {
+    let response = if let Some(shared) = (!cookie_context.cross_site_ancestor)
+        .then(|| {
+            cache.peek_resource(
+                &resolved,
+                page,
+                "script",
+                Some(crate::http::CredentialsMode::SameOrigin),
+            )
+        })
+        .flatten()
+    {
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     } else {
         // HTML's fetch-a-module-script graph algorithm requires this dependency. Keep the count
         // as diagnostics, but never turn historical activity into a synthetic load failure.
         fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let shared = cache.fetch_resource(
+        let shared = cache.fetch_resource_with_cookies(
             handle,
             resolved.clone(),
             page,
             "script",
             Some(crate::http::CredentialsMode::SameOrigin),
+            cookie_context.clone(),
         );
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     };
     crate::http::module_script_response_allowed(response.status, &response.content_type).then(
         || {
-            if cache.claim_module_import_scan(&resolved) {
+            if !cookie_context.cross_site_ancestor && cache.claim_module_import_scan(&resolved) {
                 speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
             }
             (
@@ -7624,6 +7817,7 @@ fn queue_dynamic_module_load(
 ) {
     let Some(resolved) = resolve_module_specifier(&loader.page, specifier, referrer) else {
         let _ = loader.events.send(LumenHostTask::DynamicModule {
+            context: loader.context,
             request_id,
             result: None,
         });
@@ -7631,13 +7825,16 @@ fn queue_dynamic_module_load(
     };
     if resolved.scheme() == "data" {
         let result = data_dynamic_module_result(&resolved);
-        let _ = loader
-            .events
-            .send(LumenHostTask::DynamicModule { request_id, result });
+        let _ = loader.events.send(LumenHostTask::DynamicModule {
+            context: loader.context,
+            request_id,
+            result,
+        });
         return;
     }
     let Some(network) = loader.network.as_ref() else {
         let _ = loader.events.send(LumenHostTask::DynamicModule {
+            context: loader.context,
             request_id,
             result: None,
         });
@@ -7647,18 +7844,24 @@ fn queue_dynamic_module_load(
         || !crate::http::subresource_allowed(&loader.page, &resolved)
     {
         let _ = loader.events.send(LumenHostTask::DynamicModule {
+            context: loader.context,
             request_id,
             result: None,
         });
         return;
     }
 
-    let shared = if let Some(shared) = network.cache.peek_resource(
-        &resolved,
-        &loader.page,
-        "script",
-        Some(crate::http::CredentialsMode::SameOrigin),
-    ) {
+    let shared = if let Some(shared) = (!loader.cookie_context.cross_site_ancestor)
+        .then(|| {
+            network.cache.peek_resource(
+                &resolved,
+                &loader.page,
+                "script",
+                Some(crate::http::CredentialsMode::SameOrigin),
+            )
+        })
+        .flatten()
+    {
         shared
     } else {
         // ECMA-262 HostLoadImportedModule plus HTML's module-script fetch do not permit a host to
@@ -7666,15 +7869,17 @@ fn queue_dynamic_module_load(
         network
             .fetched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        network.cache.fetch_resource(
+        network.cache.fetch_resource_with_cookies(
             &network.handle,
             resolved.clone(),
             &loader.page,
             "script",
             Some(crate::http::CredentialsMode::SameOrigin),
+            loader.cookie_context.clone(),
         )
     };
     let events = loader.events.clone();
+    let context = loader.context;
     network.cache.spawn(&network.handle, async move {
         let result = shared.await.ok().and_then(|response| {
             crate::http::module_script_response_allowed(response.status, &response.content_type)
@@ -7685,11 +7890,18 @@ fn queue_dynamic_module_load(
                     )
                 })
         });
-        let _ = events.send(LumenHostTask::DynamicModule { request_id, result });
+        let _ = events.send(LumenHostTask::DynamicModule {
+            context,
+            request_id,
+            result,
+        });
     });
 }
 
 fn speculate_engine_imports(engine: &mut lumen::Engine, base: &url::Url, body: &[u8]) {
+    if request_cookie_context(engine.ctx()).cross_site_ancestor {
+        return;
+    }
     let Some((page, handle, cache, fetched)) =
         engine.ctx().host_mut::<HostState>().and_then(|state| {
             let network = state.network.as_ref()?;
@@ -7884,10 +8096,12 @@ fn run_injected_module_task(
     name: &str,
     source: &str,
 ) -> Result<(), String> {
+    let cookie_context = element_cookie_context(engine.ctx(), node_id);
+    let client = element_request_client_url(engine.ctx(), node_id);
     let snapshot = engine.ctx().host_mut::<HostState>().and_then(|state| {
         let network = state.network.as_ref()?;
         Some((
-            state.base.clone(),
+            client,
             network.handle.clone(),
             network.cache.clone(),
             network.fetched.clone(),
@@ -7913,6 +8127,7 @@ fn run_injected_module_task(
                     move |specifier, referrer, _attributes| {
                         module_dependency_loader(
                             &loader_page,
+                            &cookie_context,
                             &handle,
                             &cache,
                             &fetched,
@@ -8228,7 +8443,41 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 }
             }
         }
-        LumenHostTask::DynamicModule { request_id, result } => {
+        LumenHostTask::DynamicModuleStart {
+            request_id,
+            context,
+            specifier,
+            referrer,
+        } => {
+            let cookie_context = cookie_context_for_id(engine.ctx(), context);
+            let page = request_context_url(engine.ctx(), context);
+            let state = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .expect("module host state");
+            if let Some(events) = state.task_events.clone() {
+                let loader = LumenDynamicModuleLoader {
+                    context,
+                    page,
+                    cookie_context,
+                    events,
+                    network: state
+                        .network
+                        .as_ref()
+                        .map(|network| LumenDynamicModuleNetwork {
+                            handle: network.handle.clone(),
+                            cache: network.cache.clone(),
+                            fetched: network.fetched.clone(),
+                        }),
+                };
+                queue_dynamic_module_load(&loader, request_id, &specifier, &referrer);
+            }
+        }
+        LumenHostTask::DynamicModule {
+            context,
+            request_id,
+            result,
+        } => {
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
                 let _ = state.pending_dynamic_modules.fetch_update(
                     std::sync::atomic::Ordering::Relaxed,
@@ -8236,12 +8485,9 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     |count| Some(count.saturating_sub(1)),
                 );
             }
-            if let Some((name, source)) = result.as_ref()
-                && let Ok(base) = url::Url::parse(name)
-            {
-                speculate_engine_imports(engine, &base, source.as_bytes());
-            }
+            install_context_module_loader(engine, context);
             let _ = engine.finish_dynamic_module_load(request_id, result);
+            install_context_module_loader(engine, 0);
         }
         LumenHostTask::WebSocket { id, event } => {
             dispatch_websocket_task(engine, id, event)?;
@@ -9826,24 +10072,69 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Undefined)
 }
 
-fn host_cookie_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let page = ctx
-        .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call")
-        .base
-        .clone();
-    Ok(Value::from_string(crate::http::cookies_for_js(&page)))
+fn document_cookie_url(ctx: &mut Ctx, args: &[Value]) -> Option<url::Url> {
+    let id = args.first()?.as_num_opt()? as usize;
+    let context_id = args.get(1)?.as_num_opt()? as u64;
+    let url = url::Url::parse(&host_arg_string(ctx, args, 2)).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let state = ctx.host_mut::<HostState>()?;
+    if id == DOCUMENT && context_id == 0 {
+        return crate::http::same_origin_for_host(
+            &url,
+            state.window_request_urls.get(&0).unwrap_or(&state.base),
+        )
+        .then_some(url);
+    }
+    let context = if context_id != 0 {
+        state
+            .window_cookie_contexts
+            .get(&context_id)
+            .filter(|(frame, _, _)| *frame == id)
+    } else {
+        state
+            .window_cookie_contexts
+            .iter()
+            .filter(|(_, (frame, _, _))| *frame == id)
+            .max_by_key(|(id, _)| *id)
+            .map(|(_, record)| record)
+    };
+    context
+        .filter(|(_, _, c)| {
+            !c.cross_site_ancestor
+                && c.client
+                    .as_ref()
+                    .is_some_and(|client| crate::http::same_origin_for_host(client, &url))
+        })
+        .map(|_| url)
 }
 
+fn host_cookie_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = document_cookie_url(ctx, args)
+        .map_or_else(String::new, |page| crate::http::cookies_for_js(&page));
+    Ok(Value::from_string(value))
+}
 fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let line = host_arg_string(ctx, args, 0);
-    let page = ctx
-        .host_mut::<HostState>()
-        .expect("HostState installed before any Lumen host call")
-        .base
-        .clone();
-    crate::http::set_cookie_from_js(&page, &line);
+    let line = host_arg_string(ctx, args, 3);
+    if let Some(page) = document_cookie_url(ctx, args) {
+        crate::http::set_cookie_from_js(&page, &line);
+    }
     Ok(Value::Undefined)
+}
+fn host_storage_allowed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .map_or(u64::MAX, |v| v as u64);
+    let context = cookie_context_for_id(ctx, id);
+    Ok(Value::Bool(
+        !context.cross_site_ancestor
+            && context
+                .client
+                .as_ref()
+                .is_some_and(|url| crate::site_storage::site(url).is_some()),
+    ))
 }
 
 fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage, String) {
@@ -9874,27 +10165,50 @@ fn host_storage_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     let key = host_arg_string(ctx, args, 1);
     let value = host_arg_string(ctx, args, 2);
     let (storage, bucket) = host_storage_bucket(ctx, args);
-    storage
-        .lock()
-        .unwrap()
-        .entry(bucket)
-        .or_default()
-        .insert(key, value);
-    Ok(Value::Undefined)
+    let mut storage = storage.lock().unwrap();
+    if bucket.starts_with("local:") {
+        let size = |k: &str, v: &str| 2 * (k.encode_utf16().count() + v.encode_utf16().count());
+        let mut total = 0;
+        let mut origin = 0;
+        for (other, entries) in storage.iter().filter(|(b, _)| b.starts_with("local:")) {
+            for (k, v) in entries {
+                if other == &bucket && k == &key {
+                    continue;
+                }
+                let bytes = size(k, v);
+                total += bytes;
+                if other == &bucket {
+                    origin += bytes;
+                }
+            }
+        }
+        let bytes = size(&key, &value);
+        if origin + bytes > crate::site_storage::ORIGIN_QUOTA
+            || total + bytes > crate::site_storage::PROFILE_QUOTA
+        {
+            return Ok(Value::Bool(false));
+        }
+    }
+    crate::site_storage::local_mutation(&bucket, &key, Some(&value));
+    storage.entry(bucket).or_default().insert(key, value);
+    Ok(Value::Bool(true))
 }
 
 fn host_storage_remove(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let key = host_arg_string(ctx, args, 1);
     let (storage, bucket) = host_storage_bucket(ctx, args);
-    if let Some(bucket) = storage.lock().unwrap().get_mut(&bucket) {
-        bucket.remove(&key);
+    if let Some(values) = storage.lock().unwrap().get_mut(&bucket) {
+        values.remove(&key);
+        crate::site_storage::local_mutation(&bucket, &key, None);
     }
     Ok(Value::Undefined)
 }
 
 fn host_storage_clear(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let (storage, bucket) = host_storage_bucket(ctx, args);
-    storage.lock().unwrap().remove(&bucket);
+    let mut storage = storage.lock().unwrap();
+    storage.remove(&bucket);
+    crate::site_storage::local_clear(&bucket);
     Ok(Value::Undefined)
 }
 
@@ -10973,7 +11287,10 @@ mod tests {
         engine
     }
 
-    fn configured_engine_before_prelude(state: HostState, url: &str) -> lumen::Engine {
+    fn configured_engine_before_prelude(mut state: HostState, url: &str) -> lumen::Engine {
+        state
+            .window_request_urls
+            .insert(0, url::Url::parse(url).unwrap());
         let mut engine = lumen::Engine::new();
         engine.set_tier(Tier::Interp);
         let clock = state.clock.clone();
@@ -11177,7 +11494,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 148, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 149, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -11188,7 +11505,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 148);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 149);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -13695,7 +14012,7 @@ mod tests {
         let cache = Arc::new(crate::http::PageCache::default());
         seed_direct_response(
             &cache,
-            "https://widget.example.test/api".into(),
+            "https://widget.example.com/api".into(),
             200,
             "text/plain".into(),
             b"child response".to_vec(),
@@ -13722,7 +14039,7 @@ mod tests {
             // without needing a live external document server in this unit test.
             const context = __dom_allocate_job_context();
             globalThis.foreign = __dom_create_window_realm(context, frame.__id,
-                'https://widget.example.test/widget', __trust_cfg, window, window, frame, 0, '');
+                'https://widget.example.com/widget', __trust_cfg, window, window, frame, 0, '');
             foreign.eval("globalThis.result='pending'; fetch('/api',{mode:'same-origin'})" +
                 ".then(r=>r.text()).then(t=>globalThis.result=t,e=>globalThis.result=e.name)");
         "#,
@@ -13740,7 +14057,7 @@ mod tests {
             string_value(&mut engine, "foreign.result"),
             "child response"
         );
-        let client = url::Url::parse("https://widget.example.test/widget").unwrap();
+        let client = url::Url::parse("https://widget.example.com/widget").unwrap();
         let state = engine.ctx().host_mut::<HostState>().unwrap();
         let (_, _, request) = prepare_client_request(
             state,
@@ -14783,12 +15100,20 @@ mod tests {
             Some(1)
         );
 
-        let task = runtime
-            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await })
-            .expect("dynamic module task completes")
-            .expect("dynamic module channel remains open");
-        dispatch_host_task(&mut engine, task).unwrap();
-        run_microtask_checkpoint(&mut engine);
+        loop {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await
+                })
+                .expect("dynamic module task completes")
+                .expect("dynamic module channel remains open");
+            let started = matches!(&task, LumenHostTask::DynamicModuleStart { .. });
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+            if !started {
+                break;
+            }
+        }
 
         assert_eq!(string_value(&mut engine, "awaitedModuleBody"), "done");
         assert_eq!(string_value(&mut engine, "awaitedEntryBody"), "done");
@@ -16071,6 +16396,142 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_storage_policy_blocks_third_party_frames_and_hides_host_capabilities() {
+        let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        crate::http::set_cookies_enabled(true);
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://bookmark-policy.example/",
+        );
+        eval(&mut engine, r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            document.cookie = 'storagePolicy=top; Path=/';
+            function createStoragePolicyRealm(url) {
+                const frame = document.createElement('iframe'); body.appendChild(frame);
+                frame.__contentDoc = undefined;
+                return __dom_create_window_realm(__dom_allocate_job_context(), frame.__id, url,
+                    __trust_cfg, window, window, frame, 0, '');
+            }
+            const third = createStoragePolicyRealm('https://third.example.net/');
+            third.eval(`
+                globalThis.policyResult = [];
+                try { localStorage; policyResult.push('exposed'); }
+                catch (e) { policyResult.push(e.name, e instanceof DOMException); }
+                document.__id = 0;
+                document.cookie = 'storagePolicy=attack; Path=/';
+                policyResult.push(document.cookie, typeof __cookie_get, typeof __cookie_set,
+                    typeof __storage_get, typeof __storage_set, typeof __storage_allowed);
+            `);
+            const sibling = createStoragePolicyRealm('https://sibling.bookmark-policy.example/');
+            sibling.eval(`localStorage.marker = 'sibling'; document.cookie = 'child=visible; Path=/'; globalThis.policyResult = localStorage.marker + ':' + document.cookie;`);
+            const insecure = createStoragePolicyRealm('http://bookmark-policy.example/');
+            insecure.eval(`try { localStorage; globalThis.policyResult = 'exposed'; } catch (e) { globalThis.policyResult = e.name; }`);
+            globalThis.bookmarkStoragePolicyResult = third.policyResult.join('|') + '|' + sibling.policyResult + '|' + insecure.policyResult + '|' + document.cookie;
+            globalThis.fakeCookieDocument = new Document(0).cookie;
+        "#, "bookmark storage policy").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "bookmarkStoragePolicyResult"),
+            "SecurityError|true||undefined|undefined|undefined|undefined|undefined|sibling:child=visible|SecurityError|storagePolicy=top"
+        );
+        assert_eq!(string_value(&mut engine, "fakeCookieDocument"), "");
+    }
+
+    #[test]
+    fn bookmark_storage_policy_local_quota_keeps_previous_value_and_throws_dom_exception() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            localStorage.marker = 'kept';
+            const tooLarge = 'x'.repeat(5 * 1024 * 1024 / 2);
+            const errors = [];
+            for (const write of [() => localStorage.setItem('marker', tooLarge), () => { localStorage.marker = tooLarge; }]) {
+                try { write(); errors.push('accepted'); } catch (e) { errors.push(e.name + ':' + (e instanceof DOMException)); }
+            }
+            globalThis.bookmarkQuotaResult = errors.join('|') + '|' + localStorage.marker;
+        "#, "localStorage quota").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "bookmarkQuotaResult"),
+            "QuotaExceededError:true|QuotaExceededError:true|kept"
+        );
+    }
+
+    #[test]
+    fn bookmark_storage_policy_cookie_path_follows_document_history_url() {
+        let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        crate::http::set_cookies_enabled(true);
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://cookie-history.example/first/page",
+        );
+        eval(&mut engine, r#"
+            document.cookie = 'first=1';
+            const base = document.createElement('base');
+            base.href = 'https://cookie-history.example/unrelated/';
+            document.appendChild(base);
+            Object.defineProperty(document, 'URL', {value:'https://cookie-history.example/forged/'});
+            const result = [document.cookie];
+            history.pushState({}, '', 'https://cookie-history.example/second/page');
+            result.push(document.cookie);
+            document.cookie = 'second=1';
+            result.push(document.cookie);
+            location.href = 'https://cookie-history.example/first/page';
+            result.push(document.cookie);
+            globalThis.cookieHistoryResult = result.join('|');
+        "#, "cookie document URL").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "cookieHistoryResult"),
+            "first=1||second=1|second=1"
+        );
+    }
+
+    #[test]
+    fn bookmark_storage_policy_checks_nested_ancestors_and_cookie_averse_documents() {
+        let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        crate::http::set_cookies_enabled(true);
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://cookie-ancestors.example/",
+        );
+        eval(&mut engine, r#"
+            document.cookie = 'ancestor=top; Path=/';
+            function realm(url, sandbox) {
+                const frame = document.createElement('iframe');
+                if (sandbox !== undefined) frame.setAttribute('sandbox', sandbox);
+                document.appendChild(frame); frame.__contentDoc = undefined;
+                return __dom_create_window_realm(__dom_allocate_job_context(), frame.__id, url,
+                    __trust_cfg, window, window, frame, 0, '');
+            }
+            const third = realm('https://elsewhere.example.net/');
+            third.eval(`
+                const frame = document.createElement('iframe');
+                document.appendChild(frame); frame.__contentDoc = undefined;
+                const nested = __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
+                    'https://cookie-ancestors.example/', __trust_cfg, window, top, frame, 0, '');
+                nested.eval("globalThis.result = document.cookie; try { localStorage; result += 'exposed'; } catch (e) { result += e.name; }");
+                globalThis.result = nested.result;
+            `);
+            const opaque = realm('https://cookie-ancestors.example/', 'allow-scripts');
+            opaque.eval(`globalThis.result = []; for (const op of [() => document.cookie, () => { document.cookie = 'bad=1'; }]) { try { op(); result.push('exposed'); } catch (e) { result.push(e.name); } }`);
+            const blank = realm('about:blank', 'allow-scripts');
+            blank.eval(`document.cookie = 'ignored=1'; globalThis.result = document.cookie;`);
+            globalThis.ancestorCookieResult = [third.result, opaque.result.join(','), blank.result, document.cookie].join('|');
+        "#, "nested site for cookies").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "ancestorCookieResult"),
+            "SecurityError|SecurityError,SecurityError||ancestor=top"
+        );
+    }
+
+    #[test]
     fn storage_named_properties_survive_realm_replacement_at_the_same_origin() {
         let storage = crate::js::WebStorage::default();
         for (url, expected) in [
@@ -16111,18 +16572,18 @@ mod tests {
                 return __dom_create_window_realm(context, frame.__id, url,
                     __trust_cfg, window, window, frame, 0, '');
             }
-            globalThis.storageForeign = storageRealm('https://storage-child.example.test/a');
-            globalThis.storagePeer = storageRealm('https://storage-child.example.test/b');
-            globalThis.storagePort = storageRealm('https://storage-child.example.test:8443/a');
-            globalThis.storageScheme = storageRealm('http://storage-child.example.test/a');
+            globalThis.storageForeign = storageRealm('https://storage-child.example.com/a');
+            globalThis.storagePeer = storageRealm('https://storage-child.example.com/b');
+            globalThis.storagePort = storageRealm('https://storage-child.example.com:8443/a');
+            globalThis.storageScheme = storageRealm('http://storage-child.example.com/a');
             const results = [];
             for (const kind of ['localStorage', 'sessionStorage']) {
                 const top = window[kind], child = storageForeign[kind];
-                top.clear(); child.clear(); storagePort[kind].clear(); storageScheme[kind].clear();
+                top.clear(); child.clear(); storagePort[kind].clear(); if (kind === "sessionStorage") storageScheme[kind].clear();
                 top.setItem('marker', 'top'); child.setItem('marker', 'child');
                 results.push(top.getItem('marker'), child.getItem('marker'),
                     storagePeer[kind].getItem('marker'), storagePort[kind].getItem('marker') === null,
-                    storageScheme[kind].getItem('marker') === null, child === storageForeign[kind]);
+                    kind === 'localStorage' || storageScheme[kind].getItem('marker') === null, child === storageForeign[kind]);
                 storagePeer[kind].setItem('peer', 'shared');
                 results.push(child.length, child.getItem('peer'), top.length);
                 child.removeItem('marker');
@@ -16152,11 +16613,11 @@ mod tests {
             frame.__contentDoc = undefined;
             const context = __dom_allocate_job_context();
             const child = __dom_create_window_realm(context, frame.__id,
-                'https://storage-inherit.example.test/a', __trust_cfg, window, window, frame, 0, '');
+                'https://storage-inherit.example.com/a', __trust_cfg, window, window, frame, 0, '');
             // Mirror the UA publication step used by createFrameWindowRealm.
             // Otherwise the arena still associates descendants with the old
             // initial about:blank Window created when the frame was inserted.
-            frame.__frameUrl = 'https://storage-inherit.example.test/a';
+            frame.__frameUrl = 'https://storage-inherit.example.com/a';
             frame.__contentRealmWindow = child;
             frame.__contentDoc = child.document;
             child.eval(`
@@ -16202,12 +16663,12 @@ mod tests {
             frame.__contentDoc = undefined;
             globalThis.storageContext = __dom_allocate_job_context();
             const child = __dom_create_window_realm(storageContext, frame.__id,
-                'https://storage-retained.example.test/a', __trust_cfg, window, window, frame, 0, '');
+                'https://storage-retained.example.com/a', __trust_cfg, window, window, frame, 0, '');
             globalThis.retainedStorage = child.localStorage;
             localStorage.setItem('marker', 'top'); retainedStorage.setItem('marker', 'retained');
         "#, "retained frame storage setup").unwrap();
         engine.ctx().host_mut::<HostState>().unwrap().base =
-            url::Url::parse("https://different-base.example.test/").unwrap();
+            url::Url::parse("https://different-base.example.com/").unwrap();
         eval(&mut engine, r#"
             __dom_release_job_context(storageContext);
             globalThis.retainedStorageResult = [localStorage.getItem('marker'),

@@ -202,11 +202,37 @@ to it. Elsewhere the shortcuts also work in input fields and the image viewer.
 
 Bookmarks are shared by the terminal and desktop browsers, stored as versioned
 JSON in `$XDG_DATA_HOME/trust/bookmarks.json` (default
-`~/.local/share/trust/bookmarks.json`). They load only when needed. Saves are
+`~/.local/share/trust/bookmarks.json`). They also determine which web sites may
+retain state between runs. Saves are
 atomic and coordinate between running instances. Saving an existing destination
 reuses its entry; only an explicit title replaces its name. `status` shows the
 storage directories. Existing TLS certificates, pins and DICT preferences keep
-their existing locations. No disk cache or persistent cookies are introduced.
+their existing locations.
+
+HTTP(S) bookmarks allow the site's cookies with an explicit expiry and its
+localStorage to persist under `$XDG_DATA_HOME/trust/site-data/`. Site grouping
+uses the Public Suffix List (including private suffixes): subdomains, HTTP/HTTPS,
+and ports share permission, while cookie domain/path rules and localStorage's
+separate origins remain intact. A Gemini, Gopher, or other non-web bookmark does
+not grant web-storage permission. Session cookies and sessionStorage end when
+TRust closes. IndexedDB, Cache Storage, and service-worker state remain temporary.
+
+Bookmarking captures eligible cookies and localStorage already in memory, so you
+can bookmark after logging in. Removing the last web bookmark for a site deletes
+its saved state immediately but leaves the current session's memory intact.
+Undoing the removal allows that live state to be saved again. Expiration and
+site-requested deletion still apply; bookmarking does not guarantee that a login
+survives restart, particularly when the site uses session cookies.
+
+Third-party embedded/background requests cannot send or set cookies, and
+third-party frames cannot access localStorage, even for bookmarked sites.
+Main-page navigations follow SameSite rules. `set cookies off` disables cookie
+access and capture without clearing saved cookies or localStorage. These are
+separate stores: a site's cookie deletion does not itself clear localStorage.
+LocalStorage has a 5 MiB quota per origin and a 64 MiB total budget. Saved files
+have private filesystem permissions and are not encrypted. Writes are atomic,
+run off the UI thread, and coordinate with bookmark edits across instances;
+storage failures appear in the status line.
 
 Gopher menus and text appear progressively in a centered, left-aligned
 monospace column sized to the longest displayed source line, preserving line

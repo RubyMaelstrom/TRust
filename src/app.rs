@@ -633,7 +633,7 @@ pub struct App {
     /// call, 2026-06-12 — the engine only spins up for pages that
     /// actually carry scripts); `set js off` opts out.
     js_enabled: bool,
-    /// Session-lifetime web storage for page JS (RAM-only, origin-keyed).
+    /// Origin-keyed web storage; bookmarked localStorage may survive restarts.
     web_storage: crate::js::WebStorage,
     /// The living page behind the current browser doc, if its JS left
     /// anything to interact with. ONE live engine, ever.
@@ -1016,7 +1016,7 @@ impl App {
             vt: new_vt(24, 80),
             encoding: Encoding::Utf8,
             js_enabled: true,
-            web_storage: Default::default(),
+            web_storage: crate::site_storage::web_storage(),
             live_page: None,
             page_rx: None,
             last_scroll_sent: None,
@@ -1152,6 +1152,10 @@ impl App {
         // with no such hazard. (crossterm's own `EventStream` uses an identical
         // background-reader thread internally; we just own the channel.)
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<TermEvent>();
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        crate::site_storage::set_wake(move || {
+            let _ = storage_tx.try_send(());
+        });
         std::thread::Builder::new()
             .name("trust-input".into())
             .spawn(move || {
@@ -1197,6 +1201,9 @@ impl App {
         }
 
         while !self.quit {
+            if let Some(error) = crate::site_storage::take_notice() {
+                self.status = error;
+            }
             let menu_open = self.select_menu.is_some();
             if menu_was_open && !menu_open && !self.image_protocols.is_empty() {
                 terminal.clear()?;
@@ -1321,6 +1328,9 @@ impl App {
                 .as_ref()
                 .map(|(deadline, _)| *deadline);
             tokio::select! {
+                _ = storage_rx.recv() => {
+                    if let Some(error) = crate::site_storage::take_notice() { self.status = error; }
+                },
                 event = input_rx.recv() => match event {
                     Some(event) => self.on_terminal_event(event).await,
                     None => break, // the input reader thread ended
@@ -2646,7 +2656,7 @@ impl App {
                 (Some("cookies"), Some("on")) => {
                     http::set_cookies_enabled(true);
                     self.status = String::from(
-                        "Cookies on: RAM-only, exact-host only, sent with matching requests.",
+                        "Cookies on: first-party access; bookmarked sites may remember cookies.",
                     );
                 }
                 (Some("cookies"), Some("off")) => {
@@ -2981,7 +2991,7 @@ impl App {
             },
             js = if self.js_enabled { "on" } else { "off" },
             cookies = if http::cookies_enabled() {
-                "on (RAM-only, exact-host)"
+                "on (first-party; bookmarked sites may persist)"
             } else {
                 "off"
             },
@@ -3619,6 +3629,7 @@ impl App {
                 )),
                 headers: Vec::new(),
                 fetch_metadata: None,
+                cookie_context: None,
                 timing_client: None,
                 fetch_policy: None,
             };
@@ -3735,6 +3746,11 @@ impl App {
             .browser
             .as_ref()
             .and_then(|g| g.doc.blobs.as_ref().map(|b| b.0.clone()));
+        let cookie_restrictions = self
+            .browser
+            .as_ref()
+            .map(|g| g.doc.cookie_restricted_images.clone())
+            .unwrap_or_default();
         for u in &todo {
             self.imgs_in_flight.insert(u.clone());
         }
@@ -3746,8 +3762,11 @@ impl App {
                 let tx = tx.clone();
                 let page = page.clone();
                 let blobs = blobs.clone();
+                let restricted = cookie_restrictions.contains(&url);
                 async move {
-                    let decoded = load_one_image(&page, &url, blobs.as_ref()).await;
+                    let decoded =
+                        load_image_with_cookie_policy(&page, &url, blobs.as_ref(), restricted)
+                            .await;
                     let _ = tx.send(ImgLoadMsg { url, decoded }).await;
                 }
             }))
@@ -6318,6 +6337,12 @@ impl App {
             self.region_live.insert(node, old);
             return false;
         };
+        // Serialized patches do not carry immutable browsing contexts. Let
+        // the canonical full render authorize new image work instead.
+        if !keep_scroll && !rp.image_urls.is_empty() {
+            self.region_live.insert(node, old);
+            return false;
+        }
         self.region_live.insert(
             node,
             RegionLive {
@@ -6464,7 +6489,7 @@ impl App {
         } else {
             laid.width as usize <= content_width
         };
-        if !width_ok {
+        if !width_ok || !laid.image_urls.is_empty() {
             return false;
         }
         let g = self.browser.as_mut().unwrap();
@@ -9198,10 +9223,20 @@ const IMG_FETCH_CONCURRENCY: usize = 8;
 /// Fetch one page image (pooled GET, SSRF-guarded against private
 /// addresses) and decode it on a blocking task, returning its raw bytes
 /// and decode-first cell box. `None` on any failure (the alt text stands).
+#[cfg(test)]
 async fn load_one_image(
     page: &Url,
     url: &str,
     blobs: Option<&crate::js::BlobMap>,
+) -> Option<DecodedImage> {
+    load_image_with_cookie_policy(page, url, blobs, false).await
+}
+
+async fn load_image_with_cookie_policy(
+    page: &Url,
+    url: &str,
+    blobs: Option<&crate::js::BlobMap>,
+    restricted: bool,
 ) -> Option<DecodedImage> {
     // A `data:` image (a rewritten inline SVG, or a page's own data image)
     // carries its bytes — decode locally, no fetch, no SSRF concern.
@@ -9237,6 +9272,7 @@ async fn load_one_image(
     // and most boorus, plenty of others) hotlink-protect and 302/403 a
     // refererless request to a placeholder instead of the file.
     let mut req = http::Request::subresource(parsed, page, "image", None);
+    req.cookie_context.as_mut().unwrap().cross_site_ancestor = restricted;
     http::set_image_accept(&mut req);
     http::set_referrer(&mut req, page);
     let resp = http::fetch(&req).await.ok()?;

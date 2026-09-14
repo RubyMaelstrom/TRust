@@ -67,6 +67,8 @@ pub struct Request {
     /// User-agent-owned Fetch Metadata context. It is kept apart from the
     /// page header list so JavaScript cannot forge `Sec-Fetch-*` values.
     pub(crate) fetch_metadata: Option<FetchMetadata>,
+    /// Cookie authorization is supplied by the browser, independently of headers.
+    pub(crate) cookie_context: Option<CookieContext>,
     /// The native request client for Resource Timing's TAO check. Referer can
     /// be suppressed and is not an origin or authorization credential.
     pub(crate) timing_client: Option<Url>,
@@ -74,6 +76,70 @@ pub struct Request {
     /// realm. Navigation and browser-owned subresource requests leave this
     /// unset and retain the existing browser defaults.
     pub(crate) fetch_policy: Option<FetchPolicy>,
+}
+
+/// RFC6265bis #same-site-requests / #document-requests (1057fe0f, 2026-09-06).
+#[derive(Clone, Debug)]
+pub(crate) struct CookieContext {
+    pub(crate) client: Option<Url>,
+    pub(crate) top_level: bool,
+    pub(crate) cross_site_ancestor: bool,
+    pub(crate) cross_site_redirect: bool,
+}
+
+impl CookieContext {
+    pub(crate) fn subresource(client: &Url) -> Self {
+        Self {
+            client: Some(client.clone()),
+            top_level: false,
+            cross_site_ancestor: false,
+            cross_site_redirect: false,
+        }
+    }
+    fn same_site(&self, target: &Url) -> bool {
+        !self.cross_site_ancestor
+            && !self.cross_site_redirect
+            && self
+                .client
+                .as_ref()
+                .is_none_or(|source| crate::site_storage::same_site(source, target))
+    }
+    fn allows(&self, target: &Url) -> bool {
+        self.top_level || self.same_site(target)
+    }
+}
+
+pub(crate) fn request_cookies(request: &Request) -> String {
+    let Some(context) = &request.cookie_context else {
+        return String::new();
+    };
+    if !credentials_included(request) || !context.allows(&request.url) {
+        return String::new();
+    }
+    let mut jar = COOKIE_JAR.lock().unwrap();
+    cookie_string(
+        &mut jar,
+        &request.url,
+        cookie_now_ms(),
+        false,
+        context.same_site(&request.url),
+        context.top_level
+            && matches!(
+                request.method.as_str(),
+                "GET" | "HEAD" | "OPTIONS" | "TRACE"
+            ),
+    )
+}
+
+pub(crate) fn response_cookie(request: &Request, line: &str) {
+    if credentials_included(request)
+        && request
+            .cookie_context
+            .as_ref()
+            .is_some_and(|c| c.allows(&request.url))
+    {
+        store_cookie(&request.url, line, false);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +197,7 @@ impl Request {
             body: None,
             headers: Vec::new(),
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: None,
         }
@@ -227,6 +294,9 @@ pub struct RenderedPage {
         std::collections::HashMap<crate::dom::NodeId, crate::layout2::RichEditorPresentation>,
     pub image_urls: Vec<String>,
     pub eager_image_urls: Vec<String>,
+    /// A presentation image fetch can serve several elements. It may use
+    /// cookies only when every consumer has an eligible browsing context.
+    pub cookie_restricted_images: std::collections::HashSet<String>,
     pub lazy_image_handles: std::collections::HashSet<crate::render::ImageHandle>,
     pub deferred_images: Vec<crate::doc::DeferredImage>,
     /// Composed-tree ancestry and named-fragment geometry needed for native
@@ -251,6 +321,7 @@ impl Clone for RenderedPage {
             rich_editors: self.rich_editors.clone(),
             image_urls: self.image_urls.clone(),
             eager_image_urls: self.eager_image_urls.clone(),
+            cookie_restricted_images: self.cookie_restricted_images.clone(),
             lazy_image_handles: self.lazy_image_handles.clone(),
             deferred_images: self.deferred_images.clone(),
             parents: self.parents.clone(),
@@ -275,6 +346,7 @@ impl RenderedPage {
             && self.rich_editors == other.rich_editors
             && self.image_urls == other.image_urls
             && self.eager_image_urls == other.eager_image_urls
+            && self.cookie_restricted_images == other.cookie_restricted_images
             && self.lazy_image_handles == other.lazy_image_handles
             && self.deferred_images == other.deferred_images
             && self.parents == other.parents
@@ -436,6 +508,7 @@ pub(crate) fn render_arena_with_layout(
         rich_editors,
         image_urls: resources.all,
         eager_image_urls: resources.eager,
+        cookie_restricted_images: resources.cookie_restricted,
         lazy_image_handles: resources.lazy_handles,
         deferred_images,
         parents,
@@ -560,6 +633,7 @@ pub fn adapt_rendered_terminal(
         rows: output.rows,
         image_urls: rendered.image_urls,
         eager_image_urls: rendered.eager_image_urls,
+        cookie_restricted_images: rendered.cookie_restricted_images,
         deferred_images,
         blobs: None,
         carousels: output.carousels,
@@ -577,6 +651,15 @@ pub async fn fetch_graphical_image(
     page: &Url,
     source: &str,
     blobs: Option<&crate::js::BlobMap>,
+) -> Result<Vec<u8>, String> {
+    fetch_graphical_image_with_cookie_policy(page, source, blobs, false).await
+}
+
+pub async fn fetch_graphical_image_with_cookie_policy(
+    page: &Url,
+    source: &str,
+    blobs: Option<&crate::js::BlobMap>,
+    restricted: bool,
 ) -> Result<Vec<u8>, String> {
     if source.starts_with("data:") {
         return crate::img::decode_data_url(source)
@@ -596,6 +679,7 @@ pub async fn fetch_graphical_image(
         ));
     }
     let mut request = Request::subresource(url, page, "image", None);
+    request.cookie_context.as_mut().unwrap().cross_site_ancestor = restricted;
     set_image_accept(&mut request);
     set_referrer(&mut request, page);
     fetch(&request).await.map(|response| response.body)
@@ -717,6 +801,7 @@ struct CachedFetch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResourceCacheContext {
     Unscoped,
+    CookieRestricted(Box<ResourceCacheContext>),
     Element {
         origin: url::Origin,
         destination: &'static str,
@@ -805,6 +890,24 @@ impl PageCache {
             Request::subresource(url, client, destination, cors_credentials),
             ResourceCacheContext::new(client, destination, cors_credentials),
         )
+    }
+
+    pub(crate) fn fetch_resource_with_cookies(
+        &self,
+        handle: &tokio::runtime::Handle,
+        url: Url,
+        client: &Url,
+        destination: &'static str,
+        credentials: Option<CredentialsMode>,
+        cookie_context: CookieContext,
+    ) -> SharedFetch {
+        let mut request = Request::subresource(url, client, destination, credentials);
+        let mut context = ResourceCacheContext::new(client, destination, credentials);
+        if cookie_context.cross_site_ancestor {
+            context = ResourceCacheContext::CookieRestricted(Box::new(context));
+        }
+        request.cookie_context = Some(cookie_context);
+        self.fetch_request(handle, request, context)
     }
 
     fn fetch_request(
@@ -1247,6 +1350,7 @@ async fn fetch_script_timing_inner(request: &Request) -> Result<Response, TimedF
                 metadata.user_activation = false;
                 metadata
             }),
+            cookie_context: request.cookie_context.clone(),
             timing_client: request.timing_client.clone(),
             fetch_policy: Some(FetchPolicy {
                 origin: policy.origin.clone(),
@@ -1980,19 +2084,15 @@ fn pool_put(key: PoolKey, io: BufReader<Conn>) {
     }
 }
 
-// ---- RAM-only cookie jar ----------------------------------------------
+// ---- Live cookie jar with bookmark-controlled persistence -------------
 //
-// Cookies are ON by default, RAM-only, and never persisted. We CAPTURE
-// `Set-Cookie`, expose non-HttpOnly matches to page JS via
-// `document.cookie`, and send matching cookies back on requests. Cookie scope
-// follows RFC 6265: a cookie without `Domain=` is host-only, while an explicit
-// domain can cover matching subdomains. `set cookies off` disables capture,
-// sends, and document.cookie exposure without deleting the in-memory jar.
-// This bounded session jar implements name/value, Domain, Path, Secure,
-// HttpOnly, Expires, and Max-Age; it intentionally remains non-persistent.
+// Cookies are accepted only in first-party contexts (top-level navigations
+// additionally follow SameSite). Bookmarks control persistence independently.
+// Session cookies never touch disk; explicit lifetimes are preserved.
+// `set cookies off` disables access/capture without clearing remembered data.
 
-#[derive(Clone)]
-struct Cookie {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Cookie {
     name: String,
     value: String,
     domain: String, // lowercased host-only host or explicit domain scope
@@ -2001,6 +2101,359 @@ struct Cookie {
     secure: bool,
     http_only: bool,
     expires_at: Option<i64>, // UTC milliseconds; None means the process session
+    same_site: CookieSameSite,
+    created_at: i64,
+    last_access: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CookieSameSite {
+    Default,
+    Strict,
+    Lax,
+    None,
+}
+
+impl Cookie {
+    fn key(&self) -> String {
+        serde_json::json!(["cookie", self.name, self.domain, self.host_only, self.path]).to_string()
+    }
+    fn site(&self) -> Option<String> {
+        Url::parse(&format!("https://{}/", self.domain))
+            .ok()
+            .and_then(|u| crate::site_storage::site(&u))
+    }
+    fn record(&self) -> serde_json::Value {
+        serde_json::json!({"kind":"cookie","name":self.name,"value":self.value,"domain":self.domain,
+            "host_only":self.host_only,"path":self.path,"secure":self.secure,"http_only":self.http_only,
+            "expires_at":self.expires_at,"same_site":format!("{:?}",self.same_site),
+            "created_at":self.created_at,"last_access":self.last_access})
+    }
+    fn persist(&self, deleted: bool) {
+        if let Some(site) = self.site() {
+            crate::site_storage::mutation(
+                site,
+                self.key(),
+                (!deleted && self.expires_at.is_some()).then(|| self.record()),
+            );
+        }
+    }
+}
+
+pub(crate) fn persist_cookie_snapshot(sites: &std::collections::HashSet<String>) {
+    let mut jar = COOKIE_JAR.lock().unwrap();
+    evict_expired_cookies(&mut jar, cookie_now_ms());
+    for cookie in jar
+        .iter()
+        .filter(|c| c.site().is_some_and(|s| sites.contains(&s)))
+    {
+        cookie.persist(false);
+    }
+}
+
+pub(crate) fn restore_cookie_record(v: &serde_json::Value, site: &str) -> Option<Cookie> {
+    let cookie = Cookie {
+        name: v["name"].as_str()?.into(),
+        value: v["value"].as_str()?.into(),
+        domain: v["domain"].as_str()?.into(),
+        host_only: v["host_only"].as_bool()?,
+        path: v["path"].as_str()?.into(),
+        secure: v["secure"].as_bool()?,
+        http_only: v["http_only"].as_bool()?,
+        expires_at: Some(v["expires_at"].as_i64()?),
+        same_site: match v["same_site"].as_str()? {
+            "Default" => CookieSameSite::Default,
+            "Lax" => CookieSameSite::Lax,
+            "Strict" => CookieSameSite::Strict,
+            "None" => CookieSameSite::None,
+            _ => return None,
+        },
+        created_at: v["created_at"].as_i64()?,
+        last_access: v["last_access"].as_i64()?,
+    };
+    let url = Url::parse(&format!("https://{}/", cookie.domain)).ok()?;
+    if cookie.site().as_deref() != Some(site)
+        || url.host_str()? != cookie.domain
+        || cookie.expires_at? <= cookie_now_ms()
+        || cookie.name.len() + cookie.value.len() > 4096
+        || cookie.name.is_empty() && cookie.value.is_empty()
+        || !cookie.path.starts_with('/')
+        || cookie.path.len() > 1024
+        || cookie
+            .name
+            .bytes()
+            .chain(cookie.value.bytes())
+            .any(|b| b < 0x20 && b != b'\t' || b == 0x7f || b == b';')
+        || cookie.name.contains('=')
+        || !cookie.host_only && public_suffix(&cookie.domain)
+        || cookie.same_site == CookieSameSite::None && !cookie.secure
+        || cookie.name.to_ascii_lowercase().starts_with("__secure-") && !cookie.secure
+        || cookie.name.to_ascii_lowercase().starts_with("__host-")
+            && !(cookie.secure && cookie.host_only && cookie.path == "/")
+    {
+        return None;
+    }
+    Some(cookie)
+}
+
+pub(crate) fn restore_cookies(mut cookies: Vec<Cookie>) {
+    cookies.sort_by_key(|c| c.last_access);
+    if cookies.len() > COOKIE_JAR_MAX {
+        cookies.drain(..cookies.len() - COOKIE_JAR_MAX);
+    }
+    *COOKIE_JAR.lock().unwrap() = cookies;
+}
+
+fn public_suffix(domain: &str) -> bool {
+    psl::suffix(domain.as_bytes()).is_some_and(|s| s.as_bytes() == domain.as_bytes())
+}
+
+#[cfg(test)]
+mod cookie_policy_tests {
+    use super::*;
+    fn url(value: &str) -> Url {
+        Url::parse(value).unwrap()
+    }
+    #[test]
+    fn cookie_policy_blocks_third_parties_independent_of_attributes_and_credentials() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let page = url("https://cookie-policy.example.com/account");
+        let unrelated = url("https://unrelated.test/");
+        store_cookie(
+            &page,
+            "auth=first; Secure; HttpOnly; SameSite=None; Path=/",
+            false,
+        );
+        let mut request = Request::subresource(page.clone(), &unrelated, "image", None);
+        request.fetch_policy = Some(FetchPolicy {
+            origin: unrelated,
+            mode: RequestMode::Cors,
+            credentials: CredentialsMode::Include,
+        });
+        assert_eq!(request_cookies(&request), "");
+        response_cookie(&request, "auth=third; Secure; SameSite=None; Path=/");
+        assert_eq!(cookies_for_request(&page), "auth=first");
+        request.cookie_context = Some(CookieContext::subresource(&page));
+        assert_eq!(request_cookies(&request), "auth=first");
+        request.cookie_context.as_mut().unwrap().cross_site_ancestor = true;
+        assert_eq!(request_cookies(&request), "");
+        request.cookie_context = None;
+        assert_eq!(request_cookies(&request), "");
+    }
+    #[test]
+    fn cookie_policy_navigation_honors_strict_lax_none_and_redirects() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let page = url("https://cookie-navigation.example.org/");
+        for (name, attr) in [
+            ("strict", "Strict"),
+            ("lax", "Lax"),
+            ("none", "None"),
+            ("default", "invalid"),
+        ] {
+            store_cookie(&page, &format!("{name}=1; Secure; SameSite={attr}"), false);
+        }
+        let mut req = Request::get(page.clone());
+        set_navigation_metadata(&mut req, Some(&url("https://elsewhere.test")));
+        let cookies = request_cookies(&req);
+        assert!(!cookies.contains("strict="));
+        assert!(cookies.contains("lax="));
+        assert!(cookies.contains("none="));
+        assert!(cookies.contains("default="));
+        req.method = "POST".into();
+        assert_eq!(request_cookies(&req), "none=1");
+        response_cookie(&req, "new=1; Secure; SameSite=Strict");
+        assert!(cookies_for_request(&page).contains("new=1"));
+        set_navigation_metadata(&mut req, None);
+        assert!(request_cookies(&req).contains("strict=1"));
+        req = Request::subresource(page.clone(), &page, "script", None);
+        update_navigation_metadata_for_redirect(&mut req, &url("https://elsewhere.test"));
+        assert!(request_cookies(&req).is_empty());
+    }
+    #[test]
+    fn cookie_policy_public_suffixes_secure_overlays_prefixes_and_order() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let page = url("https://a.example.co.uk/account/page");
+        let mut jar = Vec::new();
+        for line in [
+            "bad=1; Domain=co.uk",
+            "bad=1; Domain=uk",
+            "bad=1; SameSite=None",
+            "__Host-bad=1; Secure",
+            "__Secure-bad=1",
+        ] {
+            store_cookie_at(&mut jar, &page, line, false, 1000);
+        }
+        assert!(jar.is_empty());
+        store_cookie_at(&mut jar, &page, "wide=1; Secure; Path=/", false, 1000);
+        store_cookie_at(&mut jar, &page, "narrow=1; Path=/account", false, 2000);
+        store_cookie_at(&mut jar, &page, "wide=2; Secure; Path=/", false, 3000);
+        assert_eq!(
+            cookies_for_request_at(&mut jar, &page, 4000),
+            "narrow=1; wide=2"
+        );
+        assert_eq!(
+            jar.iter().find(|c| c.name == "wide").unwrap().created_at,
+            1000
+        );
+        store_cookie_at(
+            &mut jar,
+            &url("http://a.example.co.uk/"),
+            "wide=; Max-Age=0; Path=/",
+            false,
+            4000,
+        );
+        assert!(cookies_for_request_at(&mut jar, &page, 4000).contains("wide=2"));
+    }
+    #[test]
+    fn cookie_policy_restore_preserves_scope_flags_and_rejects_invalid_records() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let mut jar = Vec::new();
+        let page = url("https://saved.example.com/private");
+        store_cookie_at(
+            &mut jar,
+            &page,
+            "saved=1; Secure; HttpOnly; SameSite=Lax; Path=/private; Max-Age=120",
+            false,
+            cookie_now_ms(),
+        );
+        let record = jar[0].record();
+        let restored = restore_cookie_record(&record, "example.com").unwrap();
+        assert_eq!(restored, jar[0]);
+        assert!(restore_cookie_record(&record, "elsewhere.test").is_none());
+        let mut session = record.clone();
+        session["expires_at"] = serde_json::Value::Null;
+        assert!(restore_cookie_record(&session, "example.com").is_none());
+        let mut invalid = record;
+        invalid["domain"] = "com".into();
+        invalid["host_only"] = false.into();
+        assert!(restore_cookie_record(&invalid, "com").is_none());
+    }
+
+    #[test]
+    fn cookie_policy_parser_and_restore_preserve_the_same_cookie_octets() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let page = url("https://parse.example.com/account/page");
+        let now = cookie_now_ms();
+        let mut jar = Vec::new();
+        store_cookie_at(
+            &mut jar,
+            &page,
+            "\t token\t=\t before\tafter\t; Max-Age=60; Domain=example.com; Domain=",
+            false,
+            now,
+        );
+        assert_eq!(jar.len(), 1);
+        assert!(jar[0].host_only);
+        assert_eq!(jar[0].domain, "parse.example.com");
+        assert_eq!(jar[0].value, "before\tafter");
+        assert_eq!(
+            restore_cookie_record(&jar[0].record(), "example.com"),
+            Some(jar[0].clone())
+        );
+        store_cookie_at(&mut jar, &page, "nameless; Max-Age=60", false, now);
+        assert_eq!(
+            cookies_for_request_at(&mut jar, &page, now),
+            "token=before\tafter; nameless"
+        );
+        store_cookie_at(&mut jar, &page, "bad=1; ignored=\n", false, now);
+        assert_eq!(jar.len(), 2);
+    }
+    #[test]
+    fn cookie_policy_image_discovery_retains_redirect_and_nested_frame_restrictions() {
+        let page = url("https://picture.example.com/");
+        let mut dom = crate::dom::Dom::parse_document(
+            "<img src='/root.png'><iframe id='outer' src='/redirect'></iframe><iframe src='/same'></iframe>",
+        );
+        let frames = HashMap::from([
+            (page.join("/redirect").unwrap().to_string(), (url("https://third.example.net/"),
+                "<img src='https://picture.example.com/private.png'><div style=\"background-image:url(https://picture.example.com/background.png)\">x</div><iframe src='https://picture.example.com/inner'></iframe>".into())),
+            (page.join("/inner").unwrap().to_string(), (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into())),
+            (page.join("/same").unwrap().to_string(), (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into())),
+        ]);
+        install_page_frames(&mut dom, &page, &frames);
+        let outer = dom
+            .flat_descendants(crate::dom::DOCUMENT)
+            .into_iter()
+            .find(|&id| dom.attr(id, "id") == Some("outer"))
+            .unwrap();
+        dom.set_attr(outer, "src", page.as_str());
+        let images = collect_image_urls(
+            &dom,
+            &page,
+            crate::layout2::Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        for path in ["/private.png", "/background.png", "/nested.png"] {
+            assert!(
+                images
+                    .cookie_restricted
+                    .contains(page.join(path).unwrap().as_str()),
+                "{path}"
+            );
+        }
+        for path in ["/root.png", "/allowed.png"] {
+            assert!(images.all.contains(&page.join(path).unwrap().to_string()));
+            assert!(
+                !images
+                    .cookie_restricted
+                    .contains(page.join(path).unwrap().as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_policy_presentation_image_requests_cannot_send_or_replace_cookies() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        set_cookies_enabled(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let page = url(&format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut heads = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut byte)
+                        .await
+                        .unwrap();
+                    head.push(byte[0]);
+                }
+                heads.push(String::from_utf8(head).unwrap());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\nSet-Cookie: image_policy=reply{index}; Path=/\r\n\r\nx"
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            heads
+        });
+        store_cookie(&page, "image_policy=initial; Path=/", false);
+        for restricted in [false, true] {
+            assert_eq!(
+                fetch_graphical_image_with_cookie_policy(&page, page.as_str(), None, restricted)
+                    .await
+                    .unwrap(),
+                b"x"
+            );
+        }
+        let heads = server.await.unwrap();
+        assert!(heads[0].contains("image_policy=initial"));
+        assert!(!heads[1].to_ascii_lowercase().contains("\r\ncookie:"));
+        assert!(cookies_for_request(&page).contains("image_policy=reply0"));
+        store_cookie(&page, "image_policy=; Path=/; Max-Age=0", false);
+        });
+    }
 }
 
 static COOKIE_JAR: std::sync::LazyLock<std::sync::Mutex<Vec<Cookie>>> =
@@ -2126,7 +2579,13 @@ fn cookie_max_age(value: &str, now: i64) -> Option<i64> {
 fn evict_expired_cookies(jar: &mut Vec<Cookie>, now: i64) {
     // RFC 6265 §5.3: evict expired cookies before storage or retrieval.
     // Lazy eviction avoids a timer or background work for this bounded jar.
-    jar.retain(|cookie| cookie.expires_at.is_none_or(|expiry| expiry > now));
+    jar.retain(|cookie| {
+        let live = cookie.expires_at.is_none_or(|expiry| expiry > now);
+        if !live {
+            cookie.persist(true);
+        }
+        live
+    });
 }
 
 #[cfg(test)]
@@ -2284,14 +2743,27 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
         trace_cookie_line("store-disabled", url, line);
         return;
     }
-    let (nv, rest) = line.split_once(';').unwrap_or((line, ""));
-    let Some((name, value)) = nv.split_once('=') else {
-        trace_cookie_line("store-invalid-pair", url, line);
+    // RFC6265bis #set-cookie: reject controls across the entire field, preserve
+    // internal HTAB, and trim only HTTP whitespace (SP / HTAB).
+    if line.bytes().any(|b| b < 0x20 && b != b'\t' || b == 0x7f) {
         return;
-    };
-    let (name, value) = (name.trim().to_string(), value.trim().to_string());
-    if name.is_empty() {
-        trace_cookie_line("store-empty-name", url, line);
+    }
+    let (nv, rest) = line.split_once(';').unwrap_or((line, ""));
+    let (name, value) = nv.split_once('=').unwrap_or(("", nv));
+    let (name, value) = (
+        name.trim_matches([' ', '\t']).to_string(),
+        value.trim_matches([' ', '\t']).to_string(),
+    );
+    if (name.is_empty() && value.is_empty())
+        || name.len() + value.len() > 4096
+        || name
+            .bytes()
+            .chain(value.bytes())
+            .any(|b| b < 0x20 && b != b'\t' || b == 0x7f)
+    {
+        return;
+    }
+    if !matches!(url.scheme(), "http" | "https") {
         return;
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -2300,24 +2772,54 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
     let mut invalid_domain = false;
     let (mut secure, mut http_only, mut max_age) = (false, false, None::<i64>);
     let mut expires = None;
+    let mut same_site = CookieSameSite::Default;
+    let mut explicit_root_path = false;
     for attr in rest.split(';') {
-        let attr = attr.trim();
-        let (k, v) = attr
-            .split_once('=')
-            .map_or((attr.to_ascii_lowercase(), String::new()), |(k, v)| {
-                (k.trim().to_ascii_lowercase(), v.trim().to_string())
-            });
+        let attr = attr.trim_matches([' ', '\t']);
+        let (k, v) =
+            attr.split_once('=')
+                .map_or((attr.to_ascii_lowercase(), String::new()), |(k, v)| {
+                    (
+                        k.trim_matches([' ', '\t']).to_ascii_lowercase(),
+                        v.trim_matches([' ', '\t']).to_string(),
+                    )
+                });
+        if v.len() > 1024 {
+            continue;
+        }
         match k.as_str() {
             "domain" => {
                 let candidate = v.strip_prefix('.').unwrap_or(&v).to_ascii_lowercase();
-                if candidate.is_empty() || !domain_matches(&host, &candidate) {
-                    invalid_domain = true;
-                } else {
+                invalid_domain = !candidate.is_ascii()
+                    || (!candidate.is_empty() && !domain_matches(&host, &candidate));
+                if !candidate.is_empty() && public_suffix(&candidate) {
+                    invalid_domain |= candidate != host;
+                    domain = host.clone();
+                    host_only = true;
+                } else if !candidate.is_empty() {
                     domain = candidate;
                     host_only = false;
+                } else {
+                    domain = host.clone();
+                    host_only = true;
                 }
             }
-            "path" if v.starts_with('/') => path = v,
+            "path" => {
+                path = if v.starts_with('/') {
+                    v
+                } else {
+                    default_cookie_path(url)
+                };
+                explicit_root_path = path == "/";
+            }
+            "samesite" => {
+                same_site = match v.to_ascii_lowercase().as_str() {
+                    "strict" => CookieSameSite::Strict,
+                    "lax" => CookieSameSite::Lax,
+                    "none" => CookieSameSite::None,
+                    _ => CookieSameSite::Default,
+                }
+            }
             "secure" => secure = true,
             "httponly" => http_only = true,
             "max-age" => {
@@ -2343,18 +2845,61 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
         trace_cookie_line("store-domain-mismatch", url, line);
         return;
     }
+    if secure && url.scheme() != "https" || same_site == CookieSameSite::None && !secure {
+        return;
+    }
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name.starts_with("__secure-") && !secure
+        || lower_name.starts_with("__host-") && !(secure && host_only && explicit_root_path)
+    {
+        return;
+    }
+    if name.is_empty()
+        && (value.to_ascii_lowercase().starts_with("__secure-")
+            || value.to_ascii_lowercase().starts_with("__host-"))
+    {
+        return;
+    }
     evict_expired_cookies(jar, now);
+    if !secure
+        && url.scheme() != "https"
+        && jar.iter().any(|c| {
+            c.secure
+                && c.name == name
+                && (domain_matches(&c.domain, &domain) || domain_matches(&domain, &c.domain))
+                && cookie_path_matches(&path, &c.path)
+        })
+    {
+        return;
+    }
     if from_js
-        && jar
-            .iter()
-            .any(|c| c.name == name && c.domain == domain && c.path == path && c.http_only)
+        && jar.iter().any(|c| {
+            c.name == name
+                && c.domain == domain
+                && c.host_only == host_only
+                && c.path == path
+                && c.http_only
+        })
     {
         // RFC 6265 §5.3 step 11.2: document.cookie cannot overwrite or
         // delete an existing HttpOnly cookie with the same name/domain/path.
         trace_cookie_line("store-protected-httponly", url, line);
         return;
     }
-    jar.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+    let created_at = jar
+        .iter()
+        .find(|c| {
+            c.name == name && c.domain == domain && c.host_only == host_only && c.path == path
+        })
+        .map_or(now, |c| c.created_at);
+    jar.retain(|c| {
+        let replaced =
+            c.name == name && c.domain == domain && c.host_only == host_only && c.path == path;
+        if replaced {
+            c.persist(true);
+        }
+        !replaced
+    });
     // §5.3 step 3: the last valid Max-Age overrides every Expires attribute.
     let expires_at = max_age.or(expires);
     if expires_at.is_some_and(|expiry| expiry <= now) {
@@ -2370,11 +2915,21 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
         secure,
         http_only,
         expires_at,
+        same_site,
+        created_at,
+        last_access: now,
     };
+    cookie.persist(false);
     trace_cookie_receipt(&cookie, line);
     jar.push(cookie);
     if jar.len() > COOKIE_JAR_MAX {
-        jar.remove(0);
+        let oldest = jar
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, c)| c.last_access)
+            .unwrap()
+            .0;
+        jar.remove(oldest).persist(true);
     }
     trace_cookie_line("stored", url, line);
 }
@@ -2433,58 +2988,67 @@ pub(crate) fn cookies_for_js(page: &Url) -> String {
 }
 
 fn cookies_for_js_at(jar: &mut Vec<Cookie>, page: &Url, now: i64) -> String {
-    if !cookies_enabled() {
-        trace_cookie_counts("script-read-disabled", page, 0, (0, 0));
-        return String::new();
-    }
-    let host = page.host_str().unwrap_or_default().to_ascii_lowercase();
-    let path = page.path();
-    let https = page.scheme() == "https";
-    evict_expired_cookies(jar, now);
-    let result = jar
-        .iter()
-        .filter(|c| !c.http_only)
-        .filter(|c| !c.secure || https)
-        .filter(|c| cookie_domain_match(&host, c))
-        .filter(|c| cookie_path_matches(path, &c.path))
-        .map(|c| format!("{}={}", c.name, c.value))
-        .collect::<Vec<_>>()
-        .join("; ");
-    if cookie_trace_enabled() {
-        trace_cookie_counts(
-            "script-read",
-            page,
-            0,
-            cookie_trace_counts(result.split(';')),
-        );
-    }
-    result
+    cookie_string(jar, page, now, true, true, false)
 }
 
 /// A `document.cookie = "..."` write from page JS. Stored in the same
-/// RAM-only cookie jar used for requests; Domain is validated against the
+/// Live cookie jar used for requests; Domain is validated against the
 /// current document host.
 pub(crate) fn set_cookie_from_js(page: &Url, line: &str) {
     store_cookie(page, line, true);
 }
 
+#[cfg(test)]
 pub(crate) fn cookies_for_request(url: &Url) -> String {
     cookies_for_request_at(&mut COOKIE_JAR.lock().unwrap(), url, cookie_now_ms())
 }
 
+#[cfg(test)]
 fn cookies_for_request_at(jar: &mut Vec<Cookie>, url: &Url, now: i64) -> String {
-    if !cookies_enabled() {
+    cookie_string(jar, url, now, false, true, false)
+}
+
+// RFC6265bis #retrieval-algorithm: path length, then original creation time.
+fn cookie_string(
+    jar: &mut Vec<Cookie>,
+    url: &Url,
+    now: i64,
+    from_js: bool,
+    same_site: bool,
+    lax_navigation: bool,
+) -> String {
+    if !cookies_enabled() || !matches!(url.scheme(), "http" | "https") {
         return String::new();
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let path = url.path();
-    let https = url.scheme() == "https";
     evict_expired_cookies(jar, now);
-    jar.iter()
-        .filter(|c| !c.secure || https)
-        .filter(|c| cookie_domain_match(&host, c))
-        .filter(|c| cookie_path_matches(path, &c.path))
-        .map(|c| format!("{}={}", c.name, c.value))
+    let mut cookies: Vec<_> = jar
+        .iter_mut()
+        .filter(|c| {
+            (!from_js || !c.http_only)
+                && (!c.secure || url.scheme() == "https")
+                && cookie_domain_match(&host, c)
+                && (c.host_only || !public_suffix(&c.domain))
+                && cookie_path_matches(url.path(), &c.path)
+                && (same_site
+                    || c.same_site == CookieSameSite::None
+                    || lax_navigation
+                        && matches!(c.same_site, CookieSameSite::Lax | CookieSameSite::Default))
+        })
+        .collect();
+    cookies.sort_by_key(|c| (std::cmp::Reverse(c.path.len()), c.created_at));
+    for cookie in &mut cookies {
+        cookie.last_access = now;
+    }
+    cookies
+        .iter()
+        .map(|c| {
+            if c.name.is_empty() {
+                c.value.clone()
+            } else {
+                format!("{}={}", c.name, c.value)
+            }
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -2546,14 +3110,6 @@ pub(crate) async fn download_connection(url: &Url) -> Result<BufReader<Conn>, St
     let host = url.host_str().ok_or("download URL has no host")?;
     let port = url.port_or_known_default().unwrap_or(80);
     dial(url.scheme(), host, port).await
-}
-
-pub(crate) fn download_cookies(url: &Url) -> String {
-    cookies_for_request(url)
-}
-
-pub(crate) fn download_store_cookie(url: &Url, line: &str) {
-    store_cookie(url, line, false);
 }
 
 pub(crate) fn download_referrer(source: &Url, target: &Url) -> Option<String> {
@@ -2654,7 +3210,7 @@ fn finish_response(
     }
     if credentials_included(request) {
         for line in &set_cookies {
-            store_cookie(url, line, false);
+            response_cookie(request, line);
         }
     }
     // Redirect processing also consumes response headers (notably
@@ -2812,11 +3368,7 @@ async fn exchange(
             head.push_str("Upgrade-Insecure-Requests: 1\r\n");
         }
     }
-    let cookie = if credentials_included(request) {
-        cookies_for_request(url)
-    } else {
-        String::new()
-    };
+    let cookie = request_cookies(request);
     if cookie_trace_enabled() {
         trace_cookie_counts(
             if credentials_included(request) {
@@ -4957,9 +5509,9 @@ async fn prefetch_frame_documents(
     html: &str,
     base: &Url,
     page_url: &Url,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, (Url, String)> {
     use std::collections::VecDeque;
-    let mut map: HashMap<String, String> = HashMap::new();
+    let mut map: HashMap<String, (Url, String)> = HashMap::new();
     // (document markup, its base, fragment-stripped ancestor URLs)
     let mut queue: VecDeque<(String, Url, Vec<String>)> = VecDeque::new();
     queue.push_back((
@@ -4971,13 +5523,20 @@ async fn prefetch_frame_documents(
     while let Some((markup, base, ancestors)) = queue.pop_front() {
         let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors);
 
+        let cookie_ancestor = ancestors.iter().any(|ancestor| {
+            Url::parse(ancestor)
+                .ok()
+                .is_none_or(|url| !crate::site_storage::same_site(page_url, &url))
+        });
         // Fetch this level's `src` documents concurrently.
-        let fetched: Vec<Option<(Url, String)>> =
+        let fetched: Vec<Option<(Url, Url, String)>> =
             futures::stream::iter(srcs.into_iter().map(|url| async move {
                 if url.scheme() == "data" {
-                    return data_frame_document(&url).map(|body| (url, body));
+                    return data_frame_document(&url).map(|body| (url.clone(), url, body));
                 }
-                let resp = fetch(&Request::get(url.clone())).await.ok()?;
+                let mut request = Request::subresource(url.clone(), page_url, "iframe", None);
+                request.cookie_context.as_mut().unwrap().cross_site_ancestor = cookie_ancestor;
+                let resp = fetch(&request).await.ok()?;
                 let media = resp
                     .content_type
                     .split(';')
@@ -4987,18 +5546,18 @@ async fn prefetch_frame_documents(
                     .to_ascii_lowercase();
                 let is_html = media == "text/html" || media == "application/xhtml+xml";
                 (resp.status >= 200 && resp.status < 300 && is_html)
-                    .then(|| (url, decode_body(&resp.content_type, &resp.body)))
+                    .then(|| (url, resp.url, decode_body(&resp.content_type, &resp.body)))
             }))
             .buffered(PREFETCH_CONCURRENCY)
             .collect()
             .await;
 
-        for (url, body) in fetched.into_iter().flatten() {
+        for (requested, url, body) in fetched.into_iter().flatten() {
             let mut child_ancestors = ancestors.clone();
             child_ancestors.push(strip_fragment(url.as_str()).to_string());
             // Nested frames in the fetched content resolve against ITS url.
             queue.push_back((body.clone(), url.clone(), child_ancestors));
-            map.insert(url.to_string(), body);
+            map.insert(requested.to_string(), (url, body));
         }
         // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
         // (base/origin inherit the parent document, per about:srcdoc).
@@ -5017,7 +5576,7 @@ async fn prefetch_frame_documents(
 fn install_page_frames(
     dom: &mut crate::dom::Dom,
     page_url: &Url,
-    fetched: &HashMap<String, String>,
+    fetched: &HashMap<String, (Url, String)>,
 ) {
     use crate::dom::{DOCUMENT, NodeId};
     use std::collections::VecDeque;
@@ -5058,14 +5617,27 @@ fn install_page_frames(
             }
             if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
                 && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors)
-                && let Some(content) = fetched.get(url.as_str())
+                && let Some((final_url, content)) = fetched.get(url.as_str())
             {
-                plans.push((id, content.clone(), url.clone(), Some(url)));
+                plans.push((
+                    id,
+                    content.clone(),
+                    final_url.clone(),
+                    Some(final_url.clone()),
+                ));
             }
         }
 
         for (frame, content, frame_base, frame_url) in plans {
             if let Some(body) = dom.install_frame_document(frame, &content, frame_base.as_str()) {
+                let restricted = ancestors.iter().any(|ancestor| {
+                    Url::parse(ancestor)
+                        .ok()
+                        .is_none_or(|url| !crate::site_storage::same_site(page_url, &url))
+                }) || frame_url
+                    .as_ref()
+                    .is_some_and(|url| !crate::site_storage::same_site(page_url, url));
+                dom.set_frame_cookie_restriction(frame, restricted);
                 let mut child_ancestors = ancestors.clone();
                 if let Some(u) = &frame_url {
                     child_ancestors.push(strip_fragment(u.as_str()).to_string());
@@ -5187,8 +5759,14 @@ fn potentially_trustworthy(url: &Url) -> bool {
 /// the chain more trusted. Same-origin and schemeful same-site are equivalence
 /// relations, so retaining the least-trusted relation over successive hops is
 /// equivalent to checking the request origin against the whole URL list.
-fn update_navigation_metadata_for_redirect(request: &mut Request, target: &Url) {
+pub(crate) fn update_navigation_metadata_for_redirect(request: &mut Request, target: &Url) {
     let relation = fetch_site(&request.url, target);
+    if let Some(context) = request.cookie_context.as_mut()
+        && relation == FetchSite::CrossSite
+        && context.client.is_some()
+    {
+        context.cross_site_redirect = true;
+    }
     let Some(metadata) = request.fetch_metadata.as_mut() else {
         return;
     };
@@ -5239,6 +5817,13 @@ pub(crate) fn set_fetch_metadata(
     mode: &'static str,
 ) {
     request.timing_client = Some(source.clone());
+    let cross_site_ancestor = request
+        .cookie_context
+        .as_ref()
+        .is_some_and(|c| c.cross_site_ancestor);
+    let mut context = CookieContext::subresource(source);
+    context.cross_site_ancestor = cross_site_ancestor;
+    request.cookie_context = Some(context);
     request.fetch_metadata = Some(FetchMetadata {
         destination,
         mode,
@@ -5257,6 +5842,12 @@ pub(crate) fn set_fetch_metadata(
 /// own source context through `set_fetch_metadata`.
 pub fn set_navigation_metadata(req: &mut Request, referrer: Option<&Url>) {
     req.timing_client = referrer.cloned();
+    req.cookie_context = Some(CookieContext {
+        client: referrer.cloned(),
+        top_level: true,
+        cross_site_ancestor: false,
+        cross_site_redirect: false,
+    });
     let site = match referrer {
         None => FetchSite::None,
         Some(source) => fetch_site(source, &req.url),
@@ -5414,6 +6005,7 @@ pub fn parse_seeded(
     let mut scroll_clips = Vec::new();
     let mut boundaries = Vec::new();
     let mut image_urls = Vec::new();
+    let mut cookie_restricted_images = Default::default();
     let mut hover_ids = std::collections::HashMap::new();
     let mut anchor_rows = std::collections::HashMap::new();
     let mut composites = std::collections::HashMap::new();
@@ -5451,7 +6043,9 @@ pub fn parse_seeded(
         let t1 = std::time::Instant::now();
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
-        image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
+        let resources = collect_image_urls(&dom, url, css_viewport, 1.0);
+        image_urls = resources.all;
+        cookie_restricted_images = resources.cookie_restricted;
         let t_forms = t1.elapsed();
         let t2 = std::time::Instant::now();
         let (
@@ -5537,6 +6131,7 @@ pub fn parse_seeded(
         forms,
         rows,
         eager_image_urls: image_urls.clone(),
+        cookie_restricted_images,
         image_urls,
         deferred_images: Vec::new(),
         blobs: None,
@@ -5771,6 +6366,7 @@ pub fn lay_subtree_patch(
 pub(crate) struct CollectedImages {
     pub(crate) all: Vec<String>,
     pub(crate) eager: Vec<String>,
+    pub(crate) cookie_restricted: std::collections::HashSet<String>,
     pub(crate) lazy_handles: std::collections::HashSet<crate::render::ImageHandle>,
     pub(crate) lazy_nodes: Vec<(crate::dom::NodeId, String)>,
 }
@@ -5793,6 +6389,7 @@ fn collect_image_urls_for_boxes(
 ) -> CollectedImages {
     let mut urls = Vec::new();
     let mut eager = Vec::new();
+    let mut cookie_restricted = std::collections::HashSet::new();
     let mut lazy_handles = std::collections::HashSet::new();
     let mut lazy_nodes = Vec::new();
     for id in dom.flat_descendants(crate::dom::DOCUMENT) {
@@ -5835,6 +6432,9 @@ fn collect_image_urls_for_boxes(
                 .attr(id, "loading")
                 .is_some_and(|value| value.eq_ignore_ascii_case("lazy"));
         let handle = crate::render::ImageHandle::for_source(&u);
+        if dom.resource_cookies_restricted(id) {
+            cookie_restricted.insert(u.clone());
+        }
         if !urls.contains(&u) {
             urls.push(u.clone());
         }
@@ -5872,6 +6472,9 @@ fn collect_image_urls_for_boxes(
                 let Some(url) = resolve_css_image_source(base, &source) else {
                     continue;
                 };
+                if dom.resource_cookies_restricted(id) {
+                    cookie_restricted.insert(url.clone());
+                }
                 if !urls.contains(&url) {
                     urls.push(url.clone());
                 }
@@ -5921,6 +6524,7 @@ fn collect_image_urls_for_boxes(
     CollectedImages {
         all: urls,
         eager,
+        cookie_restricted,
         lazy_handles,
         lazy_nodes,
     }
@@ -6735,6 +7339,7 @@ mod tests {
             body: None,
             headers: Vec::new(),
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: Some(FetchPolicy {
                 origin: Url::parse("https://app.example").unwrap(),
@@ -10127,7 +10732,6 @@ mod tests {
         let started = std::time::Instant::now();
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
-        let peak = peak.load(Relaxed);
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
         // A rendering opportunity may expose the interactive shell while the entry module is
         // suspended at top-level await. The module script still delays `load`; observe the actor's
@@ -10153,6 +10757,7 @@ mod tests {
             .await
             .expect("module evaluation render timed out");
         }
+        let peak = peak.load(Relaxed);
         eprintln!(
             "dynamic_sibling_imports_load_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
         );
@@ -13271,6 +13876,7 @@ customElements.define('lit-counter', LitCounter);
             )),
             headers: Vec::new(),
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: None,
         };
@@ -13293,6 +13899,7 @@ customElements.define('lit-counter', LitCounter);
                 body: None,
                 headers: Vec::new(),
                 fetch_metadata: None,
+                cookie_context: None,
                 timing_client: None,
                 fetch_policy: None,
             };
@@ -13313,6 +13920,7 @@ customElements.define('lit-counter', LitCounter);
             )),
             headers: Vec::new(),
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: None,
         };
@@ -13377,6 +13985,7 @@ customElements.define('lit-counter', LitCounter);
                 String::from("Bearer should-not-cross-origin"),
             )],
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: None,
         };
@@ -13685,6 +14294,9 @@ customElements.define('lit-counter', LitCounter);
             secure: true,
             http_only: true,
             expires_at: None,
+            same_site: CookieSameSite::Default,
+            created_at: 0,
+            last_access: 0,
         };
         let line = "other=ignored; cf_clearance=original-test.%2F+/:=end";
         let receipts = [receipt];
@@ -13766,7 +14378,9 @@ customElements.define('lit-counter', LitCounter);
             }
         });
         let url = parse_url(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut navigation = Request::get(url);
+        set_navigation_metadata(&mut navigation, None);
+        let response = fetch(&navigation).await.unwrap();
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let out = String::from_utf8_lossy(&response.body);
         assert!(out.contains("tjar=ckval123"), "cookie visible to JS: {out}");
@@ -14152,7 +14766,9 @@ customElements.define('lit-counter', LitCounter);
         });
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/start")).unwrap();
-        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut navigation = Request::get(url);
+        set_navigation_metadata(&mut navigation, None);
+        let response = fetch(&navigation).await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"cookie ok");
         server.abort();
@@ -14233,6 +14849,7 @@ customElements.define('lit-counter', LitCounter);
             body: Some((String::from("text/plain"), b"hi".to_vec())),
             headers: Vec::new(),
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: None,
         };
@@ -14290,6 +14907,7 @@ customElements.define('lit-counter', LitCounter);
                 ("Upgrade-Insecure-Requests".into(), "0".into()),
             ],
             fetch_metadata: None,
+            cookie_context: None,
             timing_client: None,
             fetch_policy: None,
         };
@@ -14699,15 +15317,16 @@ customElements.define('lit-counter', LitCounter);
             let url = Url::parse(&format!("http://{address}/save")).unwrap();
             let mut request = Request::get(url.clone());
             request.method = String::from("POST");
+            set_navigation_metadata(&mut request, None);
             let response = fetch(&request)
                 .await
                 .expect("204 plus zero length is a successful save");
             assert_eq!(response.status, 204);
             assert!(response.body.is_empty());
             assert!(cookies_for_request(&url).contains(&expected_cookie));
-            let response = fetch(&Request::get(url.join("/check").unwrap()))
-                .await
-                .unwrap();
+            let mut check = Request::get(url.join("/check").unwrap());
+            set_navigation_metadata(&mut check, Some(&url));
+            let response = fetch(&check).await.unwrap();
             assert_eq!(response.body, b"ok");
             server.await.unwrap();
         })

@@ -1751,11 +1751,17 @@ impl DesktopApp {
             let source = request.source.clone();
             let handle = request.handle;
             let blobs = blobs.clone();
+            let restricted = self
+                .browser
+                .current_page()
+                .and_then(|page| page.rendered_page())
+                .is_some_and(|page| page.cookie_restricted_images.contains(&source));
             let task = self.runtime.spawn(async move {
-                let result = match trust::http::fetch_graphical_image(
+                let result = match trust::http::fetch_graphical_image_with_cookie_policy(
                     &page,
                     &source,
                     blobs.as_ref(),
+                    restricted,
                 )
                 .await
                 {
@@ -7165,8 +7171,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         trust::media::launch_mpv(url.as_str(), None).map_err(std::io::Error::other)?;
         return Ok(());
     }
+    if let Err(error) = trust::site_storage::initialize() {
+        eprintln!("trust: {error}; using temporary site storage");
+    }
     let event_loop = EventLoop::<DesktopEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    let storage_proxy = proxy.clone();
+    trust::site_storage::set_wake(move || {
+        let _ = storage_proxy.send_event(DesktopEvent::BrowserWake);
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("trust-desktop-net")
@@ -7185,7 +7198,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         options.renderer,
         options.address,
     );
-    event_loop.run_app(&mut app)?;
+    let result = event_loop.run_app(&mut app);
+    drop(app);
+    if let Err(error) = trust::site_storage::shutdown() {
+        eprintln!("trust: {error}");
+    }
+    result?;
     Ok(())
 }
 

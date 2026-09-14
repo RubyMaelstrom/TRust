@@ -500,6 +500,7 @@ pub struct Doc {
     /// set at document commit; missing/invalid `loading` values are eager per
     /// HTML's lazy-loading attribute definition.
     pub eager_image_urls: Vec<String>,
+    pub cookie_restricted_images: std::collections::HashSet<String>,
     /// Paint-space placements of deferred images. The terminal frontend uses
     /// these retained CSS-pixel rectangles to resume a lazy image when it is in
     /// or approaching the viewport, without fetching an off-screen catalog at
@@ -674,6 +675,7 @@ impl Doc {
             rows: Vec::new(),
             image_urls: Vec::new(),
             eager_image_urls: Vec::new(),
+            cookie_restricted_images: Default::default(),
             deferred_images: Vec::new(),
             blobs: None,
             carousels: Vec::new(),

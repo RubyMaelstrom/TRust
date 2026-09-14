@@ -1,12 +1,36 @@
 (function () {
     "use strict";
     const g = globalThis;
+    // These capabilities are bootstrap-only. Author code cannot supply an
+    // arbitrary cookie document or storage bucket to the native host.
+    const __cookie_get = g.__cookie_get;
+    delete g.__cookie_get;
+    const __cookie_set = g.__cookie_set;
+    delete g.__cookie_set;
+    const __storage_allowed = g.__storage_allowed;
+    delete g.__storage_allowed;
+    const __storage_get = g.__storage_get;
+    delete g.__storage_get;
+    const __storage_set = g.__storage_set;
+    delete g.__storage_set;
+    const __storage_remove = g.__storage_remove;
+    delete g.__storage_remove;
+    const __storage_clear = g.__storage_clear;
+    delete g.__storage_clear;
+    const __storage_key = g.__storage_key;
+    delete g.__storage_key;
+    const __storage_len = g.__storage_len;
+    delete g.__storage_len;
+    const cookieDocuments = new WeakMap();
+
     const cfg = g.__trust_cfg || { url: "about:blank", ua: "TRust/0.1", language: "en-US", languages: ["en-US", "en"], width: 640, height: 384 };
     // A nested Window Realm receives its parent-owned iframe Element as the
     // browsing-context anchor. The value deliberately crosses the Realm
     // boundary: Window.frameElement and the parent's element reference must
     // retain object identity for a same-origin child.
     const realmRootFrame = cfg.frameElement || null;
+    const storageContextId = Number(cfg.hostSettingsContext) || 0;
+    const storageOpaque = !!cfg.cookieOpaque;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
     const documentContentTypes = new WeakMap();
     const documentURLs = new WeakMap();
@@ -6670,8 +6694,18 @@
             }
             t.textContent = String(v);
         }
-        get cookie() { return __cookie_get(); }
-        set cookie(v) { __cookie_set(String(v)); }
+        get cookie() {
+            const slot = cookieDocuments.get(this);
+            if (!slot || !/^https?:/i.test(slot[3])) return "";
+            if (slot[2]) throw new DOMException("Cookie access requires a non-opaque origin.", "SecurityError");
+            return __cookie_get(slot[0], slot[1], slot[3]);
+        }
+        set cookie(v) {
+            const slot = cookieDocuments.get(this);
+            if (!slot || !/^https?:/i.test(slot[3])) return;
+            if (slot[2]) throw new DOMException("Cookie access requires a non-opaque origin.", "SecurityError");
+            __cookie_set(slot[0], slot[1], slot[3], String(v));
+        }
         get location() { return g.location; }
         // HTML §2.4.3: the document base URL is used by relative URL APIs,
         // including new URL("_framework/dotnet.js", document.baseURI).
@@ -6901,6 +6935,7 @@
     class FrameDocument extends Document {
         constructor(frameEl) {
             super(frameEl.__id);
+            cookieDocuments.set(this, [frameEl.__id, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
             this.__frame = frameEl;
             documentReferrers.set(this, frameEl === realmRootFrame
                 ? configuredReferrer : frameReferrers.get(frameEl) || "");
@@ -6936,13 +6971,6 @@
         get body() { return this.documentElement.querySelector("body") || this.documentElement; }
         get defaultView() { return trust.__activeFrame === this.__frame ? g : this.__frame.contentWindow; }
         get readyState() { return this.__frame.__trustReadyState || "complete"; }
-        get cookie() {
-            if (cfg.frameTrace) ftrace("cookie-read frame=" + this.__frame.__id + " stub=1");
-            return "";
-        }
-        set cookie(_v) {
-            if (cfg.frameTrace) ftrace("cookie-write frame=" + this.__frame.__id + " stub=1");
-        }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
         get location() { return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location; }
@@ -9589,6 +9617,7 @@
     g.DOMTokenList = DOMTokenList;
     g.DOMStringMap = DOMStringMap;
     g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(0);
+    cookieDocuments.set(g.document, [realmRootFrame ? realmRootFrame.__id : 0, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
     documentReferrers.set(g.document, configuredReferrer);
 
     // --- environment ---
@@ -9597,10 +9626,14 @@
         href: L[0], protocol: L[1], host: L[2], hostname: L[3], port: L[4],
         pathname: L[5], search: L[6], hash: L[7], origin: L[8],
     };
-    const setLocParts = (p) => {
+    const setLocParts = (p, documentChanged = true) => {
         locState.href = p[0]; locState.protocol = p[1]; locState.host = p[2];
         locState.hostname = p[3]; locState.port = p[4]; locState.pathname = p[5];
         locState.search = p[6]; locState.hash = p[7]; locState.origin = p[8];
+        // HTML #dom-document-cookie uses the Document URL, including history
+        // rewrites, but not a pending cross-document Location navigation.
+        const cookieSlot = cookieDocuments.get(g.document);
+        if (documentChanged && cookieSlot) cookieSlot[3] = p[0];
         baseHrefCache = null; // the base resolves against location.href
     };
     const withoutHash = (u) => {
@@ -9619,7 +9652,7 @@
         // Only the hash setter suppresses an unchanged fragment (HTML
         // §7.2.4, location.hash). href/assign/replace must still navigate.
         if (hashOnly && p[7] === locState.hash) return;
-        setLocParts(p);
+        setLocParts(p, false);
         // HTML navigate-fragid-step requires a NON-NULL target fragment.
         // Equal fragmentless URLs are cross-document navigations, not no-ops:
         // routers can deliberately suspend the old page until this completes.
@@ -11726,8 +11759,11 @@
         setResourceTimingBufferSize() {},
     };
 
-    // RAM-only, session-lifetime storage: origin-bucketed maps shared
-    // across pages, dead with the process, never disk.
+    // Storage maps retain origin boundaries; only localStorage has bookmark-
+    // controlled persistence. Third-party localStorage is blocked independently.
+    function setStorageValue(bucket, key, value) {
+        if (__storage_set(bucket, key, value) === false) throw new DOMException("The localStorage quota was exceeded.", "QuotaExceededError");
+    }
     const storageBuckets = new WeakMap();
     function storageBucket(object) {
         const bucket = storageBuckets.get(object);
@@ -11744,7 +11780,7 @@
         setItem(key, value) {
             const bucket = storageBucket(this);
             if (arguments.length < 2) throw new TypeError("Storage key and value are required");
-            __storage_set(bucket, domString(key), domString(value));
+            setStorageValue(bucket, domString(key), domString(value));
         }
         removeItem(key) {
             const bucket = storageBucket(this);
@@ -11781,7 +11817,7 @@
             },
             set(t, key, value, receiver) {
                 if (receiver === proxy && typeof key === "string") {
-                    __storage_set(bucket, key, domString(value));
+                    setStorageValue(bucket, key, domString(value));
                     return true;
                 }
                 return Reflect.set(t, key, value, receiver);
@@ -11807,7 +11843,7 @@
             defineProperty(t, key, descriptor) {
                 if (typeof key === "string" && !Object.hasOwn(t, key)) {
                     if (!("value" in descriptor || "writable" in descriptor)) return false;
-                    __storage_set(bucket, key, domString(descriptor.value));
+                    setStorageValue(bucket, key, domString(descriptor.value));
                     return true;
                 }
                 return Reflect.defineProperty(t, key, descriptor);
@@ -11820,6 +11856,7 @@
     }
     const documentStorageHolders = new WeakMap();
     function windowStorage(kind) {
+        if (kind === "local" && (storageOpaque || !__storage_allowed(storageContextId))) throw new DOMException("Third-party localStorage is unavailable.", "SecurityError");
         const doc = g.document;
         let holders = documentStorageHolders.get(doc);
         if (holders && holders[kind]) return holders[kind];
