@@ -228,6 +228,8 @@ formats. Explicit `gophers://` requests require TLS and never fall back to
 unencrypted Gopher. Bookmarks retain the chosen scheme.
 
 Gemini text also arrives progressively, in a reading column of 96 characters.
+List items have bullets and aligned continuation lines. Desktop headings use
+three distinct font sizes in the normal text colour.
 Use **W** or `wrap` for ordinary text, **Shift+Left/Right** to pan preformatted
 blocks, and **S** or `save` to save the received source. `gemini-width 20..240`
 adjusts the column, `outline` lists numbered headings, `heading next|previous|N`

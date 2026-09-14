@@ -5,6 +5,8 @@ use super::{MediaType, Response};
 use crate::doc::{Doc, DocLine, Kind, Link, push_wrapped};
 use crate::text_reply::{MAX_COLUMNS, MAX_LINKS, MAX_ROWS};
 
+pub(crate) const LIST_MARKER: &str = "• ";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heading {
     pub row: usize,
@@ -101,14 +103,8 @@ pub fn render(url: Link, meta: &str, body: &[u8], width: usize, mut view: View) 
         }
         let text = media.decode(body, view.controls.loading)?;
         // Bare CR is not a Gemini line ending. Filter it as a control while
-        // retaining LF and CRLF; display_text additionally bounds geometry.
+        // retaining LF and CRLF; parse_lines additionally bounds geometry.
         let text = text.replace("\r\n", "\n").replace('\r', "");
-        let (text, clipped) =
-            crate::text_reply::display_text(text.as_bytes(), view.controls.loading);
-        if clipped {
-            view.controls.notice =
-                Some("Display limit reached; save the received source for the full text.".into());
-        }
         let columns = if width > MAX_COLUMNS {
             width
         } else {
@@ -184,7 +180,6 @@ pub fn parse_gemtext(body: &[u8], width: usize, resolve: &dyn Fn(&str) -> Link) 
         .unwrap_or(&text)
         .replace("\r\n", "\n")
         .replace('\r', "");
-    let (text, _) = crate::text_reply::display_text(text.as_bytes(), false);
     parse_lines(&text, width.max(1), true, &mut View::default(), resolve)
 }
 
@@ -201,13 +196,32 @@ fn parse_lines(
     let mut lines = Vec::new();
     let mut pre = false;
     let mut links = 0;
+    let mut display_bytes = 0usize;
     for (source, line) in text.lines().enumerate() {
-        if lines.len() >= MAX_ROWS {
+        if source >= MAX_ROWS || lines.len() >= MAX_ROWS {
             view.controls.notice =
                 Some("Display limited to 4,096 rows; save the source to read more.".into());
             break;
         }
-        let (kind, text, link) = if gemtext && line.starts_with("```") {
+        // Gemtext 0.24.1, Line oriented design / List items: recognize the
+        // source prefix before display filtering or tab expansion. In
+        // particular, '*\t' is ordinary text; only a literal '* ' is a list.
+        let toggle = gemtext && line.starts_with("```");
+        let linked = gemtext && line.starts_with("=>");
+        let heading = gemtext && line.starts_with('#');
+        let level = line.bytes().take_while(|&b| b == b'#').count().min(3) as u8;
+        let listed = gemtext && line.starts_with("* ");
+        let quoted = gemtext && line.starts_with('>');
+        let (line, clipped) = crate::text_reply::display_text(line.as_bytes(), false);
+        display_bytes = display_bytes.saturating_add(line.len() + 1);
+        if clipped || display_bytes > crate::text_reply::MAX_RESPONSE {
+            view.controls.notice =
+                Some("Display limit reached; save the received source for the full text.".into());
+        }
+        if display_bytes > crate::text_reply::MAX_RESPONSE {
+            break;
+        }
+        let (kind, text, link) = if toggle {
             pre = !pre;
             let alt = line[3..].trim();
             if !pre || !view.show_alt || alt.is_empty() {
@@ -216,7 +230,7 @@ fn parse_lines(
             (Kind::Info, format!("[Preformatted: {alt}]"), None)
         } else if pre {
             (Kind::Pre, line.to_string(), None)
-        } else if gemtext && line.starts_with("=>") {
+        } else if linked {
             let rest = line[2..].trim_start_matches([' ', '\t']);
             let (target, label) = rest
                 .split_once([' ', '\t'])
@@ -235,8 +249,7 @@ fn parse_lines(
                 if label.is_empty() { target } else { label }.to_string(),
                 link,
             )
-        } else if gemtext && line.starts_with('#') {
-            let level = line.bytes().take_while(|&b| b == b'#').count().min(3) as u8;
+        } else if heading {
             let text = line[level as usize..].trim_start().to_string();
             view.headings.push(Heading {
                 row: lines.len(),
@@ -244,9 +257,9 @@ fn parse_lines(
                 text: text.clone(),
             });
             (Kind::Heading(level), text, None)
-        } else if gemtext && line.starts_with("* ") {
+        } else if listed {
             (Kind::List, line[2..].to_string(), None)
-        } else if gemtext && line.starts_with('>') {
+        } else if quoted {
             (Kind::Quote, line[1..].trim_start().to_string(), None)
         } else {
             (Kind::Text, line.to_string(), None)
@@ -254,6 +267,22 @@ fn parse_lines(
         let owner = lines.len();
         if kind == Kind::Pre {
             lines.push(DocLine { kind, text, link });
+        } else if kind == Kind::List {
+            // Gemtext 0.24.1, List items: one bullet per source item, with
+            // every continuation aligned with the first line's text. The
+            // native renderer measures the same marker in CSS pixels.
+            let indent = unicode_width::UnicodeWidthStr::width(LIST_MARKER);
+            push_wrapped(
+                &mut lines,
+                kind,
+                text,
+                link,
+                width.saturating_sub(indent).max(1),
+            );
+            for (index, row) in lines[owner..].iter_mut().enumerate() {
+                row.text
+                    .insert_str(0, if index == 0 { LIST_MARKER } else { "  " });
+            }
         } else {
             push_wrapped(&mut lines, kind, text, link, width);
         }
@@ -322,6 +351,97 @@ pub fn heading_row(view: &View, current: usize, which: &str) -> Result<usize, &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemtext_lists_keep_bullets_and_hanging_indents_when_wrapped() {
+        let url = super::super::GeminiUrl::parse("gemini://example.org/").unwrap();
+        let body = b"* First item has several words\n=> /server Server\n* Second item\n* \n";
+        let mut doc = super::super::parse(&url, "text/gemini", body, 12);
+        assert_eq!(doc.raw, body);
+        assert!(doc.lines[0].text.starts_with("• First"));
+        let link_row = doc
+            .lines
+            .iter()
+            .position(|line| line.link.is_some())
+            .unwrap();
+        assert!(link_row > 1);
+        let mut words = Vec::new();
+        for (index, row) in doc.lines[..link_row].iter().enumerate() {
+            let text = row
+                .text
+                .strip_prefix(if index == 0 { "• " } else { "  " })
+                .unwrap();
+            words.extend(text.split_whitespace());
+            assert_eq!(doc.gemini.as_ref().unwrap().owners[index], 0);
+            assert_eq!(doc.gemini.as_ref().unwrap().sources[index], 0);
+        }
+        assert_eq!(words, ["First", "item", "has", "several", "words"]);
+        assert_eq!(doc.lines.last().unwrap().text, "• ");
+        assert!(
+            doc.lines
+                .iter()
+                .all(|line| { unicode_width::UnicodeWidthStr::width(line.text.as_str()) <= 12 })
+        );
+        doc.gemini.as_mut().unwrap().controls.wrap = false;
+        doc.rerender_reply(12);
+        assert_eq!(doc.lines[0].text, "• First item has several words");
+        assert_eq!(doc.lines.len(), 4);
+        doc.gemini.as_mut().unwrap().controls.wrap = true;
+        doc.rerender_reply(80);
+        assert_eq!(doc.lines[0].text, "• First item has several words");
+        assert_eq!(doc.raw, body);
+    }
+
+    #[test]
+    fn gemtext_recognizes_all_six_line_types_before_display_normalization() {
+        let url = super::super::GeminiUrl::parse("gemini://example.org/dir/").unwrap();
+        let source = "\u{feff}#Title\n## Subtitle\n### Third\n#### Fourth hash is text\n\n\nText **stays literal** [label](url)\nAnother paragraph\n=>\tchild.gmi\tChild\n* Item\n*\tNot a list\n * Not a list\n**Not a list**\n- Not a list\n1. Not a list\n> Quoted\n```diagram\n* literal list\n=> literal link\n# literal heading\n> literal quote\n  indented\tcode\n```ignored closing description\nAfter\n";
+        for source in [source.to_string(), source.replace('\n', "\r\n")] {
+            let doc = super::super::parse(&url, "text/gemini", source.as_bytes(), 80);
+            let expected = [
+                (Kind::Heading(1), "Title"),
+                (Kind::Heading(2), "Subtitle"),
+                (Kind::Heading(3), "Third"),
+                (Kind::Heading(3), "# Fourth hash is text"),
+                (Kind::Text, ""),
+                (Kind::Text, ""),
+                (Kind::Text, "Text **stays literal** [label](url)"),
+                (Kind::Text, "Another paragraph"),
+                (Kind::GemLink, "Child"),
+                (Kind::List, "• Item"),
+                (Kind::Text, "*       Not a list"),
+                (Kind::Text, " * Not a list"),
+                (Kind::Text, "**Not a list**"),
+                (Kind::Text, "- Not a list"),
+                (Kind::Text, "1. Not a list"),
+                (Kind::Quote, "Quoted"),
+                (Kind::Pre, "* literal list"),
+                (Kind::Pre, "=> literal link"),
+                (Kind::Pre, "# literal heading"),
+                (Kind::Pre, "> literal quote"),
+                (Kind::Pre, "  indented      code"),
+                (Kind::Text, "After"),
+            ];
+            assert_eq!(
+                doc.lines
+                    .iter()
+                    .map(|line| (line.kind, line.text.as_str()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(doc.raw, source.as_bytes());
+            assert_eq!(
+                doc.lines[8].link,
+                Some(Link::Gemini(url.resolve("child.gmi", false).unwrap()))
+            );
+            assert!(doc.lines[16..].iter().all(|line| line.link.is_none()));
+        }
+        let doc = super::super::parse(&url, "text/plain", b"* Plain text\n# Plain text\n", 80);
+        assert_eq!(doc.lines[0].kind, Kind::Text);
+        assert_eq!(doc.lines[0].text, "* Plain text");
+        assert_eq!(doc.lines[1].kind, Kind::Text);
+    }
+
     #[test]
     fn bounded_rendering_retains_source_alt_headings_and_link_ownership() {
         let url = super::super::GeminiUrl::parse("gemini://example.org/dir/page").unwrap();

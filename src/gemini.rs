@@ -197,6 +197,7 @@ pub fn status_name(status: u8) -> &'static str {
 }
 
 mod presentation;
+pub(crate) use presentation::LIST_MARKER;
 pub use presentation::{View, heading_row, parse_gemtext, render, source_offer};
 
 pub fn parse(url: &GeminiUrl, meta: &str, body: &[u8], width: usize) -> Doc {
