@@ -10119,6 +10119,8 @@ fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let line = host_arg_string(ctx, args, 3);
     if let Some(page) = document_cookie_url(ctx, args) {
         crate::http::set_cookie_from_js(&page, &line);
+    } else if let Ok(page) = url::Url::parse(&host_arg_string(ctx, args, 2)) {
+        crate::http::trace_cookie_line("script-write-denied-context", &page, &line);
     }
     Ok(Value::Undefined)
 }
