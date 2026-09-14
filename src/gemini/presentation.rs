@@ -43,7 +43,11 @@ impl Response {
     pub fn document(&self, width: usize) -> Doc {
         let mut view = self.view.clone();
         view.controls.loading = !self.finished;
-        view.controls.notice = self.notice.clone();
+        // Gemini 0.24.1, Closing connections: report an abrupt TLS close to
+        // the user through status_text (including COMMAND), without adding
+        // transport diagnostics to the received document. Rendering below
+        // supplies its own display-limit notices.
+        view.controls.notice = None;
         if (20..30).contains(&self.status) {
             return render(
                 Link::Gemini(self.url.public_url()),
