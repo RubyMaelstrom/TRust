@@ -362,7 +362,9 @@ impl Dom {
         if restyle_children
             || matches!(
                 self.tag_name(parent),
-                Some("picture" | "select" | "optgroup" | "fieldset" | "form")
+                // Replacing a body's document-wide link-color hints can
+                // also restyle links outside that body's subtree.
+                Some("html" | "picture" | "select" | "optgroup" | "fieldset" | "form")
             )
         {
             self.invalidate_style_subtree(root, true);

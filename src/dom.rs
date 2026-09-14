@@ -22,6 +22,7 @@ mod counter_styles;
 pub(crate) mod cssom;
 mod focus;
 mod generated;
+mod html_hints;
 mod input;
 mod invalidation;
 mod properties;
@@ -1573,6 +1574,17 @@ impl Dom {
 
     /// An attribute change on `id` (its own styling/box may have changed).
     fn touch_attr(&mut self, id: NodeId, name: &str) {
+        // HTML #the-page: body link hints style links throughout the document,
+        // including elements outside the body's descendant subtree.
+        if self.tag_name(id) == Some("body")
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "link" | "vlink" | "alink"
+            )
+        {
+            self.touch();
+            return;
+        }
         if name.eq_ignore_ascii_case("class") {
             self.class_cache.get_mut().invalidate(id);
         }
@@ -4222,6 +4234,17 @@ impl Dom {
     fn ua_default(&self, id: NodeId, name: &str) -> Option<String> {
         let tag = self.tag_name(id)?;
         let v = match name {
+            // HTML #phrasing-content-3: a link has its own UA color, before
+            // inheritance. Body text hints must not recolor links when the
+            // document has no `link` hint; author declarations can override
+            // this default or explicitly request inheritance.
+            "color"
+                if self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+                    && matches!(tag, "a" | "area")
+                    && self.attr(id, "href").is_some() =>
+            {
+                "#0000ee"
+            }
             "font-weight" if matches!(tag, "b" | "strong") => "bold",
             "font-style" if matches!(tag, "i" | "em") => "italic",
             "white-space" if tag == "pre" => "pre",
@@ -4406,6 +4429,17 @@ impl Dom {
         let mut before = Winners::default();
         let mut after = Winners::default();
         let mut conditional_pseudos = Vec::new();
+        // HTML rendering hints have their own origin below every author
+        // layer. `revert` discards them, while `revert-layer` can reveal them
+        // (CSS Cascade 5 #preshint and #revert-layer).
+        self.html_presentational_hints(id, |property, value| {
+            consider_into(
+                &mut elem,
+                property,
+                (false, false, true, false, 0, (0, 0, 0), 0),
+                &value,
+            );
+        });
         if let Some(style) = self.attr(id, "style") {
             let parsed;
             let declarations = match self.cssom_inline.get(&id) {
@@ -4430,6 +4464,7 @@ impl Dom {
                         &pk,
                         (
                             important,
+                            true,
                             !important,
                             true,
                             encode_layer(&[], important),
@@ -4461,6 +4496,7 @@ impl Dom {
                         pk,
                         (
                             *imp,
+                            true,
                             !*imp,
                             false,
                             r.layer_key(*imp),
@@ -4488,7 +4524,15 @@ impl Dom {
                 consider_into(
                     &mut elem,
                     pk,
-                    (*imp, *imp, false, r.layer_key(*imp), r.specificity, r.order),
+                    (
+                        *imp,
+                        true,
+                        *imp,
+                        false,
+                        r.layer_key(*imp),
+                        r.specificity,
+                        r.order,
+                    ),
                     v,
                 );
             }
@@ -4509,7 +4553,15 @@ impl Dom {
                     consider_into(
                         &mut elem,
                         pk,
-                        (*imp, *imp, false, r.layer_key(*imp), r.specificity, r.order),
+                        (
+                            *imp,
+                            true,
+                            *imp,
+                            false,
+                            r.layer_key(*imp),
+                            r.specificity,
+                            r.order,
+                        ),
                         v,
                     );
                 }
@@ -4532,7 +4584,15 @@ impl Dom {
                     consider_into(
                         &mut elem,
                         property,
-                        (false, true, false, encode_layer(&[], false), (0, 0, 0), 0),
+                        (
+                            false,
+                            true,
+                            true,
+                            false,
+                            encode_layer(&[], false),
+                            (0, 0, 0),
+                            0,
+                        ),
                         &value,
                     );
                 }
@@ -4570,6 +4630,7 @@ impl Dom {
                         pk,
                         (
                             *imp,
+                            true,
                             !*imp,
                             false,
                             r.layer_key(*imp),
@@ -4599,7 +4660,7 @@ impl Dom {
         ] {
             for (name, winner) in winners.iter().filter(|(name, _)| name.starts_with("--")) {
                 if let Some((key, _)) = winner.resolve_with_key(|_| false)
-                    && let Some(base) = index.rule_bases.get(&key.5)
+                    && let Some(base) = index.rule_bases.get(&key.6)
                 {
                     maps.custom_bases
                         .insert((pseudo, name.clone()), base.clone());
@@ -4649,7 +4710,7 @@ impl Dom {
                             let source_key = (pseudo, property.clone());
                             maps.custom_bases.remove(&source_key);
                             if let Some((key, _)) = selected
-                                && let Some(base) = index.rule_bases.get(&key.5)
+                                && let Some(base) = index.rule_bases.get(&key.6)
                             {
                                 maps.custom_bases.insert(source_key, base.clone());
                             }
@@ -11622,15 +11683,18 @@ impl StyleRule {
     }
 }
 
-/// (!important, context, inline, layer, specificity, source order): the
-/// cascade key; lexicographic max wins. `context` implements CSS Cascade 5
+/// (!important, author origin, context, inline, layer, specificity, source
+/// order): the cascade key; lexicographic max wins. HTML presentational hints
+/// sort below the author origin (CSS Cascade 5 #preshint); `revert-layer`
+/// can reach that origin, whereas `revert` discards it during defaulting.
+/// `context` implements CSS Cascade 5
 /// §6.1: outer wins for normal declarations, inner wins for important ones.
 /// `layer` is the importance-adjusted cascade-layer encoding (`encode_layer`);
 /// it sits AFTER context and the inline flag because encapsulation context is
 /// sorted before element-attached styles, and element-attached styles before
 /// layers (CSS Cascade 5 §6.1), and BEFORE specificity (layers beat
 /// specificity — the point of the feature).
-type CascadeKey = (bool, bool, bool, u64, (u32, u32, u32), usize);
+type CascadeKey = (bool, bool, bool, bool, u64, (u32, u32, u32), usize);
 
 /// CSS Cascade 5 #revert-layer: keep the strongest declaration at each
 /// importance/context/inline/layer level when rollback occurs in the sheet.
@@ -11640,8 +11704,8 @@ enum CascadeWinner {
     Layers(Vec<(CascadeKey, String)>),
 }
 
-fn cascade_level(key: CascadeKey) -> (bool, bool, bool, u64) {
-    (key.0, key.1, key.2, key.3)
+fn cascade_level(key: CascadeKey) -> (bool, bool, bool, bool, u64) {
+    (key.0, key.1, key.2, key.3, key.4)
 }
 
 impl CascadeWinner {
@@ -11690,7 +11754,7 @@ impl CascadeWinner {
             let (key, value) = candidates
                 .iter()
                 .filter(|(key, _)| {
-                    (!exclude_inline || !key.2)
+                    (!exclude_inline || !key.3)
                         && below.is_none_or(|floor| cascade_level(*key) < floor)
                 })
                 .max_by_key(|(key, _)| key)?;
@@ -11698,7 +11762,7 @@ impl CascadeWinner {
             {
                 return Some((*key, value));
             }
-            if key.0 && key.2 {
+            if key.0 && key.3 {
                 // Important element-attached styles revert their own normal
                 // declarations, but preserve intervening author-important rules.
                 exclude_inline = true;
@@ -11707,14 +11771,14 @@ impl CascadeWinner {
                 // normal levels. Invert encode_layer's per-component ordering.
                 let mut normal_layer = 0u64;
                 for shift in [48, 32, 16, 0] {
-                    let component = (key.3 >> shift) & 0xffff;
+                    let component = (key.4 >> shift) & 0xffff;
                     normal_layer |= (if component == 0 {
                         0xffff
                     } else {
                         0xfffe - component
                     }) << shift;
                 }
-                below = Some((false, !key.1, false, normal_layer));
+                below = Some((false, key.1, !key.2, false, normal_layer));
             } else {
                 below = Some(cascade_level(*key));
             }
