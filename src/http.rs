@@ -7548,6 +7548,117 @@ mod tests {
     }
 
     #[test]
+    fn clickable_accessible_names_do_not_paint_in_either_frontend() {
+        // AccName #comp_label supplies accessibility metadata. CSS Content 3
+        // #content-property / #strings and CSS Pseudo 4 #generated-content
+        // still allow authors to explicitly paint an attribute via attr().
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<style>
+                body { margin:0; font:16px/16px sans-serif }
+                .dot { display:inline-block; vertical-align:top; width:16px;
+                       height:16px; margin-right:16px; border-radius:50%; background:gray }
+                #generated::before { content:attr(aria-label) }
+                #pseudo { background:none }
+                #pseudo::before { content:""; display:block; width:16px;
+                                  height:16px; border-radius:50%; background:gray }
+            </style><body>
+                <div><div id=dot class=dot role=button tabindex=0
+                          aria-label="Show slide 1 of 8"></div><span id=pseudo class=dot
+                          role=button tabindex=0 aria-label="Show slide 2 of 8"></span><span
+                          id=titled class=dot role=button tabindex=0 title="Show slide 3 of 8"></span></div>
+                <div id=generated role=button aria-label="Generated label"></div>
+                <div id=authored role=button aria-label="Accessible action">Visible action</div>
+            </body>"#,
+        );
+        let names = ["dot", "pseudo", "titled", "generated", "authored"];
+        let clickables = names.map(|name| dom.get_by_id(name).unwrap());
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_viewport_px(640.0, 384.0);
+        dom.set_render_clickables(clickables.into_iter().collect(), true);
+        let html = dom.serialize_live(crate::dom::DOCUMENT, &clickables.into_iter().collect());
+        let mut snapshot = crate::dom::Dom::parse_document(&html);
+        snapshot.set_doc_url(Some(base.clone()));
+        snapshot.set_viewport_px(640.0, 384.0);
+
+        for arena in [&dom, &snapshot] {
+            let rendered = render_arena(
+                arena,
+                &base,
+                crate::layout2::Viewport::new(640.0, 384.0),
+                1.0,
+                None,
+                &Default::default(),
+            );
+            let glyphs = rendered
+                .layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                        Some(shaped.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<String>();
+            assert!(!glyphs.contains("Show"), "{glyphs:?}");
+            assert!(!glyphs.contains("Accessible action"), "{glyphs:?}");
+            assert_eq!(glyphs.matches("Generated label").count(), 1, "{glyphs:?}");
+            assert!(glyphs.contains("Visible action"), "{glyphs:?}");
+            for (index, name) in names[..3].iter().enumerate() {
+                let node = arena.get_by_id(name).unwrap();
+                let bounds = rendered.layout.boxes[&node];
+                assert_eq!((bounds.width, bounds.height), (16.0, 16.0));
+                let semantic = rendered
+                    .semantics
+                    .nodes
+                    .iter()
+                    .find(|semantic| semantic.dom_node == Some(node))
+                    .unwrap();
+                assert_eq!(semantic.name, format!("Show slide {} of 8", index + 1));
+                assert_eq!(semantic.role, crate::accessibility::Role::Button);
+                assert!(
+                    semantic
+                        .actions
+                        .contains(&crate::accessibility::Action::Activate)
+                );
+                assert!(
+                    rendered.layout.paint.primitives.iter().any(|command| {
+                        matches!(command, crate::render::DisplayCommand::HitRegion(hit)
+                        if hit.node == node && hit.actor == Some(clickables[index]))
+                    }),
+                    "missing activation target for {name}"
+                );
+            }
+            let terminal = adapt_rendered_terminal(
+                &base,
+                "text/html",
+                Vec::new(),
+                rendered,
+                crate::layout2::TerminalViewport::new(80, 24, 8.0, 16.0),
+                &Default::default(),
+            );
+            let text = terminal
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .map(|item| item.text.as_str())
+                .collect::<String>();
+            assert!(!text.contains("Show"), "{text:?}");
+            assert!(!text.contains("Accessible action"), "{text:?}");
+            assert_eq!(text.matches("Generated label").count(), 1, "{text:?}");
+            assert!(text.contains("Visible action"), "{text:?}");
+            for node in &clickables[..3] {
+                assert!(terminal.rows.iter().flat_map(|row| &row.items).any(|item| {
+                    matches!(item.link, Some(Link::JsClick { node: target, .. }) if target == *node)
+                }), "missing terminal activation target for {node}, direct={}",
+                    arena.render_live());
+            }
+        }
+    }
+
+    #[test]
     fn direct_live_layout_retains_generated_search_and_svg_icon_handles() {
         let base = Url::parse("https://example.test/").unwrap();
         let mut dom = crate::dom::Dom::parse_document(
@@ -7589,8 +7700,8 @@ mod tests {
             "SVG menu placeholder paints: {glyphs:?}"
         );
         assert!(
-            glyphs.contains("[Open filters]"),
-            "named empty activation paints: {glyphs:?}"
+            !glyphs.contains("Open filters"),
+            "an accessible name alone is not visual content: {glyphs:?}"
         );
     }
 

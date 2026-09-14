@@ -165,6 +165,31 @@ impl TerminalPaintModel {
                     && let Some(target) = super::inline::media_target(dom, base, node)
                 {
                     links.insert(node, Link::Media(target));
+                } else {
+                    // DOM #concept-event-dispatch finds hyperlink activation
+                    // on the event path. An empty CSS box inside an anchor is
+                    // still clickable, even when no text/image item inherits
+                    // the link. Check point eligibility on this descendant;
+                    // CSS UI 4 #pointer-events-control allows an auto child
+                    // beneath a pointer-events:none ancestor.
+                    let mut ancestor = dom.parent_flat(node);
+                    while let Some(id) = ancestor {
+                        if dom.tag_name(id) == Some("a")
+                            && let Some(href) = dom.attr(id, "href")
+                        {
+                            let link = if dom.render_clickable(id) {
+                                Link::JsClick {
+                                    node: id,
+                                    href: href.to_string(),
+                                }
+                            } else {
+                                crate::http::resolve(base, href)
+                            };
+                            links.insert(node, link);
+                            break;
+                        }
+                        ancestor = dom.parent_flat(id);
+                    }
                 }
             }
             let inline_snap = dom

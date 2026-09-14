@@ -5932,6 +5932,51 @@ mod tests {
     }
 
     #[test]
+    fn empty_css_box_retains_enclosing_hyperlink_activation() {
+        // DOM event dispatch selects the enclosing anchor's activation
+        // behavior. CSS UI 4 pointer-events controls which descendant boxes
+        // participate; display:contents need not give the anchor its own box.
+        for (parent_style, child_style, attr, expected) in [
+            ("", "", "", true),
+            ("pointer-events:none", "pointer-events:auto", "", true),
+            ("pointer-events:none", "", "", false),
+            ("", "pointer-events:none", "", false),
+            ("", "visibility:hidden", "", false),
+            ("", "opacity:0", "", true),
+            ("", "", "inert", false),
+        ] {
+            let out = lay(
+                &format!(
+                    r#"<body style="margin:0;font:16px/16px sans-serif">
+                        <a href="/next" {attr} style="display:contents;{parent_style}">
+                          <span style="display:inline-block;width:16px;height:16px;
+                                       background:gray;{child_style}"></span>
+                        </a></body>"#
+                ),
+                80,
+            );
+            let hits = out
+                .rows
+                .iter()
+                .flat_map(|row| row.hits.iter().map(move |hit| &row.items[hit.item]))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                hits.len(),
+                usize::from(expected),
+                "parent={parent_style}, child={child_style}, attr={attr}"
+            );
+            for hit in hits {
+                assert!(hit.text.is_empty());
+                assert_eq!((hit.width, hit.height), (2, 1));
+                assert!(
+                    matches!(hit.link.as_ref(), Some(crate::doc::Link::Http(url))
+                    if url.path() == "/next")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn an_empty_div_does_not_become_an_activation_target() {
         let out = lay(
             r#"<body style="margin:0"><div style="position:relative;width:160px;height:32px">
