@@ -132,7 +132,7 @@ pub fn connect(
     url: url::Url,
     protocols: Vec<String>,
     origin: String,
-    cookie: Option<String>,
+    cookie: Option<crate::http::Request>,
     handle: &tokio::runtime::Handle,
     id: usize,
     events: mpsc::Sender<(usize, WsIn)>,
@@ -148,12 +148,12 @@ async fn run_session(
     url: url::Url,
     protocols: Vec<String>,
     origin: String,
-    cookie: Option<String>,
+    cookie: Option<crate::http::Request>,
     id: usize,
     events: mpsc::Sender<(usize, WsIn)>,
     mut out_rx: mpsc::Receiver<WsOut>,
 ) {
-    let (io, protocol) = match handshake(&url, &protocols, &origin, cookie.as_deref()).await {
+    let (io, protocol) = match handshake(&url, &protocols, &origin, cookie.as_ref()).await {
         Ok(result) => result,
         Err(e) => {
             wsdiag(&format!("WS handshake FAILED for {url}: {e}"));
@@ -347,7 +347,7 @@ async fn handshake(
     url: &url::Url,
     protocols: &[String],
     origin: &str,
-    cookie: Option<&str>,
+    cookie: Option<&crate::http::Request>,
 ) -> Result<(crate::http::WsTransport, String), String> {
     let host = url.host_str().ok_or("no host")?.to_string();
     let secure = url.scheme() == "wss";
@@ -389,8 +389,11 @@ async fn handshake(
     if crate::http::GLOBAL_PRIVACY_CONTROL {
         req.push_str("Sec-GPC: 1\r\n");
     }
-    if let Some(c) = cookie.filter(|c| !c.is_empty()) {
-        req.push_str(&format!("Cookie: {c}\r\n"));
+    if let Some(request) = cookie {
+        let cookies = crate::http::request_cookies(request);
+        if !cookies.is_empty() {
+            req.push_str(&format!("Cookie: {cookies}\r\n"));
+        }
     }
     if !protocols.is_empty() {
         req.push_str(&format!(
@@ -407,9 +410,16 @@ async fn handshake(
     // Read the response headers up to the blank line. Anything after is the
     // first frame's bytes — the BufReader keeps them for `read_frame`.
     let head = read_until_headers_end(&mut io).await?;
-    wsdiag(&format!(
-        "WS handshake -> {path}\n--- response head ---\n{head}---"
-    ));
+    wsdiag("WS handshake response received");
+    if let Some(request) = cookie {
+        for line in head.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("set-cookie")
+            {
+                crate::http::response_cookie(request, value.trim());
+            }
+        }
+    }
     let status_line = head.lines().next().unwrap_or("");
     if status_line.split_ascii_whitespace().nth(1) != Some("101") {
         return Err(format!("not a websocket upgrade: {status_line}"));

@@ -43,7 +43,7 @@ impl Outcome {
     }
 }
 
-/// Session-lifetime, RAM-only, origin-bucketed Web Storage.
+/// Origin-bucketed RAM storage; the site storage service persists only localStorage.
 pub type WebStorage = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
 >;

@@ -789,6 +789,8 @@ pub fn open_external(path: &Path) -> Result<(), String> {
 
 async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result<u64, String> {
     let mut current = url.clone();
+    let mut cookie_request = http::Request::get(current.clone());
+    http::set_navigation_metadata(&mut cookie_request, referrer);
     for _ in 0..=10 {
         if !matches!(current.scheme(), "http" | "https") {
             return Err(format!(
@@ -812,7 +814,8 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
             http::USER_AGENT
         );
-        let cookies = http::download_cookies(&current);
+        cookie_request.url = current.clone();
+        let cookies = http::request_cookies(&cookie_request);
         if !cookies.is_empty() {
             request.push_str(&format!("Cookie: {cookies}\r\n"));
         }
@@ -843,7 +846,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
                 let name = name.trim().to_ascii_lowercase();
                 let value = value.trim().to_string();
                 if name == "set-cookie" {
-                    http::download_store_cookie(&current, &value);
+                    http::response_cookie(&cookie_request, &value);
                 }
                 headers.insert(name, value);
             }
@@ -855,6 +858,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             current = current
                 .join(location)
                 .map_err(|error| format!("bad download redirect: {error}"))?;
+            http::update_navigation_metadata_for_redirect(&mut cookie_request, &current);
             continue;
         }
         if !(200..300).contains(&status) {

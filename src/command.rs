@@ -285,7 +285,7 @@ quit                      exit
 set encoding cp437|utf8   BBS art mode
 set image sixel|halfblocks|kitty|iterm2|auto
 set js on|off             page JavaScript (default on)
-set cookies on|off        RAM-only cookies (default on)
+set cookies on|off        First-party cookies (default on); bookmarks allow saving
 set borders on|off        CSS borders (default off)
 mode character|line|auto  telnet input mode
 send escape|<iac>         Ctrl-] or an IAC (brk/ip/ayt/…)
@@ -343,6 +343,10 @@ Use bookmark and bookmarks during Telnet: Ctrl-B and Alt-B keep their
 remote meanings. Back from the bookmark list returns to the live session.
 Bookmarks use XDG_DATA_HOME/trust/bookmarks.json (~/.local/share/trust by
 default); status shows the path. Every protocol uses the same store.
+HTTP(S) bookmarks let the site's expiring cookies and localStorage survive
+restarts. Removing the last bookmark deletes saved state but keeps the open
+session running. Session cookies are never saved; third-party access stays
+blocked. See README.md for site grouping and storage limits.
 
 ## Finger replies
 

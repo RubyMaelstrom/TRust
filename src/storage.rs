@@ -43,8 +43,9 @@ impl Paths {
     }
     pub fn report(&self) -> String {
         format!(
-            "Bookmarks: {}\nConfig: {}\nData: {}\nState (reserved): {}\nCache (reserved): {}",
+            "Bookmarks: {}\nSite data: {}\nConfig: {}\nData: {}\nState (reserved): {}\nCache (reserved): {}",
             self.bookmarks().display(),
+            self.data.join("site-data").display(),
             self.config.display(),
             self.data.display(),
             self.state.display(),

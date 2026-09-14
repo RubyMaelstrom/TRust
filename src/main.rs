@@ -46,6 +46,9 @@ async fn main() -> ExitCode {
         };
     }
 
+    if let Err(error) = trust::site_storage::initialize() {
+        eprintln!("trust: {error}; using temporary site storage");
+    }
     let terminal = ratatui::init();
     // This thread (the `#[tokio::main]` `block_on` driver) owns the live
     // terminal, and the run loop never migrates off it (verified). Claim it
@@ -135,6 +138,9 @@ async fn main() -> ExitCode {
     );
     pop_terminal_title();
     ratatui::restore();
+    if let Err(error) = trust::site_storage::shutdown() {
+        eprintln!("trust: {error}");
+    }
 
     match result {
         Ok(()) => ExitCode::SUCCESS,

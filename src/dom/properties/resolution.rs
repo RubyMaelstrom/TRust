@@ -8,6 +8,9 @@ type AdoptedSource = (std::ops::Range<usize>, Option<url::Url>);
 pub(in crate::dom) struct State {
     pub javascript: FxHashMap<NodeId, Registry>,
     pub document_bases: FxHashMap<NodeId, url::Url>,
+    /// Browser-owned cookie context of installed frame documents, independent
+    /// of author-mutable URL attributes and CSS/document base URLs.
+    pub document_cookie_restrictions: FxHashMap<NodeId, bool>,
     pub adopted_sources: FxHashMap<NodeId, Vec<AdoptedSource>>,
     resolving: RefCell<Resolving>,
 }
@@ -93,6 +96,7 @@ impl State {
 
     pub fn retained_bytes(&self) -> usize {
         let mut bytes = self.javascript.capacity() * std::mem::size_of::<(NodeId, Registry)>()
+            + self.document_cookie_restrictions.capacity() * std::mem::size_of::<(NodeId, bool)>()
             + self.document_bases.capacity() * std::mem::size_of::<(NodeId, url::Url)>()
             + self
                 .document_bases
