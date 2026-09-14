@@ -186,6 +186,7 @@
     // prototype lookups on each wrapper creation / interface conversion.
     const rememberElement = messageWeakSet.bind(elementSlots);
     const elementIdentity = messageWeakGet.bind(elementSlots);
+    const formElementTargets = new WeakMap();
     // Infra namespace constants used by DOM's expanded-name algorithms.
     const HTML_NS = "http://www.w3.org/1999/xhtml";
     const SVG_NS = "http://www.w3.org/2000/svg";
@@ -1472,8 +1473,12 @@
     // relatedTarget adjustment.
     function rootOfNode(a) {
         let r = a;
-        while (r.parentNode) r = r.parentNode;
-        return r;
+        for (;;) {
+            const target = formElementTargets.get(r) || r;
+            const parent = target.parentNode;
+            if (!parent) return r;
+            r = parent;
+        }
     }
     function shadowInclusiveContains(anc, b) {
         let n = b;
@@ -1531,7 +1536,7 @@
     // adjusted relatedTarget collapse to the same object (a mouseover wholly
     // inside a component, seen from outside), and propagation ends at the tree
     // where a hop makes them collapse mid-walk.
-    function dispatch(target, ev, forceBubble, legacyTargetOverride = false) {
+    function dispatch(target, ev, forceBubble, legacyTargetOverride = false, clickContext = null) {
         const targetOverride = legacyTargetOverride ? g.document : target;
         eventsWithListenerExceptions.delete(ev);
         // Each browsing context owns a distinct Window/EventTarget. TRust
@@ -1561,8 +1566,9 @@
             if (target === relatedAtTarget && target !== origRelated) return !ev.defaultPrevented;
             ev.relatedTarget = relatedAtTarget;
         }
+        const isActivationEvent = ev.type === "click" && ev instanceof MouseEvent;
         let path = null; // [{ n, t: shadow-adjusted target, r: adjusted relatedTarget, c: root-of-closed-tree, s: slot-in-closed-tree }], target-first
-        if (forceBubble || ev.bubbles || captureCount > 0) {
+        if (forceBubble || ev.bubbles || captureCount > 0 || isActivationEvent) {
             path = [];
             let n = target, t = targetOverride;
             path.push({ n: n, t: t, r: relatedAtTarget, c: false, s: false });
@@ -1658,6 +1664,21 @@
             }
             ev.__path = path; // composedPath() reads it; emptied on unwind (spec)
         }
+        // DOM #concept-event-dispatch chooses the first activation target
+        // BEFORE listeners, including for dispatchEvent(new PointerEvent("click"))
+        // with the default bubbles=false. Ordinary ancestors qualify only for
+        // bubbling clicks; a retargeted shadow host also qualifies at-target.
+        let activationTarget = null;
+        if (isActivationEvent) {
+            for (let i = 0; i < path.length; i++) {
+                if ((i === 0 || ev.bubbles || path[i].n === path[i].t)
+                    && hasClickActivation(path[i].n)) {
+                    activationTarget = path[i].n;
+                    break;
+                }
+            }
+        }
+        const inputActivation = inputLegacyPreActivation(activationTarget);
         let stopped = false;
         if (path && captureCount > 0) {
             ev.eventPhase = 1; // CAPTURING_PHASE
@@ -1692,6 +1713,15 @@
         ev.__path = null; // spec: "set event's path to the empty list"
         ev.target = targetOverride;
         if (hasRelated) ev.relatedTarget = origRelated;
+        ev.__stop = ev.__stopNow = false;
+        if (activationTarget) {
+            if (ev.defaultPrevented) cancelInputActivation(inputActivation);
+            else {
+                const handled = finishInputActivation(inputActivation)
+                    ? false : runClickActivation(activationTarget, clickContext);
+                if (clickContext) clickContext.handled = handled;
+            }
+        }
         return !ev.defaultPrevented;
     }
     trust.fire = function (target, type, bubble) {
@@ -2375,6 +2405,16 @@
     // hyperlink default, so removing/reparenting the clicked subtree during a
     // listener does not erase or replace the selected activation target.
     let pendingClickHyperlink = null;
+    function hasClickActivation(node) {
+        if (!node || node.nodeType !== 1 || node.namespaceURI !== HTML_NS) return false;
+        const tag = node.localName;
+        if (tag === "input" || tag === "button") return true;
+        if (tag === "a" || tag === "area") return node.hasAttribute("href");
+        if (tag !== "summary") return false;
+        const parent = node.parentElement;
+        return parent && parent.localName === "details"
+            && parent.children.find(child => child.localName === "summary") === node;
+    }
     // The submit control at or above `el` (the default action of clicking it
     // is to submit its form). A <button>'s type defaults to "submit";
     // type="button"/"reset" do not submit. <input type=submit|image> too.
@@ -2473,14 +2513,10 @@
         subject.close(result);
         return true;
     }
-    // Activate an element as a click does: fire a bubbling, cancelable `click`
-    // event, then (unless prevented) run the submit-control activation. Shared
-    // by the actor's `trust.click` (a real user click, `record` = true so the
-    // app learns whether to run the native form submit) and the scripted
-    // `Element.prototype.click()` (HTML "fire a synthetic pointer event named
-    // click" — `record` = false, it must not clobber the actor's read-once
-    // `lastClickSubmit`). The bubbling click is what reaches React's delegated
-    // root-container listener, so a programmatic `.click()` finally runs onClick.
+    // User clicks and HTMLElement.click() create events here; dispatch() owns
+    // activation for every route, including author-created Mouse/PointerEvents.
+    // The per-dispatch context keeps nested synthetic clicks from overwriting
+    // the foreground click's read-once navigation/submit acknowledgment.
     // Popovers currently SHOWING, keyed by node id (the arena set is the
     // render truth; this mirror drives the API logic + auto-closing).
     const POPOVER_OPEN = Object.create(null);
@@ -2562,22 +2598,27 @@
             pendingClickHyperlink = null;
         }
         if (!t) return false;
-        const hyperlink = hyperlinkActivationTarget(t);
         // HTML §6.6.2: user activation of a click-focusable area runs the
         // focusing steps. HTMLElement.click() is synthetic and deliberately
         // does not focus; the actor's trusted terminal click does.
         if (trusted && !nativePointerPosition && elementCanFocus(t)) focusElement(t, { preventScroll: true });
         if (isActuallyDisabled(t)) return false;
-        const inputActivation = inputLegacyPreActivation(t);
         const ev = syntheticClickEvent(!!trusted);
         if (record) nativePointerPosition = null;
-        dispatch(t, ev, false);
-        if (ev.defaultPrevented) {
-            cancelInputActivation(inputActivation);
-            return true;
+        const context = { record, handled: false };
+        const allowed = dispatch(t, ev, false, false, context);
+        return !allowed || context.handled;
+    }
+    function runClickActivation(t, context) {
+        if (isActuallyDisabled(t)) return false;
+        if (t.localName === "a" || t.localName === "area") {
+            if (context && context.record) pendingClickHyperlink = t;
+            else {
+                const url = followHyperlink(t);
+                if (url) g.location.href = url;
+            }
+            return false;
         }
-        if (finishInputActivation(inputActivation)) return false;
-        if (record) pendingClickHyperlink = hyperlink;
         // HTML §4.11.2: the first <summary> child of a <details> element has
         // activation behavior that toggles the parent's boolean `open`
         // attribute. This is a default action of the click, so it must run
@@ -2625,25 +2666,25 @@
             if (form) resetForm(form);
             return true;
         }
-        // The default action of activating a submit control is to submit its
-        // form (HTML). A live <button>/<input type=submit> reaches the app as a
-        // JsClick, so without this a click fired only a `click` event and the
-        // form's `submit` handler (e.g. React's onSubmit, bound on the <form>)
-        // never ran — pixiv's login button did "nothing". Fire a real submit;
-        // page JS may preventDefault (then it owns the update) — else the app
-        // runs the native GET/POST.
+        // HTML #concept-form-submit fires a trusted SubmitEvent even when the
+        // triggering click is untrusted. Preventing that event transfers the
+        // submission to page code; otherwise queue the native navigation.
         const btn = submitControlFor(t);
         if (btn) {
             const form = formOwner(btn);
             if (form) {
-                if (!form.hasAttribute("novalidate") && !btn.hasAttribute("formnovalidate") && !form.checkValidity()) return true;
-                const sev = trusted
-                    ? createTrustedEvent(Event, "submit", { bubbles: true, cancelable: true })
-                    : new Event("submit", { bubbles: true, cancelable: true });
-                sev.submitter = btn;
-                dispatch(form, sev, false);
-                if (record || trust.keyDispatch) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
-                if (!sev.defaultPrevented) handleDialogSubmission(form, btn);
+                if (!form.isConnected || form.__trustFiringSubmit) return true;
+                const sev = createTrustedEvent(SubmitEvent, "submit", { bubbles: true, cancelable: true, submitter: btn });
+                form.__trustFiringSubmit = true;
+                try {
+                    if (!form.hasAttribute("novalidate") && !btn.hasAttribute("formnovalidate")
+                        && !HTMLFormElement.prototype.checkValidity.call(form)) return true;
+                    dispatch(form, sev, false);
+                } finally { form.__trustFiringSubmit = false; }
+                const record = (context && context.record) || trust.keyDispatch;
+                if (record) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
+                if (!sev.defaultPrevented && form.isConnected && !handleDialogSubmission(form, btn) && !record)
+                    trust.queueFormSubmit(form.__id, btn.__id);
                 return sev.defaultPrevented;
             }
         }
@@ -2948,7 +2989,9 @@
     function nearestForm(el) {
         let p = el;
         while (p) {
-            if (p.localName === "form") return p;
+            // Do not enter a form's named getter while computing its own
+            // control membership (names may also shadow localName).
+            if (formElementTargets.has(p)) return p;
             p = p.parentNode;
         }
         return null;
@@ -2958,20 +3001,32 @@
     // requestSubmit(), and the live controls collection share this helper.
     function formOwner(el) {
         if (!el || el.nodeType !== 1) return null;
-        const explicit = el.getAttribute("form");
-        if (explicit !== null) {
-            const owner = g.document && g.document.getElementById(explicit);
-            return owner && owner.localName === "form" ? owner : null;
+        const explicit = el.localName === "img" ? null : el.getAttribute("form");
+        if (explicit !== null && el.isConnected) {
+            // HTML #reset-the-form-owner searches the element's own tree,
+            // including a shadow tree, and considers only the first matching ID.
+            const root = el.getRootNode();
+            const owner = root.getElementById(explicit);
+            return owner && formElementTargets.has(owner) ? owner : null;
         }
         return nearestForm(el.parentNode);
     }
+    function formTreeElements(form, selector) {
+        // Named form properties may shadow querySelectorAll/getRootNode, so
+        // internal algorithms use the underlying platform object directly.
+        const target = formElementTargets.get(form) || form;
+        const root = Node.prototype.getRootNode.call(target);
+        return Array.from(wrapQueryResults(root, __dom_query(root.__id, selector, false)))
+            .filter(el => el.namespaceURI === HTML_NS);
+    }
     function listedFormControls(form) {
-        if (!form || !g.document) return [];
+        if (!form) return [];
         // DOM §4.2.10.1 gives NodeList indexed getters plus iterable methods,
         // not Array.prototype.filter. Convert explicitly before applying the
         // HTML form-owner predicate.
-        return Array.from(g.document
-            .querySelectorAll("button,fieldset,input,object,output,select,textarea"))
+        // HTML #dom-form-elements roots the collection at the form's root,
+        // not at the Window's document. Detached and shadow forms are live too.
+        return formTreeElements(form, "button,fieldset,input,object,output,select,textarea")
             .filter(function (el) {
                 // input[type=image] is form-associated but expressly excluded
                 // from HTMLFormElement.elements.
@@ -3368,7 +3423,7 @@
             // DOM §4.4: the content Document, not the embedding element, is
             // the parent of a child navigable's document element. The native
             // presentation arena nests frame content for layout only.
-            return parent && (parent.localName === "iframe" || parent.localName === "frame") &&
+            return parent && (parent.__trustLN === "iframe" || parent.__trustLN === "frame") &&
                 parent.__contentDoc ? parent.__contentDoc : parent;
         }
         get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
@@ -5642,6 +5697,7 @@
         }
     }
     class HTMLFormElement extends HTMLElement {
+        constructor(...args) { super(...args); return formElementProxy(this); }
         reset() { requireHTMLInterface(this,["form"]); resetForm(this); }
         get elements() {
             return this.__trustElements
@@ -5696,6 +5752,87 @@
                 trust.queueFormSubmit(this.__id, submitter ? submitter.__id : null);
             }
         }
+    }
+    // HTML #dom-form-nameditem and Web IDL #legacy-platform-objects:
+    // indexed controls, live named controls, and the historical past names map.
+    // Own expandos precede names; names precede inherited built-ins. Named
+    // properties are unenumerable and read-only, like HTMLFormElement's IDL.
+    function formElementProxy(target) {
+        const pastNames = new Map();
+        let proxy;
+        function candidates(name) {
+            let list = listedFormControls(proxy).filter(el => el.id === name || el.getAttribute("name") === name);
+            if (!list.length) list = formTreeElements(proxy, "img").filter(el =>
+                formOwner(el) === proxy && (el.id === name || el.getAttribute("name") === name));
+            return list;
+        }
+        function prunePastNames() {
+            for (const [name, el] of pastNames) if (formOwner(el) !== proxy) pastNames.delete(name);
+        }
+        function named(name) {
+            if (typeof name !== "string" || name === "") return undefined;
+            // Wrapper construction seeds names before registering its native
+            // identity. Do not walk descendants until that wrapper is cached.
+            if (elementIdentity(proxy) === undefined) return undefined;
+            prunePastNames();
+            const list = candidates(name);
+            if (list.length > 1) return new RadioNodeList(RADIO_NODE_LIST_TOKEN, () => candidates(name));
+            if (list.length === 1) { pastNames.set(name, list[0]); return list[0]; }
+            return pastNames.get(name);
+        }
+        function descriptor(property) {
+            const index = nodeListArrayIndex(property);
+            if (index >= 0) {
+                const value = listedFormControls(proxy)[index];
+                return value ? {value, writable:false, enumerable:true, configurable:true}
+                    : Reflect.getOwnPropertyDescriptor(target, property);
+            }
+            const own = Reflect.getOwnPropertyDescriptor(target, property);
+            if (own) return own;
+            const value = named(property);
+            return value === undefined ? undefined
+                : {value, writable:false, enumerable:false, configurable:true};
+        }
+        proxy = new Proxy(target, {
+            get(t, property, receiver) {
+                const desc = descriptor(property);
+                return desc && "value" in desc ? desc.value : Reflect.get(t, property, receiver);
+            },
+            has(t, property) { return descriptor(property) !== undefined || Reflect.has(t, property); },
+            getOwnPropertyDescriptor(t, property) { return descriptor(property); },
+            ownKeys(t) {
+                const list = listedFormControls(proxy), keys = list.map((_, i) => String(i));
+                prunePastNames();
+                const elements = formTreeElements(proxy, "button,fieldset,input,object,output,select,textarea,img")
+                    .filter(el => formOwner(el) === proxy
+                        && !(el.localName === "input" && el.type === "image"));
+                for (const el of elements) {
+                    const names = [el.id, el.getAttribute("name")];
+                    for (const [name, previous] of pastNames) if (previous === el) names.push(name);
+                    for (const name of names) if (name && nodeListArrayIndex(name) < 0
+                        && !Reflect.getOwnPropertyDescriptor(t, name) && !keys.includes(name)) keys.push(name);
+                }
+                for (const key of Reflect.ownKeys(t)) if (!keys.includes(key)) keys.push(key);
+                return keys;
+            },
+            set(t, property, value, receiver) {
+                if (nodeListArrayIndex(property) >= 0) return false;
+                return Reflect.set(t, property, value, receiver);
+            },
+            defineProperty(t, property, desc) {
+                if (nodeListArrayIndex(property) >= 0 || named(property) !== undefined) return false;
+                return Reflect.defineProperty(t, property, desc);
+            },
+            deleteProperty(t, property) {
+                const index = nodeListArrayIndex(property);
+                if (index >= 0) return index >= listedFormControls(proxy).length;
+                if (!Reflect.getOwnPropertyDescriptor(t, property) && named(property) !== undefined) return false;
+                return Reflect.deleteProperty(t, property);
+            },
+            preventExtensions() { return false; },
+        });
+        formElementTargets.set(proxy, target);
+        return proxy;
     }
     // HTML "update the image data" / "when to obtain images": creation and
     // relevant mutations, NOT painting, drive requests. Keep decoded pixels in
@@ -7198,6 +7335,9 @@
         pendingClickHyperlink = null;
         if (!anchor) anchor = hyperlinkActivationTarget(wrap(nodeId));
         if (!anchor) return null;
+        return followHyperlink(anchor);
+    };
+    function followHyperlink(anchor) {
         const raw = anchor.getAttribute("href");
         // Presence, not non-emptiness, creates the hyperlink. `href=""`
         // resolves to the document's current base URL.
@@ -7244,7 +7384,7 @@
             trust.errors.push("hyperlink navigation: " + ((e && e.message) || e));
             return null;
         }
-    };
+    }
 
     function makeFrameLocation(frame, parentLocation) {
         const raw = frameURLFor(frame);
@@ -8031,7 +8171,13 @@
         }
         get adoptedStyleSheets() { return adoptedArray(this); }
         set adoptedStyleSheets(v) { setAdoptedArray(this, v); }
-        getElementById(i) { const r = this.querySelectorAll("[id]"); for (const e of r) if (e.id === String(i)) return e; return null; }
+        getElementById(i) {
+            const id = String(i), nodes = this.querySelectorAll("[id]");
+            // HTMLFormElement's named getter can shadow .id. ID lookup uses
+            // the content attribute, not the element's JavaScript property.
+            for (const node of nodes) if (__dom_get_attr(node.__id, "id") === id) return node;
+            return null;
+        }
         querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
@@ -9079,11 +9225,15 @@
             },
         });
     }
+    const RADIO_NODE_LIST_TOKEN = {};
     class RadioNodeList extends NodeList {
-        constructor(resolve) {
-            super();
-            this.__resolve = resolve;
-            return collectionProxy(this);
+        constructor(token, resolve) {
+            if (token !== RADIO_NODE_LIST_TOKEN) throw new TypeError("Illegal constructor");
+            // NodeList has no public constructor. Allocate this live subtype
+            // without invoking that deliberately throwing constructor.
+            const list = Object.create(new.target.prototype);
+            list.__resolve = resolve;
+            return collectionProxy(list);
         }
         __list() { return this.__resolve(); }
         get length() { return this.__list().length; }
@@ -9142,7 +9292,7 @@
             const list = matches();
             if (!list.length) return null;
             if (list.length === 1) return list[0];
-            return new RadioNodeList(matches);
+            return new RadioNodeList(RADIO_NODE_LIST_TOKEN, matches);
         }
         forEach(fn, thisArg) { return this.__list().forEach(fn, thisArg); }
         [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
@@ -9249,6 +9399,17 @@
             g[__cn] = __C;
         }
     }
+    // HTML #dom-fae-form exposes the same owner used for validation,
+    // collection membership, and activation; shadow roots do not change it.
+    for (const [C, tag] of [
+        [HTMLInputElement, "input"], [HTMLButtonElement, "button"],
+        [HTMLSelectElement, "select"], [HTMLTextAreaElement, "textarea"],
+        [g.HTMLFieldSetElement, "fieldset"], [g.HTMLObjectElement, "object"],
+        [g.HTMLOutputElement, "output"],
+    ]) Object.defineProperty(C.prototype, "form", {
+        configurable:true, enumerable:true,
+        get() { requireHTMLInterface(this, [tag]); return formOwner(this); },
+    });
     // The caption/column interfaces have reflected members only, including
     // obsolete members still required by HTML §16.3.10.
     for (const [C, names, props] of [
