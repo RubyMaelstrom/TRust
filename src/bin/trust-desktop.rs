@@ -715,6 +715,7 @@ struct DesktopPageAdapter {
     focus_order: Vec<usize>,
     direct_actor_nodes: bool,
     lazy_image_handles: HashSet<ImageHandle>,
+    deferred_images: Vec<trust::doc::DeferredImage>,
     parents: HashMap<usize, usize>,
     fragment_y: HashMap<String, f32>,
     semantics: SemanticTree,
@@ -735,6 +736,7 @@ impl DesktopPageAdapter {
                 focus_order: rendered.focus_order,
                 direct_actor_nodes: rendered.direct_actor_nodes,
                 lazy_image_handles: rendered.lazy_image_handles,
+                deferred_images: rendered.deferred_images,
                 parents: rendered.parents,
                 fragment_y: rendered.fragment_y,
                 semantics: rendered.semantics,
@@ -1041,7 +1043,21 @@ fn scheduled_page_images(
             visible.insert(*handle);
         }
     }
-    let requests = page
+    // HTML #lazy-loading-attributes observes elements, not decoded image
+    // commands. An unsized pending img can paint only alt text; retain the
+    // canonical element rectangles so it can start fetching in that state.
+    for image in &page.document.deferred_images {
+        let rect = image.rect;
+        if image.fixed
+            || (rect.x <= band.x + band.width
+                && rect.x + rect.width >= band.x
+                && rect.y <= band.y + band.height
+                && rect.y + rect.height >= band.y)
+        {
+            visible.insert(ImageHandle::for_source(&image.source));
+        }
+    }
+    let mut requests: Vec<_> = page
         .layout
         .paint
         .image_requests
@@ -1052,6 +1068,16 @@ fn scheduled_page_images(
         })
         .cloned()
         .collect();
+    let mut requested: HashSet<_> = requests.iter().map(|request| request.handle).collect();
+    for image in &page.document.deferred_images {
+        let handle = ImageHandle::for_source(&image.source);
+        if visible.contains(&handle) && requested.insert(handle) {
+            requests.push(trust::render::ImageRequest {
+                handle,
+                source: image.source.clone(),
+            });
+        }
+    }
     (requests, visible)
 }
 
@@ -8057,6 +8083,75 @@ mod tests {
         assert_eq!(sizes.get(&pending.source), Some(&PENDING_IMAGE_SIZE));
         assert_eq!(sizes.get(&available.source), Some(&(640, 480)));
         assert_eq!(sizes.get(&broken.source), None);
+    }
+
+    #[test]
+    fn lazy_images_without_decoded_dimensions_load_when_near_the_viewport() {
+        // HTML #lazy-loading-attributes observes the element, including its
+        // alt-text fallback box; a painted image is not a prerequisite.
+        let base = url::Url::parse("https://example.test/gallery").unwrap();
+        let mut dom = trust::dom::Dom::parse_document(
+            r#"<style>body { margin: 0 } img { display: block }</style>
+            <img loading="lazy" src="near.jpg" alt="Near image">
+            <img loading="lazy" src="near.jpg" alt="Same source">
+            <div style="height: 5000px"></div>
+            <img loading="lazy" src="far.jpg" alt="Far image">
+            <img loading="lazy" src="fixed.jpg" alt="Fixed image"
+                 style="position: fixed; top: 0; left: 0">"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_viewport_px(800.0, 600.0);
+        let rendered = trust::http::render_arena(
+            &dom,
+            &base,
+            trust::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        assert_eq!(rendered.deferred_images.len(), 4);
+        let near = ImageHandle::for_source("https://example.test/near.jpg");
+        let mut painted = HashSet::new();
+        collect_visible_image_handles(
+            &rendered.layout.paint.primitives,
+            CssRect::new(0.0, 0.0, 800.0, 600.0),
+            &mut painted,
+        );
+        assert!(
+            !painted.contains(&near),
+            "the pending image paints alt text"
+        );
+        let (document, layout) = DesktopPageAdapter::from_rendered(base, rendered);
+        let viewport = CssSize::new(800.0, 600.0);
+        let page = PageLayoutCache {
+            generation: 1,
+            revision: 1,
+            rendered_revision: 1,
+            viewport,
+            device_pixel_ratio: 1.0,
+            frozen: false,
+            document,
+            layout,
+        };
+        for (scroll, expected) in [
+            (0.0, vec!["fixed.jpg", "near.jpg"]),
+            (4800.0, vec!["far.jpg", "fixed.jpg"]),
+        ] {
+            let (requests, visible) =
+                scheduled_page_images(&page, CssPoint::new(0.0, scroll), viewport);
+            let mut sources: Vec<_> = requests
+                .iter()
+                .map(|request| request.source.rsplit('/').next().unwrap())
+                .collect();
+            sources.sort_unstable();
+            assert_eq!(sources, expected);
+            assert_eq!(visible.len(), expected.len());
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| visible.contains(&request.handle))
+            );
+        }
     }
 
     #[test]
