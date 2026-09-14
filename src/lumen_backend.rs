@@ -4055,6 +4055,65 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn actor_forwarded_click_queues_shadow_form_submission() {
+            // DOM #concept-event-dispatch + HTML #concept-form-submit:
+            // a component forwards a user click to an author-created,
+            // non-bubbling PointerEvent on its hidden submit input.
+            let html = r#"<!doctype html><html><body><x-login id="target">Log in</x-login>
+                <script>
+                    const component = document.getElementById('target');
+                    const root = component.attachShadow({mode:'open'});
+                    root.innerHTML = '<form action="/login" method="post"><input name="username"><input name="password" type="password"><input type="submit" name="go" value="yes" style="display:none"></form>';
+                    const form = root.querySelector('form');
+                    form.username.value = 'dummy';
+                    form.password.value = 'fixture';
+                    component.addEventListener('click', () => {
+                        form.go.dispatchEvent(new PointerEvent('click'));
+                    });
+                </script></body></html>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed before click"),
+                    }
+                }
+                handle.try_send_user(PageCmd::Click(target)).unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::SubmitForm {
+                            submitter,
+                            submission,
+                            ..
+                        }) => {
+                            assert!(submitter.is_some());
+                            let submission = submission.expect("live form entry list");
+                            assert_eq!(submission.action, "https://example.com/login");
+                            assert_eq!(submission.method, "post");
+                            assert_eq!(submission.body, "username=dummy&password=fixture&go=yes");
+                            break;
+                        }
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed before submission"),
+                    }
+                }
+            })
+            .await
+            .expect("forwarded click submission timed out");
+        }
+
+        #[tokio::test]
         async fn actor_async_request_submit_preserves_hidden_successful_controls() {
             // WHATWG HTML §§4.10.22.3–4.10.22.4 and
             // HTMLFormElement.requestSubmit(): mirror Reddit's verification
@@ -15597,6 +15656,42 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "detachedListenerResult"),
             "2|false|true"
+        );
+    }
+
+    #[test]
+    fn dispatched_click_activates_shadow_form_controls() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                include_str!("fixtures/shadow_form_activation.mjs")
+            ),
+            "shadow-form-activation-ok"
+        );
+    }
+
+    #[test]
+    fn form_named_properties_follow_the_form_tree() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                include_str!("fixtures/form_named_properties.mjs")
+            ),
+            "form-named-properties-ok"
         );
     }
 
