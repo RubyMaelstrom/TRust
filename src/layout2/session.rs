@@ -82,8 +82,9 @@ impl LayoutFragments {
             let mut bytes = frag.children.capacity() * std::mem::size_of::<flow::Frag<'_>>();
             match &frag.kind {
                 flow::FragKind::Line(line) => {
-                    bytes += line.pieces.capacity() * std::mem::size_of::<inline::Piece>();
-                    for piece in &line.pieces {
+                    bytes += (line.pieces.capacity() + line.atom_boxes.capacity())
+                        * std::mem::size_of::<inline::Piece>();
+                    for piece in line.pieces.iter().chain(&line.atom_boxes) {
                         bytes += piece.item.text.capacity();
                         for value in [
                             &piece.item.terminal_text,

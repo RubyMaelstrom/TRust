@@ -41,6 +41,7 @@ use super::value::{Len, Vp};
 /// the positioned post-pass replaces them).
 #[derive(Clone, Debug)]
 pub(crate) struct Frag<'t> {
+    pub flow: super::clamp::FlowInfo,
     /// The generating element (`NO_NODE` for anonymous boxes/line boxes).
     pub node: NodeId,
     pub x: f32,
@@ -148,6 +149,10 @@ pub(crate) enum FragKind<'t> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LineFrag {
+    pub atom_boxes: Vec<Piece>,
+    pub band: [f32; 2],
+    pub alignment_offset: f32,
+    pub justification: f32,
     pub pieces: Vec<Piece>,
     pub contains_atomic_inline: bool,
     pub width: f32,
@@ -180,6 +185,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
         .map(retain_for_paint)
         .collect::<Option<Vec<_>>>()?;
     Some(Frag {
+        flow: fragment.flow,
         node: fragment.node,
         x: fragment.x,
         y: fragment.y,
@@ -312,6 +318,7 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
 impl<'t> Frag<'t> {
     pub(super) fn empty() -> Frag<'t> {
         Frag {
+            flow: Default::default(),
             node: NO_NODE,
             x: 0.0,
             y: 0.0,
@@ -427,6 +434,7 @@ struct CbRect {
 /// (`content_x + the IFC pen offset`, the line's y).
 fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag<'_> {
     Frag {
+        flow: Default::default(),
         node: NO_NODE,
         x: content_x + m.x_px,
         y,
@@ -1225,7 +1233,7 @@ impl Flow<'_> {
         // Contain floats (§9.5): a BFC-establishing, auto-height box grows to
         // enclose the lowest float bottom in its own context (the ubiquitous
         // `overflow:hidden`/`flow-root` clearfix). A definite height overflows.
-        if own_bfc && spec_h.is_none() && !own_fc.is_empty() {
+        if own_bfc && s.line_clamp.is_none() && spec_h.is_none() && !own_fc.is_empty() {
             let fb = own_fc.bottom();
             if fb > cur.preview() {
                 cur.y = fb;
@@ -1235,6 +1243,21 @@ impl Flow<'_> {
                 // border-top edge exists even if no line box flushed.
                 y_border.get_or_insert(fb - bt);
             }
+        }
+
+        if let Some(max_lines) = s.line_clamp
+            && let Some(bottom) = super::clamp::apply(
+                &mut children,
+                max_lines,
+                content_top_of(y_border.unwrap_or(box_top)),
+                self.dom,
+                self.base,
+                &inl,
+            )
+        {
+            cur.y = bottom;
+            cur.pos = 0.0;
+            cur.neg = 0.0;
         }
 
         // ---- the ::marker (outside position) ----
@@ -1404,6 +1427,27 @@ impl Flow<'_> {
             + b.style.border[BOTTOM]
             + self.pad(&b.style, BOTTOM, cb.0);
         let mut frag = Frag {
+            flow: super::clamp::FlowInfo {
+                clamp_container: b.style.line_clamp.is_some(),
+                independent: self.establishes_bfc(b)
+                    || matches!(
+                        b.content,
+                        Content::Flex(_)
+                            | Content::Grid(_)
+                            | Content::Table(_)
+                            | Content::Atomic(_)
+                    ),
+                auto_height: b.style.height.is_auto().then(|| {
+                    [
+                        self.height_px(&b.style.min_height, &b.style, 0.0, vertical_edges, cb.1)
+                            .unwrap_or(0.0),
+                        self.height_px(&b.style.max_height, &b.style, 0.0, vertical_edges, cb.1)
+                            .unwrap_or(f32::INFINITY),
+                    ]
+                }),
+                margin_bottom: b.style.margin[BOTTOM].resolve(Some(cb.0)).unwrap_or(0.0),
+                ..Default::default()
+            },
             node: b.node,
             x,
             y,
@@ -1423,6 +1467,7 @@ impl Flow<'_> {
             children,
         };
         let (dx, dy) = self.paint_offset(&b.style, cb.0, cb.1, frag.w, frag.h);
+        frag.flow.offset_y = dy;
         if dx != 0.0 || dy != 0.0 {
             Self::offset_frag(&mut frag, dx, dy);
             for a in &mut cur.anchors[a0..] {
@@ -1461,6 +1506,7 @@ impl Flow<'_> {
     ) {
         for ob in &b.oof {
             out.push(Frag {
+                flow: Default::default(),
                 node: NO_NODE,
                 x,
                 y,
@@ -1484,6 +1530,10 @@ impl Flow<'_> {
         for line in lines {
             let hpx = line.height;
             let line_frag = LineFrag {
+                atom_boxes: line.atom_boxes,
+                band: [line.left, line.right],
+                alignment_offset: line.alignment_offset,
+                justification: line.justification,
                 pieces: line.pieces,
                 contains_atomic_inline: line.contains_atomic_inline,
                 width: line.width,
@@ -1494,6 +1544,7 @@ impl Flow<'_> {
                 forced: line.forced,
             };
             out.push(Frag {
+                flow: Default::default(),
                 node: NO_NODE,
                 x,
                 y: cur.y,
@@ -1627,6 +1678,7 @@ impl Flow<'_> {
         };
         let x = (content_x - w).max(0.0);
         Frag {
+            flow: Default::default(),
             node: NO_NODE,
             x,
             y,
@@ -1642,6 +1694,10 @@ impl Flow<'_> {
             },
             clip: None,
             kind: FragKind::Line(LineFrag {
+                atom_boxes: Vec::new(),
+                band: [0.0, w],
+                alignment_offset: 0.0,
+                justification: 0.0,
                 pieces,
                 contains_atomic_inline: false,
                 width: w,
@@ -3098,10 +3154,18 @@ impl Flow<'_> {
                 }
             }
         }
+        if let Some(max_lines) = s.line_clamp
+            && let Some(bottom) =
+                super::clamp::apply(&mut children, max_lines, bt, self.dom, self.base, &inl)
+        {
+            cur.y = bottom;
+            cur.pos = 0.0;
+            cur.neg = 0.0;
+        }
         let mut content_h = (cur.flush() - bt).max(0.0);
         // Contain floats (§9.5): an auto-height item box grows to the lowest
         // float bottom in its own context; a definite height overflows.
-        if def_h.is_none() && !own_fc.is_empty() {
+        if def_h.is_none() && s.line_clamp.is_none() && !own_fc.is_empty() {
             content_h = content_h.max((own_fc.bottom() - bt).max(0.0));
         }
         if let Some(hd) = def_h {
@@ -3125,6 +3189,11 @@ impl Flow<'_> {
         );
         (
             Frag {
+                flow: super::clamp::FlowInfo {
+                    independent: true,
+                    clamp_container: s.line_clamp.is_some(),
+                    ..Default::default()
+                },
                 node: b.node,
                 x: 0.0,
                 y: 0.0,
@@ -3210,6 +3279,7 @@ impl Flow<'_> {
             invisible: inl.invisible,
         };
         Frag {
+            flow: Default::default(),
             node: NO_NODE,
             x,
             y,
@@ -3222,6 +3292,10 @@ impl Flow<'_> {
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
+                atom_boxes: Vec::new(),
+                band: [0.0, r.box_w],
+                alignment_offset: 0.0,
+                justification: 0.0,
                 pieces: vec![Piece::boxed(
                     item, r.box_w, r.box_h, r.off_x, r.off_y, r.paint_w, r.paint_h,
                 )],
@@ -3403,6 +3477,10 @@ impl Flow<'_> {
         abs_clip: Option<Clip>,
         fixed_clip: Option<Clip>,
     ) {
+        if f.flow.clamp_container {
+            let content = f.content_box();
+            super::clamp::clip_floats(&mut f.children, content.y + content.height);
+        }
         // ANY `overflow: auto|scroll` container's scrollable overflow is its
         // OWN concern (CSS Overflow L3 §3.2), never an ancestor's: its own box
         // is already sized by ORDINARY layout inside that ancestor (never by
@@ -3430,7 +3508,7 @@ impl Flow<'_> {
         // away tail is never in the buffer and the strip "cuts off" mid-band no
         // matter how far you scroll. Gated on the cheap scroll-container reads
         // so the common non-scrolling fragment is untouched.
-        let own_clip = if own_clip.is_some()
+        let own_clip = if own_clip.is_some_and(|c| c.x0 < c.x1 && c.y0 < c.y1)
             && f.node != NO_NODE
             && (self.dom.is_scroll_container(f.node) || self.dom.is_hscroll_container(f.node))
         {
@@ -3442,6 +3520,30 @@ impl Flow<'_> {
         // chain (`own_clip`); its in-flow descendants — and the abspos/fixed
         // descendants for which it is the containing block — are additionally
         // clipped by the padding box it establishes when it clips overflow.
+        // CSS Overflow 4 #line-clamp-containers: invisible content retains
+        // layout boxes. Suppression follows the containing-block chain for
+        // abspos/fixed descendants, just like overflow clipping.
+        let own_clip = if f.flow.hidden {
+            Some(Clip {
+                x0: 0.0,
+                x1: 0.0,
+                y0: 0.0,
+                y1: 0.0,
+            })
+        } else {
+            Clip::intersect(
+                own_clip,
+                f.flow.float_clip_end.map(|end| Clip {
+                    x0: f32::NEG_INFINITY,
+                    x1: f32::INFINITY,
+                    y0: f32::NEG_INFINITY,
+                    y1: f.y + end,
+                }),
+            )
+        };
+        if own_clip.is_some_and(|c| c.x0 == c.x1 && c.y0 == c.y1) {
+            f.flow.hidden = true;
+        }
         f.clip = own_clip;
         let content_clip = Clip::intersect(own_clip, self.clip_box(f));
         // CSS Overflow 3 §3 clips an abspos descendant through its containing-
@@ -3542,6 +3644,7 @@ impl Flow<'_> {
                     f.children.insert(
                         i,
                         Frag {
+                            flow: Default::default(),
                             node: NO_NODE,
                             x: 0.0,
                             y: 0.0,
@@ -4155,6 +4258,7 @@ impl Flow<'_> {
             // The atom box's inner anchors ride out with the float anchors (both
             // become `cur.anchors` in the caller).
             float_anchors.append(&mut pa.anchors);
+            pa.frag.flow.inline_box = true;
             atom_frags.push(pa.frag);
         }
         InlineLaid {

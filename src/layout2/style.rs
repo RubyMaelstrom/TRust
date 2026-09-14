@@ -167,6 +167,8 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
 /// honored and retained at fractional CSS-pixel precision.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BoxStyle {
+    /// CSS Overflow 4 #webkit-line-clamp, active only for a vertical legacy box.
+    pub line_clamp: Option<usize>,
     /// Generated boxes have no DOM node of their own, but CSS Pseudo 4 §4.1
     /// gives them a complete computed style. Retain the originating element
     /// and pseudo identity so graphical paint reads that style rather than
@@ -250,6 +252,7 @@ impl BoxStyle {
     /// the initial value for every non-inherited property).
     pub fn anonymous() -> BoxStyle {
         BoxStyle {
+            line_clamp: None,
             pseudo: None,
             size_container: 0,
             margin: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
@@ -315,6 +318,7 @@ impl BoxStyle {
             Len::parse_or(cv(prop).as_deref(), u, vp, Len::px(ua[i]))
         };
         BoxStyle {
+            line_clamp: dom.legacy_line_clamp(id),
             pseudo: None,
             size_container: dom.size_container_kind(id),
             margin: [
@@ -453,6 +457,7 @@ impl BoxStyle {
             })
         };
         BoxStyle {
+            line_clamp: None,
             pseudo: Some((id, which)),
             size_container: 0,
             margin: [

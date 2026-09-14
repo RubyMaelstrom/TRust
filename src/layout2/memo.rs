@@ -433,10 +433,12 @@ impl LayoutCache {
 fn fragment_bytes(fragment: &Frag<'_>) -> usize {
     let own = match &fragment.kind {
         FragKind::Line(line) => {
-            line.pieces.capacity() * size_of::<super::inline::Piece>()
+            (line.pieces.capacity() + line.atom_boxes.capacity())
+                * size_of::<super::inline::Piece>()
                 + line
                     .pieces
                     .iter()
+                    .chain(&line.atom_boxes)
                     .map(super::inline::Piece::retained_bytes)
                     .sum::<usize>()
         }

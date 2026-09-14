@@ -115,6 +115,16 @@ impl ScrollAreas {
         if matches!(f.kind, FragKind::Fixed(_) | FragKind::Oof(..)) {
             return Edge(0., 0.);
         }
+        if f.flow.hidden || f.flow.float_clip_end.is_some() {
+            // CSS Overflow 4 #line-clamp-containers: these boxes retain
+            // CSSOM geometry but contribute only ink overflow. An abspos
+            // descendant whose containing block escapes the hidden subtree
+            // can still contribute to that external containing block.
+            for child in &f.children {
+                self.walk(dom, child, viewport_source, false, escaping);
+            }
+            return Edge(0., 0.);
+        }
         let frame = f.node != NO_NODE && matches!(dom.tag_name(f.node), Some("iframe" | "frame"));
         let [top, right, bottom, left] = f.border;
         let content = f.content_box();
