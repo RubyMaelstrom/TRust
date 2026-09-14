@@ -1988,7 +1988,7 @@ fn pool_put(key: PoolKey, io: BufReader<Conn>) {
 // domain can cover matching subdomains. `set cookies off` disables capture,
 // sends, and document.cookie exposure without deleting the in-memory jar.
 // This bounded session jar implements name/value, Domain, Path, Secure,
-// HttpOnly, and Max-Age(=0 deletes); it intentionally remains non-persistent.
+// HttpOnly, Expires, and Max-Age; it intentionally remains non-persistent.
 
 #[derive(Clone)]
 struct Cookie {
@@ -1999,6 +1999,7 @@ struct Cookie {
     path: String,
     secure: bool,
     http_only: bool,
+    expires_at: Option<i64>, // UTC milliseconds; None means the process session
 }
 
 static COOKIE_JAR: std::sync::LazyLock<std::sync::Mutex<Vec<Cookie>>> =
@@ -2006,6 +2007,126 @@ static COOKIE_JAR: std::sync::LazyLock<std::sync::Mutex<Vec<Cookie>>> =
 static COOKIES_ENABLED: AtomicBool = AtomicBool::new(true);
 
 const COOKIE_JAR_MAX: usize = 1000;
+// RFC6265bis #cookie-lifetime-limits (local http-extensions snapshot
+// 1057fe0f1570aa539eb90502411995e28ba304c7): cap explicit lifetimes at 400 days.
+const COOKIE_MAX_AGE_SECS: i64 = 400 * 24 * 60 * 60;
+
+fn cookie_now_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// RFC 6265 §5.1.1, including verified erratum 4148: cookie dates use an
+/// ordered token scan, not HTTP-date's fixed grammar. Ignore weekday/timezone
+/// labels and interpret the extracted Gregorian date and time as UTC.
+/// https://www.rfc-editor.org/errata/eid4148
+fn parse_cookie_date(value: &str) -> Option<i64> {
+    fn number(token: &[u8], minimum: usize, maximum: usize) -> Option<(i64, &[u8])> {
+        let digits = token.iter().take_while(|b| b.is_ascii_digit()).count();
+        if !(minimum..=maximum).contains(&digits) {
+            return None;
+        }
+        Some((
+            token[..digits]
+                .iter()
+                .fold(0, |n, b| n * 10 + i64::from(b - b'0')),
+            &token[digits..],
+        ))
+    }
+    fn time(token: &[u8]) -> Option<(i64, i64, i64)> {
+        let (hour, rest) = number(token, 1, 2)?;
+        let (minute, rest) = number(rest.strip_prefix(b":")?, 1, 2)?;
+        let (second, _) = number(rest.strip_prefix(b":")?, 1, 2)?;
+        Some((hour, minute, second))
+    }
+    let (mut found_time, mut day, mut month, mut year) = (None, None, None, None);
+    for token in value
+        .as_bytes()
+        .split(|b| matches!(b, 0x09 | 0x20..=0x2f | 0x3b..=0x40 | 0x5b..=0x60 | 0x7b..=0x7e))
+    {
+        if found_time.is_none()
+            && let Some(parsed) = time(token)
+        {
+            found_time = Some(parsed);
+            continue;
+        }
+        if day.is_none()
+            && let Some((parsed, _)) = number(token, 1, 2)
+        {
+            day = Some(parsed);
+            continue;
+        }
+        if month.is_none()
+            && let Some(prefix) = token.get(..3)
+            && let Some(index) = [
+                b"jan", b"feb", b"mar", b"apr", b"may", b"jun", b"jul", b"aug", b"sep", b"oct",
+                b"nov", b"dec",
+            ]
+            .iter()
+            .position(|name| prefix.eq_ignore_ascii_case(*name))
+        {
+            month = Some(index);
+            continue;
+        }
+        if year.is_none()
+            && let Some((parsed, _)) = number(token, 2, 4)
+        {
+            year = Some(parsed);
+        }
+    }
+    let (hour, minute, second) = found_time?;
+    let (day, month, mut year) = (day?, month?, year?);
+    year += match year {
+        70..=99 => 1900,
+        0..=69 => 2000,
+        _ => 0,
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let mut month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    month_days[1] += i64::from(leap);
+    if year < 1601
+        || !(1..=month_days[month]).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days_before_year = |year: i64| {
+        let y = year - 1;
+        365 * y + y / 4 - y / 100 + y / 400
+    };
+    let days = days_before_year(year) - days_before_year(1970)
+        + month_days[..month].iter().sum::<i64>()
+        + day
+        - 1;
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000)
+}
+
+/// RFC 6265 §5.2.2 / RFC6265bis #ua-attribute-max-age. Invalid attributes
+/// are ignored; oversized integers saturate at the supported lifetime limit.
+fn cookie_max_age(value: &str, now: i64) -> Option<i64> {
+    let digits = value.strip_prefix('-').unwrap_or(value).as_bytes();
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let seconds = digits.iter().fold(0i64, |n, b| {
+        (n * 10 + i64::from(b - b'0')).min(COOKIE_MAX_AGE_SECS)
+    });
+    Some(if value.starts_with('-') || seconds == 0 {
+        i64::MIN
+    } else {
+        now.saturating_add(seconds * 1000)
+    })
+}
+
+fn evict_expired_cookies(jar: &mut Vec<Cookie>, now: i64) {
+    // RFC 6265 §5.3: evict expired cookies before storage or retrieval.
+    // Lazy eviction avoids a timer or background work for this bounded jar.
+    jar.retain(|cookie| cookie.expires_at.is_none_or(|expiry| expiry > now));
+}
 
 #[cfg(test)]
 pub(crate) static COOKIE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -2139,6 +2260,16 @@ fn trace_cookie_wire(url: &Url, line: &str) {
 /// Store a `Set-Cookie` header value against the response URL. `from_js`
 /// (a `document.cookie` write) cannot create or overwrite HttpOnly cookies.
 fn store_cookie(url: &Url, line: &str, from_js: bool) {
+    store_cookie_at(
+        &mut COOKIE_JAR.lock().unwrap(),
+        url,
+        line,
+        from_js,
+        cookie_now_ms(),
+    );
+}
+
+fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, now: i64) {
     trace_cookie_line(
         if from_js {
             "script-write"
@@ -2167,6 +2298,7 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
     let mut host_only = true;
     let mut invalid_domain = false;
     let (mut secure, mut http_only, mut max_age) = (false, false, None::<i64>);
+    let mut expires = None;
     for attr in rest.split(';') {
         let attr = attr.trim();
         let (k, v) = attr
@@ -2187,7 +2319,16 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
             "path" if v.starts_with('/') => path = v,
             "secure" => secure = true,
             "httponly" => http_only = true,
-            "max-age" => max_age = v.parse().ok(),
+            "max-age" => {
+                if let Some(expiry) = cookie_max_age(&v, now) {
+                    max_age = Some(expiry);
+                }
+            }
+            "expires" => {
+                if let Some(expiry) = parse_cookie_date(&v) {
+                    expires = Some(expiry.min(now.saturating_add(COOKIE_MAX_AGE_SECS * 1000)));
+                }
+            }
             _ => {}
         }
     }
@@ -2201,7 +2342,7 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         trace_cookie_line("store-domain-mismatch", url, line);
         return;
     }
-    let mut jar = COOKIE_JAR.lock().unwrap();
+    evict_expired_cookies(jar, now);
     if from_js
         && jar
             .iter()
@@ -2213,7 +2354,9 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         return;
     }
     jar.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
-    if max_age.is_some_and(|m| m <= 0) {
+    // §5.3 step 3: the last valid Max-Age overrides every Expires attribute.
+    let expires_at = max_age.or(expires);
+    if expires_at.is_some_and(|expiry| expiry <= now) {
         trace_cookie_line("store-deleted", url, line);
         return; // deletion (the retain above removed it)
     }
@@ -2225,6 +2368,7 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         path,
         secure,
         http_only,
+        expires_at,
     };
     trace_cookie_receipt(&cookie, line);
     jar.push(cookie);
@@ -2284,6 +2428,10 @@ fn cookie_domain_match(host: &str, c: &Cookie) -> bool {
 /// jar cookie that domain/path/secure-matches, excluding HttpOnly (which
 /// JS can never read).
 pub(crate) fn cookies_for_js(page: &Url) -> String {
+    cookies_for_js_at(&mut COOKIE_JAR.lock().unwrap(), page, cookie_now_ms())
+}
+
+fn cookies_for_js_at(jar: &mut Vec<Cookie>, page: &Url, now: i64) -> String {
     if !cookies_enabled() {
         trace_cookie_counts("script-read-disabled", page, 0, (0, 0));
         return String::new();
@@ -2291,7 +2439,7 @@ pub(crate) fn cookies_for_js(page: &Url) -> String {
     let host = page.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = page.path();
     let https = page.scheme() == "https";
-    let jar = COOKIE_JAR.lock().unwrap();
+    evict_expired_cookies(jar, now);
     let result = jar
         .iter()
         .filter(|c| !c.http_only)
@@ -2320,13 +2468,17 @@ pub(crate) fn set_cookie_from_js(page: &Url, line: &str) {
 }
 
 pub(crate) fn cookies_for_request(url: &Url) -> String {
+    cookies_for_request_at(&mut COOKIE_JAR.lock().unwrap(), url, cookie_now_ms())
+}
+
+fn cookies_for_request_at(jar: &mut Vec<Cookie>, url: &Url, now: i64) -> String {
     if !cookies_enabled() {
         return String::new();
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = url.path();
     let https = url.scheme() == "https";
-    let jar = COOKIE_JAR.lock().unwrap();
+    evict_expired_cookies(jar, now);
     jar.iter()
         .filter(|c| !c.secure || https)
         .filter(|c| cookie_domain_match(&host, c))
@@ -13231,6 +13383,155 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
+    fn cookie_dates_follow_rfc6265_token_order_and_calendar_rules() {
+        // RFC 6265 §5.1.1 and erratum 4148: optional suffixes, unordered
+        // date components, two-digit years, and a real UTC Gregorian date.
+        for value in [
+            "Thu, 01 Jan 1970 00:00:00 GMT",
+            "Thursday, 01-Jan-70 00:00:00 GMT",
+            "Thu Jan 1 00:00:00 1970",
+            "00:00:00 ignored JANuary 01st 1970year",
+            "[1970]/(Jan)/{01} 0:0:0suffix",
+        ] {
+            assert_eq!(parse_cookie_date(value), Some(0), "{value}");
+        }
+        assert_eq!(parse_cookie_date("31 Dec 1969 23:59:59"), Some(-1000));
+        assert_eq!(
+            parse_cookie_date("01 Jan 69 00:00:00"),
+            parse_cookie_date("01 Jan 2069 00:00:00")
+        );
+        assert_eq!(parse_cookie_date("01 Jan 70 00:00:00"), Some(0));
+        assert!(parse_cookie_date("29 Feb 2000 00:00:00").is_some());
+        assert!(parse_cookie_date("01 Jan 1601 00:00:00").is_some());
+        for value in [
+            "01 Jan 1600 00:00:00",
+            "29 Feb 1900 00:00:00",
+            "29 Feb 2025 00:00:00",
+            "31 Apr 2026 00:00:00",
+            "00 Jan 2026 00:00:00",
+            "32 Jan 2026 00:00:00",
+            "01 Jan 2026 24:00:00",
+            "01 Jan 2026 00:60:00",
+            "01 Jan 2026 00:00:60",
+            "01 Jan 2026 000:00:00",
+            "001 Jan 2026 00:00:00",
+            "01 Jan 10000 00:00:00",
+            "01 Jan 2026",
+            "01 Nope 2026 00:00:00",
+            "not a date",
+        ] {
+            assert_eq!(parse_cookie_date(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn cookie_expiry_removes_empty_host_cookie_before_domain_token_reload() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        // Keep the fake clock and its jar isolated from concurrent page tests.
+        let mut jar = Vec::new();
+        let page = parse_url("https://www.cookie-expiry.example.test/").unwrap();
+        let now = parse_cookie_date("14 Sep 2026 12:00:00 GMT").unwrap();
+        // A verification script deletes the old host cookie before writing
+        // the replacement domain cookie. The deleted cookie must never be
+        // inserted as an empty value ahead of the replacement in the header.
+        store_cookie_at(&mut jar, &page, "verification=old; Path=/", true, now);
+        store_cookie_at(
+            &mut jar,
+            &page,
+            "verification=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            true,
+            now,
+        );
+        store_cookie_at(
+            &mut jar,
+            &page,
+            "verification=fresh; Domain=cookie-expiry.example.test; Path=/; Secure",
+            true,
+            now,
+        );
+        assert_eq!(
+            cookies_for_js_at(&mut jar, &page, now),
+            "verification=fresh"
+        );
+        assert_eq!(
+            cookies_for_request_at(&mut jar, &page, now),
+            "verification=fresh"
+        );
+    }
+
+    #[test]
+    fn cookie_expiry_precedence_lifetimes_and_httponly_protection() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        // Keep the fake clock and its jar isolated from concurrent page tests.
+        let mut jar = Vec::new();
+        let page = parse_url("https://cookie-lifetimes.example.test/").unwrap();
+        let now = parse_cookie_date("14 Sep 2026 12:00:00 GMT").unwrap() + 123;
+        for line in [
+            "valid=a; Max-Age=2; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=invalid",
+            "removed=a; Expires=Thu, 01 Jan 2099 00:00:00 GMT; Max-Age=0",
+            "expired=a; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Expires=invalid",
+            "session=a; Expires=invalid; Max-Age=+2",
+            "last=a; Max-Age=0; Max-Age=2",
+            "http=a; Max-Age=1; HttpOnly",
+            "absolute=a; Expires=Mon, 14 Sep 2026 12:00:02 GMT",
+        ] {
+            store_cookie_at(&mut jar, &page, line, false, now);
+        }
+        assert_eq!(
+            cookies_for_js_at(&mut jar, &page, now),
+            "valid=a; session=a; last=a; absolute=a"
+        );
+        assert!(cookies_for_request_at(&mut jar, &page, now).contains("http=a"));
+        store_cookie_at(
+            &mut jar,
+            &page,
+            "http=; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            true,
+            now,
+        );
+        assert!(
+            cookies_for_request_at(&mut jar, &page, now).contains("http=a"),
+            "JS cannot delete live HttpOnly cookies"
+        );
+        assert!(!cookies_for_request_at(&mut jar, &page, now + 1000).contains("http="));
+        assert_eq!(
+            cookies_for_js_at(&mut jar, &page, now + 1999),
+            "valid=a; session=a; last=a"
+        );
+        assert_eq!(
+            cookies_for_request_at(&mut jar, &page, now + 2000),
+            "session=a"
+        );
+        // Once expired, the HttpOnly cookie no longer prevents a JS write.
+        store_cookie_at(&mut jar, &page, "http=new", true, now + 2000);
+        assert!(cookies_for_js_at(&mut jar, &page, now + 2000).contains("http=new"));
+        for value in ["-", "+1", "1x", "1.0", ""] {
+            assert_eq!(cookie_max_age(value, now), None);
+        }
+        assert_eq!(
+            cookie_max_age("-999999999999999999999", now),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            cookie_max_age("999999999999999999999", now),
+            Some(now + COOKIE_MAX_AGE_SECS * 1000)
+        );
+        store_cookie_at(
+            &mut jar,
+            &page,
+            "capped=yes; Expires=31 Dec 9999 23:59:59 GMT",
+            false,
+            now,
+        );
+        assert!(
+            !cookies_for_request_at(&mut jar, &page, now + COOKIE_MAX_AGE_SECS * 1000)
+                .contains("capped=")
+        );
+    }
+
+    #[test]
     fn cookie_trace_metadata_never_confuses_names_with_values() {
         assert_eq!(cookie_trace_counts(["", "  "].into_iter()), (0, 0));
         assert_eq!(
@@ -13261,6 +13562,7 @@ customElements.define('lit-counter', LitCounter);
             path: "/path".into(),
             secure: true,
             http_only: true,
+            expires_at: None,
         };
         let line = "other=ignored; cf_clearance=original-test.%2F+/:=end";
         let receipts = [receipt];
