@@ -1,0 +1,18 @@
+Based on the unmodified crates.io glifo 0.3.0 package (Linebender Vello).
+Upstream commit: `7073a85d61ee099d1d3595651ddf92302b074348`.
+
+TRust adds `GlyphRunBuilder::hinting_mode` and `HintingMode::Light`. The default
+remains native vertical hinting. The opt-in policy uses Skrifa's automatic light
+hinter for TrueType, native light hinting for CFF/CFF2, and the required native
+interpreter for hint-reliant fonts. It retains the supplied glyph advances and
+the existing scale/rotation eligibility checks.
+
+Hinting mode participates in the hinter, outline, and bitmap-atlas caches,
+including underline ink exclusions. Color and bitmap glyphs stay unhinted.
+Regressions live in TRust's `src/render/text_raster_tests.rs`; they exercise the
+production CPU and Hybrid paths and both cached and uncached glyph rendering.
+
+Policy references: CSS Fonts 4 `#font-size-prop` and `#font-style-matching`
+(local CSSWG snapshot `81c27f68690138345b2b3b6af8ccc42dad3dca1d`, 2026-09-06),
+and FreeType's `FT_LOAD_TARGET_LIGHT` contract:
+https://freetype.org/freetype2/docs/reference/ft2-glyph_retrieval.html#ft_load_target_xxx
