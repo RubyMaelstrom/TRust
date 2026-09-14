@@ -62,6 +62,9 @@ pub(crate) struct Piece {
     pub y: f32,
     pub box_width: f32,
     pub box_height: f32,
+    /// Vertical space outside this piece's box. Replaced inline boxes align
+    /// and size lines by their margin box; paint/CSSOM retain the inner box.
+    vertical_edges: [f32; 2],
     /// Object-fit paint rectangle relative to the piece box.
     pub paint_x: f32,
     pub paint_y: f32,
@@ -131,6 +134,10 @@ pub(crate) struct InlineItem {
 }
 
 impl Piece {
+    fn layout_height(&self) -> f32 {
+        self.box_height + self.vertical_edges[0] + self.vertical_edges[1]
+    }
+
     pub(super) fn retained_bytes(&self) -> usize {
         self.item.text.capacity()
             + [
@@ -171,6 +178,7 @@ impl Piece {
             y: 0.0,
             box_width,
             box_height,
+            vertical_edges: [0.0; 2],
             paint_x,
             paint_y,
             paint_width,
@@ -197,6 +205,7 @@ impl Piece {
             y: 0.0,
             box_width: width,
             box_height: height,
+            vertical_edges: [0.0; 2],
             paint_x: 0.0,
             paint_y: 0.0,
             paint_width: width,
@@ -477,7 +486,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let line_height = self
             .cur
             .iter()
-            .map(|piece| piece.box_height)
+            .map(Piece::layout_height)
             .fold(self.strut.line_height, f32::max);
         let (Some(fc), Some(fb)) = (self.fc.as_deref_mut(), self.float_boxes.get(idx).copied())
         else {
@@ -573,14 +582,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 } else {
                     self.edge_px(&style, LEFT)
                 };
-                self.atom(a, &atom_context);
+                self.atom(a, &atom_context, ctx.ws.wraps());
                 self.pending_gap_px += if complete_border_box {
                     self.margin_px(&style, RIGHT)
                 } else {
                     self.edge_px(&style, RIGHT)
                 };
             }
-            Inline::Atom(a) => self.atom(a, ctx),
+            Inline::Atom(a) => self.atom(a, ctx, ctx.ws.wraps()),
             // A static-position mark, nothing more: the hypothetical box
             // would have entered here (§10.3.7 — "UAs are free to make a
             // guess"; ours is the exact pen position).
@@ -596,7 +605,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // An atomic inline box (inline-block/-flex/-grid): reserve its
             // pre-laid margin box on the line; the block flow splices its
             // content fragment at the resolved position.
-            Inline::AtomBox(b) => self.place_atom_box(b.node, ctx),
+            Inline::AtomBox(b) => self.place_atom_box(b, ctx),
             Inline::Box { node, style, kids } => {
                 // Generated ::before/::after inline boxes have no DOM node;
                 // their inherited text context is the originating element's
@@ -751,6 +760,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             false,
             ctx.vertical_align,
             Self::space_advance(ctx),
+            ctx.ws.wraps(),
         );
     }
 
@@ -1060,6 +1070,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             y: 0.0,
             box_width: w,
             box_height: height,
+            vertical_edges: [0.0; 2],
             paint_x: 0.0,
             paint_y: 0.0,
             paint_width: w,
@@ -1093,9 +1104,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.pending_space = false;
     }
 
-    /// An atomic inline box (image or form control). Public so the block
-    /// flow can size a block-level replaced box through the same path.
-    pub fn atom(&mut self, a: &Atom, ctx: &InlineStyle) {
+    /// An atomic inline box (image or form control). Its own text style
+    /// sizes the content; the surrounding inline context controls wrapping.
+    fn atom(&mut self, a: &Atom, ctx: &InlineStyle, can_wrap: bool) {
         match &a.kind {
             AtomKind::Img {
                 url,
@@ -1109,8 +1120,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 *density,
                 alt,
                 ctx,
+                can_wrap,
             ),
-            AtomKind::Media { video } => self.media(a.node, *video, ctx),
+            AtomKind::Media { video } => self.media(a.node, *video, ctx, can_wrap),
             AtomKind::Control { form, field } => {
                 let Some(f) = self.forms.get(*form).and_then(|f| f.fields.get(*field)) else {
                     return;
@@ -1167,6 +1179,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     true,
                     ctx.vertical_align,
                     Self::space_advance(ctx),
+                    can_wrap,
                 );
             }
         }
@@ -1188,7 +1201,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.strut = crate::text::ShapedText::default();
             let mut block_context = ctx.clone();
             block_context.vertical_align = VerticalAlign::Baseline;
-            self.atom(a, &block_context);
+            self.atom(a, &block_context, false);
             return;
         };
         let Some(f) = self
@@ -1258,6 +1271,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             false,
             ctx.vertical_align,
             Self::space_advance(ctx),
+            false,
         );
     }
 
@@ -1267,7 +1281,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// text flows as an Image-kind run (HTML's inline representation of an
     /// unavailable image), and the decode pipeline's re-layout turns it into
     /// pixels.
-    pub fn image(
+    #[allow(clippy::too_many_arguments)] // Outer wrapping is independent of the image's own text style.
+    fn image(
         &mut self,
         node: NodeId,
         dimension_source: NodeId,
@@ -1275,6 +1290,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         density: f32,
         alt: &str,
         ctx: &InlineStyle,
+        can_wrap: bool,
     ) {
         // A player often paints its `<video poster>` again as an absolutely
         // positioned sibling `<img>` so custom controls can cover the native
@@ -1348,6 +1364,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 false,
                 ctx.vertical_align,
                 Self::space_advance(ctx),
+                can_wrap,
             );
             return;
         }
@@ -1375,7 +1392,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// faded-poster borrow (`hidden_preview_in_cb`) is deletion-list
     /// machinery and deliberately NOT ported — the fragment stack reads it
     /// once positioned layout lands (P4).
-    fn media(&mut self, node: NodeId, video: bool, ctx: &InlineStyle) {
+    fn media(&mut self, node: NodeId, video: bool, ctx: &InlineStyle, can_wrap: bool) {
         let own_suppressed = self.dom.paint_suppressed(node) || self.dom.visibility_hidden(node);
         // A paint-suppressed OUT-OF-FLOW media element contributes nothing:
         // an abspos box takes no normal-flow space (§9.3.1 — such boxes are
@@ -1473,6 +1490,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 false,
                 ctx.vertical_align,
                 Self::space_advance(ctx),
+                can_wrap,
             );
             return; // the drawn preview IS the mpv affordance
         }
@@ -1503,14 +1521,22 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         paint_control_box: bool,
         vertical_align: VerticalAlign,
         space_advance: f32,
+        can_wrap: bool,
     ) {
         let space = self.pending_space && self.pen > self.line_start;
         let space_width = if space { space_advance.max(0.0) } else { 0.0 };
         let gap = self.take_gap();
-        if !super::css_px_fits(
-            self.pen + space_width + gap + geometry.box_width,
-            self.line_right,
-        ) && self.pen > self.line_start
+        // CSS Text 3 #white-space-property / #atomic-compat-wrap: the
+        // opportunities around atomic inlines are soft breaks. `nowrap`
+        // and `pre` must overflow horizontally instead of making new lines.
+        // Use the surrounding context, independently of the atom's own
+        // white-space (e.g. normal text inside a nowrap carousel's slides).
+        if can_wrap
+            && !super::css_px_fits(
+                self.pen + space_width + gap + geometry.box_width,
+                self.line_right,
+            )
+            && self.pen > self.line_start
         {
             self.soft_break();
             self.pending_gap_px = gap;
@@ -1522,20 +1548,38 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 paint_control_box,
                 vertical_align,
                 space_advance,
+                can_wrap,
             );
             return;
         }
         let x = self.pen + space_width + gap;
+        // CSS 2 #line-height / #propdef-vertical-align: an inline replaced
+        // element contributes its margin box, including negative margins.
+        // Auto margins resolve to zero and percentages use the CB width
+        // (#margin-properties / #inline-replaced-height). Pre-laid atomic
+        // placeholders already contain their margins; block-level atoms
+        // receive these edges from their enclosing flow fragment.
+        let vertical_edges = if self.position_inline_atoms && !atom_box && item.node != NO_NODE {
+            let style = BoxStyle::of(self.dom, item.node, self.vp);
+            if paint_control_box {
+                [self.margin_px(&style, TOP), self.margin_px(&style, BOTTOM)]
+            } else {
+                [self.edge_px(&style, TOP), self.edge_px(&style, BOTTOM)]
+            }
+        } else {
+            [0.0; 2]
+        };
         self.cur.push(Piece {
             x,
             y: 0.0,
             box_width: geometry.box_width,
             box_height: geometry.box_height,
+            vertical_edges,
             paint_x: geometry.paint_x,
             paint_y: geometry.paint_y,
             paint_width: geometry.paint_width,
             paint_height: geometry.paint_height,
-            ascent: geometry.box_height,
+            ascent: geometry.box_height + vertical_edges[0] + vertical_edges[1],
             descent: 0.0,
             vertical_align,
             item,
@@ -1555,11 +1599,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// paint-nothing placeholder (`item.node` = the box id). The box's real
     /// content is a fragment the block flow splices at this piece's resolved
     /// position (`finish` returns the placement). The IFC only needs the size.
-    fn place_atom_box(&mut self, node: NodeId, ctx: &InlineStyle) {
+    fn place_atom_box(&mut self, b: &BoxNode, ctx: &InlineStyle) {
         let idx = self.atom_next;
         self.atom_next += 1;
         let Some(sz) = self.atom_boxes.get(idx).copied() else {
             return;
+        };
+        let node = b.node;
+        // CSS 2 #propdef-vertical-align: the atomic inline's own alignment
+        // positions its margin box on the surrounding line. Keep its outer
+        // wrapping and inter-box spaces in the parent's text context.
+        let own = if node == NO_NODE {
+            ctx.with_pseudo(self.dom, b.style.pseudo)
+        } else {
+            InlineStyle::derive(self.dom, node, ctx, self.base)
         };
         self.place_atom(
             AtomGeometry {
@@ -1588,8 +1641,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             None,
             true,
             false,
-            ctx.vertical_align,
+            own.vertical_align,
             Self::space_advance(ctx),
+            ctx.ws.wraps(),
         );
     }
 
@@ -1644,34 +1698,47 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
         self.pen += shift;
         let strut = &self.strut;
+        // CSS 2 #line-height: top/bottom-aligned boxes constrain the whole
+        // line's height, not its baseline ascent/descent. Counting a tall
+        // top-aligned slide as an ascent adds an unnecessary descender gap.
+        let edge_aligned_height = pieces
+            .iter()
+            .filter(|p| matches!(p.vertical_align, VerticalAlign::Top | VerticalAlign::Bottom))
+            .map(Piece::layout_height)
+            .fold(0.0, f32::max);
         let ascent = pieces
             .iter()
             .map(|p| match p.vertical_align {
+                VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
                 VerticalAlign::Shift(rise) => p.ascent + rise,
-                VerticalAlign::Middle(half_x) => p.box_height / 2.0 + half_x,
+                VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 + half_x,
                 _ => p.ascent,
             })
             .fold(strut.baseline, f32::max);
         let descent = pieces
             .iter()
             .map(|p| match p.vertical_align {
+                VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
                 VerticalAlign::Shift(rise) => p.descent - rise,
-                VerticalAlign::Middle(half_x) => p.box_height / 2.0 - half_x,
+                VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 - half_x,
                 _ => p.descent,
             })
             .fold((strut.line_height - strut.baseline).max(0.0), f32::max);
-        let height = (ascent + descent).max(strut.line_height);
+        let height = (ascent + descent)
+            .max(strut.line_height)
+            .max(edge_aligned_height);
+        let descent = height - ascent;
         let baseline = ascent;
         for p in &mut pieces {
             p.y = match p.vertical_align {
                 VerticalAlign::Baseline => baseline - p.ascent,
                 VerticalAlign::Shift(rise) => baseline - p.ascent - rise,
                 VerticalAlign::Top => 0.0,
-                VerticalAlign::Bottom => (height - p.box_height).max(0.0),
+                VerticalAlign::Bottom => (height - p.layout_height()).max(0.0),
                 // CSS 2.2 #valdef-vertical-align-middle: x-height is above
                 // the alphabetic baseline; CSS-pixel y grows downwards.
-                VerticalAlign::Middle(half_x) => baseline - half_x - p.box_height / 2.0,
-            };
+                VerticalAlign::Middle(half_x) => baseline - half_x - p.layout_height() / 2.0,
+            } + p.vertical_edges[0];
         }
         // The pen is the line's used extent. A contain-fitted replaced box
         // occupies its full object box even when its paint rectangle is less.
