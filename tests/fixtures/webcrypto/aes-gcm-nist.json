@@ -1,0 +1,140 @@
+{
+  "source": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/mac/gcmtestvectors.zip",
+  "vectors": [
+    {
+      "source": "gcmEncryptExtIV128.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 0, 0, 128)",
+      "key": "11754cd72aec309bf52f7687212e8957",
+      "iv": "3c819d9a9bed087615030b65",
+      "pt": "",
+      "aad": "",
+      "ct": "",
+      "tag": "250327c674aaf477aef2675748cf6971"
+    },
+    {
+      "source": "gcmEncryptExtIV128.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 128, 128, 128)",
+      "key": "c939cc13397c1d37de6ae0e1cb7c423c",
+      "iv": "b3d8cc017cbb89b39e0f67e2",
+      "pt": "c3b3c41f113a31b73d9a5cd432103069",
+      "aad": "24825602bd12a984e0092d3e448eda5f",
+      "ct": "93fe7d9e9bfd10348a5606e5cafa7354",
+      "tag": "0032a1dc85f1c9786925a2e71d8272dd"
+    },
+    {
+      "source": "gcmEncryptExtIV128.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 408, 160, 128)",
+      "key": "fe47fcce5fc32665d2ae399e4eec72ba",
+      "iv": "5adb9609dbaeb58cbd6e7275",
+      "pt": "7c0e88c88899a779228465074797cd4c2e1498d259b54390b85e3eef1c02df60e743f1b840382c4bccaf3bafb4ca8429bea063",
+      "aad": "88319d6e1d3ffa5f987199166c8a9b56c2aeba5a",
+      "ct": "98f4826f05a265e6dd2be82db241c0fbbbf9ffb1c173aa83964b7cf5393043736365253ddbc5db8778371495da76d269e5db3e",
+      "tag": "291ef1982e4defedaa2249f898556b47"
+    },
+    {
+      "source": "gcmEncryptExtIV128.rsp, Count=0, IV/PT/AAD/Tag bits=(8, 128, 0, 128)",
+      "key": "15b2d414826453f9e1c7dd0b69d8d1eb",
+      "iv": "b6",
+      "pt": "8cfa255530c6fbc19d51bd4aeb39c91b",
+      "aad": "",
+      "ct": "4822cb98bd5f5d921ee19285c9032375",
+      "tag": "8a40670ebac98cf4e9cc1bf8f803167d"
+    },
+    {
+      "source": "gcmEncryptExtIV128.rsp, Count=0, IV/PT/AAD/Tag bits=(1024, 128, 0, 128)",
+      "key": "71eebc49c8fb773b2224eaff3ad68714",
+      "iv": "07e961e67784011f72faafd95b0eb64089c8de15ad685ec57e63d56e679d3e202b18b75fcbbec3185ffc41653bc2ac4ae6ae8be8c85636f353a9d19a86100d0bd035cc6bdefcab4318ac7b1a08b819427ad8f6abc782466c6ebd4d6a0dd76e78389b0a2a66506bb85f038ffc1da220c24f3817c7b2d02c5e8fc5e7e3be5074bc",
+      "pt": "705da82292143d2c949dc4ba014f6396",
+      "aad": "",
+      "ct": "032363cf0828a03553478bec0f51f372",
+      "tag": "c681b2c568feaa21900bc44b86aeb946"
+    },
+    {
+      "source": "gcmEncryptExtIV192.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 0, 0, 128)",
+      "key": "aa740abfadcda779220d3b406c5d7ec09a77fe9d94104539",
+      "iv": "ab2265b4c168955561f04315",
+      "pt": "",
+      "aad": "",
+      "ct": "",
+      "tag": "f149e2b5f0adaa9842ca5f45b768a8fc"
+    },
+    {
+      "source": "gcmEncryptExtIV192.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 128, 128, 128)",
+      "key": "6f44f52c2f62dae4e8684bd2bc7d16ee7c557330305a790d",
+      "iv": "9ae35825d7c7edc9a39a0732",
+      "pt": "37222d30895eb95884bbbbaee4d9cae1",
+      "aad": "1b4236b846fc2a0f782881ba48a067e9",
+      "ct": "a54b5da33fc1196a8ef31a5321bfcaeb",
+      "tag": "1c198086450ae1834dd6c2636796bce2"
+    },
+    {
+      "source": "gcmEncryptExtIV192.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 408, 160, 128)",
+      "key": "9900227ae0fccbb0d35ecf954629c969f36e539399f32ebe",
+      "iv": "1398992bfbd63149c14ba2a2",
+      "pt": "9d4227eed28b9738f21541c4755a923a43ba20d6f3d6a6b7e31e56f1502f5e93ed4c00511c6a7daeb0281ab947e91756638154",
+      "aad": "788b6885feff23fc27bf9c462877b642ba1aa68d",
+      "ct": "7b6ee7dd98eda9b20edb414711d9710de402b01950a6712e5809f608f7c0aa0fba4098f145fea6886d7baf51fcd182c8febf49",
+      "tag": "f22c7c21f5ece2de684821092194f26c"
+    },
+    {
+      "source": "gcmEncryptExtIV192.rsp, Count=0, IV/PT/AAD/Tag bits=(8, 128, 0, 128)",
+      "key": "d4ba70cb3e8d246aa66ebfafd26266b5f08ec3a88000e770",
+      "iv": "13",
+      "pt": "0616236190652619ff51ad2775f2826e",
+      "aad": "",
+      "ct": "52b5f106a01d1cef4c833099ce88a354",
+      "tag": "d8acd529c97efbefb6102a4a9c3dafb2"
+    },
+    {
+      "source": "gcmEncryptExtIV192.rsp, Count=0, IV/PT/AAD/Tag bits=(1024, 128, 0, 128)",
+      "key": "4e2840fda6f6a60aa76a31333905d8d29e438ffe256ae280",
+      "iv": "6aaa112d3ee4365bf5f1c26f53085c5bd705d702dcbf07ead37e1c8f236e7c83297d0b3cbb7569314313e444bdba3f500def9278c36f94b04ee97ba25221381a8abc12dec49361e221b1c8ad6041946103545243f1ed898ac0d1653b2236ff11e34931b9c943ee6d550569e8ac1674ec08b1fb8973d416ac85cf15648d5f319c",
+      "pt": "81a42f4a2644e978be742e3cb1d293e7",
+      "aad": "",
+      "ct": "44524b745bcee155b8feb6c754c0e6d8",
+      "tag": "f6fc6bd36354b6762ab7e1674254bf9f"
+    },
+    {
+      "source": "gcmEncryptExtIV256.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 0, 0, 128)",
+      "key": "b52c505a37d78eda5dd34f20c22540ea1b58963cf8e5bf8ffa85f9f2492505b4",
+      "iv": "516c33929df5a3284ff463d7",
+      "pt": "",
+      "aad": "",
+      "ct": "",
+      "tag": "bdc1ac884d332457a1d2664f168c76f0"
+    },
+    {
+      "source": "gcmEncryptExtIV256.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 128, 128, 128)",
+      "key": "92e11dcdaa866f5ce790fd24501f92509aacf4cb8b1339d50c9c1240935dd08b",
+      "iv": "ac93a1a6145299bde902f21a",
+      "pt": "2d71bcfa914e4ac045b2aa60955fad24",
+      "aad": "1e0889016f67601c8ebea4943bc23ad6",
+      "ct": "8995ae2e6df3dbf96fac7b7137bae67f",
+      "tag": "eca5aa77d51d4a0a14d9c51e1da474ab"
+    },
+    {
+      "source": "gcmEncryptExtIV256.rsp, Count=0, IV/PT/AAD/Tag bits=(96, 408, 160, 128)",
+      "key": "24501ad384e473963d476edcfe08205237acfd49b5b8f33857f8114e863fec7f",
+      "iv": "9ff18563b978ec281b3f2794",
+      "pt": "27f348f9cdc0c5bd5e66b1ccb63ad920ff2219d14e8d631b3872265cf117ee86757accb158bd9abb3868fdc0d0b074b5f01b2c",
+      "aad": "adb5ec720ccf9898500028bf34afccbcaca126ef",
+      "ct": "eb7cb754c824e8d96f7c6d9b76c7d26fb874ffbf1d65c6f64a698d839b0b06145dae82057ad55994cf59ad7f67c0fa5e85fab8",
+      "tag": "bc95c532fecc594c36d1550286a7a3f0"
+    },
+    {
+      "source": "gcmEncryptExtIV256.rsp, Count=0, IV/PT/AAD/Tag bits=(8, 128, 0, 128)",
+      "key": "9473c28f6e978eb15e1967b888282aa6b078d320034fe5f40f8bb68674f1ecda",
+      "iv": "0a",
+      "pt": "2d2e2798c10bcfcce742e92d3c390fef",
+      "aad": "",
+      "ct": "c4e5ab2c6a4316e57c6c37d2c2acb42c",
+      "tag": "03337df7e1e68d77706abef9edaf5e07"
+    },
+    {
+      "source": "gcmEncryptExtIV256.rsp, Count=0, IV/PT/AAD/Tag bits=(1024, 128, 0, 128)",
+      "key": "d0c267c19f30d80b8914bbbfb72f73b8d3cd5f6a787015848a7b30e38f16f18b",
+      "iv": "b6dcda95ac99777625ae87f8a3a9dd64d79bbd5f4a0e54ca1a9fa2e3f45f5fc2cea7b614126ff0affd3e17356ea01609dda13fd8ddf3df4fcb1849b8b3692c5d4fad309108bcbe24010fbe9cfb4f5d197f4c53b09590ac7b1f7ba099e1f34854d0fca9cc91f81f9b6c9ae0dc63ea7d2a4a7da5ed6857276b68e0f2b851508d3d",
+      "pt": "b8b6883644e234df243291074fe36f81",
+      "aad": "",
+      "ct": "ff4fb3f3f9a251d482c2bef3e2d0eced",
+      "tag": "bd063809f7e1c4720ef2ea63db996c21"
+    }
+  ]
+}

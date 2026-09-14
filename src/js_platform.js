@@ -11143,11 +11143,11 @@
     const __nativeRandom = __crypto_random_bytes;
     const __nativeHmac = __crypto_hmac;
     const __nativeAes = __crypto_aes_ctr;
-    const __cryptoBytes = (d) => {
-        if (d instanceof ArrayBuffer) return new Uint8Array(d.slice(0));
-        if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
-        throw new TypeError("Expected a BufferSource");
-    };
+    const __nativeAesGcm = __crypto_aes_gcm;
+    // The native BufferSource conversion reads internal slots, preserves view
+    // bounds, and rejects shared/detached buffers without author property reads.
+    const __nativeCryptoBuffer = __body_buffer;
+    const __cryptoBytes = d => new Uint8Array(__nativeCryptoBuffer(d));
     const __cryptoKeyStore = new WeakMap();
     const __cryptoKeyToken = {};
     const __cryptoError = (name, message) => {
@@ -11156,9 +11156,13 @@
         error.name = name;
         return error;
     };
-    const __cryptoAlgorithmName = (algorithm) => String(
-        typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name) || ""
-    ).toUpperCase();
+    const __cryptoAlgorithmName = algorithm => {
+        const value = algorithm !== null && (typeof algorithm === "object" || typeof algorithm === "function")
+            ? algorithm.name : algorithm;
+        if (value === undefined || typeof value === "symbol") throw new TypeError("Missing algorithm name");
+        // Algorithm registration uses ASCII case-insensitive matching.
+        return String(value).replace(/[a-z]/g, letter => letter.toUpperCase());
+    };
     class CryptoKey {
         constructor(token, slot) {
             if (token !== __cryptoKeyToken) throw new TypeError("Illegal constructor");
@@ -11184,7 +11188,23 @@
     };
     const __cryptoAesOperation = (algorithm, key, data, usage) => {
         try {
-            if (__cryptoAlgorithmName(algorithm) !== "AES-CTR") {
+            const name = __cryptoAlgorithmName(algorithm);
+            if (name === "AES-GCM") {
+                const params = __cryptoGcmParams(algorithm);
+                const input = __cryptoBytes(data);
+                const entry = __cryptoKeyEntry(key);
+                if (entry.algorithm.name !== "AES-GCM" || !entry.usages.includes(usage)) {
+                    throw __cryptoError("InvalidAccessError", "Key usage is not permitted");
+                }
+                if (![32, 64, 96, 104, 112, 120, 128].includes(params.tagLength)) {
+                    throw __cryptoError("OperationError", "Invalid AES-GCM tag length");
+                }
+                const result = __nativeAesGcm(entry.bytes, params.iv,
+                    params.additionalData, params.tagLength, input, usage === "decrypt");
+                if (result === null) throw __cryptoError("OperationError", "AES-GCM operation failed");
+                return Promise.resolve(result);
+            }
+            if (name !== "AES-CTR") {
                 return Promise.reject(__cryptoError("NotSupportedError", "Unsupported AES algorithm"));
             }
             const raw = __cryptoKeyBytes(key);
@@ -11226,6 +11246,88 @@
     };
     const __cryptoMakeKey = (bytes,algorithm,extractable,usages) =>
         new CryptoKey(__cryptoKeyToken,{bytes,algorithm,extractable:!!extractable,usages});
+    // Web Crypto #algorithm-normalization-normalize-an-algorithm and
+    // #aes-gcm-params; Web IDL #js-dictionary / #js-integer-types-abstract-ops.
+    // Read dictionary members in Web IDL order, then snapshot BufferSources.
+    const __cryptoEnforceRange = (value, maximum) => {
+        const n = +value, integer = Math.trunc(n);
+        if (!Number.isFinite(n) || integer < 0 || integer > maximum) {
+            throw new TypeError("Integer outside the permitted range");
+        }
+        return integer;
+    };
+    const __cryptoRequiredName = algorithm => {
+        const name = algorithm && algorithm.name;
+        if (name === undefined || typeof name === "symbol") throw new TypeError("Missing algorithm name");
+        return String(name);
+    };
+    const __cryptoArrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+    const __cryptoTypedArrayBuffer = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), "buffer").get;
+    const __cryptoDataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get;
+    const __cryptoBufferSource = value => {
+        let buffer = value;
+        if (ArrayBuffer.isView(value)) {
+            try { buffer = __cryptoTypedArrayBuffer.call(value); }
+            catch (_) { buffer = __cryptoDataViewBuffer.call(value); }
+        }
+        // Brand-check the actual backing buffer without reading shadowable
+        // .buffer/.byteLength properties. SharedArrayBuffer fails this check.
+        __cryptoArrayBufferLength.call(buffer);
+        return value;
+    };
+    const __cryptoGcmParams = algorithm => {
+        // The first Algorithm conversion selected AES-GCM; this is the
+        // second conversion, to AesGcmParams. Its name is then canonicalized.
+        __cryptoRequiredName(algorithm);
+        const additional = algorithm.additionalData;
+        if (additional !== undefined) __cryptoBufferSource(additional);
+        const iv = __cryptoBufferSource(algorithm.iv);
+        const tag = algorithm.tagLength;
+        const tagLength = tag === undefined ? 128 : __cryptoEnforceRange(tag, 255);
+        return {iv: __cryptoBytes(iv), additionalData: additional === undefined ? new Uint8Array(0) : __cryptoBytes(additional), tagLength};
+    };
+    const __cryptoGcmUsages = values => {
+        // Empty secret-key usages are rejected after the algorithm's key
+        // validation, per #SubtleCrypto-method-importKey / generateKey.
+        if (values == null || typeof values[Symbol.iterator] !== "function") throw new TypeError("Expected key usages sequence");
+        const requested = Array.from(values, String);
+        const all = ["encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey"];
+        if (requested.some(v => !all.includes(v))) throw new TypeError("Invalid KeyUsage");
+        if (requested.some(v => !["encrypt", "decrypt", "wrapKey", "unwrapKey"].includes(v))) {
+            throw __cryptoError("SyntaxError", "Invalid AES key usages");
+        }
+        return all.filter(v => requested.includes(v));
+    };
+    const __cryptoGcmKey = (bytes, extractable, requested) => {
+        if (![16, 24, 32].includes(bytes.length)) throw __cryptoError("DataError", "AES key must be 128, 192, or 256 bits");
+        if (!requested.length) throw __cryptoError("SyntaxError", "Empty secret-key usages");
+        return __cryptoMakeKey(bytes, {name: "AES-GCM", length: bytes.length * 8}, extractable, requested);
+    };
+    const __cryptoGcmJwk = keyData => {
+        if (keyData instanceof ArrayBuffer || ArrayBuffer.isView(keyData) ||
+            (keyData != null && typeof keyData !== "object" && typeof keyData !== "function")) {
+            throw new TypeError("Expected a JsonWebKey dictionary");
+        }
+        // Snapshot the symmetric JWK members with their Web IDL conversions.
+        // key_ops is a sequence<DOMString>, so iterable input is permitted.
+        const jwk = {};
+        for (const member of ["alg", "ext", "k", "key_ops", "kty", "use"]) {
+            const value = keyData == null ? undefined : keyData[member];
+            if (value === undefined) continue;
+            if (member === "ext") jwk[member] = !!value;
+            else if (member === "key_ops") {
+                if (value == null || typeof value[Symbol.iterator] !== "function") throw new TypeError("Expected JWK key operations sequence");
+                jwk[member] = Array.from(value, item => {
+                    if (typeof item === "symbol") throw new TypeError("Expected DOMString");
+                    return String(item);
+                });
+            } else {
+                if (typeof value === "symbol") throw new TypeError("Expected DOMString");
+                jwk[member] = String(value);
+            }
+        }
+        return jwk;
+    };
     const __hmacAlg = hash => hash==="SHA-1" ? "HS1" : "HS"+hash.slice(4);
     const __hmacOperation = (algorithm,key,data,signature,usage) => {
         try {
@@ -11258,7 +11360,18 @@
             },
             generateKey(algorithm,extractable,usages) {
                 try {
-                    if(__cryptoAlgorithmName(algorithm)!=="HMAC")throw __cryptoError("NotSupportedError","Unsupported key generation algorithm");
+                    const name = __cryptoAlgorithmName(algorithm);
+                    if (name === "AES-GCM") {
+                        __cryptoRequiredName(algorithm);
+                        const length = __cryptoEnforceRange(algorithm.length, 65535);
+                        const requested = __cryptoGcmUsages(usages);
+                        if (![128, 192, 256].includes(length)) throw __cryptoError("OperationError", "Invalid AES key length");
+                        let bytes;
+                        try { bytes = __nativeRandom(length / 8); }
+                        catch (_) { throw __cryptoError("OperationError", "AES key generation failed"); }
+                        return Promise.resolve(__cryptoGcmKey(bytes, extractable, requested));
+                    }
+                    if(name!=="HMAC")throw __cryptoError("NotSupportedError","Unsupported key generation algorithm");
                     const hash=__cryptoHash(algorithm.hash);
                     const length=algorithm.length===undefined ? (hash==="SHA-1"||hash==="SHA-256"?512:1024) : __cryptoLength(algorithm.length);
                     const requested=__cryptoUsages(usages,["sign","verify"]);
@@ -11270,21 +11383,45 @@
             },
             exportKey(format,key) {
                 try {
-                    if(!["raw","jwk","spki","pkcs8"].includes(String(format)))throw new TypeError("Invalid KeyFormat");
+                    format = String(format);
+                    if(!["raw","jwk","spki","pkcs8"].includes(format))throw new TypeError("Invalid KeyFormat");
                     const entry=__cryptoKeyEntry(key);
                     if(!entry.extractable)throw __cryptoError("InvalidAccessError","Key is not extractable");
                     if(format==="raw")return Promise.resolve(entry.bytes.slice().buffer);
-                    if(format!=="jwk"||entry.algorithm.name!=="HMAC")throw __cryptoError("NotSupportedError","Unsupported key export format");
+                    if(format!=="jwk"||!["HMAC", "AES-GCM"].includes(entry.algorithm.name))throw __cryptoError("NotSupportedError","Unsupported key export format");
                     let binary="";for(const b of entry.bytes)binary+=String.fromCharCode(b);
                     return Promise.resolve({kty:"oct",k:btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/, ""),
-                        alg:__hmacAlg(entry.algorithm.hash.name),key_ops:entry.usages.slice(),ext:entry.extractable});
+                        alg:entry.algorithm.name === "AES-GCM" ? "A" + entry.algorithm.length + "GCM" : __hmacAlg(entry.algorithm.hash.name),key_ops:entry.usages.slice(),ext:entry.extractable});
                 }catch(error){return Promise.reject(error);}
             },
             importKey(format, keyData, algorithm, extractable, usages) {
                 try {
                     format=String(format);
                     if(!["raw","jwk","spki","pkcs8"].includes(format))throw new TypeError("Invalid KeyFormat");
-                    if(__cryptoAlgorithmName(algorithm)==="HMAC") {
+                    const name = __cryptoAlgorithmName(algorithm);
+                    if (name === "AES-GCM") {
+                        const requested = __cryptoGcmUsages(usages);
+                        let bytes;
+                        if (format === "raw") bytes = __cryptoBytes(__cryptoBufferSource(keyData));
+                        else if (format === "jwk") {
+                            const jwk = __cryptoGcmJwk(keyData);
+                            if (jwk.kty !== "oct" || typeof jwk.k !== "string" || !/^[A-Za-z0-9_-]*$/.test(jwk.k) || jwk.k.length % 4 === 1) {
+                                throw __cryptoError("DataError", "Invalid symmetric JWK");
+                            }
+                            const binary = atob(jwk.k.replace(/-/g, "+").replace(/_/g, "/"));
+                            bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+                            if ((jwk.alg !== undefined && jwk.alg !== "A" + bytes.length * 8 + "GCM") ||
+                                (requested.length && jwk.use !== undefined && jwk.use !== "enc") ||
+                                (jwk.ext === false && extractable)) {
+                                throw __cryptoError("DataError", "JWK metadata mismatch");
+                            }
+                            if (jwk.key_ops !== undefined && (!Array.isArray(jwk.key_ops) || new Set(jwk.key_ops).size !== jwk.key_ops.length || requested.some(v => !jwk.key_ops.includes(v)))) {
+                                throw __cryptoError("DataError", "JWK key operations mismatch");
+                            }
+                        } else throw __cryptoError("NotSupportedError", "Unsupported AES-GCM import format");
+                        return Promise.resolve(__cryptoGcmKey(bytes, extractable, requested));
+                    }
+                    if(name==="HMAC") {
                         const hash=__cryptoHash(algorithm.hash);
                         const requested=__cryptoUsages(usages,["sign","verify"]);
                         let bytes;
@@ -11306,7 +11443,7 @@
                         return Promise.resolve(__cryptoMakeKey(bytes,{name:"HMAC",hash:{name:hash},length},extractable,requested));
                     }
                     if (String(format).toLowerCase() !== "raw"
-                        || __cryptoAlgorithmName(algorithm) !== "AES-CTR") {
+                        || name !== "AES-CTR") {
                         return Promise.reject(__cryptoError("NotSupportedError", "Unsupported AES key format or algorithm"));
                     }
                     const allowed = ["encrypt", "decrypt", "wrapKey", "unwrapKey"];
