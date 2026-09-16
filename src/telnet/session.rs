@@ -532,6 +532,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn binary_linemode_login_does_not_insert_cr_into_username() {
+        // RFC 1184 EDIT with outbound BINARY (RFC 1123 §3.2.7), followed
+        // by a password prompt with EDIT off and server-owned echo.
+        let greeting =
+            b"\xff\xfd\x22\xff\xfa\x22\x01\x0b\xff\xf0\xff\xfb\x01\xff\xfd\x00\xff\xfc\x01login: ";
+        for split in 0..=greeting.len() {
+            let mut protocol = Protocol::new((80, 24));
+            let mut terminal = crate::terminal::Terminal::new(24, 80);
+            let (mut wire, mut events) = (Vec::new(), VecDeque::new());
+            for chunk in [&greeting[..split], &greeting[split..]] {
+                protocol.receive(chunk, &mut wire, &mut events).unwrap();
+                for event in events.drain(..) {
+                    terminal.observe(&event);
+                    if let Event::Data(data) = event {
+                        assert!(terminal.process(&data).is_empty());
+                    }
+                }
+            }
+            assert!(protocol.local(BINARY));
+            assert!(!protocol.remote(BINARY));
+            assert!(!terminal.char_mode(true));
+            assert!(!terminal.remote_echo());
+            wire.clear();
+            let line = terminal.encode_line("reader").unwrap();
+            terminal.echo_input(&line);
+            protocol.command(Command::Send(line), &mut wire);
+            assert_eq!(wire, b"reader\n", "greeting split at {split}");
+            assert_eq!(terminal.screen().cursor_position(), (1, 0));
+
+            // Password mode and prompt can arrive one octet at a time.
+            for byte in b"\xff\xfa\x22\x01\x18\xff\xf0\xff\xfb\x01Password for reader@host:" {
+                protocol.receive(&[*byte], &mut wire, &mut events).unwrap();
+                for event in events.drain(..) {
+                    terminal.observe(&event);
+                    if let Event::Data(data) = event {
+                        assert!(terminal.process(&data).is_empty());
+                    }
+                }
+            }
+            assert!(terminal.char_mode(true));
+            assert!(terminal.remote_echo());
+            terminal.echo_input(b"hidden");
+            assert_eq!(
+                terminal.visible_text(),
+                "login: reader\nPassword for reader@host:"
+            );
+            assert_eq!(terminal.screen().cursor_position(), (1, 25));
+        }
+    }
+
+    #[test]
     fn binary_and_sga_negotiate_independently_in_both_directions() {
         for option in [BINARY, SGA] {
             let mut protocol = Protocol::new((255, 511));

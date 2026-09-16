@@ -350,7 +350,13 @@ impl Terminal {
             text
         };
         let mut bytes = self.encoding.encode(text)?;
-        bytes.extend_from_slice(b"\r\n");
+        // RFC 1123 §3.2.7: BINARY has no NVT end-of-line convention.
+        // Our line editor completes a line with LF; only NVT expands it to
+        // CR LF (RFC 1184 §5.2). In binary mode an added CR is literal data.
+        if !self.local_options.contains(&op_option::BINARY) {
+            bytes.push(b'\r');
+        }
+        bytes.push(b'\n');
         Ok(bytes)
     }
 
@@ -585,6 +591,9 @@ impl Terminal {
             match byte {
                 b'\r' => echo.extend_from_slice(b"\r\n"),
                 b'\n' | 0 if previous_cr => {}
+                // A locally edited line still echoes a complete newline
+                // when BINARY sends its terminating LF without an NVT CR.
+                b'\n' if !self.char_mode(true) => echo.extend_from_slice(b"\r\n"),
                 8 | 127 => echo.extend_from_slice(b"\x08 \x08"),
                 0..=31 if byte != b'\t' && byte != b'\n' && self.line_mode & 16 == 0 => {
                     echo.extend([b'^', byte + 64]);
@@ -1087,6 +1096,76 @@ mod tests {
         terminal.encoding = Encoding::Cp437;
         assert_eq!(terminal.encode_line("é╔").unwrap(), b"\x82\xc9\r\n");
         assert!(terminal.encode_line("😀").is_err());
+    }
+
+    #[test]
+    fn terminal_line_endings_follow_outbound_binary_negotiation() {
+        let mut terminal = Terminal::new(3, 40);
+        terminal.observe(&Event::LineMode {
+            active: true,
+            mode: 11,
+        });
+        assert_eq!(terminal.encode_line("reader").unwrap(), b"reader\r\n");
+
+        // RFC 856: the two BINARY directions are independent. Receiving
+        // binary data does not change how the local editor transmits lines.
+        terminal.observe(&Event::Negotiation {
+            command: op_command::WILL,
+            option: op_option::BINARY,
+        });
+        assert_eq!(terminal.encode_line("reader").unwrap(), b"reader\r\n");
+        terminal.observe(&Event::Negotiation {
+            command: op_command::DO,
+            option: op_option::BINARY,
+        });
+        assert_eq!(terminal.encode_line("reader").unwrap(), b"reader\n");
+        assert_eq!(terminal.encode_line("").unwrap(), b"\n");
+
+        // A user-selected line editor has the same binary transparency as
+        // negotiated LINEMODE. RFC 1123 §3.2.7 has no binary EOL convention.
+        terminal.observe(&Event::LineMode {
+            active: false,
+            mode: 0,
+        });
+        terminal.input_mode = Some(InputMode::Line);
+        assert_eq!(terminal.encode_line("reader").unwrap(), b"reader\n");
+        terminal.observe(&Event::Negotiation {
+            command: op_command::DONT,
+            option: op_option::BINARY,
+        });
+        assert_eq!(terminal.encode_line("reader").unwrap(), b"reader\r\n");
+    }
+
+    #[test]
+    fn terminal_binary_line_echo_and_paste_keep_newline_geometry() {
+        let mut terminal = Terminal::new(5, 40);
+        terminal.observe(&Event::LineMode {
+            active: true,
+            mode: 11,
+        });
+        terminal.observe(&Event::Negotiation {
+            command: op_command::DO,
+            option: op_option::BINARY,
+        });
+        terminal.process(b"login: ");
+        let bytes = terminal.encode_line("reader").unwrap();
+        assert_eq!(bytes, b"reader\n");
+        terminal.echo_input(&bytes);
+        assert_eq!(terminal.visible_text(), "login: reader");
+        assert_eq!(terminal.screen().cursor_position(), (1, 0));
+
+        let (bytes, draft) = terminal.line_paste("", 0..0, "one\r\ntwo\nthree").unwrap();
+        assert_eq!(bytes, b"one\ntwo\n");
+        assert_eq!(draft, "three");
+        terminal.echo_input(&bytes);
+        assert_eq!(terminal.visible_text(), "login: reader\none\ntwo");
+        assert_eq!(terminal.screen().cursor_position(), (3, 0));
+
+        // Character-mode LF retains its independent cursor motion; local
+        // line-editor echo must not change received VT control semantics.
+        terminal.input_mode = Some(InputMode::Character);
+        terminal.echo_input(b"x\ny");
+        assert_eq!(terminal.screen().cursor_position(), (4, 2));
     }
 
     #[test]
