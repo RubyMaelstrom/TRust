@@ -1589,6 +1589,9 @@ impl BrowserController {
     }
 
     fn queue_external_media(&mut self, url: url::Url) {
+        // RFC 9110 §10.1.3: the referrer identifies the resource from which
+        // the target URI was obtained. Capture the source with the media
+        // request before the frontend drains it and launches the player.
         let referrer = self.current.as_ref().and_then(|page| match &page.target {
             Link::Http(url) => Some(url.clone()),
             _ => None,
@@ -2466,7 +2469,7 @@ impl BrowserController {
                 self.status = String::from("Page action …");
             }
             Link::Form { .. } => return false,
-            Link::Media(url) => self.status = format!("Media: {url}"),
+            Link::Media(url) => self.queue_external_media(url),
             Link::External(url) if crate::rdap::is_action(&url) => {
                 self.begin_fetch(Link::External(url), false, NavigationIntent::New)
             }
@@ -4066,6 +4069,58 @@ mod tests {
         )));
         assert!(browser.snapshot().loading);
         assert!(browser.take_external_media().is_none());
+    }
+
+    #[test]
+    fn media_activation_carries_the_source_page_referrer_and_keeps_it_live() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let source = url::Url::parse("https://www.example.test/album/123").unwrap();
+        browser.current = Some(BrowserPage {
+            target: Link::Http(source.clone()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+
+        for target in [
+            "https://cdn.example.test/video.mp4",
+            "https://cdn.example.test/audio.ogg",
+        ] {
+            let target = url::Url::parse(target).unwrap();
+            let outcome = browser.handle_action(UserAction::Activate(Link::Media(target.clone())));
+            assert!(outcome.invalidated);
+            assert!(!outcome.loading_retired);
+            assert_eq!(
+                browser.take_external_media(),
+                Some((target, Some(source.clone())))
+            );
+            assert!(browser.page_is_live());
+            assert!(!browser.snapshot().loading);
+            assert_eq!(
+                browser.current_page().unwrap().target(),
+                &Link::Http(source.clone())
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "external playback must not click the page player"
+            );
+            assert!(browser.back.is_empty());
+        }
+
+        browser.open_internal_gemtext("about:help", Vec::new());
+        let target = url::Url::parse("https://cdn.example.test/video.mp4").unwrap();
+        browser.handle_action(UserAction::Activate(Link::Media(target.clone())));
+        assert_eq!(browser.take_external_media(), Some((target, None)));
     }
 
     #[tokio::test]
