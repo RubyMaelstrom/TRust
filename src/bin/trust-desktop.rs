@@ -7223,6 +7223,13 @@ fn same_page_target(left: &PageHit, right: &PageHit) -> bool {
 /// retained solely as the dead-actor fallback used by the controller's
 /// navigation-priority lane.
 fn page_hit_activation(hit: &PageHit, page_live: bool) -> Option<Link> {
+    // HTML §4.8.8 allows a video to represent an external playback control.
+    // Preserve that browser action even when the underlying player has a JS
+    // actor, so activation reaches mpv with the originating page's referrer.
+    // https://html.spec.whatwg.org/multipage/media.html#the-video-element
+    if matches!(hit.link, Some(Link::Media(_))) {
+        return hit.link.clone();
+    }
     if page_live && let Some(node) = hit.actor {
         let href = match hit.link.as_ref() {
             Some(Link::JsClick { href, .. }) => href.clone(),
@@ -7785,6 +7792,26 @@ mod tests {
             })
         );
         assert_eq!(page_hit_activation(&target, false), target.link);
+    }
+
+    #[test]
+    fn media_hit_preserves_external_playback_on_live_and_static_pages() {
+        let target = PageHit {
+            rect: CssRect::new(0.0, 0.0, 320.0, 180.0),
+            node: 9,
+            actor: Some(42),
+            link: Some(Link::Media(
+                url::Url::parse("https://media.example.test/video.mp4").unwrap(),
+            )),
+            cursor: None,
+        };
+        for page_live in [true, false] {
+            assert_eq!(
+                page_hit_activation(&target, page_live),
+                target.link,
+                "the browser's external playback control must retain its media action"
+            );
+        }
     }
 
     #[test]
