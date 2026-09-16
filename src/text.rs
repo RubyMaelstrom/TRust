@@ -352,10 +352,12 @@ impl TextEditor {
             }
             ImeAction::Commit(text) => {
                 if self.editor.is_composing() {
-                    self.drive(|driver| driver.finish_compose());
-                } else {
-                    self.replace_selection(text);
+                    // UI Events #event-type-compositionend: the committed
+                    // string is the final result, which can differ from the
+                    // last preedit (or be empty when composition is canceled).
+                    self.drive(|driver| driver.clear_compose());
                 }
+                self.replace_selection(text);
                 true
             }
             ImeAction::Disabled => {
@@ -1391,6 +1393,22 @@ mod tests {
         assert_eq!(editor.raw_text(), "aに");
         editor.handle_ime(&ImeAction::Commit(String::from("に")));
         assert_eq!(editor.text(), "aに");
+    }
+
+    #[test]
+    fn editor_ime_commit_replaces_preedit_with_the_actual_final_text() {
+        for (commit, expected) in [("日本", "@ 日本 tail"), ("", "@  tail")] {
+            let mut editor = TextEditor::new("@  tail", &TextStyle::default(), 300.0, false);
+            editor.select_byte_range(2, 2);
+            editor.handle_ime(&ImeAction::Preedit {
+                text: "にほん".into(),
+                cursor: Some((9, 9)),
+            });
+            editor.handle_ime(&ImeAction::Commit(commit.into()));
+            assert_eq!(editor.text(), expected);
+            assert!(!editor.is_composing());
+            assert_eq!(editor.selection(), 2 + commit.len()..2 + commit.len());
+        }
     }
 
     #[test]
