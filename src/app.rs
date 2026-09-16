@@ -2033,8 +2033,10 @@ impl App {
                     }
                     LineControl::Send(bytes) => {
                         self.send_input(bytes).await;
+                        return;
                     }
                 }
+                self.session_history.detach();
             }
             return;
         }
@@ -2133,7 +2135,9 @@ impl App {
                 self.input.remove(self.byte_cursor());
                 self.active_history().detach();
             }
-            KeyCode::Up if !self.masked_input => {
+            KeyCode::Up
+                if !self.masked_input && !(self.mode == Mode::Session && self.vt.remote_echo()) =>
+            {
                 let current = self.input.clone();
                 if let Some(text) = self.active_history().up(&current) {
                     self.cursor = text.chars().count();
@@ -2141,7 +2145,9 @@ impl App {
                     self.select_anchor = None;
                 }
             }
-            KeyCode::Down if !self.masked_input => {
+            KeyCode::Down
+                if !self.masked_input && !(self.mode == Mode::Session && self.vt.remote_echo()) =>
+            {
                 if let Some(text) = self.active_history().down() {
                     self.cursor = text.chars().count();
                     self.input = text;
@@ -2561,9 +2567,15 @@ impl App {
                     .map(|(lo, hi)| self.byte_at(lo)..self.byte_at(hi))
                     .unwrap_or_else(|| self.byte_cursor()..self.byte_cursor());
                 match self.vt.line_paste(&self.input, selection, &text) {
-                    Ok((bytes, draft)) => {
-                        if bytes.is_empty() || self.send_input(bytes).await {
-                            self.input = draft;
+                    Ok(paste) => {
+                        if paste.bytes.is_empty() || self.send_input(paste.bytes).await {
+                            if !self.vt.remote_echo() {
+                                for line in paste.completed.lines() {
+                                    self.session_history.push(line);
+                                }
+                            }
+                            self.session_history.detach();
+                            self.input = paste.draft;
                             self.cursor = self.input.chars().count();
                             self.select_anchor = None;
                         }
@@ -2608,6 +2620,9 @@ impl App {
             // still controls secret input. Never retain a submitted password.
             if self.vt.remote_echo() {
                 self.input.clear();
+                self.session_history.detach();
+            } else {
+                self.session_history.push(&self.input);
             }
             self.cursor = self.input.chars().count();
             self.select_anchor = (!self.input.is_empty()).then_some(0);
@@ -9159,6 +9174,7 @@ impl App {
     fn open(&mut self, host: String, port: u16, use_tls: bool) {
         self.terminal_tls = use_tls;
         self.terminal_draft = None;
+        self.session_history.detach();
         self.terminal_size_sent = None;
         self.retire_fetch("Incomplete reply: left this page");
         self.replace_nav = false;
@@ -13576,6 +13592,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_line_history_recalls_restores_drafts_and_separates_command_history() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let key = |code| Event::Key(KeyEvent::from(code));
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        for text in ["north", "south", "south", ""] {
+            app.input = text.into();
+            app.cursor = text.chars().count();
+            app.on_terminal_event(key(KeyCode::Enter)).await;
+            assert!(matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(_))));
+        }
+        assert_eq!(app.session_history.entries, ["north", "south"]);
+        app.input = "unfinished 界".into();
+        app.cursor = app.input.chars().count();
+        for (code, expected) in [
+            (KeyCode::Up, "south"),
+            (KeyCode::Up, "north"),
+            (KeyCode::Up, "north"),
+            (KeyCode::Down, "south"),
+            (KeyCode::Down, "unfinished 界"),
+            (KeyCode::Down, "unfinished 界"),
+        ] {
+            app.on_terminal_event(key(code)).await;
+            assert_eq!(app.input, expected);
+            assert_eq!(app.cursor, expected.chars().count());
+            assert_eq!(app.selection(), None);
+        }
+        assert!(rx.try_recv().is_err(), "recalling text never sends it");
+
+        // Editing a recalled line makes it the new draft, including SLC edits.
+        for (edit, expected) in [
+            (KeyEvent::from(KeyCode::Char('!')), "south!"),
+            (KeyEvent::from(KeyCode::Backspace), "sout"),
+            (KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), ""),
+            (KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), ""),
+        ] {
+            app.on_terminal_event(key(KeyCode::Up)).await;
+            app.on_terminal_event(Event::Key(edit)).await;
+            assert_eq!(app.input, expected);
+            app.on_terminal_event(key(KeyCode::Up)).await;
+            assert_eq!(app.input, "south");
+            app.on_terminal_event(key(KeyCode::Down)).await;
+            assert_eq!(app.input, expected);
+        }
+        app.on_terminal_event(key(KeyCode::Up)).await;
+        app.command_history.push("help");
+        app.open_command();
+        app.on_terminal_event(key(KeyCode::Up)).await;
+        assert_eq!(app.input, "help");
+        app.on_terminal_event(key(KeyCode::Esc)).await;
+        assert_eq!(app.input, "south");
+        app.on_terminal_event(key(KeyCode::Up)).await;
+        assert_eq!(app.input, "north");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_line_history_survives_new_connections_with_fresh_navigation() {
+        let mut app = super::App::new(None, 23);
+        app.session_history.push("north");
+        app.session_history.push("south");
+        assert_eq!(
+            app.session_history.up("old draft").as_deref(),
+            Some("south")
+        );
+        assert_eq!(app.session_history.up("").as_deref(), Some("north"));
+        app.open("127.0.0.1".into(), 0, false);
+        assert_eq!(app.session_history.up("").as_deref(), Some("south"));
+        assert_eq!(app.session_history.down().as_deref(), Some(""));
+        let mut fresh_app = super::App::new(None, 23);
+        assert!(fresh_app.session_history.up("").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_line_history_records_completed_paste_lines_and_keeps_the_draft() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.input = "say ".into();
+        app.cursor = 4;
+        app.on_paste("é界\r\none\ttwo\rtail".into()).await;
+        assert_eq!(app.session_history.entries, ["say é界", "one\ttwo"]);
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == "say é界\r\none\ttwo\r\n".as_bytes())
+        );
+        assert_eq!(app.input, "tail");
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Up)))
+            .await;
+        assert_eq!(app.input, "one\ttwo");
+        app.on_paste("!".into()).await;
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Up)))
+            .await;
+        assert_eq!(app.input, "one\ttwo");
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Down)))
+            .await;
+        assert_eq!(app.input, "one\ttwo!");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_line_history_ignores_passwords_and_leaves_character_arrows_remote() {
+        use crate::telnet::{op_command, op_option};
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let key = |code| Event::Key(KeyEvent::from(code));
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.session_history.push("look");
+        app.vt.observe(&crate::telnet::Event::LineMode {
+            active: true,
+            mode: 1,
+        });
+        app.vt.observe(&crate::telnet::Event::Negotiation {
+            command: op_command::WILL,
+            option: op_option::ECHO,
+        });
+        app.input = "private value".into();
+        app.cursor = app.input.chars().count();
+        for code in [KeyCode::Up, KeyCode::Down] {
+            app.on_terminal_event(key(code)).await;
+            assert_eq!(app.input, "private value");
+        }
+        app.on_terminal_event(key(KeyCode::Enter)).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"private value\r\n")
+        );
+        app.on_paste("pasted secret\n".into()).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"pasted secret\r\n")
+        );
+        assert_eq!(app.session_history.entries, ["look"]);
+        app.vt.observe(&crate::telnet::Event::Negotiation {
+            command: op_command::WONT,
+            option: op_option::ECHO,
+        });
+        app.on_terminal_event(key(KeyCode::Up)).await;
+        assert_eq!(app.input, "look");
+        app.on_terminal_event(key(KeyCode::Down)).await;
+        assert!(
+            app.input.is_empty(),
+            "history must not stash a password draft"
+        );
+        app.vt.input_mode = Some(super::InputMode::Character);
+        for (code, expected) in [(KeyCode::Up, b"\x1b[A"), (KeyCode::Down, b"\x1b[B")] {
+            app.on_terminal_event(key(code)).await;
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == expected)
+            );
+        }
+        assert_eq!(app.session_history.entries, ["look"]);
+    }
+
+    #[tokio::test]
     async fn terminal_line_submission_retains_selects_resends_and_replaces_text() {
         use crossterm::event::{Event, KeyCode, KeyEvent};
         let mut app = super::App::new(None, 23);
@@ -13687,6 +13864,7 @@ mod tests {
         assert_eq!(app.input, "say 👩‍💻");
         assert_eq!(app.selection(), Some((1, 3)));
         assert!(app.status.contains("CP437"));
+        assert!(app.session_history.up("").is_none());
     }
 
     #[tokio::test]
@@ -13764,6 +13942,7 @@ mod tests {
         assert_eq!(app.selection(), Some((2, 7)));
         assert!(app.status.contains("not sent"));
         assert!(!app.vt.transcript().contains("keep me"));
+        assert!(app.session_history.up("").is_none());
     }
 
     #[tokio::test]
