@@ -1988,6 +1988,7 @@ impl App {
 
         if self.mode == Mode::Session
             && self.conn.is_some()
+            && !matches!(key.code, KeyCode::Home | KeyCode::End)
             && (key.modifiers.contains(KeyModifiers::CONTROL)
                 || key.code == KeyCode::Tab
                 || key.code == KeyCode::Backspace)
@@ -13589,6 +13590,63 @@ mod tests {
             panic!("expected a Send");
         };
         assert_eq!(bytes, b"\x1b[200~marked\x1b[201~".to_vec());
+    }
+
+    #[tokio::test]
+    async fn terminal_line_home_end_edit_and_select_without_scrolling_or_sending() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.vt.input_mode = Some(crate::terminal::InputMode::Line);
+        app.vt.process("old output\r\n".repeat(100).as_bytes());
+        app.input = "@ a  界e\u{301}".into();
+        app.cursor = app.input.chars().count();
+        let end = app.cursor;
+        for control in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            for (code, modifiers, cursor, selection) in [
+                (KeyCode::Home, control, 0, None),
+                (
+                    KeyCode::End,
+                    control | KeyModifiers::SHIFT,
+                    end,
+                    Some((0, end)),
+                ),
+                (KeyCode::Home, control, 0, None),
+                (KeyCode::End, control, end, None),
+                (
+                    KeyCode::Home,
+                    control | KeyModifiers::SHIFT,
+                    0,
+                    Some((0, end)),
+                ),
+                (KeyCode::End, control, end, None),
+            ] {
+                app.on_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
+                    .await;
+                assert_eq!(app.cursor, cursor);
+                assert_eq!(app.selection(), selection);
+                assert_eq!(app.vt.screen().scrollback(), 0);
+                assert_eq!(app.input, "@ a  界e\u{301}");
+                assert!(rx.try_recv().is_err());
+            }
+        }
+        app.on_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Home,
+            KeyModifiers::SHIFT,
+        )))
+        .await;
+        app.on_paste("replacement".into()).await;
+        assert_eq!(app.input, "replacement");
+        assert!(rx.try_recv().is_err());
+        app.vt.input_mode = Some(crate::terminal::InputMode::Character);
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Home)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"\x1b[H")
+        );
     }
 
     #[tokio::test]

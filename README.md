@@ -206,6 +206,10 @@ pasting replaces it. Password entries still clear after submission.
 Up/Down recalls successfully sent lines, restoring your unfinished draft when
 you move past the newest entry. This separate, RAM-only history keeps up to 500
 entries for the app's lifetime, skips consecutive duplicates, and excludes passwords.
+Home/End moves to the beginning/end of the draft in both frontends; holding
+Shift selects to that point. On desktop, the editor uses the terminal's font,
+keeps the caret visible in long lines, and supports click/drag and Shift-click
+selection. COMMAND retains its separate controls and history.
 
 Use these controls from COMMAND:
 
