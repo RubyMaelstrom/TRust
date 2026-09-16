@@ -2488,6 +2488,7 @@ impl DesktopApp {
             status_label: self.status_label(snapshot),
             link_preview: self.link_preview.clone(),
             terminal_session: self.terminal.is_some(),
+            terminal_input_top: None,
             find,
             find_count: (!self.find_matches.is_empty())
                 .then_some((self.find_index + 1, self.find_matches.len())),
@@ -3045,6 +3046,7 @@ impl DesktopApp {
                     (scene.content_viewport.width - 16.0).max(1.0),
                     26.0,
                 );
+                chrome.terminal_input_top = Some(input_rect.y);
                 terminal
                     .line_editor
                     .set_width((input_rect.width - 12.0).max(1.0));

@@ -1114,6 +1114,7 @@ pub struct ChromeModel {
     pub status_label: String,
     pub link_preview: String,
     pub terminal_session: bool,
+    pub terminal_input_top: Option<f32>,
     pub find: Option<EditorVisual>,
     pub find_count: Option<(usize, usize)>,
     pub heart: HeartVisual,
@@ -2862,6 +2863,7 @@ fn paint_browse_hints(scene: &mut Scene, model: &ChromeModel) {
         );
     }
     if model.link_preview.is_empty() {
+        let hint_bottom = model.terminal_input_top.unwrap_or(bottom);
         paint_ui_text(
             &mut scene.primitives,
             if model.terminal_session {
@@ -2869,7 +2871,7 @@ fn paint_browse_hints(scene: &mut Scene, model: &ChromeModel) {
             } else {
                 "TAB · COMMAND"
             },
-            CssPoint::new(10.0, (bottom - 14.0).max(0.0)),
+            CssPoint::new(10.0, (hint_bottom - 14.0).max(0.0)),
             UI_DIM,
             108.0,
             command_text_style_with_size(9.0),
