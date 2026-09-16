@@ -1230,6 +1230,22 @@ impl TerminalSession {
         Ok(())
     }
 
+    fn submit_line(&mut self) -> Result<(), String> {
+        self.send_input(
+            self.view
+                .terminal
+                .encode_line(self.line_editor.raw_text())?,
+        )?;
+        // RFC 1184 §§2.2, 5.1: keep ordinary local input ready to resend,
+        // but clear submitted secrets before local echo resumes.
+        if self.view.terminal.remote_echo() {
+            self.line_editor.set_text("");
+        } else {
+            self.line_editor.select_all();
+        }
+        Ok(())
+    }
+
     fn paste(&mut self, text: &str) -> Result<(), String> {
         if !self.connected {
             return Err("Telnet connection is not ready. COMMAND: status / reconnect".into());
@@ -4304,14 +4320,8 @@ impl DesktopApp {
             && pressed
             && input.key == Key::Enter
         {
-            let result = terminal
-                .view
-                .terminal
-                .encode_line(&terminal.line_editor.text())
-                .and_then(|bytes| terminal.send_input(bytes));
-            match result {
-                Ok(()) => terminal.line_editor.set_text(""),
-                Err(error) => self.browser.set_status(error),
+            if let Err(error) = terminal.submit_line() {
+                self.browser.set_status(error);
             }
             self.request_redraw();
             return;
@@ -8002,6 +8012,160 @@ mod tests {
             );
             assert_eq!(FocusTarget::Command.viewport(size), size);
         }
+    }
+
+    async fn terminal_line_test_session() -> (
+        TerminalSession,
+        tokio::net::TcpStream,
+        tokio::sync::mpsc::Receiver<trust::telnet::Event>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (handle, mut events) =
+            trust::telnet::connect("127.0.0.1".into(), port, (80, 24), false);
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let connected = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(connected, trust::telnet::Event::Connected { .. }));
+        let mut terminal = TerminalSession {
+            id: 1,
+            forwarder: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            address: format!("telnet://127.0.0.1:{port}"),
+            view: trust::terminal_view::TerminalView::new(24, 80),
+            handle,
+            cols: 80,
+            rows: 24,
+            connected: false,
+            line_editor: TextEditor::new("", &terminal_text_style(), 700.0, false),
+            mouse_button: None,
+            last_mouse_cell: None,
+            wheel_remainder: 0.0,
+        };
+        terminal.receive(1, vec![connected]);
+        (terminal, stream, events)
+    }
+
+    #[tokio::test]
+    async fn terminal_line_submission_retains_selects_resends_and_replaces_text() {
+        use tokio::io::AsyncReadExt;
+        let (mut terminal, mut remote, _events) = terminal_line_test_session().await;
+        let text = "say e\u{301}界👩‍💻";
+        terminal.line_editor.set_text(text);
+        for _ in 0..3 {
+            terminal.submit_line().unwrap();
+            assert_eq!(terminal.line_editor.raw_text(), text);
+            assert_eq!(terminal.line_editor.selection(), 0..text.len());
+        }
+        let visual = DesktopApp::editor_visual(&mut terminal.line_editor, false);
+        assert_eq!(visual.text, text);
+        assert!(!visual.selection.is_empty());
+        assert!(visual.selection.iter().all(|rect| rect.width > 0.0));
+        terminal.line_editor.replace_selection("n");
+        assert_eq!(terminal.line_editor.raw_text(), "n");
+        terminal.submit_line().unwrap();
+        terminal.paste("south\nwest").unwrap();
+        assert_eq!(terminal.line_editor.raw_text(), "west");
+        assert!(terminal.line_editor.selection().is_empty());
+        terminal.submit_line().unwrap();
+        terminal.paste("look").unwrap();
+        assert_eq!(terminal.line_editor.raw_text(), "look");
+        assert!(terminal.line_editor.selection().is_empty());
+        terminal.submit_line().unwrap();
+        terminal.line_editor.delete_selection();
+        assert!(terminal.line_editor.raw_text().is_empty());
+        terminal.submit_line().unwrap();
+        assert!(terminal.line_editor.selection().is_empty());
+        let expected = format!(
+            "{}n\r\nsouth\r\nwest\r\nlook\r\n\r\n",
+            format!("{text}\r\n").repeat(3)
+        );
+        let mut received = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(5), remote.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn terminal_line_submission_clears_passwords() {
+        use tokio::io::AsyncReadExt;
+        use trust::telnet::{Event, op_command, op_option};
+        let (mut terminal, mut remote, _events) = terminal_line_test_session().await;
+        terminal.receive(
+            1,
+            vec![
+                Event::LineMode {
+                    active: true,
+                    mode: 1,
+                },
+                Event::Negotiation {
+                    command: op_command::WILL,
+                    option: op_option::ECHO,
+                },
+            ],
+        );
+        assert!(!terminal.char_mode());
+        terminal.line_editor.set_text("private value");
+        terminal.submit_line().unwrap();
+        assert!(terminal.line_editor.raw_text().is_empty());
+        assert!(terminal.line_editor.selection().is_empty());
+        assert!(
+            !terminal
+                .view
+                .terminal
+                .transcript()
+                .contains("private value")
+        );
+        terminal.receive(
+            1,
+            vec![Event::Negotiation {
+                command: op_command::WONT,
+                option: op_option::ECHO,
+            }],
+        );
+        assert!(terminal.line_editor.raw_text().is_empty());
+        let mut received = [0; 15];
+        tokio::time::timeout(Duration::from_secs(5), remote.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received, b"private value\r\n");
+    }
+
+    #[tokio::test]
+    async fn terminal_line_submission_failure_preserves_the_draft_and_selection() {
+        let (mut terminal, _remote, _events) = terminal_line_test_session().await;
+        terminal.line_editor.set_text("say 👩‍💻");
+        terminal.line_editor.select_byte_range(1, 3);
+        terminal.view.terminal.encoding = trust::terminal::Encoding::Cp437;
+        assert!(terminal.submit_line().unwrap_err().contains("CP437"));
+        assert_eq!(terminal.line_editor.raw_text(), "say 👩‍💻");
+        assert_eq!(terminal.line_editor.selection(), 1..3);
+        terminal.view.terminal.encoding = trust::terminal::Encoding::Utf8;
+        // The single-threaded runtime cannot drain these until we yield.
+        for _ in 0..1024 {
+            terminal
+                .handle
+                .commands
+                .try_send(trust::telnet::Command::Send(Vec::new()))
+                .unwrap();
+        }
+        assert!(terminal.submit_line().unwrap_err().contains("not sent"));
+        assert!(
+            terminal
+                .paste("\nsecond\nthird")
+                .unwrap_err()
+                .contains("not sent")
+        );
+        assert_eq!(terminal.line_editor.raw_text(), "say 👩‍💻");
+        assert_eq!(terminal.line_editor.selection(), 1..3);
+        assert!(terminal.view.terminal.transcript().is_empty());
     }
 
     #[test]

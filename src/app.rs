@@ -659,7 +659,7 @@ pub struct App {
     bells_seen: usize,
     /// The local-echo entry field at the bottom of the screen.
     pub input: String,
-    terminal_draft: Option<(String, usize)>,
+    terminal_draft: Option<(String, usize, Option<usize>)>,
     terminal_size_sent: Option<(u16, u16)>,
     /// Cursor position in `input`, counted in chars.
     pub cursor: usize,
@@ -1670,7 +1670,11 @@ impl App {
             && self.viewer.is_none()
             && (self.conn.is_some() || self.host.is_some())
         {
-            self.terminal_draft = Some((std::mem::take(&mut self.input), self.cursor));
+            self.terminal_draft = Some((
+                std::mem::take(&mut self.input),
+                self.cursor,
+                self.select_anchor.take(),
+            ));
             self.cursor = 0;
             self.select_anchor = None;
         }
@@ -1732,13 +1736,13 @@ impl App {
     }
 
     fn restore_terminal_draft(&mut self) {
-        if let Some((draft, cursor)) = self.terminal_draft.take()
+        if let Some((draft, cursor, select_anchor)) = self.terminal_draft.take()
             && self.browser.is_none()
             && self.viewer.is_none()
         {
             self.input = draft;
             self.cursor = cursor;
-            self.select_anchor = None;
+            self.select_anchor = select_anchor;
         }
     }
 
@@ -2040,10 +2044,10 @@ impl App {
             KeyCode::Esc if matches!(self.mode, Mode::Command | Mode::Search) => {
                 self.clear_gemini_input();
                 self.mode = Mode::Session;
+                self.select_anchor = None;
                 self.restore_terminal_draft();
                 self.search_target = None;
                 self.cert_for = None;
-                self.select_anchor = None;
             }
             // Esc in a line-mode session opens command mode, like
             // Ctrl-]. (Char-mode sessions never reach here — their Esc
@@ -2052,6 +2056,7 @@ impl App {
                 self.open_command();
                 self.select_anchor = None;
             }
+            KeyCode::Enter if self.mode == Mode::Session => self.send_line().await,
             KeyCode::Enter => {
                 let line = std::mem::take(&mut self.input);
                 self.cursor = 0;
@@ -2060,7 +2065,7 @@ impl App {
                     self.active_history().push(&line);
                 }
                 match self.mode {
-                    Mode::Session => self.send_line(&line).await,
+                    Mode::Session => unreachable!("session Enter is handled above"),
                     Mode::Command => {
                         self.mode = Mode::Session;
                         self.execute_command(&line).await;
@@ -2589,18 +2594,23 @@ impl App {
         self.cursor = to;
     }
 
-    /// Send one entered line to the remote host.
-    async fn send_line(&mut self, line: &str) {
-        let accepted = match self.vt.encode_line(line) {
+    /// Send one entered line and select it for resubmission or replacement.
+    async fn send_line(&mut self) {
+        let accepted = match self.vt.encode_line(&self.input) {
             Ok(bytes) => self.send_input(bytes).await,
             Err(error) => {
                 self.status = error;
                 false
             }
         };
-        if !accepted {
-            self.input = line.to_owned();
+        if accepted {
+            // RFC 1184 §§2.2, 5.1: retention is local editing policy; ECHO
+            // still controls secret input. Never retain a submitted password.
+            if self.vt.remote_echo() {
+                self.input.clear();
+            }
             self.cursor = self.input.chars().count();
+            self.select_anchor = (!self.input.is_empty()).then_some(0);
         }
     }
 
@@ -13566,6 +13576,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_line_submission_retains_selects_resends_and_replaces_text() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        let text = "say e\u{301}界👩‍💻";
+        app.input = text.into();
+        app.cursor = text.chars().count();
+        for _ in 0..3 {
+            app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+                .await;
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == format!("{text}\r\n").as_bytes())
+            );
+            assert_eq!(app.input, text);
+            assert_eq!(app.selection(), Some((0, text.chars().count())));
+        }
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Char('n'))))
+            .await;
+        assert_eq!(app.input, "n");
+        assert_eq!(app.selection(), None);
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"n\r\n")
+        );
+
+        app.on_paste("south\nwest".into()).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"south\r\n")
+        );
+        assert_eq!(app.input, "west");
+        assert_eq!(app.selection(), None);
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"west\r\n")
+        );
+        app.on_paste("look".into()).await;
+        assert_eq!(app.input, "look");
+        assert_eq!(app.selection(), None);
+        assert!(rx.try_recv().is_err(), "an unfinished paste stays local");
+
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"look\r\n")
+        );
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Backspace)))
+            .await;
+        assert!(app.input.is_empty());
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"\r\n")
+        );
+        assert_eq!(app.selection(), None);
+    }
+
+    #[tokio::test]
+    async fn terminal_line_submission_clears_passwords_and_keeps_encoding_failures() {
+        use crate::telnet::{op_command, op_option};
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        // RFC 1184 §2.2: EDIT and ECHO are independent; the local editor
+        // must still clear a password when the server suppresses its echo.
+        app.on_telnet_event(crate::telnet::Event::LineMode {
+            active: true,
+            mode: 1,
+        })
+        .await;
+        app.on_telnet_event(crate::telnet::Event::Negotiation {
+            command: op_command::WILL,
+            option: op_option::ECHO,
+        })
+        .await;
+        app.input = "private value".into();
+        app.cursor = app.input.chars().count();
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"private value\r\n")
+        );
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.selection(), None);
+        assert!(!app.vt.transcript().contains("private value"));
+        app.on_telnet_event(crate::telnet::Event::Negotiation {
+            command: op_command::WONT,
+            option: op_option::ECHO,
+        })
+        .await;
+        assert!(app.input.is_empty());
+        assert!(app.session_history.up("").is_none());
+
+        app.vt.encoding = crate::terminal::Encoding::Cp437;
+        app.input = "say 👩‍💻".into();
+        app.cursor = 3;
+        app.select_anchor = Some(1);
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.input, "say 👩‍💻");
+        assert_eq!(app.selection(), Some((1, 3)));
+        assert!(app.status.contains("CP437"));
+    }
+
+    #[tokio::test]
     async fn line_mode_paste_sends_completed_lines() {
         use crate::telnet;
         use tokio::sync::mpsc;
@@ -13597,12 +13721,14 @@ mod tests {
         app.mode = super::Mode::Session;
         app.input = "unfinished command".into();
         app.cursor = 5;
+        app.select_anchor = Some(0);
         app.open_command_with_address();
         assert_eq!(app.input, "example.test:23");
         app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
             .await;
         assert_eq!(app.input, "unfinished command");
         assert_eq!(app.cursor, 5);
+        assert_eq!(app.selection(), Some((0, 5)));
         app.toggle_command_mode();
         app.input = "status".into();
         app.cursor = 6;
@@ -13612,6 +13738,7 @@ mod tests {
         app.toggle_command_mode();
         assert_eq!(app.input, "unfinished command");
         assert_eq!(app.cursor, 5);
+        assert_eq!(app.selection(), Some((0, 5)));
     }
 
     #[tokio::test]
@@ -13626,12 +13753,15 @@ mod tests {
         app.mode = super::Mode::Session;
         app.input = "keep me".into();
         app.cursor = 7;
+        app.select_anchor = Some(2);
         app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
             .await;
         assert_eq!(app.input, "keep me");
+        assert_eq!(app.selection(), Some((2, 7)));
         assert!(app.status.contains("not sent"));
         app.on_paste("\nsecond\nthird".into()).await;
         assert_eq!(app.input, "keep me");
+        assert_eq!(app.selection(), Some((2, 7)));
         assert!(app.status.contains("not sent"));
         assert!(!app.vt.transcript().contains("keep me"));
     }
