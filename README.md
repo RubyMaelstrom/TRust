@@ -203,6 +203,9 @@ area. COMMAND overlays it without changing the advertised terminal size;
 line mode keeps a local editor and preserves its text and selection across COMMAND.
 After Enter, ordinary text stays selected: Enter sends it again, while typing or
 pasting replaces it. Password entries still clear after submission.
+Up/Down recalls successfully sent lines, restoring your unfinished draft when
+you move past the newest entry. This separate, RAM-only history keeps up to 500
+entries for the app's lifetime, skips consecutive duplicates, and excludes passwords.
 
 Use these controls from COMMAND:
 

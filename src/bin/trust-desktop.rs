@@ -1230,7 +1230,7 @@ impl TerminalSession {
         Ok(())
     }
 
-    fn submit_line(&mut self) -> Result<(), String> {
+    fn submit_line(&mut self, history: &mut trust::command::History) -> Result<(), String> {
         self.send_input(
             self.view
                 .terminal
@@ -1240,28 +1240,52 @@ impl TerminalSession {
         // but clear submitted secrets before local echo resumes.
         if self.view.terminal.remote_echo() {
             self.line_editor.set_text("");
+            history.detach();
         } else {
+            history.push(self.line_editor.raw_text());
             self.line_editor.select_all();
         }
         Ok(())
     }
 
-    fn paste(&mut self, text: &str) -> Result<(), String> {
+    fn recall_line(&mut self, older: bool, history: &mut trust::command::History) {
+        // RFC 1184 §2.2: history belongs to local EDIT, and a secret draft
+        // must never be stashed by history navigation while ECHO is remote.
+        if !self.connected || self.char_mode() || self.view.terminal.remote_echo() {
+            return;
+        }
+        let recalled = if older {
+            history.up(self.line_editor.raw_text())
+        } else {
+            history.down()
+        };
+        if let Some(text) = recalled {
+            self.line_editor.set_text(&text);
+        }
+    }
+
+    fn paste(&mut self, text: &str, history: &mut trust::command::History) -> Result<(), String> {
         if !self.connected {
             return Err("Telnet connection is not ready. COMMAND: status / reconnect".into());
         }
         if self.char_mode() {
             self.send_input(self.view.terminal.encode_paste(text)?)
         } else {
-            let (bytes, draft) = self.view.terminal.line_paste(
+            let paste = self.view.terminal.line_paste(
                 &self.line_editor.text(),
                 self.line_editor.selection(),
                 text,
             )?;
-            if !bytes.is_empty() {
-                self.send_input(bytes)?;
+            if !paste.bytes.is_empty() {
+                self.send_input(paste.bytes)?;
             }
-            self.line_editor.set_text(&draft);
+            if !self.view.terminal.remote_echo() {
+                for line in paste.completed.lines() {
+                    history.push(line);
+                }
+            }
+            history.detach();
+            self.line_editor.set_text(&paste.draft);
             Ok(())
         }
     }
@@ -1358,6 +1382,8 @@ struct DesktopApp {
     find: TextEditor,
     command: TextEditor,
     command_history: trust::command::History,
+    /// RAM-only line-entry history, separate from COMMAND for this app run.
+    session_history: trust::command::History,
     file_action_selected: usize,
     downloads_in_flight: usize,
     form_editor: Option<TextEditor>,
@@ -1701,6 +1727,7 @@ impl DesktopApp {
             find: TextEditor::new("", &style, 500.0, false),
             command: TextEditor::new("", &style, 700.0, false),
             command_history: trust::command::History::default(),
+            session_history: trust::command::History::default(),
             file_action_selected: 0,
             downloads_in_flight: 0,
             form_editor: None,
@@ -2392,6 +2419,7 @@ impl DesktopApp {
         self.image_sizes_sent = 0;
         self.page_layout = None;
         self.protocol_page = None;
+        self.session_history.detach();
         self.terminal = Some(TerminalSession {
             id,
             forwarder,
@@ -3578,6 +3606,9 @@ impl DesktopApp {
     }
 
     fn finish_text_edit(&mut self) {
+        if self.focus == FocusTarget::Page && self.terminal.is_some() {
+            self.session_history.detach();
+        }
         let FocusTarget::Form { form, field } = self.focus else {
             return;
         };
@@ -3675,7 +3706,7 @@ impl DesktopApp {
         if self.focus == FocusTarget::Page
             && let Some(terminal) = &mut self.terminal
         {
-            if let Err(error) = terminal.paste(&text) {
+            if let Err(error) = terminal.paste(&text, &mut self.session_history) {
                 self.browser.set_status(error);
             }
             self.request_redraw();
@@ -4292,14 +4323,20 @@ impl DesktopApp {
                             LineControl::Insert(text) => {
                                 terminal.line_editor.replace_selection(&text)
                             }
-                            LineControl::Send(bytes) => terminal.send_input(bytes)?,
+                            LineControl::Send(bytes) => return terminal.send_input(bytes),
                         }
+                        self.session_history.detach();
                     }
                     Ok(())
                 });
                 if let Err(error) = result {
                     self.browser.set_status(error);
                 }
+                self.request_redraw();
+                return;
+            }
+            if pressed && !input.composing && matches!(input.key, Key::ArrowUp | Key::ArrowDown) {
+                terminal.recall_line(input.key == Key::ArrowUp, &mut self.session_history);
                 self.request_redraw();
                 return;
             }
@@ -4320,7 +4357,7 @@ impl DesktopApp {
             && pressed
             && input.key == Key::Enter
         {
-            if let Err(error) = terminal.submit_line() {
+            if let Err(error) = terminal.submit_line(&mut self.session_history) {
                 self.browser.set_status(error);
             }
             self.request_redraw();
@@ -8051,13 +8088,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_line_history_recalls_restores_drafts_and_records_pastes() {
+        let (mut terminal, _remote, _events) = terminal_line_test_session().await;
+        let mut history = trust::command::History::default();
+        for text in ["north", "south", "south", ""] {
+            terminal.line_editor.set_text(text);
+            terminal.submit_line(&mut history).unwrap();
+        }
+        terminal.line_editor.set_text("unfinished 界");
+        for (older, expected) in [
+            (true, "south"),
+            (true, "north"),
+            (true, "north"),
+            (false, "south"),
+            (false, "unfinished 界"),
+            (false, "unfinished 界"),
+        ] {
+            terminal.recall_line(older, &mut history);
+            assert_eq!(terminal.line_editor.raw_text(), expected);
+            assert_eq!(
+                terminal.line_editor.selection(),
+                expected.len()..expected.len()
+            );
+        }
+        terminal.recall_line(true, &mut history);
+        terminal.paste("!", &mut history).unwrap();
+        terminal.recall_line(true, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "south");
+        terminal.recall_line(false, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "south!");
+
+        terminal.line_editor.set_text("say ");
+        terminal
+            .paste("é界\r\none\ttwo\rtail", &mut history)
+            .unwrap();
+        assert_eq!(terminal.line_editor.raw_text(), "tail");
+        terminal.recall_line(true, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "one\ttwo");
+        terminal.recall_line(true, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "say é界");
+        terminal.recall_line(false, &mut history);
+        terminal.recall_line(false, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "tail");
+
+        terminal.view.terminal.input_mode = Some(trust::terminal::InputMode::Character);
+        terminal.recall_line(true, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "tail");
+    }
+
+    #[tokio::test]
     async fn terminal_line_submission_retains_selects_resends_and_replaces_text() {
         use tokio::io::AsyncReadExt;
         let (mut terminal, mut remote, _events) = terminal_line_test_session().await;
+        let mut history = trust::command::History::default();
         let text = "say e\u{301}界👩‍💻";
         terminal.line_editor.set_text(text);
         for _ in 0..3 {
-            terminal.submit_line().unwrap();
+            terminal.submit_line(&mut history).unwrap();
             assert_eq!(terminal.line_editor.raw_text(), text);
             assert_eq!(terminal.line_editor.selection(), 0..text.len());
         }
@@ -8067,18 +8154,18 @@ mod tests {
         assert!(visual.selection.iter().all(|rect| rect.width > 0.0));
         terminal.line_editor.replace_selection("n");
         assert_eq!(terminal.line_editor.raw_text(), "n");
-        terminal.submit_line().unwrap();
-        terminal.paste("south\nwest").unwrap();
+        terminal.submit_line(&mut history).unwrap();
+        terminal.paste("south\nwest", &mut history).unwrap();
         assert_eq!(terminal.line_editor.raw_text(), "west");
         assert!(terminal.line_editor.selection().is_empty());
-        terminal.submit_line().unwrap();
-        terminal.paste("look").unwrap();
+        terminal.submit_line(&mut history).unwrap();
+        terminal.paste("look", &mut history).unwrap();
         assert_eq!(terminal.line_editor.raw_text(), "look");
         assert!(terminal.line_editor.selection().is_empty());
-        terminal.submit_line().unwrap();
+        terminal.submit_line(&mut history).unwrap();
         terminal.line_editor.delete_selection();
         assert!(terminal.line_editor.raw_text().is_empty());
-        terminal.submit_line().unwrap();
+        terminal.submit_line(&mut history).unwrap();
         assert!(terminal.line_editor.selection().is_empty());
         let expected = format!(
             "{}n\r\nsouth\r\nwest\r\nlook\r\n\r\n",
@@ -8090,6 +8177,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received, expected.as_bytes());
+        for expected in ["look", "west", "south", "n", text] {
+            assert_eq!(history.up("").as_deref(), Some(expected));
+        }
+        assert_eq!(history.up(""), None);
     }
 
     #[tokio::test]
@@ -8097,6 +8188,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use trust::telnet::{Event, op_command, op_option};
         let (mut terminal, mut remote, _events) = terminal_line_test_session().await;
+        let mut history = trust::command::History::default();
         terminal.receive(
             1,
             vec![
@@ -8111,8 +8203,13 @@ mod tests {
             ],
         );
         assert!(!terminal.char_mode());
+        history.push("look");
         terminal.line_editor.set_text("private value");
-        terminal.submit_line().unwrap();
+        for older in [true, false] {
+            terminal.recall_line(older, &mut history);
+            assert_eq!(terminal.line_editor.raw_text(), "private value");
+        }
+        terminal.submit_line(&mut history).unwrap();
         assert!(terminal.line_editor.raw_text().is_empty());
         assert!(terminal.line_editor.selection().is_empty());
         assert!(
@@ -8122,6 +8219,7 @@ mod tests {
                 .transcript()
                 .contains("private value")
         );
+        terminal.paste("pasted secret\n", &mut history).unwrap();
         terminal.receive(
             1,
             vec![Event::Negotiation {
@@ -8130,21 +8228,31 @@ mod tests {
             }],
         );
         assert!(terminal.line_editor.raw_text().is_empty());
-        let mut received = [0; 15];
+        let mut received = [0; 30];
         tokio::time::timeout(Duration::from_secs(5), remote.read_exact(&mut received))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&received, b"private value\r\n");
+        assert_eq!(&received, b"private value\r\npasted secret\r\n");
+        terminal.recall_line(true, &mut history);
+        assert_eq!(terminal.line_editor.raw_text(), "look");
+        terminal.recall_line(false, &mut history);
+        assert!(terminal.line_editor.raw_text().is_empty());
     }
 
     #[tokio::test]
     async fn terminal_line_submission_failure_preserves_the_draft_and_selection() {
         let (mut terminal, _remote, _events) = terminal_line_test_session().await;
+        let mut history = trust::command::History::default();
         terminal.line_editor.set_text("say 👩‍💻");
         terminal.line_editor.select_byte_range(1, 3);
         terminal.view.terminal.encoding = trust::terminal::Encoding::Cp437;
-        assert!(terminal.submit_line().unwrap_err().contains("CP437"));
+        assert!(
+            terminal
+                .submit_line(&mut history)
+                .unwrap_err()
+                .contains("CP437")
+        );
         assert_eq!(terminal.line_editor.raw_text(), "say 👩‍💻");
         assert_eq!(terminal.line_editor.selection(), 1..3);
         terminal.view.terminal.encoding = trust::terminal::Encoding::Utf8;
@@ -8156,16 +8264,22 @@ mod tests {
                 .try_send(trust::telnet::Command::Send(Vec::new()))
                 .unwrap();
         }
-        assert!(terminal.submit_line().unwrap_err().contains("not sent"));
         assert!(
             terminal
-                .paste("\nsecond\nthird")
+                .submit_line(&mut history)
+                .unwrap_err()
+                .contains("not sent")
+        );
+        assert!(
+            terminal
+                .paste("\nsecond\nthird", &mut history)
                 .unwrap_err()
                 .contains("not sent")
         );
         assert_eq!(terminal.line_editor.raw_text(), "say 👩‍💻");
         assert_eq!(terminal.line_editor.selection(), 1..3);
         assert!(terminal.view.terminal.transcript().is_empty());
+        assert!(history.up("").is_none());
     }
 
     #[test]

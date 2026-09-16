@@ -120,6 +120,15 @@ impl vt100::Callbacks for Callbacks {
     }
 }
 
+/// A prepared line-editor paste. History may record `completed` only after
+/// `bytes` is accepted, using the entered text before encoding/tab expansion.
+#[derive(Debug)]
+pub struct LinePaste {
+    pub bytes: Vec<u8>,
+    pub draft: String,
+    pub completed: String,
+}
+
 pub struct Terminal {
     parser: vt100::Parser<Callbacks>,
     pub encoding: Encoding,
@@ -381,7 +390,7 @@ impl Terminal {
         draft: &str,
         selection: std::ops::Range<usize>,
         text: &str,
-    ) -> Result<(Vec<u8>, String), String> {
+    ) -> Result<LinePaste, String> {
         let normalized: String = text
             .replace("\r\n", "\n")
             .replace('\r', "\n")
@@ -397,13 +406,23 @@ impl Terminal {
         }
         combined.replace_range(selection, &normalized);
         let Some(last) = combined.rfind('\n') else {
-            return Ok((Vec::new(), combined));
+            return Ok(LinePaste {
+                bytes: Vec::new(),
+                draft: combined,
+                completed: String::new(),
+            });
         };
         let mut bytes = Vec::new();
         for line in combined[..last].split('\n') {
             bytes.extend(self.encode_line(line)?);
         }
-        Ok((bytes, combined[last + 1..].to_owned()))
+        let draft = combined[last + 1..].to_owned();
+        combined.truncate(last);
+        Ok(LinePaste {
+            bytes,
+            draft,
+            completed: combined,
+        })
     }
 
     /// RFC 1184 TRAPSIG. The fixed SLC values are exported by the transport.
@@ -1154,10 +1173,11 @@ mod tests {
         assert_eq!(terminal.visible_text(), "login: reader");
         assert_eq!(terminal.screen().cursor_position(), (1, 0));
 
-        let (bytes, draft) = terminal.line_paste("", 0..0, "one\r\ntwo\nthree").unwrap();
-        assert_eq!(bytes, b"one\ntwo\n");
-        assert_eq!(draft, "three");
-        terminal.echo_input(&bytes);
+        let paste = terminal.line_paste("", 0..0, "one\r\ntwo\nthree").unwrap();
+        assert_eq!(paste.bytes, b"one\ntwo\n");
+        assert_eq!(paste.draft, "three");
+        assert_eq!(paste.completed, "one\ntwo");
+        terminal.echo_input(&paste.bytes);
         assert_eq!(terminal.visible_text(), "login: reader\none\ntwo");
         assert_eq!(terminal.screen().cursor_position(), (3, 0));
 
@@ -1166,6 +1186,27 @@ mod tests {
         terminal.input_mode = Some(InputMode::Character);
         terminal.echo_input(b"x\ny");
         assert_eq!(terminal.screen().cursor_position(), (4, 2));
+    }
+
+    #[test]
+    fn terminal_line_history_paste_preserves_entered_text_before_encoding() {
+        let mut terminal = Terminal::new(24, 80);
+        terminal.encoding = Encoding::Cp437;
+        terminal.observe(&Event::LineMode {
+            active: true,
+            mode: 9,
+        });
+        let paste = terminal
+            .line_paste("say ", 4..4, "é\tX\r\nnext\x07\rtail")
+            .unwrap();
+        assert_eq!(paste.bytes, b"say \x82   X\r\nnext\r\n");
+        assert_eq!(paste.completed, "say é\tX\nnext");
+        assert_eq!(paste.draft, "tail");
+        let paste = terminal.line_paste("old", 0..3, "new").unwrap();
+        assert!(paste.bytes.is_empty());
+        assert!(paste.completed.is_empty());
+        assert_eq!(paste.draft, "new");
+        assert!(terminal.line_paste("", 0..0, "valid\n😀\n").is_err());
     }
 
     #[test]
