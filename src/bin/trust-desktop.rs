@@ -2487,6 +2487,7 @@ impl DesktopApp {
             status: snapshot.status.clone(),
             status_label: self.status_label(snapshot),
             link_preview: self.link_preview.clone(),
+            terminal_session: self.terminal.is_some(),
             find,
             find_count: (!self.find_matches.is_empty())
                 .then_some((self.find_index + 1, self.find_matches.len())),

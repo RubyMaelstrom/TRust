@@ -1314,7 +1314,7 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
 fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
     app.char_mode().then_some((
         " CHAR ",
-        " keys go directly to remote · server echoes · Tab/Ctrl-] cmds",
+        " keys go directly to remote · server echoes · CTRL + ] cmds",
     ))
 }
 
@@ -1340,7 +1340,8 @@ fn status_bar(app: &App) -> Paragraph<'_> {
             (Mode::Session, Some(false), _) => {
                 "· ↑↓ scroll · → follow · ← back · Esc stop · Tab cmds"
             }
-            (Mode::Session, None, true) => "· keys go to remote · Tab/Ctrl-] cmds",
+            (Mode::Session, None, true) => "· keys go to remote · CTRL + ] cmds",
+            (Mode::Session, None, false) if app.host.is_some() => "· Enter send · CTRL + ] cmds",
             (Mode::Session, None, false) => "· Enter send · Tab/Esc cmds",
             (Mode::Command, ..) => "· Enter run · Esc/Tab back · help · open <url>/close/quit",
             (Mode::Search, ..) if app.masked_input => {
