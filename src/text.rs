@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::Arc;
 
 use parley::{
     FontContext, FontFamily, FontStyle, FontWeight, Language, Layout, LayoutContext, LineHeight,
@@ -221,6 +222,18 @@ pub struct EditorRect {
     pub height: f32,
 }
 
+/// Glyphs and editing geometry from the same single-line Parley layout.
+/// Native input fields must paint these glyphs, rather than reshape their
+/// value with an independently chosen font or whitespace policy.
+#[derive(Clone, Debug)]
+pub struct EditorLine {
+    pub shaped: ShapedText,
+    pub selection: Vec<EditorRect>,
+    pub caret: Option<EditorRect>,
+    pub ime: EditorRect,
+    pub underlines: Vec<EditorRect>,
+}
+
 /// A TRust-owned Unicode text editor backed by Parley's cluster, bidi and
 /// line-layout machinery. Native frontends never manipulate byte indices or
 /// guess grapheme boundaries themselves. This is used by browser chrome and
@@ -230,6 +243,7 @@ pub struct EditorRect {
 pub struct TextEditor {
     editor: PlainEditor<()>,
     multiline: bool,
+    line_cache: Option<(parley::editing::Generation, bool, Arc<EditorLine>)>,
 }
 
 impl std::fmt::Debug for TextEditor {
@@ -269,7 +283,11 @@ impl TextEditor {
             CssLineHeight::Number(number) => LineHeight::FontSizeRelative(number.max(0.0)),
             CssLineHeight::Length(px) => LineHeight::Absolute(px.max(0.0)),
         }));
-        let mut this = Self { editor, multiline };
+        let mut this = Self {
+            editor,
+            multiline,
+            line_cache: None,
+        };
         this.move_to_end(false, false);
         this
     }
@@ -288,8 +306,11 @@ impl TextEditor {
     }
 
     pub fn set_width(&mut self, width: f32) {
-        self.editor
-            .set_width(self.multiline.then_some(width.max(1.0)));
+        // Single-line fields scroll their presentation; setting an unused
+        // width on every frame would needlessly invalidate Parley's layout.
+        if self.multiline {
+            self.editor.set_width(Some(width.max(1.0)));
+        }
     }
 
     pub fn is_composing(&self) -> bool {
@@ -448,6 +469,130 @@ impl TextEditor {
             let caret = driver.editor.cursor_geometry(1.5).map(editor_rect);
             let ime = editor_rect(driver.editor.ime_cursor_area());
             (selection, caret, ime)
+        })
+    }
+
+    /// Retain the actual editor layout, including preedit and trailing spaces.
+    /// Masked fields use one bullet per extended grapheme (UAX #29 §3); their
+    /// selection and caret are measured against those bullets, never secrets.
+    pub fn line_layout(&mut self, masked: bool) -> Arc<EditorLine> {
+        debug_assert!(!self.multiline);
+        self.drive(|driver| driver.refresh_layout());
+        let generation = self.editor.generation();
+        if let Some((cached_generation, cached_masked, line)) = &self.line_cache
+            && *cached_generation == generation
+            && *cached_masked == masked
+        {
+            return line.clone();
+        }
+        let line = if masked {
+            let mut display = self.masked_editor();
+            display.retain_editor_line()
+        } else {
+            self.retain_editor_line()
+        };
+        let line = Arc::new(line);
+        self.line_cache = Some((generation, masked, line.clone()));
+        line
+    }
+
+    /// Hit test the same display used by `line_layout`, including masking.
+    pub fn move_to_line_point(&mut self, x: f32, y: f32, extend: bool, masked: bool) {
+        if !masked {
+            self.move_to_point(x, y, extend);
+            return;
+        }
+        let mut display = self.masked_editor();
+        display.move_to_point(x, y, false);
+        let index = display.editor.raw_selection().focus().index() / '•'.len_utf8();
+        let byte = self
+            .raw_text()
+            .grapheme_indices(true)
+            .nth(index)
+            .map_or(self.raw_text().len(), |(byte, _)| byte);
+        self.drive(|driver| {
+            if extend {
+                driver.extend_selection_to_byte(byte);
+            } else {
+                driver.move_to_byte(byte);
+            }
+        });
+    }
+
+    fn masked_editor(&self) -> Self {
+        let mut display = Self {
+            editor: self.editor.clone(),
+            multiline: false,
+            line_cache: None,
+        };
+        let selection = self.editor.raw_selection();
+        let mask_index = |index| {
+            self.raw_text()
+                .grapheme_indices(true)
+                .take_while(|(byte, _)| *byte < index)
+                .count()
+                * '•'.len_utf8()
+        };
+        let anchor = mask_index(selection.anchor().index());
+        let focus = mask_index(selection.focus().index());
+        display
+            .editor
+            .set_text(&"•".repeat(self.raw_text().graphemes(true).count()));
+        display.select_byte_range(anchor, focus);
+        display
+    }
+
+    fn retain_editor_line(&mut self) -> EditorLine {
+        TEXT.with_borrow_mut(|system| {
+            system.refresh_page_fonts();
+            self.editor
+                .refresh_layout(&mut system.fonts, &mut system.layouts);
+            let layout = self.editor.try_layout().expect("refreshed editor layout");
+            let mut underlines = Vec::new();
+            if let Some(line) = layout.lines().next() {
+                for item in line.items() {
+                    let PositionedLayoutItem::GlyphRun(run) = item else {
+                        continue;
+                    };
+                    if let Some(underline) = &run.style().underline {
+                        let metrics = run.run().metrics();
+                        underlines.push(EditorRect {
+                            x: run.offset(),
+                            y: line.metrics().baseline
+                                - underline.offset.unwrap_or(metrics.underline_offset),
+                            width: run.advance(),
+                            height: underline.size.unwrap_or(metrics.underline_size).max(1.0),
+                        });
+                    }
+                }
+            }
+            // Parley supplies an empty editor with a synthetic metrics run;
+            // its byte range does not refer to the zero-length input string.
+            let shaped = if self.editor.raw_text().is_empty() {
+                let metrics = layout.lines().next().map(|line| *line.metrics());
+                metrics.map_or_else(ShapedText::default, |metrics| ShapedText {
+                    ascent: metrics.ascent,
+                    descent: metrics.descent,
+                    leading: metrics.leading,
+                    line_height: metrics.line_height,
+                    baseline: metrics.baseline - metrics.block_min_coord,
+                    ..Default::default()
+                })
+            } else {
+                retain_first_line(self.editor.raw_text(), layout)
+            };
+            EditorLine {
+                shaped,
+                selection: self
+                    .editor
+                    .selection_geometry()
+                    .into_iter()
+                    .map(|(rect, _)| editor_rect(rect))
+                    .collect(),
+                caret: self.editor.cursor_geometry(1.5).map(editor_rect),
+                ime: editor_rect(self.editor.ime_cursor_area()),
+                underlines,
+            }
         })
     }
 

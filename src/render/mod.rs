@@ -1086,6 +1086,7 @@ pub struct PagePaint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlId {
+    TerminalInput,
     Find,
     Command,
     CommandPanel,

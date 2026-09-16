@@ -11,6 +11,9 @@ use crate::render::{
 };
 use crate::text::{self, TextStyle};
 
+mod line_input;
+pub use line_input::{TerminalInputView, terminal_input_rect};
+
 pub use crate::terminal::Encoding;
 
 pub struct TerminalView {
@@ -308,7 +311,8 @@ pub(crate) fn color_rgb(color: vt100::Color, background: bool) -> [u8; 3] {
     }
 }
 
-fn terminal_text_style() -> TextStyle {
+/// Shared face, size and weight for the native terminal and its line editor.
+pub fn terminal_text_style() -> TextStyle {
     TextStyle {
         family: String::from(crate::theme::TERMINAL_FONT_FAMILY),
         size: crate::theme::TERMINAL_FONT_SIZE_CSS_PX,

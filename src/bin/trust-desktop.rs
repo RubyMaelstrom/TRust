@@ -1150,6 +1150,7 @@ struct TerminalSession {
     rows: u16,
     connected: bool,
     line_editor: TextEditor,
+    line_input: trust::terminal_view::TerminalInputView,
     mouse_button: Option<u8>,
     last_mouse_cell: Option<(u16, u16)>,
     wheel_remainder: f32,
@@ -1158,6 +1159,13 @@ struct TerminalSession {
 impl TerminalSession {
     fn char_mode(&self) -> bool {
         self.view.terminal.char_mode(self.connected)
+    }
+
+    fn edit_line_navigation(&mut self, input: &KeyInput) -> bool {
+        self.connected
+            && !self.char_mode()
+            && matches!(input.key, Key::Home | Key::End)
+            && self.line_editor.handle_key(input)
     }
 }
 
@@ -2430,6 +2438,7 @@ impl DesktopApp {
             rows,
             connected: false,
             line_editor: TextEditor::new("", &terminal_text_style(), 700.0, false),
+            line_input: Default::default(),
             mouse_button: None,
             last_mouse_cell: None,
             wheel_remainder: 0.0,
@@ -3084,35 +3093,24 @@ impl DesktopApp {
             );
             scene.append_page(terminal.view.paint(), CssPoint::default());
             if line_mode {
-                let input_rect = CssRect::new(
-                    scene.content_viewport.x + 8.0,
-                    scene.content_viewport.y + scene.content_viewport.height - 30.0,
-                    (scene.content_viewport.width - 16.0).max(1.0),
-                    26.0,
-                );
+                let input_rect = trust::terminal_view::terminal_input_rect(scene.content_viewport);
                 chrome.terminal_input_top = Some(input_rect.y);
-                terminal
-                    .line_editor
-                    .set_width((input_rect.width - 12.0).max(1.0));
-                let visual = Self::editor_visual(
+                terminal.line_input.update(
                     &mut terminal.line_editor,
+                    input_rect,
                     terminal.view.terminal.remote_echo(),
                 );
-                scene.primitives.push(DisplayCommand::FillRect {
-                    rect: input_rect,
-                    color: PaintColor::Rgba(20, 25, 33, 255),
-                });
-                paint_text_editor(
+                terminal.line_input.paint(
                     &mut scene.primitives,
-                    &visual,
-                    input_rect,
-                    PaintColor::Rgba(222, 232, 242, 255),
+                    self.focus == FocusTarget::Page && self.window_focused,
                 );
-                scene.primitives.push(DisplayCommand::Stroke {
-                    shape: PaintShape::Rect(input_rect),
-                    brush: PaintBrush::Solid(PaintColor::Accent),
-                    style: StrokeStyle::solid(1.0),
+                scene.controls.push(trust::render::ControlRegion {
+                    id: ControlId::TerminalInput,
+                    rect: input_rect,
+                    enabled: true,
                 });
+            } else {
+                terminal.line_input.selecting = false;
             }
         } else if let Some(page) = &self.page_layout {
             scene.append_page_at(
@@ -3256,6 +3254,9 @@ impl DesktopApp {
             });
         }
         self.scene = Some(scene);
+        if self.terminal.is_some() && self.focus == FocusTarget::Page {
+            self.update_ime_cursor_area();
+        }
         // UI Events `mouseout`/`mouseover` target the element currently under
         // the pointing device, not the element that occupied that coordinate
         // at the last native motion report. DOM/layout mutations can move or
@@ -3392,6 +3393,9 @@ impl DesktopApp {
         self.focus = focus;
         if focus != FocusTarget::Page {
             self.keyboard_target = None;
+            if let Some(terminal) = &mut self.terminal {
+                terminal.line_input.selecting = false;
+            }
         }
         let editable = match focus {
             FocusTarget::Find | FocusTarget::Command => true,
@@ -3521,6 +3525,7 @@ impl DesktopApp {
 
     fn activate_control(&mut self, control: ControlId) {
         match control {
+            ControlId::TerminalInput => self.set_focus(FocusTarget::Page),
             ControlId::CommandPanel => {}
             ControlId::Find => self.focus_chrome_editor(FocusTarget::Find, control),
             ControlId::Command => self.focus_chrome_editor(FocusTarget::Command, control),
@@ -3676,6 +3681,13 @@ impl DesktopApp {
         if self.gemini_input && self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
             return;
         }
+        if self.focus == FocusTarget::Page
+            && self.terminal.as_ref().is_some_and(|terminal| {
+                !terminal.char_mode() && terminal.view.terminal.remote_echo()
+            })
+        {
+            return;
+        }
         let selected = self
             .active_editor_mut()
             .and_then(|editor| editor.selected_text().map(str::to_string))
@@ -3691,6 +3703,7 @@ impl DesktopApp {
             if cut && let Some(editor) = self.active_editor_mut() {
                 editor.delete_selection();
                 self.finish_text_edit();
+                self.request_redraw();
             }
         }
     }
@@ -4261,6 +4274,9 @@ impl DesktopApp {
             }
         }
         if remote_focus && let Some(terminal) = &mut self.terminal {
+            if input.composing {
+                return;
+            }
             if terminal
                 .view
                 .terminal
@@ -4285,6 +4301,10 @@ impl DesktopApp {
                 if let Err(error) = result {
                     self.browser.set_status(error);
                 }
+                self.request_redraw();
+                return;
+            }
+            if terminal.edit_line_navigation(&input) {
                 self.request_redraw();
                 return;
             }
@@ -4436,6 +4456,25 @@ impl DesktopApp {
     }
 
     fn update_ime_cursor_area(&mut self) {
+        if self.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.terminal
+            && terminal.connected
+            && !terminal.char_mode()
+            && let Some(scene) = &self.scene
+        {
+            terminal.line_input.update(
+                &mut terminal.line_editor,
+                trust::terminal_view::terminal_input_rect(scene.content_viewport),
+                terminal.view.terminal.remote_echo(),
+            );
+            if let (Some(window), Some(area)) = (&self.window, terminal.line_input.ime_area()) {
+                window.set_ime_cursor_area(
+                    LogicalPosition::new(f64::from(area.x), f64::from(area.y)),
+                    LogicalSize::new(f64::from(area.width), f64::from(area.height)),
+                );
+            }
+            return;
+        }
         let focus = self.focus;
         let Some(editor) = self.active_editor_mut() else {
             return;
@@ -5892,11 +5931,45 @@ impl DesktopApp {
         true
     }
 
+    fn over_terminal_input(&self) -> bool {
+        self.scene
+            .as_ref()
+            .and_then(|scene| scene.control_at(self.pointer))
+            == Some(ControlId::TerminalInput)
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.connected && !terminal.char_mode())
+    }
+
+    fn move_terminal_input_pointer(&mut self, extend: bool) {
+        if let Some(terminal) = &mut self.terminal {
+            terminal
+                .line_input
+                .move_to_point(&mut terminal.line_editor, self.pointer, extend);
+        }
+        self.update_ime_cursor_area();
+        self.request_redraw();
+    }
+
     fn pointer_moved(&mut self, event_loop: Option<&ActiveEventLoop>, point: CssPoint) {
         if event_loop.is_some() {
             self.protocol_pointer_selection = true;
         }
         self.pointer = point;
+        let dragging_input = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.line_input.selecting);
+        if dragging_input || self.over_terminal_input() {
+            // Scene re-hit-testing must not extend a selection again: only a
+            // real pointer motion sample changes the draft's selection.
+            if dragging_input && event_loop.is_some() {
+                self.move_terminal_input_pointer(true);
+            }
+            self.apply_cursor_icon(CursorIcon::Text);
+            return;
+        }
         if self.terminal_mouse(trust::terminal::MouseAction::Motion(None)) {
             return;
         }
@@ -6087,6 +6160,34 @@ impl DesktopApp {
     }
 
     fn handle_pointer_button(&mut self, state: ElementState, button: MouseButton) {
+        let dragging_input = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.line_input.selecting);
+        if (dragging_input || self.over_terminal_input())
+            && !(state == ElementState::Released
+                && self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.mouse_button.is_some()))
+        {
+            if button == MouseButton::Left {
+                if state == ElementState::Pressed {
+                    if self.focus != FocusTarget::Page {
+                        self.set_focus(FocusTarget::Page);
+                    }
+                    self.selection = None;
+                    self.selecting = false;
+                    self.pressed_control = None;
+                    self.pressed_hit = None;
+                    self.move_terminal_input_pointer(self.modifiers.shift_key());
+                }
+                if let Some(terminal) = &mut self.terminal {
+                    terminal.line_input.selecting = state == ElementState::Pressed;
+                }
+            }
+            return;
+        }
         let terminal_button = match button {
             MouseButton::Left => Some(0),
             MouseButton::Middle => Some(1),
@@ -6957,11 +7058,14 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 if !focused {
                     self.composing = false;
                     self.selecting = false;
+                    if let Some(terminal) = &mut self.terminal {
+                        terminal.line_input.selecting = false;
+                    }
                     self.set_active_animations(HashSet::new());
                 } else {
                     self.image_schedule_key = None;
-                    self.request_redraw();
                 }
+                self.request_redraw();
                 self.dispatch(UserAction::Focus(focused));
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
@@ -7214,11 +7318,12 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         });
         input.set_label("Telnet input");
         input.set_value(if masked { String::new() } else { text });
+        let rect = trust::terminal_view::terminal_input_rect(content_viewport);
         input.set_bounds(AccessRect::new(
-            f64::from(content_viewport.x + 8.0),
-            f64::from(content_viewport.y + content_viewport.height - 30.0),
-            f64::from(content_viewport.x + content_viewport.width - 8.0),
-            f64::from(content_viewport.y + content_viewport.height - 4.0),
+            f64::from(rect.x),
+            f64::from(rect.y),
+            f64::from(rect.x + rect.width),
+            f64::from(rect.y + rect.height),
         ));
         input.add_action(AccessAction::Focus);
         children.push(ACCESS_TERMINAL_INPUT);
@@ -7559,12 +7664,7 @@ fn chrome_text_style() -> TextStyle {
 }
 
 fn terminal_text_style() -> TextStyle {
-    TextStyle {
-        family: String::from(trust::theme::TERMINAL_FONT_FAMILY),
-        size: trust::theme::TERMINAL_FONT_SIZE_CSS_PX,
-        weight: trust::theme::TERMINAL_FONT_WEIGHT,
-        ..TextStyle::default()
-    }
+    trust::terminal_view::terminal_text_style()
 }
 
 fn parse_telnet_target(address: &str) -> Option<(String, u16, bool)> {
@@ -8079,12 +8179,128 @@ mod tests {
             rows: 24,
             connected: false,
             line_editor: TextEditor::new("", &terminal_text_style(), 700.0, false),
+            line_input: Default::default(),
             mouse_button: None,
             last_mouse_cell: None,
             wheel_remainder: 0.0,
         };
         terminal.receive(1, vec![connected]);
         (terminal, stream, events)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Wayland for the native event-loop proxy; creates no window"]
+    async fn terminal_line_pointer_native_hit_testing() {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        builder.with_any_thread(true).with_wayland();
+        let event_loop = builder.build().unwrap();
+        let (mut terminal, _remote, _events) = terminal_line_test_session().await;
+        terminal.line_editor.set_text("@ ab  more text");
+        terminal.view.process(b"\x1b[?1000h");
+        let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(960.0, 600.0));
+        let mut app = DesktopApp::new(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.clipboard = None;
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(960, 600), ScaleFactor::new(1.0));
+        app.focus = FocusTarget::Page;
+        let mut scene = desktop_chrome(
+            app.metrics,
+            &app.browser.snapshot(),
+            &ChromeModel::default(),
+        );
+        let rect = trust::terminal_view::terminal_input_rect(scene.content_viewport);
+        terminal
+            .line_input
+            .update(&mut terminal.line_editor, rect, false);
+        terminal.line_input.paint(&mut scene.primitives, true);
+        scene.controls.push(trust::render::ControlRegion {
+            id: ControlId::TerminalInput,
+            rect,
+            enabled: true,
+        });
+        let cell = terminal.view.cell_size().0;
+        app.terminal = Some(terminal);
+        app.scene = Some(scene);
+        app.pointer = CssPoint::new(rect.x + 8.0 + cell * 3.0, rect.y + rect.height / 2.0);
+        app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(app.terminal.as_ref().unwrap().line_editor.selection(), 3..3);
+        assert!(app.terminal.as_ref().unwrap().line_input.selecting);
+        assert!(app.terminal.as_ref().unwrap().mouse_button.is_none());
+        app.pointer.x += cell * 4.0;
+        app.move_terminal_input_pointer(true);
+        assert_eq!(app.terminal.as_ref().unwrap().line_editor.selection(), 3..7);
+        app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+        assert!(!app.terminal.as_ref().unwrap().line_input.selecting);
+
+        // A remote drag that ends over the entry field must still send its
+        // release, rather than leave the remote application holding a button.
+        app.terminal.as_mut().unwrap().mouse_button = Some(0);
+        app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+        assert!(app.terminal.as_ref().unwrap().mouse_button.is_none());
+        assert_eq!(app.terminal.as_ref().unwrap().line_editor.selection(), 3..7);
+    }
+
+    #[tokio::test]
+    async fn terminal_line_home_end_edit_and_select_before_protocol_key_handling() {
+        let (mut terminal, _remote, _events) = terminal_line_test_session().await;
+        terminal.view.terminal.input_mode = Some(trust::terminal::InputMode::Line);
+        terminal
+            .view
+            .process("old output\r\n".repeat(100).as_bytes());
+        let text = "@ a  界e\u{301}";
+        terminal.line_editor.set_text(text);
+        for control in [false, true] {
+            for (key, shift, selection) in [
+                (Key::Home, false, 0..0),
+                (Key::End, true, 0..text.len()),
+                (Key::Home, false, 0..0),
+                (Key::End, false, text.len()..text.len()),
+                (Key::Home, true, 0..text.len()),
+                (Key::End, false, text.len()..text.len()),
+            ] {
+                let input = KeyInput {
+                    key,
+                    code: String::new(),
+                    location: 0,
+                    state: KeyState::Pressed,
+                    modifiers: trust::core::Modifiers {
+                        shift,
+                        control,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                    composing: false,
+                };
+                assert!(!terminal.view.terminal.scroll_key(&input, true));
+                assert!(terminal.edit_line_navigation(&input));
+                assert_eq!(terminal.line_editor.selection(), selection);
+                assert_eq!(terminal.line_editor.raw_text(), text);
+                assert_eq!(terminal.view.terminal.screen().scrollback(), 0);
+            }
+        }
+        terminal.view.terminal.input_mode = Some(trust::terminal::InputMode::Character);
+        let input = KeyInput {
+            key: Key::Home,
+            code: String::new(),
+            location: 0,
+            state: KeyState::Pressed,
+            modifiers: Default::default(),
+            repeat: false,
+            composing: false,
+        };
+        assert!(!terminal.edit_line_navigation(&input));
+        assert_eq!(
+            terminal.view.terminal.encode_key(&input).unwrap().unwrap(),
+            b"\x1b[H"
+        );
     }
 
     #[tokio::test]
@@ -8348,6 +8564,7 @@ mod tests {
             rows: 24,
             connected: true,
             line_editor: TextEditor::new("draft", &terminal_text_style(), 700.0, false),
+            line_input: Default::default(),
             mouse_button: None,
             last_mouse_cell: None,
             wheel_remainder: 0.0,

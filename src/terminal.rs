@@ -640,6 +640,11 @@ impl Terminal {
             || input.modifiers.alt
             || input.modifiers.meta
             || (connected && !input.modifiers.shift)
+            // RFC 1184 §2.2: EDIT owns local cursor motion. In particular,
+            // Shift+Home/End extends the draft selection, not scrollback.
+            || (connected
+                && !self.char_mode(connected)
+                && matches!(input.key, Key::Home | Key::End))
         {
             return false;
         }
