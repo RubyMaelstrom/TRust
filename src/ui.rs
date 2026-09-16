@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, BrowserView, Encoding, FindLoc, FindState, Mode};
 use crate::doc::{Kind, Link};
@@ -36,25 +35,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // While browsing or viewing an image the input field can't be typed
     // into, so its 3-row box is dropped and those rows go to the content
     // panel; everything folds into the single status line. The box returns
-    // for command/search/line entry (and the char-mode strip).
+    // for command/search/line entry.
     let file_prompt = app.file_dialog.is_some();
+    let terminal_view = app.browser.is_none() && app.viewer.is_none();
+    let terminal_line = terminal_view && app.connected && !app.char_mode();
     let collapse_input = !file_prompt
         && app.mode == Mode::Session
-        && (app.browser.is_some() || app.viewer.is_some());
-    let (session_area, input_area, status_area) = if collapse_input {
-        let [session_area, status_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
-        (session_area, None, status_area)
-    } else {
-        let input_height = if file_prompt { 4 } else { 3 };
-        let [session_area, input_area, status_area] = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-        (session_area, Some(input_area), status_area)
-    };
+        && (app.browser.is_some() || app.viewer.is_some() || !terminal_line);
+    let (session_area, input_area, status_area) =
+        if terminal_view && app.mode == Mode::Command && !terminal_line {
+            // COMMAND overlays a character-mode terminal. Opening controls must
+            // not send NAWS or make the remote redraw its full-screen application.
+            let [session, status] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+            let height = 3.min(session.height);
+            let input = Rect::new(
+                session.x,
+                session.bottom().saturating_sub(height),
+                session.width,
+                height,
+            );
+            (session, Some(input), status)
+        } else if collapse_input {
+            let [session_area, status_area] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+            (session_area, None, status_area)
+        } else {
+            let input_height = if file_prompt { 4 } else { 3 };
+            let [session_area, input_area, status_area] = Layout::vertical([
+                Constraint::Min(3),
+                Constraint::Length(input_height),
+                Constraint::Length(1),
+            ])
+            .areas(frame.area());
+            (session_area, Some(input_area), status_area)
+        };
 
     let (title, border_color) = match (&app.viewer, &app.browser) {
         (Some(v), _) => (format!("░▒▓ TRUST :: {} ▓▒░", v.url), theme::NEON_PINK),
@@ -184,8 +199,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             hbars = render_carousel_scrollbars(frame, g, inner);
         }
         (None, None) => {
-            let term = PseudoTerminal::new(app.vt.screen()).block(block);
-            frame.render_widget(term, session_area);
+            // Resize before painting. The controller independently tracks the
+            // size advertised over NAWS, so a local redraw never waits for the
+            // server to send another byte after a window resize.
+            app.vt.resize(inner.width, inner.height);
+            frame.render_widget(block, session_area);
+            crate::terminal_tui::paint(
+                frame,
+                &app.vt,
+                inner,
+                app.mode == Mode::Session && app.char_mode(),
+            );
+            if app.mode == Mode::Command
+                && let Some(report) = &app.vt.report
+            {
+                let height =
+                    (report.lines().count() as u16 + 2).min(inner.height.saturating_sub(3));
+                let report_area = Rect::new(inner.x, inner.y, inner.width, height);
+                frame.render_widget(Clear, report_area);
+                frame.render_widget(
+                    Paragraph::new(report.as_str())
+                        .style(Style::new().fg(theme::TEXT).bg(theme::BG))
+                        .block(Block::bordered().title("Telnet status")),
+                    report_area,
+                );
+            }
         }
     }
     app.last_vbar = vbar;
@@ -1184,7 +1222,8 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
     // prompt (gemini status 11, HTML password fields).
     let editing_field = matches!(app.search_target, Some(Link::Form { .. }));
     let minting_identity = app.cert_for.is_some();
-    let masked = app.mode == Mode::Search && app.masked_input;
+    let masked = (app.mode == Mode::Search && app.masked_input)
+        || (app.mode == Mode::Session && app.browser.is_none() && app.vt.remote_echo());
     let (prompt, accent) = match app.mode {
         Mode::Session => ("❯ ", theme::NEON_GREEN),
         Mode::Command => ("trust> ", theme::PASTEL_GREEN),

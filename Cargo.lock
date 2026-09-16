@@ -25,7 +25,6 @@ dependencies = [
  "httpdate",
  "image",
  "libmimalloc-sys",
- "libmudtelnet",
  "lumen",
  "mimalloc",
  "parley",
@@ -49,7 +48,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "ttf-parser",
- "tui-term",
  "unicode-casefold",
  "unicode-segmentation",
  "unicode-width",
@@ -2561,15 +2559,6 @@ checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
  "cty",
-]
-
-[[package]]
-name = "libmudtelnet"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a10ab1ab4be318016487c307e6b7f2a679c7bed43f880d04825e42f1ff53ea7d"
-dependencies = [
- "bytes",
 ]
 
 [[package]]
@@ -5311,17 +5300,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
-name = "tui-term"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a338ded85dbe7f9ea2298321d126244f54e531e2b2006b97abdab8e47d6f3c88"
-dependencies = [
- "ratatui-core",
- "ratatui-widgets",
- "vt100",
-]
-
-[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5558,10 +5536,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 [[package]]
 name = "vt100"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
 dependencies = [
  "itoa",
+ "unicode-segmentation",
  "unicode-width",
  "vte",
 ]

@@ -34,6 +34,23 @@ pub fn decode(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode user text without substituting an unrelated byte for an unsupported
+/// character. The caller retains the draft/paste and can select UTF-8 instead.
+pub fn encode(text: &str) -> Result<Vec<u8>, char> {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii() {
+                Ok(character as u8)
+            } else {
+                HIGH.iter()
+                    .position(|&mapped| mapped == character)
+                    .map(|index| index as u8 + 0x80)
+                    .ok_or(character)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::decode;
