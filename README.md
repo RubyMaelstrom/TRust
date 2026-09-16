@@ -200,7 +200,9 @@ command nor an address searches DuckDuckGo Lite.
 Both frontends use the same protocol, terminal, keyboard, paste, mouse, and
 encoding engine. Character mode gives the remote display the full content
 area. COMMAND overlays it without changing the advertised terminal size;
-line mode keeps a local editor and preserves an unfinished line across COMMAND.
+line mode keeps a local editor and preserves its text and selection across COMMAND.
+After Enter, ordinary text stays selected: Enter sends it again, while typing or
+pasting replaces it. Password entries still clear after submission.
 
 Use these controls from COMMAND:
 
