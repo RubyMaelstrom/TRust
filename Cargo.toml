@@ -74,7 +74,6 @@ html5ever = "0.39"
 httpdate = "1.0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
-libmudtelnet = "2.0.2"
 # Lumen is the JavaScript engine in every browser and test configuration.
 lumen = { path = "../Lumen/crates/lumen", features = ["embed"] }
 mimalloc = { version = "0.1", optional = true }
@@ -133,7 +132,6 @@ tiny-skia = "0.12.0"
 svgtypes = "0.16.1"
 tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
 tokio-rustls = "0.26.4"
-tui-term = "0.3.4"
 unicode-width = "0.2"
 # Extended grapheme boundaries complete Parley's shaping-cluster data for
 # logical selection (notably emoji ZWJ sequences split by font fallback).
@@ -183,6 +181,8 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# Shared Telnet VT engine: owned conformance/resize fixes, see README.trust.txt.
+vt100 = { path = "vendor/vt100-0.16.2" }
 # Web Crypto accepts runtime-sized IVs. This fork exposes RustCrypto's
 # existing GCM operation for byte-slice nonces; see README.trust.txt.
 aes-gcm = { path = "vendor/aes-gcm-0.11.1" }

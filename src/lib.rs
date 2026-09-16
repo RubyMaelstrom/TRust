@@ -62,6 +62,8 @@ pub mod media;
 pub mod oneshot;
 mod performance;
 pub mod telnet;
+pub mod terminal;
+mod terminal_tui;
 pub mod terminal_view;
 pub mod text;
 pub mod theme;

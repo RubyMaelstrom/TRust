@@ -156,8 +156,9 @@ methods other than GET return an error; opening a file never writes to it.
 
 ## Driving it
 
-**TAB** or **Ctrl+]** opens the `trust>` command prompt from anywhere; in line
-mode plain **Esc** works too. You can skip `open` entirely — typing
+**Ctrl+]** opens the `trust>` command prompt from anywhere. **TAB** also opens
+it outside an active Telnet session; Telnet owns Tab for completion and input.
+In line mode plain **Esc** works too. You can skip `open` entirely — typing
 `gemini://gem.sdf.org` at the prompt just goes there. Text that is neither a
 command nor an address searches DuckDuckGo Lite.
 
@@ -186,13 +187,56 @@ command nor an address searches DuckDuckGo Lite.
 | `bookmark remove <id>` / `bookmark undo` | remove an entry / undo the last removal in this session |
 | `reload` | re-fetch what's on screen, history untouched |
 | `close` / `quit` | drop the connection / exit |
-| `mode character\|line\|auto` | force input mode or follow ECHO |
+| `mode character\|line\|auto` | force Telnet input mode or follow LINEMODE/ECHO negotiation |
 | `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit IAC commands (or a literal Ctrl-]) |
-| `set encoding cp437\|utf8` | CP437 for BBS ANSI art |
+| `set encoding cp437\|utf8` | Telnet input and display encoding; CP437 for BBS ANSI art |
 | `set image sixel\|halfblocks\|kitty\|iterm2\|auto` | force the image protocol |
 | `set js on\|off` | run web-page JavaScript against a real DOM (on by default; `off` opts out) |
 | `toggle crlf` | Enter sends CR LF instead of CR NUL |
 | `status` | connection/options report |
+
+### Telnet in terminal and desktop modes
+
+Both frontends use the same protocol, terminal, keyboard, paste, mouse, and
+encoding engine. Character mode gives the remote display the full content
+area. COMMAND overlays it without changing the advertised terminal size;
+line mode keeps a local editor and preserves an unfinished line across COMMAND.
+
+Use these controls from COMMAND:
+
+| Command | Effect |
+|---|---|
+| `status` / `help` | show Telnet state and controls without modifying remote output |
+| `find <text>` | search retained output, including text split across soft wraps |
+| `find-next` / `find-prev` | move between matches; refresh results after new output or resize |
+| `scroll <lines>` / `scroll top` | read history; positive numbers move toward older output |
+| `live` / `scroll bottom` | return to incoming output |
+| `copy screen` / `copy scrollback` | copy visible text or the retained transcript |
+| `clear scrollback` | discard history while preserving the live screen |
+| `reconnect` | reconnect with the current input settings and draft |
+| `close` | close the connection and retain the last screen for reading |
+
+On desktop, the focused terminal owns Ctrl+C, Ctrl+F, Ctrl+R and similar remote
+keys. Ctrl+Shift+C/V provide local copy/paste; Ctrl+Shift+F opens COMMAND search.
+Shift overrides remote mouse reporting for local selection and scrolling.
+The terminal frontend uses its host's clipboard through OSC 52 for explicit
+copy commands, and receives paste through the host's bracketed-paste support.
+
+UTF-8 and CP437 work in both directions. Unsupported CP437 input produces a
+visible error. Bracketed paste is sent as one queue entry; rejected lines and
+multiline pastes leave the draft intact. Remote echo and LINEMODE editing are
+independent, and locally hidden input is excluded from command history.
+
+The shared engine supports DEC line graphics, programmable tabs, cursor and
+keypad modes, 16/256/RGB colors, dim/conceal/strike/blink, wide characters and
+streamed emoji clusters. Primary-screen resizing reflows soft-wrapped text;
+alternate screens keep cell coordinates. Reading history hides the live cursor
+and incoming output keeps the reading position until retained history expires.
+Scrollback retains up to 10,000 rows within a one-million-cell history budget.
+
+The capability target and remaining extension limits are documented in
+[the revamp notes](docs/telnet-revamp.txt). This is an ANSI/BBS terminal with
+selected VT and xterm extensions; it does not claim complete xterm emulation.
 
 **Ctrl+B** bookmarks the current destination; **Alt+B** opens bookmarks.
 During Telnet sessions both shortcuts retain their remote meanings (Ctrl+B is

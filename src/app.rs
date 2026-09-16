@@ -5,21 +5,19 @@ use std::time::Duration;
 
 use url::Url;
 
+use crate::telnet::op_option;
 use crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use futures::StreamExt;
-use libmudtelnet::telnet::{op_command, op_option};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
-use tui_term::vt100;
 
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 
-use crate::cp437;
 use crate::doc::{Doc, Link};
 use crate::gemini::{self, GeminiUrl};
 use crate::gopher::{self, GopherUrl};
@@ -52,112 +50,14 @@ pub enum Mode {
     Find,
 }
 
-/// Manual override for the line/char decision (GNU telnet's `mode` command).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum InputMode {
-    Character,
-    Line,
-}
-
-/// How inbound bytes are interpreted before terminal emulation.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Encoding {
-    Utf8,
-    Cp437,
-}
-
-/// Counts BEL requests from the emulator so the app can ring the real
-/// terminal's bell.
-#[derive(Default)]
-pub struct VtCallbacks {
-    bells: usize,
-}
-
-impl vt100::Callbacks for VtCallbacks {
-    fn audible_bell(&mut self, _: &mut vt100::Screen) {
-        self.bells += 1;
-    }
-}
-
-type Vt = vt100::Parser<VtCallbacks>;
-
+pub use crate::terminal::{Encoding, InputMode};
+type Vt = crate::terminal::Terminal;
 fn new_vt(rows: u16, cols: u16) -> Vt {
-    vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, VtCallbacks::default())
+    Vt::new(rows, cols)
 }
-
-/// Lines of session scrollback kept in memory.
-const SCROLLBACK_LINES: usize = 10_000;
 #[cfg(test)]
 use crate::command::HISTORY_CAP;
 use crate::command::{HELP_PAGE, History};
-
-/// Terminal queries a server may send to probe the "terminal" — which is
-/// our embedded emulator, so we must answer where a real terminal would.
-/// BBS ANSI detection hinges on these.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Probe {
-    /// `ESC[6n` — Device Status Report asking for a Cursor Position Report.
-    CursorPosition,
-    /// `ESC[5n` — Device Status Report asking if the terminal is OK.
-    Status,
-    /// `ESC[c` / `ESC[0c` — Primary Device Attributes.
-    DeviceAttributes,
-}
-
-/// Scans the inbound byte stream for terminal queries. Keeps its state
-/// across calls so probes split between TCP segments still match.
-#[derive(Default)]
-struct ProbeDetector {
-    state: ProbeState,
-}
-
-#[derive(Default, Clone, PartialEq, Eq)]
-enum ProbeState {
-    #[default]
-    Ground,
-    Escape,
-    /// Inside a CSI sequence, accumulating parameter bytes.
-    Csi(Vec<u8>),
-}
-
-impl ProbeDetector {
-    fn feed(&mut self, data: &[u8]) -> Vec<Probe> {
-        let mut found = Vec::new();
-        for &byte in data {
-            self.state = match std::mem::take(&mut self.state) {
-                ProbeState::Ground => match byte {
-                    0x1b => ProbeState::Escape,
-                    _ => ProbeState::Ground,
-                },
-                ProbeState::Escape => match byte {
-                    b'[' => ProbeState::Csi(Vec::new()),
-                    0x1b => ProbeState::Escape,
-                    _ => ProbeState::Ground,
-                },
-                ProbeState::Csi(mut params) => match byte {
-                    // Parameter bytes; cap length so binary noise can't grow it.
-                    0x30..=0x3f if params.len() < 8 => {
-                        params.push(byte);
-                        ProbeState::Csi(params)
-                    }
-                    // Final byte ends the sequence.
-                    0x40..=0x7e => {
-                        match (byte, params.as_slice()) {
-                            (b'n', b"6") => found.push(Probe::CursorPosition),
-                            (b'n', b"5" | b"") => found.push(Probe::Status),
-                            (b'c', b"" | b"0") => found.push(Probe::DeviceAttributes),
-                            _ => {}
-                        }
-                        ProbeState::Ground
-                    }
-                    0x1b => ProbeState::Escape,
-                    _ => ProbeState::Ground,
-                },
-            };
-        }
-        found
-    }
-}
 
 /// The gopherus-style browser state (shared by gopher and gemini): a
 /// scrolling viewport with a link cursor constrained to it, and in-RAM
@@ -625,7 +525,7 @@ pub struct App {
     bookmark_rx: mpsc::UnboundedReceiver<crate::bookmarks::Completion>,
 
     pub mode: Mode,
-    /// Terminal emulation of the remote byte stream, rendered by tui-term.
+    /// Shared terminal model; the UI only paints its cells.
     pub vt: Vt,
     /// Inbound byte interpretation (`set encoding cp437` for BBS art).
     pub encoding: Encoding,
@@ -755,22 +655,12 @@ pub struct App {
     /// `from_post` of the response `navigate_to` is about to show; consumed
     /// there into `current_from_post` (the push needs the OLD value first).
     nav_from_post: bool,
-    /// GNU telnet's `crlf` toggle: Enter sends CR LF when true, CR NUL
-    /// when false (char mode only; line mode always sends CR LF).
-    crlf: bool,
     /// Bell count already forwarded to the real terminal.
     bells_seen: usize,
-    /// Options the server has enabled on its side (WILL ...).
-    remote_opts: HashSet<u8>,
-    /// Options the server has enabled on our side (DO ...).
-    local_opts: HashSet<u8>,
-    /// LINEMODE (RFC 1184) is in effect on this connection (we WILL'd it).
-    linemode_active: bool,
-    /// LINEMODE EDIT bit: true = the server wants local line editing, false
-    /// = character-at-a-time. Only meaningful while `linemode_active`.
-    linemode_edit: bool,
     /// The local-echo entry field at the bottom of the screen.
     pub input: String,
+    terminal_draft: Option<(String, usize)>,
+    terminal_size_sent: Option<(u16, u16)>,
     /// Cursor position in `input`, counted in chars.
     pub cursor: usize,
     /// Selection anchor (char index) while Shift+movement extends a
@@ -793,6 +683,7 @@ pub struct App {
     pub connected: bool,
     /// Whether the live connection is wrapped in TLS.
     pub tls: bool,
+    terminal_tls: bool,
     /// Connection state / last result, shown in the status bar.
     pub status: String,
     /// Inner size of the session widget as of the last draw (cols, rows).
@@ -802,15 +693,11 @@ pub struct App {
     /// ("scroll the hovered region", CSS Overscroll target). `None` until the
     /// first mouse event.
     last_mouse: Option<(u16, u16)>,
-    /// `mode character` / `mode line` override; None means follow ECHO.
-    mode_override: Option<InputMode>,
     /// Up/Down recall for lines sent to the remote host.
     session_history: History,
     /// Up/Down recall for `trust>` commands, kept separate so MUD spam
     /// doesn't bury `open`/`mode` invocations.
     command_history: History,
-    /// Watches inbound data for terminal queries we must answer.
-    probes: ProbeDetector,
     /// When Some, the browser (gopher/gemini) replaces the terminal panel.
     pub browser: Option<BrowserView>,
     /// When Some, the image viewer sits over the browser (or terminal).
@@ -1040,13 +927,10 @@ impl App {
             pending_travel: None,
             current_from_post: false,
             nav_from_post: false,
-            crlf: false,
             bells_seen: 0,
-            remote_opts: HashSet::new(),
-            local_opts: HashSet::new(),
-            linemode_active: false,
-            linemode_edit: false,
             input: String::new(),
+            terminal_draft: None,
+            terminal_size_sent: None,
             cursor: 0,
             select_anchor: None,
             spinner: 0,
@@ -1057,13 +941,12 @@ impl App {
             start_port: None,
             connected: false,
             tls: false,
+            terminal_tls: false,
             status: String::from("No connection. Ctrl-] for commands."),
             last_inner: (80, 24),
             last_mouse: None,
-            mode_override: None,
             session_history: History::default(),
             command_history: History::default(),
-            probes: ProbeDetector::default(),
             browser: None,
             viewer: None,
             // Tests and pre-query startup get the universal fallback;
@@ -1187,6 +1070,7 @@ impl App {
         // full repaint on close (only when images are present) so the pixels
         // behind the dropdown come back.
         let mut menu_was_open = false;
+        let mut cursor_style_seen = None;
         // The run loop only redraws on events; this ticker animates the
         // loading pulse while a fetch is pending (and is disabled, via
         // the select guard, the rest of the time).
@@ -1288,6 +1172,25 @@ impl App {
                 });
             }
             self.sync_vt_size().await;
+            let cursor_style = if self.browser.is_none() && self.mode == Mode::Session {
+                self.vt.screen().cursor_style()
+            } else {
+                0
+            };
+            if cursor_style_seen != Some(cursor_style) {
+                use crossterm::cursor::SetCursorStyle;
+                let style = match cursor_style {
+                    1 => SetCursorStyle::BlinkingBlock,
+                    2 => SetCursorStyle::SteadyBlock,
+                    3 => SetCursorStyle::BlinkingUnderScore,
+                    4 => SetCursorStyle::SteadyUnderScore,
+                    5 => SetCursorStyle::BlinkingBar,
+                    6 => SetCursorStyle::SteadyBar,
+                    _ => SetCursorStyle::DefaultUserShape,
+                };
+                crossterm::execute!(terminal.backend_mut(), style)?;
+                cursor_style_seen = Some(cursor_style);
+            }
             match self.pending_browser_wrap_target() {
                 Some(target) if pending_wrap_target != Some(target) => {
                     pending_wrap_target = Some(target);
@@ -1413,6 +1316,26 @@ impl App {
                     Err(_) => break, // Empty (nothing queued) or Disconnected
                 }
             }
+            let telnet_budget = std::time::Instant::now();
+            let mut telnet_bytes = 0;
+            for _ in 0..64 {
+                if telnet_bytes >= 64 * 1024
+                    || telnet_budget.elapsed() >= std::time::Duration::from_millis(4)
+                {
+                    break;
+                }
+                let event = self
+                    .events
+                    .as_mut()
+                    .and_then(|events| events.try_recv().ok());
+                let Some(event) = event else {
+                    break;
+                };
+                if let telnet::Event::Data(bytes) = &event {
+                    telnet_bytes += bytes.len();
+                }
+                self.on_telnet_event(event).await;
+            }
             // Coalesce inline-image decodes the same way: the `select!` took ONE
             // `imgs_rx` message; drain the rest that are already ready, then do a
             // SINGLE relayout. A page load fetches dozens of images that finish in
@@ -1473,16 +1396,16 @@ impl App {
     /// Resize the emulated screen (and renegotiate NAWS) when the widget's
     /// inner area changed during the last draw.
     async fn sync_vt_size(&mut self) {
-        let (cols, rows) = self.last_inner;
-        let (cur_rows, cur_cols) = self.vt.screen().size();
-        if (cur_cols, cur_rows) != (cols, rows) && cols > 0 && rows > 0 {
-            self.vt.screen_mut().set_size(rows, cols);
-            if let Some(conn) = &self.conn {
-                let _ = conn
-                    .commands
-                    .send(telnet::Command::Resize { cols, rows })
-                    .await;
-            }
+        let (cols, rows) = crate::terminal::bounded_size(self.last_inner.0, self.last_inner.1);
+        self.vt.resize(cols, rows);
+        if self.terminal_size_sent != Some((cols, rows))
+            && let Some(conn) = &self.conn
+            && conn
+                .commands
+                .try_send(telnet::Command::Resize { cols, rows })
+                .is_ok()
+        {
+            self.terminal_size_sent = Some((cols, rows));
         }
     }
 
@@ -1531,6 +1454,51 @@ impl App {
         if self.select_menu.is_some() {
             self.select_menu_mouse(mouse);
             return;
+        }
+        if self.connected
+            && self.browser.is_none()
+            && self.mode == Mode::Session
+            && self
+                .last_content_area
+                .contains((mouse.column, mouse.row).into())
+        {
+            use crate::terminal::MouseAction;
+            let button = |button| match button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                _ => 3,
+            };
+            let action = match mouse.kind {
+                MouseEventKind::Down(b) => Some(MouseAction::Press(button(b))),
+                MouseEventKind::Up(b) => Some(MouseAction::Release(button(b))),
+                MouseEventKind::Drag(b) => Some(MouseAction::Motion(Some(button(b)))),
+                MouseEventKind::Moved => Some(MouseAction::Motion(None)),
+                MouseEventKind::ScrollUp => Some(MouseAction::Wheel(true)),
+                MouseEventKind::ScrollDown => Some(MouseAction::Wheel(false)),
+                _ => None,
+            };
+            let modifiers = crate::core::Modifiers {
+                shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
+                control: mouse.modifiers.contains(KeyModifiers::CONTROL),
+                alt: mouse.modifiers.contains(KeyModifiers::ALT),
+                meta: false,
+            };
+            if let Some(bytes) = action.and_then(|action| {
+                self.vt.encode_mouse(
+                    mouse.row - self.last_content_area.y,
+                    mouse.column - self.last_content_area.x,
+                    action,
+                    modifiers,
+                )
+            }) {
+                if let Some(conn) = &self.conn
+                    && let Err(error) = conn.commands.try_send(telnet::Command::Send(bytes))
+                {
+                    self.status = error.to_string();
+                }
+                return;
+            }
         }
         // Scrollbar drag: a left-press on a drawn scrollbar track grabs it, and
         // subsequent motion (Drag) seeks it until the button is released — the
@@ -1697,6 +1665,15 @@ impl App {
     }
 
     fn open_command(&mut self) {
+        if self.mode == Mode::Session
+            && self.browser.is_none()
+            && self.viewer.is_none()
+            && (self.conn.is_some() || self.host.is_some())
+        {
+            self.terminal_draft = Some((std::mem::take(&mut self.input), self.cursor));
+            self.cursor = 0;
+            self.select_anchor = None;
+        }
         self.clear_gemini_input();
         // UA bottom sheets never stack. Dismissing this view does not touch a
         // transfer already moved into background ownership.
@@ -1744,12 +1721,25 @@ impl App {
         }
         self.find = None;
         self.file_dialog = None;
-        self.mode = match self.mode {
-            Mode::Session | Mode::Search | Mode::Find => Mode::Command,
-            Mode::Command => Mode::Session,
-        };
+        if self.mode == Mode::Command {
+            self.mode = Mode::Session;
+            self.restore_terminal_draft();
+        } else {
+            self.open_command();
+        }
         self.cert_for = None;
         self.select_menu = None;
+    }
+
+    fn restore_terminal_draft(&mut self) {
+        if let Some((draft, cursor)) = self.terminal_draft.take()
+            && self.browser.is_none()
+            && self.viewer.is_none()
+        {
+            self.input = draft;
+            self.cursor = cursor;
+            self.select_anchor = None;
+        }
     }
 
     /// Mouse hover/click target in the browser, dispatching by layout model:
@@ -1847,7 +1837,7 @@ impl App {
         // already going straight to the remote.
         if key.code == KeyCode::Tab
             && key.modifiers.is_empty()
-            && !(self.mode == Mode::Session && self.char_mode() && self.file_dialog.is_none())
+            && !(self.mode == Mode::Session && self.conn.is_some() && self.file_dialog.is_none())
         {
             self.toggle_command_mode();
             return;
@@ -1969,9 +1959,78 @@ impl App {
 
         // Character-at-a-time mode: every keystroke goes straight to the
         // remote end, which does the echoing.
+        if self.mode == Mode::Session && (self.host.is_some() || self.conn.is_some()) {
+            if self
+                .vt
+                .scroll_key(&crate::terminal::from_crossterm(key), self.connected)
+            {
+                return;
+            }
+            if !self.connected && !matches!(key.code, KeyCode::Esc) {
+                self.status = "Telnet connection is not ready. COMMAND: status / reconnect".into();
+                return;
+            }
+        }
         if self.mode == Mode::Session && self.char_mode() {
-            if let Some(bytes) = encode_key(key, self.crlf) {
-                self.send_bytes(bytes).await;
+            match self.vt.encode_key(&crate::terminal::from_crossterm(key)) {
+                Ok(Some(bytes)) => {
+                    self.send_input(bytes).await;
+                }
+                Err(error) => self.status = error,
+                Ok(None) => {}
+            }
+            return;
+        }
+
+        if self.mode == Mode::Session
+            && self.conn.is_some()
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.code == KeyCode::Tab
+                || key.code == KeyCode::Backspace)
+        {
+            let encoded = if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+                Ok(Some(vec![9]))
+            } else {
+                self.vt.encode_key(&crate::terminal::from_crossterm(key))
+            };
+            if let Ok(Some(bytes)) = encoded {
+                use crate::terminal::LineControl;
+                match self.vt.line_control(bytes) {
+                    LineControl::EraseCharacter => {
+                        if self.selection().is_some() {
+                            self.delete_selection();
+                        } else {
+                            let cursor = self.byte_cursor();
+                            let start =
+                                crate::terminal::Terminal::previous_grapheme(&self.input, cursor);
+                            self.input.replace_range(start..cursor, "");
+                            self.cursor = self.input[..start].chars().count();
+                        }
+                    }
+                    LineControl::EraseLine => {
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.select_anchor = None;
+                    }
+                    LineControl::EraseWord => {
+                        let prefix = &self.input[..self.byte_cursor()];
+                        let start = prefix
+                            .trim_end()
+                            .rfind(char::is_whitespace)
+                            .map_or(0, |byte| byte + 1);
+                        self.input.replace_range(start..self.byte_cursor(), "");
+                        self.cursor = self.input[..start].chars().count();
+                        self.select_anchor = None;
+                    }
+                    LineControl::Insert(text) => {
+                        self.delete_selection();
+                        self.input.insert_str(self.byte_cursor(), &text);
+                        self.cursor += text.chars().count();
+                    }
+                    LineControl::Send(bytes) => {
+                        self.send_input(bytes).await;
+                    }
+                }
             }
             return;
         }
@@ -1981,6 +2040,7 @@ impl App {
             KeyCode::Esc if matches!(self.mode, Mode::Command | Mode::Search) => {
                 self.clear_gemini_input();
                 self.mode = Mode::Session;
+                self.restore_terminal_draft();
                 self.search_target = None;
                 self.cert_for = None;
                 self.select_anchor = None;
@@ -1989,14 +2049,14 @@ impl App {
             // Ctrl-]. (Char-mode sessions never reach here — their Esc
             // goes to the remote, where full-screen apps need it.)
             KeyCode::Esc => {
-                self.mode = Mode::Command;
+                self.open_command();
                 self.select_anchor = None;
             }
             KeyCode::Enter => {
                 let line = std::mem::take(&mut self.input);
                 self.cursor = 0;
                 self.select_anchor = None;
-                if !self.masked_input {
+                if !self.masked_input && self.mode != Mode::Session {
                     self.active_history().push(&line);
                 }
                 match self.mode {
@@ -2004,6 +2064,9 @@ impl App {
                     Mode::Command => {
                         self.mode = Mode::Session;
                         self.execute_command(&line).await;
+                        if self.mode == Mode::Session {
+                            self.restore_terminal_draft();
+                        }
                     }
                     Mode::Search => {
                         self.mode = Mode::Session;
@@ -2015,12 +2078,35 @@ impl App {
             }
             // In session mode, control chords bypass the input field and go
             // straight to the remote end (Ctrl-C, Ctrl-D, Ctrl-Z, ...).
+            KeyCode::Tab if self.mode == Mode::Session => {
+                self.input.insert(self.byte_cursor(), '\t');
+                self.cursor += 1;
+            }
+            KeyCode::Char('u')
+                if self.mode == Mode::Session && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.input.clear();
+                self.cursor = 0;
+                self.select_anchor = None;
+            }
+            KeyCode::Char('w')
+                if self.mode == Mode::Session && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let prefix = &self.input[..self.byte_cursor()];
+                let start = prefix
+                    .trim_end()
+                    .rfind(char::is_whitespace)
+                    .map_or(0, |byte| byte + 1);
+                self.input.replace_range(start..self.byte_cursor(), "");
+                self.cursor = self.input[..start].chars().count();
+                self.select_anchor = None;
+            }
             KeyCode::Char(c)
                 if self.mode == Mode::Session && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 let upper = c.to_ascii_uppercase();
                 if ('@'..='_').contains(&upper) {
-                    self.send_bytes(vec![upper as u8 & 0x1f]).await;
+                    self.send_input(vec![upper as u8 & 0x1f]).await;
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2080,8 +2166,11 @@ impl App {
     /// row inside a stale one-line scroll region.
     fn reset_screen(&mut self) {
         let (cols, rows) = self.last_inner;
-        self.vt = new_vt(rows.max(1), cols.max(1));
-        self.probes = ProbeDetector::default();
+        let mut fresh = new_vt(rows.max(1), cols.max(1));
+        fresh.crlf = self.vt.crlf;
+        fresh.input_mode = self.vt.input_mode;
+        fresh.encoding = self.encoding;
+        self.vt = fresh;
         self.bells_seen = 0;
     }
 
@@ -2376,18 +2465,7 @@ impl App {
     /// True when keystrokes should bypass the input field, GNU telnet
     /// style: the server echoes (WILL ECHO), or the user forced it.
     pub fn char_mode(&self) -> bool {
-        self.connected
-            && match self.mode_override {
-                Some(InputMode::Character) => true,
-                Some(InputMode::Line) => false,
-                // ECHO dominates (it covers password prompts even under
-                // LINEMODE); otherwise an active LINEMODE with EDIT clear
-                // also means character-at-a-time.
-                None => {
-                    self.remote_opts.contains(&op_option::ECHO)
-                        || (self.linemode_active && !self.linemode_edit)
-                }
-            }
+        self.vt.char_mode(self.connected)
     }
 
     /// Byte offset of the char cursor into `input`.
@@ -2457,33 +2535,35 @@ impl App {
                 self.status = String::from("Paste ignored — Tab opens the console for a URL.");
                 self.notice = true;
             }
+            Mode::Session if !self.connected && (self.host.is_some() || self.conn.is_some()) => {
+                self.status = "Telnet connection is not ready. COMMAND: status / reconnect".into();
+            }
             // Character-at-a-time: the remote owns editing. Newlines go as
             // CR (the terminal paste rule); when the remote app enabled
             // bracketed paste itself (mode 2004, tracked by the emulator),
             // it gets the markers a real terminal would send.
-            Mode::Session if self.char_mode() => {
-                let mut bytes = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
-                if self.vt.screen().bracketed_paste() {
-                    let mut wrapped = b"\x1b[200~".to_vec();
-                    wrapped.append(&mut bytes);
-                    wrapped.extend_from_slice(b"\x1b[201~");
-                    bytes = wrapped;
+            Mode::Session if self.char_mode() => match self.vt.encode_paste(&text) {
+                Ok(bytes) => {
+                    self.send_input(bytes).await;
                 }
-                self.send_bytes(bytes).await;
-            }
+                Err(error) => self.status = error,
+            },
             // Session line editor: embedded newlines send the line, so a
             // multi-line paste types like it does into a real terminal.
             Mode::Session => {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                for (i, part) in normalized.split('\n').enumerate() {
-                    if i > 0 {
-                        let line = std::mem::take(&mut self.input);
-                        self.cursor = 0;
-                        self.select_anchor = None;
-                        self.active_history().push(&line);
-                        self.send_line(&line).await;
+                let selection = self
+                    .selection()
+                    .map(|(lo, hi)| self.byte_at(lo)..self.byte_at(hi))
+                    .unwrap_or_else(|| self.byte_cursor()..self.byte_cursor());
+                match self.vt.line_paste(&self.input, selection, &text) {
+                    Ok((bytes, draft)) => {
+                        if bytes.is_empty() || self.send_input(bytes).await {
+                            self.input = draft;
+                            self.cursor = self.input.chars().count();
+                            self.select_anchor = None;
+                        }
                     }
-                    self.insert_text(part);
+                    Err(error) => self.status = error,
                 }
             }
             // Command console / prompts / find: insert only — a pasted
@@ -2511,23 +2591,55 @@ impl App {
 
     /// Send one entered line to the remote host.
     async fn send_line(&mut self, line: &str) {
-        if self.conn.is_none() {
-            self.status = String::from("No connection. Ctrl-] then `open <host>`.");
-            return;
+        let accepted = match self.vt.encode_line(line) {
+            Ok(bytes) => self.send_input(bytes).await,
+            Err(error) => {
+                self.status = error;
+                false
+            }
+        };
+        if !accepted {
+            self.input = line.to_owned();
+            self.cursor = self.input.chars().count();
         }
-        // TODO: GNU telnet maps end-of-line per the crlf/binary toggles
-        // (CR LF vs CR NUL); we always send CR LF for now.
-        let mut bytes = line.as_bytes().to_vec();
-        bytes.extend_from_slice(b"\r\n");
-        self.send_bytes(bytes).await;
     }
 
-    async fn send_bytes(&mut self, bytes: Vec<u8>) {
-        // Sending anything snaps the view back to the live screen.
-        self.vt.screen_mut().set_scrollback(0);
-        if let Some(conn) = &self.conn {
-            let _ = conn.commands.send(telnet::Command::Send(bytes)).await;
+    async fn send_bytes(&mut self, bytes: Vec<u8>) -> bool {
+        let Some(conn) = &self.conn else {
+            self.status = "No connection. Use COMMAND: open <host>".into();
+            return false;
+        };
+        match conn.commands.try_send(telnet::Command::Send(bytes)) {
+            Ok(()) => {
+                self.vt.screen_mut().set_scrollback(0);
+                true
+            }
+            Err(error) => {
+                self.status = error.to_string();
+                false
+            }
         }
+    }
+
+    async fn send_input(&mut self, bytes: Vec<u8>) -> bool {
+        if let Some(signal) = self.vt.signal(&bytes) {
+            if let Some(conn) = &self.conn {
+                match conn.commands.try_send(telnet::Command::SendIac(signal)) {
+                    Ok(()) => return true,
+                    Err(error) => {
+                        self.status = error.to_string();
+                        return false;
+                    }
+                }
+            }
+            return false;
+        }
+        let echo = (!self.vt.remote_echo()).then(|| bytes.clone());
+        let accepted = self.send_bytes(bytes).await;
+        if accepted && let Some(bytes) = echo {
+            self.vt.echo_input(&bytes);
+        }
+        accepted
     }
 
     /// Under active LINEMODE, tell the server about a `mode` change so the
@@ -2535,7 +2647,7 @@ impl App {
     /// LINEMODE isn't active — the kludge ECHO/SGA path needs no MODE; the
     /// server's ACK updates `linemode_edit`, so `mode auto` then follows it.
     async fn request_linemode(&self, edit: bool) {
-        if self.linemode_active
+        if self.vt.linemode_active
             && let Some(conn) = &self.conn
         {
             let _ = conn
@@ -2546,6 +2658,57 @@ impl App {
     }
 
     async fn execute_command(&mut self, line: &str) {
+        if self.browser.is_none()
+            && self.viewer.is_none()
+            && (self.host.is_some() || !matches!(line.trim(), "help" | "?"))
+        {
+            self.vt.report = None;
+            if let Some(result) = self.vt.control(line, self.connected) {
+                self.encoding = self.vt.encoding;
+                match result {
+                    Err(error) => self.status = error,
+                    Ok(crate::terminal::Control::Message(message)) => self.status = message,
+                    Ok(crate::terminal::Control::Send(command, message)) => {
+                        self.status = match &self.conn {
+                            Some(conn) => conn
+                                .commands
+                                .try_send(command)
+                                .map_or_else(|error| error.to_string(), |_| message),
+                            None => "No Telnet connection".into(),
+                        };
+                    }
+                    Ok(crate::terminal::Control::Copy(text)) => {
+                        use std::io::Write as _;
+                        let mut out = std::io::stdout();
+                        self.status = match out
+                            .write_all(osc52_copy(&text).as_bytes())
+                            .and_then(|()| out.flush())
+                        {
+                            Ok(()) => "Terminal text sent to the host clipboard".into(),
+                            Err(error) => format!("Clipboard: {error}"),
+                        };
+                    }
+                    Ok(crate::terminal::Control::Reconnect) => {
+                        if let Some(host) = self.host.clone() {
+                            let draft = self.terminal_draft.take();
+                            self.open(host, self.port, self.terminal_tls);
+                            self.terminal_draft = draft;
+                        }
+                    }
+                    Ok(crate::terminal::Control::Close) => {
+                        self.conn = None;
+                        self.events = None;
+                        self.connected = false;
+                        self.vt.reset_negotiation();
+                        self.status = "Connection closed. COMMAND: reconnect".into();
+                    }
+                }
+                if self.vt.report.is_some() {
+                    self.mode = Mode::Command;
+                }
+                return;
+            }
+        }
         let mut parts = line.split_whitespace();
         match parts.next() {
             None => {}
@@ -2597,17 +2760,17 @@ impl App {
             },
             Some("mode" | "m") => match parts.next() {
                 Some("character" | "char") => {
-                    self.mode_override = Some(InputMode::Character);
+                    self.vt.input_mode = Some(InputMode::Character);
                     self.request_linemode(false).await;
                     self.status = String::from("Input mode forced to character-at-a-time.");
                 }
                 Some("line") => {
-                    self.mode_override = Some(InputMode::Line);
+                    self.vt.input_mode = Some(InputMode::Line);
                     self.request_linemode(true).await;
                     self.status = String::from("Input mode forced to line-by-line.");
                 }
                 Some("auto") => {
-                    self.mode_override = None;
+                    self.vt.input_mode = None;
                     self.status = String::from("Input mode follows ECHO negotiation.");
                 }
                 _ => self.status = String::from("usage: mode character|line|auto"),
@@ -2692,10 +2855,10 @@ impl App {
             },
             Some("toggle" | "t") => match parts.next() {
                 Some("crlf") => {
-                    self.crlf = !self.crlf;
+                    self.vt.crlf = !self.vt.crlf;
                     self.status = format!(
                         "Enter now sends {}.",
-                        if self.crlf { "CR LF" } else { "CR NUL" }
+                        if self.vt.crlf { "CR LF" } else { "CR NUL" }
                     );
                 }
                 _ => self.status = String::from("usage: toggle crlf"),
@@ -2966,11 +3129,11 @@ impl App {
             (Some(host), false) => format!("Not connected (last host {host}:{}).", self.port),
             _ => String::from("No connection."),
         };
-        let mode = match (self.mode_override, self.char_mode()) {
+        let mode = match (self.vt.input_mode, self.char_mode()) {
             (Some(InputMode::Character), _) => "character (forced)",
             (Some(InputMode::Line), _) => "line (forced)",
-            (None, true) if self.linemode_active => "character (LINEMODE)",
-            (None, false) if self.linemode_active => "line (LINEMODE)",
+            (None, true) if self.vt.linemode_active => "character (LINEMODE)",
+            (None, false) if self.vt.linemode_active => "line (LINEMODE)",
             (None, true) => "character (negotiated)",
             (None, false) => "line (negotiated)",
         };
@@ -2984,7 +3147,7 @@ impl App {
              Cookies: {cookies}\n\
              Remote options (WILL): {remote}\n\
              Local options (DO): {local}\n{paths}",
-            eol = if self.crlf { "CR LF" } else { "CR NUL" },
+            eol = if self.vt.crlf { "CR LF" } else { "CR NUL" },
             enc = match self.encoding {
                 Encoding::Utf8 => "UTF-8",
                 Encoding::Cp437 => "CP437",
@@ -2998,21 +3161,15 @@ impl App {
             paths = crate::storage::Paths::discover()
                 .map(|p| p.report())
                 .unwrap_or_else(|e| e),
-            remote = option_names(&self.remote_opts),
-            local = option_names(&self.local_opts),
+            remote = option_names(&self.vt.remote_options),
+            local = option_names(&self.vt.local_options),
         )
     }
 
-    /// GNU telnet's `status` command: print connection state into the
-    /// session feed, the way GNU telnet prints to the terminal. While a
-    /// browser doc is on screen the feed is hidden, so `execute_command`
-    /// routes to the `about:status` page instead.
+    /// Keep application controls separate from the remote terminal canvas.
     fn show_status(&mut self) {
-        let report = format!(
-            "\r\n\x1b[36m--- TRUST STATUS ---\x1b[0m\r\n{}\r\n\x1b[36m--------------------\x1b[0m\r\n",
-            self.status_report().replace('\n', "\r\n"),
-        );
-        self.vt.process(report.as_bytes());
+        self.vt.report = Some(self.status_report());
+        self.mode = Mode::Command;
     }
 
     /// Gemtext source of an internal `about:` page, or None for a name we
@@ -8990,6 +9147,9 @@ impl App {
     }
 
     fn open(&mut self, host: String, port: u16, use_tls: bool) {
+        self.terminal_tls = use_tls;
+        self.terminal_draft = None;
+        self.terminal_size_sent = None;
         self.retire_fetch("Incomplete reply: left this page");
         self.replace_nav = false;
         self.pending_travel = None;
@@ -9004,15 +9164,16 @@ impl App {
         self.failed_images.clear();
         self.sweep_image_caches();
         self.reset_screen();
-        let (handle, events) = telnet::connect(host.clone(), port, self.last_inner, use_tls);
+        let size = crate::terminal::bounded_size(self.last_inner.0, self.last_inner.1);
+        let (handle, events) = telnet::connect(host.clone(), port, size, use_tls);
         self.conn = Some(handle);
         self.events = Some(events);
         self.connected = false;
         self.tls = false;
-        self.remote_opts.clear();
-        self.local_opts.clear();
-        self.linemode_active = false;
-        self.linemode_edit = false;
+        self.vt.remote_options.clear();
+        self.vt.local_options.clear();
+        self.vt.linemode_active = false;
+        self.vt.linemode_edit = false;
         let padlock = if use_tls { " (TLS)" } else { "" };
         self.status = format!("Trying {host}:{port}{padlock}...");
         self.host = Some(host);
@@ -9020,6 +9181,7 @@ impl App {
     }
 
     async fn on_telnet_event(&mut self, event: telnet::Event) {
+        self.vt.observe(&event);
         match event {
             telnet::Event::Connected { peer, tls } => {
                 self.connected = true;
@@ -9031,40 +9193,26 @@ impl App {
                 // Answer terminal probes directly, not via send_bytes, so a
                 // background query doesn't yank the scrollback view to live.
                 for reply in self.on_data(&data) {
-                    if let Some(conn) = &self.conn {
-                        let _ = conn.commands.send(telnet::Command::Send(reply)).await;
+                    if let Some(conn) = &self.conn
+                        && let Err(error) = conn.commands.try_send(telnet::Command::Send(reply))
+                    {
+                        self.status = format!("Terminal reply: {error}");
                     }
                 }
                 if self.take_bell() {
                     ring_terminal_bell();
                 }
             }
-            telnet::Event::Negotiation { command, option } => match command {
-                op_command::WILL => {
-                    self.remote_opts.insert(option);
-                }
-                op_command::WONT => {
-                    self.remote_opts.remove(&option);
-                }
-                op_command::DO => {
-                    self.local_opts.insert(option);
-                }
-                op_command::DONT => {
-                    self.local_opts.remove(&option);
-                }
-                _ => {}
-            },
-            telnet::Event::LineMode { active, edit } => {
-                self.linemode_active = active;
-                self.linemode_edit = edit;
-            }
+            telnet::Event::Negotiation { .. }
+            | telnet::Event::LineMode { .. }
+            | telnet::Event::Slc { .. } => {}
             telnet::Event::Closed(reason) => {
                 self.connected = false;
                 self.tls = false;
-                self.remote_opts.clear();
-                self.local_opts.clear();
-                self.linemode_active = false;
-                self.linemode_edit = false;
+                self.vt.remote_options.clear();
+                self.vt.local_options.clear();
+                self.vt.linemode_active = false;
+                self.vt.linemode_edit = false;
                 self.conn = None;
                 self.events = None;
                 self.status = match reason {
@@ -9075,30 +9223,9 @@ impl App {
         }
     }
 
-    /// Process inbound application data through the emulator and build the
-    /// replies a real terminal would send for any probes found in it. The
-    /// data is processed first so a Cursor Position Report reflects e.g.
-    /// the `ESC[255;255H` a BBS sends just before `ESC[6n` to size us.
+    /// Shared parser callbacks answer each query at its position in the stream.
     fn on_data(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
-        match self.encoding {
-            Encoding::Utf8 => self.vt.process(data),
-            Encoding::Cp437 => self.vt.process(&cp437::decode(data)),
-        }
-        // The detector sees the raw bytes; probe sequences are pure ASCII,
-        // which both encodings pass through unchanged.
-        self.probes
-            .feed(data)
-            .into_iter()
-            .map(|probe| match probe {
-                Probe::CursorPosition => {
-                    let (row, col) = self.vt.screen().cursor_position();
-                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
-                }
-                Probe::Status => b"\x1b[0n".to_vec(),
-                // VT100 with Advanced Video Option.
-                Probe::DeviceAttributes => b"\x1b[?1;2c".to_vec(),
-            })
-            .collect()
+        self.vt.process(data)
     }
 
     /// True once per BEL the emulator has seen since the last call.
@@ -9337,68 +9464,15 @@ fn natural_cell_box_dimensions(
     (w, h)
 }
 
-/// Translate a key event into the bytes a character-mode telnet client sends.
+/// Compatibility helper for the frontend's key regression tests.
+#[cfg(test)]
 fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
-    let mut bytes = match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Ctrl-A..Ctrl-Z and friends map onto the C0 control range.
-            let upper = c.to_ascii_uppercase();
-            if ('@'..='_').contains(&upper) {
-                vec![upper as u8 & 0x1f]
-            } else {
-                return None;
-            }
-        }
-        KeyCode::Char(c) => {
-            let mut buf = [0u8; 4];
-            c.encode_utf8(&mut buf).as_bytes().to_vec()
-        }
-        // RFC 854: a bare CR is sent as CR NUL; GNU telnet's `crlf`
-        // toggle switches Enter to CR LF instead.
-        KeyCode::Enter if crlf => b"\r\n".to_vec(),
-        KeyCode::Enter => b"\r\x00".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],
-        // Shift-Tab, as CSI Z (back-tab) — BBS forms navigate fields with it.
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        // Function keys, xterm/VT-style: SS3 P..S for F1-F4 (the VT100 PF
-        // keys), CSI n ~ for F5-F12 (with the historic VT220 gaps at 16/22).
-        // BBS door games and full-screen menus bind these; dropping them made
-        // the keys silently dead in char-mode sessions.
-        KeyCode::F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    // xterm altSendsEscape convention: Alt-character input is ESC-prefixed.
-    // https://invisible-island.net/xterm/manpage/xterm.html (altSendsEscape)
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char(_)) {
-        bytes.insert(0, 0x1b);
-    }
-    Some(bytes)
+    let mut terminal = Vt::new(24, 80);
+    terminal.crlf = crlf;
+    terminal
+        .encode_key(&crate::terminal::from_crossterm(key))
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -9478,9 +9552,9 @@ mod tests {
         ));
         app.browser = None;
         app.connected = true;
-        app.mode_override = Some(super::InputMode::Character);
+        app.vt.input_mode = Some(super::InputMode::Character);
         let (commands, mut remote) = tokio::sync::mpsc::channel(8);
-        app.conn = Some(crate::telnet::Handle { commands });
+        app.conn = Some(crate::telnet::Handle::for_test(commands));
         for (modifier, expected) in [
             (crossterm::event::KeyModifiers::CONTROL, b"\x02".as_slice()),
             (crossterm::event::KeyModifiers::ALT, b"\x1bb".as_slice()),
@@ -9709,17 +9783,17 @@ mod tests {
 
     #[test]
     fn detects_probe_split_across_segments() {
-        let mut det = super::ProbeDetector::default();
-        assert!(det.feed(b"hello \x1b[").is_empty());
-        assert!(det.feed(b"6").is_empty());
-        assert_eq!(det.feed(b"n world"), [super::Probe::CursorPosition]);
+        let mut det = super::new_vt(24, 80);
+        assert!(det.process(b"hello \x1b[").is_empty());
+        assert!(det.process(b"6").is_empty());
+        assert_eq!(det.process(b"n world"), [b"\x1b[1;7R".to_vec()]);
     }
 
     #[test]
-    fn enter_sends_cr_nul_unless_crlf_toggled() {
+    fn enter_defers_nvt_encoding_to_the_transport() {
         use crossterm::event::{KeyCode, KeyEvent};
         let enter = KeyEvent::from(KeyCode::Enter);
-        assert_eq!(super::encode_key(enter, false), Some(b"\r\x00".to_vec()));
+        assert_eq!(super::encode_key(enter, false), Some(b"\r".to_vec()));
         assert_eq!(super::encode_key(enter, true), Some(b"\r\n".to_vec()));
     }
 
@@ -9736,7 +9810,7 @@ mod tests {
         assert_eq!(k(KeyCode::F(6)), Some(b"\x1b[17~".to_vec()));
         assert_eq!(k(KeyCode::F(10)), Some(b"\x1b[21~".to_vec()));
         assert_eq!(k(KeyCode::F(12)), Some(b"\x1b[24~".to_vec()));
-        assert_eq!(k(KeyCode::F(13)), None);
+        assert_eq!(k(KeyCode::F(13)), Some(b"\x1b[25~".to_vec()));
         assert_eq!(k(KeyCode::Insert), Some(b"\x1b[2~".to_vec()));
         assert_eq!(k(KeyCode::BackTab), Some(b"\x1b[Z".to_vec()));
     }
@@ -10170,9 +10244,27 @@ mod tests {
         assert!(!app.vt.screen().contents().contains("╔═╗"));
 
         app.reset_screen();
-        app.encoding = super::Encoding::Cp437;
+        app.vt.encoding = super::Encoding::Cp437;
         app.on_data(b"\xC9\xCD\xBB");
         assert!(app.vt.screen().contents().contains("╔═╗"));
+    }
+
+    #[tokio::test]
+    async fn terminal_encoding_is_isolated_from_other_protocol_preferences() {
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.vt.input_mode = Some(super::InputMode::Character);
+        app.vt.encoding = super::Encoding::Cp437;
+        app.encoding = super::Encoding::Utf8; // another protocol's preference
+        app.on_data(b"\xc9\xcd\xbb");
+        assert!(app.vt.visible_text().contains("╔═╗"));
+        app.on_paste("é".into()).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == [0x82])
+        );
     }
 
     #[test]
@@ -10187,14 +10279,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_command_prints_into_the_feed() {
+    async fn status_command_preserves_the_remote_canvas() {
         let mut app = super::App::new(None, 23);
+        app.vt.process(b"remote screen");
+        let before = app.vt.screen().contents();
         app.execute_command("status").await;
-        let contents = app.vt.screen().contents();
-        assert!(contents.contains("TRUST STATUS"), "got: {contents}");
-        assert!(contents.contains("No connection."));
-        assert!(contents.contains("Enter sends: CR NUL"));
-        assert!(contents.contains("Encoding: UTF-8"));
+        assert_eq!(app.vt.screen().contents(), before);
+        assert_eq!(app.mode, super::Mode::Command);
+        assert!(app.vt.report.as_ref().unwrap().contains("Disconnected"));
     }
 
     #[tokio::test]
@@ -13452,9 +13544,9 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.connected = true; // char_mode needs a live session
-        app.mode_override = Some(super::InputMode::Character);
+        app.vt.input_mode = Some(super::InputMode::Character);
         let (tx, mut rx) = mpsc::channel(8);
-        app.conn = Some(telnet::Handle { commands: tx });
+        app.conn = Some(telnet::Handle::for_test(tx));
 
         // Newlines travel as CR, the terminal paste rule.
         app.on_paste(String::from("two\nlines\n")).await;
@@ -13479,8 +13571,9 @@ mod tests {
         use tokio::sync::mpsc;
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
+        app.connected = true;
         let (tx, mut rx) = mpsc::channel(8);
-        app.conn = Some(telnet::Handle { commands: tx });
+        app.conn = Some(telnet::Handle::for_test(tx));
         app.input = String::from("say ");
         app.cursor = 4;
         app.on_paste(String::from("hello\nworld")).await;
@@ -13492,6 +13585,113 @@ mod tests {
         // … and the remainder stays in the editor, unsent.
         assert_eq!(app.input, "world");
         assert_eq!(app.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn terminal_command_escape_and_address_click_preserve_the_draft() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(Some("example.test".into()), 23);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.input = "unfinished command".into();
+        app.cursor = 5;
+        app.open_command_with_address();
+        assert_eq!(app.input, "example.test:23");
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        assert_eq!(app.input, "unfinished command");
+        assert_eq!(app.cursor, 5);
+        app.toggle_command_mode();
+        app.input = "status".into();
+        app.cursor = 6;
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert_eq!(app.mode, super::Mode::Command);
+        app.toggle_command_mode();
+        assert_eq!(app.input, "unfinished command");
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn terminal_full_input_queue_retains_enter_and_multiline_paste() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(None, 23);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(crate::telnet::Command::Send(b"busy".to_vec()))
+            .unwrap();
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.input = "keep me".into();
+        app.cursor = 7;
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert_eq!(app.input, "keep me");
+        assert!(app.status.contains("not sent"));
+        app.on_paste("\nsecond\nthird".into()).await;
+        assert_eq!(app.input, "keep me");
+        assert!(app.status.contains("not sent"));
+        assert!(!app.vt.transcript().contains("keep me"));
+    }
+
+    #[tokio::test]
+    async fn terminal_edit_keeps_untrapped_controls_until_enter() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = super::App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.conn = Some(crate::telnet::Handle::for_test(tx));
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.vt.observe(&crate::telnet::Event::LineMode {
+            active: true,
+            mode: 1,
+        });
+        app.on_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.input, "\x03");
+        app.on_paste("👩‍💻".into()).await;
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Backspace)))
+            .await;
+        assert_eq!(
+            app.input, "\x03",
+            "erase removes a complete streamed emoji cluster"
+        );
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"\x03\r\n")
+        );
+    }
+
+    #[test]
+    fn terminal_command_overlay_keeps_geometry_and_resize_paints_immediately() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = super::App::new(None, 23);
+        app.connected = true;
+        app.mode = super::Mode::Session;
+        app.vt.input_mode = Some(super::InputMode::Character);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let size = app.vt.screen().size();
+        app.mode = super::Mode::Command;
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.vt.screen().size(), size);
+        terminal.backend_mut().resize(60, 20);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.vt.screen().size(), (app.last_inner.1, app.last_inner.0));
+        assert_ne!(app.vt.screen().size(), size);
     }
 
     #[tokio::test]
@@ -15365,7 +15565,7 @@ mod tests {
     }
 
     #[test]
-    fn char_mode_follows_linemode_edit_with_echo_dominant() {
+    fn char_mode_follows_linemode_edit_independently_of_echo() {
         use super::{InputMode, op_option};
 
         let mut app = super::App::new(Some(String::from("h")), 23);
@@ -15375,25 +15575,25 @@ mod tests {
         assert!(!app.char_mode());
 
         // LINEMODE active with EDIT set stays line mode...
-        app.linemode_active = true;
-        app.linemode_edit = true;
+        app.vt.linemode_active = true;
+        app.vt.linemode_edit = true;
         assert!(!app.char_mode());
         // ...and EDIT clear flips to character-at-a-time.
-        app.linemode_edit = false;
+        app.vt.linemode_edit = false;
         assert!(app.char_mode());
 
         // ECHO dominates even under LINEMODE EDIT (password prompts): the
         // server echoing forces character mode regardless of the EDIT bit.
-        app.linemode_edit = true;
-        app.remote_opts.insert(op_option::ECHO);
-        assert!(app.char_mode());
-        app.remote_opts.remove(&op_option::ECHO);
+        app.vt.linemode_edit = true;
+        app.vt.remote_options.insert(op_option::ECHO);
+        assert!(!app.char_mode());
+        app.vt.remote_options.remove(&op_option::ECHO);
 
         // A manual override still wins over the negotiated state.
-        app.linemode_edit = false; // negotiated character mode
-        app.mode_override = Some(InputMode::Line);
+        app.vt.linemode_edit = false; // negotiated character mode
+        app.vt.input_mode = Some(InputMode::Line);
         assert!(!app.char_mode());
-        app.mode_override = Some(InputMode::Character);
+        app.vt.input_mode = Some(InputMode::Character);
         assert!(app.char_mode());
     }
 

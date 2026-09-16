@@ -47,6 +47,8 @@ const PAGE_ACCESS_BASE: u64 = 10_000;
 const ACCESS_ROOT: AccessNodeId = AccessNodeId(0);
 const ACCESS_FIND: AccessNodeId = AccessNodeId(6);
 const ACCESS_COMMAND: AccessNodeId = AccessNodeId(7);
+const ACCESS_TERMINAL: AccessNodeId = AccessNodeId(8);
+const ACCESS_TERMINAL_INPUT: AccessNodeId = AccessNodeId(9);
 const IMAGE_FETCH_CONCURRENCY: usize = 8;
 /// Encoded animation sources are much smaller than decoded frame sequences,
 /// but remain attacker-controlled cache data. Keep this document-local pool
@@ -137,7 +139,11 @@ enum DesktopEvent {
     },
     AnimationWake,
     Access(AccessEvent),
-    Telnet(trust::telnet::Event),
+    Telnet {
+        session: u64,
+        events: Vec<trust::telnet::Event>,
+        acknowledged: tokio::sync::oneshot::Sender<()>,
+    },
     DownloadFinished {
         path: std::path::PathBuf,
         result: Result<u64, String>,
@@ -1135,21 +1141,113 @@ fn collect_visible_image_handles(
 }
 
 struct TerminalSession {
+    id: u64,
+    forwarder: tokio::task::AbortHandle,
     address: String,
     view: trust::terminal_view::TerminalView,
     handle: trust::telnet::Handle,
     cols: u16,
     rows: u16,
     connected: bool,
-    remote_echo: bool,
-    linemode_active: bool,
-    linemode_edit: bool,
     line_editor: TextEditor,
+    mouse_button: Option<u8>,
+    last_mouse_cell: Option<(u16, u16)>,
+    wheel_remainder: f32,
 }
 
 impl TerminalSession {
     fn char_mode(&self) -> bool {
-        self.connected && (self.remote_echo || (self.linemode_active && !self.linemode_edit))
+        self.view.terminal.char_mode(self.connected)
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.forwarder.abort();
+    }
+}
+
+impl TerminalSession {
+    fn receive(&mut self, id: u64, events: Vec<trust::telnet::Event>) -> Option<String> {
+        if self.id != id {
+            return None;
+        }
+        let mut status = None;
+        for event in events {
+            self.view.terminal.observe(&event);
+            match event {
+                trust::telnet::Event::Connected { peer, tls } => {
+                    self.connected = true;
+                    status = Some(format!(
+                        "Connected to {peer}{} · Ctrl-] for COMMAND",
+                        if tls { " over TLS" } else { "" }
+                    ));
+                }
+                trust::telnet::Event::Data(data) => {
+                    for reply in self.view.process(&data) {
+                        if let Err(error) = self
+                            .handle
+                            .commands
+                            .try_send(trust::telnet::Command::Send(reply))
+                        {
+                            status = Some(error.to_string());
+                        }
+                    }
+                }
+                trust::telnet::Event::Closed(reason) => {
+                    self.connected = false;
+                    status = Some(reason.map_or_else(
+                        || "Connection closed. COMMAND: reconnect".into(),
+                        |error| format!("Telnet: {error}"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        status
+    }
+
+    fn send_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if !self.connected {
+            return Err("Telnet connection is closed".into());
+        }
+        if let Some(signal) = self.view.terminal.signal(&bytes) {
+            return self
+                .handle
+                .commands
+                .try_send(trust::telnet::Command::SendIac(signal))
+                .map_err(|error| error.to_string());
+        }
+        let echo = (!self.view.terminal.remote_echo()).then(|| bytes.clone());
+        self.handle
+            .commands
+            .try_send(trust::telnet::Command::Send(bytes))
+            .map_err(|error| error.to_string())?;
+        self.view.terminal.screen_mut().set_scrollback(0);
+        if let Some(bytes) = echo {
+            self.view.terminal.echo_input(&bytes);
+        }
+        Ok(())
+    }
+
+    fn paste(&mut self, text: &str) -> Result<(), String> {
+        if !self.connected {
+            return Err("Telnet connection is not ready. COMMAND: status / reconnect".into());
+        }
+        if self.char_mode() {
+            self.send_input(self.view.terminal.encode_paste(text)?)
+        } else {
+            let (bytes, draft) = self.view.terminal.line_paste(
+                &self.line_editor.text(),
+                self.line_editor.selection(),
+                text,
+            )?;
+            if !bytes.is_empty() {
+                self.send_input(bytes)?;
+            }
+            self.line_editor.set_text(&draft);
+            Ok(())
+        }
     }
 }
 
@@ -2229,18 +2327,48 @@ impl DesktopApp {
                 .commands
                 .try_send(trust::telnet::Command::Close);
         }
-        let view = trust::terminal_view::TerminalView::new(24, 80);
+        static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut view = trust::terminal_view::TerminalView::new(24, 80);
+        let (cols, rows) = view.size_for_viewport(self.browser_viewport());
+        view.resize(cols, rows);
         let _runtime = self.runtime.enter();
-        let (handle, mut events) = trust::telnet::connect(host, port, (80, 24), tls);
+        let (handle, mut events) = trust::telnet::connect(host, port, (cols, rows), tls);
         drop(_runtime);
         let proxy = self.event_proxy.clone();
-        self.runtime.spawn(async move {
-            while let Some(event) = events.recv().await {
-                if proxy.send_event(DesktopEvent::Telnet(event)).is_err() {
-                    break;
+        let forwarder = self
+            .runtime
+            .spawn(async move {
+                while let Some(event) = events.recv().await {
+                    let mut batch = vec![event];
+                    let mut bytes = 0;
+                    while batch.len() < 32 && bytes < 32 * 1024 {
+                        let Ok(event) = events.try_recv() else {
+                            break;
+                        };
+                        if let trust::telnet::Event::Data(data) = &event {
+                            bytes += data.len();
+                        }
+                        batch.push(event);
+                    }
+                    let (acknowledged, done) = tokio::sync::oneshot::channel();
+                    if proxy
+                        .send_event(DesktopEvent::Telnet {
+                            session: id,
+                            events: batch,
+                            acknowledged,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    // At most one batch enters winit's unbounded user-event queue.
+                    if done.await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .abort_handle();
         self.browser.open_external_session(address.clone());
         self.retire_page_loading();
         self.image_store.clear();
@@ -2249,16 +2377,18 @@ impl DesktopApp {
         self.page_layout = None;
         self.protocol_page = None;
         self.terminal = Some(TerminalSession {
+            id,
+            forwarder,
             address,
             view,
             handle,
-            cols: 80,
-            rows: 24,
+            cols,
+            rows,
             connected: false,
-            remote_echo: false,
-            linemode_active: false,
-            linemode_edit: false,
             line_editor: TextEditor::new("", &terminal_text_style(), 700.0, false),
+            mouse_button: None,
+            last_mouse_cell: None,
+            wheel_remainder: 0.0,
         });
         self.set_focus(FocusTarget::Page);
     }
@@ -2888,7 +3018,7 @@ impl DesktopApp {
         }
         let css_animation_elapsed = self.css_animation_elapsed();
         if let Some(terminal) = &mut self.terminal {
-            let line_mode = !terminal.char_mode();
+            let line_mode = terminal.connected && !terminal.char_mode();
             let terminal_viewport = CssSize::new(
                 page_viewport.width,
                 (page_viewport.height - if line_mode { 32.0 } else { 0.0 }).max(1.0),
@@ -2903,7 +3033,10 @@ impl DesktopApp {
                     .commands
                     .try_send(trust::telnet::Command::Resize { cols, rows });
             }
-            scene.append_page(&terminal.view.paint(), CssPoint::default());
+            terminal.view.set_cursor_active(
+                terminal.connected && terminal.char_mode() && self.focus == FocusTarget::Page,
+            );
+            scene.append_page(terminal.view.paint(), CssPoint::default());
             if line_mode {
                 let input_rect = CssRect::new(
                     scene.content_viewport.x + 8.0,
@@ -2914,7 +3047,10 @@ impl DesktopApp {
                 terminal
                     .line_editor
                     .set_width((input_rect.width - 12.0).max(1.0));
-                let visual = Self::editor_visual(&mut terminal.line_editor, false);
+                let visual = Self::editor_visual(
+                    &mut terminal.line_editor,
+                    terminal.view.terminal.remote_echo(),
+                );
                 scene.primitives.push(DisplayCommand::FillRect {
                     rect: input_rect,
                     color: PaintColor::Rgba(20, 25, 33, 255),
@@ -2970,6 +3106,46 @@ impl DesktopApp {
         self.paint_keyboard_focus(&mut scene);
         chrome.heart = self.heart_visual(&scene, &snapshot);
         paint_desktop_overlay(&mut scene, &snapshot, &chrome);
+        if self.focus == FocusTarget::Command
+            && let Some(report) = self
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.view.terminal.report.as_ref())
+        {
+            let style = terminal_text_style();
+            let metrics = trust::text::shape("0", &style);
+            let line_height = metrics.line_height.max(18.0);
+            let rect = CssRect::new(
+                scene.content_viewport.x + 12.0,
+                scene.content_viewport.y + 12.0,
+                (scene.content_viewport.width - 24.0).clamp(1.0, 720.0),
+                ((report.lines().count() + 1) as f32 * line_height)
+                    .min((scene.content_viewport.height - 100.0).max(1.0)),
+            );
+            scene.primitives.push(DisplayCommand::FillRect {
+                rect,
+                color: PaintColor::Rgba(15, 20, 28, 255),
+            });
+            for (index, line) in report.lines().enumerate() {
+                let y = rect.y + 8.0 + index as f32 * line_height;
+                if y + line_height > rect.y + rect.height {
+                    break;
+                }
+                scene.primitives.push(DisplayCommand::GlyphRun {
+                    origin: CssPoint::new(rect.x + 10.0, y),
+                    shaped: trust::text::shape(line, &style),
+                    color: PaintColor::Rgba(220, 232, 245, 255),
+                    decoration: trust::render::TextDecorationPaint {
+                        color: PaintColor::Rgba(220, 232, 245, 255),
+                        style: trust::render::DecorationStyle::Solid,
+                    },
+                    shadows: Vec::new(),
+                    clip: Some(rect),
+                    node: 0,
+                    link: None,
+                });
+            }
+        }
 
         if trace {
             eprintln!(
@@ -3017,6 +3193,20 @@ impl DesktopApp {
         let css_animations_active = self.css_animations_active();
         if self.chrome_loading(&snapshot) || self.heart_glide.is_some() || css_animations_active {
             self.schedule_chrome_tick(self.heart_glide.is_some() || css_animations_active);
+        }
+        if !self.chrome_tick_scheduled
+            && self.window_focused
+            && let Some(delay) = self
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.view.animation_delay())
+        {
+            self.chrome_tick_scheduled = true;
+            let proxy = self.event_proxy.clone();
+            self.runtime.spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = proxy.send_event(DesktopEvent::ChromeTick);
+            });
         }
         self.scene = Some(scene);
         // UI Events `mouseout`/`mouseover` target the element currently under
@@ -3176,7 +3366,7 @@ impl DesktopApp {
             FocusTarget::Page => self
                 .terminal
                 .as_ref()
-                .is_some_and(|terminal| !terminal.char_mode()),
+                .is_some_and(|terminal| terminal.connected),
         };
         if let Some(window) = &self.window {
             window.set_ime_allowed(
@@ -3363,7 +3553,7 @@ impl DesktopApp {
             FocusTarget::Page => self
                 .terminal
                 .as_mut()
-                .filter(|terminal| !terminal.char_mode())
+                .filter(|terminal| terminal.connected && !terminal.char_mode())
                 .map(|terminal| &mut terminal.line_editor),
         }
     }
@@ -3456,13 +3646,23 @@ impl DesktopApp {
     }
 
     fn paste(&mut self) {
-        let text = self
+        let Some(text) = self
             .clipboard
             .as_mut()
-            .and_then(|clipboard| clipboard.get_text().ok());
-        if let Some(text) = text
-            && let Some(editor) = self.active_editor_mut()
+            .and_then(|clipboard| clipboard.get_text().ok())
+        else {
+            return;
+        };
+        if self.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.terminal
         {
+            if let Err(error) = terminal.paste(&text) {
+                self.browser.set_status(error);
+            }
+            self.request_redraw();
+            return;
+        }
+        if let Some(editor) = self.active_editor_mut() {
             editor.replace_selection(&text);
             self.finish_text_edit();
             self.request_redraw();
@@ -3710,8 +3910,12 @@ impl DesktopApp {
                 return;
             }
         }
+        let remote_focus = self.focus == FocusTarget::Page && self.terminal.is_some();
         let command = self.modifiers.control_key() || self.modifiers.super_key();
+        let local_shortcut =
+            !remote_focus || self.modifiers.super_key() || self.modifiers.shift_key();
         if pressed
+            && local_shortcut
             && command
             && let WinitKey::Character(character) = &event.logical_key
         {
@@ -3720,6 +3924,12 @@ impl DesktopApp {
                 return;
             }
             if character.eq_ignore_ascii_case("f") {
+                if let Some(terminal) = &self.terminal {
+                    self.command
+                        .set_text(&format!("find {}", terminal.view.terminal.search));
+                    self.set_focus(FocusTarget::Command);
+                    return;
+                }
                 self.find.select_all();
                 self.set_focus(FocusTarget::Find);
                 return;
@@ -3741,7 +3951,7 @@ impl DesktopApp {
                 return;
             }
         }
-        if pressed {
+        if pressed && !remote_focus {
             match (&event.logical_key, self.modifiers.alt_key()) {
                 (WinitKey::Named(NamedKey::ArrowLeft), true) => {
                     self.dispatch(UserAction::Back);
@@ -3788,7 +3998,12 @@ impl DesktopApp {
         // that UA-control transfer as COMMAND, but an actually focused form or
         // contenteditable control retains the document's sequential-focus
         // behavior. COMMAND itself always yields to Tab.
-        if pressed && input.key == Key::Tab && !input.modifiers.control && !input.modifiers.meta {
+        if pressed
+            && !remote_focus
+            && input.key == Key::Tab
+            && !input.modifiers.control
+            && !input.modifiers.meta
+        {
             match self.focus {
                 FocusTarget::Command => self.close_command(),
                 FocusTarget::Download => self.open_command(false),
@@ -3995,6 +4210,81 @@ impl DesktopApp {
                 _ => {}
             }
         }
+        if remote_focus && let Some(terminal) = &mut self.terminal {
+            if terminal
+                .view
+                .terminal
+                .scroll_key(&input, terminal.connected)
+            {
+                self.request_redraw();
+                return;
+            }
+            if !terminal.connected {
+                self.browser
+                    .set_status("Telnet connection is not ready. COMMAND: status / reconnect");
+                return;
+            }
+            if terminal.char_mode() {
+                let result = terminal.view.terminal.encode_key(&input).and_then(|bytes| {
+                    if let Some(bytes) = bytes {
+                        terminal.send_input(bytes)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = result {
+                    self.browser.set_status(error);
+                }
+                self.request_redraw();
+                return;
+            }
+            if input.modifiers.control || input.key == Key::Tab || input.key == Key::Backspace {
+                use trust::terminal::LineControl;
+                let encoded = if input.key == Key::Tab && !input.modifiers.shift {
+                    Ok(Some(vec![9]))
+                } else {
+                    terminal.view.terminal.encode_key(&input)
+                };
+                let result = encoded.and_then(|bytes| {
+                    if let Some(bytes) = bytes {
+                        match terminal.view.terminal.line_control(bytes) {
+                            LineControl::EraseCharacter => {
+                                let selection = terminal.line_editor.selection();
+                                if selection.is_empty() {
+                                    let start = trust::terminal::Terminal::previous_grapheme(
+                                        &terminal.line_editor.text(),
+                                        selection.end,
+                                    );
+                                    terminal.line_editor.select_byte_range(start, selection.end);
+                                }
+                                terminal.line_editor.delete_selection();
+                            }
+                            LineControl::EraseLine => terminal.line_editor.set_text(""),
+                            LineControl::EraseWord => {
+                                let text = terminal.line_editor.text();
+                                let cursor = terminal.line_editor.selection().end;
+                                let start = text[..cursor]
+                                    .trim_end()
+                                    .rfind(char::is_whitespace)
+                                    .map_or(0, |byte| byte + 1);
+                                terminal.line_editor.select_byte_range(start, cursor);
+                                terminal.line_editor.delete_selection();
+                            }
+                            LineControl::Insert(text) => {
+                                terminal.line_editor.replace_selection(&text)
+                            }
+                            LineControl::Send(bytes) => terminal.send_input(bytes)?,
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    self.browser.set_status(error);
+                }
+                self.request_redraw();
+                return;
+            }
+        }
         let consumed = self
             .active_editor_mut()
             .is_some_and(|editor| editor.handle_key(&input));
@@ -4008,27 +4298,22 @@ impl DesktopApp {
         }
         if self.focus == FocusTarget::Page
             && let Some(terminal) = &mut self.terminal
+            && pressed
+            && input.key == Key::Enter
         {
-            if terminal.char_mode() {
-                if let Some(bytes) = trust::terminal_view::TerminalView::encode_key(&input) {
-                    let _ = terminal
-                        .handle
-                        .commands
-                        .try_send(trust::telnet::Command::Send(bytes));
-                    return;
-                }
-            } else if pressed && input.key == Key::Enter {
-                let mut bytes = terminal.line_editor.text().into_bytes();
-                bytes.extend_from_slice(b"\r\n");
-                terminal.line_editor.set_text("");
-                let _ = terminal
-                    .handle
-                    .commands
-                    .try_send(trust::telnet::Command::Send(bytes));
-                self.request_redraw();
-                return;
+            let result = terminal
+                .view
+                .terminal
+                .encode_line(&terminal.line_editor.text())
+                .and_then(|bytes| terminal.send_input(bytes));
+            match result {
+                Ok(()) => terminal.line_editor.set_text(""),
+                Err(error) => self.browser.set_status(error),
             }
+            self.request_redraw();
+            return;
         }
+
         if pressed
             && !self.composing
             && !command
@@ -4052,7 +4337,7 @@ impl DesktopApp {
             }
         }
         // Keys consumed by browser chrome must not leak into the underlying document.
-        if self.focus == FocusTarget::Page {
+        if self.focus == FocusTarget::Page && self.terminal.is_none() {
             self.dispatch(UserAction::Key(input));
         }
     }
@@ -4080,14 +4365,22 @@ impl DesktopApp {
             editor.handle_ime(&action);
             self.finish_text_edit();
         } else if let ImeAction::Commit(text) = &action
-            && let Some(terminal) = &self.terminal
+            && self.focus == FocusTarget::Page
+            && let Some(terminal) = &mut self.terminal
         {
-            let _ = terminal
-                .handle
-                .commands
-                .try_send(trust::telnet::Command::Send(text.as_bytes().to_vec()));
+            let result = terminal
+                .view
+                .terminal
+                .encoding
+                .encode(text)
+                .and_then(|bytes| terminal.send_input(bytes));
+            if let Err(error) = result {
+                self.browser.set_status(error);
+            }
         }
-        self.dispatch(UserAction::Ime(action));
+        if self.terminal.is_none() || self.focus != FocusTarget::Page {
+            self.dispatch(UserAction::Ime(action));
+        }
         self.update_ime_cursor_area();
         self.request_redraw();
     }
@@ -4311,6 +4604,68 @@ impl DesktopApp {
         }
         let command = line.trim();
         self.command_history.push(command);
+        if let Some(terminal) = &mut self.terminal {
+            terminal.view.terminal.report = None;
+            if let Some(result) = terminal.view.terminal.control(command, terminal.connected) {
+                match result {
+                    Err(error) => self.browser.set_status(error),
+                    Ok(trust::terminal::Control::Message(message)) => {
+                        self.browser.set_status(message)
+                    }
+                    Ok(trust::terminal::Control::Send(command, message)) => {
+                        self.browser.set_status(
+                            terminal
+                                .handle
+                                .commands
+                                .try_send(command)
+                                .map_or_else(|error| error.to_string(), |_| message),
+                        );
+                    }
+                    Ok(trust::terminal::Control::Copy(text)) => {
+                        self.browser.set_status(match self.clipboard.as_mut() {
+                            Some(clipboard) => clipboard.set_text(text).map_or_else(
+                                |error| format!("Clipboard: {error}"),
+                                |_| "Terminal text copied".into(),
+                            ),
+                            None => "Clipboard unavailable".into(),
+                        });
+                    }
+                    Ok(trust::terminal::Control::Reconnect) => {
+                        let address = terminal.address.clone();
+                        let draft = terminal.line_editor.text();
+                        let encoding = terminal.view.terminal.encoding;
+                        let input_mode = terminal.view.terminal.input_mode;
+                        let crlf = terminal.view.terminal.crlf;
+                        self.navigate(address);
+                        if let Some(terminal) = &mut self.terminal {
+                            terminal.line_editor.set_text(&draft);
+                            terminal.view.terminal.encoding = encoding;
+                            terminal.view.terminal.input_mode = input_mode;
+                            terminal.view.terminal.crlf = crlf;
+                        }
+                    }
+                    Ok(trust::terminal::Control::Close) => {
+                        let _ = terminal
+                            .handle
+                            .commands
+                            .try_send(trust::telnet::Command::Close);
+                        terminal.connected = false;
+                        terminal.view.terminal.reset_negotiation();
+                        self.browser
+                            .set_status("Connection closed. COMMAND: reconnect");
+                    }
+                }
+                if self
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|terminal| terminal.view.terminal.report.is_none())
+                {
+                    self.close_command();
+                }
+                self.request_redraw();
+                return;
+            }
+        }
         let mut parts = command.split_whitespace();
         let verb = parts.next().unwrap_or("").to_ascii_lowercase();
         match verb.as_str() {
@@ -4396,7 +4751,7 @@ impl DesktopApp {
             "set" => match (parts.next(), parts.next()) {
                 (Some("encoding"), Some("cp437")) => {
                     if let Some(terminal) = &mut self.terminal {
-                        terminal.view.encoding = trust::terminal_view::Encoding::Cp437;
+                        terminal.view.terminal.encoding = trust::terminal_view::Encoding::Cp437;
                         self.browser.set_status("Terminal encoding: CP437");
                     } else {
                         self.browser
@@ -4405,7 +4760,7 @@ impl DesktopApp {
                 }
                 (Some("encoding"), Some("utf8" | "utf-8")) => {
                     if let Some(terminal) = &mut self.terminal {
-                        terminal.view.encoding = trust::terminal_view::Encoding::Utf8;
+                        terminal.view.terminal.encoding = trust::terminal_view::Encoding::Utf8;
                         self.browser.set_status("Terminal encoding: UTF-8");
                     } else {
                         self.browser
@@ -5210,19 +5565,6 @@ impl DesktopApp {
                 }
             }
             Link::Form { form, field } => self.activate_form_control(form, field),
-            Link::Media(url) => {
-                let referrer = self
-                    .browser
-                    .current_page()
-                    .and_then(|page| match page.target() {
-                        Link::Http(url) => Some(url),
-                        _ => None,
-                    });
-                match trust::media::launch_mpv(url.as_str(), referrer) {
-                    Ok(()) => self.browser.set_status(format!("▶ mpv {url}")),
-                    Err(error) => self.browser.set_status(error),
-                }
-            }
             Link::Http(url) if self.same_document_fragment(&url) => {
                 self.scroll_static_fragment(url.fragment().unwrap_or(""));
             }
@@ -5432,11 +5774,82 @@ impl DesktopApp {
         }
     }
 
+    fn terminal_mouse(&mut self, action: trust::terminal::MouseAction) -> bool {
+        let captured_release = matches!(action, trust::terminal::MouseAction::Release(button)
+            if self.terminal.as_ref().is_some_and(|terminal| terminal.mouse_button == Some(button)));
+        if !captured_release && (self.focus != FocusTarget::Page || self.modifiers.shift_key()) {
+            return false;
+        }
+        let Some(scene) = &self.scene else {
+            return false;
+        };
+        if !captured_release
+            && (!scene.content_viewport.contains(self.pointer)
+                || scene.control_at(self.pointer).is_some())
+        {
+            return false;
+        }
+        let Some(terminal) = &mut self.terminal else {
+            return false;
+        };
+        if !terminal.connected
+            || terminal.view.terminal.screen().scrollback() > 0
+            || terminal.view.terminal.screen().mouse_protocol_mode()
+                == vt100::MouseProtocolMode::None
+        {
+            return false;
+        }
+        let (width, height) = terminal.view.cell_size();
+        let col = (((self.pointer.x - scene.content_viewport.x) / width)
+            .floor()
+            .max(0.0) as u16)
+            .min(terminal.cols - 1);
+        let row = (((self.pointer.y - scene.content_viewport.y) / height)
+            .floor()
+            .max(0.0) as u16)
+            .min(terminal.rows - 1);
+        let action = match action {
+            trust::terminal::MouseAction::Motion(_) => {
+                if terminal.last_mouse_cell == Some((row, col)) {
+                    return true;
+                }
+                trust::terminal::MouseAction::Motion(terminal.mouse_button)
+            }
+            action => action,
+        };
+        terminal.last_mouse_cell = Some((row, col));
+        if let trust::terminal::MouseAction::Press(button) = action {
+            terminal.mouse_button = Some(button);
+        }
+        if let trust::terminal::MouseAction::Release(_) = action {
+            terminal.mouse_button = None;
+        }
+        let mut modifiers = translate_modifiers(self.modifiers);
+        if captured_release {
+            modifiers.shift = false;
+        }
+        if let Some(bytes) = terminal
+            .view
+            .terminal
+            .encode_mouse(row, col, action, modifiers)
+            && let Err(error) = terminal
+                .handle
+                .commands
+                .try_send(trust::telnet::Command::Send(bytes))
+        {
+            self.browser.set_status(error.to_string());
+        }
+        true
+    }
+
     fn pointer_moved(&mut self, event_loop: Option<&ActiveEventLoop>, point: CssPoint) {
         if event_loop.is_some() {
             self.protocol_pointer_selection = true;
         }
         self.pointer = point;
+        if self.terminal_mouse(trust::terminal::MouseAction::Motion(None)) {
+            return;
+        }
         let chrome_owned = self.heart_drag.is_some()
             || self
                 .scene
@@ -5624,6 +6037,22 @@ impl DesktopApp {
     }
 
     fn handle_pointer_button(&mut self, state: ElementState, button: MouseButton) {
+        let terminal_button = match button {
+            MouseButton::Left => Some(0),
+            MouseButton::Middle => Some(1),
+            MouseButton::Right => Some(2),
+            _ => None,
+        };
+        if let Some(button) = terminal_button {
+            let action = if state == ElementState::Pressed {
+                trust::terminal::MouseAction::Press(button)
+            } else {
+                trust::terminal::MouseAction::Release(button)
+            };
+            if self.terminal_mouse(action) {
+                return;
+            }
+        }
         let button = translate_button(button);
         let chrome_owned = self.heart_drag.is_some()
             || self
@@ -5848,8 +6277,15 @@ impl DesktopApp {
                 ((-position.x / scale) as f32, (-position.y / scale) as f32)
             }
         };
+        if dy != 0.0 && self.terminal_mouse(trust::terminal::MouseAction::Wheel(dy < 0.0)) {
+            return;
+        }
         if let Some(terminal) = &mut self.terminal {
-            terminal.view.scroll((dy / 19.0).round() as i32);
+            let (_, height) = terminal.view.cell_size();
+            terminal.wheel_remainder -= dy / height;
+            let lines = terminal.wheel_remainder.trunc() as i32;
+            terminal.wheel_remainder -= lines as f32;
+            terminal.view.scroll(lines);
             self.request_redraw();
             return;
         }
@@ -5978,6 +6414,20 @@ impl DesktopApp {
                     }
                 }),
                 find_value: (self.focus == FocusTarget::Find).then(|| self.find.raw_text()),
+                terminal_text: self
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.view.terminal.visible_text()),
+                terminal_input: self
+                    .terminal
+                    .as_ref()
+                    .filter(|terminal| terminal.connected && !terminal.char_mode())
+                    .map(|terminal| {
+                        (
+                            terminal.line_editor.text(),
+                            terminal.view.terminal.remote_echo(),
+                        )
+                    }),
             },
             initial,
         );
@@ -5989,6 +6439,9 @@ impl DesktopApp {
 
     fn handle_access_action(&mut self, request: ActionRequest) {
         match request.target_node {
+            ACCESS_TERMINAL | ACCESS_TERMINAL_INPUT if request.action == AccessAction::Focus => {
+                self.set_focus(FocusTarget::Page)
+            }
             ACCESS_COMMAND => match request.action {
                 AccessAction::Focus | AccessAction::Click => {
                     if self.gemini_input {
@@ -6175,6 +6628,11 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 if self.chrome_loading(&snapshot)
                     || self.heart_glide.is_some()
                     || self.css_animations_active()
+                    || (self.window_focused
+                        && self
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|terminal| terminal.view.animation_delay().is_some()))
                 {
                     self.request_redraw();
                 }
@@ -6352,74 +6810,48 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 }
                 accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
             },
-            DesktopEvent::Telnet(event) => {
-                match event {
-                    trust::telnet::Event::Connected { peer, tls } => {
-                        if let Some(terminal) =
-                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
+            DesktopEvent::Telnet {
+                session,
+                events,
+                acknowledged,
+            } => {
+                let visible = self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.id == session);
+                if let Some(terminal) = self
+                    .terminal
+                    .as_mut()
+                    .filter(|terminal| terminal.id == session)
+                    .or_else(|| {
+                        self.bookmark_terminal
+                            .as_mut()
+                            .filter(|terminal| terminal.id == session)
+                    })
+                {
+                    let bells_before = terminal.view.terminal.callbacks().bells;
+                    let input_before = (terminal.connected, terminal.char_mode());
+                    let status = terminal.receive(session, events);
+                    let input_changed = input_before != (terminal.connected, terminal.char_mode());
+                    if visible {
+                        if terminal.view.terminal.callbacks().bells != bells_before
+                            && !self.window_focused
+                            && let Some(window) = &self.window
                         {
-                            terminal.connected = true;
+                            window.request_user_attention(Some(
+                                winit::window::UserAttentionType::Informational,
+                            ));
                         }
-                        self.browser.set_status(format!(
-                            "Connected to {peer}{}",
-                            if tls { " over TLS" } else { "" }
-                        ));
-                    }
-                    trust::telnet::Event::Data(data) => {
-                        if let Some(terminal) =
-                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
-                        {
-                            for reply in terminal.view.process(&data) {
-                                let _ = terminal
-                                    .handle
-                                    .commands
-                                    .try_send(trust::telnet::Command::Send(reply));
-                            }
+                        if let Some(status) = status {
+                            self.browser.set_status(status);
                         }
-                    }
-                    trust::telnet::Event::LineMode { active, edit } => {
-                        if let Some(terminal) =
-                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
-                        {
-                            terminal.linemode_active = active;
-                            terminal.linemode_edit = edit;
+                        if input_changed && self.focus == FocusTarget::Page {
+                            self.set_focus(FocusTarget::Page);
                         }
-                        self.browser.set_status(format!(
-                            "Terminal input: {}",
-                            if active && edit {
-                                "line mode"
-                            } else {
-                                "character mode"
-                            }
-                        ));
-                    }
-                    trust::telnet::Event::Closed(reason) => {
-                        if let Some(terminal) =
-                            self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
-                        {
-                            terminal.connected = false;
-                            terminal.remote_echo = false;
-                            terminal.linemode_active = false;
-                        }
-                        self.browser.set_status(reason.map_or_else(
-                            || String::from("Connection closed by foreign host."),
-                            |error| format!("Terminal connection closed: {error}"),
-                        ));
-                    }
-                    trust::telnet::Event::Negotiation { command, option } => {
-                        if option == libmudtelnet::telnet::op_option::ECHO
-                            && let Some(terminal) =
-                                self.terminal.as_mut().or(self.bookmark_terminal.as_mut())
-                        {
-                            terminal.remote_echo =
-                                command == libmudtelnet::telnet::op_command::WILL;
-                        }
+                        self.request_redraw();
                     }
                 }
-                if self.focus == FocusTarget::Page {
-                    self.set_focus(FocusTarget::Page);
-                }
-                self.request_redraw();
+                let _ = acknowledged.send(());
             }
         }
     }
@@ -6551,6 +6983,8 @@ struct AccessibilityFrame<'a> {
     command_value: Option<&'a str>,
     command_prompt: Option<&'a trust::gemini::Prompt>,
     find_value: Option<&'a str>,
+    terminal_text: Option<String>,
+    terminal_input: Option<(String, bool)>,
 }
 
 fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> TreeUpdate {
@@ -6564,6 +6998,8 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
         command_value,
         command_prompt,
         find_value,
+        terminal_text,
+        terminal_input,
     } = frame;
     let mut nodes = Vec::new();
     let mut root = AccessNode::new(AccessRole::Window);
@@ -6700,6 +7136,44 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
             nodes.push((id, node));
         }
     }
+    let has_terminal = terminal_text.is_some();
+    if let Some(text) = terminal_text {
+        // AccessKit's native Terminal role preserves the distinction between
+        // a live terminal and a document. Use polite updates (ARIA's log/live
+        // region model); actual announcement granularity depends on the AT.
+        let mut terminal = AccessNode::new(AccessRole::Terminal);
+        terminal.set_label("Telnet session");
+        terminal.set_value(text);
+        terminal.set_live(accesskit::Live::Polite);
+        terminal.set_bounds(AccessRect::new(
+            f64::from(content_viewport.x),
+            f64::from(content_viewport.y),
+            f64::from(content_viewport.x + content_viewport.width),
+            f64::from(content_viewport.y + content_viewport.height),
+        ));
+        terminal.add_action(AccessAction::Focus);
+        children.push(ACCESS_TERMINAL);
+        nodes.push((ACCESS_TERMINAL, terminal));
+    }
+    let has_terminal_input = terminal_input.is_some();
+    if let Some((text, masked)) = terminal_input {
+        let mut input = AccessNode::new(if masked {
+            AccessRole::PasswordInput
+        } else {
+            AccessRole::TextInput
+        });
+        input.set_label("Telnet input");
+        input.set_value(if masked { String::new() } else { text });
+        input.set_bounds(AccessRect::new(
+            f64::from(content_viewport.x + 8.0),
+            f64::from(content_viewport.y + content_viewport.height - 30.0),
+            f64::from(content_viewport.x + content_viewport.width - 8.0),
+            f64::from(content_viewport.y + content_viewport.height - 4.0),
+        ));
+        input.add_action(AccessAction::Focus);
+        children.push(ACCESS_TERMINAL_INPUT);
+        nodes.push((ACCESS_TERMINAL_INPUT, input));
+    }
     root.set_children(children);
     nodes.push((ACCESS_ROOT, root));
     let focus = match focus {
@@ -6715,6 +7189,8 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
             })
             .map(|node| AccessNodeId(PAGE_ACCESS_BASE + SemanticTree::DOM_BASE + node as u64))
             .unwrap_or(ACCESS_ROOT),
+        FocusTarget::Page if has_terminal_input => ACCESS_TERMINAL_INPUT,
+        FocusTarget::Page if has_terminal => ACCESS_TERMINAL,
         FocusTarget::Page => keyboard_node
             .filter(|node| page.is_some_and(|page| page.layout.boxes.contains_key(node)))
             .map(|node| AccessNodeId(PAGE_ACCESS_BASE + SemanticTree::DOM_BASE + node as u64))
@@ -7499,6 +7975,104 @@ mod tests {
     }
 
     #[test]
+    fn terminal_accessibility_exposes_output_and_masks_remote_echo_input() {
+        for masked in [false, true] {
+            let update = build_accessibility_update(
+                AccessibilityFrame {
+                    metrics: ViewportMetrics::from_physical(
+                        PhysicalSize::new(800, 600),
+                        ScaleFactor::new(1.0),
+                    ),
+                    page: None,
+                    focus: FocusTarget::Page,
+                    content_viewport: CssRect::new(0.0, 0.0, 800.0, 600.0),
+                    scroll: CssPoint::default(),
+                    keyboard_node: None,
+                    command_value: None,
+                    command_prompt: None,
+                    find_value: None,
+                    terminal_text: Some("Welcome\nLogin:".into()),
+                    terminal_input: Some(("private draft".into(), masked)),
+                },
+                true,
+            );
+            assert_eq!(update.focus, ACCESS_TERMINAL_INPUT);
+            let output = &update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == ACCESS_TERMINAL)
+                .unwrap()
+                .1;
+            assert_eq!(output.role(), AccessRole::Terminal);
+            assert_eq!(output.value(), Some("Welcome\nLogin:"));
+            let input = &update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == ACCESS_TERMINAL_INPUT)
+                .unwrap()
+                .1;
+            assert_eq!(
+                input.role(),
+                if masked {
+                    AccessRole::PasswordInput
+                } else {
+                    AccessRole::TextInput
+                }
+            );
+            assert_eq!(
+                input.value(),
+                Some(if masked { "" } else { "private draft" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_retired_session_events_cannot_change_the_current_session() {
+        use trust::telnet::{Event, op_command, op_option};
+        let (handle, _events) = trust::telnet::connect("127.0.0.1".into(), 0, (80, 24), false);
+        let mut terminal = TerminalSession {
+            id: 2,
+            forwarder: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            address: "telnet://127.0.0.1:23".into(),
+            view: trust::terminal_view::TerminalView::new(24, 80),
+            handle,
+            cols: 80,
+            rows: 24,
+            connected: true,
+            line_editor: TextEditor::new("draft", &terminal_text_style(), 700.0, false),
+            mouse_button: None,
+            last_mouse_cell: None,
+            wheel_remainder: 0.0,
+        };
+        terminal.view.process(b"current");
+        assert!(
+            terminal
+                .receive(
+                    1,
+                    vec![
+                        Event::Data(b"stale".to_vec()),
+                        Event::Negotiation {
+                            command: op_command::WILL,
+                            option: op_option::ECHO
+                        },
+                        Event::Closed(Some("old failure".into()))
+                    ]
+                )
+                .is_none()
+        );
+        assert!(terminal.connected);
+        assert_eq!(terminal.view.terminal.visible_text(), "current");
+        assert!(!terminal.view.terminal.remote_echo());
+        terminal.receive(
+            2,
+            vec![Event::Data(b" session".to_vec()), Event::Closed(None)],
+        );
+        assert!(!terminal.connected);
+        assert_eq!(terminal.view.terminal.visible_text(), "current session");
+        assert_eq!(terminal.line_editor.text(), "draft");
+    }
+
+    #[test]
     fn gemini_sensitive_prompt_masks_visual_and_accessibility_values() {
         let prompt = trust::gemini::Prompt {
             url: trust::gemini::GeminiUrl::new("example.org", 1965, "/login"),
@@ -7522,6 +8096,8 @@ mod tests {
                 command_value: Some("private value"),
                 command_prompt: Some(&prompt),
                 find_value: None,
+                terminal_text: None,
+                terminal_input: None,
             },
             true,
         );
@@ -7553,6 +8129,8 @@ mod tests {
                 command_value: Some("https://example.test/"),
                 command_prompt: None,
                 find_value: None,
+                terminal_text: None,
+                terminal_input: None,
             },
             true,
         );
