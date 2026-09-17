@@ -29,10 +29,9 @@ use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureVi
 use winit::window::Window;
 
 use super::vello_cpu::{
-    MAX_REGISTERED_IMAGES, OwnedRgbaFrame, intersect_rect, offset_shape, point_bounds,
-    rect_is_visible, rect_path, shape_bounds, shape_fill, shape_is_visible, shape_path,
-    simple_rounded_rect, transformed_bounds, vello_affine, vello_blend, vello_color, vello_rect,
-    vello_stops, vello_stroke,
+    MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, offset_shape, point_bounds,
+    rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
+    vello_affine, vello_blend, vello_color, vello_rect, vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
@@ -734,12 +733,12 @@ impl VelloHybridRenderer {
         let device_transform = Affine::scale(scene.viewport.scale_factor.get());
         let mut transforms = vec![device_transform];
         let mut logical_transforms = vec![Affine2d::IDENTITY];
-        let mut visible_clips = vec![CssRect::new(
+        let mut clips = RasterClips::new(CssRect::new(
             0.0,
             0.0,
             scene.viewport.css.width,
             scene.viewport.css.height,
-        )];
+        ));
         target.set_transform(device_transform);
 
         for command in &scene.primitives {
@@ -748,9 +747,10 @@ impl VelloHybridRenderer {
                     if shape_is_visible(
                         shape,
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                         0.0,
                     ) {
+                        apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                         set_brush(&mut target, brush);
                         target.set_fill_rule(shape_fill(shape));
                         target.fill_path(&shape_path(shape));
@@ -765,31 +765,25 @@ impl VelloHybridRenderer {
                     if shape_is_visible(
                         shape,
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                         style.width.max(0.0) / 2.0,
                     ) {
+                        apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                         set_brush(&mut target, brush);
                         target.set_stroke(vello_stroke(style));
                         target.stroke_path(&shape_path(shape));
                     }
                 }
                 DisplayCommand::PushClip(shape) => {
-                    target.set_fill_rule(shape_fill(shape));
-                    target.push_clip_path(&shape_path(shape));
-                    target.set_fill_rule(vello_common::peniko::Fill::NonZero);
-                    let current = *visible_clips.last().unwrap();
-                    let next = shape_bounds(shape)
-                        .map(|bounds| {
-                            transformed_bounds(bounds, *logical_transforms.last().unwrap())
-                        })
-                        .and_then(|bounds| intersect_rect(current, bounds))
-                        .unwrap_or_default();
-                    visible_clips.push(next);
+                    clips.push(
+                        shape,
+                        *logical_transforms.last().unwrap(),
+                        *transforms.last().unwrap(),
+                    );
                 }
                 DisplayCommand::PopClip => {
-                    target.pop_clip_path();
-                    if visible_clips.len() > 1 {
-                        visible_clips.pop();
+                    if clips.pop() {
+                        target.pop_clip_path();
                     }
                 }
                 DisplayCommand::PushTransform(transform) => {
@@ -808,13 +802,16 @@ impl VelloHybridRenderer {
                         logical_transforms.pop();
                     }
                 }
-                DisplayCommand::PushLayer(layer) => target.push_layer(
-                    None,
-                    Some(vello_blend(layer.blend)),
-                    Some(layer.opacity.clamp(0.0, 1.0)),
-                    None,
-                    None,
-                ),
+                DisplayCommand::PushLayer(layer) => {
+                    apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
+                    target.push_layer(
+                        None,
+                        Some(vello_blend(layer.blend)),
+                        Some(layer.opacity.clamp(0.0, 1.0)),
+                        None,
+                        None,
+                    );
+                }
                 DisplayCommand::PopLayer => target.pop_layer(),
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky
@@ -839,11 +836,12 @@ impl VelloHybridRenderer {
                     if !shape_is_visible(
                         &shifted,
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                         expansion,
                     ) {
                         continue;
                     }
+                    apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     target.set_paint(vello_color(*color));
                     if let Some((rect, radius)) = simple_rounded_rect(&shifted) {
                         if *inset {
@@ -867,11 +865,8 @@ impl VelloHybridRenderer {
                 }
                 DisplayCommand::HitRegion(_) => {}
                 Primitive::FillRect { rect, color } => {
-                    if rect_is_visible(
-                        *rect,
-                        *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
-                    ) {
+                    if rect_is_visible(*rect, *logical_transforms.last().unwrap(), clips.bounds()) {
+                        apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                         target.set_paint(vello_color(*color));
                         target.fill_rect(&vello_rect(*rect));
                     }
@@ -881,13 +876,11 @@ impl VelloHybridRenderer {
                         continue;
                     };
                     let bounds = point_bounds(points.iter().copied()).unwrap_or_default();
-                    if !rect_is_visible(
-                        bounds,
-                        *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
-                    ) {
+                    if !rect_is_visible(bounds, *logical_transforms.last().unwrap(), clips.bounds())
+                    {
                         continue;
                     }
+                    apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     let mut path = BezPath::new();
                     path.move_to((f64::from(first.x), f64::from(first.y)));
                     for point in &points[1..] {
@@ -914,10 +907,11 @@ impl VelloHybridRenderer {
                             shaped.line_height.max(1.0),
                         ),
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                     ) {
                         continue;
                     }
+                    apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     if let Some(clip) = clip {
                         target.push_clip_path(&rect_path(*clip));
                     }
@@ -956,13 +950,11 @@ impl VelloHybridRenderer {
                     clip,
                     ..
                 } => {
-                    if !rect_is_visible(
-                        *rect,
-                        *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
-                    ) {
+                    if !rect_is_visible(*rect, *logical_transforms.last().unwrap(), clips.bounds())
+                    {
                         continue;
                     }
+                    apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     if let Some(clip) = clip {
                         target.push_clip_path(&rect_path(*clip));
                     }
@@ -1344,6 +1336,17 @@ fn premultiply_rgba(rgba: &[u8]) -> Vec<PremulRgba8> {
             }
         })
         .collect()
+}
+
+fn apply_clips(target: &mut vello_hybrid::Scene, clips: &mut RasterClips<'_>, transform: Affine) {
+    if clips.apply(|shape, at| {
+        target.set_transform(at);
+        target.set_fill_rule(shape_fill(shape));
+        target.push_clip_path(&shape_path(shape));
+    }) {
+        target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+        target.set_transform(transform);
+    }
 }
 
 fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {

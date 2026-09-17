@@ -51,6 +51,10 @@ pub struct VelloCpuRenderer {
     size: PhysicalSize,
     images: HashMap<ImageHandle, CachedImage>,
     frame_id: u64,
+    #[cfg(test)]
+    eager_clips: bool,
+    #[cfg(test)]
+    rasterized_clips: usize,
 }
 
 impl VelloCpuRenderer {
@@ -64,6 +68,10 @@ impl VelloCpuRenderer {
             size: PhysicalSize::new(1, 1),
             images: HashMap::new(),
             frame_id: 0,
+            #[cfg(test)]
+            eager_clips: false,
+            #[cfg(test)]
+            rasterized_clips: 0,
         }
     }
 
@@ -130,12 +138,12 @@ impl VelloCpuRenderer {
         let device = Affine::scale(scene.viewport.scale_factor.get());
         let mut transforms = vec![device];
         let mut logical_transforms = vec![Affine2d::IDENTITY];
-        let mut visible_clips = vec![CssRect::new(
+        let mut clips = RasterClips::new(CssRect::new(
             0.0,
             0.0,
             scene.viewport.css.width,
             scene.viewport.css.height,
-        )];
+        ));
         self.context.set_transform(device);
         for command in &scene.primitives {
             match command {
@@ -143,11 +151,12 @@ impl VelloCpuRenderer {
                     if !shape_is_visible(
                         shape,
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                         0.0,
                     ) {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.set_brush(brush);
                     self.context.set_fill_rule(shape_fill(shape));
                     self.context.fill_path(&shape_path(shape));
@@ -161,32 +170,30 @@ impl VelloCpuRenderer {
                     if !shape_is_visible(
                         shape,
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                         style.width.max(0.0) / 2.0,
                     ) {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.set_brush(brush);
                     self.context.set_stroke(vello_stroke(style));
                     self.context.stroke_path(&shape_path(shape));
                 }
                 DisplayCommand::PushClip(shape) => {
-                    self.context.set_fill_rule(shape_fill(shape));
-                    self.context.push_clip_path(&shape_path(shape));
-                    self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
-                    let current = *visible_clips.last().unwrap();
-                    let next = shape_bounds(shape)
-                        .map(|bounds| {
-                            transformed_bounds(bounds, *logical_transforms.last().unwrap())
-                        })
-                        .and_then(|bounds| intersect_rect(current, bounds))
-                        .unwrap_or_default();
-                    visible_clips.push(next);
+                    clips.push(
+                        shape,
+                        *logical_transforms.last().unwrap(),
+                        *transforms.last().unwrap(),
+                    );
+                    #[cfg(test)]
+                    if self.eager_clips {
+                        apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
+                    }
                 }
                 DisplayCommand::PopClip => {
-                    self.context.pop_clip_path();
-                    if visible_clips.len() > 1 {
-                        visible_clips.pop();
+                    if clips.pop() {
+                        self.context.pop_clip_path();
                     }
                 }
                 DisplayCommand::PushTransform(transform) => {
@@ -205,13 +212,16 @@ impl VelloCpuRenderer {
                         logical_transforms.pop();
                     }
                 }
-                DisplayCommand::PushLayer(layer) => self.context.push_layer(
-                    None,
-                    Some(vello_blend(layer.blend)),
-                    Some(layer.opacity.clamp(0.0, 1.0)),
-                    None,
-                    None,
-                ),
+                DisplayCommand::PushLayer(layer) => {
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
+                    self.context.push_layer(
+                        None,
+                        Some(vello_blend(layer.blend)),
+                        Some(layer.opacity.clamp(0.0, 1.0)),
+                        None,
+                        None,
+                    );
+                }
                 DisplayCommand::PopLayer => self.context.pop_layer(),
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky
@@ -238,11 +248,12 @@ impl VelloCpuRenderer {
                     if !shape_is_visible(
                         &shifted,
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                         expansion,
                     ) {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.set_paint(vello_color(*color));
                     if let Some((rect, radius)) = simple_rounded_rect(&shifted) {
                         if *inset {
@@ -265,13 +276,11 @@ impl VelloCpuRenderer {
                 }
                 DisplayCommand::HitRegion(_) => {}
                 Primitive::FillRect { rect, color } => {
-                    if !rect_is_visible(
-                        *rect,
-                        *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
-                    ) {
+                    if !rect_is_visible(*rect, *logical_transforms.last().unwrap(), clips.bounds())
+                    {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.set_paint(vello_color(*color));
                     self.context.fill_rect(&vello_rect(*rect));
                 }
@@ -280,13 +289,11 @@ impl VelloCpuRenderer {
                         continue;
                     };
                     let bounds = point_bounds(points.iter().copied()).unwrap_or_default();
-                    if !rect_is_visible(
-                        bounds,
-                        *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
-                    ) {
+                    if !rect_is_visible(bounds, *logical_transforms.last().unwrap(), clips.bounds())
+                    {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     let mut path = BezPath::new();
                     path.move_to((f64::from(first.x), f64::from(first.y)));
                     for point in &points[1..] {
@@ -313,10 +320,11 @@ impl VelloCpuRenderer {
                             shaped.line_height.max(1.0),
                         ),
                         *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
+                        clips.bounds(),
                     ) {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     if let Some(clip) = clip {
                         self.context.push_clip_path(&rect_path(*clip));
                     }
@@ -365,13 +373,11 @@ impl VelloCpuRenderer {
                     clip,
                     ..
                 } => {
-                    if !rect_is_visible(
-                        *rect,
-                        *logical_transforms.last().unwrap(),
-                        *visible_clips.last().unwrap(),
-                    ) {
+                    if !rect_is_visible(*rect, *logical_transforms.last().unwrap(), clips.bounds())
+                    {
                         continue;
                     }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     if let Some(clip) = clip {
                         self.context.push_clip_path(&rect_path(*clip));
                     }
@@ -381,6 +387,10 @@ impl VelloCpuRenderer {
                     }
                 }
             }
+        }
+        #[cfg(test)]
+        {
+            self.rasterized_clips = clips.applied_total;
         }
         self.context.flush();
         self.context.render(&mut self.pixmap, &mut self.resources);
@@ -947,6 +957,96 @@ pub(super) fn simple_rounded_rect(shape: &PaintShape) -> Option<(Rect, f32)> {
     }
 }
 
+/// Retain clip geometry until a visible draw needs its raster mask. Long pages
+/// can repeat the same ancestor clip around thousands of offscreen fragments;
+/// eagerly rasterizing those clips defeats leaf-command culling.
+///
+/// CSS Masking 1 §5 (https://drafts.csswg.org/css-masking-1/#clipping-paths)
+/// defines clipping as the cumulative intersection, without changing geometry.
+/// Keep that conservative intersection immediately, but apply each exact shape
+/// in its original device transform only when needed. The complete scene stays
+/// available to hit testing, selection, accessibility, and subsequent scrolls.
+pub(super) struct RasterClips<'a> {
+    viewport: CssRect,
+    entries: Vec<DeferredClip<'a>>,
+    applied: usize,
+    #[cfg(test)]
+    applied_total: usize,
+}
+
+struct DeferredClip<'a> {
+    shape: &'a PaintShape,
+    transform: Affine,
+    bounds: CssRect,
+}
+
+impl<'a> RasterClips<'a> {
+    pub(super) fn new(viewport: CssRect) -> Self {
+        Self {
+            viewport,
+            entries: Vec::new(),
+            applied: 0,
+            #[cfg(test)]
+            applied_total: 0,
+        }
+    }
+
+    pub(super) fn bounds(&self) -> CssRect {
+        self.entries
+            .last()
+            .map_or(self.viewport, |clip| clip.bounds)
+    }
+
+    pub(super) fn push(&mut self, shape: &'a PaintShape, logical: Affine2d, device: Affine) {
+        let bounds = shape_bounds(shape)
+            .map(|bounds| transformed_bounds(bounds, logical))
+            .and_then(|bounds| intersect_rect(self.bounds(), bounds))
+            .unwrap_or_default();
+        self.entries.push(DeferredClip {
+            shape,
+            transform: device,
+            bounds,
+        });
+    }
+
+    /// Whether the backend must pop a mask; unapplied clips cost no raster work.
+    pub(super) fn pop(&mut self) -> bool {
+        self.entries.pop();
+        if self.applied > self.entries.len() {
+            self.applied -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply the pending suffix in order, before paint or a compositing layer.
+    /// The caller restores its current draw transform when this returns true.
+    pub(super) fn apply(&mut self, mut push: impl FnMut(&PaintShape, Affine)) -> bool {
+        let changed = self.applied < self.entries.len();
+        for clip in &self.entries[self.applied..] {
+            push(clip.shape, clip.transform);
+        }
+        #[cfg(test)]
+        {
+            self.applied_total += self.entries.len() - self.applied;
+        }
+        self.applied = self.entries.len();
+        changed
+    }
+}
+
+fn apply_clips(context: &mut RenderContext, clips: &mut RasterClips<'_>, transform: Affine) {
+    if clips.apply(|shape, at| {
+        context.set_transform(at);
+        context.set_fill_rule(shape_fill(shape));
+        context.push_clip_path(&shape_path(shape));
+    }) {
+        context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+        context.set_transform(transform);
+    }
+}
+
 /// Conservative screen-space culling. The renderer-neutral display list stays
 /// complete for hit testing, selection, accessibility, and future backends;
 /// the CPU raster adapter simply avoids constructing glyph/image work that
@@ -1033,6 +1133,139 @@ mod tests {
     use super::*;
     use crate::core::{BrowserSnapshot, CssSize, ScaleFactor, ViewportMetrics};
     use crate::render::{ImageResource, desktop_shell};
+
+    fn clip_test_scene(scale: f64) -> Scene {
+        Scene {
+            viewport: ViewportMetrics::from_physical(
+                PhysicalSize::new((96.0 * scale) as u32, (64.0 * scale) as u32),
+                ScaleFactor::new(scale),
+            ),
+            primitives: vec![DisplayCommand::FillRect {
+                rect: CssRect::new(0.0, 0.0, 96.0, 64.0),
+                color: PaintColor::Rgba(240, 240, 240, 255),
+            }],
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 96.0, 64.0),
+            image_store: Default::default(),
+            canvas_images: Default::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: crate::core::CssSize::new(96.0, 64.0),
+        }
+    }
+
+    #[test]
+    fn deferred_clips_do_not_rasterize_ancestors_of_offscreen_content() {
+        let mut scene = clip_test_scene(1.0);
+        for row in 0..1_024 {
+            // A long overflow container intersects the viewport even when the
+            // individual descendant wrapped in its clip is far below it.
+            scene.primitives.extend([
+                DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0.0, 0.0, 96.0, 100_000.0))),
+                DisplayCommand::PushTransform(Affine2d::translate(
+                    0.0,
+                    1_000.0 + row as f32 * 40.0,
+                )),
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0.0, 0.0, 80.0, 30.0),
+                    color: PaintColor::Rgba(240, 0, 0, 255),
+                },
+                DisplayCommand::PopTransform,
+                DisplayCommand::PopClip,
+            ]);
+        }
+        scene.primitives.extend([
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(8.0, 8.0, 20.0, 20.0))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(0.0, 0.0, 96.0, 64.0),
+                color: PaintColor::Rgba(0, 0, 240, 255),
+            },
+            DisplayCommand::PopClip,
+        ]);
+        let mut deferred = VelloCpuRenderer::new();
+        let mut eager = VelloCpuRenderer::new();
+        eager.eager_clips = true;
+        assert_eq!(
+            deferred.render_rgba(&scene).unwrap().pixels,
+            eager.render_rgba(&scene).unwrap().pixels,
+        );
+        assert_eq!(deferred.rasterized_clips, 1);
+        assert_eq!(eager.rasterized_clips, 1_025);
+
+        // Reusing the renderer and scrolling those descendants into view must
+        // restore their clips rather than treating the earlier cull as final.
+        scene.primitives.insert(
+            1,
+            DisplayCommand::PushTransform(Affine2d::translate(0.0, -1_000.0)),
+        );
+        scene.primitives.push(DisplayCommand::PopTransform);
+        assert_eq!(
+            deferred.render_rgba(&scene).unwrap().pixels,
+            eager.render_rgba(&scene).unwrap().pixels,
+        );
+        assert_eq!(deferred.rasterized_clips, 2);
+    }
+
+    #[test]
+    fn deferred_clips_preserve_transforms_intersections_and_compositing() {
+        // CSS Masking §5 fixes each clip in the coordinate system where it
+        // was established. Later transforms, empty clips, nested rounded and
+        // even-odd clips, and opacity/blend groups must retain eager pixels.
+        for scale in [1.0, 1.5, 2.0] {
+            let mut scene = clip_test_scene(scale);
+            scene.primitives.extend([
+                DisplayCommand::PushTransform(Affine2d::translate(20.25, 8.5)),
+                DisplayCommand::PushClip(PaintShape::RoundedRect {
+                    rect: CssRect::new(0.0, 0.0, 40.0, 36.0),
+                    radii: super::super::CornerRadii {
+                        corners: [(7.0, 5.0); 4],
+                    },
+                }),
+                DisplayCommand::PopTransform,
+                DisplayCommand::PushLayer(super::super::CompositingLayer {
+                    opacity: 0.6,
+                    blend: BlendMode::Multiply,
+                }),
+                DisplayCommand::PushTransform(Affine2d([0.9, 0.2, -0.1, 0.8, -3.5, 6.25])),
+                DisplayCommand::PushClip(PaintShape::Polygon {
+                    points: vec![
+                        CssPoint::new(0.0, 0.0),
+                        CssPoint::new(80.0, 50.0),
+                        CssPoint::new(0.0, 50.0),
+                        CssPoint::new(80.0, 0.0),
+                    ],
+                    evenodd: true,
+                }),
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(-30.0, -30.0, 150.0, 150.0),
+                    color: PaintColor::Rgba(240, 0, 0, 255),
+                },
+                DisplayCommand::PushClip(PaintShape::Rect(CssRect::default())),
+                DisplayCommand::PushTransform(Affine2d::translate(30.0, 10.0)),
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0.0, 0.0, 96.0, 64.0),
+                    color: PaintColor::Rgba(0, 240, 0, 255),
+                },
+                DisplayCommand::PopTransform,
+                DisplayCommand::PopClip,
+                DisplayCommand::PopClip,
+                DisplayCommand::PopTransform,
+                DisplayCommand::PopLayer,
+                DisplayCommand::PopClip,
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(70.0, 6.0, 20.0, 20.0),
+                    color: PaintColor::Rgba(0, 0, 240, 255),
+                },
+            ]);
+            let mut deferred = VelloCpuRenderer::new();
+            let mut eager = VelloCpuRenderer::new();
+            eager.eager_clips = true;
+            let actual = deferred.render_rgba(&scene).unwrap();
+            assert_eq!(actual.pixels, eager.render_rgba(&scene).unwrap().pixels);
+            assert!(actual.pixels.chunks_exact(4).any(|p| p[0] > p[1]));
+            assert!(actual.pixels.chunks_exact(4).any(|p| p == [0, 0, 240, 255]));
+            assert_eq!(deferred.rasterized_clips, 2);
+        }
+    }
 
     #[test]
     fn adapter_rasterizes_and_reuses_then_resizes_its_cpu_context() {
