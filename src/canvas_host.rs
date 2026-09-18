@@ -52,8 +52,15 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         let height = ctx.member_get(&payload, "1")?.as_num_opt().unwrap_or(0.) as u32;
         let pixels = ctx.member_get(&payload, "2")?;
         let clean = matches!(ctx.member_get(&payload, "3")?, Value::Bool(true));
+        let premultiplied = matches!(ctx.member_get(&payload, "5")?, Value::Bool(true));
         ctx.typed_array_bytes(&pixels)
-            .and_then(|bytes| rgba_bitmap(width, height, &bytes))
+            .and_then(|bytes| {
+                if premultiplied {
+                    sk::Pixmap::from_vec(bytes, sk::IntSize::from_wh(width, height)?)
+                } else {
+                    rgba_bitmap(width, height, &bytes)
+                }
+            })
             .map(|bitmap| (bitmap, clean))
     } else {
         None
@@ -75,6 +82,38 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                 .get(&id)
                 .is_none_or(|canvas| canvas.origin_clean),
         ));
+    }
+    if op == "snapshot" {
+        let canvases = dom.canvases.borrow();
+        let blank;
+        let canvas = if let Some(canvas) = canvases.get(&id) {
+            canvas
+        } else {
+            let Some(canvas) = Canvas::new(width, height, true) else {
+                return Ok(Value::Null);
+            };
+            blank = canvas;
+            &blank
+        };
+        let Some(bytes) = canvas.get(0, 0, width, height) else {
+            return Ok(Value::Null);
+        };
+        let pixels = ctx.make_uint8array(&bytes)?;
+        let record = ctx.new_object_with_proto(&Value::Null);
+        for (i, value) in [
+            Value::Num(width as f64),
+            Value::Num(height as f64),
+            pixels,
+            Value::Bool(canvas.origin_clean),
+            Value::Num(1.),
+            Value::Bool(false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.member_set(&record, &i.to_string(), value)?;
+        }
+        return Ok(record);
     }
     if op == "init" {
         let mut canvases = dom.canvases.borrow_mut();

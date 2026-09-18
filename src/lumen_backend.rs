@@ -19,10 +19,14 @@ use std::time::{Duration, Instant};
 
 #[path = "canvas_host.rs"]
 mod canvas_host;
+#[path = "image_bitmap_host.rs"]
+mod image_bitmap_host;
 #[path = "image_host.rs"]
 mod image_host;
 #[path = "lumen_wasm.rs"]
 mod lumen_wasm;
+#[path = "message_port_host.rs"]
+mod message_port_host;
 
 const DEFAULT_URL: &str = "https://example.com/";
 const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
@@ -79,6 +83,7 @@ enum LumenResourceKind {
 /// selecting the corresponding HTML task.
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
+    PortReady,
     ParserResourceTiming(LumenResourceTiming),
     ImageDone {
         id: usize,
@@ -165,11 +170,12 @@ struct LumenWebSockets {
 
 enum LumenWorkerCtl {
     Message(String),
+    PortReady,
     Terminate,
 }
 
 struct LumenWorkerHandle {
-    ctl: std::sync::mpsc::SyncSender<LumenWorkerCtl>,
+    ctl: Arc<std::sync::mpsc::SyncSender<LumenWorkerCtl>>,
     interrupt: Arc<lumen::RuntimeInterrupt>,
     /// HTML Worker.outside port belongs to its constructor's settings Realm,
     /// not necessarily the top-level Window that owns the native page actor.
@@ -215,9 +221,12 @@ struct LumenWorkerLaunch {
     script_body: Option<Vec<u8>>,
     secure_context: bool,
     agent_cluster: u64,
+    port_registry: Arc<std::sync::Mutex<message_port_host::Registry>>,
+    port_wake: message_port_host::Wake,
 }
 
 struct HostState {
+    message_ports: message_port_host::Agent,
     dom: Rc<RefCell<Dom>>,
     clock: Rc<RealmClock>,
     base: url::Url,
@@ -247,6 +256,7 @@ struct HostState {
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
+    image_bitmap_slots: Option<Value>,
     canvas_gradient_slots: Option<Value>,
     canvas_text_metrics_slots: Option<Value>,
     permission_slots: Option<Value>,
@@ -272,6 +282,7 @@ impl HostState {
             dom.set_device_pixel_ratio(1.0);
         }
         Self {
+            message_ports: Default::default(),
             dom,
             clock,
             base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
@@ -297,6 +308,7 @@ impl HostState {
             window_request_urls: HashMap::new(),
             window_cookie_contexts: HashMap::new(),
             image_data_slots: None,
+            image_bitmap_slots: None,
             canvas_gradient_slots: None,
             canvas_text_metrics_slots: None,
             permission_slots: None,
@@ -452,6 +464,7 @@ impl RetainedMemory for HostState {
         // host-defined roots; the Lumen visitor deduplicates the identities emitted below across
         // the root realm and its ShadowRealms.
         let HostState {
+            message_ports,
             dom,
             clock,
             base,
@@ -477,6 +490,7 @@ impl RetainedMemory for HostState {
             window_request_urls,
             window_cookie_contexts,
             image_data_slots,
+            image_bitmap_slots,
             canvas_gradient_slots,
             canvas_text_metrics_slots,
             permission_slots,
@@ -743,6 +757,8 @@ impl RetainedMemory for HostState {
         }
 
         wasm.scan_retained_memory(visitor);
+        // The broker owns bounded cross-agent queues; no JavaScript values cross it.
+        message_ports.scan_retained_memory(visitor);
 
         if window_realms.capacity() != 0 {
             visitor.opaque_storage();
@@ -758,6 +774,9 @@ impl RetainedMemory for HostState {
             visitor.value(value);
         }
         if let Some(value) = image_data_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = image_bitmap_slots {
             visitor.value(value);
         }
         if let Some(value) = canvas_gradient_slots {
@@ -5235,8 +5254,10 @@ pub(crate) use desktop::transform;
 /// compare every entry with `js_host_boundary::HOST_BOUNDARY_SIGNATURES`, while the table remains
 /// the single source used to install functions into each new realm.
 const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
+    ("__message_port_binding", 3, message_port_host::call),
     ("__image_data_slots", 1, host_image_data_slots),
     ("__image_binding", 2, image_host::call),
+    ("__image_bitmap_binding", 3, image_bitmap_host::call),
     ("__wasm_module_binding", 1, host_wasm_module_binding),
     ("__window_message_binding", 2, host_window_message_binding),
     (
@@ -5725,12 +5746,9 @@ fn host_fetch_args(
         .get(3)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
         .map(|_| host_arg_string(ctx, args, 3));
-    let body = body.map(|bytes| {
-        (
-            content_type.unwrap_or_else(|| String::from("text/plain;charset=UTF-8")),
-            bytes,
-        )
-    });
+    // BodyInit extraction already chose the inferred type. A null type is
+    // significant for BufferSource and untyped Blob bodies (Fetch §5.2).
+    let body = body.map(|bytes| (content_type.unwrap_or_default(), bytes));
     let headers = args
         .get(4)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
@@ -6378,7 +6396,15 @@ fn eval_platform_prelude(engine: &mut lumen::Engine) -> Result<(), String> {
 
 fn worker_prelude_snapshot() -> Result<&'static [u8], String> {
     static SNAPSHOT: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
-    match SNAPSHOT.get_or_init(|| lumen::compile_host_snapshot(crate::js::worker_prelude())) {
+    match SNAPSHOT.get_or_init(|| {
+        let override_source = std::env::var_os("TRUST_WORKER_PRELUDE_FILE")
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        lumen::compile_host_snapshot(
+            override_source
+                .as_deref()
+                .unwrap_or_else(|| crate::js::worker_prelude()),
+        )
+    }) {
         Ok(snapshot) => Ok(snapshot.as_slice()),
         Err(error) => Err(error.clone()),
     }
@@ -6598,6 +6624,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     }
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.remove(&context);
+        state.message_ports.release(Some(context));
         state.window_request_urls.remove(&context);
         state.window_cookie_contexts.remove(&context);
         if let Some(network) = state.network.as_mut() {
@@ -7294,6 +7321,15 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let agent_cluster = ctx
         .host_mut::<HostState>()
         .map_or(0, |state| state.agent_cluster);
+    let port_registry = ctx
+        .host_mut::<HostState>()
+        .unwrap()
+        .message_ports
+        .registry
+        .clone();
+    let (ctl, ctl_rx) = std::sync::mpsc::sync_channel(64);
+    let ctl = Arc::new(ctl);
+    let port_wake = message_port_host::Wake::Worker(Arc::downgrade(&ctl));
     let Some((id, launch, handle, tasks, events)) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.workers.as_mut())
@@ -7318,6 +7354,8 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
                     script_body,
                     secure_context,
                     agent_cluster,
+                    port_registry,
+                    port_wake,
                 },
                 workers.handle.clone(),
                 workers.tasks.clone(),
@@ -7328,7 +7366,6 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         return Ok(Value::Num(-1.0));
     };
 
-    let (ctl, ctl_rx) = std::sync::mpsc::sync_channel(64);
     let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
     let worker_interrupt = interrupt.clone();
     let panic_events = events.clone();
@@ -7430,9 +7467,11 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 }
 
 fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
+    engine.define_global("__message_port_binding", 3, message_port_host::call);
     engine.ctx().op_state().register_gc::<HostState>();
     engine.define_global("__image_data_slots", 1, host_image_data_slots);
     engine.define_global("__image_binding", 2, image_host::call);
+    engine.define_global("__image_bitmap_binding", 3, image_bitmap_host::call);
     engine.define_global("__wasm_module_binding", 1, host_wasm_module_binding);
     engine.define_global("__permissions_binding", 2, host_permissions_binding);
     engine.define_global("__navigator_binding", 1, host_navigator_binding);
@@ -7440,6 +7479,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
     // shared worker prelude can reach, including its independent per-agent
     // WebAssembly store.
     for &(name, len, function) in &[
+        ("__clock_now", 0, host_clock_now as NativeFn),
         ("__url_parse", 2, host_url_parse as NativeFn),
         ("__url_set", 3, host_url_set as NativeFn),
         ("__http_fetch", 5, host_http_fetch as NativeFn),
@@ -7864,6 +7904,8 @@ fn run_lumen_worker(
         ),
     );
     state.agent_cluster = launch.agent_cluster;
+    state.message_ports.registry = launch.port_registry.clone();
+    state.message_ports.wake = launch.port_wake.clone();
     state.network = Some(LumenNetwork {
         handle: handle.clone(),
         cache: cache.clone(),
@@ -7893,7 +7935,7 @@ fn run_lumen_worker(
         "classic"
     };
     let config = format!(
-        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {} }};",
+        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {} }};",
         launch.id,
         serde_json::to_string(&launch.name).unwrap_or_else(|_| String::from("\"\"")),
         serde_json::to_string(worker_type).expect("static worker type serializes"),
@@ -7906,6 +7948,7 @@ fn run_lumen_worker(
             .unwrap_or(8),
         crate::http::GLOBAL_PRIVACY_CONTROL,
         launch.secure_context,
+        clock.epoch_ms.get(),
     );
     for platform in [false, true] {
         let setup = if platform {
@@ -7968,51 +8011,85 @@ fn run_lumen_worker(
     {
         return;
     }
+    enum WorkerTask {
+        Command(LumenWorkerCtl),
+        Timer,
+        Port,
+        Bitmap,
+    }
+    let wall_origin = Instant::now();
+    let virtual_origin = lumen_worker_now(&mut engine);
+    let mut queued_command = None;
+    let mut source_cursor = 0;
     loop {
-        let base_ms = lumen_worker_now(&mut engine);
-        let wall = Instant::now();
+        let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
         let deadline = lumen_worker_deadline(&mut engine);
-        let queued_command = match ctl_rx.try_recv() {
-            Ok(command) => Some(command),
-            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-        };
-        // This is a forced full host collection, so use it only as the idle
-        // hook it is: after proving no message is runnable and immediately
-        // before an indefinite park. A worker with a future timer remains
-        // active and uses Lumen's allocation/task-boundary collection instead
-        // of tracing its entire heap after every message or timer task.
-        if queued_command.is_none() && deadline.is_none() {
-            engine.collect_garbage_at_idle();
+        if queued_command.is_none() {
+            queued_command = match ctl_rx.try_recv() {
+                Ok(command) => Some(command),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            };
         }
-        let command = match queued_command {
-            Some(command) => Some(command),
-            None => match deadline {
-                Some(deadline) => {
-                    let wait = Duration::from_secs_f64(((deadline - base_ms).max(0.0)) / 1000.0);
-                    match ctl_rx.recv_timeout(wait) {
-                        Ok(command) => Some(command),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
+        let port_ready = matches!(
+            lumen_worker_internal_call(&mut engine, "hasPortTask", &[]),
+            Ok(Value::Bool(true))
+        );
+        let bitmap_ready = matches!(
+            lumen_worker_internal_call(&mut engine, "hasBitmapTask", &[]),
+            Ok(Value::Bool(true))
+        );
+        // Distinct task sources all make progress. A busy implicit worker port
+        // must not starve transferred channels or an already-due timer.
+        let mut task = None;
+        for offset in 0..4 {
+            let source = (source_cursor + offset) % 4;
+            task = match source {
+                0 => queued_command.take().map(WorkerTask::Command),
+                1 if deadline.is_some_and(|deadline| deadline <= now) => Some(WorkerTask::Timer),
+                2 if port_ready => Some(WorkerTask::Port),
+                3 if bitmap_ready => Some(WorkerTask::Bitmap),
+                _ => None,
+            };
+            if task.is_some() {
+                source_cursor = (source + 1) % 4;
+                break;
+            }
+        }
+        let task = match task {
+            Some(task) => task,
+            None => {
+                if deadline.is_none() {
+                    engine.collect_garbage_at_idle();
                 }
-                None => match ctl_rx.recv() {
-                    Ok(command) => Some(command),
-                    Err(_) => break,
-                },
-            },
+                match deadline {
+                    Some(deadline) => match ctl_rx
+                        .recv_timeout(Duration::from_secs_f64((deadline - now).max(0.0) / 1000.0))
+                    {
+                        Ok(command) => WorkerTask::Command(command),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WorkerTask::Timer,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
+                    None => match ctl_rx.recv() {
+                        Ok(command) => WorkerTask::Command(command),
+                        Err(_) => break,
+                    },
+                }
+            }
         };
-
-        let task_result = match command {
-            Some(LumenWorkerCtl::Terminate) => break,
-            Some(LumenWorkerCtl::Message(message)) => {
+        let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
+        let _ = lumen_worker_internal_call(&mut engine, "advanceClock", &[Value::Num(now)]);
+        let task_result = match task {
+            WorkerTask::Command(LumenWorkerCtl::Terminate) => break,
+            WorkerTask::Command(LumenWorkerCtl::PortReady) => Ok(Value::Undefined),
+            WorkerTask::Command(LumenWorkerCtl::Message(message)) => {
                 lumen_worker_internal_call(&mut engine, "message", &[Value::from_string(message)])
             }
-            None => lumen_worker_internal_call(
-                &mut engine,
-                "tick",
-                &[Value::Num(base_ms + wall.elapsed().as_secs_f64() * 1000.0)],
-            ),
+            WorkerTask::Port => lumen_worker_internal_call(&mut engine, "runPortTask", &[]),
+            WorkerTask::Bitmap => lumen_worker_internal_call(&mut engine, "runBitmapTask", &[]),
+            WorkerTask::Timer => {
+                lumen_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
+            }
         };
         match task_result {
             Ok(_) => {}
@@ -8697,6 +8774,7 @@ fn settle_network_task(
 
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
+        LumenHostTask::PortReady => {}
         LumenHostTask::ParserResourceTiming(timing) => {
             record_resource_timing_ref(engine.ctx(), &timing);
         }
@@ -11870,7 +11948,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 150, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 152, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -11881,7 +11959,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 150);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 152);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -15029,6 +15107,380 @@ mod tests {
                 "true|true|true|true"
             );
         }
+    }
+
+    #[test]
+    fn image_bitmap_sources_tasks_and_transfers_in_windows_and_workers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            for worker in [false, true] {
+                let mut engine = if worker {
+                    let clock = Rc::new(RealmClock::new());
+                    let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+                    let mut engine = lumen::Engine::new();
+                    engine.set_wall_clock(move || clock.now_ms());
+                    engine
+                        .ctx()
+                        .op_state()
+                        .put_retained_memory_with_external_memory(state);
+                    install_lumen_worker_boundary(&mut engine);
+                    eval(
+                        &mut engine,
+                        "globalThis.__worker_cfg={url:'https://example.org/worker.js'}",
+                        "worker config",
+                    )
+                    .unwrap();
+                    assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+                    engine
+                } else {
+                    platform_engine()
+                };
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(
+                    string_value(&mut engine, include_str!("fixtures/image_bitmaps.mjs")),
+                    "bitmap-pending"
+                );
+                for _ in 0..64 {
+                    run_microtask_checkpoint(&mut engine);
+                    let task = if worker {
+                        "if (__wkr.hasBitmapTask()) __wkr.runBitmapTask(); else if (__wkr.hasPortTask()) __wkr.runPortTask();"
+                    } else {
+                        "if (__trust.hasPlatformTask()) __trust.runPlatformTask();"
+                    };
+                    eval(&mut engine, task, "bitmap task").unwrap();
+                }
+                assert_eq!(
+                    string_value(&mut engine, "bitmapResult"),
+                    "ok",
+                    "{tier:?} worker={worker}"
+                );
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        "[typeof __image_bitmap_binding,typeof __bitmap_api,typeof __sc_bitmap_codec].join()"
+                    ),
+                    "undefined,undefined,undefined"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_bitmap_preserves_canvas_taint_and_cross_realm_brands() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            r#"
+            globalThis.bitmapCanvas=document.createElement('canvas');
+            bitmapCanvas.width=2; bitmapCanvas.height=1;
+            bitmapCanvas.getContext('2d').fillRect(0,0,2,1);
+        "#,
+            "bitmap canvas",
+        )
+        .unwrap();
+        let id = eval_value(&mut engine, "bitmapCanvas.__id", "canvas id")
+            .unwrap()
+            .as_num_opt()
+            .unwrap() as usize;
+        engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .dom
+            .borrow_mut()
+            .canvases
+            .borrow_mut()
+            .get_mut(&id)
+            .unwrap()
+            .origin_clean = false;
+        eval(&mut engine, r#"
+            globalThis.bitmapSecurityResult='pending';
+            (async()=>{
+                const bitmap=await createImageBitmap(bitmapCanvas);
+                const frame=document.createElement('iframe');document.documentElement.appendChild(frame);
+                const child=frame.contentWindow;
+                const width=Object.getOwnPropertyDescriptor(child.ImageBitmap.prototype,'width').get;
+                if(width.call(bitmap)!==2) throw Error('cross-Realm brand');
+                const childCanvas=child.document.createElement('canvas');
+                childCanvas.width=3;childCanvas.height=1;
+                const childBitmap=await createImageBitmap(childCanvas);
+                if(childBitmap.width!==3)throw Error('cross-Realm canvas');
+                const parentBitmap=await child.createImageBitmap(bitmapCanvas);
+                if(parentBitmap.width!==2)throw Error('cross-Realm factory');
+                const copy=await createImageBitmap(bitmap,{resizeWidth:4});
+                function cloneFails(fn) {try{fn();}catch(e){if(e.name==='DataCloneError')return;throw e;}throw Error('taint escaped');}
+                cloneFails(()=>structuredClone(copy));
+                cloneFails(()=>structuredClone(null,{transfer:[copy]}));
+                if(copy.width!==4)throw Error('failed transfer detached bitmap');
+                const canvas=document.createElement('canvas'),context=canvas.getContext('2d');
+                context.drawImage(copy,0,0);
+                try{context.getImageData(0,0,1,1);throw Error('tainted pixels exposed');}catch(e){if(e.name!=='SecurityError')throw e;}
+                child.ImageBitmap.prototype.close.call(bitmap);
+                if(bitmap.width!==0)throw Error('cross-Realm close');
+                copy.close();childBitmap.close();parentBitmap.close();frame.remove();
+                bitmapSecurityResult='ok';
+            })().catch(e=>{bitmapSecurityResult=String(e)});
+        "#, "bitmap security").unwrap();
+        for _ in 0..24 {
+            run_microtask_checkpoint(&mut engine);
+            eval(
+                &mut engine,
+                "if(__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                "bitmap task",
+            )
+            .unwrap();
+        }
+        assert_eq!(string_value(&mut engine, "bitmapSecurityResult"), "ok");
+    }
+
+    #[test]
+    fn worker_performance_uses_native_monotonic_time_and_creation_origin() {
+        // HR-Time #now-method / #timeorigin-attribute / #dfn-coarsen-time;
+        // HTML #run-a-worker. Local September 6, 2026 snapshots (HR-Time 1f0b9fa).
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let clock = Rc::new(RealmClock::new());
+            let origin = clock.epoch_ms.get();
+            let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+            let mut engine = lumen::Engine::new();
+            engine.set_wall_clock(move || clock.now_ms());
+            engine
+                .ctx()
+                .op_state()
+                .put_retained_memory_with_external_memory(state);
+            install_lumen_worker_boundary(&mut engine);
+            eval(
+                &mut engine,
+                &format!(
+                    "globalThis.__worker_cfg = {{url:'https://example.org/worker.js', timeOrigin:{origin}}};"
+                ),
+                "worker creation time",
+            )
+            .unwrap();
+            assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, "String(performance.timeOrigin)")
+                    .parse::<f64>()
+                    .unwrap(),
+                (origin * 10.0).floor() / 10.0,
+                "{tier:?} creation origin must precede prelude initialization"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                        const origin = performance.timeOrigin;
+                        let previous = performance.now(), minimum = Infinity;
+                        // Date and Math are mutable author objects, not clock authorities.
+                        Date.now = () => { throw new Error('author Date.now called'); };
+                        Math.floor = () => { throw new Error('author Math.floor called'); };
+                        for (let i=0; i<2048; i++) {
+                            const current = performance.now(), delta = current - previous;
+                            if (delta < 0) return 'clock went backwards';
+                            if (delta > 0 && delta < minimum) minimum = delta;
+                            previous = current;
+                        }
+                        return [minimum > 0 && minimum < 1, origin === performance.timeOrigin,
+                            previous >= 0, typeof __clock_now].join('|');
+                    })()"#
+                ),
+                "true|true|true|undefined",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_fetch_preserves_binary_bodies_headers_and_consumption() {
+        // Fetch §5.3 consume body / arrayBuffer(), §5.4 RequestInit headers.
+        // A real native binary response omits the optional text slot.
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let script = r#"
+            (async () => {
+                const r = await fetch('/binary', {method:'POST', headers:{'X-Fixture':'kept','X-Empty':''},
+                    body:new Uint8Array([0,255,128])});
+                const copy = r.clone(), blobCopy = r.clone(), byteCopy = r.clone();
+                const buffer = await r.arrayBuffer();
+                let used = false, cloneUsed = false;
+                try { await r.text(); } catch (e) { used = e instanceof TypeError; }
+                try { r.clone(); } catch (e) { cloneUsed = e instanceof TypeError; }
+                const fromBlob = await (await blobCopy.blob()).arrayBuffer();
+                const fromBytes = await byteCopy.bytes();
+                const utf = await fetch('/utf8');
+                postMessage([new Uint8Array(buffer).join(), new Uint8Array(await copy.arrayBuffer()).join(),
+                    new Uint8Array(fromBlob).join(), fromBytes.join(), r.bodyUsed, used, cloneUsed,
+                    r.headers.get('x-fixture-reply'), utf.status, utf.ok, await utf.text()].join('|'));
+            })().catch(error => postMessage('ERROR:' + error.name + ':' + error.message));
+        "#;
+        let origin = page.origin().ascii_serialization();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut bytes).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                assert!(head.contains("accept: */*\r\n"), "{head}");
+                let (mime, body) = if head.starts_with("get /worker.js ") {
+                    ("text/javascript", script.as_bytes())
+                } else if head.starts_with("post /binary ") {
+                    assert!(head.contains("x-fixture: kept\r\n"), "{head}");
+                    assert!(head.contains("x-empty: \r\n"), "{head}");
+                    assert!(head.contains(&format!("origin: {origin}\r\n")), "{head}");
+                    assert!(
+                        !head.contains("content-type:"),
+                        "binary BodyInit has no inferred type: {head}"
+                    );
+                    let end = request
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    while request.len() < end + 3 {
+                        let count = stream.read(&mut bytes).unwrap();
+                        assert_ne!(count, 0);
+                        request.extend_from_slice(&bytes[..count]);
+                    }
+                    assert_eq!(&request[end..end + 3], &[0, 255, 128]);
+                    ("application/octet-stream", &[0, 255, 128, 3][..])
+                } else {
+                    assert!(head.starts_with("get /utf8 "), "{head}");
+                    ("text/plain;charset=utf-8", "café".as_bytes())
+                };
+                let status = if head.starts_with("get /utf8 ") {
+                    708
+                } else {
+                    200
+                };
+                write!(stream, "HTTP/1.1 {status} Reply\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nX-Fixture-Reply: present\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(&mut engine, "globalThis.binaryWorker = new Worker('/worker.js'); binaryWorker.onmessage = e => globalThis.binaryResult = e.data; binaryWorker.onerror = e => globalThis.binaryResult = 'ERROR:' + e.message;", "worker binary fetch").unwrap();
+        loop {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(15), task_rx.recv()).await
+                })
+                .expect("worker response")
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+            if string_value(&mut engine, "typeof binaryResult") != "undefined" {
+                break;
+            }
+        }
+        assert_eq!(
+            string_value(&mut engine, "binaryResult"),
+            "0,255,128,3|0,255,128,3|0,255,128,3|0,255,128,3|true|true|true|present|708|false|café"
+        );
+        eval(&mut engine, "binaryWorker.terminate()", "worker cleanup").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_message_ports_transfer_queues_buffers_and_return_endpoints() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            include_str!("fixtures/worker_message_ports.mjs"),
+            "Worker MessagePorts",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert_eq!(string_value(&mut engine, "portFailures.join('|')"), "");
+            let log = string_value(&mut engine, "portChecks.join('|')");
+            if log.contains("return:again")
+                && log.contains("nested")
+                && log.contains("detached")
+                && log.contains("bitmap-detached")
+            {
+                let echo: Vec<_> = log
+                    .split('|')
+                    .filter(|entry| entry.contains("first") || entry.contains("second"))
+                    .collect();
+                assert_eq!(
+                    echo,
+                    ["first", "micro:first", "second", "micro:second"],
+                    "{log}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "messages stalled: {log}");
+            if matches!(
+                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
+                Ok(Value::Bool(true))
+            ) {
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
+                    |error| panic!("{}", describe_eval_error(&mut engine, error, "port task")),
+                );
+            } else {
+                let task = runtime
+                    .block_on(async {
+                        tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            task_rx.recv(),
+                        )
+                        .await
+                    })
+                    .unwrap_or_else(|_| panic!("worker timeout: {log}"))
+                    .unwrap();
+                dispatch_host_task(&mut engine, task).unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+        }
+        eval(&mut engine, "portWorker.terminate()", "Worker cleanup").unwrap();
     }
 
     #[test]

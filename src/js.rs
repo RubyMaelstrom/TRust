@@ -579,7 +579,10 @@ pub(crate) fn worker_prelude() -> &'static str {
     static PRELUDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PRELUDE
         .get_or_init(|| {
+            let ports = platform_block("/*__PORTS_BEGIN__*/", "/*__PORTS_END__*/");
+            let headers = wrapped_platform_block("/*__HEADERS_BEGIN__*/", "/*__HEADERS_END__*/");
             let codec = platform_block("/*__SC_CODEC_BEGIN__*/", "/*__SC_CODEC_END__*/");
+            let bitmap = platform_block("/*__IMAGE_BITMAP_BEGIN__*/", "/*__IMAGE_BITMAP_END__*/");
             let crypto = wrapped_platform_block("/*__CRYPTO_BEGIN__*/", "/*__CRYPTO_END__*/");
             let streams = wrapped_platform_block("/*__STREAMS_BEGIN__*/", "/*__STREAMS_END__*/");
             let wasm = platform_block("/*__WASM_BEGIN__*/", "/*__WASM_END__*/");
@@ -588,7 +591,11 @@ pub(crate) fn worker_prelude() -> &'static str {
                 platform_block("/*__PERMISSIONS_BEGIN__*/", "/*__PERMISSIONS_END__*/");
             let navigator = platform_block("/*__NAVIGATOR_BEGIN__*/", "/*__NAVIGATOR_END__*/");
             format!(
-                "{WORKER_SCOPE}\n{navigator}\n{permissions}\n{codec}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}"
+                "{WORKER_SCOPE}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{bitmap}\n{headers}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                 __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
+                 __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
+                 delete globalThis.__bitmap_api; delete globalThis.__sc_bitmap_codec;\n\
+                 __wkr.installPorts(__port_api); delete globalThis.__port_api;"
             )
         })
         .as_str()

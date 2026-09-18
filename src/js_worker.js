@@ -1,5 +1,7 @@
 (function () {
     var g = globalThis;
+    var portAPI;
+    const bitmapTasks = [];
     var cfg = g.__worker_cfg || { id: 0, name: "", type: "classic", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
     function errStr(where, e) { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
 
@@ -7,6 +9,7 @@
     var WK = g.__wkr = {
         timers: [], ids: new Set(), nextId: 1, nowMs: 0, activeNesting: 0, errors: [],
         now: function () { return this.nowMs; },
+        advanceClock: function (now) { this.nowMs = Math.max(this.nowMs, now); },
         nextDeadline: function () {
             var min = null;
             for (var i = 0; i < this.timers.length; i++) { var a = this.timers[i].at; if (min === null || a < min) min = a; }
@@ -37,11 +40,18 @@
             return true;
         },
         message: function (s) {
-            var data;
-            try { data = g.__sc_deserialize(s); }
+            var packet;
+            try { packet = portAPI.deserialize(JSON.parse(s)); }
             catch (e) { fireScope("messageerror", trustedScopeEvent(MessageEvent, "messageerror", {})); return; }
-            fireScope("message", trustedScopeEvent(MessageEvent, "message", { data: data, origin: "" }));
+            fireScope("message", trustedScopeEvent(MessageEvent, "message", {
+                data: packet.data, origin: "", ports: Object.freeze(packet.ports)
+            }));
         },
+        installPorts: function (api) { portAPI = api; },
+        hasBitmapTask: function () { return bitmapTasks.length > 0; },
+        runBitmapTask: function () { if (!bitmapTasks.length) return false; bitmapTasks.shift()(); return true; },
+        hasPortTask: function () { return portAPI.hasTask(); },
+        runPortTask: function () { return portAPI.runTask(); },
         takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); }
     };
     // HTML Timers "timer initialization steps" apply to both Window and
@@ -85,7 +95,15 @@
     // behave per spec, `capture` is stored for removal matching — the worker
     // global is a flat target, so there is no capture PHASE) ---
     var LS = new Map();
-    function lsFor(type) { var l = LS.get(type); if (!l) { l = []; LS.set(type, l); } return l; }
+    var targetListeners = new WeakMap();
+    function lsFor(type, target) {
+        var map = LS;
+        if (target && target !== g) {
+            map = targetListeners.get(target);
+            if (!map) { map = new Map(); targetListeners.set(target, map); }
+        }
+        var l = map.get(type); if (!l) { l = []; map.set(type, l); } return l;
+    }
     // (fn, capture) lookup via NATIVE indexOf over the parallel `l.fns`/`l.caps`
     // arrays — same perf invariant as the page realm's `lsFind`: an interpreted
     // per-entry scan goes quadratic under a listener-flooding script.
@@ -99,35 +117,36 @@
         if (!(typeof fn === "function" || (fn && typeof fn.handleEvent === "function"))) return;
         var o = options === true ? { capture: true } : (options && typeof options === "object" ? options : {});
         if (o.signal && o.signal.aborted) return;
-        var t = String(type), l = lsFor(t);
+        var target = this || g, t = String(type), l = lsFor(t, target);
         if (lsFind(l, fn, !!o.capture) >= 0) return;
         var entry = { fn: fn, capture: !!o.capture, once: !!o.once, removed: false };
         if (!l.fns) { l.fns = []; l.caps = []; }
         l.push(entry); l.fns.push(fn); l.caps.push(entry.capture);
         if (o.signal && typeof o.signal.addEventListener === "function") {
-            o.signal.addEventListener("abort", function () { g.removeEventListener(t, fn, { capture: entry.capture }); }, { once: true });
+            o.signal.addEventListener("abort", function () { g.removeEventListener.call(target, t, fn, { capture: entry.capture }); }, { once: true });
         }
     };
     g.removeEventListener = function (type, fn, options) {
         var capture = options === true || !!(options && options.capture);
-        var l = lsFor(String(type));
+        var l = lsFor(String(type), this);
         var i = lsFind(l, fn, capture);
         if (i < 0) return;
         l[i].removed = true;
         l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     };
     var trustedScopeEvents = new WeakSet();
-    function dispatchScopeEvent(ev, preserveTrusted) {
+    function dispatchScopeEvent(ev, preserveTrusted, target) {
+        target = target || g;
         if (!preserveTrusted) trustedScopeEvents.delete(ev);
-        ev.target = g; ev.currentTarget = g;
-        var l = lsFor(ev.type), snap = l.slice();
+        ev.target = target; ev.currentTarget = target;
+        var l = lsFor(ev.type, target), snap = l.slice();
         for (var i = 0; i < snap.length; i++) {
             var entry = snap[i];
             if (entry.removed) continue;
             // `once`: remove through removeEventListener so the parallel
             // fns/caps arrays stay aligned with the entry list.
-            if (entry.once) g.removeEventListener(ev.type, entry.fn, { capture: entry.capture });
-            try { (typeof entry.fn === "function") ? entry.fn.call(g, ev) : entry.fn.handleEvent(ev); }
+            if (entry.once) g.removeEventListener.call(target, ev.type, entry.fn, { capture: entry.capture });
+            try { (typeof entry.fn === "function") ? entry.fn.call(target, ev) : entry.fn.handleEvent(ev); }
             catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); }
         }
         return !ev.defaultPrevented;
@@ -184,10 +203,27 @@
 
     if (!g.DOMException) { g.DOMException = function (message, name) { var e = new Error(message || ""); e.name = name || "Error"; return e; }; }
 
+    const addListener = g.addEventListener, removeListener = g.removeEventListener;
+    g.EventTarget = class EventTarget {
+        addEventListener(type, callback, options) { addListener.call(this, type, callback, options); }
+        removeEventListener(type, callback, options) { removeListener.call(this, type, callback, options); }
+        dispatchEvent(event) { return dispatchScopeEvent(event, false, this); }
+    };
+    g.__bitmap_adapter = { queue(fn) { bitmapTasks.push(fn); }, source() { return undefined; } };
+    g.__port_adapter = {
+        slots: new WeakMap(), EventTarget: g.EventTarget,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        deliver(target, type, init) { dispatchScopeEvent(trustedScopeEvent(MessageEvent, type, init), true, target); }
+    };
+
     // --- self / postMessage / close / on* (DedicatedWorkerGlobalScope) ---
     g.self = g;
     g.name = cfg.name || "";
-    g.postMessage = function (message, transfer) { __worker_self_post(g.__sc_serialize(message)); };
+    g.postMessage = function (message, options) {
+        if (arguments.length === 0) throw new TypeError("postMessage requires a message");
+        __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))));
+    };
     g.close = function () { __worker_self_close(); };
 
     // --- timers / microtasks / performance ---
@@ -196,8 +232,16 @@
     g.clearTimeout = function (id) { removeTimer(id); };
     g.clearInterval = function (id) { removeTimer(id); };
     g.queueMicrotask = function (fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { WK.errors.push(errStr("queueMicrotask", e)); } }); };
-    var perfOrigin = Date.now();
-    g.performance = { now: function () { return Date.now() - perfOrigin; }, timeOrigin: perfOrigin };
+    // HR-Time #now-method / #dfn-coarsen-time: use the shared native monotonic
+    // clock, independently of Date's integral milliseconds or author overrides.
+    // HTML #run-a-worker records the origin before the worker prelude runs.
+    var perfClock = g.__clock_now, perfFloor = Math.floor;
+    delete g.__clock_now;
+    var perfOrigin = perfFloor((cfg.timeOrigin === undefined ? perfClock() : cfg.timeOrigin) * 10) / 10;
+    g.performance = {
+        now: function () { return perfFloor(perfClock() * 10) / 10 - perfOrigin; },
+        timeOrigin: perfOrigin
+    };
 
     // --- console: a worker's console isn't surfaced; no-op (never throws) ---
     var noop = function () {};
@@ -347,7 +391,7 @@
     g.Blob = Blob; g.File = File;
 
     // --- structuredClone (in-realm, via the shared codec) ---
-    g.structuredClone = function (v) { return g.__sc_deserialize(g.__sc_serialize(v)); };
+    g.structuredClone = function (v, options) { return portAPI.deserialize(portAPI.serialize(v, options && options.transfer)).data; };
 
     // --- URLSearchParams / URL (over the __url_parse syscall) ---
     function URLSearchParams(init) {
@@ -474,30 +518,77 @@
     };
 
     // --- fetch (sync-backed in v1: blocks the worker thread, never the page) ---
-    function makeResponse(status, ctype, text, url) {
+    // Fetch #concept-body-consume-body / #dom-body-arraybuffer. The native
+    // response tuple stores bytes independently of its optional decoded text.
+    // Binary responses intentionally have no text field; never reconstruct
+    // binary content from that field or UTF-8-decode it before arrayBuffer().
+    const copyBodyBuffer = __body_buffer;
+    function makeResponse(status, ctype, body, url, headers) {
+        let buffer;
+        if (typeof body === "string") {
+            const bytes = new Uint8Array(body.length);
+            for (let i = 0; i < body.length; i++) bytes[i] = body.charCodeAt(i) & 0xff;
+            buffer = bytes.buffer;
+        } else {
+            buffer = body;
+        }
+        let used = false;
+        function consume(convert) {
+            if (used) return Promise.reject(new TypeError("Body is unusable"));
+            used = true;
+            return Promise.resolve().then(() => convert(copyBodyBuffer(buffer)));
+        }
         return {
-            ok: status >= 200 && status < 300, status: status, statusText: "", url: url, redirected: false, type: "basic", bodyUsed: false,
-            headers: { get: function (n) { return String(n).toLowerCase() === "content-type" ? ctype : null; }, has: function (n) { return String(n).toLowerCase() === "content-type"; }, forEach: function () {} },
-            text: function () { return Promise.resolve(text); },
-            json: function () { return Promise.resolve(JSON.parse(text)); },
-            arrayBuffer: function () { var b = new Uint8Array(text.length); for (var i = 0; i < text.length; i++) b[i] = text.charCodeAt(i) & 0xFF; return Promise.resolve(b.buffer); },
-            blob: function () { return Promise.resolve(new Blob([text], { type: ctype || "" })); },
-            clone: function () { return makeResponse(status, ctype, text, url); }
+            ok: status >= 200 && status < 300, status, statusText: "", url, redirected: false, type: "basic",
+            get bodyUsed() { return used; },
+            headers: new g.Headers(headers || (ctype ? {'content-type':ctype} : {})),
+            text() { return consume(bytes => new g.TextDecoder().decode(bytes)); },
+            json() { return consume(bytes => JSON.parse(new g.TextDecoder().decode(bytes))); },
+            arrayBuffer() { return consume(bytes => bytes); },
+            bytes() { return consume(bytes => new Uint8Array(bytes)); },
+            blob() { return consume(bytes => new Blob([bytes], {type:ctype || ""})); },
+            clone() {
+                if (used) throw new TypeError("Body is unusable");
+                return makeResponse(status, ctype, buffer, url, headers);
+            }
         };
     }
     g.fetch = function (input, init) {
-        init = init || {};
-        var url = (input && input.url) ? input.url : String(input);
-        if (url.slice(0, 5) === "blob:") {
-            var be = __resolveBlobURL(url);
-            if (!be) return Promise.reject(new TypeError("Failed to fetch: " + url));
-            return Promise.resolve(makeResponse(200, be.type || null, __blobText(be.bytes), url));
-        }
-        var rp = __url_parse(url, g.location.href); if (rp) url = rp[0];
-        var method = String(init.method || (input && input.method) || "GET").toUpperCase();
-        var body = (init.body != null) ? String(init.body) : null;
-        var r = __http_fetch(url, method, body, null, "");
-        if (!r) return Promise.reject(new TypeError("Failed to fetch: " + url));
-        return Promise.resolve(makeResponse(r[0], r[1], r[2], url));
+        try {
+            init = init || {};
+            var url = (input && input.url) ? input.url : String(input);
+            if (url.slice(0, 5) === "blob:") {
+                var be = __resolveBlobURL(url);
+                if (!be) return Promise.reject(new TypeError("Failed to fetch: " + url));
+                return Promise.resolve(makeResponse(200, be.type || null, be.bytes, url));
+            }
+            var rp = __url_parse(url, g.location.href); if (rp) url = rp[0];
+            var method = String(init.method || (input && input.method) || "GET").toUpperCase();
+            // Use the same header and native BufferSource boundary as Window fetch.
+            const headers = new g.Headers(init.headers !== undefined ? init.headers : input && input.headers);
+            const value = init.body !== undefined ? init.body : input && input.body;
+            let body = null, ctype = null;
+            if (value != null) {
+                if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) body = copyBodyBuffer(value);
+                else if (value instanceof Blob) { body = __blobBytes(value); ctype = value.type || null; }
+                else {
+                    body = new g.TextEncoder().encode(String(value));
+                    ctype = value instanceof URLSearchParams ? 'application/x-www-form-urlencoded;charset=UTF-8' : 'text/plain;charset=UTF-8';
+                }
+            }
+            if (headers.has('content-type')) ctype = headers.get('content-type');
+            let headerWire = '';
+            headers.forEach((value, key) => { headerWire += (headerWire ? '\n' : '') + key + '\n' + value; });
+            const mode = init.mode || (input && input.mode) || 'cors';
+            const credentials = init.credentials || (input && input.credentials) || 'same-origin';
+            if (!['cors','no-cors','same-origin'].includes(mode) || !['omit','same-origin','include'].includes(credentials))
+                throw new TypeError('Invalid fetch mode or credentials');
+            var r = __http_fetch(url, method, body, ctype, headerWire, mode, credentials, 'fetch');
+            if (!r) return Promise.reject(new TypeError("Failed to fetch: " + url));
+            const responseHeaders = new g.Headers();
+            const lines = String(r[4] || '').split('\n');
+            for (let i = 0; i + 1 < lines.length; i += 2) responseHeaders.append(lines[i], lines[i + 1]);
+            return Promise.resolve(makeResponse(r[0], r[1], r[3], url, responseHeaders));
+        } catch (error) { return Promise.reject(error); }
     };
 })();
