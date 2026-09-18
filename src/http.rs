@@ -57,7 +57,8 @@ pub const IMAGE_ACCEPT: &str = "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
 pub struct Request {
     pub method: String,
     pub url: Url,
-    /// (content-type, payload) for POST and friends.
+    /// (inferred content-type, payload) for POST and friends. An empty type
+    /// means the BodyInit inferred no Content-Type; explicit headers win.
     pub body: Option<(String, Vec<u8>)>,
     /// Extra request headers the page set (XHR `setRequestHeader`, fetch
     /// `init.headers`) — `X-Requested-With`, `Authorization`, a custom
@@ -199,6 +200,34 @@ pub(crate) struct FetchMetadata {
 }
 
 impl Request {
+    /// Fetch #concept-bodyinit-extract leaves the type null for BufferSource
+    /// and untyped Blob bodies. Preserve an explicit empty header separately.
+    fn content_type(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .or_else(|| {
+                self.body
+                    .as_ref()
+                    .map(|(value, _)| value.as_str())
+                    .filter(|value| !value.is_empty())
+            })
+            .filter(|value| !value.contains(['\r', '\n']))
+    }
+
+    /// Fetch #concept-fetch chooses the default Accept from the destination.
+    fn default_accept(&self) -> &'static str {
+        match self.fetch_metadata.map(|metadata| metadata.destination) {
+            Some("document" | "frame" | "iframe") => "text/html, text/*;q=0.8, */*;q=0.1",
+            Some("image") => IMAGE_ACCEPT,
+            Some("json") => "application/json,*/*;q=0.5",
+            Some("style") => "text/css,*/*;q=0.1",
+            Some("text") => "text/plain,*/*;q=0.5",
+            _ => "*/*",
+        }
+    }
+
     pub fn get(url: Url) -> Self {
         Self {
             method: String::from("GET"),
@@ -1435,10 +1464,6 @@ fn cors_preflight_required(request: &Request) -> bool {
         return true;
     }
     !cors_non_safelisted_header_names(request).is_empty()
-        || request
-            .body
-            .as_ref()
-            .is_some_and(|(content_type, _)| !cors_safelisted_content_type(content_type))
 }
 
 fn cors_non_safelisted_header_names(request: &Request) -> Vec<String> {
@@ -1451,9 +1476,10 @@ fn cors_non_safelisted_header_names(request: &Request) -> Vec<String> {
         // Fetch §4.6 appends it after §4.4's preflight decision: it must not
         // trigger OPTIONS or appear in Access-Control-Request-Headers (§4.8).
         // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
-        let generated_content_type = lower == "content-type" && request.body.is_some();
+        // Classify the effective Content-Type once below, including BodyInit's
+        // inferred type only when no author header overrides it.
         if lower.starts_with("access-control-")
-            || generated_content_type
+            || lower == "content-type"
             || matches!(
                 lower.as_str(),
                 "host"
@@ -1480,9 +1506,8 @@ fn cors_non_safelisted_header_names(request: &Request) -> Vec<String> {
         }
     }
     if request
-        .body
-        .as_ref()
-        .is_some_and(|(content_type, _)| !cors_safelisted_content_type(content_type))
+        .content_type()
+        .is_some_and(|value| !cors_safelisted_header("content-type", value))
     {
         names.push(String::from("content-type"));
     }
@@ -1625,7 +1650,12 @@ fn validate_cors_preflight(
 
 async fn fetch_preflight(request: &Request) -> Result<Response, TimedFetchError> {
     let start = crate::performance::now_ms();
-    let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(request))
+    let origin = request_origin_header(
+        request,
+        Default::default(),
+        std::slice::from_ref(&request.url),
+    );
+    let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(request, origin.as_deref()))
         .await
         .map_err(|_| TimedFetchError::network(String::from("timed out"), start))?
         .map_err(|error| TimedFetchError::network(error, start))?;
@@ -1677,7 +1707,8 @@ async fn fetch_redirecting(
         {
             return Err(String::from("same-origin fetch crossed origins").into());
         }
-        let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(&request))
+        let origin = request_origin_header(&request, policy, &url_list);
+        let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(&request, origin.as_deref()))
             .await
             .map_err(|_| TimedFetchError::network(String::from("timed out"), navigation_start))?
             .map_err(|error| TimedFetchError::network(error, navigation_start))?;
@@ -1764,7 +1795,12 @@ async fn fetch_redirecting(
                 // Recorded off the FINAL hop: 301-303 rewrite the method to
                 // GET below, so a Post/Redirect/Get flow lands here as a GET.
                 response.from_post = request.method.eq_ignore_ascii_case("POST");
-                response = enforce_fetch_policy(&request, response)?;
+                response = enforce_fetch_policy_for_redirect_chain(
+                    &request,
+                    response,
+                    origin.as_deref(),
+                    cross_origin_response,
+                )?;
                 let referrer = request
                     .headers
                     .iter()
@@ -1853,11 +1889,26 @@ async fn fetch_redirecting(
 /// Apply the script-facing part of Fetch after the network/redirect steps.
 /// Browser-owned navigations and element subresources have no policy here and
 /// therefore retain their existing presentation behavior.
-fn enforce_fetch_policy(request: &Request, mut response: Response) -> Result<Response, String> {
+#[cfg(test)]
+fn enforce_fetch_policy(request: &Request, response: Response) -> Result<Response, String> {
+    let origin = request_origin_header(
+        request,
+        Default::default(),
+        std::slice::from_ref(&request.url),
+    );
+    enforce_fetch_policy_for_redirect_chain(request, response, origin.as_deref(), false)
+}
+
+fn enforce_fetch_policy_for_redirect_chain(
+    request: &Request,
+    mut response: Response,
+    serialized_origin: Option<&str>,
+    crossed_origin: bool,
+) -> Result<Response, String> {
     let Some(policy) = &request.fetch_policy else {
         return Ok(response);
     };
-    let cross_origin = !same_origin(&policy.origin, &response.url);
+    let cross_origin = crossed_origin || !same_origin(&policy.origin, &response.url);
     match policy.mode {
         RequestMode::SameOrigin if cross_origin => {
             Err(String::from("same-origin fetch crossed origins"))
@@ -1878,7 +1929,7 @@ fn enforce_fetch_policy(request: &Request, mut response: Response) -> Result<Res
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("access-control-allow-origin"))
                 .map(|(_, value)| value.trim());
-            let origin = policy.origin.origin().ascii_serialization();
+            let origin = serialized_origin.unwrap_or("null");
             let origin_ok = allowed_origin.is_some_and(|value| {
                 value == origin || (value == "*" && policy.credentials != CredentialsMode::Include)
             });
@@ -3177,7 +3228,69 @@ pub(crate) fn download_referrer(source: &Url, target: &Url) -> Option<String> {
     referrer_for(source, target)
 }
 
-async fn fetch_once(request: &Request) -> Result<Response, String> {
+/// Fetch #append-a-request-origin-header / #concept-request-tainted-origin.
+/// Origin is browser-owned request metadata, independent of the Referer field.
+/// In particular, a same-origin POST still needs Origin even without a body.
+fn request_origin_header(
+    request: &Request,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    url_list: &[Url],
+) -> Option<String> {
+    use crate::referrer_policy::ReferrerPolicy;
+    let client = request
+        .fetch_policy
+        .as_ref()
+        .map(|policy| &policy.origin)
+        .or_else(|| {
+            request
+                .cookie_context
+                .as_ref()
+                .and_then(|context| context.client.as_ref())
+        })
+        .or(request.timing_client.as_ref());
+    let mode = request.fetch_policy.as_ref().map_or_else(
+        || {
+            request
+                .fetch_metadata
+                .map_or("no-cors", |metadata| metadata.mode)
+        },
+        |policy| policy.mode.as_str(),
+    );
+    let cors_response = mode == "cors"
+        && client.is_some_and(|client| url_list.iter().any(|url| !same_origin(client, url)));
+    if !cors_response && matches!(request.method.as_str(), "GET" | "HEAD") {
+        return None;
+    }
+    let tainted = client.is_none_or(|client| {
+        url_list
+            .windows(2)
+            .any(|hop| !same_origin(&hop[0], &hop[1]) && !same_origin(client, &hop[0]))
+    });
+    let mut serialized = client.filter(|_| !tainted).map_or_else(
+        || String::from("null"),
+        |client| client.origin().ascii_serialization(),
+    );
+    if mode != "cors" {
+        let hidden = match referrer_policy {
+            ReferrerPolicy::NoReferrer => true,
+            ReferrerPolicy::NoReferrerWhenDowngrade
+            | ReferrerPolicy::StrictOrigin
+            | ReferrerPolicy::StrictOriginWhenCrossOrigin => client.is_some_and(|client| {
+                client.scheme() == "https" && request.url.scheme() != "https"
+            }),
+            ReferrerPolicy::SameOrigin => {
+                client.is_none_or(|client| !same_origin(client, &request.url))
+            }
+            _ => false,
+        };
+        if hidden {
+            serialized = String::from("null");
+        }
+    }
+    Some(serialized)
+}
+
+async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response, String> {
     let url = &request.url;
     if url.scheme() == "file" {
         // Fetch includes `file` in its fetch-scheme set but leaves the
@@ -3203,7 +3316,7 @@ async fn fetch_once(request: &Request) -> Result<Response, String> {
             timing.reused_connection(url.scheme() == "https");
             timing.first_interim_response_start = 0.0;
             timing.final_response_start = 0.0;
-            if let Ok(parts) = exchange(&mut io, request, &host, port, &mut timing).await {
+            if let Ok(parts) = exchange(&mut io, request, &host, port, origin, &mut timing).await {
                 return finish_response(request, parts, io, key, timing);
             }
         }
@@ -3213,7 +3326,7 @@ async fn fetch_once(request: &Request) -> Result<Response, String> {
     timing.first_interim_response_start = 0.0;
     timing.final_response_start = 0.0;
     let mut io = dial_with_timing(url.scheme(), &host, port, Some(&mut timing)).await?;
-    let parts = exchange(&mut io, request, &host, port, &mut timing).await?;
+    let parts = exchange(&mut io, request, &host, port, origin, &mut timing).await?;
     finish_response(request, parts, io, key, timing)
 }
 
@@ -3335,6 +3448,7 @@ async fn exchange(
     request: &Request,
     host: &str,
     port: u16,
+    origin: Option<&str>,
     timing: &mut crate::performance::FetchTiming,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
     let url = &request.url;
@@ -3391,7 +3505,7 @@ async fn exchange(
         path,
         host_header,
         USER_AGENT,
-        page_accept.unwrap_or("text/html, text/*;q=0.8, */*;q=0.1"),
+        page_accept.unwrap_or_else(|| request.default_accept()),
         page_accept_language.unwrap_or(crate::locale::ACCEPT_LANGUAGE),
     );
     if GLOBAL_PRIVACY_CONTROL {
@@ -3452,21 +3566,14 @@ async fn exchange(
         trace_cookie_wire(url, &cookie);
         head.push_str(&format!("Cookie: {cookie}\r\n"));
     }
-    if let Some(policy) = &request.fetch_policy
-        && policy.mode == RequestMode::Cors
-        && !same_origin(&policy.origin, url)
-    {
-        head.push_str(&format!(
-            "Origin: {}\r\n",
-            policy.origin.origin().ascii_serialization()
-        ));
+    if let Some(origin) = origin {
+        head.push_str(&format!("Origin: {origin}\r\n"));
     }
-    if let Some((content_type, payload)) = &request.body {
-        head.push_str(&format!(
-            "Content-Type: {}\r\nContent-Length: {}\r\n",
-            content_type,
-            payload.len()
-        ));
+    if let Some(content_type) = request.content_type() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    if let Some((_, payload)) = &request.body {
+        head.push_str(&format!("Content-Length: {}\r\n", payload.len()));
     } else if request.method.eq_ignore_ascii_case("POST")
         || request.method.eq_ignore_ascii_case("PUT")
     {
@@ -3478,12 +3585,12 @@ async fn exchange(
     }
     // Page-supplied headers (X-Requested-With — which servers read as
     // `$request->ajax()` — Authorization, X-CSRF-TOKEN, …), minus the managed
-    // set and `accept` (already folded in above). A header with no value or a
-    // CR/LF (injection) is dropped.
+    // set and fields already folded in above. RFC 9110 §5.5 permits an empty
+    // field value; CR/LF (injection) is rejected.
     for (k, v) in &request.headers {
         let lk = k.to_ascii_lowercase();
         if MANAGED.contains(&lk.as_str())
-            || (lk == "content-type" && request.body.is_some())
+            || lk == "content-type"
             || lk == "accept"
             || lk == "origin"
             || (lk.starts_with("access-control-")
@@ -3607,7 +3714,11 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
         let status: u16 = status_code
             .parse()
             .ok()
-            .filter(|status| (100..=599).contains(status))
+            // Fetch §2.2.3 represents statuses through 999. RFC 9110 §15 says
+            // codes beyond 599 should be processed as server errors, so retain
+            // their body and raw status instead of turning them into network
+            // failures. They remain non-ok and never select redirect handling.
+            .filter(|status| (100..=999).contains(status))
             .ok_or_else(|| format!("invalid status code: {status_line:?}"))?;
         let mut headers = HashMap::new();
         let mut set_cookies = Vec::new();
@@ -7405,6 +7516,143 @@ mod tests {
                 credentials,
             }),
         }
+    }
+
+    #[test]
+    fn request_origin_header_obeys_method_policy_and_redirect_taint() {
+        use crate::referrer_policy::ReferrerPolicy::{
+            NoReferrer, Origin, SameOrigin, StrictOriginWhenCrossOrigin,
+        };
+        for (method, mode, target, policy, expected) in [
+            (
+                "GET",
+                RequestMode::Cors,
+                "https://app.example/path",
+                NoReferrer,
+                None,
+            ),
+            (
+                "HEAD",
+                RequestMode::Cors,
+                "https://other.example/",
+                NoReferrer,
+                Some("https://app.example"),
+            ),
+            (
+                "GET",
+                RequestMode::NoCors,
+                "https://other.example/",
+                Origin,
+                None,
+            ),
+            (
+                "POST",
+                RequestMode::Cors,
+                "https://app.example/path",
+                NoReferrer,
+                Some("https://app.example"),
+            ),
+            (
+                "PUT",
+                RequestMode::SameOrigin,
+                "https://app.example/path",
+                StrictOriginWhenCrossOrigin,
+                Some("https://app.example"),
+            ),
+            (
+                "POST",
+                RequestMode::NoCors,
+                "https://app.example/path",
+                NoReferrer,
+                Some("null"),
+            ),
+            (
+                "POST",
+                RequestMode::NoCors,
+                "https://app.example/path",
+                SameOrigin,
+                Some("https://app.example"),
+            ),
+            (
+                "POST",
+                RequestMode::NoCors,
+                "https://other.example/",
+                SameOrigin,
+                Some("null"),
+            ),
+            (
+                "POST",
+                RequestMode::NoCors,
+                "http://other.example/",
+                StrictOriginWhenCrossOrigin,
+                Some("null"),
+            ),
+            (
+                "POST",
+                RequestMode::NoCors,
+                "http://other.example/",
+                Origin,
+                Some("https://app.example"),
+            ),
+            (
+                "POST",
+                RequestMode::Cors,
+                "http://other.example/",
+                StrictOriginWhenCrossOrigin,
+                Some("https://app.example"),
+            ),
+        ] {
+            let mut request = scripted_request(target, mode, CredentialsMode::SameOrigin);
+            request.method = method.into();
+            request
+                .headers
+                .push(("Origin".into(), "https://forged.example".into()));
+            assert_eq!(
+                request_origin_header(&request, policy, std::slice::from_ref(&request.url))
+                    .as_deref(),
+                expected,
+                "{method} {mode:?} {target} {policy:?}"
+            );
+        }
+        let a = Url::parse("https://app.example/").unwrap();
+        let b = Url::parse("https://other.example/").unwrap();
+        let request = scripted_request(a.as_str(), RequestMode::Cors, CredentialsMode::SameOrigin);
+        assert_eq!(
+            request_origin_header(&request, Origin, &[a.clone(), b.clone()]).as_deref(),
+            Some("https://app.example")
+        );
+        assert_eq!(
+            request_origin_header(&request, Origin, &[a.clone(), b, a.clone()]).as_deref(),
+            Some("null")
+        );
+        let returned = policy_response(a.as_str(), 200, &[("access-control-allow-origin", "null")]);
+        assert!(
+            enforce_fetch_policy_for_redirect_chain(&request, returned, Some("null"), true).is_ok()
+        );
+        let returned = policy_response(
+            a.as_str(),
+            200,
+            &[("access-control-allow-origin", "https://app.example")],
+        );
+        assert!(
+            enforce_fetch_policy_for_redirect_chain(&request, returned, Some("null"), true)
+                .is_err()
+        );
+
+        let mut navigation = Request::get(a.join("/form").unwrap());
+        navigation.method = "POST".into();
+        navigation.cookie_context = Some(CookieContext::subresource(&a));
+        assert_eq!(
+            request_origin_header(&navigation, Origin, std::slice::from_ref(&navigation.url))
+                .as_deref(),
+            Some("https://app.example")
+        );
+        navigation.cookie_context = None;
+        assert_eq!(
+            request_origin_header(&navigation, Origin, std::slice::from_ref(&navigation.url))
+                .as_deref(),
+            Some("null")
+        );
     }
 
     #[test]
@@ -14689,6 +14937,10 @@ customElements.define('lit-counter', LitCounter);
                     ""
                 };
                 let response = if path.starts_with("/start/") {
+                    // HR-Time #dfn-coarsen-time permits 100µs resolution. Make
+                    // the redirect span exceed it so this TAO test cannot confuse
+                    // an exposed zero after rounding with a privacy-hidden zero.
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                     let host = if path.contains("same") {
                         "127.0.0.1"
                     } else {
@@ -15200,6 +15452,116 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[tokio::test]
+    async fn fetch_destinations_and_body_types_reach_the_wire() {
+        // Fetch #concept-fetch / #concept-bodyinit-extract / #cors-unsafe-request-header-names.
+        // Local WHATWG snapshot 394d20d (2026-09-06); HTTP empty values: RFC 9110 §5.5.
+        let document_accept = "text/html, text/*;q=0.8, */*;q=0.1";
+        for (destination, inferred_type, author_type, accept, expected_type, preflight) in [
+            ("", Some(""), None, "*/*", None, false),
+            ("script", None, None, "*/*", None, false),
+            ("worker", Some(""), Some(""), "*/*", Some(""), true),
+            (
+                "image",
+                Some("image/png"),
+                None,
+                IMAGE_ACCEPT,
+                Some("image/png"),
+                true,
+            ),
+            ("document", None, None, document_accept, None, false),
+            (
+                "style",
+                Some("text/plain"),
+                Some("application/json"),
+                "text/css,*/*;q=0.1",
+                Some("application/json"),
+                true,
+            ),
+            (
+                "json",
+                None,
+                Some("text/plain"),
+                "application/json,*/*;q=0.5",
+                Some("text/plain"),
+                false,
+            ),
+            (
+                "text",
+                Some("text/plain"),
+                Some(""),
+                "text/plain,*/*;q=0.5",
+                Some(""),
+                true,
+            ),
+            ("iframe", Some(""), None, document_accept, None, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let body_len = if inferred_type.is_some() { 3 } else { 0 };
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut wire = Vec::new();
+                let mut bytes = [0; 2048];
+                let header_end = loop {
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(count, 0);
+                    wire.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = wire.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                while wire.len() < header_end + body_len {
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(count, 0);
+                    wire.extend_from_slice(&bytes[..count]);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                (
+                    String::from_utf8(wire[..header_end].to_vec()).unwrap(),
+                    wire[header_end..].to_vec(),
+                )
+            });
+            let mut request = Request::get(url.clone());
+            set_fetch_metadata(&mut request, &url, destination, "cors");
+            if let Some(content_type) = inferred_type {
+                request.method = "POST".into();
+                request.body = Some((content_type.into(), vec![0, 255, 128]));
+            }
+            if let Some(content_type) = author_type {
+                request
+                    .headers
+                    .push(("Content-Type".into(), content_type.into()));
+            }
+            assert_eq!(
+                cors_preflight_required(&request),
+                preflight,
+                "{destination:?}"
+            );
+            assert_eq!(fetch(&request).await.unwrap().status, 200);
+            let (head, body) = server.await.unwrap();
+            assert!(head.contains(&format!("Accept: {accept}\r\n")), "{head}");
+            let types: Vec<_> = head
+                .lines()
+                .filter_map(|line| line.strip_prefix("Content-Type: "))
+                .collect();
+            assert_eq!(
+                types,
+                expected_type.into_iter().collect::<Vec<_>>(),
+                "{head}"
+            );
+            if body_len > 0 {
+                assert_eq!(body, [0, 255, 128]);
+                assert!(head.contains("Content-Length: 3\r\n"), "{head}");
+            } else {
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn default_accept_language_reaches_the_wire() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -15563,6 +15925,38 @@ customElements.define('lit-counter', LitCounter);
         })
         .await
         .expect("bodyless responses must not hang on a keep-alive connection");
+    }
+
+    #[tokio::test]
+    async fn response_status_preserves_nonstandard_server_errors_and_body_framing() {
+        // Fetch #concept-status and RFC 9110 §15: an unfamiliar error response
+        // still exposes its headers/body, including after informational headers.
+        for status in [200, 471, 599, 600, 708, 999] {
+            let raw = format!(
+                "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 {status} Unfamiliar\r\nContent-Length: 5\r\nX-Detail: kept\r\n\r\nerror"
+            );
+            let (actual, headers, body, _, _) =
+                read_response(&mut BufReader::new(raw.as_bytes()), false)
+                    .await
+                    .unwrap();
+            assert_eq!(actual, status);
+            assert_eq!(headers.get("x-detail").map(String::as_str), Some("kept"));
+            assert_eq!(body, b"error");
+            let (actual, _, body, _, _) = read_response(&mut BufReader::new(raw.as_bytes()), true)
+                .await
+                .unwrap();
+            assert_eq!(actual, status);
+            assert!(body.is_empty(), "HEAD responses never consume the body");
+        }
+        for status in ["99", "099", "1000", "70x", "+708"] {
+            let raw = format!("HTTP/1.1 {status} Invalid\r\nContent-Length: 0\r\n\r\n");
+            assert!(
+                read_response(&mut BufReader::new(raw.as_bytes()), false)
+                    .await
+                    .is_err(),
+                "{status}"
+            );
+        }
     }
 
     #[tokio::test]
