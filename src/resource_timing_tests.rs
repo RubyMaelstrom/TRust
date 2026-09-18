@@ -76,10 +76,11 @@ async fn resource_timing_element_fetches_keep_native_measurements_and_completion
             e.responseStart>=e.requestStart && e.responseEnd>=e.responseStart && e.responseEnd<=performance.now(),path+' timestamps');
           check(e.responseStatus===200 && e.decodedBodySize>0,path+' real response');return e;};
         check(parserTimingVisible,'parser script entry before execution');
-        entry('/parser.js','script');
+        check(entry('/parser.js','script').transferSize>0,'parser preload retains network timing');
         check(entry('/main.css','css').renderBlockingStatus==='blocking','head sheet blocks');
         check(entry('/print.css','css').renderBlockingStatus==='non-blocking','unmatched media does not block');
-        entry('/module.js','script'); check(originalModuleLoaded,'module preload consumed');
+        check(entry('/module.js','script').transferSize>0,'module preload retains network timing');
+        check(originalModuleLoaded,'module preload consumed');
         const observed=[];const observer=new PerformanceObserver(list=>observed.push(...list.getEntries()));
         observer.observe({type:'resource'});
         await new Promise((resolve,reject)=>{const s=document.createElement('script');s.src='/dynamic.js';

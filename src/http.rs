@@ -718,6 +718,7 @@ pub struct CachedResp {
 
 pub type FetchOutcome = Result<std::sync::Arc<CachedResp>, ()>;
 pub type SharedFetch = futures::future::Shared<futures::future::BoxFuture<'static, FetchOutcome>>;
+type FetchTimingReporter = Box<dyn FnOnce(Option<Box<crate::performance::FetchTiming>>) + Send>;
 
 /// A per-page subresource cache with in-flight dedup. Shared across the
 /// runtime (the initial `execute_js` prefetch) and the page thread (the
@@ -804,6 +805,7 @@ pub struct PageCache {
 struct CachedFetch {
     future: SharedFetch,
     module_imports_scanned: bool,
+    preload_unclaimed: bool,
     resource_context: Option<ResourceCacheContext>,
 }
 
@@ -837,6 +839,7 @@ impl CachedFetch {
         Self {
             future,
             module_imports_scanned: false,
+            preload_unclaimed: false,
             resource_context: None,
         }
     }
@@ -925,6 +928,16 @@ impl PageCache {
         request: Request,
         context: ResourceCacheContext,
     ) -> SharedFetch {
+        self.fetch_request_reporting(handle, request, context, None)
+    }
+
+    fn fetch_request_reporting(
+        &self,
+        handle: &tokio::runtime::Handle,
+        request: Request,
+        context: ResourceCacheContext,
+        report: Option<FetchTimingReporter>,
+    ) -> SharedFetch {
         use futures::future::FutureExt as _;
         let key = request.url.to_string();
         let mut map = self.map.lock().unwrap();
@@ -935,11 +948,17 @@ impl PageCache {
         }
         let (abort, registration) = futures::future::AbortHandle::new_pair();
         self.tasks.track_fetch(abort);
+        let preload = report.is_some();
         let fut = futures::future::Abortable::new(
             async move {
-                match fetch_with_metadata(&request, Default::default()).await {
+                match fetch_with_timing(&request, Default::default()).await {
                     Ok(details) => {
                         let r = details.response;
+                        // Fetch #fetch-finale: enqueue the real fetch's timing
+                        // before a consumer can execute the completed script.
+                        if let Some(report) = report {
+                            report(r.timing.clone());
+                        }
                         Ok(std::sync::Arc::new(CachedResp {
                             status: r.status,
                             content_type: r.content_type,
@@ -949,7 +968,12 @@ impl PageCache {
                             timing: r.timing,
                         }))
                     }
-                    Err(_) => Err(()),
+                    Err(error) => {
+                        if let Some(report) = report {
+                            report(error.timing);
+                        }
+                        Err(())
+                    }
                 }
             },
             registration,
@@ -958,6 +982,7 @@ impl PageCache {
         .boxed()
         .shared();
         let mut entry = CachedFetch::new(fut.clone());
+        entry.preload_unclaimed = preload;
         entry.resource_context = Some(context);
         map.insert(key, entry);
         // Drive it now (dropping the JoinHandle doesn't cancel the task):
@@ -1030,6 +1055,33 @@ impl PageCache {
             .map(|entry| entry.future.clone())
     }
 
+    /// The first matching consumer uses the preload's fetch and timing entry;
+    /// later consumers perform a new memory-cache load with their own timing.
+    pub(crate) fn consume_resource(
+        &self,
+        url: &Url,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    ) -> Option<(SharedFetch, bool)> {
+        let context = ResourceCacheContext::new(client, destination, cors_credentials);
+        self.map
+            .lock()
+            .unwrap()
+            .get_mut(url.as_str())
+            .filter(|entry| {
+                entry.resource_context.as_ref() == Some(&context)
+                    || entry.resource_context.is_none()
+            })
+            .map(|entry| {
+                (
+                    entry.future.clone(),
+                    std::mem::take(&mut entry.preload_unclaimed),
+                )
+            })
+    }
+
+    #[cfg(test)]
     fn seed_resource(
         &self,
         url: String,
@@ -4123,9 +4175,8 @@ const MAX_PAGE_PRELOADS: usize = 96;
 /// idle connections anyway.
 const PREFETCH_CONCURRENCY: usize = 8;
 
-/// Run an HTML page's JavaScript through the selected backend and swap the
-/// body for the post-JS document. External scripts are fetched here, with the same
-/// caps and timeouts as pages — the page's own JS has no I/O at all.
+/// Run an HTML page's JavaScript and return its interactive document shell.
+/// The resident page actor fetches and schedules scripts and subsequent tasks.
 /// Never fails: trouble lands in `response.js` and the original body
 /// survives.
 pub async fn execute_js(
@@ -4155,6 +4206,68 @@ pub async fn execute_js_for_device(
         storage,
     )
     .await
+}
+
+/// HTML #speculative-html-parsing: fetch ahead without controlling execution
+/// order. The parser's script queues consume these shared requests when ready.
+pub(crate) fn prefetch_page_scripts(
+    html: &str,
+    env: &crate::js::PageEnv,
+    report: std::sync::Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync>,
+) {
+    let Some(handle) = env.net.as_ref() else {
+        return;
+    };
+    let Ok(client) = Url::parse(&env.url) else {
+        return;
+    };
+    let base = base_with_doc_base(html, &client);
+    let mut scripts = 0;
+    let mut preloads = 0;
+    for job in crate::js::external_resources_at(
+        html,
+        f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
+        f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
+        env.device_pixel_ratio,
+    ) {
+        let allowed = match job.kind {
+            crate::js::ExternalResourceKind::Script => {
+                scripts += 1;
+                scripts <= MAX_PAGE_SCRIPTS
+            }
+            crate::js::ExternalResourceKind::Preload => {
+                preloads += 1;
+                preloads <= MAX_PAGE_PRELOADS
+            }
+            _ => false,
+        };
+        if allowed
+            && !job.source.is_empty()
+            && let Ok(url) = base.join(&job.source)
+            && matches!(url.scheme(), "http" | "https" | "file")
+            && subresource_allowed(&client, &url)
+        {
+            let credentials = job.cors_credentials();
+            let name = url.to_string();
+            let report = report.clone();
+            drop(env.cache.fetch_request_reporting(
+                handle,
+                Request::subresource(url, &client, "script", credentials),
+                ResourceCacheContext::new(&client, "script", credentials),
+                Some(Box::new(move |timing| {
+                    if let Some(mut timing) = timing {
+                        timing.render_blocking = job.render_blocking;
+                        report(crate::performance::ResourceTiming {
+                            name,
+                            initiator: job.initiator,
+                            timing,
+                            cached: false,
+                        });
+                    }
+                })),
+            ));
+        }
+    }
 }
 
 pub(crate) async fn execute_js_for_window(
@@ -4210,13 +4323,10 @@ pub(crate) async fn execute_js_for_window(
         // CSS-only behavior when no hover state is present.
         prefetched_sheets = Some(sheets);
     }
-    // All subresources — classic scripts, stylesheets, and the module
-    // graph the page announces up front (modulepreload + module entry
-    // srcs) — fetch CONCURRENTLY. With the keep-alive pool this turns
-    // a page load from sum-of-latencies into max-of-latencies.
+    // Stylesheets still establish the initial cascade before layout. Scripts
+    // are fetched by the page's parser scheduler: waiting for every script
+    // here erases async readiness and incorrectly makes async parser-blocking.
     use crate::js::ExternalResourceKind as Kind;
-    let mut scripts = 0;
-    let mut preloads = 0;
     let jobs: Vec<_> = crate::js::external_resources_at(
         &html,
         f32::from(viewport.0) * f32::from(cell_px.0.max(1)),
@@ -4225,14 +4335,7 @@ pub(crate) async fn execute_js_for_window(
     )
     .into_iter()
     .filter(|job| match job.kind {
-        Kind::Script => {
-            scripts += 1;
-            scripts <= MAX_PAGE_SCRIPTS
-        }
-        Kind::Preload => {
-            preloads += 1;
-            preloads <= MAX_PAGE_PRELOADS
-        }
+        Kind::Script | Kind::Preload => false,
         Kind::Sheet => prefetched_sheets.is_none(),
         Kind::Sprite => true,
     })
@@ -4279,28 +4382,23 @@ pub(crate) async fn execute_js_for_window(
                 }
                 None => None,
             };
-            let credentials = job.cors_credentials();
-            (job, resolved, resp, credentials)
+            (job, resolved, resp)
         }
     }))
-    // `buffered` keeps list order: scripts execute and sheets cascade
-    // in document order regardless of arrival order.
+    // Stylesheets cascade in document order regardless of arrival order.
     .buffered(PREFETCH_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
 
-    // The shared subresource cache. Module preloads seed it; the module
-    // loader, speculative import prefetch, and the page's own fetch() all
-    // share it from here on (no chunk is downloaded twice).
+    // The parser, module loader, and page fetches share this resource cache.
     let cache = std::sync::Arc::new(PageCache::default());
-    let mut externals = Vec::new();
     let mut sheets = prefetched_sheets.unwrap_or_default();
     let mut resource_timings = Vec::new();
-    for (job, resolved, details, credentials) in results {
+    for (job, resolved, details) in results {
         let kind = job.kind;
         let raw = job.source;
-        let (resp, url_list) = match details {
-            Some(Ok(details)) => (Some(details.response), details.url_list),
+        let resp = match details {
+            Some(Ok(details)) => Some(details.response),
             failure => {
                 if let (Some(Err(error)), Some(url)) = (failure, resolved.as_ref())
                     && let Some(mut timing) = error.timing
@@ -4313,7 +4411,7 @@ pub(crate) async fn execute_js_for_window(
                         cached: false,
                     });
                 }
-                (None, Vec::new())
+                None
             }
         };
         if let (Some(response), Some(url)) = (resp.as_ref(), resolved.as_ref())
@@ -4328,39 +4426,7 @@ pub(crate) async fn execute_js_for_window(
             });
         }
         match kind {
-            Kind::Script => {
-                // HTML "fetch a classic script" rejects non-OK responses;
-                // Fetch additionally rejects a non-JavaScript MIME type when
-                // the response opts into `X-Content-Type-Options: nosniff`.
-                // Preserve the complete metadata in the shared HTTP cache, but
-                // only expose an allowed body to the parser/executor.
-                if let (Some(u), Some(r)) = (resolved.as_ref(), resp.as_ref()) {
-                    cache.seed_resource(
-                        u.to_string(),
-                        &response.url,
-                        "script",
-                        credentials,
-                        CachedResp {
-                            status: r.status,
-                            content_type: r.content_type.clone(),
-                            headers: r.headers.clone(),
-                            body: r.body.clone(),
-                            url_list: url_list.clone(),
-                            timing: r.timing.clone(),
-                        },
-                    );
-                }
-                let allowed = resp.as_ref().is_some_and(|r| {
-                    classic_script_response_allowed(r.status, &r.content_type, &r.headers)
-                });
-                // Arc so the parallel-parse pool shares the body with its
-                // worker threads instead of cloning a multi-MB bundle.
-                externals.push((
-                    raw,
-                    resp.filter(|_| allowed)
-                        .map(|r| std::sync::Arc::new(r.body)),
-                ));
-            }
+            Kind::Script | Kind::Preload => unreachable!("scripts belong to the page scheduler"),
             Kind::Sheet => {
                 // A failed sheet is simply absent: fail-open, nothing
                 // gets hidden.
@@ -4378,29 +4444,6 @@ pub(crate) async fn execute_js_for_window(
                     )
                     .await;
                     sheets.push((raw, css));
-                }
-            }
-            Kind::Preload => {
-                // Every entry here is a modulepreload or a module-script entry.
-                // Keep the full response in the shared HTTP cache. The module
-                // consumer performs HTML's mandatory OK-status + JavaScript
-                // MIME check before parsing, including for rejected responses;
-                // caching those responses avoids an incorrect second request.
-                if let (Some(u), Some(r)) = (resolved, resp) {
-                    cache.seed_resource(
-                        u.to_string(),
-                        &response.url,
-                        "script",
-                        credentials,
-                        CachedResp {
-                            status: r.status,
-                            content_type: r.content_type,
-                            headers: r.headers,
-                            body: r.body,
-                            url_list,
-                            timing: r.timing,
-                        },
-                    );
                 }
             }
             Kind::Sprite => {
@@ -4426,7 +4469,7 @@ pub(crate) async fn execute_js_for_window(
         cell_px,
         device_pixel_ratio,
         screen_position,
-        externals,
+        externals: Vec::new(),
         sheets,
         cache,
         net: Some(tokio::runtime::Handle::current()),
@@ -9547,6 +9590,179 @@ mod tests {
         );
         let outcome = response.js.expect("outcome recorded");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn parser_async_scripts_run_when_ready_without_blocking_dom_content_loaded() {
+        // HTML #script-processing-src, #script-processing-defer and #the-end
+        // (local official snapshot 2026-09-06). Network gates, rather than
+        // elapsed-time assertions, force both directions of the async race.
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blocking_requested = Arc::new(tokio::sync::Notify::new());
+        let unblock_parser = Arc::new(tokio::sync::Notify::new());
+        let second_defer_requested = Arc::new(tokio::sync::Notify::new());
+        let (release_slow, slow_gate) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let blocking_requested = blocking_requested.clone();
+                let unblock_parser = unblock_parser.clone();
+                let second_defer_requested = second_defer_requested.clone();
+                let mut slow_gate = slow_gate.clone();
+                connections.spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 2048];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        if count == 0 { return; }
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let (mime, body) = match path {
+                        "/page" => ("text/html", r#"<body><div id=out></div>
+                            <script>
+                                window.order = [];
+                                window.scriptErrors = [];
+                                window.mark = value => { order.push(value); document.getElementById('out').textContent = order.join('|'); };
+                                document.addEventListener('error', event => {
+                                    if (event.target.tagName === 'SCRIPT') {
+                                        scriptErrors.push(event.target.id);
+                                        document.body.setAttribute('data-script-errors', scriptErrors.join(','));
+                                    }
+                                }, true);
+                                mark('start');
+                                document.addEventListener('DOMContentLoaded', () => {
+                                    document.body.appendChild(document.getElementById('blocking'));
+                                    mark('DOM:' + document.readyState);
+                                });
+                                window.addEventListener('load', () => mark('load:' + document.readyState));
+                            </script>
+                            <script id=empty src=''>mark('incorrect-inline-fallback');</script>
+                            <script async src='/slow.js'></script>
+                            <script async defer src='/fast.js'></script>
+                            <script id=blocking src='/blocking.js'></script>
+                            <script async defer>
+                                mark('inline:' + document.readyState);
+                                Promise.resolve().then(() => mark('inline-micro'));
+                            </script>
+                            <script defer src='/defer1.js'></script>
+                            <script defer src='/defer2.js'></script>
+                            <script id=bad-module type=module src='/bad-module.js'></script>
+                            <script type=module>
+                                mark('module:' + document.readyState);
+                                await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, {once:true}));
+                                mark('module-resumed');
+                            </script>
+                            <script type=module async src='/async-module.js'></script>
+                            <script nomodule>mark('incorrect-nomodule');</script>
+                            </body>"#),
+                        "/fast.js" => {
+                            blocking_requested.notified().await;
+                            ("text/javascript", "mark('fast'); Promise.resolve().then(() => mark('fast-micro')); fetch('/unblock');")
+                        }
+                        "/blocking.js" => {
+                            blocking_requested.notify_one();
+                            unblock_parser.notified().await;
+                            ("text/javascript", "mark('blocking:' + document.readyState);")
+                        }
+                        "/unblock" => { unblock_parser.notify_one(); ("text/plain", "ok") }
+                        "/defer1.js" => {
+                            second_defer_requested.notified().await;
+                            ("text/javascript", "mark('defer1:' + document.readyState);")
+                        }
+                        "/defer2.js" => {
+                            second_defer_requested.notify_one();
+                            ("text/javascript", "mark('defer2:' + document.readyState);")
+                        }
+                        "/bad-module.js" => ("text/plain", "mark('incorrect-module-mime');"),
+                        "/slow.js" | "/async-module.js" => {
+                            slow_gate.wait_for(|ready| *ready).await.unwrap();
+                            ("text/javascript", if path == "/slow.js" {
+                                "mark('slow:' + document.readyState);"
+                            } else { "mark('async-module:' + document.readyState);" })
+                        }
+                        _ => panic!("unexpected request: {path}"),
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let response = fetch(&Request::get(
+            parse_url(&format!("http://{address}/page")).unwrap(),
+        ))
+        .await
+        .unwrap();
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(20),
+            execute_js(response, (80, 24), (8, 16), Default::default()),
+        )
+        .await
+        .expect("async script blocked parsing or DOMContentLoaded");
+        let initial = String::from_utf8_lossy(&response.body);
+        assert!(initial.contains("start|fast|fast-micro|blocking:loading|inline:loading|inline-micro|defer1:interactive|defer2:interactive|module:interactive|DOM:interactive|module-resumed"), "{initial}");
+        assert!(
+            !initial.contains("slow:interactive") && !initial.contains("load:complete"),
+            "{initial}"
+        );
+        assert!(!initial.contains("incorrect-nomodule"), "{initial}");
+        assert!(!initial.contains("incorrect-inline-fallback"), "{initial}");
+        assert!(!initial.contains("incorrect-module-mime"), "{initial}");
+        assert!(
+            initial.contains("data-script-errors=\"empty,bad-module\""),
+            "{initial}"
+        );
+        assert!(
+            response.js.as_ref().unwrap().errors.is_empty(),
+            "{:?}",
+            response.js
+        );
+        let mut live = response
+            .live
+            .take()
+            .expect("async resources retain the actor");
+        release_slow.send(true).unwrap();
+        let final_html = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = live.events.recv().await {
+                let (html, outcome) = match event {
+                    crate::js::PageEvt::Updated { html, outcome }
+                    | crate::js::PageEvt::Static { html, outcome } => (html, outcome),
+                    crate::js::PageEvt::Patched {
+                        patches, outcome, ..
+                    } => (
+                        patches
+                            .into_iter()
+                            .map(|patch| patch.html)
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        outcome,
+                    ),
+                    _ => continue,
+                };
+                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                if html.contains("load:complete") {
+                    return html;
+                }
+            }
+            panic!("page closed before load");
+        })
+        .await
+        .expect("load never followed async completion");
+        assert!(final_html.contains("slow:interactive"), "{final_html}");
+        assert!(
+            final_html.contains("async-module:interactive"),
+            "{final_html}"
+        );
+        assert_eq!(
+            final_html.matches("load:complete").count(),
+            1,
+            "{final_html}"
+        );
         server.abort();
     }
 
