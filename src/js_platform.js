@@ -2809,6 +2809,13 @@
         }
         return prevented;
     };
+    // Parser and live DOM insertion share HTML's already-started flag.
+    trust.prepareParserScript = function (id) {
+        const node = wrap(id);
+        if (!node || !node.isConnected || SCRIPTS_STARTED.has(id)) return false;
+        SCRIPTS_STARTED.add(id);
+        return true;
+    };
     // Fire a load/error event on an injected resource. GlobalEventHandlers
     // backs `onload`/`onerror` with the same listener registry, so dispatch
     // invokes it exactly once; calling the property again here would violate
@@ -6775,6 +6782,40 @@
         return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
     }
 
+    const DOM_IMPLEMENTATION_TOKEN = {};
+    const documentImplementations = new WeakMap();
+    const implementationDocuments = new WeakMap();
+    class DOMImplementation {
+        constructor(token, document) {
+            if (token !== DOM_IMPLEMENTATION_TOKEN) throw new TypeError("Illegal constructor");
+            implementationDocuments.set(this, document);
+        }
+        // DOM #dom-domimplementation-hasfeature: historical, takes no IDL
+        // arguments, and always returns true (even for unknown features).
+        hasFeature() {
+            if (!implementationDocuments.has(this)) throw new TypeError("Illegal invocation");
+            return true;
+        }
+        createHTMLDocument(title) {
+            if (!implementationDocuments.has(this)) throw new TypeError("Illegal invocation");
+            if (title !== undefined) {
+                if (typeof title === "symbol") throw new TypeError("Cannot convert a Symbol to a string");
+                title = String(title);
+            }
+            // DOM #dom-domimplementation-createhtmldocument: create a real
+            // detached Document, with its own node document and implementation.
+            const doc = wrap(__dom_parse_document(
+                "<!doctype html><html><head></head><body></body></html>", "text/html"));
+            documentURLs.set(doc, "about:blank");
+            if (title !== undefined) {
+                const element = doc.createElement("title");
+                element.appendChild(doc.createTextNode(title));
+                doc.head.appendChild(element);
+            }
+            return doc;
+        }
+        get [Symbol.toStringTag]() { return "DOMImplementation"; }
+    }
     class Document extends Node {
         constructor(id) {
             super(id === undefined ? __dom_create_document("application/xml") : id);
@@ -6876,29 +6917,14 @@
         get URL() { return documentURLs.get(this) || g.location.href; }
         get currentScript() { return wrap(trust.currentScript); }
         get implementation() {
-            const doc = this;
-            return {
-                createHTMLDocument() {
-                    // A detached mini-document, real enough for jQuery's
-                    // support checks and parseHTML: same arena, same API.
-                    const html = doc.createElement("html");
-                    const head = doc.createElement("head");
-                    const body = doc.createElement("body");
-                    html.appendChild(head); html.appendChild(body);
-                    return {
-                        documentElement: html, head: head, body: body,
-                        createElement: (t) => doc.createElement(t),
-                        createTextNode: (s) => doc.createTextNode(s),
-                        createDocumentFragment: () => doc.createDocumentFragment(),
-                        getElementsByTagName: (t) => html.getElementsByTagName(t),
-                        querySelector: (s) => html.querySelector(s),
-                        querySelectorAll: (s) => html.querySelectorAll(s),
-                        createRange: () => new Range(),
-                        createNodeIterator: (r, w) => new NodeIterator(r, w),
-                        createTreeWalker: (r, w, f) => new TreeWalker(r, w, f),
-                    };
-                },
-            };
+            if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
+            // DOM #dom-document-implementation is [SameObject], per Document.
+            let implementation = documentImplementations.get(this);
+            if (!implementation) {
+                implementation = new DOMImplementation(DOM_IMPLEMENTATION_TOKEN, this);
+                documentImplementations.set(this, implementation);
+            }
+            return implementation;
         }
         // DOM Standard §4.5: adoptNode removes a node from its old parent,
         // changes the node document for its entire shadow-including subtree,
@@ -7129,7 +7155,6 @@
         // Parent-side access must use this child document's base rather than
         // the currently active page scope.
         get baseURI() { return frameBaseURL(this.__frame); }
-        get implementation() { return wrap(0).implementation; }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
         open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
         get currentScript() {
@@ -9320,7 +9345,7 @@
     g.DocumentType = DocumentType; g.Attr = Attr;
     g.Node = Node; g.Element = Element; g.HTMLElement = HTMLElement;
     g.Text = Text; g.Document = Document; g.HTMLDocument = Document;
-    g.XMLDocument = XMLDocument;
+    g.XMLDocument = XMLDocument; g.DOMImplementation = DOMImplementation;
     g.DocumentFragment = DocumentFragment; g.Comment = Comment;
     g.Event = Event; g.CustomEvent = CustomEvent;
     g.UIEvent = UIEvent; g.MouseEvent = MouseEvent; g.PointerEvent = PointerEvent;
@@ -15182,8 +15207,13 @@
             if (arguments.length === 0) throw new TypeError("IDBFactory.open requires a database name.");
             name = __idbDOMString(name);
             if (version !== undefined) {
-                version = Number(version);
-                if (!Number.isSafeInteger(version) || version <= 0) throw new TypeError("The database version must be a positive unsigned long long.");
+                // Web IDL #abstract-opdef-converttoint: [EnforceRange]
+                // unsigned long long uses ToNumber, then truncation, then
+                // bounds checking. IndexedDB #dom-idbfactory-open additionally
+                // rejects zero. Unary + also rejects BigInt as ToNumber must.
+                version = Math.trunc(+version);
+                if (!Number.isFinite(version) || version <= 0 || version > Number.MAX_SAFE_INTEGER)
+                    throw new TypeError("The database version must be a positive unsigned long long.");
             }
             __idbCheckStorageKey();
             const request = new IDBOpenDBRequest(__idbToken);

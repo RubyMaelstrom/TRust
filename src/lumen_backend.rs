@@ -79,6 +79,7 @@ enum LumenResourceKind {
 /// selecting the corresponding HTML task.
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
+    ParserResourceTiming(LumenResourceTiming),
     ImageDone {
         id: usize,
         result: Option<image_host::LoadedImage>,
@@ -229,6 +230,8 @@ struct HostState {
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
     pending_resources: usize,
+    pending_module_evaluations: usize,
+    modules_skipped: usize,
     pending_dynamic_modules: Arc<std::sync::atomic::AtomicUsize>,
     network: Option<LumenNetwork>,
     websockets: Option<LumenWebSockets>,
@@ -281,6 +284,8 @@ impl HostState {
             images: Default::default(),
             task_events: None,
             pending_resources: 0,
+            pending_module_evaluations: 0,
+            modules_skipped: 0,
             pending_dynamic_modules: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             network: None,
             websockets: None,
@@ -459,6 +464,8 @@ impl RetainedMemory for HostState {
             images,
             task_events,
             pending_resources,
+            pending_module_evaluations: _,
+            modules_skipped: _,
             pending_dynamic_modules,
             network,
             websockets,
@@ -1138,7 +1145,7 @@ mod desktop {
             storage: env.storage.clone(),
             blobs: env.blobs.clone(),
         };
-        let mut page = match load_page(html, env, host_tx, interrupt.clone()) {
+        let mut page = match load_page(html, env, host_tx, &mut host_rx, None, interrupt.clone()) {
             Ok(page) => page,
             Err(mut outcome) => {
                 outcome.elapsed = Duration::ZERO;
@@ -1146,23 +1153,32 @@ mod desktop {
             }
         };
         let _ = evaluate_task(&mut page, "__trust.oneShot = true;", "one-shot setup");
-        let _ = evaluate_task(
-            &mut page,
-            "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
-            "load event",
-        );
-        checkpoint(&mut page, "load event");
+        let mut lifecycle_complete = false;
+        let mut tasks = ParserTasks::new(&mut host_rx, None, &mut page);
 
         // A one-shot document has no future rendering opportunity, so advance
         // its task sources until they are quiescent. The cap is a diagnostic
         // resource envelope, not a browsing deadline or replacement for the
         // resident event loop.
         for _ in 0..100_000 {
-            if let Ok(task) = host_rx.try_recv() {
+            if let Ok(task) = tasks.receiver.try_recv() {
                 if let Err(error) = dispatch_host_task(&mut page.engine, task) {
                     page.outcome.errors.push(error);
                 }
                 checkpoint(&mut page, "host task");
+                continue;
+            }
+            if !lifecycle_complete
+                && pending_resources(&mut page) == 0
+                && !trust_bool(&mut page, "hasInitialFramesPending")
+            {
+                let _ = evaluate_task(
+                    &mut page,
+                    "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
+                    "load event",
+                );
+                checkpoint(&mut page, "load event");
+                lifecycle_complete = true;
                 continue;
             }
             if trust_bool(&mut page, "hasPlatformTask") {
@@ -1174,6 +1190,15 @@ mod desktop {
                 }
             }
             let Some(deadline) = trust_number(&mut page, "nextDeadline") else {
+                // An unresolved top-level await alone has no task to wait for.
+                // Keep the diagnostic snapshot interactive, without parking
+                // forever waiting for a promise that has no producer.
+                if has_pending_host_work(&mut page) {
+                    if let Some(task) = tasks.next(&mut page) {
+                        ParserTasks::dispatch(&mut page, task);
+                    }
+                    continue;
+                }
                 break;
             };
             let ran = dispatch_timer_task(&mut page, deadline, "timer task");
@@ -1383,7 +1408,14 @@ mod desktop {
         // lane open anyway: a closed `recv()` is immediately ready and would
         // otherwise win the actor select before lifecycle/timer/input work.
         let _host_keepalive = host_tx.clone();
-        let mut page = match load_page(&html, env, host_tx, interrupt.clone()) {
+        let mut page = match load_page(
+            &html,
+            env,
+            host_tx,
+            &mut host_rx,
+            Some(&events),
+            interrupt.clone(),
+        ) {
             Ok(page) => page,
             Err(outcome) => {
                 let _ = events.blocking_send(PageEvt::Static { html, outcome });
@@ -1804,6 +1836,8 @@ mod desktop {
         html: &str,
         env: PageEnv,
         host_tasks: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+        host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        events: Option<&tokio::sync::mpsc::Sender<PageEvt>>,
         interrupt: Arc<lumen::RuntimeInterrupt>,
     ) -> Result<LumenPage, Outcome> {
         let mut outcome = Outcome::default();
@@ -1822,26 +1856,12 @@ mod desktop {
                 dom.attach_external_sheets(&env.sheets);
             }
         }
-        let (scripts, parser_blocking_count) = {
-            let dom = dom.borrow();
-            let (mut blocking, deferred): (Vec<_>, Vec<_>) = dom
-                .scripts()
-                .into_iter()
-                .filter(|(_, _, ty, node)| {
-                    !(is_classic(ty) && dom.attr(*node, "nomodule").is_some())
-                })
-                .partition(|(src, _, ty, node)| {
-                    let module = ty.as_deref().is_some_and(|value| value.trim() == "module");
-                    dom.attr(*node, "async").is_some()
-                        || !(module
-                            || (is_classic(ty)
-                                && src.is_some()
-                                && dom.attr(*node, "defer").is_some()))
-                });
-            let count = blocking.len();
-            blocking.extend(deferred);
-            (blocking, count)
-        };
+        let scripts: Vec<_> = dom
+            .borrow()
+            .scripts()
+            .into_iter()
+            .map(|(_, _, _, node)| node)
+            .collect();
         if scripts.is_empty() && !dom.borrow().hover_css_affects_rendering() {
             return Err(outcome);
         }
@@ -1952,78 +1972,6 @@ mod desktop {
         }
 
         let started = Instant::now();
-        let trace = std::env::var_os("TRUST_LUMEN_TRACE").is_some();
-        for (index, (src, inline, ty, node)) in scripts.into_iter().enumerate() {
-            if index == parser_blocking_count {
-                // HTML #the-end: parser-blocking classic scripts see loading;
-                // ordered deferred/module scripts execute after interactive.
-                let _ = eval(
-                    &mut engine,
-                    "__trust.setDocumentReadiness('interactive')",
-                    "parser EOF",
-                );
-            }
-            let script_started = Instant::now();
-            if is_classic(&ty) {
-                let credentials = crate::js::element_cors_credentials(
-                    dom.borrow().attr(node, "crossorigin"),
-                    false,
-                );
-                let source =
-                    initial_classic_source(src.as_deref(), &inline, &env, &base, credentials);
-                let Some((name, source, external)) = source else {
-                    // HTML §4.12.1.1 executes a null script result by firing `error` at the
-                    // element and returning. A fetch/MIME/status rejection is not an uncaught
-                    // JavaScript exception and therefore does not belong in the page error tally.
-                    fire_engine_script_event(&mut engine, node, "error");
-                    continue;
-                };
-                if trace {
-                    eprintln!("lumen: script[{index}] start classic {name}");
-                }
-                if let Err(error) = run_injected_classic_task(&mut engine, node, &name, &source) {
-                    outcome.errors.push(error);
-                } else if external {
-                    fire_engine_script_event(&mut engine, node, "load");
-                }
-                if trace {
-                    eprintln!(
-                        "lumen: script[{index}] done +{}ms",
-                        script_started.elapsed().as_millis()
-                    );
-                }
-            } else if ty.as_deref().is_some_and(|ty| ty.trim() == "module") {
-                let external = src.is_some();
-                let credentials = crate::js::element_cors_credentials(
-                    dom.borrow().attr(node, "crossorigin"),
-                    true,
-                );
-                let source =
-                    initial_module_source(src.as_deref(), &inline, &env, &base, credentials);
-                let Some((mut name, source)) = source else {
-                    outcome.modules_skipped += 1;
-                    fire_engine_script_event(&mut engine, node, "error");
-                    continue;
-                };
-                if !external {
-                    name = format!("inline-module#{}", index + 1);
-                }
-                let import_base = url::Url::parse(&name).unwrap_or_else(|_| base.clone());
-                speculate_engine_imports(&mut engine, &import_base, source.as_bytes());
-                if trace {
-                    eprintln!("lumen: script[{index}] start module {name}");
-                }
-                if let Err(error) = run_injected_module_task(&mut engine, node, &name, &source) {
-                    outcome.errors.push(error);
-                }
-                if trace {
-                    eprintln!(
-                        "lumen: script[{index}] done +{}ms",
-                        script_started.elapsed().as_millis()
-                    );
-                }
-            }
-        }
         let mut page = LumenPage {
             engine,
             dom,
@@ -2042,9 +1990,121 @@ mod desktop {
             task_trace: ActorTaskTrace::enabled(),
             engine_metrics: lumen::PerformanceMetricsSampler::from_env(),
         };
+        // HTML #prepare-the-script-element / #the-end. Fetch readiness and
+        // execution order are separate: async scripts run on completion;
+        // blocking scripts suspend the parser while other task sources run;
+        // deferred classics and modules execute in order after interactive.
+        // Start speculation only once the realm can consume its completions.
+        crate::http::prefetch_page_scripts(
+            html,
+            &env,
+            Arc::new(move |timing| {
+                let _ = host_tasks.send(LumenHostTask::ParserResourceTiming(timing));
+            }),
+        );
+        let mut tasks = ParserTasks::new(host_rx, events, &mut page);
+        let mut deferred = Vec::new();
+        for node in scripts {
+            // Earlier scripts may change a later element before the parser
+            // prepares it. The speculative scanner is never authoritative.
+            let (src, inline, ty) = {
+                let dom = page.dom.borrow();
+                (
+                    dom.attr(node, "src").map(str::to_string),
+                    dom.text_content(node),
+                    dom.attr(node, "type").map(str::to_string),
+                )
+            };
+            let module = ty.as_deref().is_some_and(|ty| ty.trim() == "module");
+            let classic = is_classic(&ty);
+            if (!classic && !module)
+                || (classic && page.dom.borrow().attr(node, "nomodule").is_some())
+            {
+                continue;
+            }
+            let prepared = call_trust(
+                &mut page,
+                "prepareParserScript",
+                &[Value::Num(node as f64)],
+                "prepare script",
+            )
+            .is_some_and(|value| matches!(value, Value::Bool(true)));
+            if !prepared {
+                continue;
+            }
+            if classic && src.is_none() {
+                // async/defer have no effect on an inline classic script.
+                if let Err(error) =
+                    run_injected_classic_task(&mut page.engine, node, "inline script", &inline)
+                {
+                    page.outcome.errors.push(error);
+                }
+                checkpoint(&mut page, "inline parser script");
+                continue;
+            }
+            let asynchronous = page.dom.borrow().attr(node, "async").is_some();
+            let defer =
+                !asynchronous && (module || page.dom.borrow().attr(node, "defer").is_some());
+            if defer {
+                tasks.deferred.insert(node);
+                deferred.push(node);
+            }
+            // Offline transformations can provide captured classic resources.
+            // Browsing uses the same metadata-checked resource tasks as live
+            // DOM insertion (including data: URLs, CORS and fetch failures).
+            if classic
+                && env.net.is_none()
+                && src.as_deref().is_some_and(|src| !src.starts_with("data:"))
+            {
+                let src = src.as_deref().unwrap();
+                let result = env
+                    .externals
+                    .iter()
+                    .find(|(name, _)| name == src)
+                    .and_then(|(_, body)| body.as_ref())
+                    .map(|body| {
+                        (
+                            200,
+                            String::from("text/javascript"),
+                            body.as_ref().clone(),
+                            Vec::new(),
+                        )
+                    });
+                send_resource_completion(
+                    page.engine.ctx(),
+                    node,
+                    src.to_string(),
+                    LumenResourceKind::ClassicScript,
+                    result,
+                    true,
+                );
+            } else if let Err(error) = host_run_injected_script(
+                page.engine.ctx(),
+                Value::Undefined,
+                &[Value::Num(node as f64)],
+            ) {
+                let message = describe_throw(&mut page.engine, error, "prepare parser script");
+                page.outcome.errors.push(message);
+                continue;
+            }
+            if !asynchronous && !defer && !tasks.execute_when_ready(&mut page, node) {
+                return Err(page.outcome);
+            }
+        }
         let _ = evaluate_task(
             &mut page,
-            "__trust.setDocumentReadiness('interactive'); __trust.queueInitialFrameNavigations(); __trust.fire(document, 'DOMContentLoaded', true);",
+            "__trust.setDocumentReadiness('interactive');",
+            "parser EOF",
+        );
+        checkpoint(&mut page, "parser EOF");
+        for node in deferred {
+            if !tasks.execute_when_ready(&mut page, node) {
+                return Err(page.outcome);
+            }
+        }
+        let _ = evaluate_task(
+            &mut page,
+            "__trust.queueInitialFrameNavigations(); __trust.fire(document, 'DOMContentLoaded', true);",
             "DOMContentLoaded",
         );
         checkpoint(&mut page, "DOMContentLoaded");
@@ -2061,115 +2121,129 @@ mod desktop {
         }
     }
 
-    fn initial_classic_source(
-        src: Option<&str>,
-        inline: &str,
-        env: &PageEnv,
-        base: &url::Url,
-        credentials: Option<crate::http::CredentialsMode>,
-    ) -> Option<(String, String, bool)> {
-        let Some(src) = src else {
-            return Some((String::from("inline script"), inline.to_string(), false));
-        };
-        if src.starts_with("data:") {
-            let body = crate::img::decode_data_url(src)?;
-            return Some((
-                src.to_string(),
-                String::from_utf8_lossy(&body).into_owned(),
-                true,
-            ));
-        }
-        let resolved = base.join(src).ok()?;
-        let client = url::Url::parse(&env.url).ok()?;
-        if !matches!(resolved.scheme(), "http" | "https" | "file")
-            || !crate::http::subresource_allowed(&client, &resolved)
-        {
-            return None;
-        }
-        if (env.net.is_none()
-            || env
-                .cache
-                .peek_resource(&resolved, &client, "script", credentials)
-                .is_some())
-            && let Some(body) = env
-                .externals
-                .iter()
-                .find(|(name, _)| name == src)
-                .and_then(|(_, body)| body.as_ref())
-        {
-            return Some((
-                src.to_string(),
-                String::from_utf8_lossy(body).into_owned(),
-                true,
-            ));
-        }
-
-        // HTML §4.12.1.1, "prepare the script element": prefetching is an
-        // optional optimization. Once a connected classic script with `src`
-        // is prepared, fetching that classic script is mandatory even when a
-        // preload scanner did not announce it.
-        let handle = env.net.as_ref()?;
-        let fetch = env
-            .cache
-            .peek_resource(&resolved, &client, "script", credentials)
-            .unwrap_or_else(|| {
-                env.cache
-                    .fetch_resource(handle, resolved.clone(), &client, "script", credentials)
-            });
-        let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
-        crate::http::classic_script_response_allowed(
-            response.status,
-            &response.content_type,
-            &response.headers,
-        )
-        .then(|| {
-            (
-                resolved.to_string(),
-                crate::http::decode_body(&response.content_type, &response.body),
-                true,
-            )
-        })
+    /// HTML's "spin the event loop" during a parser/deferred-script fetch.
+    /// Deferred completions are retained until their turn; all other host
+    /// tasks, timers and platform tasks remain runnable. Waiting parks the
+    /// actor, and closing its event receiver cancels a pending parser wait.
+    struct ParserTasks<'a> {
+        receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        events: Option<&'a tokio::sync::mpsc::Sender<PageEvt>>,
+        deferred: HashSet<usize>,
+        ready: HashMap<usize, LumenHostTask>,
+        runtime: Option<tokio::runtime::Runtime>,
+        wall_origin: Instant,
+        virtual_origin: f64,
+        prefer_page_task: bool,
     }
 
-    fn initial_module_source(
-        src: Option<&str>,
-        inline: &str,
-        env: &PageEnv,
-        base: &url::Url,
-        credentials: Option<crate::http::CredentialsMode>,
-    ) -> Option<(String, String)> {
-        let Some(src) = src else {
-            return Some((base.to_string(), inline.to_string()));
-        };
-        let resolved = base.join(src).ok()?;
-        if resolved.scheme() == "data" {
-            let content_type = data_url_content_type(resolved.as_str());
-            let body = crate::img::decode_data_url(resolved.as_str())?;
-            return crate::http::module_script_response_allowed(200, &content_type).then(|| {
-                (
-                    resolved.to_string(),
-                    crate::http::decode_body(&content_type, &body),
-                )
-            });
+    impl<'a> ParserTasks<'a> {
+        fn new(
+            receiver: &'a mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+            events: Option<&'a tokio::sync::mpsc::Sender<PageEvt>>,
+            page: &mut LumenPage,
+        ) -> Self {
+            Self {
+                receiver,
+                events,
+                deferred: HashSet::new(),
+                ready: HashMap::new(),
+                runtime: None,
+                wall_origin: Instant::now(),
+                virtual_origin: trust_number(page, "now").unwrap_or(0.0),
+                prefer_page_task: false,
+            }
         }
-        let handle = env.net.as_ref()?;
-        let client = url::Url::parse(&env.url).ok()?;
-        let fetch = env
-            .cache
-            .peek_resource(&resolved, &client, "script", credentials)
-            .unwrap_or_else(|| {
-                env.cache
-                    .fetch_resource(handle, resolved.clone(), &client, "script", credentials)
-            });
-        let response = crate::http::PageCache::block_on_fetch(Some(handle), fetch)?;
-        crate::http::module_script_response_allowed(response.status, &response.content_type).then(
-            || {
-                (
-                    resolved.to_string(),
-                    crate::http::decode_body(&response.content_type, &response.body),
-                )
-            },
-        )
+
+        fn dispatch(page: &mut LumenPage, task: LumenHostTask) {
+            if let Err(error) = dispatch_host_task(&mut page.engine, task) {
+                page.outcome.errors.push(error);
+            }
+            checkpoint(page, "parser networking task");
+        }
+
+        fn execute_when_ready(&mut self, page: &mut LumenPage, node: usize) -> bool {
+            if let Some(task) = self.ready.remove(&node) {
+                self.deferred.remove(&node);
+                Self::dispatch(page, task);
+                return true;
+            }
+            while let Some(task) = self.next(page) {
+                if let LumenHostTask::ResourceDone { node_id, .. } = &task {
+                    if *node_id == node {
+                        self.deferred.remove(&node);
+                        Self::dispatch(page, task);
+                        return true;
+                    }
+                    if self.deferred.contains(node_id) {
+                        self.ready.insert(*node_id, task);
+                        continue;
+                    }
+                }
+                Self::dispatch(page, task);
+            }
+            false
+        }
+
+        fn next(&mut self, page: &mut LumenPage) -> Option<LumenHostTask> {
+            loop {
+                if self.events.is_some_and(|events| events.is_closed())
+                    || !has_pending_host_work(page)
+                {
+                    return None;
+                }
+                let elapsed = self.wall_origin.elapsed().as_secs_f64() * 1000.0;
+                let now = trust_number(page, "now")
+                    .unwrap_or(0.0)
+                    .max(self.virtual_origin + elapsed);
+                let deadline = trust_number(page, "nextDeadline");
+                let timer_due = deadline.is_some_and(|deadline| deadline <= now);
+                let platform_ready = trust_bool(page, "hasPlatformTask");
+                if self.prefer_page_task && (timer_due || platform_ready) {
+                    self.prefer_page_task = false;
+                    if timer_due {
+                        dispatch_timer_task(page, now, "parser timer task");
+                    } else {
+                        call_trust(page, "runPlatformTask", &[], "parser platform task");
+                    }
+                    checkpoint(page, "parser page task");
+                    continue;
+                }
+                if let Ok(task) = self.receiver.try_recv() {
+                    self.prefer_page_task = true;
+                    return Some(task);
+                }
+                if timer_due || platform_ready {
+                    self.prefer_page_task = true;
+                    continue;
+                }
+                let wait = deadline
+                    .map(|deadline| Duration::from_secs_f64((deadline - now).max(0.0) / 1000.0));
+                let runtime = self.runtime.get_or_insert_with(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .expect("trust parser task runtime")
+                });
+                let wake = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        () = async {
+                            match self.events {
+                                Some(events) => events.closed().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => Wake::Host(None),
+                        task = self.receiver.recv() => Wake::Host(task),
+                        () = sleep_or_pending(wait) => Wake::Timer,
+                    }
+                });
+                if let Wake::Host(task) = wake {
+                    self.prefer_page_task = true;
+                    return task;
+                }
+                self.prefer_page_task = true;
+            }
+        }
     }
 
     fn json_string(value: &str) -> String {
@@ -2181,6 +2255,23 @@ mod desktop {
             .ctx()
             .host_mut::<HostState>()
             .map_or(0, |state| state.pending_resources)
+    }
+
+    fn has_pending_host_work(page: &mut LumenPage) -> bool {
+        page.engine
+            .ctx()
+            .host_mut::<HostState>()
+            .is_some_and(|state| {
+                state.pending_resources > state.pending_module_evaluations
+                    || state
+                        .pending_dynamic_modules
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                    || state
+                        .network
+                        .as_ref()
+                        .is_some_and(|network| !network.pending_fetches.is_empty())
+            })
     }
 
     fn has_resident_work(page: &mut LumenPage, has_interaction: bool) -> bool {
@@ -2364,6 +2455,9 @@ mod desktop {
     }
 
     fn drain_diagnostics(page: &mut LumenPage) {
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            page.outcome.modules_skipped += std::mem::take(&mut state.modules_skipped);
+        }
         let error_start = page.outcome.errors.len();
         let console_start = page.outcome.console.len();
         for (source, errors) in [
@@ -6762,18 +6856,22 @@ fn spawn_resource_fetch(
     }) else {
         return false;
     };
-    let shared = cache.peek_resource(&request.url, &client, destination, credentials);
+    let shared = cache.consume_resource(&request.url, &client, destination, credentials);
     let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
     cache.spawn(&handle, async move {
         let (result, timing) = match shared {
-            Some(shared) => match shared.await {
+            Some((shared, preloaded)) => match shared.await {
                 Ok(response) => {
-                    let timing = LumenResourceTiming::cached(
-                        name.clone(),
-                        initiator,
-                        response.timing.as_deref(),
-                        started,
-                    );
+                    let timing = if preloaded {
+                        None
+                    } else {
+                        LumenResourceTiming::cached(
+                            name.clone(),
+                            initiator,
+                            response.timing.as_deref(),
+                            started,
+                        )
+                    };
                     (
                         Some((
                             response.status,
@@ -6911,7 +7009,23 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("module")),
         )
     };
+    let has_src = src.is_some();
     let src = host_resource_url(ctx, node_id, src);
+    // HTML #prepare-the-script-element queues an error for an empty src;
+    // it must not fall through to the inline path or strand a parser wait.
+    if has_src && src.is_none() {
+        queue_resource_error(
+            ctx,
+            node_id,
+            if module {
+                LumenResourceKind::ModuleScript
+            } else {
+                LumenResourceKind::ClassicScript
+            },
+            String::new(),
+        );
+        return Ok(Value::Undefined);
+    }
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!("[fetch-trace] injected script src={src:?} module={module} node={node_id}");
     }
@@ -8224,6 +8338,7 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
     };
     if let Some(state) = engine.ctx().host_mut::<HostState>() {
         state.pending_resources += 1;
+        state.pending_module_evaluations += 1;
     } else {
         return false;
     }
@@ -8234,6 +8349,8 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
         Rc::new(move |ctx, _this, _args| {
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
+                state.pending_module_evaluations =
+                    state.pending_module_evaluations.saturating_sub(1);
             }
             host_fire_script_event(ctx, node_id, "load");
             Ok(Value::Undefined)
@@ -8246,6 +8363,8 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
         Rc::new(move |ctx, _this, args| {
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
+                state.pending_module_evaluations =
+                    state.pending_module_evaluations.saturating_sub(1);
             }
             let reason = args
                 .first()
@@ -8264,6 +8383,7 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
         .is_ok();
     if !attached && let Some(state) = engine.ctx().host_mut::<HostState>() {
         state.pending_resources = state.pending_resources.saturating_sub(1);
+        state.pending_module_evaluations = state.pending_module_evaluations.saturating_sub(1);
     }
     attached
 }
@@ -8439,10 +8559,18 @@ fn run_resource_task(
             Some((status, content_type, body, _headers))
                 if crate::http::module_script_response_allowed(status, &content_type) =>
             {
+                let import_base = url::Url::parse(&name)
+                    .unwrap_or_else(|_| url::Url::parse(&state_base(engine.ctx())).unwrap());
+                speculate_engine_imports(engine, &import_base, &body);
                 let source = crate::http::decode_body(&content_type, &body);
                 run_injected_module_task(engine, node_id, &name, &source)?;
             }
-            _ => fire_engine_script_event(engine, node_id, "error"),
+            _ => {
+                if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                    state.modules_skipped += 1;
+                }
+                fire_engine_script_event(engine, node_id, "error");
+            }
         },
         LumenResourceKind::Stylesheet => match result {
             Some((status, content_type, body, headers))
@@ -8569,6 +8697,9 @@ fn settle_network_task(
 
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
+        LumenHostTask::ParserResourceTiming(timing) => {
+            record_resource_timing_ref(engine.ctx(), &timing);
+        }
         LumenHostTask::ImageDone { id, result, timing } => {
             settle_network_task(engine, id, move |ctx| {
                 record_resource_timing(ctx, timing);
@@ -17880,6 +18011,90 @@ mod tests {
     }
 
     #[test]
+    fn dom_implementation_has_feature_and_document_identity() {
+        // DOM #dom-document-implementation / #dom-domimplementation-hasfeature,
+        // local official snapshot 2026-09-06. Extra arguments are not converted.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const implementation = document.implementation;
+            const poison = { toString() { throw new Error('must not convert'); } };
+            const other = implementation.createHTMLDocument('<literal>');
+            const empty = implementation.createHTMLDocument('');
+            const omitted = implementation.createHTMLDocument();
+            let brand = false, constructor = false;
+            try { implementation.hasFeature.call({}); } catch (e) { brand = e instanceof TypeError; }
+            try { new DOMImplementation(); } catch (e) { constructor = e instanceof TypeError; }
+            globalThis.implementationResult = [
+                implementation === document.implementation,
+                implementation instanceof DOMImplementation,
+                Object.prototype.toString.call(implementation),
+                implementation.hasFeature(),
+                implementation.hasFeature('http://www.w3.org/TR/SVG11/feature#Image', '1.1'),
+                implementation.hasFeature('unknown', poison, Symbol()),
+                brand, constructor,
+                other instanceof Document,
+                other.implementation !== implementation,
+                other.implementation === other.implementation,
+                other.implementation.hasFeature(),
+                other.body.ownerDocument === other,
+                other.contentType, other.URL, other.title,
+                empty.head.firstChild.firstChild.nodeType,
+                omitted.head.childNodes.length
+            ].join('|');
+        "#, "DOMImplementation conformance").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "implementationResult"),
+            "true|true|[object DOMImplementation]|true|true|true|true|true|true|true|true|true|true|text/html|about:blank|<literal>|3|0"
+        );
+    }
+
+    #[test]
+    fn indexed_db_version_uses_enforce_range_integer_conversion() {
+        // IndexedDB #dom-idbfactory-open and Web IDL #abstract-opdef-converttoint,
+        // local official snapshots 2026-09-06: truncate before checking range.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            globalThis.idbVersions = [];
+            globalThis.idbVersionErrors = [];
+            const versions = [994137.531, '2.9', true, undefined, Number.MAX_SAFE_INTEGER];
+            versions.forEach((version, index) => {
+                const request = indexedDB.open('version-conversion-' + index, version);
+                request.onupgradeneeded = event => {
+                    idbVersions[index] = event.newVersion + ':' + request.result.version;
+                };
+                request.onsuccess = () => request.result.close();
+                request.onerror = () => { idbVersions[index] = 'ERROR:' + request.error.name; };
+            });
+            [NaN, Infinity, -Infinity, -1.5, -0.5, -0, 0, 0.9, null, false, '',
+                Number.MAX_SAFE_INTEGER + 1, 1n, Object(1n), Symbol()].forEach(version => {
+                try { indexedDB.open('invalid-version', version); idbVersionErrors.push('accepted'); }
+                catch (error) { idbVersionErrors.push(error.name); }
+            });
+            globalThis.idbConversionOrder = [];
+            const ordered = indexedDB.open(
+                { toString() { idbConversionOrder.push('name'); return 'ordered-version'; } },
+                { valueOf() { idbConversionOrder.push('version'); return 3.7; } });
+            ordered.onsuccess = () => { idbConversionOrder.push(ordered.result.version); ordered.result.close(); };
+        "#, "IndexedDB version conversion").unwrap();
+        for _ in 0..128 {
+            eval(&mut engine, "__trust.runPlatformTask()", "IndexedDB task").unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "idbVersions.join('|')"),
+            "994137:994137|2:2|1:1|1:1|9007199254740991:9007199254740991"
+        );
+        assert_eq!(
+            string_value(&mut engine, "idbVersionErrors.join('|')"),
+            vec!["TypeError"; 15].join("|")
+        );
+        assert_eq!(
+            string_value(&mut engine, "idbConversionOrder.join('|')"),
+            "name|version|3"
+        );
+    }
+
+    #[test]
     fn indexed_db_orders_upgrade_requests_transactions_and_cursor_iteration() {
         // Indexed Database 3 §§2.7.1, 4.1, 4.3–4.5, 4.9, and 5.1/5.6/5.7:
         // an open request upgrades before succeeding; transaction requests and
@@ -20730,6 +20945,33 @@ mod tests {
             string_value(&mut engine, "document.baseURI"),
             "https://example.com/"
         );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_waits_for_async_scripts_but_not_unsettled_module_promises() {
+        let html = r#"<!doctype html><body>
+            <script>
+                window.addEventListener('load', () => document.body.setAttribute('data-load', window.asyncRan));
+            </script>
+            <script async src="data:text/javascript,window.asyncRan='yes'"></script>
+        </body>"#;
+        let (rendered, outcome) =
+            crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(rendered.contains("data-load=\"yes\""), "{rendered}");
+
+        let pending = r#"<!doctype html><body>
+            <script>
+                document.addEventListener('DOMContentLoaded', () => document.body.setAttribute('data-dom', document.readyState));
+                window.addEventListener('load', () => document.body.setAttribute('data-load', 'early'));
+            </script>
+            <script type="module">await new Promise(() => {});</script>
+        </body>"#;
+        let (rendered, outcome) =
+            crate::js::transform(pending, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(rendered.contains("data-dom=\"interactive\""), "{rendered}");
+        assert!(!rendered.contains("data-load="), "{rendered}");
     }
 
     #[test]
