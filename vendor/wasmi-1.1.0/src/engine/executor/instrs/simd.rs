@@ -700,12 +700,13 @@ macro_rules! impl_execute_v128_store_lane_offset16 {
             #[doc = concat!("Executes an [`Op::", stringify!($op), "`] instruction.")]
             pub fn $exec(
                 &mut self,
+                store: &mut StoreInner,
                 ptr: Slot,
                 value: Slot,
                 offset: Offset8,
                 lane: <$ty as IntoLaneIdx>::LaneIdx,
             ) -> Result<(), Error> {
-                self.execute_v128_store_lane_offset8::<$ty>(ptr, value, offset, lane, $eval)
+                self.execute_v128_store_lane_offset8::<$ty>(store, ptr, value, offset, lane, $eval)
             }
         )*
     };
@@ -753,8 +754,15 @@ impl Executor<'_> {
         let offset = Offset64::combine(offset_hi, offset_lo);
         let ptr = self.get_stack_slot_as::<u64>(ptr);
         let v128 = self.get_stack_slot_as::<V128>(value);
-        let memory = self.fetch_memory_bytes_mut(memory, store);
-        eval(memory, ptr, u64::from(offset), v128, lane)?;
+        let memory_bytes = self.fetch_memory_bytes_mut(memory, store);
+        eval(memory_bytes, ptr, u64::from(offset), v128, lane)?;
+        // Core #exec-vstore_lane / JS API #memories: publish exactly the written lane.
+        self.mark_memory_dirty(
+            store,
+            memory,
+            ptr.saturating_add(u64::from(offset)),
+            core::mem::size_of::<T>(),
+        );
         self.try_next_instr_at(3)
     }
 
@@ -767,6 +775,7 @@ impl Executor<'_> {
 
     fn execute_v128_store_lane_offset8<T: IntoLaneIdx>(
         &mut self,
+        store: &mut StoreInner,
         ptr: Slot,
         value: Slot,
         offset: Offset8,
@@ -778,6 +787,12 @@ impl Executor<'_> {
         let v128 = self.get_stack_slot_as::<V128>(value);
         let memory = self.fetch_default_memory_bytes_mut();
         eval(memory, ptr, offset, v128, lane)?;
+        self.mark_memory_dirty(
+            store,
+            index::Memory::from(0),
+            ptr.saturating_add(offset),
+            core::mem::size_of::<T>(),
+        );
         self.try_next_instr()
     }
 
@@ -800,8 +815,14 @@ impl Executor<'_> {
     {
         let (lane, memory) = self.fetch_lane_and_memory::<T::LaneIdx>(1);
         let v128 = self.get_stack_slot_as::<V128>(value);
-        let memory = self.fetch_memory_bytes_mut(memory, store);
-        eval(memory, usize::from(address), v128, lane)?;
+        let memory_bytes = self.fetch_memory_bytes_mut(memory, store);
+        eval(memory_bytes, usize::from(address), v128, lane)?;
+        self.mark_memory_dirty(
+            store,
+            memory,
+            usize::from(address) as u64,
+            core::mem::size_of::<T>(),
+        );
         self.try_next_instr_at(2)
     }
 

@@ -1,17 +1,7 @@
 use crate::{
-    core::UntypedVal,
-    engine::DedupFuncType,
-    instance::InstanceEntity,
-    ir::index,
-    memory::DataSegment,
-    module::DEFAULT_MEMORY_INDEX,
-    store::StoreInner,
-    table::ElementSegment,
-    Func,
-    Global,
-    Instance,
-    Memory,
-    Table,
+    core::UntypedVal, engine::DedupFuncType, instance::InstanceEntity, ir::index,
+    memory::DataSegment, module::DEFAULT_MEMORY_INDEX, store::StoreInner, table::ElementSegment,
+    Func, Global, Instance, Memory, Table,
 };
 use core::ptr::{self, NonNull};
 
@@ -24,6 +14,9 @@ pub struct CachedInstance {
     pub memory: CachedMemory,
     /// The cached value of the global variable at index 0.
     pub global: CachedGlobal,
+    /// The last accessed nonzero global. Zero is the empty-cache sentinel.
+    other_global_index: u32,
+    other_global: CachedGlobal,
 }
 
 impl CachedInstance {
@@ -35,6 +28,8 @@ impl CachedInstance {
             instance,
             memory,
             global,
+            other_global_index: 0,
+            other_global: CachedGlobal::default(),
         }
     }
 
@@ -67,6 +62,36 @@ impl CachedInstance {
     #[inline]
     pub fn update(&mut self, ctx: &mut StoreInner, instance: &Instance) {
         (self.instance, self.memory, self.global) = Self::load_caches(ctx, instance);
+        self.other_global_index = 0;
+        self.other_global = CachedGlobal::default();
+    }
+
+    /// Resolves a global using the same invalidation boundary as the default global.
+    ///
+    /// Core #exec-global.get / #exec-global.set: cache only its address, never its
+    /// value, so aliased globals and mutations by a host callback remain visible.
+    ///
+    /// # Safety
+    ///
+    /// The caches must be fresh and `index` must be a valid global of this instance.
+    #[inline]
+    pub unsafe fn global_at(
+        &mut self,
+        ctx: &mut StoreInner,
+        index: index::Global,
+    ) -> &mut CachedGlobal {
+        let index = u32::from(index);
+        if index == 0 {
+            return &mut self.global;
+        }
+        if self.other_global_index != index {
+            let global = unsafe { self.as_ref() }
+                .get_global(index)
+                .expect("validated global index");
+            self.other_global = CachedGlobal::new(ctx, &global);
+            self.other_global_index = index;
+        }
+        &mut self.other_global
     }
 
     /// Returns a shared reference to the cached [`InstanceEntity`].
@@ -135,17 +160,6 @@ impl CachedInstance {
     pub unsafe fn get_table(&self, index: index::Table) -> Option<Table> {
         let instance = unsafe { self.as_ref() };
         instance.get_table(u32::from(index))
-    }
-
-    /// Returns the [`Global`] at the `index` if any.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to use this method only when the caches are fresh.
-    #[inline]
-    pub unsafe fn get_global(&self, index: index::Global) -> Option<Global> {
-        let instance = unsafe { self.as_ref() };
-        instance.get_global(u32::from(index))
     }
 
     /// Returns the [`DataSegment`] at the `index` if any.
@@ -271,6 +285,16 @@ impl Default for CachedGlobal {
 }
 
 impl CachedGlobal {
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut UntypedVal {
+        self.data
+    }
+
     /// Create a new [`CachedGlobal`].
     #[inline]
     fn new(ctx: &mut StoreInner, global: &Global) -> Self {

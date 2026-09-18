@@ -28,6 +28,38 @@ comment/example in the same change.
 
 ## Quick-start commands
 
+Compare native WebAssembly execution against the interpreter with the same
+release artifact: `TRUST_WASM_NATIVE_JIT=0` (or `false`) disables the optional
+native compiler. It is enabled by default on little-endian AArch64 and x86-64;
+unsupported instructions and fuel-metered engines use the interpreter.
+`WASMI_JIT_TRACE=1` reports compiled instruction counts, native code sizes, and
+compilation times. The per-engine cache accepts at most 128 native regions of
+256 Wasmi instruction words each and 2,048 candidate addresses. Native code
+allocations are released when the engine and its active calls are dropped.
+
+The deterministic `src/fixtures/wasm_native_benchmark.html` fixture reports
+execution time and checks its result. Compare both modes without competing
+builds; repeat measurements because process RSS includes allocator and browser
+variation. On Linux, `/usr/bin/time -v` reports peak RSS:
+
+```sh
+cargo build --release
+TRUST_WASM_NATIVE_JIT=0 /usr/bin/time -v target/release/trust-headless --settle 3 "file://$PWD/src/fixtures/wasm_native_benchmark.html"
+TRUST_WASM_NATIVE_JIT=1 /usr/bin/time -v target/release/trust-headless --settle 3 "file://$PWD/src/fixtures/wasm_native_benchmark.html"
+stat -c '%s bytes' target/release/trust
+```
+
+Run the owned Wasmi compiler regressions, including interpreter comparisons,
+with its local dependency patches:
+
+```sh
+cargo test --manifest-path vendor/wasmi-1.1.0/Cargo.toml \
+  --target-dir target/wasmi-tests --features simd,native-jit \
+  --config "patch.crates-io.wasmi_core.path='$PWD/vendor/wasmi_core-1.1.0'" \
+  --config "patch.crates-io.wasmi_ir.path='$PWD/vendor/wasmi_ir-1.1.0'" \
+  --config "patch.crates-io.wasmi_collections.path='$PWD/vendor/wasmi_collections-1.1.0'"
+```
+
 Trace a normal Lumen page load and its network requests:
 
 ```sh

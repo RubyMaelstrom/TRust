@@ -10,8 +10,7 @@ use core::{
     fmt::{self, Debug},
     mem::{self, MaybeUninit},
     ops::Range,
-    ptr,
-    slice,
+    ptr, slice,
 };
 
 #[cfg(doc)]
@@ -402,6 +401,16 @@ impl Debug for FrameSlots {
 }
 
 impl FrameSlots {
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut UntypedVal {
+        self.ptr
+    }
+
     /// Creates a new [`FrameSlots`].
     fn new(ptr: *mut UntypedVal) -> Self {
         Self { ptr }

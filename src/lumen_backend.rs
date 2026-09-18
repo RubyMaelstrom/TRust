@@ -13497,6 +13497,218 @@ mod tests {
     }
 
     #[test]
+    fn webassembly_global_addresses_follow_host_growth_aliases_and_instance_switches() {
+        // Core #exec-global.get / #exec-global.set and JS API #globals identify
+        // one mutable global instance even across host calls and module aliases.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"(module
+                    (import "env" "hook" (func $hook))
+                    (import "env" "other" (func $other (result i32)))
+                    (import "env" "dummy" (global (mut i32)))
+                    (import "env" "state" (global $state (mut i32)))
+                    (global $alternate (mut i32) (i32.const 100))
+                    (export "state" (global $state))
+                    (func (export "read") (result i32) global.get $state)
+                    (func (export "set") (param i32) local.get 0 global.set $state)
+                    (func (export "touch") (result i32)
+                        global.get $state i32.const 1 i32.add global.set $state global.get $state)
+                    (func (export "mixed") (result i32)
+                        global.get $state global.get $alternate i32.add global.get $state i32.add)
+                    (func (export "host") (result i32)
+                        global.get $state drop call $hook global.get $state)
+                    (func (export "cross") (param i32) (result i32)
+                        local.get 0 global.set $state global.get $state drop
+                        call $other drop global.get $state))"#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                const module = new WebAssembly.Module(wasmFixture);
+                const makeGlobal = value => new WebAssembly.Global({value:'i32', mutable:true}, value);
+                const shared = makeGlobal(7), kept = [];
+                const second = new WebAssembly.Instance(module, {env:{
+                    dummy:makeGlobal(0), state:makeGlobal(80), hook(){}, other(){return 0;}
+                }}).exports;
+                const first = new WebAssembly.Instance(module, {env:{
+                    dummy:makeGlobal(0), state:shared, other:second.touch,
+                    hook(){
+                        shared.value = 41;
+                        for (let i=0;i<256;i++) kept.push(makeGlobal(i));
+                        second.state.value = 89;
+                    }
+                }}).exports;
+                const alias = new WebAssembly.Instance(module, {env:{
+                    dummy:makeGlobal(0), state:shared, other:first.touch, hook(){}
+                }}).exports;
+                const results = [first.cross(23), second.read(), first.host(), first.mixed(),
+                    first.cross(99), second.read(), first.state === alias.state];
+                alias.set(51); results.push(first.read(), alias.mixed());
+                globalThis.globalAddressResult = results.join('|');
+            "#,
+                "global storage identity across cache invalidation boundaries",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "globalAddressResult"),
+                "23|81|41|182|99|90|true|51|202",
+                "tier {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_packed_stores_publish_their_exact_byte_width() {
+        // Core #exec-store-pack writes N/8 bytes, independent of the operand's
+        // i32/i64 width; JS API #memories identifies those bytes with Memory.buffer.
+        // Official WebAssembly snapshot 37d6b059 (2026-09-06).
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            for (ty, width) in [("i32", 1), ("i32", 2), ("i64", 1), ("i64", 2), ("i64", 4)] {
+                let mut engine = platform_engine();
+                engine.set_tier(tier);
+                let end = 131072 - width;
+                let op = format!("{ty}.store{}", width * 8);
+                install_wasm_test_fixture(
+                    &mut engine,
+                    &format!(
+                        r#"(module
+                            (import "env" "observe" (func $observe))
+                            (memory (export "memory") 2)
+                            (func (export "atValue") (param {ty})
+                                i32.const {end} local.get 0 {op})
+                            (func (export "atImmediate")
+                                i32.const {end} {ty}.const 4660 {op})
+                            (func (export "offsetValue") (param i32 {ty})
+                                local.get 0 local.get 1 {op} offset=3)
+                            (func (export "offsetImmediate") (param i32)
+                                local.get 0 {ty}.const 4660 {op} offset=3)
+                            (func (export "largeOffsetValue") (param i32 {ty})
+                                local.get 0 local.get 1 {op} offset=65536)
+                            (func (export "largeOffsetImmediate") (param i32)
+                                local.get 0 {ty}.const 4660 {op} offset=65536)
+                            (func (export "observe")
+                                i32.const {end} {ty}.const 4660 {op} call $observe)
+                            (func (export "trapAfter")
+                                i32.const {end} {ty}.const 4660 {op} unreachable)
+                            (func (export "outOfBounds") (param i32)
+                                local.get 0 {ty}.const 4660 {op}))"#
+                    ),
+                );
+                let value = if ty == "i64" {
+                    "305419896n"
+                } else {
+                    "305419896"
+                };
+                eval(
+                    &mut engine,
+                    &format!(
+                        r#"
+                        let bytes, observed;
+                        const width = {width}, end = {end};
+                        const exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {{
+                            env: {{ observe() {{ observed = Array.from(bytes.slice(end)).join(','); }} }}
+                        }}).exports;
+                        bytes = new Uint8Array(exports.memory.buffer);
+                        const immediate = [52,18,0,0].slice(0,width).join(',');
+                        const variable = [120,86,52,18].slice(0,width).join(',');
+                        const cases = [
+                            ['atValue',[{value}],variable], ['atImmediate',[],immediate],
+                            ['offsetValue',[end-3,{value}],variable], ['offsetImmediate',[end-3],immediate],
+                            ['largeOffsetValue',[end-65536,{value}],variable],
+                            ['largeOffsetImmediate',[end-65536],immediate],
+                            ['observe',[],immediate], ['trapAfter',[],immediate],
+                            ['outOfBounds',[end+1],[0,0,0,0].slice(0,width).join(',')]
+                        ];
+                        for (const [name,args,expected] of cases) {{
+                            bytes.fill(0); observed = null;
+                            let trapped = false;
+                            try {{ exports[name](...args); }}
+                            catch (e) {{ if (!(e instanceof WebAssembly.RuntimeError)) throw e; trapped = true; }}
+                            const actual = Array.from(bytes.slice(end)).join(',');
+                            if (actual !== expected || bytes[end-1] !== 0 ||
+                                trapped !== (name === 'trapAfter' || name === 'outOfBounds') ||
+                                (name === 'observe' && observed !== expected))
+                                throw new Error(name + ': expected ' + expected + ', got ' + actual);
+                        }}
+                    "#
+                    ),
+                    "packed store bytes at the end of linear memory",
+                )
+                .unwrap_or_else(|error| panic!("{tier:?} {op}: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn webassembly_simd_lane_stores_publish_memory_effects() {
+        // Core #exec-vstore_lane writes the selected lane's N/8 bytes. Every
+        // successful store must reach Memory.buffer, including before a trap.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            for width in [1, 2, 4, 8] {
+                let mut engine = platform_engine();
+                engine.set_tier(tier);
+                let end = 131072 - width;
+                let op = format!("v128.store{}_lane", width * 8);
+                install_wasm_test_fixture(
+                    &mut engine,
+                    &format!(
+                        r#"(module
+                            (import "env" "observe" (func $observe))
+                            (memory (export "memory") 2)
+                            (global $vector (mut v128)
+                                (v128.const i8x16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))
+                            (func (export "at")
+                                i32.const {end} global.get $vector {op} 0)
+                            (func (export "offset") (param i32)
+                                local.get 0 global.get $vector {op} offset=3 0)
+                            (func (export "largeOffset") (param i32)
+                                local.get 0 global.get $vector {op} offset=65536 0)
+                            (func (export "observe")
+                                i32.const {end} global.get $vector {op} 0 call $observe)
+                            (func (export "trapAfter")
+                                i32.const {end} global.get $vector {op} 0 unreachable)
+                            (func (export "outOfBounds") (param i32)
+                                local.get 0 global.get $vector {op} 0))"#
+                    ),
+                );
+                eval(
+                    &mut engine,
+                    &format!(
+                        r#"
+                        let bytes, observed;
+                        const width = {width}, end = {end};
+                        const exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {{
+                            env: {{ observe() {{ observed = Array.from(bytes.slice(end)).join(','); }} }}
+                        }}).exports;
+                        bytes = new Uint8Array(exports.memory.buffer);
+                        const written = [1,2,3,4,5,6,7,8].slice(0,width).join(',');
+                        for (const [name,args] of [['at',[]],['offset',[end-3]],
+                            ['largeOffset',[end-65536]],['observe',[]],['trapAfter',[]],
+                            ['outOfBounds',[end+1]]]) {{
+                            bytes.fill(0); observed = null;
+                            let trapped = false;
+                            try {{ exports[name](...args); }}
+                            catch (e) {{ if (!(e instanceof WebAssembly.RuntimeError)) throw e; trapped = true; }}
+                            const expected = name === 'outOfBounds' ? new Array(width).fill(0).join(',') : written;
+                            const actual = Array.from(bytes.slice(end)).join(',');
+                            if (actual !== expected || bytes[end-1] !== 0 ||
+                                trapped !== (name === 'trapAfter' || name === 'outOfBounds') ||
+                                (name === 'observe' && observed !== expected))
+                                throw new Error(name + ': expected ' + expected + ', got ' + actual);
+                        }}
+                    "#
+                    ),
+                    "SIMD lane bytes at the end of linear memory",
+                )
+                .unwrap_or_else(|error| panic!("{tier:?} {op}: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
     fn webassembly_traps_publish_memory_effects() {
         // JS API §4.1 and §5.6 call steps 8–10: update the store before reporting
         // the trap, including when a host callback re-enters a Wasm export.

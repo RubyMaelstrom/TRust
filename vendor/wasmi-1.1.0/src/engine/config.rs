@@ -13,6 +13,8 @@ pub struct Config {
     features: WasmFeatures,
     /// Is `true` if Wasmi executions shall consume fuel.
     consume_fuel: bool,
+    /// Whether the optional native compiler may accelerate hot instruction regions.
+    native_jit: bool,
     /// Is `true` if Wasmi shall ignore Wasm custom sections when parsing Wasm modules.
     ignore_custom_sections: bool,
     /// The configured fuel costs of all Wasmi bytecode instructions.
@@ -46,6 +48,7 @@ impl Default for Config {
             stack: StackConfig::default(),
             features: Self::default_features(),
             consume_fuel: false,
+            native_jit: cfg!(feature = "native-jit"),
             ignore_custom_sections: false,
             fuel_costs: FuelCostsProvider::default(),
             compilation_mode: CompilationMode::default(),
@@ -55,6 +58,25 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Enables native compilation of hot regions on supported hosts.
+    ///
+    /// Requires the `native-jit` Cargo feature. Fuel-metered engines always use
+    /// the interpreter, preserving their exact accounting and resumability.
+    pub fn native_jit(&mut self, enabled: bool) -> &mut Self {
+        self.native_jit = enabled;
+        self
+    }
+
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn native_jit_enabled(&self) -> bool {
+        self.native_jit && !self.consume_fuel
+    }
+
     /// Returns the default [`WasmFeatures`].
     fn default_features() -> WasmFeatures {
         let mut features = WasmFeatures::empty();

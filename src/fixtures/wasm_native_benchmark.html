@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebAssembly execution benchmark</title>
+<pre id="result">Starting</pre>
+<!--
+Deterministic integer and packed-memory loop. Compare the same release browser
+with TRUST_WASM_NATIVE_JIT=0 and =1; the checksum must remain 128.
+The embedded module is generated from:
+(module
+  (memory (export "memory") 2)
+  (func (export "run") (param $n i32) (param $v i32) (result i32)
+    (local $p i32)
+    (loop $again
+      local.get $n i32.const 65535 i32.and local.set $p
+      local.get $p local.get $v i32.store8
+      local.get $p i32.load8_u local.get $n i32.xor
+      i32.const 7 i32.rotl local.set $v
+      local.get $n i32.const 1 i32.sub local.tee $n br_if $again)
+    local.get $v))
+-->
+<script>
+const module = new WebAssembly.Module(Uint8Array.from(atob("AGFzbQEAAAABBwFgAn9/AX8DAgEABQMBAAIHEAIGbWVtb3J5AgADcnVuAAAKMQEvAQF/A0AgAEH//wNxIQIgAiABOgAAIAItAAAgAHNBB3chASAAQQFrIgANAAsgAQsAHwRuYW1lAgwBAAMAAW4BAXYCAXADCgEAAQAFYWdhaW4="), c => c.charCodeAt(0)));
+const instance = new WebAssembly.Instance(module);
+const start = performance.now();
+const checksum = instance.exports.run(20000000, 12345);
+const elapsed = performance.now() - start;
+const result = document.getElementById('result');
+result.textContent = (checksum === 128 ? 'PASS' : 'FAIL') +
+    ' wasm-native-bench result=' + checksum + ' elapsed=' + elapsed + 'ms';
+// Leave a short idle interval for observing retained process memory.
+setTimeout(() => result.textContent += ' retained=ok', 2500);
+</script>

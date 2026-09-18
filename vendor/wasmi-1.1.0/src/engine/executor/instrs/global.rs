@@ -1,6 +1,6 @@
 use super::Executor;
 use crate::{
-    core::{hint, UntypedVal},
+    core::UntypedVal,
     ir::{index, Const16, Slot},
     store::StoreInner,
 };
@@ -10,15 +10,14 @@ use crate::ir::Op;
 
 impl Executor<'_> {
     /// Executes an [`Op::GlobalGet`].
-    pub fn execute_global_get(&mut self, store: &StoreInner, result: Slot, global: index::Global) {
-        let value = match u32::from(global) {
-            0 => unsafe { self.cache.global.get() },
-            _ => {
-                hint::cold();
-                let global = self.get_global(global);
-                *store.resolve_global(&global).get_untyped()
-            }
-        };
+    pub fn execute_global_get(
+        &mut self,
+        store: &mut StoreInner,
+        result: Slot,
+        global: index::Global,
+    ) {
+        // The executor refreshes its caches after host calls and instance switches.
+        let value = unsafe { self.cache.global_at(store, global).get() };
         self.set_stack_slot(result, value);
         self.next_instr()
     }
@@ -63,20 +62,9 @@ impl Executor<'_> {
         global: index::Global,
         new_value: UntypedVal,
     ) {
-        match u32::from(global) {
-            0 => unsafe { self.cache.global.set(new_value) },
-            _ => {
-                hint::cold();
-                let global = self.get_global(global);
-                let mut ptr = store.resolve_global_mut(&global).get_untyped_ptr();
-                // Safety:
-                // - Wasmi translation won't create `global.set` instructions for immutable globals.
-                // - Wasm validation ensures that values with matching types are written to globals.
-                unsafe {
-                    *ptr.as_mut() = new_value;
-                }
-            }
-        };
+        // Validation guarantees a mutable global of the matching type. Cache
+        // invalidation is identical to the existing global-zero optimization.
+        unsafe { self.cache.global_at(store, global).set(new_value) };
         self.next_instr()
     }
 }

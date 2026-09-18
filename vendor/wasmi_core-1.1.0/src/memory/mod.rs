@@ -297,6 +297,7 @@ impl Memory {
     }
 
     /// Records a write to linear memory, rounded to memory pages for efficient mirror updates.
+    #[inline]
     pub fn mark_dirty_range(&mut self, start: usize, len: usize) {
         let Some(end) = start.checked_add(len) else {
             return;
@@ -304,6 +305,25 @@ impl Memory {
         if len == 0 || start >= self.bytes.len() || end > self.bytes.len() {
             return;
         }
+        self.data_version = self.data_version.wrapping_add(1);
+        // WebAssembly JS API §4.1 identifies Memory.buffer with the store's Data Block.
+        // Repeated writes still advance the generation, but an already-covered span
+        // needs no rounding or Vec removal/insertion. This is the hot path for Wasm
+        // loops rewriting stack slots between calls into JavaScript.
+        if self
+            .dirty_ranges
+            .last()
+            .is_some_and(|range| range.start <= start && end <= range.end)
+        {
+            return;
+        }
+        self.insert_dirty_range(start, end);
+    }
+
+    // Keep the range-merging slow path out of each interpreted store instruction.
+    // Most writes are already covered until the next JS/wasm synchronization.
+    #[inline(never)]
+    fn insert_dirty_range(&mut self, start: usize, end: usize) {
         let page_size = self.memory_type.page_size() as usize;
         let mut start = start / page_size * page_size;
         let mut end = end
@@ -327,7 +347,6 @@ impl Memory {
             self.dirty_ranges.remove(index);
         }
         self.dirty_ranges.insert(index, start..end);
-        self.data_version = self.data_version.wrapping_add(1);
     }
 
     /// Takes the page-aligned ranges written since the previous call.

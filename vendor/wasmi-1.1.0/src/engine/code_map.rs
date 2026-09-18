@@ -13,9 +13,7 @@ use crate::{
     errors::FuelError,
     ir::{index::InternalFunc, Op},
     module::{FuncIdx, ModuleHeader},
-    Config,
-    Error,
-    TrapCode,
+    Config, Error, TrapCode,
 };
 use alloc::boxed::Box;
 use core::{
@@ -74,6 +72,13 @@ impl ArenaIndex for EngineFunc {
 pub struct CodeMap {
     funcs: Mutex<Arena<EngineFunc, FuncEntity>>,
     features: WasmFeatures,
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    pub(super) native_jit: super::native_jit::NativeJit,
 }
 
 /// A range of [`EngineFunc`]s with contiguous indices.
@@ -216,6 +221,13 @@ impl CodeMap {
         Self {
             funcs: Mutex::new(Arena::default()),
             features: config.wasm_features(),
+            #[cfg(all(
+                feature = "native-jit",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                target_endian = "little",
+                target_pointer_width = "64"
+            ))]
+            native_jit: super::native_jit::NativeJit::new(config.native_jit_enabled()),
         }
     }
 
@@ -324,6 +336,33 @@ impl CodeMap {
         };
         let cref = entity.get_compiled()?;
         Some(self.adjust_cref_lifetime(cref))
+    }
+
+    /// Locates a validated instruction and its containing, pinned function.
+    /// This linear lookup is only used when compiling a new hot region.
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    pub(super) fn function_at(&self, address: usize) -> Option<(&[Op], usize)> {
+        let funcs = self.funcs.lock();
+        for (_, entity) in funcs.iter() {
+            let Some(cref) = entity.get_compiled() else {
+                continue;
+            };
+            let instrs = self.adjust_cref_lifetime(cref).instrs();
+            let start = instrs.as_ptr() as usize;
+            let end = start + core::mem::size_of_val(instrs);
+            if (start..end).contains(&address) {
+                let offset = address - start;
+                if offset % core::mem::size_of::<Op>() == 0 {
+                    return Some((instrs, offset / core::mem::size_of::<Op>()));
+                }
+            }
+        }
+        None
     }
 
     /// Returns the [`UncompiledFuncEntity`] of `func` if possible, otherwise returns `None`.
