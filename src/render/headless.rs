@@ -1143,7 +1143,7 @@ mod tests {
             page_scroll_containers: Vec::new(),
             page_size: CssSize::default(),
         };
-        scene.append_page(&paint, CssPoint::default());
+        scene.append_page(paint, CssPoint::default());
         let started = Instant::now();
         let mut cpu = VelloCpuRenderer::new();
         for _ in 0..iterations {

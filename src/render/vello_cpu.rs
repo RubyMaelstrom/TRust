@@ -1261,8 +1261,8 @@ mod tests {
             eager.eager_clips = true;
             let actual = deferred.render_rgba(&scene).unwrap();
             assert_eq!(actual.pixels, eager.render_rgba(&scene).unwrap().pixels);
-            assert!(actual.pixels.chunks_exact(4).any(|p| p[0] > p[1]));
-            assert!(actual.pixels.chunks_exact(4).any(|p| p == [0, 0, 240, 255]));
+            assert!(actual.pixels.as_chunks::<4>().0.iter().any(|p| p[0] > p[1]));
+            assert!(actual.pixels.as_chunks::<4>().0.contains(&[0, 0, 240, 255]));
             assert_eq!(deferred.rasterized_clips, 2);
         }
     }
