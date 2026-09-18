@@ -1151,7 +1151,7 @@ impl Canvas {
 
 // CSS Color 4 color-conversion algorithm, relative-colorimetric; all four
 // predefined canvas spaces use D65. Linear P3 shares the sRGB transfer curve.
-fn convert(mut rgb: [f32; 3], source: u8, destination: u8) -> [f32; 3] {
+pub(crate) fn convert(mut rgb: [f32; 3], source: u8, destination: u8) -> [f32; 3] {
     if source == destination {
         return rgb;
     }

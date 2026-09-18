@@ -112,5 +112,24 @@
     const buffer = new Uint8Array([3,4]).buffer;
     const bufferCopy = structuredClone({buffer}, {transfer:[buffer]});
     assert(buffer.byteLength === 0 && new Uint8Array(bufferCopy.buffer).join() === '3,4', 'buffer transfer detaches');
+    const lateBuffer = new Uint8Array([1]).buffer;
+    const lateCopy = structuredClone({buffer:lateBuffer, get mutate() {
+        new Uint8Array(lateBuffer)[0] = 9; return true;
+    }}, {transfer:[lateBuffer]});
+    assert(new Uint8Array(lateCopy.buffer)[0] === 9, 'transfer takes bytes after graph serialization');
+    const closed = new MessageChannel().port1;
+    closed.close();
+    let visited = false, closedError = false;
+    try { structuredClone({get value() { visited = true; }}, {transfer:[closed]}); }
+    catch (e) { closedError = e.name === 'DataCloneError'; }
+    assert(visited && closedError, 'detached transfer rejected after graph serialization');
+    const moving = new MessageChannel();
+    let moved, delivered;
+    moving.port2.onmessage = e => delivered = e.data.value;
+    moving.port1.postMessage({get value() {
+        moved = structuredClone(moving.port1, {transfer:[moving.port1]}); return 17;
+    }});
+    while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+    assert(delivered === 17 && moved instanceof MessagePort, 'target captured before getter transfers source');
     return 'window-messages-ok';
 })()

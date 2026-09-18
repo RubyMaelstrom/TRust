@@ -743,7 +743,6 @@
         discardTasks(domTasks);
         discardTasks(intersectionTasks);
         discardTasks(messageTasks);
-        discardTasks(portMessages);
         for (let i = MO.length - 1; i >= 0; i--) {
             if (MO[i].__windowState === state) MO.splice(i, 1);
         }
@@ -5386,7 +5385,9 @@
             canvasOwner(this);
             const count = arguments.length >= 9 ? 8 : arguments.length >= 5 ? 4 : 2;
             const imageRequest = imageState(image);
-            if (!(image instanceof HTMLCanvasElement) && !(image instanceof HTMLImageElement) && !imageRequest) throw new TypeError("Invalid canvas image source");
+            const bitmap = bitmapAPI.state(image);
+            if (bitmap && bitmap.detached) throw new DOMException("Detached ImageBitmap", "InvalidStateError");
+            if (!(image instanceof HTMLCanvasElement) && !(image instanceof HTMLImageElement) && !imageRequest && !bitmap) throw new TypeError("Invalid canvas image source");
             const n = canvasNumbers(Array.prototype.slice.call(arguments,1),count);
             if (!n.every(Number.isFinite)) return;
             if (image instanceof HTMLCanvasElement) {
@@ -5395,7 +5396,7 @@
             }
             if (imageRequest && imageRequest.broken) throw new DOMException("Broken image", "InvalidStateError");
             if (imageRequest && !imageRequest.current) return;
-            n.unshift(image.__id); canvasCall(this,"draw",n,imageRequest ? imageRequest.current : undefined);
+            n.unshift(bitmap ? 0 : image.__id); canvasCall(this,"draw",n,bitmap ? bitmap.record : imageRequest ? imageRequest.current : undefined);
         }
         measureText(text) {
             canvasOwner(this);
@@ -11856,7 +11857,7 @@
         if (cfg.frameTrace) ftrace("postMessage send from=" + sender.origin + " to=" + receiver.origin +
             " target=" + String(targetOrigin) + " bytes=" + wire.length + " ports=" + ports.length +
             " source-frame=" + sender.frameId + " receiver-frame=" + receiver.frameId + " event=" + messageKind);
-        receiver.enqueue(wire, sender.origin, sender.sourceFor(receiver.window), ports, targetOrigin);
+        receiver.enqueue(wire, sender.origin, sender.sourceFor(receiver.window), ports, targetOrigin, packet.buffers);
     });
     windowMessageSlots = messaging[0];
     g.postMessage = messaging[1];
@@ -11873,7 +11874,7 @@
             return realmRootFrame && receiver === cfg.parentWindow ? realmRootFrame.contentWindow : g;
         },
         serialize(value, transfer) { return serializeMessage(value, transfer); },
-        enqueue(wire, origin, source, ports, targetOrigin) {
+        enqueue(wire, origin, source, ports, targetOrigin, buffers) {
             const frame = trust.__activeFrame || null;
             __queue_message_task(function () {
                 if (cfg.frameTrace) ftrace("postMessage deliver from=" + origin + " to=" + messageWindowState.origin +
@@ -11882,7 +11883,7 @@
                     " realm=" + (realmRootFrame ? realmRootFrame.__id : 0));
                 if (targetOrigin !== "*" && targetOrigin !== messageWindowState.originKey) return;
                 let packet;
-                try { packet = deserializeMessage({ wire, ports }); }
+                try { packet = deserializeMessage({ wire, ports, buffers }); }
                 catch (_) {
                     dispatch(g, createTrustedEvent(MessageEvent, "messageerror", { origin, source }), false);
                     return;
@@ -12220,6 +12221,7 @@
         }
     };
     const domTasks = [];
+    const bitmapTasks = [];
     const __queue_dom_task = function (fn, frame) {
         if (typeof fn === "function") {
             frame = frame === undefined ? (trust.__activeFrame || null) : frame;
@@ -13525,6 +13527,7 @@
     // so many in-flight fetches overlap and Promise.all runs them in
     // parallel. The promise settles when the bytes arrive. Only legacy
     // synchronous XHR still blocks (via the __http_fetch syscall).
+    /*__HEADERS_BEGIN__*/
     class Headers {
         constructor(init) {
             // Null-proto: header names are arbitrary strings, and a plain {}
@@ -13567,6 +13570,7 @@
         get [Symbol.toStringTag]() { return "Headers"; }
     }
     g.Headers = Headers;
+    /*__HEADERS_END__*/
     // The wire body for a request/response: the platform accepts strings,
     // URLSearchParams, Blob/File, and ArrayBuffer views; our syscall takes a
     // string, so flatten to one. Unknown objects stringify (no multipart and no
@@ -15336,185 +15340,199 @@
         abort(reason) { this.signal.__abort(reason); }
     };
 
-    // HTML §9.4: MessagePort owns a port-message TASK SOURCE. It is deliberately
-    // separate from the timer queue: React's scheduler uses MessageChannel to
-    // yield between units of work, and treating each post as setTimeout(0)
-    // incorrectly applies timer cadence/clamping to runnable message tasks.
-    const portMessages = [];
-    const portToken = {};
-    const transferBuffer = ArrayBuffer.prototype.transfer;
-    const bufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
-    function portState(value) {
-        if (!windowMessageSlots) return undefined;
-        const slot = messageApply(messageWeakGet, windowMessageSlots, [value]);
-        return slot && slot.messagePort;
-    }
-    function requirePort(value) {
-        const state = portState(value);
-        if (!state) throw new TypeError("Illegal MessagePort invocation");
-        return state;
-    }
-    function portEndpoint(port) {
-        return { port, other: null, enabled: false, queue: portMessages,
-            frame: realmRootFrame, windowState: topWindowState };
-    }
-    // HTML §9.4.4 / #transferMessagePort: endpoint/queue ownership is private
-    // and separate from the realm-specific JS object. A transfer leaves the
-    // sender detached; queued messages follow the endpoint into the receiver.
-    function receivePort(endpoint) {
-        const port = new MessagePort(portToken);
-        const state = requirePort(port);
-        const oldQueue = endpoint.queue;
-        const pending = [];
-        for (let i = oldQueue.length - 1; i >= 0; i--) {
-            if (oldQueue[i].endpoint === endpoint) pending.unshift(oldQueue.splice(i, 1)[0]);
+    // Window and Worker use the same HTML port/transfer implementation.
+    g.__port_adapter = {
+        slots: windowMessageSlots, EventTarget,
+        add: addL, remove: removeL,
+        deliver(target, type, init) {
+            runInFrame(realmRootFrame, () => dispatch(target, createTrustedEvent(MessageEvent, type, init), false));
         }
-        state.endpoint = endpoint;
-        endpoint.port = port; endpoint.enabled = false; endpoint.queue = portMessages;
-        endpoint.frame = realmRootFrame; endpoint.windowState = topWindowState;
-        for (const task of pending) {
-            task.windowState = topWindowState;
-            portMessages.push(task);
-        }
-        return port;
-    }
-    function transferSequence(transfer) {
-        if (transfer === undefined) return [];
-        if (transfer === null || typeof transfer[Symbol.iterator] !== "function")
-            throw new TypeError("Transfer list must be a sequence");
-        return Array.from(transfer);
-    }
-    function serializeMessage(value, transfer, sourcePort) {
-        const list = transferSequence(transfer), seen = new Set(), records = [], portIndices = new Map();
-        for (const item of list) {
-            if (seen.has(item) || item === sourcePort)
-                throw new DOMException("Duplicate or source port in transfer list", "DataCloneError");
-            seen.add(item);
-            const state = portState(item);
-            if (state) {
-                if (state.detached) throw new DOMException("MessagePort is detached", "DataCloneError");
-                portIndices.set(item, portIndices.size);
-                records.push({ item, state });
-            } else {
-                try { messageApply(bufferByteLength, item, []); new Uint8Array(item, 0, 0); }
-                catch (_) { throw new DOMException("Object is not transferable", "DataCloneError"); }
-                records.push({ item });
-            }
-        }
-        // All graph serialization (including getters) must succeed before any
-        // transfer detaches a source object.
-        const wire = messageSerialize(value, false, portIndices);
-        const ports = [];
-        for (const record of records) {
-            if (record.state) {
-                const state = record.state;
-                if (state.detached) throw new DOMException("MessagePort is detached", "DataCloneError");
-                ports.push(state.endpoint);
-                state.endpoint.port = null;
-                state.endpoint = portEndpoint(record.item);
-                state.detached = true;
-            } else {
-                try { messageApply(transferBuffer, record.item, []); }
-                catch (_) { throw new DOMException("ArrayBuffer cannot be transferred", "DataCloneError"); }
-            }
-        }
-        return { wire, ports };
-    }
-    function deserializeMessage(packet) {
-        const ports = Array.from(packet.ports, receivePort);
-        return { data: messageDeserialize(packet.wire, ports), ports };
-    }
-    class MessagePort extends EventTarget {
-        constructor(token) {
-            super();
-            if (token !== portToken) throw new TypeError("Illegal constructor");
-            messageApply(messageWeakSet, windowMessageSlots, [this, { messagePort: {
-                endpoint: portEndpoint(this), detached: false, onmessage: null, onmessageerror: null
-            } }]);
-        }
-        get onmessage() { return requirePort(this).onmessage; }
-        set onmessage(handler) {
-            const state = requirePort(this);
-            if (state.onmessage) removeL(this, "message", state.onmessage);
-            state.onmessage = typeof handler === "function" ? handler : null;
-            if (state.onmessage) addL(this, "message", state.onmessage);
-            // Setting onmessage enables the port message queue as if start()
-            // had been called (HTML §9.4.4).
-            this.start();
-        }
-        get onmessageerror() { return requirePort(this).onmessageerror; }
-        set onmessageerror(handler) {
-            const state = requirePort(this);
-            if (state.onmessageerror) removeL(this, "messageerror", state.onmessageerror);
-            state.onmessageerror = typeof handler === "function" ? handler : null;
-            if (state.onmessageerror) addL(this, "messageerror", state.onmessageerror);
-        }
-        postMessage(data, options) {
-            const state = requirePort(this), other = state.endpoint.other;
-            const transfer = options != null && typeof options[Symbol.iterator] === "function"
-                ? options : options && options.transfer;
-            const packet = serializeMessage(data, transfer, this);
-            if (cfg.frameTrace) ftrace("MessagePort send realm=" + (realmRootFrame ? realmRootFrame.__id : 0) +
-                " bytes=" + packet.wire.length + " entangled=" + !!other +
-                " enabled=" + !!(other && other.enabled));
-            if (!other || packet.ports.includes(other)) return;
-            other.queue.push({ endpoint: other, packet, windowState: other.windowState });
-        }
-        start() {
-            requirePort(this).endpoint.enabled = true;
-            if (cfg.frameTrace) ftrace("MessagePort start realm=" + (realmRootFrame ? realmRootFrame.__id : 0));
-        }
-        close() {
-            const state = requirePort(this), endpoint = state.endpoint;
-            state.detached = true;
-            if (endpoint.other) endpoint.other.other = null;
-            endpoint.other = null;
-        }
-        get [Symbol.toStringTag]() { return "MessagePort"; }
-    }
-    class MessageChannel {
-        constructor() {
-            this.port1 = new MessagePort(portToken); this.port2 = new MessagePort(portToken);
-            const a = requirePort(this.port1).endpoint, b = requirePort(this.port2).endpoint;
-            a.other = b; b.other = a;
-        }
-    }
-    g.MessagePort = MessagePort; g.MessageChannel = MessageChannel;
-    // WHATWG XHR §3.5.6 invokes response processing from Fetch's networking
-    // task. It is deliberately not an author timer: replacing/clearing
-    // setTimeout must not cancel readystatechange/load/loadend.
-    trust.hasPortMessageTask = function () {
-        for (const task of portMessages) {
-            if (task.endpoint.port && task.endpoint.enabled) return true;
-        }
-        return false;
     };
-    trust.runPortMessageTask = function () {
-        let index = -1;
-        for (let i = 0; i < portMessages.length; i++) {
-            const endpoint = portMessages[i].endpoint;
-            if (endpoint.port && endpoint.enabled) { index = i; break; }
+    /*__PORTS_BEGIN__*/
+    (function (g) {
+        const adapter = g.__port_adapter;
+        delete g.__port_adapter;
+        const binding = g.__message_port_binding;
+        delete g.__message_port_binding;
+        const apply = Reflect.apply, weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+        const parse = JSON.parse, stringify = JSON.stringify;
+        const token = {}, portsById = new Map();
+        const transferBuffer = ArrayBuffer.prototype.transfer;
+        const bufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+        let encode, decode, bitmapCodec;
+        function native(op, id, payload) { return parse(binding(op, id, payload)); }
+        function state(value) {
+            const slot = apply(weakGet, adapter.slots, [value]);
+            return slot && slot.messagePort;
         }
-        if (index < 0) return false;
-        const task = portMessages.splice(index, 1)[0];
-        const target = task.endpoint.port;
-        if (cfg.frameTrace) ftrace("MessagePort deliver realm=" + (realmRootFrame ? realmRootFrame.__id : 0) +
-            " bytes=" + task.packet.wire.length);
-        try {
-            runInFrame(task.endpoint.frame, function () {
-                let packet;
-                try { packet = deserializeMessage(task.packet); }
-                catch (_) {
-                    dispatch(target, createTrustedEvent(MessageEvent, "messageerror"), false);
-                    return;
+        function requirePort(value) {
+            const slot = state(value);
+            if (!slot) throw new TypeError("Illegal MessagePort invocation");
+            return slot;
+        }
+        function cloneError(message) { return new g.DOMException(message, "DataCloneError"); }
+        function sequence(value, method) {
+            if ((typeof value !== "object" && typeof value !== "function") || value === null)
+                throw new TypeError("Transfer list must be a sequence");
+            if (method === undefined) method = value[Symbol.iterator];
+            if (typeof method !== "function") throw new TypeError("Transfer list must be iterable");
+            const iterator = apply(method, value, []);
+            if (!iterator || (typeof iterator !== "object" && typeof iterator !== "function"))
+                throw new TypeError("Invalid transfer iterator");
+            const next = iterator.next, result = [];
+            for (;;) {
+                const step = apply(next, iterator, []);
+                if (!step || (typeof step !== "object" && typeof step !== "function"))
+                    throw new TypeError("Invalid transfer iterator result");
+                if (step.done) return result;
+                const item = step.value;
+                if (!item || (typeof item !== "object" && typeof item !== "function"))
+                    throw new TypeError("Transfer list entries must be objects");
+                result.push(item);
+            }
+        }
+        // Web IDL overload resolution reads @@iterator once, then converts either
+        // sequence<object> or StructuredSerializeOptions. Never use array-like fallback.
+        function optionsTransfer(options) {
+            if (options == null) return [];
+            if (typeof options !== "object" && typeof options !== "function")
+                throw new TypeError("PostMessage options must be an object");
+            const method = options[Symbol.iterator];
+            if (method != null) return sequence(options, method);
+            const transfer = options.transfer;
+            return transfer === undefined ? [] : sequence(transfer);
+        }
+        function serialize(value, transfer, sourcePort, targetPort) {
+            const list = transfer === undefined ? [] : sequence(transfer);
+            const seen = new Set(), records = [], indices = new Map(), bufferIndices = new Map(), bitmapIndices = new Map();
+            for (const item of list) {
+                if (seen.has(item) || item === sourcePort) throw cloneError("Duplicate or source port in transfer list");
+                seen.add(item);
+                const slot = state(item), bitmap = bitmapCodec && bitmapCodec.state(item);
+                if (bitmap) {
+                    bitmapIndices.set(item, bitmapIndices.size);
+                    records.push({ item, bitmap });
+                } else if (slot) {
+                    indices.set(item, indices.size);
+                    records.push({ item, slot });
+                } else {
+                    try { apply(bufferByteLength, item, []); }
+                    catch (_) { throw cloneError("Object is not transferable"); }
+                    bufferIndices.set(item, bufferIndices.size);
+                    records.push({ item });
                 }
-                dispatch(target, createTrustedEvent(MessageEvent, "message", {
-                    data: packet.data, origin: "", source: null, ports: Object.freeze(packet.ports)
-                }), false);
+            }
+            // HTML #structuredserializewithtransfer: visit the graph before detaching
+            // anything. Exceptions in author getters leave the transfer list untouched.
+            const wire = encode(value, false, indices, bufferIndices, bitmapIndices), ports = [], buffers = [], bitmaps = [];
+            let doomed = false;
+            for (const record of records) {
+                if (record.bitmap) {
+                    bitmaps.push(encode(bitmapCodec.transfer(record.item)));
+                } else if (record.slot) {
+                    const slot = record.slot;
+                    if (slot.detached) throw cloneError("MessagePort is detached");
+                    const key = native("transfer", slot.id);
+                    if (!key) throw cloneError("MessagePort is detached");
+                    if (slot.id === targetPort) doomed = true;
+                    ports.push(key);
+                    portsById.delete(slot.id);
+                    slot.id = 0;
+                    slot.detached = true;
+                } else {
+                    try { buffers.push(encode(apply(transferBuffer, record.item, []))); }
+                    catch (_) { throw cloneError("ArrayBuffer cannot be transferred"); }
+                }
+            }
+            return { wire, ports, buffers, bitmaps, doomed };
+        }
+        function deserialize(packet) {
+            const ports = packet.ports.map(key => {
+                const id = native("receive", key);
+                if (!id) throw cloneError("MessagePort transfer is no longer available");
+                return new MessagePort(token, id);
             });
-        } catch (e) { trust.errors.push("message port: " + ((e && e.message) || e)); }
-        return true;
-    };
+            const buffers = (packet.buffers || []).map(wire => decode(wire));
+            const bitmaps = (packet.bitmaps || []).map(wire => bitmapCodec.receive(decode(wire)));
+            return { data: decode(packet.wire, ports, buffers, bitmaps), ports };
+        }
+        class MessagePort extends adapter.EventTarget {
+            constructor(key, id) {
+                super();
+                if (key !== token) throw new TypeError("Illegal constructor");
+                apply(weakSet, adapter.slots, [this, { messagePort: {
+                    id, detached: false, onmessage: null, onmessageerror: null
+                } }]);
+                portsById.set(id, this);
+            }
+            get onmessage() { return requirePort(this).onmessage; }
+            set onmessage(handler) {
+                const slot = requirePort(this);
+                if (slot.onmessage) adapter.remove(this, "message", slot.onmessage);
+                slot.onmessage = typeof handler === "function" ? handler : null;
+                if (slot.onmessage) adapter.add(this, "message", slot.onmessage);
+                native("start", slot.id);
+            }
+            get onmessageerror() { return requirePort(this).onmessageerror; }
+            set onmessageerror(handler) {
+                const slot = requirePort(this);
+                if (slot.onmessageerror) adapter.remove(this, "messageerror", slot.onmessageerror);
+                slot.onmessageerror = typeof handler === "function" ? handler : null;
+                if (slot.onmessageerror) adapter.add(this, "messageerror", slot.onmessageerror);
+            }
+            postMessage(data, options) {
+                const slot = requirePort(this);
+                if (arguments.length === 0) throw new TypeError("MessagePort.postMessage requires a message");
+                const peer = native("peer", slot.id);
+                const packet = serialize(data, optionsTransfer(options), this, peer);
+                if (!peer || packet.doomed) return;
+                native("send", peer, stringify(packet));
+            }
+            start() { native("start", requirePort(this).id); }
+            close() {
+                const slot = requirePort(this);
+                slot.detached = true;
+                native("close", slot.id);
+            }
+            get [Symbol.toStringTag]() { return "MessagePort"; }
+        }
+        class MessageChannel {
+            constructor() {
+                const ids = native("create");
+                this.port1 = new MessagePort(token, ids[0]);
+                this.port2 = new MessagePort(token, ids[1]);
+            }
+            get [Symbol.toStringTag]() { return "MessageChannel"; }
+        }
+        g.MessagePort = MessagePort;
+        g.MessageChannel = MessageChannel;
+        g.__message_port_brand = state;
+        g.__port_api = {
+            state,
+            setCodec(serialize, deserialize) { encode = serialize; decode = deserialize; },
+            setBitmaps(api) { bitmapCodec = api; },
+            serialize, deserialize, optionsTransfer,
+            hasTask() { return native("has"); },
+            runTask() {
+                const task = native("take");
+                if (!task) return false;
+                const port = portsById.get(task[0]);
+                if (!port) return true;
+                let packet;
+                try { packet = deserialize(parse(task[1])); }
+                catch (_) { adapter.deliver(port, "messageerror", {}); return true; }
+                adapter.deliver(port, "message", { data: packet.data, origin: "", source: null, ports: Object.freeze(packet.ports) });
+                return true;
+            }
+        };
+    })(globalThis);
+    /*__PORTS_END__*/
+    const portAPI = g.__port_api;
+    delete g.__port_api;
+    function portState(value) { return portAPI.state(value); }
+    const serializeMessage = portAPI.serialize, deserializeMessage = portAPI.deserialize;
+    trust.hasPortMessageTask = portAPI.hasTask;
+    trust.runPortMessageTask = portAPI.runTask;
     trust.hasPostedMessageTask = function () { return messageTasks.length > 0; };
     trust.runPostedMessageTask = function () {
         if (!messageTasks.length) return false;
@@ -15549,12 +15567,12 @@
     };
     // HTML leaves selection among runnable task sources implementation-defined,
     // while requiring the event loop to keep making progress. Rotate among the
-    // seven represented sources so a self-replenishing source cannot starve
+    // eight represented sources so a self-replenishing source cannot starve
     // another one. FIFO ordering remains intact within each source.
     let platformSourceCursor = 0;
     trust.hasPlatformTask = function () {
         if (networkTasks.length > 0 || domTasks.length > 0 || intersectionTasks.length > 0 ||
-            trust.hasMessageTask() || idleTasks.length > 0 ||
+            trust.hasMessageTask() || idleTasks.length > 0 || bitmapTasks.length > 0 ||
             (trust.hasPerformanceTask && trust.hasPerformanceTask())) return true;
         for (const childTrust of childWindowTrusts) {
             if (childTrust && childTrust.hasPlatformTask()) return true;
@@ -15563,7 +15581,7 @@
     };
     trust.runPlatformTask = function () {
         const children = Array.from(childWindowTrusts);
-        const sourceCount = 7 + children.length;
+        const sourceCount = 8 + children.length;
         for (let offset = 0; offset < sourceCount; offset++) {
             const source = (platformSourceCursor + offset) % sourceCount;
             let task = null;
@@ -15586,8 +15604,10 @@
             } else if (source === 6 && trust.hasPerformanceTask && trust.hasPerformanceTask()) {
                 platformSourceCursor = (source + 1) % sourceCount;
                 return trust.runPerformanceTask();
-            } else if (source >= 7) {
-                const childTrust = children[source - 7];
+            } else if (source === 7 && bitmapTasks.length) {
+                task = bitmapTasks.shift(); label = "bitmap task";
+            } else if (source >= 8) {
+                const childTrust = children[source - 8];
                 if (childTrust && childTrust.runPlatformTask()) {
                     platformSourceCursor = (source + 1) % sourceCount;
                     return true;
@@ -15837,7 +15857,6 @@
     // the Rust `worker_prelude()` extracts it between the two markers below, so
     // edit it ONCE here. (Self-contained IIFE over globalThis → runs identically
     // in the page realm and a worker realm.)
-    g.__message_port_brand = portState;
     /*__SC_CODEC_BEGIN__*/
     (function (G) {
         // HTML ImageData / Web IDL buffer sources, overload resolution and dictionary conversion.
@@ -15864,6 +15883,8 @@
         const BytePixels = Uint8ClampedArray, HalfPixels = Float16Array;
         const PlatformException = G.DOMException || Error;
         const imageState = value => apply(weakGet, imageSlots, [value]);
+        let bitmapCodec;
+        G.__sc_bitmap_codec = api => { bitmapCodec = api; };
         const messagePortBrand = G.__message_port_brand;
         delete G.__message_port_brand;
         // Bootstrap-only rendezvous with the self-contained Wasm binding below.
@@ -16009,6 +16030,12 @@
                 const module = wasmClone.serialize(v, forStorage);
                 if (module) return module;
             }
+            const bitmap = bitmapCodec && bitmapCodec.state(v);
+            if (bitmap) {
+                bitmapCodec.check(bitmap);
+                const r = bitmap.record;
+                return ["IB", enc(r[2], heap, seen, forStorage), r[0], r[1], !!r[5]];
+            }
             const image = imageState(v);
             if (image) return ["ID", enc(image.data, heap, seen, forStorage), image.width, image.height, image.colorSpace, image.pixelFormat];
             if (G.Node && v instanceof G.Node) throw dce("A DOM node");
@@ -16054,20 +16081,32 @@
             for (var i = 0; i < keys.length; i++) op.push([keys[i], enc(v[keys[i]], heap, seen, forStorage)]);
             return ["O", op];
         }
-        G.__sc_serialize = function (value, forStorage = false, ports) {
+        G.__sc_serialize = function (value, forStorage = false, ports, buffers, bitmaps) {
             var heap = [], seen = new Map();
             if (ports && !forStorage) ports.forEach(function (index, port) {
                 seen.set(port, heap.length); heap.push(["PT", index]);
+            });
+            if (buffers && !forStorage) buffers.forEach(function (index, buffer) {
+                seen.set(buffer, heap.length); heap.push(["BT", index]);
+            });
+            if (bitmaps && !forStorage) bitmaps.forEach(function (index, bitmap) {
+                seen.set(bitmap, heap.length); heap.push(["IBT", index]);
             });
             var root = enc(value, heap, seen, forStorage);
             return JSON.stringify([root, heap]);
         };
         // Pass 1: build leaves fully + empty containers (so refs/cycles resolve).
-        function shell(node, ports) {
+        function shell(node, ports, buffers, bitmaps) {
             switch (node[0]) {
+                case "IBT":
+                    if (!bitmaps || node[1] >= bitmaps.length) throw dce("An ImageBitmap transfer");
+                    return bitmaps[node[1]];
                 case "PT":
                     if (!ports || node[1] >= ports.length) throw dce("A MessagePort transfer");
                     return ports[node[1]];
+                case "BT":
+                    if (!buffers || node[1] >= buffers.length) throw dce("An ArrayBuffer transfer");
+                    return buffers[node[1]];
                 case "WM":
                     if (!wasmClone) throw dce("A WebAssembly.Module");
                     return wasmClone.deserialize(node);
@@ -16114,10 +16153,10 @@
             }
             return undefined;
         }
-        G.__sc_deserialize = function (str, ports) {
+        G.__sc_deserialize = function (str, ports, buffers, bitmaps) {
             var parsed = JSON.parse(str), root = parsed[0], heap = parsed[1];
             var built = new Array(heap.length), i;
-            for (i = 0; i < heap.length; i++) built[i] = shell(heap[i], ports);
+            for (i = 0; i < heap.length; i++) built[i] = shell(heap[i], ports, buffers, bitmaps);
             // Pass 2: typed arrays / DataView (their buffer is an AB leaf, now built).
             for (i = 0; i < heap.length; i++) {
                 var n = heap[i];
@@ -16128,6 +16167,12 @@
             for (i = 0; i < heap.length; i++) {
                 const n = heap[i];
                 if (n[0] === "ID") built[i] = new ImageData(decRef(n[1], built), n[2], n[3], { colorSpace: n[4], pixelFormat: n[5] });
+                else if (n[0] === "IB") {
+                    const record = Object.create(null);
+                    record[0] = n[2]; record[1] = n[3]; record[2] = decRef(n[1], built);
+                    record[3] = true; record[4] = 1; record[5] = n[4];
+                    built[i] = bitmapCodec.make(record);
+                }
             }
             // Pass 3: fill containers (all referents now exist → cycles close).
             for (i = 0; i < heap.length; i++) {
@@ -16141,8 +16186,186 @@
         };
     })(typeof globalThis !== "undefined" ? globalThis : this);
     /*__SC_CODEC_END__*/
+    g.__bitmap_adapter = {
+        queue(fn) { bitmapTasks.push({fn, frame: trust.__activeFrame || null}); },
+        source(image, snapshot) {
+            const name = htmlElementName(image);
+            if (name === "canvas") {
+                if (!snapshot) return true;
+                const id = elementIdentity(image);
+                const size = canvasNative(id, "size", []);
+                if (!size[0] || !size[1]) return null;
+                return canvasNative(id, "snapshot", []);
+            }
+            const state = imageState(image);
+            if (name === "img") return snapshot ? state && state.current : true;
+            if (name === "video") return snapshot ? null : true;
+            return undefined;
+        }
+    };
+    /*__IMAGE_BITMAP_BEGIN__*/
+    (function(g) {
+        // HTML #imagebitmap, #dom-createImageBitmap; local snapshot e5071a20.
+        // Only private records contain pixel bytes. All public values are branded,
+        // and the same Agent's Realms share the WeakMap through the native host.
+        const native = g.__image_bitmap_binding, adapter = g.__bitmap_adapter;
+        delete g.__image_bitmap_binding; delete g.__bitmap_adapter;
+        const slots = native("slots", new WeakMap());
+        const apply = Reflect.apply, weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+        const create = Object.create, define = Object.defineProperty, descriptor = Object.getOwnPropertyDescriptor;
+        const P = Promise, U8 = Uint8Array, BlobConstructor = Blob;
+        const promiseThen = P.prototype.then, promiseReject = P.reject;
+        const blobArrayBuffer = BlobConstructor.prototype.arrayBuffer;
+        const typedBytes = descriptor(Object.getPrototypeOf(U8.prototype), "byteLength").get;
+        const imageGetters = {};
+        for (const key of ["data", "width", "height", "colorSpace", "pixelFormat"])
+            imageGetters[key] = descriptor(ImageData.prototype, key).get;
+        const spaces = ["srgb", "srgb-linear", "display-p3", "display-p3-linear"];
+        function state(value) { return apply(weakGet, slots, [value]); }
+        function requireState(value) {
+            const slot = state(value);
+            if (!slot) throw new TypeError("Illegal ImageBitmap invocation");
+            return slot;
+        }
+        function invalid() { return new DOMException("The image has no usable bitmap", "InvalidStateError"); }
+        function cloneError() { return new DOMException("ImageBitmap cannot be cloned", "DataCloneError"); }
+        class ImageBitmap {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            get width() { const slot = requireState(this); return slot.detached ? 0 : slot.record[0]; }
+            get height() { const slot = requireState(this); return slot.detached ? 0 : slot.record[1]; }
+            close() { const slot = requireState(this); slot.detached = true; slot.record = null; }
+        }
+        for (const key of ["width", "height", "close"])
+            define(ImageBitmap.prototype, key, {...descriptor(ImageBitmap.prototype, key), enumerable:true});
+        define(ImageBitmap.prototype, Symbol.toStringTag, {value:"ImageBitmap", configurable:true});
+        function make(record) {
+            const bitmap = create(ImageBitmap.prototype);
+            apply(weakSet, slots, [bitmap, {record, detached:false}]);
+            return bitmap;
+        }
+        function cloneRecord(record) {
+            const copy = create(null);
+            for (let i=0; i<6; i++) copy[i] = record[i];
+            return copy;
+        }
+        function enumValue(value, values, fallback) {
+            if (value === undefined) return fallback;
+            const string = `${value}`;
+            if (!values.includes(string)) throw new TypeError("Invalid ImageBitmap option");
+            return string;
+        }
+        function dimension(value) {
+            if (value === undefined) return NaN;
+            const number = +value;
+            if (!Number.isFinite(number)) throw new TypeError("Invalid bitmap dimension");
+            const integer = Math.trunc(number);
+            if (integer < 0 || integer > 4294967295) throw new TypeError("Bitmap dimension is out of range");
+            return integer;
+        }
+        const createBitmap = {
+            createImageBitmap(image, ...rest) {
+                // Web IDL #dfn-create-operation-function: argument conversion
+                // errors become rejected promises, on an ordinary operation.
+                try {
+                    if (arguments.length === 0 || rest.length === 2 || rest.length === 3)
+                        throw new TypeError("Invalid createImageBitmap arguments");
+                    // Validate the union before converting any later arguments.
+                    let source, kind, imageData, bitmap = state(image);
+                    if (bitmap) { kind = "bitmap"; }
+                    else {
+                        try { imageData = apply(imageGetters.data, image, []); }
+                        catch (_) {}
+                        if (imageData) kind = "data";
+                        else if (image instanceof BlobConstructor) kind = "blob";
+                        else {
+                            source = adapter.source(image, false);
+                            if (source === undefined) throw new TypeError("Invalid ImageBitmapSource");
+                            kind = "element";
+                        }
+                    }
+                    const cropped = rest.length >= 4;
+                    const rect = cropped ? [rest[0] >> 0, rest[1] >> 0, rest[2] >> 0, rest[3] >> 0] : [0,0,NaN,NaN];
+                    let options = cropped ? rest[4] : rest[0];
+                    if (options != null && typeof options !== "object" && typeof options !== "function")
+                        throw new TypeError("Expected ImageBitmapOptions");
+                    options = options || {};
+                    // Web IDL dictionary members are read in lexicographic order.
+                    enumValue(options.colorSpaceConversion, ["default","none"], "default");
+                    const orientation = enumValue(options.imageOrientation, ["from-image","flipY"], "from-image");
+                    const alpha = enumValue(options.premultiplyAlpha, ["default","none","premultiply"], "default");
+                    const height = dimension(options.resizeHeight);
+                    const quality = enumValue(options.resizeQuality, ["pixelated","low","medium","high"], "low");
+                    const width = dimension(options.resizeWidth);
+                    if (rect[2] === 0 || rect[3] === 0) throw new RangeError("Empty source rectangle");
+                    if (width === 0 || height === 0) throw invalid();
+                    const numbers = [...rect, width, height, +(orientation === "flipY"),
+                        alpha === "default" ? -1 : +(alpha === "premultiply"),
+                        ["pixelated","low","medium","high"].indexOf(quality)];
+                    let record;
+                    if (kind === "element") source = adapter.source(image, true);
+                    if (kind === "blob") {
+                        // Blob bytes are immutable. Decoding and promise settlement
+                        // run in a later bitmap task, after the calling task's jobs.
+                        return new P((resolve, reject) => {
+                            const fail = () => adapter.queue(() => reject(invalid()));
+                            try {
+                                apply(promiseThen, apply(blobArrayBuffer, image, []), [buffer => adapter.queue(() => {
+                                    try {
+                                        const decoded = native("decode", numbers, new U8(buffer));
+                                        if (!decoded) throw invalid();
+                                        resolve(make(decoded));
+                                    } catch (error) { reject(error); }
+                                }), fail]);
+                            } catch (_) { fail(); }
+                        });
+                    }
+                    if (kind === "bitmap") {
+                        if (bitmap.detached) throw invalid();
+                        source = bitmap.record;
+                    }
+                    if (kind === "data") {
+                        if (apply(typedBytes, imageData, []) === 0) throw invalid();
+                        const w = apply(imageGetters.width, image, []), h = apply(imageGetters.height, image, []);
+                        const half = apply(imageGetters.pixelFormat, image, []) === "rgba-float16";
+                        const space = spaces.indexOf(apply(imageGetters.colorSpace, image, []));
+                        record = native("raw", [w,h,+half,space,0,...numbers], imageData);
+                    } else {
+                        if (!source || !source[0] || !source[1]) throw invalid();
+                        record = native("raw", [source[0],source[1],0,0,+!!source[5],...numbers], source[2]);
+                        if (record) record[3] = source[3];
+                    }
+                    if (!record) throw invalid();
+                    // Snapshot before returning; later edits/close() of the source
+                    // cannot change the new bitmap while its promise is pending.
+                    const result = make(record);
+                    return new P(resolve => adapter.queue(() => resolve(result)));
+                } catch (error) { return apply(promiseReject, P, [error]); }
+            }
+        }.createImageBitmap;
+        g.ImageBitmap = ImageBitmap;
+        g.createImageBitmap = createBitmap;
+        g.__bitmap_api = {
+            state, make,
+            check(slot) { if (slot.detached || !slot.record[3]) throw cloneError(); },
+            transfer(value) {
+                const slot = requireState(value);
+                this.check(slot);
+                const record = cloneRecord(slot.record);
+                slot.detached = true; slot.record = null;
+                return record;
+            },
+            receive(record) { return make(record); }
+        };
+    })(globalThis);
+    /*__IMAGE_BITMAP_END__*/
+    const bitmapAPI = g.__bitmap_api;
+    delete g.__bitmap_api;
+    portAPI.setBitmaps(bitmapAPI);
+    g.__sc_bitmap_codec(bitmapAPI);
+    delete g.__sc_bitmap_codec;
     messageSerialize = g.__sc_serialize;
     messageDeserialize = g.__sc_deserialize;
+    portAPI.setCodec(messageSerialize, messageDeserialize);
     canvasImageConstructor = g.ImageData;
     canvasImageGetters = {};
     for (const key of ["width","height","data","colorSpace","pixelFormat"])
@@ -16180,10 +16403,10 @@
             this.__id = __worker_spawn(href, type, name, blobSource);
             if (this.__id > 0) trust.workers[this.__id] = this;
         }
-        postMessage(message, _transfer) {
-            if (this.__id <= 0) return;
-            // Structured clone (may throw DataCloneError synchronously, per spec).
-            __worker_post(this.__id, g.__sc_serialize(message));
+        postMessage(message, options) {
+            if (arguments.length === 0) throw new TypeError("Worker.postMessage requires a message");
+            const packet = serializeMessage(message, portAPI.optionsTransfer(options));
+            if (this.__id > 0) __worker_post(this.__id, JSON.stringify(packet));
         }
         terminate() {
             if (this.__id > 0) {
@@ -16199,10 +16422,12 @@
     trust.workerMessage = function (id, s) {
         const w = trust.workers[id];
         if (!w) return;
-        let data;
-        try { data = g.__sc_deserialize(s); }
+        let packet;
+        try { packet = deserializeMessage(JSON.parse(s)); }
         catch (e) { w.__fire("messageerror", createTrustedEvent(MessageEvent, "messageerror", { origin: "" })); return; }
-        w.__fire("message", createTrustedEvent(MessageEvent, "message", { data: data, origin: "" }));
+        w.__fire("message", createTrustedEvent(MessageEvent, "message", {
+            data: packet.data, origin: "", ports: Object.freeze(packet.ports)
+        }));
     };
     trust.workerError = function (id, msg) {
         const w = trust.workers[id];
