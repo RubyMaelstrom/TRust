@@ -4627,7 +4627,7 @@ mod tests {
             let graphical = lay_graphical(&html, 640.0, &HashMap::new());
             let (_, y, _) = graphical_text(&graphical, "After");
             assert!(
-                y >= 96.0 && y < 128.0,
+                (96.0..128.0).contains(&y),
                 "desktop content follows one slide: {y}"
             );
             let (x, y, _) = graphical_text(&graphical, label);

@@ -388,7 +388,9 @@ mod tests {
             assert!(
                 frame
                     .pixels
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200)
             );
             if let Some(path) = std::env::var_os("TRUST_TERMINAL_INPUT_SNAPSHOT") {
@@ -406,8 +408,10 @@ mod tests {
                 assert_eq!(gpu.size, frame.size);
                 let mismatches = frame
                     .pixels
-                    .chunks_exact(4)
-                    .zip(gpu.pixels.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(gpu.pixels.as_chunks::<4>().0)
                     .filter(|(cpu, gpu)| (0..3).any(|index| cpu[index].abs_diff(gpu[index]) > 20))
                     .count();
                 assert!(

@@ -86,10 +86,10 @@ fn ink_height(frame: &OwnedRgbaFrame) -> usize {
         .pixels
         .chunks_exact(frame.size.width as usize * 4)
         .enumerate()
-        .filter(|(_, row)| row.chunks_exact(4).any(|pixel| pixel[3] > 32))
+        .filter(|(_, row)| row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 32))
         .map(|(y, _)| y);
     let first = rows.next().expect("the glyph must contain visible ink");
-    rows.last().unwrap_or(first) - first + 1
+    rows.next_back().unwrap_or(first) - first + 1
 }
 
 #[test]
@@ -171,10 +171,10 @@ fn light_hinting_caches_distinguish_native_and_light_outlines() {
                 true,
             );
             assert_eq!(ink_height(&frame), expected, "{mode:?}, atlas={atlas}");
-            if mode == Light {
-                if let Some(previous) = reference.replace(frame.clone()) {
-                    assert_eq!(frame, previous, "cache reuse changed the glyph");
-                }
+            if mode == Light
+                && let Some(previous) = reference.replace(frame.clone())
+            {
+                assert_eq!(frame, previous, "cache reuse changed the glyph");
             }
         }
     }
