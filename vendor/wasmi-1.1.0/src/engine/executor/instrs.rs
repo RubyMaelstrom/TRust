@@ -6,20 +6,13 @@ use crate::{
         code_map::CodeMap,
         executor::stack::{CallFrame, FrameSlots, ValueStack},
         utils::unreachable_unchecked,
-        DedupFuncType,
-        EngineFunc,
+        DedupFuncType, EngineFunc,
     },
     ir::{index, BlockFuel, Const16, Offset64Hi, Op, ShiftAmount, Slot},
     memory::DataSegment,
     store::{PrunedStore, StoreInner},
     table::ElementSegment,
-    Error,
-    Func,
-    Global,
-    Memory,
-    Ref,
-    Table,
-    TrapCode,
+    Error, Func, Memory, Ref, Table, TrapCode,
 };
 
 #[cfg(doc)]
@@ -41,6 +34,13 @@ mod exception;
 mod global;
 mod load;
 mod memory;
+#[cfg(all(
+    feature = "native-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_endian = "little",
+    target_pointer_width = "64"
+))]
+mod native;
 mod return_;
 mod select;
 mod store;
@@ -103,6 +103,13 @@ struct Executor<'engine> {
     code_map: &'engine CodeMap,
     /// The dynamic state of legacy WebAssembly exception handlers.
     exceptions: exception::ExceptionState,
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    native: native::NativeState,
 }
 
 impl<'engine> Executor<'engine> {
@@ -129,6 +136,13 @@ impl<'engine> Executor<'engine> {
             stack,
             code_map,
             exceptions: exception::ExceptionState::default(),
+            #[cfg(all(
+                feature = "native-jit",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                target_endian = "little",
+                target_pointer_width = "64"
+            ))]
+            native: native::NativeState::default(),
         }
     }
 
@@ -137,6 +151,15 @@ impl<'engine> Executor<'engine> {
     fn execute(&mut self, store: &mut PrunedStore) -> Result<(), Error> {
         use Op as Instr;
         loop {
+            #[cfg(all(
+                feature = "native-jit",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                target_endian = "little",
+                target_pointer_width = "64"
+            ))]
+            if self.try_native(store.inner_mut()) {
+                continue;
+            }
             match *self.ip.get() {
                 Instr::Trap { trap_code } => self.execute_trap(trap_code)?,
                 Instr::ConsumeFuel { block_fuel } => {
@@ -176,9 +199,7 @@ impl<'engine> Executor<'engine> {
                 Instr::ExceptionCatch { results, tag, next } => {
                     self.execute_exception_catch(results, tag, next)?
                 }
-                Instr::ExceptionCatchAll { try_id } => {
-                    self.execute_exception_catch_all(try_id)?
-                }
+                Instr::ExceptionCatchAll { try_id } => self.execute_exception_catch_all(try_id)?,
                 Instr::ExceptionThrow { tag, values } => {
                     self.execute_exception_throw(store.inner_mut(), tag, values)?
                 }
@@ -540,7 +561,7 @@ impl<'engine> Executor<'engine> {
                 }
                 Instr::RefFunc { result, func } => self.execute_ref_func(result, func),
                 Instr::GlobalGet { result, global } => {
-                    self.execute_global_get(store.inner(), result, global)
+                    self.execute_global_get(store.inner_mut(), result, global)
                 }
                 Instr::GlobalSet { global, input } => {
                     self.execute_global_set(store.inner_mut(), global, input)
@@ -1958,7 +1979,13 @@ impl<'engine> Executor<'engine> {
                     value,
                     offset,
                     lane,
-                } => self.execute_v128_store8_lane_offset8(ptr, value, offset, lane)?,
+                } => self.execute_v128_store8_lane_offset8(
+                    store.inner_mut(),
+                    ptr,
+                    value,
+                    offset,
+                    lane,
+                )?,
                 #[cfg(feature = "simd")]
                 Instr::V128Store8LaneAt { value, address } => {
                     self.execute_v128_store8_lane_at(store.inner_mut(), value, address)?
@@ -1973,7 +2000,13 @@ impl<'engine> Executor<'engine> {
                     value,
                     offset,
                     lane,
-                } => self.execute_v128_store16_lane_offset8(ptr, value, offset, lane)?,
+                } => self.execute_v128_store16_lane_offset8(
+                    store.inner_mut(),
+                    ptr,
+                    value,
+                    offset,
+                    lane,
+                )?,
                 #[cfg(feature = "simd")]
                 Instr::V128Store16LaneAt { value, address } => {
                     self.execute_v128_store16_lane_at(store.inner_mut(), value, address)?
@@ -1988,7 +2021,13 @@ impl<'engine> Executor<'engine> {
                     value,
                     offset,
                     lane,
-                } => self.execute_v128_store32_lane_offset8(ptr, value, offset, lane)?,
+                } => self.execute_v128_store32_lane_offset8(
+                    store.inner_mut(),
+                    ptr,
+                    value,
+                    offset,
+                    lane,
+                )?,
                 #[cfg(feature = "simd")]
                 Instr::V128Store32LaneAt { value, address } => {
                     self.execute_v128_store32_lane_at(store.inner_mut(), value, address)?
@@ -2003,7 +2042,13 @@ impl<'engine> Executor<'engine> {
                     value,
                     offset,
                     lane,
-                } => self.execute_v128_store64_lane_offset8(ptr, value, offset, lane)?,
+                } => self.execute_v128_store64_lane_offset8(
+                    store.inner_mut(),
+                    ptr,
+                    value,
+                    offset,
+                    lane,
+                )?,
                 #[cfg(feature = "simd")]
                 Instr::V128Store64LaneAt { value, address } => {
                     self.execute_v128_store64_lane_at(store.inner_mut(), value, address)?
@@ -2293,7 +2338,6 @@ impl Executor<'_> {
         fn get_func_type_dedup(&self, index: index::FuncType) -> DedupFuncType;
         fn get_memory(&self, index: index::Memory) -> Memory;
         fn get_table(&self, index: index::Table) -> Table;
-        fn get_global(&self, index: index::Global) -> Global;
         fn get_data_segment(&self, index: index::Data) -> DataSegment;
         fn get_element_segment(&self, index: index::Elem) -> ElementSegment;
     }

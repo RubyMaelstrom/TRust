@@ -365,7 +365,12 @@ struct WasmState {
 
 impl WasmState {
     fn new() -> Self {
-        let engine = wasmi::Engine::default();
+        let mut config = wasmi::Config::default();
+        config.native_jit(!matches!(
+            std::env::var("TRUST_WASM_NATIVE_JIT").as_deref(),
+            Ok("0" | "false")
+        ));
+        let engine = wasmi::Engine::new(&config);
         let store = wasmi::Store::new(&engine, StoreData::default());
         Self {
             engine,

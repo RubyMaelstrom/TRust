@@ -6,6 +6,13 @@ mod config;
 mod executor;
 mod func_types;
 mod limits;
+#[cfg(all(
+    feature = "native-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_endian = "little",
+    target_pointer_width = "64"
+))]
+mod native_jit;
 mod resumable;
 mod traits;
 mod translator;
@@ -16,12 +23,8 @@ pub(crate) use self::{
     executor::Stack,
     func_types::DedupFuncType,
     translator::{
-        FuncTranslationDriver,
-        FuncTranslator,
-        FuncTranslatorAllocations,
-        LazyFuncTranslator,
-        ValidatingFuncTranslator,
-        WasmTranslator,
+        FuncTranslationDriver, FuncTranslator, FuncTranslatorAllocations, LazyFuncTranslator,
+        ValidatingFuncTranslator, WasmTranslator,
     },
 };
 use self::{
@@ -34,15 +37,9 @@ pub use self::{
     config::{CompilationMode, Config},
     limits::{EnforcedLimits, EnforcedLimitsError, StackConfig},
     resumable::{
-        ResumableCall,
-        ResumableCallHostTrap,
-        ResumableCallOutOfFuel,
-        ResumableError,
-        ResumableHostTrapError,
-        ResumableOutOfFuelError,
-        TypedResumableCall,
-        TypedResumableCallHostTrap,
-        TypedResumableCallOutOfFuel,
+        ResumableCall, ResumableCallHostTrap, ResumableCallOutOfFuel, ResumableError,
+        ResumableHostTrapError, ResumableOutOfFuelError, TypedResumableCall,
+        TypedResumableCallHostTrap, TypedResumableCallOutOfFuel,
     },
     traits::{CallParams, CallResults},
     translator::TranslationError,
@@ -51,10 +48,7 @@ use crate::{
     collections::arena::{ArenaIndex, GuardedEntity},
     func::FuncInOut,
     module::{FuncIdx, ModuleHeader},
-    Error,
-    Func,
-    FuncType,
-    StoreContextMut,
+    Error, Func, FuncType, StoreContextMut,
 };
 use alloc::{
     sync::{Arc, Weak},
