@@ -3,6 +3,9 @@
 use super::{Ctx, HostState, Value, host_arg_node, host_arg_string, host_dom};
 use crate::webgl::{Attributes, Context, Reply};
 
+#[path = "webgl_host/fast.rs"]
+mod fast;
+
 pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
     let Some(state) = ctx.host_mut::<HostState>() else {
         return;
@@ -42,8 +45,26 @@ pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
 }
 
 pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let op = host_arg_string(ctx, args, 1);
+    let mut op = host_arg_string(ctx, args, 1);
     let payload = args.get(3).cloned().unwrap_or(Value::Undefined);
+    if op == "fastMethod" {
+        return fast::wrap(ctx, payload);
+    }
+    if op == "slotGetter" {
+        return Ok(Value::Obj(ctx.make_native(
+            "WebGL private slots",
+            1,
+            |ctx, _, args| {
+                let slots = ctx
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .webgl_slots
+                    .clone()
+                    .unwrap();
+                ctx.weak_map_get(&slots, args.first().unwrap_or(&Value::Undefined))
+            },
+        )));
+    }
     if op == "slots" || op == "canvasSlots" {
         let state = ctx.host_mut::<HostState>().unwrap();
         let slots = if op == "slots" {
@@ -55,13 +76,48 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     }
     let mut n = Vec::new();
     if let Some(values) = args.get(2) {
-        let count = ctx.member_get(values, "length")?.as_num_opt().unwrap_or(0.) as usize;
-        if count > 1_048_576 {
+        if let Some(values) = ctx.copy_numeric_array(values, 1_048_576) {
+            n = values;
+        } else {
+            let count = ctx.member_get(values, "length")?.as_num_opt().unwrap_or(0.) as usize;
+            if count > 1_048_576 {
+                return Err(ctx.make_error("RangeError", "WebGL argument budget exceeded"));
+            }
+            for i in 0..count {
+                let v = ctx.member_get(values, &i.to_string())?;
+                n.push(ctx.coerce_number(&v)?);
+            }
+        }
+    }
+    if op == "uniformTyped" {
+        // WebGL Float32List/Int32List + Web IDL #js-to-union: the JS binding
+        // has checked the intrinsic TypedArray brand. Read its view, including
+        // byteOffset/byteLength, without invoking its iterator or indexed getters.
+        let bytes = ctx.buffer_source_bytes(&payload, true).ok_or_else(|| {
+            ctx.make_error("TypeError", "Expected an attached WebGL numeric list")
+        })?;
+        if bytes.len() / 4 > 1_048_572 {
             return Err(ctx.make_error("RangeError", "WebGL argument budget exceeded"));
         }
-        for i in 0..count {
-            let v = ctx.member_get(values, &i.to_string())?;
-            n.push(ctx.coerce_number(&v)?);
+        let id = n.first().copied().unwrap_or(0.);
+        if id <= 0. {
+            return Ok(Value::Undefined);
+        }
+        if n.get(4).is_some_and(|v| *v != 0.) {
+            op = "error".into();
+            n.clear();
+            n.push(1281.);
+        } else {
+            let integer = n.get(2).is_some_and(|v| *v != 0.);
+            n.truncate(4);
+            n.extend(bytes.as_chunks::<4>().0.iter().map(|word| {
+                if integer {
+                    i32::from_ne_bytes(*word) as f64
+                } else {
+                    f32::from_ne_bytes(*word) as f64
+                }
+            }));
+            op = "uniform".into();
         }
     }
     let text = if let Value::Str(s) = &payload {
@@ -156,6 +212,19 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             }
         }
     }
+    let reply = execute(ctx, id, &op, &n, bytes.as_deref(), &text);
+    value(ctx, reply)
+}
+
+fn execute(
+    ctx: &mut Ctx,
+    id: usize,
+    op: &str,
+    n: &[f64],
+    bytes: Option<&[u8]>,
+    text: &str,
+) -> Reply {
+    let dom = host_dom(ctx);
     let state = ctx.host_mut::<HostState>().unwrap();
     let other = state
         .webgl
@@ -164,7 +233,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .map(|(_, c)| c.allocated_bytes())
         .sum::<usize>();
     let Some(context) = state.webgl.get_mut(&id) else {
-        return Ok(Value::Null);
+        return Reply::Null;
     };
     context.budget = crate::webgl::PAGE_BUDGET.saturating_sub(other);
     if let Some(canvas) = dom.borrow().canvases.borrow().get(&id)
@@ -175,7 +244,8 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         }
         context.generation = canvas.generation;
     }
-    let result = match op.as_str() {
+    let was_dirty = context.dirty;
+    let result = match op {
         "width" => Reply::Number(context.width as f64),
         "height" => Reply::Number(context.height as f64),
         "attributes" => Reply::Array(
@@ -191,21 +261,14 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             .map(Reply::Bool)
             .collect(),
         ),
-        _ => context.execute(&op, &n, bytes.as_deref(), &text),
+        _ => context.execute(op, n, bytes, text),
     };
-    if context.dirty
-        && matches!(
-            op.as_str(),
-            "clear"
-                | "drawArrays"
-                | "drawElements"
-                | "drawArraysInstancedANGLE"
-                | "drawElementsInstancedANGLE"
-        )
-    {
+    // Coalesce a canvas's draw operations until its next presentation. Creation
+    // and attribute-driven resizing have already requested their own repaint.
+    if !was_dirty && context.dirty {
         dom.borrow_mut().canvas_changed(id);
     }
-    value(ctx, result)
+    result
 }
 
 fn value(ctx: &mut Ctx, result: Reply) -> Result<Value, Value> {

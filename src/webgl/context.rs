@@ -55,6 +55,7 @@ impl Reply {
 
 pub(super) struct Buffer {
     pub handle: gl::Buffer,
+    pub deleted: bool,
     pub target: u32,
     pub usage: u32,
     pub bytes: Vec<u8>,
@@ -91,8 +92,15 @@ pub(super) struct Attrib {
     pub offset: i32,
     pub enabled: bool,
     pub normalized: bool,
-    pub current: [f32; 4],
     pub divisor: u32,
+}
+pub(super) struct VertexArray {
+    pub handle: Option<gl::VertexArray>,
+    pub bound: bool,
+    // The currently bound object's state lives in Context; switching swaps
+    // these vectors rather than copying every attribute on every draw.
+    pub attribs: Vec<Attrib>,
+    pub element_buffer: u32,
 }
 pub(super) struct Texture {
     pub handle: gl::Texture,
@@ -161,6 +169,11 @@ pub(crate) struct Context {
     pub(super) renderbuffers: HashMap<u32, Renderbuffer>,
     pub(super) framebuffers: HashMap<u32, Framebuffer>,
     pub(super) attribs: Vec<Attrib>,
+    pub(super) current_attribs: Vec<[f32; 4]>,
+    pub(super) vertex_arrays: HashMap<u32, VertexArray>,
+    pub(super) vertex_array: u32,
+    pub(super) vertex_array_extension: bool,
+    pub(super) retired_buffers: Vec<u32>,
     pub(super) array_buffer: u32,
     pub(super) element_buffer: u32,
     pub(super) program: u32,
@@ -214,7 +227,6 @@ impl Context {
                 Attrib {
                     size: 4,
                     kind: gl::FLOAT,
-                    current: [0., 0., 0., 1.],
                     ..Default::default()
                 };
                 g.get_parameter_i32(gl::MAX_VERTEX_ATTRIBS).clamp(8, 32) as usize
@@ -242,7 +254,20 @@ impl Context {
                 textures: HashMap::new(),
                 renderbuffers: HashMap::new(),
                 framebuffers: HashMap::new(),
+                current_attribs: vec![[0., 0., 0., 1.]; attribs.len()],
                 attribs,
+                vertex_arrays: HashMap::from([(
+                    0,
+                    VertexArray {
+                        handle: None,
+                        bound: true,
+                        attribs: vec![],
+                        element_buffer: 0,
+                    },
+                )]),
+                vertex_array: 0,
+                vertex_array_extension: false,
+                retired_buffers: vec![],
                 array_buffer: 0,
                 element_buffer: 0,
                 program: 0,
@@ -413,7 +438,8 @@ impl Context {
             + self.framebuffers.len()
             + self.renderbuffers.len()
             + self.uniforms.len()
-            >= MAX_OBJECTS
+            + self.vertex_arrays.len()
+            > MAX_OBJECTS
         {
             self.error(gl::OUT_OF_MEMORY);
             return None;
@@ -438,6 +464,9 @@ impl Context {
     }
     pub fn allocated_bytes(&self) -> usize {
         self.resources
+    }
+    pub fn array_buffer_binding(&self) -> u32 {
+        self.array_buffer
     }
     pub fn retained_bytes(&self) -> usize {
         self.resources
@@ -520,6 +549,14 @@ impl Context {
             return Reply::Null;
         }
         let value = self.dispatch(op, n, bytes, text);
+        if !self.retired_buffers.is_empty()
+            && matches!(
+                op,
+                "deleteBuffer" | "bindBuffer" | "vertexAttribPointer" | "deleteVertexArrayOES"
+            )
+        {
+            self.collect_buffers();
+        }
         if matches!(
             op,
             "deleteShader" | "deleteProgram" | "detachShader" | "useProgram"
@@ -582,6 +619,9 @@ impl Context {
         value
     }
     fn dispatch(&mut self, op: &str, n: &[f64], bytes: Option<&[u8]>, text: &str) -> Reply {
+        if let Some(result) = self.vertex_array_call(op, n.first().copied().unwrap_or(0.) as u32) {
+            return result;
+        }
         if let Some(result) = self.object_call(op, n, bytes, text) {
             return result;
         }
@@ -758,6 +798,7 @@ impl Context {
                         "OES_standard_derivatives" => self.derivatives = true,
                         "OES_element_index_uint" => self.uint_indices = true,
                         "ANGLE_instanced_arrays" => self.instancing = true,
+                        "OES_vertex_array_object" => self.vertex_array_extension = true,
                         _ => {}
                     }
                     return Reply::Bool(true);
@@ -802,6 +843,7 @@ impl Context {
         // The standardized extension name does not imply the ANGLE library.
         if es3 {
             names.push("ANGLE_instanced_arrays");
+            names.push("OES_vertex_array_object");
         }
         names
     }
@@ -819,6 +861,7 @@ impl Context {
                 0x9246 => Reply::Text(g.get_parameter_string(gl::RENDERER)),
                 gl::ARRAY_BUFFER_BINDING => self.array_buffer.into(),
                 gl::ELEMENT_ARRAY_BUFFER_BINDING => self.element_buffer.into(),
+                gl::VERTEX_ARRAY_BINDING if self.vertex_array_extension => self.vertex_array.into(),
                 gl::CURRENT_PROGRAM => self.program.into(),
                 gl::FRAMEBUFFER_BINDING => self.framebuffer.into(),
                 gl::RENDERBUFFER_BINDING => self.renderbuffer.into(),

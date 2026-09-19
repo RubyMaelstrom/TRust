@@ -21,7 +21,8 @@
     const clipped = new Uint8Array(12).fill(77);
     gl.readPixels(-1,0,3,1,gl.RGBA,gl.UNSIGNED_BYTE,clipped);
     same(clipped,[77,77,77,77,255,0,0,255,255,0,0,255],'clipped read preserves outside');
-    const buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    const buffer = gl.createBuffer();
+    check(gl.bindBuffer(gl.ARRAY_BUFFER,buffer)===undefined,'bindBuffer IDL return');
     gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
     check(gl.getBufferParameter(gl.ARRAY_BUFFER,gl.BUFFER_SIZE) === 24, 'buffer size');
     check(gl.getParameter(gl.ARRAY_BUFFER_BINDING) === buffer,'buffer identity');
@@ -33,7 +34,11 @@
     const program = gl.createProgram(); gl.attachShader(program,vertex); gl.attachShader(program,fragment); gl.linkProgram(program);
     check(gl.getProgramParameter(program,gl.LINK_STATUS),gl.getProgramInfoLog(program)); gl.useProgram(program);
     const position = gl.getAttribLocation(program,'position'); check(position >= 0,'position active');
-    gl.enableVertexAttribArray(position); gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
+    gl.enableVertexAttribArray(position);
+    check(gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0)===undefined,'vertexAttribPointer IDL return');
+    gl.vertexAttribPointer(position,5,gl.FLOAT,false,0,0);
+    check(gl.getError()===gl.INVALID_VALUE,'invalid attribute size');
+    check(gl.getVertexAttrib(position,gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)===buffer,'invalid pointer preserves retained buffer');
     const color = gl.getUniformLocation(program,'color');check(Object.prototype.toString.call(color)==='[object WebGLUniformLocation]','uniform location brand'); gl.uniform4f(color,0,1,0,1);
     same(gl.getUniform(program,color),[0,1,0,1],'uniform round trip');
     gl.drawArrays(gl.TRIANGLES,0,3); gl.readPixels(2,2,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);

@@ -5,7 +5,16 @@
 
 use glow::HasContext;
 use khronos_egl as egl;
-use std::{marker::PhantomData, rc::Rc, sync::OnceLock};
+use std::{cell::Cell, marker::PhantomData, rc::Rc, sync::OnceLock};
+
+thread_local! {
+    // EGL 1.5 §3.7.3: bindings belong to the calling thread and persist until
+    // eglMakeCurrent changes them. This module owns every EGL binding on page
+    // actor threads; the desktop compositor has its own thread. Avoid a native
+    // EGL/GLVND query for every WebGL command, while retaining real switches
+    // between canvases. Driver is !Send, so a context cannot migrate threads.
+    static CURRENT_CONTEXT: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Display {
     api: egl::DynamicInstance<egl::EGL1_5>,
@@ -131,6 +140,7 @@ impl Driver {
             let _ = api.destroy_context(dpy, context);
             return Err(e.to_string());
         }
+        CURRENT_CONTEXT.set(context.as_ptr() as usize);
         // SAFETY: this thread has the newly created GLES context current.
         let gl = unsafe {
             glow::Context::from_loader_function(|name| {
@@ -157,7 +167,8 @@ impl Driver {
     }
 
     pub fn make_current(&self) -> Result<(), String> {
-        if self.display.api.get_current_context() == Some(self.context) {
+        let context = self.context.as_ptr() as usize;
+        if CURRENT_CONTEXT.get() == context {
             return Ok(());
         }
         self.display
@@ -168,7 +179,9 @@ impl Driver {
                 Some(self.surface),
                 Some(self.context),
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        CURRENT_CONTEXT.set(context);
+        Ok(())
     }
 }
 
@@ -179,8 +192,9 @@ impl Drop for Driver {
         // EGL §3.7.2: deletion releases all objects owned by the unshared context.
         // Unbind only this context, so dropping an idle canvas does not disturb
         // another context currently in use on the same actor thread.
-        if api.get_current_context() == Some(self.context) {
+        if CURRENT_CONTEXT.get() == self.context.as_ptr() as usize {
             let _ = api.make_current(dpy, None, None, None);
+            CURRENT_CONTEXT.set(0);
         }
         let _ = api.destroy_surface(dpy, self.surface);
         let _ = api.destroy_context(dpy, self.context);
@@ -219,10 +233,25 @@ mod tests {
             assert_eq!(driver.gl.get_error(), glow::NO_ERROR);
         }
         let other = Driver::new().expect("second independent context");
+        // Switching back must reach EGL, and repeated commands may reuse it.
+        driver.make_current().unwrap();
+        driver.make_current().unwrap();
+        assert_eq!(
+            driver.display.api.get_current_context(),
+            Some(driver.context)
+        );
+        other.make_current().unwrap();
         drop(driver);
         assert_eq!(other.display.api.get_current_context(), Some(other.context));
         other.make_current().unwrap();
         drop(other);
         assert!(display().unwrap().api.get_current_context().is_none());
+        assert_eq!(CURRENT_CONTEXT.get(), 0);
+        let replacement = Driver::new().expect("context after dropping the current one");
+        replacement.make_current().unwrap();
+        assert_eq!(
+            replacement.display.api.get_current_context(),
+            Some(replacement.context)
+        );
     }
 }

@@ -11609,6 +11609,73 @@ mod tests {
     }
 
     #[test]
+    fn canvas_pixels_repaint_without_relayout_but_resize_updates_geometry() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<style>body{margin:0}canvas{display:block}</style>\
+             <canvas id=c width=12 height=10></canvas><div id=after>after</div>",
+        )));
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        let canvas = dom.borrow().get_by_id("c").unwrap();
+        let cache = ensure_host_geom_cache(engine.ctx(), "before drawing");
+        let fragments = cache.borrow().fragments.clone().unwrap();
+        let _ = dom.borrow_mut().take_dirty();
+        let _ = dom.borrow_mut().take_dirty_targets();
+        eval(
+            &mut engine,
+            r#"
+            const c=document.getElementById('c'),two=c.getContext('2d');
+            two.fillStyle='red';
+            for(let i=0;i<100;i++)two.fillRect(0,0,12,10);
+        "#,
+            "draw canvas pixels",
+        )
+        .unwrap();
+        assert!(
+            dom.borrow_mut().take_dirty(),
+            "drawing requests presentation"
+        );
+        assert_eq!(
+            dom.borrow_mut().take_dirty_targets(),
+            Some(vec![(canvas, crate::dom::DirtyKind::Paint)])
+        );
+        ensure_host_geom_cache(engine.ctx(), "after drawing");
+        assert!(
+            Arc::ptr_eq(&fragments, cache.borrow().fragments.as_ref().unwrap()),
+            "bitmap updates must reuse the established fragment geometry"
+        );
+        assert_eq!(
+            &dom.borrow().canvas_image(canvas).unwrap().image.rgba[..4],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('after').getBoundingClientRect().top)"
+            ),
+            "10"
+        );
+        eval(&mut engine, "c.height=25", "resize canvas").unwrap();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('after').getBoundingClientRect().top)"
+            ),
+            "25"
+        );
+        assert!(!Arc::ptr_eq(
+            &fragments,
+            cache.borrow().fragments.as_ref().unwrap()
+        ));
+        assert_eq!(
+            &dom.borrow().canvas_image(canvas).unwrap().image.rgba[..4],
+            &[0, 0, 0, 0]
+        );
+    }
+
+    #[test]
     fn retained_layout_invalidates_activation_and_resource_inputs_without_dom_writes() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<body><a id="link" href="/next">next</a><img id="image" src="/image.png"></body>"#,
@@ -12784,6 +12851,127 @@ mod tests {
                 run_microtask_checkpoint(&mut engine);
             }
             assert_eq!(string_value(&mut engine, "webglRestored"), "ok", "{tier:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an installed EGL/GLES driver"]
+    fn webgl_numeric_lists_use_typed_storage_before_iterators() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                const check=(value,message)=>{if(!value)throw Error(message);};
+                const canvas=document.createElement('canvas');
+                const gl=canvas.getContext('webgl');check(gl,'context');
+                const shader=(type,source)=>{
+                    const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);
+                    check(gl.getShaderParameter(s,gl.COMPILE_STATUS),gl.getShaderInfoLog(s));return s;
+                };
+                const p=gl.createProgram();
+                gl.attachShader(p,shader(gl.VERTEX_SHADER,
+                    'attribute vec4 p;uniform mat4 matrix;void main(){gl_Position=matrix*p;}'));
+                gl.attachShader(p,shader(gl.FRAGMENT_SHADER,
+                    'precision mediump float;uniform vec4 color;uniform ivec2 integers;void main(){gl_FragColor=color*float(integers.x);}'));
+                gl.linkProgram(p);check(gl.getProgramParameter(p,gl.LINK_STATUS),'link');gl.useProgram(p);
+                const matrix=gl.getUniformLocation(p,'matrix'),color=gl.getUniformLocation(p,'color');
+                const integers=gl.getUniformLocation(p,'integers');
+                const padded=new Float32Array(20);padded.set([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],2);
+                const view=new Float32Array(padded.buffer,8,16);
+                Object.defineProperty(view,Symbol.iterator,{get(){throw Error('typed iterator observed');}});
+                gl.uniformMatrix4fv(matrix,false,view);
+                check(gl.getUniform(p,matrix)[15]===1,'matrix byte offset and length');
+                view[15]=2;check(gl.getUniform(p,matrix)[15]===1,'upload snapshots storage');
+                const shared=new Float32Array(new SharedArrayBuffer(16));shared.set([.25,.5,.75,1]);
+                shared[Symbol.iterator]=null;gl.uniform4fv(color,shared);
+                check(gl.getUniform(p,color)[2]===.75,'shared typed storage');
+                const ints=new Int32Array([99,-7,9,99]);const iv=new Int32Array(ints.buffer,4,2);
+                iv[Symbol.iterator]=null;gl.uniform2iv(integers,iv);
+                check(gl.getUniform(p,integers)[0]===-7&&gl.getUniform(p,integers)[1]===9,'integer view');
+                let iterated=0;
+                const different=new Float64Array([0,0,0,0]);
+                different[Symbol.iterator]=function*(){iterated++;yield 1;yield .5;yield 0;yield 1;};
+                gl.uniform4fv(color,different);
+                check(iterated===1&&gl.getUniform(p,color)[0]===1,'other typed kinds use sequence conversion');
+                for(const invalid of [4,'1234',{0:1,length:4},null,undefined]) {
+                    let rejected=false;
+                    try{gl.uniform4fv(null,invalid);}catch(e){rejected=e instanceof TypeError;}
+                    check(rejected,'sequence requires an iterable object even with null location');
+                }
+                let methodReads=0,nextReads=0,steps=0,closed=0;
+                const sequence={get [Symbol.iterator](){methodReads++;return function(){
+                    return {get next(){nextReads++;return function(){steps++;return {
+                        done:false,value:{valueOf(){throw Error('conversion failure');}}
+                    };};},return(){closed++;return {};}};
+                };}};
+                let failure='';
+                try{gl.uniform4fv(null,sequence);}catch(e){failure=e.message;}
+                check(failure==='conversion failure'&&methodReads===1&&nextReads===1&&steps===1&&closed===0,
+                    'sequence conversion observes ordered iterator steps without IteratorClose');
+                gl.uniformMatrix4fv(null,true,view);
+                check(gl.getError()===gl.NO_ERROR,'null location ignores transpose after conversion');
+                gl.uniformMatrix4fv(matrix,true,view);
+                check(gl.getError()===gl.INVALID_VALUE,'transpose validation');
+                gl.uniform4fv(color,new Float32Array(3));
+                check(gl.getError()===gl.INVALID_VALUE,'typed length validation');
+                for(const buffer of [new ArrayBuffer(64,{maxByteLength:128}),new SharedArrayBuffer(64,{maxByteLength:128})]) {
+                    let rejected=false;
+                    try{gl.uniformMatrix4fv(null,false,new Float32Array(buffer));}catch(e){rejected=e instanceof TypeError;}
+                    check(rejected,'resizable storage rejected before null location');
+                }
+                const detached=new Float32Array(16);detached.buffer.transfer();
+                let detachedRejected=false;
+                try{gl.uniformMatrix4fv(null,false,detached);}catch(e){detachedRejected=e instanceof TypeError;}
+                check(detachedRejected,'detached storage rejected before null location');
+                let converted=0;
+                gl.uniform4f(null,{valueOf(){converted++;return 0;}},0,0,0);
+                check(converted===1,'null scalar location still converts');
+                check(gl.getError()===gl.NO_ERROR,'final error');
+            "#, "WebGL numeric list conversion").unwrap();
+            engine.ctx().collect_garbage_for_host();
+            eval(&mut engine, r#"
+                const order=[];
+                const convert=n=>({valueOf(){order.push(n);return n;}});
+                gl.uniform4f(null,convert(1),convert(2),convert(3),convert(4));
+                check(order.join(',')==='1,2,3,4','native fallback retains ordered conversion after GC');
+                order.length=0;
+                let missing=false;
+                try{gl.uniform4f(null,convert(1));}catch(e){missing=e instanceof TypeError;}
+                check(missing&&order.length===0,'arity checked before conversion');
+                let brand=false;
+                try{gl.uniform4f.call({},null,convert(1),convert(2),convert(3),convert(4));}
+                catch(e){brand=e instanceof TypeError;}
+                check(brand&&order.length===0,'receiver checked before conversion');
+                gl.uniform4fv(color,[.5,.25,0,1]);
+                check(gl.getUniform(p,color)[0]===.5,'sequence fallback survives GC');
+            "#, "WebGL native entry fallback lifetime").unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an installed EGL/GLES 3 driver"]
+    fn webgl_vertex_arrays_preserve_state_and_deleted_buffer_storage() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/webgl_vertex_arrays.mjs"),
+                "WebGL vertex arrays",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref s) if s.as_ref() == "vao-ok"),
+                "{tier:?}"
+            );
+            engine.ctx().collect_garbage_for_host();
+            assert_eq!(
+                string_value(&mut engine, "vertexArrayAfterGC()"),
+                "vao-gc-ok",
+                "{tier:?}"
+            );
         }
     }
 

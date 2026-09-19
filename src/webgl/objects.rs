@@ -24,6 +24,7 @@ impl Context {
                                 id,
                                 Buffer {
                                     handle,
+                                    deleted: false,
                                     target: 0,
                                     usage: gl::STATIC_DRAW,
                                     bytes: vec![],
@@ -41,7 +42,7 @@ impl Context {
                     let handle = if u(1) == 0 {
                         None
                     } else {
-                        let Some(b) = self.buffers.get_mut(&u(1)) else {
+                        let Some(b) = self.buffers.get_mut(&u(1)).filter(|b| !b.deleted) else {
                             return Some(self.error(gl::INVALID_OPERATION));
                         };
                         if b.target != 0 && b.target != u(0) {
@@ -56,7 +57,9 @@ impl Context {
                     } else {
                         self.element_buffer = u(1);
                     }
-                    Reply::Null
+                    // Private bridge result: retain the successful binding's JS
+                    // wrapper without a second getParameter command per bind.
+                    u(1).into()
                 }
                 "bufferData" | "bufferSubData" => {
                     if !matches!(u(0), gl::ARRAY_BUFFER | gl::ELEMENT_ARRAY_BUFFER) {
@@ -126,24 +129,14 @@ impl Context {
                     }
                 }
                 "deleteBuffer" => {
-                    if let Some(b) = self.buffers.remove(&u(0)) {
-                        self.driver.gl.delete_buffer(b.handle);
-                        self.resources -= b.bytes.len();
-                        if self.array_buffer == u(0) {
-                            self.array_buffer = 0;
-                        }
-                        if self.element_buffer == u(0) {
-                            self.element_buffer = 0;
-                        }
-                        for a in &mut self.attribs {
-                            if a.buffer == u(0) {
-                                a.buffer = 0;
-                            }
-                        }
-                    }
+                    self.delete_buffer(u(0));
                     Reply::Null
                 }
-                "isBuffer" => Reply::Bool(self.buffers.get(&u(0)).is_some_and(|b| b.target != 0)),
+                "isBuffer" => Reply::Bool(
+                    self.buffers
+                        .get(&u(0))
+                        .is_some_and(|b| !b.deleted && b.target != 0),
+                ),
                 "createShader" => {
                     if !matches!(u(0), gl::VERTEX_SHADER | gl::FRAGMENT_SHADER) {
                         return Some(self.error(gl::INVALID_ENUM));
@@ -548,10 +541,9 @@ impl Context {
                             Reply::Null
                         }
                         "vertexAttrib" => {
-                            attr.current = [a(1) as f32, a(2) as f32, a(3) as f32, a(4) as f32];
-                            self.driver
-                                .gl
-                                .vertex_attrib_4_f32_slice(u(0), &attr.current);
+                            let current = &mut self.current_attribs[u(0) as usize];
+                            *current = [a(1) as f32, a(2) as f32, a(3) as f32, a(4) as f32];
+                            self.driver.gl.vertex_attrib_4_f32_slice(u(0), current);
                             Reply::Null
                         }
                         "vertexAttribPointer" => {
@@ -589,7 +581,9 @@ impl Context {
                                 i(4),
                                 i(5),
                             );
-                            Reply::Null
+                            // The JS wrapper holds the buffer alive while this
+                            // attribute references it. Avoid querying it again.
+                            self.array_buffer.into()
                         }
                         "getVertexAttribOffset" => {
                             if u(1) == gl::VERTEX_ATTRIB_ARRAY_POINTER {
@@ -609,7 +603,7 @@ impl Context {
                                 attr.divisor.into()
                             }
                             gl::CURRENT_VERTEX_ATTRIB => {
-                                Reply::numbers(attr.current.map(f64::from))
+                                Reply::numbers(self.current_attribs[u(0) as usize].map(f64::from))
                             }
                             _ => self.error(gl::INVALID_ENUM),
                         },

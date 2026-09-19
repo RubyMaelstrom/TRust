@@ -12,5 +12,6 @@ mod driver;
 mod objects;
 mod shader;
 mod textures;
+mod vertex_arrays;
 pub(crate) use context::{Attributes, Context, Reply};
 pub(crate) const PAGE_BUDGET: usize = 256 * 1024 * 1024;
