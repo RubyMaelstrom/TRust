@@ -33,6 +33,7 @@ pub mod core;
 mod crypto;
 pub mod embed;
 pub mod finger;
+pub mod fragment;
 mod import_maps;
 mod page_threads;
 mod referrer_policy;

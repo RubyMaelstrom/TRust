@@ -268,6 +268,15 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
 #[derive(Debug)]
 pub enum PageCmd {
     Click(usize),
+    /// HTML same-document navigation keeps the resident Document and realm.
+    NavigateFragment {
+        url: String,
+        replace: bool,
+    },
+    TraverseHistory {
+        url: String,
+        delta: i32,
+    },
     /// Actual primary-pointer transitions, before the separate click action.
     PointerButton {
         node: Option<usize>,
@@ -336,6 +345,8 @@ impl PageCmd {
         matches!(
             self,
             Self::Click(_)
+                | Self::NavigateFragment { .. }
+                | Self::TraverseHistory { .. }
                 | Self::PointerButton { .. }
                 | Self::Focus(_)
                 | Self::Key { .. }

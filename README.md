@@ -64,6 +64,11 @@ excludes browser chrome, GPU copies, and other page allocations. Reading it
 adds no background reporting, heap measurement, or refresh timer.
 Ctrl+L opens COMMAND with the current address selected.
 
+Links with `#section` fragments jump to the matching page section, including
+percent-encoded IDs and legacy named anchors. Desktop fragment navigation keeps
+the live page and its scripts running, updates the address, and supports
+Back/Forward with scroll restoration.
+
 ## JavaScript engine
 
 Lumen is the sole JavaScript engine for the terminal, desktop, and headless

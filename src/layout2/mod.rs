@@ -270,6 +270,9 @@ fn contains_css_percentage(value: &str) -> bool {
 pub struct GraphicalLayout {
     pub paint: crate::render::PagePaint,
     pub boxes: HashMap<NodeId, PxRect>,
+    /// Flow positions of empty inline boxes, including legacy named anchors.
+    /// These are laid entry marks, not positions reconstructed from painting.
+    pub(crate) inline_anchor_y: HashMap<NodeId, f32>,
     pub grid_tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     /// Actor ids of every laid independent formatting context that can safely
     /// be serialized as a width-stable subtree patch. Not every such boundary
@@ -420,6 +423,7 @@ impl GraphicalLayout {
     pub(crate) fn presentation_eq(&self, other: &Self) -> bool {
         self.paint == other.paint
             && self.boxes == other.boxes
+            && self.inline_anchor_y == other.inline_anchor_y
             && self.grid_tracks == other.grid_tracks
             && self.patch_boundaries == other.patch_boundaries
             && self.paint_boundaries == other.paint_boundaries
@@ -427,6 +431,22 @@ impl GraphicalLayout {
             && self.paint_cache.as_ref().map(|cache| &cache.terminal)
                 == other.paint_cache.as_ref().map(|cache| &cache.terminal)
     }
+}
+
+fn missing_inline_anchors(
+    anchors: &[(NodeId, f32)],
+    boxes: &HashMap<NodeId, PxRect>,
+) -> HashMap<NodeId, f32> {
+    let mut positions = HashMap::<NodeId, f32>::new();
+    for &(node, y) in anchors {
+        if !boxes.contains_key(&node) {
+            positions
+                .entry(node)
+                .and_modify(|top| *top = top.min(y))
+                .or_insert(y);
+        }
+    }
+    positions
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -589,6 +609,7 @@ pub fn lay_out_graphical(
         }
         GraphicalLayout {
             paint,
+            inline_anchor_y: missing_inline_anchors(&layout.anchors, &boxes),
             boxes,
             grid_tracks: layout.tracks,
             patch_boundaries,
@@ -606,6 +627,7 @@ fn empty_graphical_layout(viewport: Viewport) -> GraphicalLayout {
             ..Default::default()
         },
         boxes: HashMap::new(),
+        inline_anchor_y: HashMap::new(),
         grid_tracks: HashMap::new(),
         patch_boundaries: Vec::new(),
         paint_boundaries: Vec::new(),
@@ -642,6 +664,7 @@ pub(crate) fn paint_retained_layout(
     terminal.capture_page_media(dom, base, images);
     GraphicalLayout {
         paint,
+        inline_anchor_y: missing_inline_anchors(&fragments.anchors, &boxes),
         boxes,
         grid_tracks,
         patch_boundaries,
@@ -843,6 +866,7 @@ pub fn lay_graphical_subtree(
     );
     Some(GraphicalLayout {
         paint,
+        inline_anchor_y: missing_inline_anchors(&anchors, &boxes),
         boxes,
         grid_tracks: flow.grid_tracks.into_inner(),
         patch_boundaries,

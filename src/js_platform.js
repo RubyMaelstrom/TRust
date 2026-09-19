@@ -7450,7 +7450,13 @@
             // a new top-level traversable. Use the single available one.
             if (destination === undefined) destination = null;
         }
-        if (!destination) return url;
+        if (!destination) {
+            if (!realmRootFrame && url.includes("#") && withoutHash(url) === withoutHash(locState.href)) {
+                navigateLoc(url, false, false);
+                return null;
+            }
+            return url;
+        }
         try {
             destination.removeAttribute("srcdoc");
             destination.setAttribute("src", url);
@@ -9871,7 +9877,7 @@
         return i < 0 ? String(u) : String(u).slice(0, i);
     };
     const fireHashChange = (oldURL, newURL) => {
-        const ev = new Event("hashchange");
+        const ev = createTrustedEvent(HashChangeEvent, "hashchange", {});
         ev.oldURL = oldURL; ev.newURL = newURL;
         dispatch(g, ev, false);
     };
@@ -9888,7 +9894,14 @@
         // routers can deliberately suspend the old page until this completes.
         // The serializer preserves a bare '#' even though Location.hash is ''.
         if (p[0].includes("#") && withoutHash(old) === withoutHash(p[0])) {
-            if (old !== p[0]) fireHashChange(old, p[0]);
+            setLocParts(p);
+            if (old !== p[0]) {
+                const record = historyRecord(g.history);
+                record.state = null;
+                commitHistoryEntry(record, p[0], !!replace);
+                trust.historyUpdates.push({url:p[0], replace:!!replace});
+                __queue_dom_task(() => fireHashChange(old, p[0]));
+            }
             // Same document, only the fragment moved (or was re-set): HTML's
             // "navigate to a fragment" scrolls the indicated element into view.
             // Signal the app the new target (`""` = the top, for a bare URL /
@@ -9908,6 +9921,21 @@
         if (u === undefined || u === null) return;
         const p = __url_parse(String(u), locState.href);
         if (p) setLocParts(p);
+    };
+    trust.navigateFragment = function (url, replace) { navigateLoc(url, false, replace); };
+    trust.traverseHistory = function (url, delta) {
+        const old = locState.href, record = historyRecord(g.history);
+        record.index = Math.max(0, Math.min(record.entries.length - 1, record.index + delta));
+        const entry = record.entries[record.index];
+        record.state = entry && entry.url === url ? entry.state : null;
+        updateLoc(url);
+        __dom_fragment_target(url.includes('#') ? locState.hash.slice(1) : null);
+        const state = record.state;
+        __queue_dom_task(() => {
+            const event = createTrustedEvent(PopStateEvent, "popstate", {state});
+            dispatch(g, event, false);
+            if (old.slice(withoutHash(old).length) !== url.slice(withoutHash(url).length)) fireHashChange(old, url);
+        });
     };
     trust.replaceInitialDocument = function (frameId, url, referrer = "", contentType = "text/html", navigationTiming = null) {
         if (!realmRootFrame || Number(frameId) !== realmRootFrame.__id)
@@ -10023,7 +10051,38 @@
     };
     // The pending same-document fragment scroll (see `navigateLoc`). `undefined`
     // (no signal) → null; a string (possibly `""` for the top) → that target.
-    trust.takeScrollFragment = function () { const f = trust.scrollFragment; trust.scrollFragment = undefined; return f === undefined ? null : f; };
+    trust.takeScrollFragment = function () {
+        const fragment = trust.scrollFragment;
+        trust.scrollFragment = undefined;
+        if (fragment === undefined || fragment === null) return null;
+        // HTML #scroll-to-the-fragment-identifier: update :target, reveal
+        // enclosing details/hidden-until-found sections, then focus the target.
+        const id = __dom_fragment_target(fragment), target = id === null ? null : wrap(id);
+        if (target) {
+            const reveal = [];
+            for (let node = target; node; node = node.parentNode || node.host) {
+                if (node.nodeType !== 1) continue;
+                if ((node.getAttribute('hidden') || '').toLowerCase() === 'until-found') reveal.push([node, false]);
+                const parent = node.parentNode;
+                if (parent && parent.localName === 'details' && !parent.hasAttribute('open')
+                    && node !== parent.querySelector('summary')) reveal.push([parent, true]);
+            }
+            for (const [node, details] of reveal) {
+                if (!node.isConnected) break;
+                if (details) { if (node.hasAttribute('open')) break; node.setAttribute('open', ''); }
+                else {
+                    if ((node.getAttribute('hidden') || '').toLowerCase() !== 'until-found') break;
+                    dispatch(node, createTrustedEvent(Event, 'beforematch', {bubbles:true}), false);
+                    if (!node.isConnected || (node.getAttribute('hidden') || '').toLowerCase() !== 'until-found') break;
+                    node.removeAttribute('hidden');
+                }
+            }
+            if (elementCanFocus(target)) focusElement(target, {preventScroll:true});
+            else blurElement(focusedArea);
+        }
+        return fragment;
+    };
+    if (L[0].includes('#')) trust.scrollFragment = L[7].slice(1);
     // Host objects must NOT look like plain objects. Real browsers tag
     // them, so `Object.prototype.toString.call(window)` is "[object
     // Window]". Without this they read as "[object Object]", and a
@@ -10518,9 +10577,17 @@
             // for synthetic test realms whose configured URL failed parsing.
             if (!parsed) throw new DOMException("Invalid history state URL.", "SecurityError");
             record.state = state;
-            if (!replace) record.length += 1;
+            commitHistoryEntry(record, parsed[0], replace);
             record.commit(parsed, replace);
     };
+    function commitHistoryEntry(record, url, replace) {
+        if (!replace) {
+            record.entries.length = record.index + 1;
+            record.index++;
+        }
+        record.entries[record.index] = {url, state:record.state};
+        record.length = record.entries.length;
+    }
     const historyObject = {
         get length() { return activeHistoryRecord(this).length; },
         get state() { return activeHistoryRecord(this).state; },
@@ -10532,6 +10599,7 @@
     historySet(historyObject, {
         context: Number(cfg.hostSettingsContext) || 0,
         location: locState, length: 1, state: null,
+        index: 0, entries: [{url:locState.href, state:null}],
         baseURL() { return documentBaseURL(realmRootFrame); },
         clone(value) { return messageDeserialize(messageSerialize(value, true)); },
         commit(parsed, replace) {

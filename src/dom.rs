@@ -312,6 +312,8 @@ pub struct Dom {
     /// the layout side, so the `SPRITE_SHEETS` key matches). `None` = unknown
     /// (sprite refs then count as unrenderable, the conservative answer).
     doc_url: Option<url::Url>,
+    /// HTML #scroll-to-the-fragment-identifier, independent of history URL rewrites.
+    fragment_target: Option<NodeId>,
     /// Incremental layout (incremental-layout contract): the element nodes mutated
     /// since the last `take_dirty_targets`, with the kind of change. A mutation
     /// confined to a relayout boundary's subtree lets the app re-lay ONLY that
@@ -589,6 +591,7 @@ impl Dom {
             scroll_state,
             scroll_changes,
             doc_url,
+            fragment_target: _,
             dirty_nodes,
             dirty_attributed,
             hover_hosts,
@@ -976,6 +979,7 @@ impl Dom {
             scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
             doc_url: None,
+            fragment_target: None,
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
             hover_hosts: std::collections::HashSet::new(),
@@ -2109,6 +2113,21 @@ impl Dom {
 
     pub fn doc_url(&self) -> Option<&url::Url> {
         self.doc_url.as_ref()
+    }
+
+    pub(crate) fn set_fragment_target(&mut self, fragment: Option<&str>) -> Option<NodeId> {
+        let target = fragment.filter(|f| !f.is_empty()).and_then(|fragment| {
+            let targets = crate::fragment::targets(self);
+            targets
+                .get(fragment)
+                .or_else(|| targets.get(&crate::fragment::decode(fragment)))
+                .copied()
+        });
+        if self.fragment_target != target {
+            self.fragment_target = target;
+            self.touch_style();
+        }
+        target
     }
 
     /// Read a scroll metric (CSSOM View, px). `which`: 0=scrollTop, 1=scrollLeft,
@@ -8026,6 +8045,9 @@ impl Dom {
         if c.hover && !self.hover_chain.contains(&id) {
             return false;
         }
+        if c.target && self.fragment_target != Some(id) {
+            return false;
+        }
         // Live `:popover-open`: the element's popover is currently showing.
         // `set_popover_open` bumps the epoch, so the match memos stay fresh.
         if c.popover_open && !self.is_popover_showing(id) {
@@ -8720,6 +8742,7 @@ struct Compound {
     /// pointer (`Dom.hover_chain` — the committed hover target + its composed
     /// ancestors). Empty chain at rest ⇒ a bare `:hover` compound is inert.
     hover: bool,
+    target: bool,
     /// `:popover-open` (live): the element's popover must currently be
     /// showing (`Dom.popover_open`, written by the popover API syscall).
     popover_open: bool,
@@ -9034,6 +9057,7 @@ impl Compound {
             && self.has.is_empty()
             && !self.never
             && !self.hover
+            && !self.target
             && !self.popover_open
             && !self.scope
             && !self.root
@@ -9709,6 +9733,9 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // `:popover-open` rule is inert and `:not(:popover-open)`
                     // genuinely matches.
                     compound.popover_open = true;
+                    compound.pseudos += 1;
+                } else if name == "target" {
+                    compound.target = true;
                     compound.pseudos += 1;
                 } else if name == "hover" {
                     // LIVE `:hover`: matches the chain under the terminal's
@@ -11860,6 +11887,7 @@ impl Compound {
             selects,
             has,
             hover,
+            target: _,
             popover_open,
             never,
             never_unknown,

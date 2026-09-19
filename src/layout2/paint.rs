@@ -55,6 +55,7 @@ type TerminalPageMedia = (Link, Option<(String, f32, f32)>);
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TerminalPaintModel {
     nodes: Vec<TerminalNodePaint>,
+    fragment_targets: HashMap<String, NodeId>,
     links: HashMap<NodeId, Link>,
     has_editing_hosts: bool,
     page_media: Option<TerminalPageMedia>,
@@ -297,6 +298,7 @@ impl TerminalPaintModel {
         }
         Self {
             nodes,
+            fragment_targets: crate::fragment::targets(dom),
             has_editing_hosts: links.values().any(|link| matches!(link, Link::Form { .. })),
             links,
             page_media: None,
@@ -567,20 +569,9 @@ pub(crate) fn paint(
         rows.push(Row::default());
     }
     let mut anchor_rows: HashMap<String, usize> = HashMap::new();
-    let mut note = |name: &str, row: usize| {
-        anchor_rows
-            .entry(name.to_string())
-            .and_modify(|r| *r = (*r).min(row))
-            .or_insert(row);
-    };
-    for (&node, &row) in &node_rows {
-        if let Some(id) = dom.node(node).and_then(|node| node.id.as_deref()) {
-            note(id, row);
-        }
-        if dom.tag_name(node) == Some("a")
-            && let Some(name) = dom.node(node).and_then(|node| node.anchor_name.as_deref())
-        {
-            note(name, row);
+    for (name, node) in &dom.fragment_targets {
+        if let Some(&row) = node_rows.get(node) {
+            anchor_rows.insert(name.clone(), row);
         }
     }
     // The pinned layer: each fixed box paints through the same pipeline into
