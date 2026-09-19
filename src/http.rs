@@ -13575,6 +13575,92 @@ mod tests {
     /// A real module graph: page → entry module → static import →
     /// dynamic import, all fetched through our stack.
     #[tokio::test]
+    async fn import_maps_apply_to_parser_static_and_dynamic_module_graphs() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or("");
+                let (mime, body) = match path {
+                    "/page" => (
+                        "text/html",
+                        r#"<!doctype html><base href='/base/'><div id='result'></div>
+                        <script type='importmap'>{"imports":{"lib":"/wrong.js","blocked":null,"mismatch":"/bad.js"},"scopes":{"./":{"lib":"./lib.js"}},"integrity":{"/bad.js":"sha256-invalid"}}</script>
+                        <script>let map=document.createElement('script');map.type='importmap';map.textContent='{"imports":{"added":"/added.js"}}';document.head.appendChild(map);</script>
+                        <script type='module' src='main.js'></script>"#,
+                    ),
+                    "/base/main.js" => (
+                        "text/javascript",
+                        r#"import { value } from 'lib';
+                        const added=await import('added');let result='maps:'+value+':'+added.value;
+                        try {await import('blocked');result+=':bad';}catch(e){result+=':blocked';}
+                        try {await import('mismatch');result+=':bad';}catch(e){result+=':integrity';}
+                        document.getElementById('result').textContent=result;"#,
+                    ),
+                    "/base/lib.js" => ("text/javascript", "export const value=42;"),
+                    "/added.js" => ("text/javascript", "export const value='added';"),
+                    "/bad.js" => (
+                        "text/javascript",
+                        "throw new Error('integrity validation was skipped');",
+                    ),
+                    _ => ("text/plain", "unexpected request"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nConnection: close\r\n\r\n{body}"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let url = parse_url(&format!("http://{address}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let expected = "maps:42:added:blocked:integrity";
+        let mut html = String::from_utf8_lossy(&response.body).into_owned();
+        if !html.contains(expected) {
+            let live = response
+                .live
+                .as_mut()
+                .expect("module evaluation remains live");
+            html = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match live.events.recv().await {
+                        Some(crate::js::PageEvt::Updated { html, .. })
+                            if html.contains(expected) =>
+                        {
+                            break html;
+                        }
+                        Some(_) => {}
+                        None => panic!("import-map actor retired before completion"),
+                    }
+                }
+            })
+            .await
+            .expect("import-map graph timeout");
+        }
+        assert!(html.contains(expected), "{html}");
+        assert!(
+            response.js.as_ref().unwrap().errors.is_empty(),
+            "{:?}",
+            response.js.as_ref().unwrap().errors
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn module_graphs_load_over_the_network() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 

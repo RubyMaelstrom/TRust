@@ -72,6 +72,9 @@ bindings and the resident page actor live in `src/lumen_backend.rs` and the
 sibling Lumen checkout. This keeps DOM, networking, storage, workers, and
 rendering behavior shared by both frontends.
 
+Import maps resolve static and dynamic module imports, including scoped
+mappings, blocked specifiers, and integrity metadata.
+
 Number inputs provide desktop spin buttons and Up/Down keyboard stepping.
 The shared DOM implements `stepUp()`, `stepDown()`, and `valueAsNumber` for
 number, range, date, month, week, time, and datetime-local inputs, including

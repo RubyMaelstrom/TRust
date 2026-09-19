@@ -157,6 +157,7 @@ struct LumenDynamicModuleLoader {
     cookie_context: crate::http::CookieContext,
     events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     network: Option<LumenDynamicModuleNetwork>,
+    import_map: crate::import_maps::Handle,
 }
 
 struct LumenWebSockets {
@@ -259,6 +260,7 @@ struct HostState {
     image_bitmap_slots: Option<Value>,
     canvas_gradient_slots: Option<Value>,
     canvas_text_metrics_slots: Option<Value>,
+    import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
     history_slots: Option<Value>,
     navigator_slots: Option<Value>,
@@ -311,6 +313,7 @@ impl HostState {
             image_bitmap_slots: None,
             canvas_gradient_slots: None,
             canvas_text_metrics_slots: None,
+            import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
             history_slots: None,
             navigator_slots: None,
@@ -387,6 +390,7 @@ impl HostState {
             let handle = network.handle.clone();
             let cache = network.cache.clone();
             let fetched = network.fetched.clone();
+            let import_map = self.import_maps.get(&0).cloned().unwrap_or_default();
             engine.set_module_loader(move |specifier, referrer| {
                 module_dependency_loader(
                     &page,
@@ -394,6 +398,7 @@ impl HostState {
                     &handle,
                     &cache,
                     &fetched,
+                    Some(&import_map),
                     specifier,
                     referrer,
                 )
@@ -493,6 +498,7 @@ impl RetainedMemory for HostState {
             image_bitmap_slots,
             canvas_gradient_slots,
             canvas_text_metrics_slots,
+            import_maps,
             permission_slots,
             history_slots,
             navigator_slots,
@@ -784,6 +790,15 @@ impl RetainedMemory for HostState {
         }
         if let Some(value) = canvas_text_metrics_slots {
             visitor.value(value);
+        }
+        for map in import_maps.values() {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.import_map",
+                Arc::as_ptr(map) as usize,
+                map.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retained_bytes(),
+            ));
         }
         if let Some(value) = permission_slots {
             visitor.value(value);
@@ -2045,7 +2060,10 @@ mod desktop {
             };
             let module = ty.as_deref().is_some_and(|ty| ty.trim() == "module");
             let classic = is_classic(&ty);
-            if (!classic && !module)
+            let import_map = ty
+                .as_deref()
+                .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("importmap"));
+            if (!classic && !module && !import_map)
                 || (classic && page.dom.borrow().attr(node, "nomodule").is_some())
             {
                 continue;
@@ -2058,6 +2076,14 @@ mod desktop {
             )
             .is_some_and(|value| matches!(value, Value::Bool(true)));
             if !prepared {
+                continue;
+            }
+            if import_map {
+                let _ = host_run_injected_script(
+                    page.engine.ctx(),
+                    Value::Undefined,
+                    &[Value::Num(node as f64)],
+                );
                 continue;
             }
             if classic && src.is_none() {
@@ -6602,6 +6628,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         Ok(Ok(())) => {}
         Ok(Err(error)) | Err(error) => {
             if let Some(state) = ctx.host_mut::<HostState>() {
+                state.import_maps.remove(&context);
                 state.window_realms.remove(&context);
                 state.window_request_urls.remove(&context);
                 state.window_cookie_contexts.remove(&context);
@@ -6632,6 +6659,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         return Ok(Value::Bool(false));
     }
     if let Some(state) = ctx.host_mut::<HostState>() {
+        state.import_maps.remove(&context);
         state.window_realms.remove(&context);
         state.message_ports.release(Some(context));
         state.window_request_urls.remove(&context);
@@ -7045,6 +7073,38 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("module")),
         )
     };
+    if host_dom(ctx)
+        .borrow()
+        .attr(node_id, "type")
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"))
+    {
+        if src.is_some() {
+            queue_resource_error(
+                ctx,
+                node_id,
+                LumenResourceKind::ClassicScript,
+                String::new(),
+            );
+            return Ok(Value::Undefined);
+        }
+        let context = host_call_trust(ctx, "resourceClientContext", &[Value::Num(node_id as f64)])
+            .ok()
+            .and_then(|v| v.as_num_opt())
+            .unwrap_or(0.) as u64;
+        let base = host_call_trust(ctx, "resourceBaseURL", &[Value::Num(node_id as f64)])
+            .ok()
+            .and_then(|v| ctx.coerce_string(&v).ok())
+            .and_then(|s| url::Url::parse(&s).ok())
+            .unwrap_or_else(|| request_context_url(ctx, context));
+        match crate::import_maps::ImportMap::parse(&text, &base) {
+            Ok(map) => context_import_map(ctx, context)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .merge(map),
+            Err(e) => host_push_injected_error(ctx, format!("Import map: {e}")),
+        }
+        return Ok(Value::Undefined);
+    }
     let has_src = src.is_some();
     let src = host_resource_url(ctx, node_id, src);
     // HTML #prepare-the-script-element queues an error for an empty src;
@@ -7801,6 +7861,7 @@ fn eval_lumen_worker_module(
                 &loader_handle,
                 &loader_cache,
                 &loader_fetched,
+                None,
                 specifier,
                 referrer,
             )
@@ -8119,6 +8180,7 @@ fn run_lumen_worker(
 }
 
 fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
+    let import_map = context_import_map(engine.ctx(), context);
     let page = request_context_url(engine.ctx(), context);
     let cookie_context = cookie_context_for_id(engine.ctx(), context);
     let work = engine.ctx().host_mut::<HostState>().and_then(|state| {
@@ -8135,6 +8197,7 @@ fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
                 &handle,
                 &cache,
                 &fetched,
+                Some(&import_map),
                 specifier,
                 referrer,
             )
@@ -8142,22 +8205,51 @@ fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
     }
 }
 
+fn context_import_map(ctx: &mut Ctx, context: u64) -> crate::import_maps::Handle {
+    ctx.host_mut::<HostState>()
+        .expect("module host state")
+        .import_maps
+        .entry(context)
+        .or_default()
+        .clone()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn module_dependency_loader(
     page: &url::Url,
     cookie_context: &crate::http::CookieContext,
     handle: &tokio::runtime::Handle,
     cache: &Arc<crate::http::PageCache>,
     fetched: &std::sync::atomic::AtomicUsize,
+    import_map: Option<&crate::import_maps::Handle>,
     specifier: &str,
     referrer: &str,
 ) -> Option<(String, String)> {
-    let resolved = resolve_module_specifier(page, specifier, referrer)?;
+    let base = url::Url::parse(referrer).unwrap_or_else(|_| page.clone());
+    let resolved = if let Some(map) = import_map {
+        map.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(specifier, &base)?
+    } else {
+        resolve_module_specifier(page, specifier, referrer)?
+    };
+    let integrity = import_map
+        .map(|m| {
+            m.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .integrity(&resolved)
+                .to_owned()
+        })
+        .unwrap_or_default();
     if resolved.scheme() == "data" {
         let content_type = data_url_content_type(resolved.as_str());
         if !crate::http::module_script_response_allowed(200, &content_type) {
             return None;
         }
         let body = crate::img::decode_data_url(resolved.as_str())?;
+        if !crate::import_maps::integrity_matches(&integrity, &body) {
+            return None;
+        }
         return Some((
             resolved.to_string(),
             crate::http::decode_body(&content_type, &body),
@@ -8194,22 +8286,22 @@ fn module_dependency_loader(
         );
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     };
-    crate::http::module_script_response_allowed(response.status, &response.content_type).then(
-        || {
-            if !cookie_context.cross_site_ancestor && cache.claim_module_import_scan(&resolved) {
-                speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
-            }
-            (
-                resolved.to_string(),
-                crate::http::decode_body(&response.content_type, &response.body),
-            )
-        },
-    )
+    (crate::http::module_script_response_allowed(response.status, &response.content_type)
+        && crate::import_maps::integrity_matches(&integrity, &response.body))
+    .then(|| {
+        if !cookie_context.cross_site_ancestor && cache.claim_module_import_scan(&resolved) {
+            speculate_module_imports(page, handle, cache, fetched, &resolved, &response.body);
+        }
+        (
+            resolved.to_string(),
+            crate::http::decode_body(&response.content_type, &response.body),
+        )
+    })
 }
 
 /// Resolve a module specifier without an import map. HTML's resolve-a-module-specifier algorithm
 /// accepts URL-like specifiers here; a bare specifier is a failure rather than a path relative to
-/// the referrer. Import-map support can replace this boundary without changing either loader.
+/// the referrer. Workers use this URL-only path; Window loaders first apply their import map.
 fn resolve_module_specifier(page: &url::Url, specifier: &str, referrer: &str) -> Option<url::Url> {
     if !(specifier.starts_with('/')
         || specifier.starts_with("./")
@@ -8244,7 +8336,13 @@ fn queue_dynamic_module_load(
     specifier: &str,
     referrer: &str,
 ) {
-    let Some(resolved) = resolve_module_specifier(&loader.page, specifier, referrer) else {
+    let base = url::Url::parse(referrer).unwrap_or_else(|_| loader.page.clone());
+    let Some(resolved) = loader
+        .import_map
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resolve(specifier, &base)
+    else {
         let _ = loader.events.send(LumenHostTask::DynamicModule {
             context: loader.context,
             request_id,
@@ -8252,8 +8350,17 @@ fn queue_dynamic_module_load(
         });
         return;
     };
+    let integrity = loader
+        .import_map
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .integrity(&resolved)
+        .to_owned();
     if resolved.scheme() == "data" {
-        let result = data_dynamic_module_result(&resolved);
+        let result = data_dynamic_module_result(&resolved).filter(|_| {
+            crate::img::decode_data_url(resolved.as_str())
+                .is_some_and(|bytes| crate::import_maps::integrity_matches(&integrity, &bytes))
+        });
         let _ = loader.events.send(LumenHostTask::DynamicModule {
             context: loader.context,
             request_id,
@@ -8311,13 +8418,14 @@ fn queue_dynamic_module_load(
     let context = loader.context;
     network.cache.spawn(&network.handle, async move {
         let result = shared.await.ok().and_then(|response| {
-            crate::http::module_script_response_allowed(response.status, &response.content_type)
-                .then(|| {
-                    (
-                        resolved.to_string(),
-                        crate::http::decode_body(&response.content_type, &response.body),
-                    )
-                })
+            (crate::http::module_script_response_allowed(response.status, &response.content_type)
+                && crate::import_maps::integrity_matches(&integrity, &response.body))
+            .then(|| {
+                (
+                    resolved.to_string(),
+                    crate::http::decode_body(&response.content_type, &response.body),
+                )
+            })
         });
         let _ = events.send(LumenHostTask::DynamicModule {
             context,
@@ -8531,6 +8639,15 @@ fn run_injected_module_task(
     name: &str,
     source: &str,
 ) -> Result<(), String> {
+    let context = host_call_trust(
+        engine.ctx(),
+        "resourceClientContext",
+        &[Value::Num(node_id as f64)],
+    )
+    .ok()
+    .and_then(|v| v.as_num_opt())
+    .unwrap_or(0.) as u64;
+    let import_map = context_import_map(engine.ctx(), context);
     let cookie_context = element_cookie_context(engine.ctx(), node_id);
     let client = element_request_client_url(engine.ctx(), node_id);
     let snapshot = engine.ctx().host_mut::<HostState>().and_then(|state| {
@@ -8566,6 +8683,7 @@ fn run_injected_module_task(
                             &handle,
                             &cache,
                             &fetched,
+                            Some(&import_map),
                             specifier,
                             referrer,
                         )
@@ -8647,6 +8765,23 @@ fn run_resource_task(
             {
                 let import_base = url::Url::parse(&name)
                     .unwrap_or_else(|_| url::Url::parse(&state_base(engine.ctx())).unwrap());
+                let context = engine.ctx().host_job_context();
+                let map = context_import_map(engine.ctx(), context);
+                let metadata = host_dom(engine.ctx())
+                    .borrow()
+                    .attr(node_id, "integrity")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        map.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .integrity(&import_base)
+                            .to_owned()
+                    });
+                if !crate::import_maps::integrity_matches(&metadata, &body) {
+                    fire_engine_script_event(engine, node_id, "error");
+                    return Ok(());
+                }
                 speculate_engine_imports(engine, &import_base, &body);
                 let source = crate::http::decode_body(&content_type, &body);
                 run_injected_module_task(engine, node_id, &name, &source)?;
@@ -8908,6 +9043,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     page,
                     cookie_context,
                     events,
+                    import_map: state.import_maps.entry(context).or_default().clone(),
                     network: state
                         .network
                         .as_ref()

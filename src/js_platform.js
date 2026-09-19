@@ -379,12 +379,12 @@
     function maybeRunScript(node) {
         if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node.__id)) return;
         const ty = (node.getAttribute("type") || "").trim().toLowerCase();
-        if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript" && ty !== "module") return;
+        if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript" && ty !== "module" && ty !== "importmap") return;
         // A classic script carrying `nomodule` is skipped: it exists only for
         // user agents WITHOUT module support, and we run module scripts (HTML
         // §"prepare the script element"). Letting it run loads the legacy
         // polyfill bundle a real browser never executes.
-        if (node.hasAttribute("nomodule")) return;
+        if (ty!=="module"&&ty!=="importmap"&&node.hasAttribute("nomodule")) return;
         // Only a script connected to the document runs (not one built up inside
         // a detached fragment, which executes when ITS root is later inserted).
         let n = node, connected = false;
@@ -7354,6 +7354,7 @@
         const p = __url_parse(raw, nodeBaseHref(node));
         return p ? p[0] : raw;
     }
+    trust.resourceBaseURL = function (nodeId) {return nodeBaseHref(wrap(nodeId));};
     trust.resourceURL = function (nodeId) { return frameResourceURL(wrap(nodeId)); };
     trust.resourceClientContext = function (nodeId) {
         const frame = frameOwnerForNode(wrap(nodeId));
@@ -7880,6 +7881,7 @@
                     const script = scripts[index];
                     if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id)) continue;
                     const type = (script.getAttribute("type") || "").trim().toLowerCase();
+                    if (type === "importmap") {maybeRunScript(script);continue;}
                     const module = type === "module";
                     if (!module && type && type !== "text/javascript" && type !== "application/javascript" &&
                         type !== "text/ecmascript") continue;
@@ -7922,8 +7924,9 @@
             if (!needsResourceTasks) {
                 for (const script of scripts) {
                     if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id) ||
-                        script.hasAttribute('nomodule')) continue;
+                        (script.hasAttribute('nomodule')&&(script.getAttribute('type')||'').trim().toLowerCase()!=='importmap')) continue;
                     const type = (script.getAttribute('type') || '').trim().toLowerCase();
+                    if(type==='importmap') {maybeRunScript(script);continue;}
                     if (type && type !== 'text/javascript' && type !== 'application/javascript' &&
                         type !== 'text/ecmascript') continue;
                     runInline(script);
