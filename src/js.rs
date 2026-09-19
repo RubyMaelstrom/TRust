@@ -568,6 +568,14 @@ impl Drop for PageHandle {
     }
 }
 
+/// Finish resident page cleanup before the process unloads native GPU drivers.
+/// Call once at process shutdown, after dropping the frontend's page handles
+/// and event receivers. Keep the network runtime alive to service cancellation.
+/// Further page actors are rejected; ordinary navigation remains asynchronous.
+pub fn shutdown_page_threads() {
+    crate::page_threads::shutdown();
+}
+
 pub fn spawn_page(
     html: String,
     env: PageEnv,

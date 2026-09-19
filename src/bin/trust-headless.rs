@@ -231,7 +231,9 @@ fn try_run(options: Options) -> Result<bool, Box<dyn Error>> {
         .enable_all()
         .thread_name("trust-headless-net")
         .build()?;
-    runtime.block_on(navigate_and_settle(&options))
+    let outcome = runtime.block_on(navigate_and_settle(&options));
+    trust::js::shutdown_page_threads();
+    outcome
 }
 
 /// Drive one navigation to a settled page and print it.

@@ -138,6 +138,7 @@ async fn main() -> ExitCode {
     );
     pop_terminal_title();
     ratatui::restore();
+    trust::js::shutdown_page_threads();
     if let Err(error) = trust::site_storage::shutdown() {
         eprintln!("trust: {error}");
     }
