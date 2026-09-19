@@ -106,9 +106,9 @@
     // map, not the timer task source. `q` preserves insertion order; `deadline`
     // represents the next rendering opportunity selected by the host.
     const animationFrames = { q: [], deadline: null };
-    // The absolute epoch the virtual clock is anchored to — the REAL host
-    // time at prelude boot (the Rust clock answers real time until the first
-    // __clockSync). Every `timers.now` advance re-anchors the Rust clock.
+    // The absolute epoch at prelude boot. Rust keeps the shared monotonic
+    // clock; synchronization can only advance it for one-shot snapshots.
+    // Stale timer samples must not shift it behind native fetch timestamps.
     const __epoch0 = Date.now();
     const navigationFloorTime = Math.floor;
     const __clockNow = typeof __clock_now === "function" ? __clock_now : Date.now;
@@ -17521,8 +17521,10 @@
     const nativeOrigin = typeof navigationOrigin === 'number' && finite(navigationOrigin) && navigationOrigin > 0
         ? navigationOrigin : oldPerformance.timeOrigin;
     const oldNow = oldPerformance.now, clockOrigin = oldPerformance.timeOrigin;
-    let nowOffset = clockOrigin - nativeOrigin;
-    const clockTimestamp = time => floor((time + nowOffset) * 10) / 10;
+    // HR-Time #dfn-relative-high-resolution-time: coarsen the shared moment
+    // before subtracting the origin, as native Resource Timing does. Rounding
+    // the relative duration instead can put a completed fetch ahead of now().
+    const clockTimestamp = time => floor((time + clockOrigin) * 10) / 10 - owner.timeOrigin;
     const worker = typeof g.document === 'undefined', host = worker ? g.__wkr : g.__trust;
     const timingNames = ['navigationStart','unloadEventStart','unloadEventEnd','redirectStart','redirectEnd',
         'fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',
@@ -18028,7 +18030,6 @@
         // initial-about:blank exception that reuses the Window and Realm.
         if (typeof data.timeOrigin === 'number' && finite(data.timeOrigin) && data.timeOrigin > 0) {
             owner.timeOrigin = data.timeOrigin;
-            nowOffset = clockOrigin - owner.timeOrigin;
         }
         const entry = create(PerformanceNavigationTiming.prototype);
         const state = {kind:'navigation',name:data.name,startTime:0,duration:0,type:data.type || 'navigate'};
