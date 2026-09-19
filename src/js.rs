@@ -626,7 +626,11 @@ fn wrapped_platform_block(begin: &str, end: &str) -> String {
 }
 
 const WORKER_SCOPE: &str = include_str!("js_worker.js");
-pub(crate) const PRELUDE: &str = include_str!("js_platform.js");
+pub(crate) const PRELUDE: &str = concat!(
+    include_str!("js_webgl.js"),
+    "\n",
+    include_str!("js_platform.js")
+);
 
 pub(crate) fn decode_history_updates(json: &str) -> Vec<(String, bool)> {
     let Ok(serde_json::Value::Array(updates)) = serde_json::from_str(json) else {

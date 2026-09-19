@@ -232,6 +232,7 @@ pub(crate) struct Canvas {
     pub height: u32,
     pub alpha: bool,
     pub origin_clean: bool,
+    pub webgl: bool,
     /// Captured at Realm bootstrap, independent of author-controlled <base>.
     pub document_origin: String,
     pub state: State,
@@ -241,6 +242,7 @@ pub(crate) struct Canvas {
     start: Option<Point>,
     bitmap: Option<sk::Pixmap>,
     presentation: Option<crate::render::CanvasImage>,
+    webgl_front: Option<crate::render::CanvasImage>,
     image_handle: crate::render::ImageHandle,
     bitmap_revision: u64,
     pub generation: u64,
@@ -253,6 +255,7 @@ impl Canvas {
             height,
             alpha,
             origin_clean: true,
+            webgl: false,
             document_origin: String::new(),
             state: State::default(),
             stack: Vec::new(),
@@ -261,6 +264,7 @@ impl Canvas {
             start: None,
             bitmap: None,
             presentation: None,
+            webgl_front: None,
             image_handle: crate::render::ImageHandle::for_canvas(),
             bitmap_revision: 0,
             generation: 0,
@@ -274,6 +278,7 @@ impl Canvas {
         self.height = height;
         self.bitmap = None;
         self.presentation = None;
+        self.webgl_front = None;
         self.bitmap_revision = self.bitmap_revision.wrapping_add(1);
         self.origin_clean = true;
         self.state = State::default();
@@ -315,6 +320,11 @@ impl Canvas {
             + self
                 .presentation
                 .as_ref()
+                .map_or(0, crate::render::CanvasImage::retained_bytes)
+            + self
+                .webgl_front
+                .as_ref()
+                .filter(|front| self.presentation.as_ref().is_none_or(|back| *front != back))
                 .map_or(0, crate::render::CanvasImage::retained_bytes)
             + std::mem::size_of_val(self.path.elements())
             + self.stack.capacity() * std::mem::size_of::<State>()
@@ -1013,6 +1023,23 @@ impl Canvas {
         self.bitmap.clone()
     }
 
+    pub(crate) fn publish_webgl(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        present: bool,
+    ) {
+        self.width = width;
+        self.height = height;
+        self.bitmap =
+            sk::IntSize::from_wh(width, height).and_then(|size| sk::Pixmap::from_vec(pixels, size));
+        self.changed();
+        if present {
+            self.webgl_front = self.backing_image();
+        }
+    }
+
     pub fn get_converted(
         &self,
         x: i64,
@@ -1123,6 +1150,12 @@ impl Canvas {
     }
 
     pub(crate) fn image(&mut self) -> Option<crate::render::CanvasImage> {
+        // WebGL §2.2: clearing an unpreserved drawing buffer after presentation
+        // does not clear the frame that the compositor is currently displaying.
+        self.webgl_front.clone().or_else(|| self.backing_image())
+    }
+
+    fn backing_image(&mut self) -> Option<crate::render::CanvasImage> {
         if let Some(image) = &self.presentation {
             return Some(image.clone());
         }
@@ -1143,7 +1176,7 @@ impl Canvas {
     }
 
     pub fn data_url(&mut self) -> String {
-        self.image()
+        self.backing_image()
             .and_then(|image| image.data_url())
             .unwrap_or_else(|| "data:,".into())
     }

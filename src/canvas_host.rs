@@ -66,9 +66,19 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         None
     };
     let dom = host_dom(ctx);
-    let mut dom = dom.borrow_mut();
-    let id = host_arg_node(&dom, args, 0)
+    let id = host_arg_node(&dom.borrow(), args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "Invalid canvas"))?;
+    let readback = if matches!(op.as_str(), "url" | "snapshot") {
+        Some(id)
+    } else if op == "draw" && loaded_image.is_none() {
+        n.first().map(|n| *n as usize)
+    } else {
+        None
+    };
+    if let Some(source) = readback {
+        super::webgl_host::publish(ctx, false, Some(source));
+    }
+    let mut dom = dom.borrow_mut();
     let (width, height) = dom
         .canvas_size(id)
         .ok_or_else(|| ctx.make_error("TypeError", "Invalid canvas"))?;
@@ -117,6 +127,9 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     }
     if op == "init" {
         let mut canvases = dom.canvases.borrow_mut();
+        if canvases.get(&id).is_some_and(|canvas| canvas.webgl) {
+            return Ok(Value::Bool(false));
+        }
         if let std::collections::hash_map::Entry::Vacant(entry) = canvases.entry(id) {
             let Some(mut canvas) =
                 Canvas::new(width, height, n.first().copied().unwrap_or(1.) != 0.)
