@@ -865,26 +865,31 @@ impl HostGc for HostState {
 }
 
 struct RealmClock {
-    epoch_ms: Cell<f64>,
-    anchored_at: Cell<Instant>,
+    origin_ms: f64,
+    offset_ms: Cell<f64>,
 }
 
 impl RealmClock {
     fn new() -> Self {
-        let epoch_ms = crate::performance::now_ms();
         Self {
-            epoch_ms: Cell::new(epoch_ms),
-            anchored_at: Cell::new(Instant::now()),
+            origin_ms: crate::performance::now_ms(),
+            offset_ms: Cell::new(0.0),
         }
     }
 
     fn now_ms(&self) -> f64 {
-        self.epoch_ms.get() + self.anchored_at.get().elapsed().as_secs_f64() * 1000.0
+        crate::performance::now_ms() + self.offset_ms.get()
     }
 
     fn set_epoch_ms(&self, epoch_ms: f64) {
-        self.epoch_ms.set(epoch_ms);
-        self.anchored_at.set(Instant::now());
+        // HR-Time #dfn-unsafe-shared-current-time: ordinary execution keeps
+        // exactly the same clock as native fetch measurements. A timer sample
+        // (including Date's truncated bootstrap value) must never rewind it.
+        // Only explicit one-shot fast-forwarding adds a persistent offset.
+        if epoch_ms.is_finite() {
+            let offset = epoch_ms - crate::performance::now_ms();
+            self.offset_ms.set(self.offset_ms.get().max(offset));
+        }
     }
 }
 
@@ -7948,7 +7953,7 @@ fn run_lumen_worker(
             .unwrap_or(8),
         crate::http::GLOBAL_PRIVACY_CONTROL,
         launch.secure_context,
-        clock.epoch_ms.get(),
+        clock.origin_ms,
     );
     for platform in [false, true] {
         let setup = if platform {
@@ -15245,7 +15250,7 @@ mod tests {
         // HTML #run-a-worker. Local September 6, 2026 snapshots (HR-Time 1f0b9fa).
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let clock = Rc::new(RealmClock::new());
-            let origin = clock.epoch_ms.get();
+            let origin = clock.origin_ms;
             let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
             let mut engine = lumen::Engine::new();
             engine.set_wall_clock(move || clock.now_ms());
@@ -21957,6 +21962,67 @@ mod tests {
             string_value(
                 &mut engine,
                 "performanceMarkWeak.deref() === undefined && performanceDetailWeak.deref() === undefined && performanceObserverWeak.deref() === undefined"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn performance_clock_synchronization_never_rewinds_shared_time() {
+        // HR-Time #now-method / #dfn-unsafe-shared-current-time: the native
+        // fetch clock and the realm clock must keep the same monotonic source.
+        // A sampled timer deadline can already be stale when it reaches Rust.
+        let clock = RealmClock::new();
+        let sampled = crate::performance::now_ms();
+        clock.set_epoch_ms(sampled - 100.0);
+        assert!(
+            clock.now_ms() >= sampled,
+            "stale synchronization rewound time"
+        );
+        let advanced = sampled + 10_000.0;
+        clock.set_epoch_ms(advanced);
+        assert!(clock.now_ms() >= advanced, "one-shot advancement was lost");
+        clock.set_epoch_ms(sampled);
+        clock.set_epoch_ms(f64::NAN);
+        clock.set_epoch_ms(f64::INFINITY);
+        let after = clock.now_ms();
+        assert!(after.is_finite() && after >= advanced);
+    }
+
+    #[test]
+    fn performance_clock_and_fetch_timestamps_coarsen_before_origin_subtraction() {
+        // HR-Time #dfn-relative-high-resolution-time coarsens the shared
+        // moment before subtracting the origin. Resource Timing's
+        // #dfn-convert-fetch-timestamp uses the very same coarse moment.
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            r#"
+                __clock_now = () => 10000.29;
+                __clock_set = () => {};
+                Date.now = () => 10000;
+                __trust_cfg.navigationTiming = {name: 'https://example.org/', timeOrigin: 9999.1};
+            "#,
+            "fixed shared clock",
+        )
+        .unwrap();
+        eval_platform_prelude(&mut engine).unwrap();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    __trust.recordResourceTiming({name: 'https://example.org/resource',
+                        startTime: 10000.1, responseEnd: 10000.2});
+                    const entry = performance.getEntriesByType('resource')[0];
+                    return performance.now() === 10000.2 - performance.timeOrigin &&
+                        entry.responseEnd === performance.now();
+                })()"#
             ),
             "true"
         );
