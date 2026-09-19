@@ -40,6 +40,7 @@ pub mod render;
 pub mod responsive_image;
 pub mod site_storage;
 pub mod storage;
+mod webgl;
 
 // These are the existing engine modules. They are declared exactly once here;
 // binaries import this library rather than compiling private copies with `mod`.

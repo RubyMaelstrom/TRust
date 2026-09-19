@@ -1,0 +1,48 @@
+[package]
+name = "glsl-lang-pp"
+version = "0.8.1"
+authors = ["Alixinne <alixinne@pm.me>"]
+edition = "2021"
+license = "BSD-3-Clause"
+description = "GLSL language preprocessor"
+homepage = "https://github.com/alixinne/glsl-lang"
+documentation = "https://docs.rs/glsl-lang/"
+repository = "https://github.com/alixinne/glsl-lang"
+readme = "README.md"
+keywords = ["glsl", "language", "preprocessor"]
+categories = ["parser-implementations", "rendering"]
+build = "build.rs"
+rust-version = "1.82.0"
+
+[dependencies]
+lang-util = "=0.8.1"
+
+string_cache = "0.8"
+thiserror = "2.0"
+arrayvec = "0.7"
+derive_more = { version = "2.0", features = ["display"] }
+
+# Preprocessor
+rowan = { version = "0.16", optional = true }
+cbitset = { version = "0.2", optional = true }
+static_assertions = { version = "1.1", optional = true }
+bimap = { version = "0.6", optional = true }
+itertools = { version = "0.14", optional = true }
+
+# Extension registry
+once_cell = { version = "1.21.3", optional = true }
+
+[dev-dependencies]
+lang-util-dev = "=0.8.1"
+
+expect-test = "1.5"
+encoding_rs = "0.8"
+regex = "1.11"
+
+[build-dependencies]
+string_cache_codegen = "0.5"
+
+[features]
+default = []
+exts = ["once_cell"]
+full = ["exts", "rowan", "cbitset", "static_assertions", "bimap", "itertools"]

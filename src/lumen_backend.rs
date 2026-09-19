@@ -27,6 +27,8 @@ mod image_host;
 mod lumen_wasm;
 #[path = "message_port_host.rs"]
 mod message_port_host;
+#[path = "webgl_host.rs"]
+mod webgl_host;
 
 const DEFAULT_URL: &str = "https://example.com/";
 const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
@@ -260,6 +262,9 @@ struct HostState {
     image_bitmap_slots: Option<Value>,
     canvas_gradient_slots: Option<Value>,
     canvas_text_metrics_slots: Option<Value>,
+    canvas_context_slots: Option<Value>,
+    webgl_slots: Option<Value>,
+    webgl: HashMap<usize, crate::webgl::Context>,
     import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
     history_slots: Option<Value>,
@@ -313,6 +318,9 @@ impl HostState {
             image_bitmap_slots: None,
             canvas_gradient_slots: None,
             canvas_text_metrics_slots: None,
+            canvas_context_slots: None,
+            webgl_slots: None,
+            webgl: HashMap::new(),
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
             history_slots: None,
@@ -498,6 +506,9 @@ impl RetainedMemory for HostState {
             image_bitmap_slots,
             canvas_gradient_slots,
             canvas_text_metrics_slots,
+            canvas_context_slots,
+            webgl_slots,
+            webgl,
             import_maps,
             permission_slots,
             history_slots,
@@ -791,6 +802,9 @@ impl RetainedMemory for HostState {
         if let Some(value) = canvas_text_metrics_slots {
             visitor.value(value);
         }
+        for value in [canvas_context_slots, webgl_slots].into_iter().flatten() {
+            visitor.value(value);
+        }
         for map in import_maps.values() {
             visitor.allocation(RetainedManagedAllocation::new(
                 "trust.import_map",
@@ -798,6 +812,17 @@ impl RetainedMemory for HostState {
                 map.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .retained_bytes(),
+            ));
+        }
+        if !webgl.is_empty() {
+            visitor.opaque_storage(); // Driver CPU/GPU allocations are external.
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.webgl",
+                webgl as *const _ as usize,
+                webgl
+                    .values()
+                    .map(crate::webgl::Context::retained_bytes)
+                    .sum(),
             ));
         }
         if let Some(value) = permission_slots {
@@ -1139,7 +1164,15 @@ fn platform_prelude() -> &'static str {
     OVERRIDE
         .get_or_init(|| {
             std::env::var_os("TRUST_PRELUDE_FILE")
-                .map(|path| std::fs::read_to_string(path).ok())
+                .map(|path| {
+                    std::fs::read_to_string(path).ok().map(|source| {
+                        if source.contains("globalThis.__trust_install_webgl =") {
+                            source
+                        } else {
+                            format!("{}\n{source}", include_str!("js_webgl.js"))
+                        }
+                    })
+                })
                 .unwrap_or(None)
         })
         .as_deref()
@@ -2638,6 +2671,7 @@ mod desktop {
     }
 
     fn extract_live(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        webgl_host::publish(page.engine.ctx(), true, None);
         prime_page_svg_sprites(page);
         let clickable_listeners = listener_ids(page, "clickables");
         let hover_listeners = listener_ids(page, "hoverables");
@@ -5310,6 +5344,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__element_slots", 1, host_element_slots),
     ("__pointer_event_slots", 1, host_pointer_event_slots),
     ("__canvas_2d", 4, canvas_host::call),
+    ("__webgl", 4, webgl_host::call),
     ("__dom_create_element", 1, host_create_element),
     ("__dom_create_element_ns", 3, host_create_element_ns),
     ("__dom_create_text", 1, host_create_text),
@@ -12093,7 +12128,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 152, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 153, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -12104,7 +12139,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 152);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 153);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -12508,6 +12543,70 @@ mod tests {
             catch(e) { rejected = e.name === 'TypeError'; }
             if (!rejected) throw Error('forged metric accepted');
         "#, "cross-Realm canvas metrics").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an installed EGL/GLES driver"]
+    fn webgl_native_pixels_and_api_conformance() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/webgl_pixels.mjs"),
+                "WebGL pixels",
+            )
+            .unwrap();
+            assert!(
+                matches!(value, Value::Str(ref text) if text.as_ref() == "webgl-pixels-ok"),
+                "{tier:?}"
+            );
+            for _ in 0..4 {
+                eval(
+                    &mut engine,
+                    "__trust.tickTo(__trust.now()+50)",
+                    "WebGL event tasks",
+                )
+                .unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(string_value(&mut engine, "webglRestored"), "ok", "{tier:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an installed EGL/GLES driver"]
+    fn webgl_readback_preserves_the_presented_frame() {
+        let mut engine = platform_engine();
+        eval(&mut engine,"const c=document.createElement('canvas');c.width=2;c.height=2;const gl=c.getContext('webgl');gl.clearColor(1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);","draw frame").unwrap();
+        let (id, dom) = {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            (*state.webgl.keys().next().unwrap(), state.dom.clone())
+        };
+        webgl_host::publish(engine.ctx(), true, None);
+        let first = dom.borrow().canvas_image(id).unwrap();
+        assert_eq!(&first.image.rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "(()=>{c.toDataURL();const copy=document.createElement('canvas');const two=copy.getContext('2d');two.drawImage(c,0,0);return Array.from(two.getImageData(0,0,1,1).data).join(',');})()"
+            ),
+            "0,0,0,0"
+        );
+        webgl_host::publish(engine.ctx(), true, None);
+        let second = dom.borrow().canvas_image(id).unwrap();
+        assert_eq!(
+            first, second,
+            "readback cannot replace the composited frame"
+        );
+        assert_eq!(&second.image.rgba[..4], &[255, 0, 0, 255]);
+        eval(&mut engine, "c.width=2;", "resize canvas").unwrap();
+        webgl_host::publish(engine.ctx(), true, None);
+        assert_eq!(
+            &dom.borrow().canvas_image(id).unwrap().image.rgba[..4],
+            &[0, 0, 0, 0]
+        );
     }
 
     #[test]

@@ -5109,7 +5109,40 @@
     const canvasNative = g.__canvas_2d;
     const canvasRealmOrigin = (__url_parse(cfg.url, null) || [])[8] || "null";
     delete g.__canvas_2d;
-    const canvasContexts = new WeakMap(), canvasOwners = new WeakMap(), canvasOptions = new WeakMap();
+    const canvasOwners = new WeakMap(), canvasOptions = new WeakMap();
+    const bitmapNativeForCanvas = g.__image_bitmap_binding;
+    const webglAPI = g.__trust_install_webgl(g, {
+        Event,
+        queue(fn) { imageTask(fn,0); },
+        fire(canvas,C,type,message) {const event=createTrustedEvent(C,type,{cancelable:true,statusMessage:message});dispatch(canvas,event,false);return event.defaultPrevented;},
+        identity: elementIdentity,
+        origin: canvasRealmOrigin,
+        source(image) {
+            const bitmap = bitmapAPI.state(image);
+            let record, half=0, space=0;
+            if (bitmap) {
+                if (bitmap.detached) throw new DOMException("Detached ImageBitmap", "InvalidStateError");
+                record=bitmap.record;
+            } else if (htmlElementName(image)==="canvas") {
+                record=canvasNative(elementIdentity(image),"snapshot",[]);
+            } else {
+                const state=imageState(image);
+                if (state) {
+                    if (state.broken) throw new DOMException("Broken texture image", "InvalidStateError");
+                    record=state.current;
+                } else {
+                    const state=canvasImageState(image),format=canvasImageFormat(state);
+                    half=format[0];space=format[1];record=[state.width,state.height,state.data,true,1,false];
+                }
+            }
+            if(!record||!record[0]||!record[1])return null;
+            if(!record[3])return {clean:false};
+            if(!bitmap&&(half||space||record[5]))record=bitmapNativeForCanvas("raw",[record[0],record[1],half,space,+!!record[5],0,0,NaN,NaN,NaN,NaN,0,0,0],record[2]);
+            return record&&{width:record[0],height:record[1],data:record[2],clean:record[3],bitmap:!!bitmap};
+        }
+    });
+    delete g.__trust_install_webgl;
+    const canvasContexts = webglAPI.contexts;
     const canvasPaths = new WeakMap(), canvasJSON = JSON.stringify;
     const canvasApply = Reflect.apply, canvasGet = WeakMap.prototype.get;
     const canvasSet = WeakMap.prototype.set, canvasPush = Array.prototype.push;
@@ -5483,9 +5516,12 @@
         set height(value) { this.setAttribute("height",String(value >>> 0)); }
         getContext(kind, options = undefined) {
             if (arguments.length < 1) throw new TypeError("Missing context kind");
-            if (`${kind}` !== "2d") return null;
+            kind=`${kind}`;
+            if(kind==="experimental-webgl")kind="webgl";
+            if(kind!=="2d"&&kind!=="webgl")return null;
             const old = canvasApply(canvasGet,canvasContexts,[this]);
-            if (old) return old;
+            if (old) return (webglAPI.is(old)?"webgl":"2d")===kind?old:null;
+            if(kind==="webgl")return webglAPI.create(this,options);
             if (options != null && typeof options !== "object" && typeof options !== "function") throw new TypeError("Expected context settings");
             options = options || {};
             const alphaValue = options.alpha, alpha = alphaValue === undefined ? true : !!alphaValue;
@@ -9537,17 +9573,9 @@
             g[__cn] = __C;
         }
     }
-    // WebGL interface objects. We have no GPU, so canvas.getContext('webgl'|
-    // 'webgl2') returns null (HTMLCanvasElement above) — EXACTLY a browser with
-    // WebGL blocklisted / hardware acceleration off. But the interface objects
-    // themselves still exist on a modern browser regardless of whether a context
-    // can be obtained, and feature-detection reads `'WebGLRenderingContext' in
-    // window`; omitting them reads as "a browser too old to know WebGL" instead
-    // of the truthful "modern browser, WebGL unavailable on this machine". They
-    // are non-constructible interface objects, so call/`new` throws a TypeError
-    // ("Illegal constructor"), matching the platform. We expose NO context and
-    // NO renderer string — that fabricated fingerprint surface stays absent.
-    for (const __n of ["WebGLRenderingContext", "WebGL2RenderingContext"]) {
+    // The WebGL 2 interface remains non-constructible; unsupported context kinds
+    // return null so content can select the implemented WebGL 1 API.
+    for (const __n of ["WebGL2RenderingContext"]) {
         const __C = function () { throw new TypeError("Illegal constructor"); };
         try { Object.defineProperty(__C, "name", { value: __n }); } catch (e) {}
         g[__n] = __C;

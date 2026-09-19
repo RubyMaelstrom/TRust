@@ -1,0 +1,128 @@
+(() => {
+    const check = (value, message) => { if (!value) throw Error(message); };
+    const same = (actual, expected, message) => check(JSON.stringify(Array.from(actual)) === JSON.stringify(expected), message + ': ' + Array.from(actual));
+    const canvas = document.createElement('canvas'); canvas.width = 4; canvas.height = 4;
+    const gl = canvas.getContext('webgl', {preserveDrawingBuffer:true, antialias:false});
+    check(gl, 'WebGL context');
+    check(canvas.getContext('experimental-webgl') === gl, 'context alias');
+    check(canvas.getContext('2d') === null && gl.canvas === canvas, 'context mode and canvas');
+    let rejected = false; try { new WebGLRenderingContext(); } catch (e) { rejected = e instanceof TypeError; }
+    check(rejected, 'illegal constructor');
+    check(Object.getOwnPropertyDescriptor(WebGLShaderPrecisionFormat.prototype,'precision').enumerable,'IDL attribute descriptor');
+    let laterMember=false;try{document.createElement('canvas').getContext('webgl',{powerPreference:'invalid',get premultipliedAlpha(){laterMember=true;}});}catch(e){check(e instanceof TypeError,'dictionary enum conversion');}
+    check(!laterMember,'dictionary conversion stops at the failing member');
+    same(gl.getParameter(gl.VIEWPORT), [0,0,4,4], 'initial viewport');
+    const pixel = new Uint8Array(4);
+    gl.clearColor(1,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);
+    same(pixel,[255,0,0,255],'clear and read');
+    check(gl.getError() === gl.NO_ERROR, 'clear error');
+    gl.uniformMatrix2fv(null,true,[]);check(gl.getError()===gl.NO_ERROR,'null uniform location ignores converted data');
+    const clipped = new Uint8Array(12).fill(77);
+    gl.readPixels(-1,0,3,1,gl.RGBA,gl.UNSIGNED_BYTE,clipped);
+    same(clipped,[77,77,77,77,255,0,0,255,255,0,0,255],'clipped read preserves outside');
+    const buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+    check(gl.getBufferParameter(gl.ARRAY_BUFFER,gl.BUFFER_SIZE) === 24, 'buffer size');
+    check(gl.getParameter(gl.ARRAY_BUFFER_BINDING) === buffer,'buffer identity');
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,buffer);
+    check(gl.getError() === gl.INVALID_OPERATION,'buffer target lifetime');
+    const shader = (type, source) => { const s=gl.createShader(type); gl.shaderSource(s,source); gl.compileShader(s); check(gl.getShaderParameter(s,gl.COMPILE_STATUS),gl.getShaderInfoLog(s)); return s; };
+    const vertex = shader(gl.VERTEX_SHADER,'attribute vec2 position;void main(){gl_Position=vec4(position,0.0,1.0);}');
+    const fragment = shader(gl.FRAGMENT_SHADER,'precision mediump float;uniform vec4 color;void main(){gl_FragColor=color;}');
+    const program = gl.createProgram(); gl.attachShader(program,vertex); gl.attachShader(program,fragment); gl.linkProgram(program);
+    check(gl.getProgramParameter(program,gl.LINK_STATUS),gl.getProgramInfoLog(program)); gl.useProgram(program);
+    const position = gl.getAttribLocation(program,'position'); check(position >= 0,'position active');
+    gl.enableVertexAttribArray(position); gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
+    const color = gl.getUniformLocation(program,'color');check(Object.prototype.toString.call(color)==='[object WebGLUniformLocation]','uniform location brand'); gl.uniform4f(color,0,1,0,1);
+    same(gl.getUniform(program,color),[0,1,0,1],'uniform round trip');
+    gl.drawArrays(gl.TRIANGLES,0,3); gl.readPixels(2,2,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);
+    same(pixel,[0,255,0,255],'triangle shader');
+    check(gl.getError() === gl.NO_ERROR,'draw error');
+    gl.drawArrays(gl.TRIANGLES,0,4); check(gl.getError() === gl.INVALID_OPERATION,'attribute bounds');
+    gl.uniform4fv(color,[1,2]); check(gl.getError() === gl.INVALID_VALUE,'uniform size');
+    gl.viewport(1,1,2,2); canvas.width=4;
+    check(gl.drawingBufferWidth === 4,'resized drawing buffer');
+    same(gl.getParameter(gl.VIEWPORT),[1,1,2,2],'resize preserves viewport');
+    gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel); same(pixel,[0,0,0,0],'redundant resize clears');
+    check(gl.getParameter(gl.CURRENT_PROGRAM) === program,'resize preserves program');
+    const texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([20,40,60,255]));
+    const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);
+    check(gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE,'texture framebuffer');
+    check(gl.getFramebufferAttachmentParameter(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) === texture,'attachment identity');
+    gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);same(pixel,[20,40,60,255],'texture upload');
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);same(pixel,[0,0,0,0],'null texture initialized');
+    const image=new ImageData(new Uint8ClampedArray([1,2,3,255]),1,1);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,image);
+    gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);same(pixel,[1,2,3,255],'ImageData upload');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,4,4);gl.clearColor(0,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);
+    check(canvas.toDataURL().startsWith('data:image/png;base64,'),'canvas serialization');
+    const target=document.createElement('canvas');target.width=4;target.height=4;
+    const two=target.getContext('2d');two.drawImage(canvas,0,0);same(two.getImageData(0,0,1,1).data,[0,0,255,255],'WebGL to 2d');
+    const bad=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(bad,'precision mediump float;void main(){while(true){} gl_FragColor=vec4(1.0);}');gl.compileShader(bad);
+    check(!gl.getShaderParameter(bad,gl.COMPILE_STATUS),'WebGL loop restriction');
+    check(gl.getError() === gl.NO_ERROR,'final error');
+    // Appendix A initialization and declaration order, including output parameters.
+    const pipeline = source => {
+        const p=gl.createProgram();gl.attachShader(p,vertex);gl.attachShader(p,shader(gl.FRAGMENT_SHADER,source));gl.linkProgram(p);
+        check(gl.getProgramParameter(p,gl.LINK_STATUS),gl.getProgramInfoLog(p));gl.useProgram(p);
+        const a=gl.getAttribLocation(p,'position');gl.enableVertexAttribArray(a);gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);return p;
+    };
+    pipeline('precision mediump float;void value(out float c){float a,b=a;c+=b;}void main(){float c;value(c);gl_FragColor=vec4(c);}float afterMain;');
+    gl.drawArrays(gl.TRIANGLES,0,3);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);same(pixel,[0,0,0,0],'private shader storage is initialized');
+    const structured=pipeline('precision mediump float;struct Light{vec4 color;};uniform Light lights[2];uniform float weights[2];void main(){gl_FragColor=lights[0].color*weights[0]+lights[1].color*weights[1];}');
+    const member=gl.getUniformLocation(structured,'lights[1].color');gl.uniform4f(member,1,2,3,4);same(gl.getUniform(structured,member),[1,2,3,4],'struct array uniform type');
+    gl.uniform1fv(gl.getUniformLocation(structured,'weights[1]'),[0.5,0.75]);check(gl.getError()===gl.NO_ERROR,'uniform array excess is ignored');
+    check(gl.getUniform(structured,gl.getUniformLocation(structured,'weights[1]'))===0.5,'uniform array last element');
+    gl.blendEquation(0x8007);check(gl.getError()===gl.INVALID_ENUM,'unenabled GLES blend extension rejected');
+    const sample=pipeline('precision mediump float;uniform sampler2D image;void main(){gl_FragColor=texture2D(image,vec2(0.5));}');
+    gl.uniform1i(gl.getUniformLocation(sample,'image'),0);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,3,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,0,0,255,255,0,0,255,255,0,0,255]));
+    gl.drawArrays(gl.TRIANGLES,0,3);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);same(pixel,[0,0,0,255],'incomplete NPOT texture samples black');
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.drawArrays(gl.TRIANGLES,0,3);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);same(pixel,[255,0,0,255],'complete NPOT texture samples actual pixels');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.drawArrays(gl.TRIANGLES,0,3);check(gl.getError()===gl.INVALID_OPERATION,'texture framebuffer feedback rejected');
+    const depth=gl.createRenderbuffer();gl.bindRenderbuffer(gl.RENDERBUFFER,depth);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,2,2);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth);
+    check(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS,'attachment dimensions must agree');
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,2,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array(8).fill(77));
+    gl.copyTexSubImage2D(gl.TEXTURE_2D,0,0,0,-1,0,2,1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fb);const copied=new Uint8Array(8);gl.readPixels(0,0,2,1,gl.RGBA,gl.UNSIGNED_BYTE,copied);
+    same(copied,[77,77,77,77,255,0,0,255],'copy outside framebuffer preserves destination');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.copyTexImage2D(gl.TEXTURE_2D,0,gl.RGBA,-1,0,2,1,0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.readPixels(0,0,2,1,gl.RGBA,gl.UNSIGNED_BYTE,copied);same(copied,[0,0,0,0,255,0,0,255],'copy image initializes outside pixels');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.useProgram(program);
+    const instances=gl.getExtension('ANGLE_instanced_arrays');
+    if(instances){
+        instances.drawArraysInstancedANGLE(gl.TRIANGLES,0,3,2);check(gl.getError()===gl.NO_ERROR,'native instanced draw');
+        instances.drawArraysInstancedANGLE(gl.TRIANGLES,0,3,-1);check(gl.getError()===gl.INVALID_VALUE,'negative instance count');
+        instances.vertexAttribDivisorANGLE(position,1);instances.drawArraysInstancedANGLE(gl.TRIANGLES,0,3,1);
+        check(gl.getError()===gl.INVALID_OPERATION,'instanced draw needs a per-vertex attribute');instances.vertexAttribDivisorANGLE(position,0);
+    }
+    check(gl.getError()===gl.NO_ERROR,'validation checks leave no errors');
+    gl.deleteBuffer(buffer);check(!gl.isBuffer(buffer),'buffer deletion');
+    const loss=gl.getExtension('WEBGL_lose_context');check(loss,'context loss extension');
+    let lost=false;
+    canvas.addEventListener('webglcontextlost',event=>{check(event.isTrusted&&event instanceof WebGLContextEvent,'trusted context event');event.preventDefault();lost=true;});
+    globalThis.webglRestored='pending';
+    canvas.addEventListener('webglcontextrestored',event=>{
+        try {
+            check(event.isTrusted&&!gl.isContextLost(),'restored context');
+            check(gl.getError()===gl.NO_ERROR,'restored errors reset');
+            same(gl.getParameter(gl.VIEWPORT),[0,0,4,4],'restored viewport defaults');
+            gl.bindTexture(gl.TEXTURE_2D,texture);check(gl.getError()===gl.INVALID_OPERATION,'old texture invalidated');
+            check(gl.getExtension('WEBGL_lose_context')===loss,'loss extension remains enabled');
+            globalThis.webglRestored='ok';
+        } catch(error) {globalThis.webglRestored=String(error);}
+    });
+    loss.loseContext();check(gl.isContextLost()&&!lost,'loss event deferred');
+    check(gl.getError()===gl.CONTEXT_LOST_WEBGL&&gl.getError()===gl.NO_ERROR,'one loss error');
+    check(!gl.isProgram(program)&&gl.getParameter(gl.VIEWPORT)===null,'lost query defaults');
+    setTimeout(()=>{check(lost,'loss event before restoration');loss.restoreContext();check(gl.isContextLost(),'restoration is asynchronous');},0);
+    return 'webgl-pixels-ok';
+})()

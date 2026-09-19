@@ -72,6 +72,15 @@ bindings and the resident page actor live in `src/lumen_backend.rs` and the
 sibling Lumen checkout. This keeps DOM, networking, storage, workers, and
 rendering behavior shared by both frontends.
 
+HTML canvases support WebGL 1 through Rust bindings to the installed EGL and
+OpenGL ES driver. Shader preparation and WebGL validation run in Rust; no ANGLE
+library is bundled. EGL loads lazily on the first WebGL context. If the system
+cannot provide a robust context, `getContext("webgl")` returns `null`. WebGL 2
+and multisample antialiasing are not implemented yet. Estimated WebGL buffer and image
+storage shares a 256 MiB page budget, with at most 16 contexts; driver overhead
+and CPU copies are additional. To run the hardware-dependent pixel,
+shader, and API tests, use `cargo test --lib webgl -- --include-ignored`.
+
 Import maps resolve static and dynamic module imports, including scoped
 mappings, blocked specifiers, and integrity metadata.
 
