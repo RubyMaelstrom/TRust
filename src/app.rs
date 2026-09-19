@@ -382,29 +382,6 @@ fn same_document(a: &url::Url, b: &url::Url) -> bool {
     a == b
 }
 
-/// Percent-decode a URL fragment to raw UTF-8 (a non-ASCII `id` anchor arrives
-/// `%XX`-encoded in the href). Lossy on invalid sequences; unknown `%` escapes
-/// pass through literally.
-fn pct_decode_utf8(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn color_rgb(c: ratatui::style::Color) -> [u8; 3] {
     match c {
         ratatui::style::Color::Rgb(r, g, b) => [r, g, b],
@@ -2436,23 +2413,10 @@ impl App {
         if !g.doc.laid_out() {
             return false;
         }
-        if frag.is_empty() || frag.eq_ignore_ascii_case("top") {
-            g.scroll = 0;
-            return true;
-        }
         // Ids carry raw text; a URL fragment may arrive percent-encoded (a
         // non-ASCII id — a Japanese section anchor). Try the literal form first,
         // then a decoded one.
-        let row = g
-            .doc
-            .anchor_rows
-            .get(frag)
-            .or_else(|| {
-                frag.contains('%')
-                    .then(|| pct_decode_utf8(frag))
-                    .and_then(|d| g.doc.anchor_rows.get(&d))
-            })
-            .copied();
+        let row = crate::fragment::position(frag, &g.doc.anchor_rows, 0);
         let Some(row) = row else {
             return false;
         };

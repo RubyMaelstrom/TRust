@@ -316,6 +316,7 @@ where
 
 #[derive(Clone, Debug)]
 struct HistoryEntry {
+    same_document_generation: Option<u64>,
     target: Link,
     fallback_http: bool,
     /// Trusted in-process documents have no transport to refetch from.
@@ -340,6 +341,7 @@ impl HistoryEntry {
             _ => (None, None, None),
         };
         Self {
+            same_document_generation: None,
             target: page.target,
             fallback_http: page.fallback_http,
             internal_source,
@@ -1332,6 +1334,29 @@ impl BrowserController {
             };
             return true;
         };
+        if entry.same_document_generation == Some(self.document_generation) {
+            let previous = self.same_document_history_entry();
+            if forward {
+                self.forward.pop();
+                self.back.extend(previous);
+            } else {
+                self.back.pop();
+                self.forward.extend(previous);
+            }
+            let address = entry.target.to_string();
+            self.apply_same_document_history_update(&address, true);
+            self.pending_fragment = None;
+            self.interaction.scroll = entry.scroll;
+            self.send_user(crate::js::PageCmd::TraverseHistory {
+                url: address,
+                delta: if forward { 1 } else { -1 },
+            });
+            self.send_user(crate::js::PageCmd::Scroll {
+                x: f64::from(entry.scroll.x),
+                y: f64::from(entry.scroll.y),
+            });
+            return true;
+        }
         if let Some(document) = entry
             .gemini_page
             .map(FetchedDocument::Gemini)
@@ -1386,6 +1411,23 @@ impl BrowserController {
     }
 
     fn begin_fetch(&mut self, target: Link, fallback_http: bool, intent: NavigationIntent) {
+        if matches!(intent, NavigationIntent::New | NavigationIntent::Replace)
+            && let Link::Http(url) = &target
+            && url.fragment().is_some()
+            && self.current.as_ref().is_some_and(|page|
+                matches!(&page.target, Link::Http(current) if crate::fragment::same_document(current, url)))
+        {
+            let replace = intent == NavigationIntent::Replace
+                || self.current.as_ref().is_some_and(|page| page.target == target);
+            if self.live_page.is_some() {
+                self.send_user(crate::js::PageCmd::NavigateFragment { url: url.to_string(), replace });
+            } else {
+                self.apply_same_document_history_update(url.as_str(), replace);
+                self.pending_fragment = url.fragment().map(str::to_owned);
+            }
+            return;
+        }
+        self.pending_fragment = None;
         self.gemini_prompt = None;
         let target = if intent == NavigationIntent::Reload
             && let Some(page) = &self.current
@@ -2134,6 +2176,12 @@ impl BrowserController {
         self.task = None;
         match result {
             Ok(mut document) => {
+                if matches!(pending.target, Link::Http(_))
+                    && let FetchedDocument::Http(response) = &document
+                {
+                    pending.target = Link::Http(response.url.clone());
+                    self.pending_fragment = response.url.fragment().map(str::to_owned);
+                }
                 if let FetchedDocument::Gemini(response) = &document {
                     pending.target = Link::Gemini(response.url.public_url());
                 }
@@ -2639,11 +2687,30 @@ impl BrowserController {
     /// replacing the resident Document. The JS realm owns classic-history
     /// state; this controller owns browser chrome and product-level navigation
     /// policy, including the existing YouTube → mpv delegation.
-    fn apply_same_document_history_update(&mut self, address: &str, _replace: bool) -> bool {
+    fn same_document_history_entry(&self) -> Option<HistoryEntry> {
+        let page = self.current.as_ref()?;
+        Some(HistoryEntry {
+            same_document_generation: Some(self.document_generation),
+            target: page.target.clone(),
+            fallback_http: page.fallback_http,
+            internal_source: None,
+            dict_view: None,
+            gopher_page: None,
+            gemini_page: None,
+            scroll: self.interaction.scroll,
+        })
+    }
+
+    fn apply_same_document_history_update(&mut self, address: &str, replace: bool) -> bool {
         let Ok(url) = url::Url::parse(address) else {
             self.status = String::from("Page supplied an invalid same-document URL.");
             return true;
         };
+        if !replace {
+            self.back.extend(self.same_document_history_entry());
+            self.forward.clear();
+        }
+        let live = self.live_page.is_some();
         let Some(page) = self.current.as_mut() else {
             return false;
         };
@@ -2652,6 +2719,10 @@ impl BrowserController {
             _ => None,
         };
         let address_changed = old_url.as_ref() != Some(&url);
+        if address_changed && !live {
+            page.revision = page.revision.wrapping_add(1);
+            page.rendered_revision = page.revision;
+        }
         page.target = Link::Http(url.clone());
         if let FetchedDocument::Http(response) = &mut page.document {
             // `Response::url` is also the base used by any later static
@@ -4244,6 +4315,62 @@ mod tests {
         let (video, referrer) = browser.take_external_media().unwrap();
         assert_eq!(video.as_str(), "https://www.youtube.com/watch?v=spa123");
         assert_eq!(referrer.as_ref(), Some(&source));
+    }
+
+    #[test]
+    fn fragment_navigation_and_history_keep_the_document_and_scroll() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let url = url::Url::parse("https://example.test/page").unwrap();
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url.clone()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 0,
+            revision: 1,
+        });
+        browser.interaction.scroll.y = 80.0;
+        browser.handle_action(UserAction::Activate(Link::Http(
+            url.join("#chapter").unwrap(),
+        )));
+        assert!(browser.pending.is_none());
+        assert_eq!(browser.take_fragment_request().as_deref(), Some("chapter"));
+        assert_eq!(
+            browser.snapshot().address,
+            "https://example.test/page#chapter"
+        );
+        browser.interaction.scroll.y = 360.0;
+        browser.handle_action(UserAction::Activate(Link::Http(
+            url.join("#chapter").unwrap(),
+        )));
+        assert_eq!(
+            browser.back.len(),
+            1,
+            "repeated fragment replaces its entry"
+        );
+        let generation = browser.document_generation();
+        browser.handle_action(UserAction::Back);
+        assert_eq!(browser.snapshot().address, url.as_str());
+        assert_eq!(browser.interaction.scroll.y, 80.0);
+        browser.handle_action(UserAction::Forward);
+        assert_eq!(browser.interaction.scroll.y, 360.0);
+        assert_eq!(browser.document_generation(), generation);
+        assert!(browser.pending.is_none());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.handle_action(UserAction::Activate(Link::Http(
+            url.join("#other").unwrap(),
+        )));
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::js::PageCmd::NavigateFragment { url, replace:false }) if url.ends_with("#other"))
+        );
+        assert!(browser.page_is_live() && browser.pending.is_none());
     }
 
     #[test]

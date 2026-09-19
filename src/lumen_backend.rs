@@ -2854,6 +2854,33 @@ mod desktop {
         interrupt: &Arc<lumen::RuntimeInterrupt>,
     ) -> bool {
         match command {
+            PageCmd::NavigateFragment { url, replace } => {
+                prepare_interaction(page, interrupt);
+                let url = Value::from_string(url);
+                let _ = call_trust(
+                    page,
+                    "navigateFragment",
+                    &[url, Value::Bool(replace)],
+                    "fragment navigation",
+                );
+                checkpoint(page, "fragment navigation");
+                finish_task(page, events)
+            }
+            PageCmd::TraverseHistory { url, delta } => {
+                prepare_interaction(page, interrupt);
+                page.dom
+                    .borrow_mut()
+                    .set_doc_url(url::Url::parse(&url).ok());
+                let url = Value::from_string(url);
+                let _ = call_trust(
+                    page,
+                    "traverseHistory",
+                    &[url, Value::Num(delta as f64)],
+                    "history traversal",
+                );
+                checkpoint(page, "history traversal");
+                finish_task(page, events)
+            }
             PageCmd::PointerButton {
                 node,
                 pressed,
@@ -3425,6 +3452,9 @@ mod desktop {
             checkpoint(page, "scroll steps");
         }
         for (url, replace) in take_history_updates(page) {
+            page.dom
+                .borrow_mut()
+                .set_doc_url(url::Url::parse(&url).ok());
             if events
                 .blocking_send(PageEvt::HistoryUpdate { url, replace })
                 .is_err()
@@ -5372,6 +5402,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_nodelist_for_each", 4, host_nodelist_for_each),
     ("__dom_contains", 2, host_contains),
     ("__dom_set_hover", 1, host_set_hover),
+    ("__dom_fragment_target", 1, host_fragment_target),
     ("__dom_children", 1, host_children),
     ("__dom_slot_assigned", 1, host_slot_assigned),
     ("__dom_assigned_slot", 1, host_assigned_slot),
@@ -9455,6 +9486,16 @@ fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Bool(contains))
 }
 
+fn host_fragment_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let fragment = args
+        .first()
+        .filter(|v| !matches!(v, Value::Undefined | Value::Null))
+        .map(|_| host_arg_string(ctx, args, 0));
+    let dom = host_dom(ctx);
+    let target = dom.borrow_mut().set_fragment_target(fragment.as_deref());
+    Ok(target.map_or(Value::Null, |node| Value::Num(node as f64)))
+}
+
 fn host_set_hover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let target = args
         .first()
@@ -12128,7 +12169,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 153, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 154, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -12139,7 +12180,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 153);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 154);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -20371,6 +20412,12 @@ mod tests {
             const childHashHandler = frame.contentWindow.onhashchange;
             if (typeof childHashHandler === "function") childHashHandler();
             frame.contentWindow.callHashHandlerAfterNavigation();
+            // HTML queues hashchange on a later task; calling the handler
+            // directly above must still work before that queued dispatch.
+            if (frame.contentDocument.body.getAttribute("data-hash-handler") !== "2")
+                throw new Error("hashchange ran synchronously");
+            for (let i = 0; i < 100 && __trust.hasPlatformTask(); i++)
+                __trust.runPlatformTask();
             globalThis.frameEventHandlerResult =
                 [frame.contentDocument.body.getAttribute("data-result"),
                  typeof childHashHandler,
@@ -20561,6 +20608,42 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn fragment_links_update_location_history_and_queue_hashchange() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<a id=link href='#chapter'>chapter</a><h2 id=chapter>Chapter</h2>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://example.test/page",
+        );
+        eval(&mut engine, r#"
+            globalThis.fragmentEvents=[];
+            addEventListener('hashchange', e=>fragmentEvents.push([e.oldURL,e.newURL]));
+            const link=document.getElementById('link');
+            __trust.click(link.__id); __trust.followAnchorDefault(link.__id);
+            if (location.hash!=='#chapter' || history.length!==2 || document.URL!==location.href) throw Error('URL/history');
+            if (fragmentEvents.length || __trust.takeNavigation()!==null) throw Error('same task/refetch');
+            if (__trust.takeScrollFragment()!=='chapter') throw Error('scroll missing');
+            if (!document.getElementById('chapter').matches(':target')) throw Error('target styling');
+            __trust.runPlatformTask();
+            if (fragmentEvents.length!==1) throw Error('hashchange task');
+            __trust.click(link.__id); __trust.followAnchorDefault(link.__id);
+            if (history.length!==2 || __trust.takeScrollFragment()!=='chapter') throw Error('repeat scroll');
+            __trust.traverseHistory('https://example.test/page',-1);
+            if (location.hash!=='') throw Error('back URL');
+            const details=document.createElement('details');
+            details.innerHTML='<summary>Summary</summary><div hidden="until-found"><input id="buried"></div>';
+            document.body.append(details);
+            let before=0; details.addEventListener('beforematch',()=>before++);
+            __trust.navigateFragment('#buried',false); __trust.takeScrollFragment();
+            if (!details.open || before!==1 || details.querySelector('[hidden]')) throw Error('ancestor revealing');
+            if (document.activeElement.id!=='buried') throw Error('target focus');
+        "#, "fragment navigation").unwrap();
     }
 
     #[test]

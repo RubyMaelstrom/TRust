@@ -340,7 +340,9 @@ pub struct RenderedPage {
     /// Composed-tree ancestry and named-fragment geometry needed for native
     /// interaction. These are resolved facts, not a second mutable DOM.
     pub parents: std::collections::HashMap<crate::dom::NodeId, crate::dom::NodeId>,
-    pub fragment_y: std::collections::HashMap<String, f32>,
+    /// Keep targets without a CSS box: a hidden literal ID still takes
+    /// precedence over a visible ID matching only after percent-decoding.
+    pub fragment_y: std::collections::HashMap<String, Option<f32>>,
     pub semantics: crate::accessibility::SemanticTree,
     pub focus_order: Vec<crate::dom::NodeId>,
     /// Layout node ids are the resident actor's canonical arena ids. Static
@@ -493,20 +495,15 @@ pub(crate) fn render_arena_with_layout(
         }
     }
     let mut fragment_y = std::collections::HashMap::new();
-    for node in dom.flat_descendants(crate::dom::DOCUMENT) {
-        let Some(rect) = layout.boxes.get(&node) else {
-            continue;
-        };
-        if let Some(id) = dom.attr(node, "id").filter(|id| !id.is_empty()) {
-            fragment_y.entry(id.to_string()).or_insert(rect.top as f32);
-        }
-        if dom.tag_name(node) == Some("a")
-            && let Some(name) = dom.attr(node, "name").filter(|name| !name.is_empty())
-        {
-            fragment_y
-                .entry(name.to_string())
-                .or_insert(rect.top as f32);
-        }
+    for (name, node) in crate::fragment::targets(dom) {
+        fragment_y.insert(
+            name,
+            layout
+                .boxes
+                .get(&node)
+                .map(|rect| rect.top as f32)
+                .or_else(|| layout.inline_anchor_y.get(&node).copied()),
+        );
     }
     let semantics = crate::accessibility::SemanticTree::for_document(
         dom,
@@ -582,6 +579,7 @@ pub fn render_html_for_environment(
     let base = base_with_doc_base(&html, &response.url);
     let mut dom = crate::dom::Dom::parse_document(&html);
     dom.set_doc_url(Some(base.clone()));
+    dom.set_fragment_target(response.url.fragment());
     dom.set_viewport_px(viewport.width, viewport.height);
     dom.set_device_pixel_ratio(device_pixel_ratio);
     dom.rewrite_inline_svgs(Some(&base));
@@ -9025,6 +9023,37 @@ mod tests {
             .iter()
             .flat_map(|r| &r.items)
             .any(|it| it.text.contains(needle))
+    }
+
+    #[test]
+    fn graphical_fragment_targets_preserve_empty_anchors_and_hidden_id_precedence() {
+        // HTML #select-the-indicated-part chooses the element before CSSOM
+        // View determines whether it has a box that can be scrolled into view.
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            "<div style='height:500px'></div><a name=legacy></a>\
+             <div id='encoded%20id' hidden></div><p id='encoded id'>Visible</p>\
+             <a name=duplicate></a><p id=duplicate style='margin-top:100px'>ID wins</p>",
+        );
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        assert!(rendered.fragment_y["legacy"].is_some_and(|y| y >= 500.0));
+        assert_eq!(
+            crate::fragment::position("encoded%20id", &rendered.fragment_y, Some(0.0)),
+            Some(None),
+            "a target without a CSS box suppresses decoded fallback"
+        );
+        let duplicate = dom.get_by_id("duplicate").unwrap();
+        assert_eq!(
+            rendered.fragment_y["duplicate"],
+            Some(rendered.layout.boxes[&duplicate].top as f32)
+        );
     }
 
     #[test]

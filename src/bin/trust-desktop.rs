@@ -723,7 +723,7 @@ struct DesktopPageAdapter {
     lazy_image_handles: HashSet<ImageHandle>,
     deferred_images: Vec<trust::doc::DeferredImage>,
     parents: HashMap<usize, usize>,
-    fragment_y: HashMap<String, f32>,
+    fragment_y: HashMap<String, Option<f32>>,
     semantics: SemanticTree,
 }
 
@@ -5654,9 +5654,6 @@ impl DesktopApp {
                 }
             }
             Link::Form { form, field } => self.activate_form_control(form, field),
-            Link::Http(url) if self.same_document_fragment(&url) => {
-                self.scroll_static_fragment(url.fragment().unwrap_or(""));
-            }
             Link::External(target) if parse_telnet_target(&target).is_some() => {
                 self.navigate(target)
             }
@@ -5735,45 +5732,6 @@ impl DesktopApp {
             self.step_number_control(form, field, direction);
         }
         true
-    }
-
-    fn same_document_fragment(&self, target: &url::Url) -> bool {
-        let Some(current) = self
-            .browser
-            .current_page()
-            .and_then(|page| match page.target() {
-                Link::Http(url) => Some(url),
-                _ => None,
-            })
-        else {
-            return false;
-        };
-        if target.fragment().is_none() {
-            return false;
-        }
-        let mut left = current.clone();
-        let mut right = target.clone();
-        left.set_fragment(None);
-        right.set_fragment(None);
-        left == right
-    }
-
-    fn scroll_static_fragment(&mut self, fragment: &str) {
-        self.cancel_heart_glide();
-        let Some(page) = &self.page_layout else {
-            return;
-        };
-        let y = if fragment.is_empty() {
-            Some(0.0)
-        } else {
-            page.document.fragment_y.get(fragment).copied()
-        };
-        if let Some(y) = y {
-            self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
-                0.0,
-                y.max(0.0),
-            )));
-        }
     }
 
     fn apply_cursor_icon(&mut self, icon: CursorIcon) {
@@ -6525,18 +6483,24 @@ impl DesktopApp {
         if page.generation != self.browser.document_generation() {
             return;
         }
+        if self
+            .browser
+            .current_page()
+            .is_some_and(|current| current.revision() != page.revision)
+        {
+            return;
+        }
         let Some(fragment) = self.browser.take_fragment_request() else {
             return;
         };
-        let target = if fragment.is_empty() {
-            Some(0.0)
-        } else {
-            page.document.fragment_y.get(fragment.as_str()).copied()
-        };
+        let target =
+            trust::fragment::position(&fragment, &page.document.fragment_y, Some(0.0)).flatten();
         if let Some(y) = target {
+            let max_y =
+                (page.layout.paint.height - self.browser.snapshot().viewport.height).max(0.0);
             self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
-                0.0,
-                y.max(0.0),
+                self.browser.interaction().scroll.x,
+                y.clamp(0.0, max_y),
             )));
         }
     }

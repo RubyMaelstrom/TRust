@@ -87,6 +87,7 @@ impl SelectorDependencies {
             selects,
             has,
             hover: _,
+            target: _,
             popover_open: _,
             never: _,
             never_unknown: _,
