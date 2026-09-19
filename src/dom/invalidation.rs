@@ -90,7 +90,7 @@ impl SelectorDependencies {
             target: _,
             popover_open: _,
             never: _,
-            never_unknown: _,
+            inert_pseudo_element: _,
             structural,
             states,
             scope: _,
