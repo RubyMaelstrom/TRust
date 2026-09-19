@@ -69,6 +69,11 @@ percent-encoded IDs and legacy named anchors. Desktop fragment navigation keeps
 the live page and its scripts running, updates the address, and supports
 Back/Forward with scroll restoration.
 
+Desktop pages can capture the mouse using `requestPointerLock()` for camera
+controls and games. Click the page to engage capture; press Escape to release
+it. Switching away from the window or navigating away also releases capture.
+The terminal frontend reports pointer lock as unsupported.
+
 ## JavaScript engine
 
 Lumen is the sole JavaScript engine for the terminal, desktop, and headless
