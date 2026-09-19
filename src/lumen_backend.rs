@@ -268,6 +268,7 @@ struct HostState {
     import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
     history_slots: Option<Value>,
+    pointer_lock_state: Option<Value>,
     navigator_slots: Option<Value>,
     screen_slots: Option<Value>,
     performance_slots: Option<Value>,
@@ -324,6 +325,7 @@ impl HostState {
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
             history_slots: None,
+            pointer_lock_state: None,
             navigator_slots: None,
             screen_slots: None,
             performance_slots: None,
@@ -512,6 +514,7 @@ impl RetainedMemory for HostState {
             import_maps,
             permission_slots,
             history_slots,
+            pointer_lock_state,
             navigator_slots,
             screen_slots,
             performance_slots,
@@ -829,6 +832,9 @@ impl RetainedMemory for HostState {
             visitor.value(value);
         }
         if let Some(value) = history_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = pointer_lock_state {
             visitor.value(value);
         }
         if let Some(value) = navigator_slots {
@@ -2854,6 +2860,59 @@ mod desktop {
         interrupt: &Arc<lumen::RuntimeInterrupt>,
     ) -> bool {
         match command {
+            PageCmd::PointerLockResult { request, error } => {
+                prepare_interaction(page, interrupt);
+                let error = error.map_or(Value::Null, Value::from_string);
+                let _ = call_trust(
+                    page,
+                    "pointerLockResult",
+                    &[Value::Num(request as f64), error],
+                    "pointer lock result",
+                );
+                checkpoint(page, "pointer lock result");
+                finish_task_with_ack(page, events, false)
+            }
+            PageCmd::ReleasePointerLock => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "releasePointerLock",
+                    &[Value::Bool(false)],
+                    "release pointer lock",
+                );
+                checkpoint(page, "release pointer lock");
+                finish_task_with_ack(page, events, false)
+            }
+            PageCmd::PointerMotion { dx, dy } | PageCmd::LockedWheel { dx, dy } => {
+                let method = if matches!(command, PageCmd::PointerMotion { .. }) {
+                    "pointerMotion"
+                } else {
+                    "lockedWheel"
+                };
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    method,
+                    &[
+                        Value::Num(finite_or_zero(dx)),
+                        Value::Num(finite_or_zero(dy)),
+                    ],
+                    method,
+                );
+                checkpoint(page, method);
+                finish_task_with_ack(page, events, false)
+            }
+            PageCmd::LockedPointerButton { button, pressed } => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "lockedPointerButton",
+                    &[Value::Num(button as f64), Value::Bool(pressed)],
+                    "locked pointer button",
+                );
+                checkpoint(page, "locked pointer button");
+                finish_task_with_ack(page, events, false)
+            }
             PageCmd::NavigateFragment { url, replace } => {
                 prepare_interaction(page, interrupt);
                 let url = Value::from_string(url);
@@ -3466,6 +3525,35 @@ mod desktop {
             return send_navigation(events, url, replace);
         }
         let fragment = take_scroll_fragment(page);
+        if let Some(value) = call_trust(page, "takePointerLockRequest", &[], "pointer lock request")
+            && !value_is_nullish(&value)
+        {
+            let ctx = page.engine.ctx();
+            let request = ctx
+                .member_get(&value, "0")
+                .ok()
+                .and_then(|v| v.as_num_opt())
+                .unwrap_or(0.0) as u64;
+            let node = ctx
+                .member_get(&value, "1")
+                .ok()
+                .and_then(|v| v.as_num_opt())
+                .map(|n| n as usize);
+            let unadjusted = ctx
+                .member_get(&value, "2")
+                .ok()
+                .is_some_and(|v| ctx.to_boolean(&v));
+            if events
+                .blocking_send(PageEvt::PointerLock {
+                    request,
+                    node,
+                    unadjusted,
+                })
+                .is_err()
+            {
+                return false;
+            }
+        }
         let submission = take_form_submit(page);
         let scrolls = page.dom.borrow_mut().take_scroll_changes();
         let mut sent_primary = false;
@@ -3723,6 +3811,77 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn actor_pointer_lock_captures_only_after_native_acknowledgement() {
+            let html = r#"<canvas id="game"></canvas><output id="result"></output><script>
+                const game=document.getElementById('game'), output=document.getElementById('result');
+                game.onclick=()=>game.requestPointerLock().then(()=>output.textContent='locked');
+                document.onmousemove=e=>{
+                    if(document.pointerLockElement===game && e.movementX===12 && e.movementY===-4)
+                        output.textContent='motion';
+                };
+                document.onpointerlockchange=()=>{
+                    if(!document.pointerLockElement) output.textContent='released';
+                };
+            </script>"#;
+            let game = Dom::parse_document(html).get_by_id("game").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle.try_send_user(PageCmd::Click(game)).unwrap();
+                let request = loop {
+                    match events.recv().await {
+                        Some(PageEvt::PointerLock {
+                            request,
+                            node: Some(node),
+                            ..
+                        }) => {
+                            assert_eq!(node, game);
+                            break request;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended"),
+                    }
+                };
+                handle
+                    .try_send_user(PageCmd::PointerLockResult {
+                        request,
+                        error: None,
+                    })
+                    .unwrap();
+                for (marker, command) in [
+                    ("locked", PageCmd::PointerMotion { dx: 12.0, dy: -4.0 }),
+                    ("motion", PageCmd::ReleasePointerLock),
+                ] {
+                    loop {
+                        match events.recv().await {
+                            Some(PageEvt::Updated { html, outcome }) => {
+                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                                if html.contains(&format!(">{marker}</output>")) {
+                                    break;
+                                }
+                            }
+                            Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                            Some(_) => {}
+                            None => panic!("actor ended"),
+                        }
+                    }
+                    handle.try_send_user(command).unwrap();
+                }
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::PointerLock { node: None, .. }) => break,
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended"),
+                    }
+                }
+            })
+            .await
+            .expect("pointer lock actor timed out");
+        }
 
         #[tokio::test]
         async fn actor_native_keyboard_delivery_uses_current_focus_for_each_event() {
@@ -5368,6 +5527,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__invoke_callback", 4, host_invoke_callback),
     ("__permissions_binding", 2, host_permissions_binding),
     ("__history_binding", 2, host_history_binding),
+    ("__pointer_lock_state", 1, host_pointer_lock_state),
     ("__navigator_binding", 1, host_navigator_binding),
     ("__screen_binding", 1, host_screen_binding),
     ("__performance_binding", 1, host_performance_binding),
@@ -5664,6 +5824,17 @@ fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(Value::Bool(
         context == 0 || state.window_realms.contains_key(&context),
     ))
+}
+
+/// Pointer Lock has one target and request queue across the page's Window Realms.
+fn host_pointer_lock_state(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let candidate = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(ctx
+        .host_mut::<HostState>()
+        .expect("Pointer Lock requires HostState")
+        .pointer_lock_state
+        .get_or_insert(candidate)
+        .clone())
 }
 
 /// History operations may be borrowed from another Window Realm. Share the
@@ -12169,7 +12340,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 154, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 155, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -12180,7 +12351,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 154);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 155);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -20605,6 +20776,30 @@ mod tests {
             assert_eq!(
                 value_string(&mut engine, &value),
                 "pointer-events-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_lock_handshake_events_movement_and_release() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/pointer_lock.mjs"),
+                "pointer lock",
+            )
+            .unwrap();
+            for _ in 0..64 {
+                run_microtask_checkpoint(&mut engine);
+                call_trust_method(&mut engine, "runPlatformTask", &[]);
+            }
+            assert_eq!(
+                string_value(&mut engine, "pointerLockTestResult"),
+                "pointer-lock-ok",
                 "{tier:?}"
             );
         }

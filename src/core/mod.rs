@@ -215,6 +215,23 @@ pub enum ImeAction {
 /// frontends translate their own event types once at their boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UserAction {
+    PointerLockResult {
+        request: u64,
+        error: Option<String>,
+    },
+    ReleasePointerLock,
+    PointerMotion {
+        dx: f64,
+        dy: f64,
+    },
+    LockedPointerButton {
+        button: i16,
+        pressed: bool,
+    },
+    LockedWheel {
+        dx: f64,
+        dy: f64,
+    },
     Navigate(String),
     Back,
     Forward,
@@ -565,6 +582,7 @@ pub struct BrowserController {
     pending_user_input: VecDeque<(crate::js::PageCmd, bool)>,
     user_input_retry: Option<JoinHandle<()>>,
     pending_fragment: Option<String>,
+    pending_pointer_lock: VecDeque<(u64, Option<usize>, bool)>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
     gemini_prompt: Option<crate::gemini::Prompt>,
@@ -594,6 +612,7 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::Reload(_) => "Reload",
         crate::js::PageEvt::HistoryUpdate { .. } => "HistoryUpdate",
         crate::js::PageEvt::ScrollToFragment(_) => "ScrollToFragment",
+        crate::js::PageEvt::PointerLock { .. } => "PointerLock",
         crate::js::PageEvt::Trouble(_) => "Trouble",
         crate::js::PageEvt::Settled => "Settled",
         _ => "Other",
@@ -626,6 +645,7 @@ impl BrowserController {
             pending_user_input: VecDeque::new(),
             user_input_retry: None,
             pending_fragment: None,
+            pending_pointer_lock: VecDeque::new(),
             external_media: VecDeque::new(),
             download_offer: None,
             gemini_prompt: None,
@@ -924,6 +944,10 @@ impl BrowserController {
         self.pending_fragment.take()
     }
 
+    pub fn take_pointer_lock_request(&mut self) -> Option<(u64, Option<usize>, bool)> {
+        self.pending_pointer_lock.pop_front()
+    }
+
     /// Queue the decoded intrinsic-size map for the resident page. The native
     /// frontend calls this from an event loop and must never block; a full
     /// command queue is therefore a normal retry condition, not a successful
@@ -947,6 +971,35 @@ impl BrowserController {
     pub fn handle_action(&mut self, action: UserAction) -> ActionOutcome {
         let generation_before = self.generation;
         let invalidated = match action {
+            UserAction::PointerLockResult { request, error } => {
+                self.send_user(crate::js::PageCmd::PointerLockResult { request, error });
+                false
+            }
+            UserAction::ReleasePointerLock => {
+                self.send_user(crate::js::PageCmd::ReleasePointerLock);
+                false
+            }
+            UserAction::PointerMotion { dx, dy } => {
+                // Preserve displacement under load while keeping the native
+                // backlog bounded. Buttons/keys remain FIFO barriers.
+                if let Some((crate::js::PageCmd::PointerMotion { dx: x, dy: y }, _)) =
+                    self.pending_user_input.back_mut()
+                {
+                    *x += dx;
+                    *y += dy;
+                } else {
+                    self.send_user(crate::js::PageCmd::PointerMotion { dx, dy });
+                }
+                false
+            }
+            UserAction::LockedPointerButton { button, pressed } => {
+                self.send_user(crate::js::PageCmd::LockedPointerButton { button, pressed });
+                false
+            }
+            UserAction::LockedWheel { dx, dy } => {
+                self.send_user(crate::js::PageCmd::LockedWheel { dx, dy });
+                false
+            }
             UserAction::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
             UserAction::Back => self.begin_history(false),
             UserAction::Forward => self.begin_history(true),
@@ -2419,6 +2472,7 @@ impl BrowserController {
     }
 
     fn drop_live_page(&mut self) {
+        self.pending_pointer_lock.clear();
         if let Some(retry) = self.user_input_retry.take() {
             retry.abort();
         }
@@ -2620,6 +2674,15 @@ impl BrowserController {
             }
             PageEvt::ScrollToFragment(fragment) => {
                 self.pending_fragment = Some(fragment);
+                true
+            }
+            PageEvt::PointerLock {
+                request,
+                node,
+                unadjusted,
+            } => {
+                self.pending_pointer_lock
+                    .push_back((request, node, unadjusted));
                 true
             }
             PageEvt::Trouble(errors) => {

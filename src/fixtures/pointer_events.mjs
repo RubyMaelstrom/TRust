@@ -74,7 +74,7 @@
     assert(Object.getOwnPropertyNames(PointerEvent.prototype).join(',') === Object.keys(defaults).join(',') + ',getCoalescedEvents,getPredictedEvents,constructor', 'interface member definition order');
     const reads = [], options = new Proxy({}, {get(target, key) { reads.push(key); }});
     new PointerEvent('x', options);
-    assert(reads.join(',') === 'bubbles,cancelable,composed,detail,view,altKey,ctrlKey,metaKey,modifierAltGraph,modifierCapsLock,modifierFn,modifierFnLock,modifierHyper,modifierNumLock,modifierScrollLock,modifierSuper,modifierSymbol,modifierSymbolLock,shiftKey,button,buttons,clientX,clientY,relatedTarget,screenX,screenY,altitudeAngle,azimuthAngle,coalescedEvents,height,isPrimary,persistentDeviceId,pointerId,pointerType,predictedEvents,pressure,tangentialPressure,tiltX,tiltY,twist,width', 'Web IDL dictionary read order: ' + reads);
+    assert(reads.join(',') === 'bubbles,cancelable,composed,detail,view,altKey,ctrlKey,metaKey,modifierAltGraph,modifierCapsLock,modifierFn,modifierFnLock,modifierHyper,modifierNumLock,modifierScrollLock,modifierSuper,modifierSymbol,modifierSymbolLock,shiftKey,button,buttons,clientX,clientY,movementX,movementY,relatedTarget,screenX,screenY,altitudeAngle,azimuthAngle,coalescedEvents,height,isPrimary,persistentDeviceId,pointerId,pointerType,predictedEvents,pressure,tangentialPressure,tiltX,tiltY,twist,width', 'Web IDL dictionary read order: ' + reads);
     const effectful = {pointerId:1, height:{valueOf() { effectful.pointerId = 9; return 2; }}};
     assert(new PointerEvent('x', effectful).pointerId === 9, 'conversion happens before the next member Get');
     let laterReads = 0;

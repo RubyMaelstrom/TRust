@@ -1088,7 +1088,7 @@
             if (this.view === undefined) this.view = null;
         }
     }
-    const mouseCoordinates = ["clientX", "clientY", "screenX", "screenY"];
+    const mouseCoordinates = ["clientX", "clientY", "screenX", "screenY", "movementX", "movementY"];
     class MouseEvent extends UIEvent {
         constructor(type, opts) {
             super(type, opts);
@@ -1214,6 +1214,8 @@
         base.buttons = +source.buttons & 65535;
         base.clientX = pointerDoubleDefault(source.clientX, 0);
         base.clientY = pointerDoubleDefault(source.clientY, 0);
+        base.movementX = pointerDoubleDefault(source.movementX, 0);
+        base.movementY = pointerDoubleDefault(source.movementY, 0);
         base.relatedTarget = pointerNullableDefault(source.relatedTarget);
         base.screenX = pointerDoubleDefault(source.screenX, 0);
         base.screenY = pointerDoubleDefault(source.screenY, 0);
@@ -1332,6 +1334,7 @@
             bubbles:init.bubbles, cancelable:init.cancelable, composed:init.composed,
             view:init.view, detail:init.detail, button:init.button, buttons:init.buttons,
             clientX:init.clientX, clientY:init.clientY, screenX:init.screenX, screenY:init.screenY,
+            movementX:init.movementX, movementY:init.movementY,
             relatedTarget:init.relatedTarget, ctrlKey:init.ctrlKey, altKey:init.altKey,
             shiftKey:init.shiftKey, metaKey:init.metaKey
         }], PointerEvent);
@@ -2697,7 +2700,10 @@
         return false;
     }
     trust.click = function (id) {
-        const target = wrap(id);
+        if (pointerLockState.target && pointerLockState.owner !== trust)
+            return pointerLockState.owner.click(pointerLockState.target.__id);
+        notifyPointerActivation();
+        const target = pointerLockState.target || wrap(id);
         if (cfg.frameTrace && target) {
             const path = [];
             for (let node = target; node; node = node.parentNode) {
@@ -2744,6 +2750,7 @@
         return 0;
     }
     trust.key = function (id, key, code, repeat, composing, shift, ctrl, alt, meta, released = false, location = 0) {
+        if (!released && key !== "Escape" && !ctrl && !alt && !meta) notifyPointerActivation();
         trust.lastClickSubmit = null;
         // UI Events #events-keyboard-event-order / native-key-up and HTML's
         // focused-area model: resolve each event against *current* focus. Keep
@@ -2855,10 +2862,177 @@
     let hoverTarget = null;
     let hoveredChildFrame = null;
     let nativePointerPosition = null, primaryPointerDown = false, suppressCompatibilityMouse = false;
+    // The click coordinates above are consumed by activateClick. Retain the
+    // actual cursor position independently for an asynchronous lock result,
+    // and the last mousemove separately for movementX/movementY deltas.
+    let lastPointerPosition = null, previousPointerMotion = null;
+    // Pointer Lock 2.0, local W3C c2692a6 (2026-09-06), #requestPointerLock.
+    // The native window must acknowledge capture before exposing a target or
+    // resolving a promise. One lock/queue is shared by all this page's Realms.
+    const pointerLockState = __pointer_lock_state({target:null, owner:null,
+        raw:false, position:null, next:1, queue:[], command:null, blocked:false});
+    delete g.__pointer_lock_state;
+    let pointerActivation = -Infinity, pointerRelock = false;
+    function notifyPointerActivation() {
+        pointerActivation = g.performance.now();
+        pointerLockState.blocked = false;
+    }
+    function pointerLockEvent(document, type) {
+        dispatch(document, createTrustedEvent(Event, type, {}), false);
+    }
+    function pointerLockFailure(record, name) {
+        __queue_dom_task(() => {
+            pointerLockEvent(record.document, "pointerlockerror");
+            record.reject(new DOMException("Pointer lock could not be acquired", name));
+            pumpPointerLock();
+        });
+    }
+    function pumpPointerLock() {
+        const state = pointerLockState, record = state.queue[0];
+        if (!record || record.sent || state.command) return;
+        if (!record.target.isConnected) {
+            state.queue.shift();
+            record.owner.pointerLockFailure(record, "WrongDocumentError");
+            return;
+        }
+        if (state.target && state.target.ownerDocument !== record.document) {
+            state.queue.shift();
+            record.owner.pointerLockFailure(record, "InvalidStateError");
+            return;
+        }
+        record.sent = true;
+        if (state.target && state.raw === record.raw) {
+            record.owner.pointerLockResult(record.id, null);
+        } else {
+            state.command = [record.id, record.target.__id, record.raw];
+        }
+    }
+    trust.pointerLockFailure = pointerLockFailure;
+    function releasePointerLock(voluntary, userExit = !voluntary) {
+        const state = pointerLockState, target = state.target;
+        if (target && state.owner !== trust) return state.owner.releasePointerLock(voluntary, userExit);
+        const position = state.position;
+        if (target) {
+            pointerRelock = !!voluntary;
+            state.target = null; state.owner = null; state.position = null;
+            state.command = [0, null, false];
+            __queue_dom_task(() => pointerLockEvent(target.ownerDocument, "pointerlockchange"));
+        }
+        if (userExit) {
+            pointerRelock = false; pointerActivation = -Infinity; state.blocked = true;
+            const pending = state.queue.splice(0);
+            for (const record of pending) record.owner.pointerLockFailure(record, "NotAllowedError");
+            // Also release capture acquired by a native request whose result
+            // was still queued when Escape/focus loss reached the actor.
+            state.command = [0, null, false];
+        }
+        nativePointerPosition = null;
+        lastPointerPosition = position; previousPointerMotion = position;
+        lockedButtons = 0; primaryPointerDown = false; suppressCompatibilityMouse = false;
+    }
+    trust.releasePointerLock = releasePointerLock;
+    function currentPointerLock() {
+        if (pointerLockState.target && !pointerLockState.target.isConnected)
+            pointerLockState.owner.releasePointerLock(false, false);
+        return pointerLockState.target;
+    }
+    trust.takePointerLockRequest = function () {
+        currentPointerLock();
+        pumpPointerLock();
+        const command = pointerLockState.command;
+        pointerLockState.command = null;
+        // A release and another request may occur in one script task.
+        // Advance the latter after handing the release to the native window.
+        if (command && command[1] === null && pointerLockState.queue.length)
+            __queue_dom_task(pumpPointerLock);
+        return command;
+    };
+    trust.pointerLockResult = function (id, error) {
+        const state = pointerLockState, record = state.queue[0];
+        if (!record || record.id !== id) return;
+        if (record.owner !== trust) return record.owner.pointerLockResult(id, error);
+        state.queue.shift();
+        if (!record.target.isConnected) error = "WrongDocumentError";
+        if (state.blocked) error = "NotAllowedError";
+        if (error) {
+            if (!state.target) state.command = [0, null, false];
+            pointerLockFailure(record, error);
+            return;
+        }
+        state.target = record.target; state.owner = trust; state.raw = record.raw;
+        state.position = lastPointerPosition || {clientX:0, clientY:0, screenX:0, screenY:0, pageX:0, pageY:0};
+        __queue_dom_task(() => {
+            pointerLockEvent(record.document, "pointerlockchange");
+            record.resolve();
+            pumpPointerLock();
+        });
+    };
+    function requestPointerLock(options = {}) {
+        if (elementIdentity(this) === undefined) throw new TypeError("Expected an Element");
+        if (options != null && typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("PointerLockOptions must be a dictionary");
+        const raw = !!(options && options.unadjustedMovement), target = this;
+        return new Promise((resolve, reject) => {
+            const record = {id:pointerLockState.next++, target, document:target.ownerDocument,
+                raw, resolve, reject, owner:trust, sent:false};
+            let error = null;
+            if (!target.isConnected) error = "WrongDocumentError";
+            else if (pointerLockState.blocked || (!pointerRelock && g.performance.now() - pointerActivation >= 5000))
+                error = "NotAllowedError";
+            for (let frame = frameOwnerForNode(target); !error && frame; frame = frameOwnerForNode(frame)) {
+                const sandbox = frame.getAttribute("sandbox");
+                if (sandbox !== null && !sandbox.split(/\s+/).includes("allow-pointer-lock")) error = "SecurityError";
+            }
+            if (!error && pointerLockState.queue.length >= 64) error = "NotSupportedError";
+            if (error) { pointerLockFailure(record, error); return; }
+            pointerLockState.queue.push(record);
+            pumpPointerLock();
+        });
+    }
+    // Relative motion never changes absolute coordinates or hit-test targets.
+    trust.pointerMotion = function (dx, dy) {
+        const target = currentPointerLock();
+        if (!target) return;
+        if (pointerLockState.owner !== trust) return pointerLockState.owner.pointerMotion(dx, dy);
+        const p = pointerLockState.position;
+        fireHoverPair("move", target, null, true, p.clientX, p.clientY, p.screenX, p.screenY, dx, dy);
+    };
+    let lockedButtons = 0;
+    trust.lockedPointerButton = function (button, pressed) {
+        const target = currentPointerLock();
+        if (!target) return;
+        if (pointerLockState.owner !== trust) return pointerLockState.owner.lockedPointerButton(button, pressed);
+        if (pressed) notifyPointerActivation();
+        const before = lockedButtons;
+        const mask = button === 1 ? 4 : button === 2 ? 2 : 1 << button;
+        lockedButtons = pressed ? lockedButtons | mask : lockedButtons & ~mask;
+        primaryPointerDown = !!(lockedButtons & 1);
+        const init = {...pointerLockState.position, bubbles:true, cancelable:true, composed:true,
+            view:g, button, buttons:lockedButtons, detail:1, pointerId:1, pointerType:"mouse", isPrimary:true};
+        // Pointer Events #chorded-button-interactions: only the first press
+        // and final release produce down/up; intermediate changes are moves.
+        const type = !before && pressed ? 'pointerdown' : !lockedButtons && !pressed ? 'pointerup' : 'pointermove';
+        const pointer = createTrustedEvent(PointerEvent, type, {...init, detail:0, pressure:lockedButtons ? 0.5 : 0});
+        dispatch(target, pointer, false);
+        if (type === 'pointerdown') suppressCompatibilityMouse = pointer.defaultPrevented;
+        if (!suppressCompatibilityMouse)
+            dispatch(target, createTrustedEvent(MouseEvent, pressed ? "mousedown" : "mouseup", init), false);
+        if (!pressed) dispatch(target, createTrustedEvent(PointerEvent, button === 0 ? "click" : "auxclick", init), false);
+        if (type === 'pointerup') suppressCompatibilityMouse = false;
+    };
+    trust.lockedWheel = function (dx, dy) {
+        const target = currentPointerLock();
+        if (!target) return;
+        if (pointerLockState.owner !== trust) return pointerLockState.owner.lockedWheel(dx, dy);
+        dispatch(target, createTrustedEvent(WheelEvent, "wheel", {...pointerLockState.position,
+            bubbles:true, cancelable:true, composed:true, view:g, deltaX:dx, deltaY:dy, deltaZ:0, deltaMode:0}), false);
+    };
     // UI Events native mouse down/up and Pointer Events compatibility mapping.
     // These entry points receive actual frontend transitions, never fabricated
     // press/release events for HTMLElement.click() or keyboard activation.
     trust.pointerButton = function (id, pressed, x, y, screenX, screenY) {
+        if (currentPointerLock()) return trust.lockedPointerButton(0, pressed);
+        if (pressed) notifyPointerActivation();
         x = +x || 0; y = +y || 0;
         screenX = screenX === undefined ? x : +screenX || 0;
         screenY = screenY === undefined ? y : +screenY || 0;
@@ -2877,6 +3051,7 @@
             clientX: x, clientY: y, screenX, screenY,
             pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
         };
+        lastPointerPosition = nativePointerPosition;
         const init = Object.assign({bubbles:true, cancelable:true, composed:true, view:g,
             detail:1, button:0, buttons:pressed ? 1 : 0, pointerId:1, pointerType:"mouse",
             isPrimary:true, width:1, height:1, pressure:pressed ? 0.5 : 0}, nativePointerPosition);
@@ -2906,16 +3081,18 @@
     }
     // One pointer/mouse compat pair. over/out/move bubble and are cancelable;
     // enter/leave are neither (Pointer Events event tables).
-    function fireHoverPair(name, target, related, bubbling, x, y, screenX, screenY) {
+    function fireHoverPair(name, target, related, bubbling, x, y, screenX, screenY, movementX = 0, movementY = 0) {
+        const buttons = pointerLockState.target ? lockedButtons : primaryPointerDown ? 1 : 0;
         const init = {
             bubbles: bubbling, cancelable: bubbling, composed: bubbling,
             clientX: x, clientY: y,
             pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
-            screenX, screenY, button: 0, buttons: primaryPointerDown ? 1 : 0,
+            screenX, screenY, button: buttons & 1 ? 0 : buttons & 2 ? 2 : buttons & 4 ? 1 : 0, buttons,
             relatedTarget: related, view: g, detail: 0,
+            movementX, movementY,
         };
         const pinit = Object.assign({}, init, {pointerId:1, pointerType:"mouse", isPrimary:true,
-            button:-1, pressure:primaryPointerDown ? 0.5 : 0});
+            button:-1, pressure:buttons ? 0.5 : 0});
         // The single observed movement is the coalesced sample when no batching
         // occurred. Never invent positions or predicted future motion.
         if (name === "move") pinit.coalescedEvents = [createTrustedEvent(PointerEvent, "pointermove", {
@@ -2929,6 +3106,7 @@
     // viewport-relative client coordinates. Keep the frontend's screen space unchanged across
     // nested browsing contexts; only the client pair crosses content-box origins.
     trust.hover = function (id, x, y, screenX, screenY) {
+        if (currentPointerLock()) return true;
         // A stale id (the node was detached since the snapshot the app hit-test
         // ran against) wraps to null — degrade to hover-clear, never an error.
         const childFrame = nativeInputChildFrame(id);
@@ -2967,7 +3145,11 @@
         // pointing device moves even if hit testing retains the same target.
         // The native lane may coalesce samples, but a target transition is not
         // the condition for `pointermove`/`mousemove` dispatch.
-        if (t) fireHoverPair("move", t, null, true, x, y, screenX, screenY);
+        const previous = previousPointerMotion;
+        if (t) fireHoverPair("move", t, null, true, x, y, screenX, screenY,
+            previous ? screenX - previous.screenX : 0, previous ? screenY - previous.screenY : 0);
+        lastPointerPosition = previousPointerMotion = t ? {clientX:x, clientY:y, screenX, screenY,
+            pageX:x+(g.scrollX||0), pageY:y+(g.scrollY||0)} : null;
         // The CSS half: the cascade's :hover chain follows the same committed
         // target (Phase B syscall; guarded so the JS half stands alone).
         if (typeof __dom_set_hover === "function") __dom_set_hover(t ? t.__id : -1);
@@ -9854,6 +10036,25 @@
     g.DOMStringMap = DOMStringMap;
     g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(0);
     cookieDocuments.set(g.document, [realmRootFrame ? realmRootFrame.__id : 0, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
+    pointerDefine(Element.prototype, "requestPointerLock", {
+        value:requestPointerLock, writable:true, enumerable:true, configurable:true,
+    });
+    pointerDefine(Document.prototype, "exitPointerLock", {
+        value:function exitPointerLock() {
+            if (!(this instanceof Document)) throw new TypeError("Expected a Document");
+            const target = currentPointerLock();
+            if (target && target.ownerDocument === this) pointerLockState.owner.releasePointerLock(true);
+        }, writable:true, enumerable:true, configurable:true,
+    });
+    for (const proto of [Document.prototype, ShadowRoot.prototype]) pointerDefine(proto, "pointerLockElement", {
+        get() {
+            if (!(this instanceof Document) && !(this instanceof ShadowRoot)) throw new TypeError("Expected a Document or ShadowRoot");
+            const target = currentPointerLock();
+            if (!target) return null;
+            const visible = retarget(target, this);
+            return visible && visible.getRootNode() === this ? visible : null;
+        }, enumerable:true, configurable:true,
+    });
     documentReferrers.set(g.document, configuredReferrer);
 
     // --- environment ---
@@ -12087,9 +12288,9 @@
     }
     installHandlerProps(Element.prototype, ELEMENT_DOCUMENT_HANDLER_TYPES);
     installHandlerProps(Document.prototype,
-        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange"]));
+        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror"]));
     installHandlerProps(FrameDocument.prototype,
-        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange"]));
+        ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror"]));
     // Bootstrap the existing legacy Navigation/Resource Timing surface. The
     // User Timing / Performance Timeline binding is installed below, after
     // the final monotonic clock and structured-clone codec are available.

@@ -6054,6 +6054,16 @@ impl App {
                     history_updates.push((url, replace));
                 }
                 Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
+                Some(PageEvt::PointerLock { request, node, .. }) => {
+                    if node.is_some()
+                        && let Some(page) = &self.live_page
+                    {
+                        let _ = page.try_send_user(crate::js::PageCmd::PointerLockResult {
+                            request,
+                            error: Some(String::from("NotSupportedError")),
+                        });
+                    }
+                }
                 None => break,
             }
             pending = self.page_rx.as_mut().and_then(|rx| rx.try_recv().ok());

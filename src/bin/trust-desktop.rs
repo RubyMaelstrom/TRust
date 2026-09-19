@@ -36,12 +36,15 @@ use trust::render::{
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase,
+    WindowEvent,
+};
 use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
 };
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Window, WindowId};
 
 const PAGE_ACCESS_BASE: u64 = 10_000;
 const ACCESS_ROOT: AccessNodeId = AccessNodeId(0);
@@ -1361,6 +1364,12 @@ impl DesktopRenderer {
     }
 }
 
+struct NativePointerLock {
+    generation: u64,
+    position: CssPoint,
+    confined: bool,
+}
+
 struct DesktopApp {
     browser: BrowserController,
     renderer: Option<DesktopRenderer>,
@@ -1379,6 +1388,7 @@ struct DesktopApp {
     cursor_icon: CursorIcon,
     cursor_custom: Option<(ImageHandle, u16, u16)>,
     cursor_visible: bool,
+    pointer_lock: Option<NativePointerLock>,
     custom_cursors: HashMap<(ImageHandle, u16, u16), CustomCursor>,
     cursor_hotspots: HashMap<ImageHandle, (u16, u16)>,
     modifiers: ModifiersState,
@@ -1727,6 +1737,7 @@ impl DesktopApp {
             cursor_icon: CursorIcon::Default,
             cursor_custom: None,
             cursor_visible: true,
+            pointer_lock: None,
             custom_cursors: HashMap::new(),
             cursor_hotspots: HashMap::new(),
             modifiers: ModifiersState::empty(),
@@ -2167,6 +2178,7 @@ impl DesktopApp {
             self.pending_page_keys.clear();
         }
         let outcome = self.browser.handle_action(action);
+        self.sync_pointer_lock();
         self.launch_external_media_requests();
         if outcome.loading_retired {
             self.retire_page_loading();
@@ -2305,6 +2317,7 @@ impl DesktopApp {
     /// queue along with the old page.
     fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
         let outcome = self.browser.process_async_events();
+        self.sync_pointer_lock();
         self.launch_external_media_requests();
         if self.browser.download_offer().is_some()
             && !matches!(self.focus, FocusTarget::Command | FocusTarget::Download)
@@ -3386,6 +3399,9 @@ impl DesktopApp {
     }
 
     fn set_focus(&mut self, focus: FocusTarget) {
+        if focus != FocusTarget::Page {
+            self.release_native_pointer_lock(true);
+        }
         if focus != FocusTarget::Command {
             self.clear_gemini_input();
         }
@@ -3955,6 +3971,12 @@ impl DesktopApp {
 
     fn handle_keyboard(&mut self, event: winit::event::KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
+        if self.pointer_lock.is_some() && event.logical_key == WinitKey::Named(NamedKey::Escape) {
+            if pressed {
+                self.release_native_pointer_lock(true);
+            }
+            return;
+        }
         if pressed {
             self.protocol_pointer_selection = false;
         }
@@ -4055,6 +4077,10 @@ impl DesktopApp {
             repeat: event.repeat,
             composing: self.composing,
         };
+        if self.pointer_lock.is_some() {
+            self.dispatch(UserAction::Key(input));
+            return;
+        }
         // UI Events §3.5.6.1 routes keydown to the focused element and makes
         // Tab's default action focus transfer. HTML §6.6.5 explicitly allows
         // that transfer to enter UA controls after the document. TRust uses
@@ -5734,7 +5760,82 @@ impl DesktopApp {
         true
     }
 
+    /// Pointer Lock 2.0: capture must succeed before acknowledging the page.
+    fn sync_pointer_lock(&mut self) {
+        if self.pointer_lock.as_ref().is_some_and(|lock| {
+            lock.generation != self.browser.document_generation() || !self.browser.page_is_live()
+        }) {
+            self.release_native_pointer_lock(false);
+        }
+        while let Some((request, node, _unadjusted)) = self.browser.take_pointer_lock_request() {
+            if node.is_none() {
+                self.release_native_pointer_lock(false);
+                continue;
+            }
+            let error = if !self.window_focused || self.focus != FocusTarget::Page {
+                Some(String::from("WrongDocumentError"))
+            } else if let Some(window) = &self.window {
+                let grab = window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .map(|()| false)
+                    .or_else(|_| {
+                        window
+                            .set_cursor_grab(CursorGrabMode::Confined)
+                            .map(|()| true)
+                    });
+                match grab {
+                    Ok(confined) => {
+                        if self.pointer_lock.is_none() {
+                            self.pointer_lock = Some(NativePointerLock {
+                                generation: self.browser.document_generation(),
+                                position: self.pointer,
+                                confined,
+                            });
+                        }
+                        window.set_cursor_visible(false);
+                        self.cursor_visible = false;
+                        self.selecting = false;
+                        self.pressed_hit = None;
+                        self.pressed_control = None;
+                        self.browser.set_status("Mouse captured · Esc to release");
+                        None
+                    }
+                    Err(_) => Some(String::from("NotSupportedError")),
+                }
+            } else {
+                Some(String::from("NotSupportedError"))
+            };
+            self.browser
+                .handle_action(UserAction::PointerLockResult { request, error });
+        }
+    }
+
+    fn release_native_pointer_lock(&mut self, notify_page: bool) {
+        if let Some(lock) = self.pointer_lock.take() {
+            if let Some(window) = &self.window {
+                // Wayland accepts the position hint only while still locked.
+                let _ = window
+                    .set_cursor_position(LogicalPosition::new(lock.position.x, lock.position.y));
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+            self.pointer = lock.position;
+            self.cursor_visible = true;
+            if lock.generation == self.browser.document_generation() && self.browser.page_is_live()
+            {
+                self.browser.set_status("Mouse released");
+            }
+            self.request_redraw();
+        }
+        if notify_page {
+            self.browser.handle_action(UserAction::ReleasePointerLock);
+        }
+    }
+
     fn apply_cursor_icon(&mut self, icon: CursorIcon) {
+        if self.pointer_lock.is_some() {
+            return;
+        }
         let changed =
             !self.cursor_visible || self.cursor_custom.is_some() || self.cursor_icon != icon;
         self.cursor_visible = true;
@@ -5911,6 +6012,9 @@ impl DesktopApp {
     }
 
     fn pointer_moved(&mut self, event_loop: Option<&ActiveEventLoop>, point: CssPoint) {
+        if self.pointer_lock.is_some() {
+            return;
+        }
         if event_loop.is_some() {
             self.protocol_pointer_selection = true;
         }
@@ -6118,6 +6222,21 @@ impl DesktopApp {
     }
 
     fn handle_pointer_button(&mut self, state: ElementState, button: MouseButton) {
+        if self.pointer_lock.is_some() {
+            let button = match button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                MouseButton::Back => 3,
+                MouseButton::Forward => 4,
+                MouseButton::Other(n) => n as i16,
+            };
+            self.dispatch(UserAction::LockedPointerButton {
+                button,
+                pressed: state == ElementState::Pressed,
+            });
+            return;
+        }
         let dragging_input = self
             .terminal
             .as_ref()
@@ -6370,6 +6489,17 @@ impl DesktopApp {
     }
 
     fn handle_scroll(&mut self, delta: MouseScrollDelta) {
+        if self.pointer_lock.is_some() {
+            let (dx, dy) = match delta {
+                MouseScrollDelta::LineDelta(x, y) => (-f64::from(x) * 40.0, -f64::from(y) * 40.0),
+                MouseScrollDelta::PixelDelta(p) => (
+                    -p.x / self.metrics.scale_factor.get(),
+                    -p.y / self.metrics.scale_factor.get(),
+                ),
+            };
+            self.dispatch(UserAction::LockedWheel { dx, dy });
+            return;
+        }
         if self
             .scene
             .as_ref()
@@ -6712,6 +6842,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.release_native_pointer_lock(true);
         self.force_full_raster = true;
         self.window_focused = false;
         self.set_active_animations(HashSet::new());
@@ -6719,6 +6850,37 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             renderer.suspend();
         }
         self.surface = None;
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if !self.window_focused {
+            return;
+        }
+        let Some(lock) = self.pointer_lock.as_ref() else {
+            return;
+        };
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if !dx.is_finite() || !dy.is_finite() {
+                return;
+            }
+            if lock.confined
+                && let Some(window) = &self.window
+            {
+                // X11 offers confinement rather than a stationary cursor.
+                // Raw device deltas remain authoritative; ignore warp-generated
+                // CursorMoved events and keep the hidden cursor off the edges.
+                let _ = window.set_cursor_position(LogicalPosition::new(
+                    self.metrics.css.width / 2.0,
+                    self.metrics.css.height / 2.0,
+                ));
+            }
+            self.dispatch(UserAction::PointerMotion { dx, dy });
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopEvent) {
@@ -6988,7 +7150,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             adapter.process_event(window, &event);
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.release_native_pointer_lock(false);
+                event_loop.exit();
+            }
             WindowEvent::Destroyed => {
                 self.surface = None;
                 self.renderer = None;
@@ -7020,6 +7185,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    self.release_native_pointer_lock(true);
                     self.composing = false;
                     self.selecting = false;
                     if let Some(terminal) = &mut self.terminal {
@@ -7056,6 +7222,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.pointer_moved(Some(event_loop), self.pointer);
             }
             WindowEvent::CursorLeft { .. } => {
+                if self.pointer_lock.is_some() {
+                    return;
+                }
                 self.pointer_inside = false;
                 self.protocol_pointer_selection = false;
                 self.hovered_actor = None;

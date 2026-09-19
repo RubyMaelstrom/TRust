@@ -277,6 +277,24 @@ pub enum PageCmd {
         url: String,
         delta: i32,
     },
+    PointerLockResult {
+        request: u64,
+        error: Option<String>,
+    },
+    /// Unconditional native release (Escape, focus loss, or retired window).
+    ReleasePointerLock,
+    PointerMotion {
+        dx: f64,
+        dy: f64,
+    },
+    LockedPointerButton {
+        button: i16,
+        pressed: bool,
+    },
+    LockedWheel {
+        dx: f64,
+        dy: f64,
+    },
     /// Actual primary-pointer transitions, before the separate click action.
     PointerButton {
         node: Option<usize>,
@@ -347,6 +365,11 @@ impl PageCmd {
             Self::Click(_)
                 | Self::NavigateFragment { .. }
                 | Self::TraverseHistory { .. }
+                | Self::PointerLockResult { .. }
+                | Self::ReleasePointerLock
+                | Self::PointerMotion { .. }
+                | Self::LockedPointerButton { .. }
+                | Self::LockedWheel { .. }
                 | Self::PointerButton { .. }
                 | Self::Focus(_)
                 | Self::Key { .. }
@@ -410,6 +433,11 @@ pub enum PageEvt {
         replace: bool,
     },
     ScrollToFragment(String),
+    PointerLock {
+        request: u64,
+        node: Option<usize>,
+        unadjusted: bool,
+    },
     Trouble(Vec<String>),
     Settled,
     /// Acknowledges a native key. Suppress the frontend default when canceled
