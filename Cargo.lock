@@ -36,6 +36,7 @@ dependencies = [
  "roxmltree",
  "rustc-hash 2.1.3",
  "rustix 1.1.4",
+ "serde",
  "serde_json",
  "sha1",
  "sha2 0.11.0",

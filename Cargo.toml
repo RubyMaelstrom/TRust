@@ -109,6 +109,7 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 # resistance buys nothing for arena-internal keys.
 rustc-hash = "2"
 serde_json = "1"
+serde = "1"
 # Fetch Metadata uses HTML's schemeful same-site relation, including private
 # suffixes (e.g. github.io). This compiled PSL has no runtime network refresh;
 # Cargo.lock pins the data revision delivered with each browser build.
