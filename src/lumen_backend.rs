@@ -1383,10 +1383,13 @@ mod desktop {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
         let actor_interrupt = interrupt.clone();
         let actor_running = interaction_running.clone();
-        let spawned = std::thread::Builder::new()
-            .name(String::from("trust-page-lumen"))
-            .stack_size(PAGE_STACK)
-            .spawn(move || {
+        let spawned = crate::page_threads::spawn(
+            std::thread::Builder::new()
+                .name(String::from("trust-page-lumen"))
+                .stack_size(PAGE_STACK),
+            interrupt.clone(),
+            &cache,
+            move || {
                 page_actor(
                     html,
                     env,
@@ -1398,7 +1401,8 @@ mod desktop {
                     actor_interrupt,
                 );
                 crate::release_allocator_memory();
-            });
+            },
+        );
         if spawned.is_err() {
             // Dropping the event sender in the failed closure tells the caller
             // to take its existing CSS-only fallback.

@@ -7833,6 +7833,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let result = event_loop.run_app(&mut app);
     drop(app);
+    trust::js::shutdown_page_threads();
     if let Err(error) = trust::site_storage::shutdown() {
         eprintln!("trust: {error}");
     }
