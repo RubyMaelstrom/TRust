@@ -257,43 +257,6 @@ impl Default for PaintFlags {
     }
 }
 
-/// Whether a pinned fixed fragment is a viewport backdrop. CSS Positioned
-/// Layout §2.2 makes fixed boxes stacking contexts, while CSS 2.1 Appendix E
-/// §E.2 places an auto-z-index backdrop below later positive-z-index content.
-/// Keep the backdrop's semantic hit regions in the underlay: a descendant
-/// remains targetable wherever later page paint does not cover it, but it no
-/// longer swallows controls painted above the backdrop.
-pub(super) fn fixed_backdrop(
-    dom: &Dom,
-    fragment: &Frag<'_>,
-    viewport_w: f32,
-    viewport_h: f32,
-) -> bool {
-    if fragment.paint.z.is_some()
-        || fragment.x > 0.5
-        || fragment.y > 0.5
-        || fragment.w + 0.5 < viewport_w
-        || fragment.h + 0.5 < viewport_h
-    {
-        return false;
-    }
-    // CSS Masking 1 §5: a fixed descendant must remain inside its ancestor
-    // clipping contexts. The standalone viewport underlay has no such stack.
-    let mut parent = (fragment.node != NO_NODE)
-        .then(|| dom.parent_flat(fragment.node))
-        .flatten();
-    while let Some(node) = parent {
-        if dom
-            .computed_value_resolved(node, "clip-path")
-            .is_some_and(|value| super::clip_path::supports(&value))
-        {
-            return false;
-        }
-        parent = dom.parent_flat(node);
-    }
-    true
-}
-
 /// Derive the paint flags from a box style. `item` = the box is a flex/grid
 /// item (a non-auto z-index then forms a stacking context even at
 /// position:static — css-flexbox §4.3).
