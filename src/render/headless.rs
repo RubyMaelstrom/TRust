@@ -454,6 +454,39 @@ mod tests {
     }
 
     #[test]
+    fn viewport_fixed_auto_context_paints_above_inflow_backgrounds() {
+        // CSS Positioned Layout 3 #stacking and CSS2 Appendix E.2 step 8:
+        // viewport coverage does not turn an auto-z stacking context into a
+        // backdrop below the body's in-flow background. Zero-level positioned
+        // siblings still paint in tree order.
+        let base = Url::parse("https://example.test/").unwrap();
+        for fixed_first in [true, false] {
+            let fixed = "<div style='position:fixed;inset:0;background:red'></div>";
+            let sibling = "<div style='position:relative;margin-left:40px;width:40px;height:64px;background:lime'></div>";
+            let body = if fixed_first {
+                format!("{fixed}{sibling}")
+            } else {
+                format!("{sibling}{fixed}")
+            };
+            let html = format!(
+                "<!doctype html><style>html,body{{margin:0;height:100%;background:black}}</style>{body}"
+            );
+            let frame = render_html(&html, &base, CssSize::new(80., 64.)).unwrap();
+            let pixel = |x: usize| &frame.pixels[(32 * 80 + x) * 4..(32 * 80 + x) * 4 + 4];
+            assert_eq!(pixel(20), &[255, 0, 0, 255], "fixed paints above body");
+            assert_eq!(
+                pixel(60),
+                if fixed_first {
+                    &[0, 255, 0, 255]
+                } else {
+                    &[255, 0, 0, 255]
+                },
+                "equal stacking levels preserve tree order"
+            );
+        }
+    }
+
+    #[test]
     fn fixed_viewport_backdrop_paints_under_later_positioned_content() {
         // CSS Positioned Layout §2.2 + CSS 2.1 Appendix E §E.2: a fixed
         // backdrop remains viewport-pinned, but a later z-index:auto positioned
@@ -478,8 +511,15 @@ mod tests {
             &controls,
             &ImageSizes::new(),
         );
-        assert!(!layout.paint.fixed_under_primitives.is_empty());
-        assert!(layout.paint.fixed_primitives.is_empty());
+        assert!(layout.paint.fixed_under_primitives.is_empty());
+        assert!(layout.paint.fixed_interleaved);
+        assert!(
+            layout
+                .paint
+                .primitives
+                .iter()
+                .any(|command| matches!(command, super::super::DisplayCommand::BeginFixed))
+        );
         let frame = render_html(html, &base, CssSize::new(240.0, 180.0)).unwrap();
         let center = ((90 * 240 + 120) * 4) as usize;
         assert_eq!(

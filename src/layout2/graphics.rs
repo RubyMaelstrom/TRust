@@ -960,17 +960,12 @@ pub(super) fn paint<'t>(
     let primitives = std::mem::take(&mut builder.commands);
     let mut fixed: Vec<_> = fixed.iter().collect();
     fixed.sort_by_key(|fragment| fragment.paint.z.unwrap_or(0));
-    let mut fixed_under_primitives = Vec::new();
     let mut fixed_primitives = Vec::new();
     for fragment in fixed {
         let start = builder.commands.len();
         build_sc(fragment, &mut builder);
         let commands = builder.commands.split_off(start);
-        if super::flow::fixed_backdrop(dom, fragment, viewport_w, viewport_h) {
-            fixed_under_primitives.extend(commands);
-        } else {
-            fixed_primitives.extend(commands);
-        }
+        fixed_primitives.extend(commands);
     }
     // CSS Positioned Layout 4 §3: each top-layer entry paints as its own
     // stacking context after the document, in ordered-set order. Its fragment
@@ -998,7 +993,7 @@ pub(super) fn paint<'t>(
         background: root_background,
         lines: builder.lines,
         primitives,
-        fixed_under_primitives,
+        fixed_under_primitives: Vec::new(),
         fixed_primitives,
         fixed_interleaved: true,
         top_layer: top_layer_entries,
@@ -1306,16 +1301,10 @@ fn build_fixed(index: usize, builder: &mut Builder<'_, '_>) {
     let Some(fragment) = builder.fixed.get(index) else {
         return;
     };
-    // The full-viewport, auto-z backdrop remains in the dedicated underlay;
-    // its marker is intentionally silent in the document stream.
-    if super::flow::fixed_backdrop(
-        builder.dom,
-        fragment,
-        builder.viewport_w,
-        builder.viewport_h,
-    ) {
-        return;
-    }
+    // CSS Positioned Layout 3 #stacking / CSS2 Appendix E.2: fixed boxes
+    // participate at their stacking level and tree position even when they
+    // cover the viewport. An auto-z box paints above in-flow backgrounds;
+    // moving it into a viewport underlay would let the body hide its pixels.
     let outer = builder.fixed_depth == 0;
     if outer {
         builder.commands.push(DisplayCommand::BeginFixed);
