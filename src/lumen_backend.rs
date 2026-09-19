@@ -11456,6 +11456,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selector_syntax_errors_enable_library_visibility_fallback() {
+        // DOM #scope-match-a-selectors-string / #dom-element-matches and
+        // Selectors 4 #invalid: libraries catch SyntaxError to evaluate their
+        // own selector extensions. An empty native result skips that fallback
+        // and leaves visible lazy images on their placeholder URLs.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<style>body{margin:0} img{width:40px;height:60px} #hidden{display:none}</style>
+            <img id=cover class=lazy src=placeholder.png data-src=cover.png>
+            <img id=hidden class=lazy src=placeholder.png data-src=hidden.png>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const cover = document.getElementById('cover');
+                    const fragment = document.createDocumentFragment();
+                    const shadow = document.createElement('div').attachShadow({mode:'open'});
+                    for (const selector of [
+                        '.lazy:visible', ':unknown-pseudo', ':unknown-function(x)',
+                        '.lazy, :visible', ':not(.lazy, :visible)',
+                        ':has(.lazy, :visible)', ':nth-child(1 of .lazy, :visible)'
+                    ]) {
+                        for (const root of [document, document.body, fragment, shadow]) {
+                            for (const method of ['querySelector', 'querySelectorAll']) {
+                                let caught = false;
+                                try { root[method](selector); }
+                                catch (error) {
+                                    caught = error instanceof DOMException && error.name === 'SyntaxError';
+                                }
+                                if (!caught) return method + ' accepted ' + selector;
+                            }
+                        }
+                        for (const method of ['matches', 'webkitMatchesSelector', 'closest']) {
+                            let caught = false;
+                            try { cover[method](selector); }
+                            catch (error) {
+                                caught = error instanceof DOMException && error.name === 'SyntaxError';
+                            }
+                            if (!caught) return method + ' accepted ' + selector;
+                        }
+                    }
+                    if (document.querySelectorAll(':is(.lazy, :visible)').length !== 2)
+                        return 'forgiving selector lost valid members';
+                    if (document.querySelectorAll(':is(:visible)').length !== 0)
+                        return 'empty forgiving selector matched';
+                    if (document.querySelectorAll('::-webkit-unknown').length !== 0)
+                        return 'inert pseudo-element matched';
+
+                    let fallbacks = 0;
+                    function visibleImages() {
+                        try { return document.querySelectorAll('.lazy:visible'); }
+                        catch (error) {
+                            if (error.name !== 'SyntaxError') throw error;
+                            fallbacks++;
+                            return Array.from(document.querySelectorAll('.lazy')).filter(
+                                image => image.offsetWidth > 0 || image.offsetHeight > 0);
+                        }
+                    }
+                    for (const image of visibleImages())
+                        image.src = image.getAttribute('data-src');
+                    const first = cover.getAttribute('src');
+                    const hidden = document.getElementById('hidden');
+                    const beforeReveal = hidden.getAttribute('src');
+                    hidden.style.display = 'block';
+                    for (const image of visibleImages())
+                        image.src = image.getAttribute('data-src');
+                    return [fallbacks, first, beforeReveal, hidden.getAttribute('src')].join('|');
+                })()"#,
+            ),
+            "2|cover.png|placeholder.png|hidden.png"
+        );
+    }
+
+    #[test]
     fn transparent_positioned_carousel_slides_keep_cssom_geometry() {
         // CSS Color 4 #transparency is a post-layout group operation;
         // CSSOM View #dom-htmlelement-offsetwidth/#dom-htmlelement-offsetheight

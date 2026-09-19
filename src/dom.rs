@@ -8112,11 +8112,9 @@ impl Dom {
         }) {
             return false;
         }
-        // `:has(...)`: each invocation's forgiving list must have at least one
-        // relative selector satisfied by an element in this element's subtree /
-        // following-sibling forest. An empty (all-invalid) group matches
-        // nothing. (Placed after the cheap own-element tests so `:has()`'s
-        // subtree walk runs only for elements that already match the subject.)
+        // `:has(...)`: each invocation needs a relative selector satisfied by
+        // an element in this element's subtree / following-sibling forest.
+        // Run the subtree walk after the cheap own-element tests.
         if !c
             .has
             .iter()
@@ -8586,8 +8584,8 @@ struct HasArg {
 
 /// Parse ONE `:has()` argument — a relative selector: an optional leading
 /// combinator (`>`/`+`/`~`, default descendant) then a complex selector.
-/// Returns `None` (the forgiving list drops it) for an unparsable argument, a
-/// pseudo-element subject, or a NESTED `:has()` (both invalid per Selectors 4).
+/// Returns `None` (invalidating the list) for an unparsable argument, a
+/// pseudo-element, or a NESTED `:has()` (both invalid per Selectors 4).
 fn parse_relative(part: &str) -> Option<HasArg> {
     let part = part.trim();
     let mut chars = part.chars().peekable();
@@ -8602,8 +8600,8 @@ fn parse_relative(part: &str) -> Option<HasArg> {
     }
     let rest: String = chars.collect();
     let mut cx = parse_complex(rest.trim())?;
-    // A pseudo-element subject is invalid inside `:has()`; nested `:has()` too.
-    if cx.0.last().is_some_and(|(_, c)| c.pseudo.is_some()) || complex_uses_has(&cx.0) {
+    // A pseudo-element is invalid inside `:has()`; nested `:has()` too.
+    if cx.0.iter().any(|(_, c)| c.has_pseudo_element()) || complex_uses_has(&cx.0) {
         return None;
     }
     // Anchor at `:scope`: the leftmost real compound takes the leading
@@ -8739,7 +8737,7 @@ struct Compound {
     /// matches nothing (the rule survives).
     selects: Vec<(Vec<Complex>, bool)>,
     /// `:has(...)` (Selectors 4 §4.5, the relational pseudo-class), one entry
-    /// per invocation. Each is a FORGIVING relative-selector list: the element
+    /// per invocation. Each is a strict relative-selector list: the element
     /// matches an invocation if AT LEAST ONE of its `HasArg`s finds a matching
     /// element in this element's subtree (or following-sibling forest). Every
     /// invocation must hold (`.a:has(.b):has(.c)` needs both). Specificity is
@@ -8753,17 +8751,13 @@ struct Compound {
     /// `:popover-open` (live): the element's popover must currently be
     /// showing (`Dom.popover_open`, written by the popover API syscall).
     popover_open: bool,
-    /// `:focus` and other pseudos we can't satisfy: parse fine,
-    /// match never (fail-open — a never-matching hide rule hides nothing,
-    /// and its comma-siblings stay alive).
+    /// Recognized inactive states and inert pseudo-elements match nothing.
+    /// Unsupported pseudo names instead invalidate the selector at parse time.
     never: bool,
-    /// Set alongside `never` for pseudos that are NOT genuinely false at
-    /// rest (`:has(…)`, `:lang(…)`, …). Inside
-    /// `:not()` a `never` compound would invert to ALWAYS-match — correct
-    /// for an interaction pseudo (`:not(:hover)` really is true at rest),
-    /// but a hide rule like `.x:not(:has(img))` must die instead of hiding
-    /// every `.x`. The `:not` parser rejects these (rule dropped, fail-open).
-    never_unknown: bool,
+    /// Selectors 4 Appendix B accepts unknown non-functional `::-webkit-*`
+    /// pseudo-elements, which never match. They remain pseudo-elements for
+    /// specificity and for argument lists that require real selectors.
+    inert_pseudo_element: bool,
     /// Structural pseudo-classes (`:empty`, `:nth-child(…)`, `:first-child`,
     /// `:*-of-type`, …) the element must satisfy. All must hold (AND).
     structural: Vec<Structural>,
@@ -9006,7 +9000,7 @@ fn parse_nth_of(sel: &str) -> Option<Vec<Complex>> {
     let mut out = Vec::new();
     for part in split_top_level(sel, ',') {
         let cx = parse_complex(part.trim())?;
-        if cx.0.last().is_some_and(|(_, c)| c.pseudo.is_some()) {
+        if cx.0.iter().any(|(_, c)| c.has_pseudo_element()) {
             return None;
         }
         out.push(cx);
@@ -9054,6 +9048,10 @@ fn attr_op_matches(op: AttrOp, got: &str, want: &str) -> bool {
 }
 
 impl Compound {
+    fn has_pseudo_element(&self) -> bool {
+        self.pseudo.is_some() || self.slotted.is_some() || self.inert_pseudo_element
+    }
+
     fn is_empty(&self) -> bool {
         self.tag.is_none()
             && self.id.is_none()
@@ -9084,7 +9082,9 @@ impl Compound {
         let mut s = (
             u32::from(self.id.is_some()),
             self.classes.len() as u32 + self.attrs.len() as u32 + self.pseudos,
-            u32::from(matches!(&self.tag, Some(t) if t != "*")) + u32::from(self.pseudo.is_some()),
+            u32::from(matches!(&self.tag, Some(t) if t != "*"))
+                + u32::from(self.pseudo.is_some())
+                + u32::from(self.inert_pseudo_element),
         );
         for group in &self.nots {
             if let Some(m) = group.iter().map(Complex::specificity).max() {
@@ -9558,7 +9558,8 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                 chars.next();
                 // `::foo` (double colon) marks a pseudo-element; `:before`
                 // and `:after` have a legacy single-colon spelling too.
-                if chars.peek() == Some(&':') {
+                let double_colon = chars.peek() == Some(&':');
+                if double_colon {
                     chars.next();
                 }
                 let name = take_name(chars)?.to_ascii_lowercase();
@@ -9585,6 +9586,45 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     }
                     arg = Some(inner);
                 }
+                // Selectors 4 #invalid / #compat (local snapshot 2026-09-06):
+                // unsupported pseudos invalidate a selector, except for the
+                // non-functional ::-webkit-* pseudo-element parsing quirk.
+                // DOM #scope-match-a-selectors-string then exposes a parse
+                // failure as SyntaxError, allowing selector libraries to
+                // evaluate their own extensions (such as :visible).
+                // https://drafts.csswg.org/selectors-4/#invalid
+                // https://dom.spec.whatwg.org/#scope-match-a-selectors-string
+                if double_colon && !matches!(name.as_str(), "before" | "after" | "slotted") {
+                    if name.starts_with("-webkit-") && arg.is_none() {
+                        compound.never = true;
+                        compound.inert_pseudo_element = true;
+                        continue;
+                    }
+                    return None;
+                }
+                if !double_colon && name == "slotted" {
+                    return None;
+                }
+                if arg.is_some()
+                    && !matches!(
+                        name.as_str(),
+                        "not"
+                            | "is"
+                            | "where"
+                            | "matches"
+                            | "has"
+                            | "slotted"
+                            | "host"
+                            | "nth-child"
+                            | "nth-last-child"
+                            | "nth-of-type"
+                            | "nth-last-of-type"
+                            | "lang"
+                            | "dir"
+                    )
+                {
+                    return None;
+                }
                 if name == "not" {
                     // Selectors 4 §4.3: unlike :is/:where, :not takes a STRICT
                     // complex-real-selector-list. Combinators are valid;
@@ -9596,14 +9636,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                             return None;
                         }
                         let inner = parse_complex(part)?;
-                        // A pseudo we can't evaluate would INVERT through
-                        // `:not` into always-match (see `never_unknown`);
-                        // fail the parse so the rule dies instead.
-                        if inner
-                            .0
-                            .iter()
-                            .any(|(_, c)| c.never_unknown || c.pseudo.is_some())
-                        {
+                        if inner.0.iter().any(|(_, c)| c.has_pseudo_element()) {
                             return None;
                         }
                         group.push(inner);
@@ -9626,30 +9659,20 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                             continue;
                         }
                         if let Some(cx) = parse_complex(part)
-                            && cx.0.last().is_none_or(|(_, c)| c.pseudo.is_none())
+                            && !cx.0.iter().any(|(_, c)| c.has_pseudo_element())
                         {
                             group.push(cx);
                         }
                     }
                     compound.selects.push((group, name == "where"));
                 } else if name == "has" {
-                    // `:has(<forgiving-relative-selector-list>)` (Selectors 4
-                    // §4.5): the element must have a matching element in its
-                    // subtree / following-sibling forest. A forgiving list —
-                    // unparsable/invalid args (pseudo-element subject, nested
-                    // `:has`) drop individually; an all-invalid group matches
-                    // nothing (the rule survives). Specificity is the most
-                    // specific argument, added in `spec()`; `:has` does NOT
-                    // bump `pseudos` (it's not `never`/`never_unknown` — real,
-                    // evaluable relational matching).
+                    // Selectors 4 #relational / #forgiving-selector: :has()
+                    // takes a strict relative-selector-list. An invalid member
+                    // rejects the whole selector, including when another member
+                    // matches. Only :is() and :where() use forgiving lists.
                     let mut group = Vec::new();
                     for part in split_top_level(&arg?, ',') {
-                        if part.trim().is_empty() {
-                            continue;
-                        }
-                        if let Some(h) = parse_relative(part) {
-                            group.push(h);
-                        }
+                        group.push(parse_relative(part)?);
                     }
                     compound.has.push(group);
                 } else if name == "slotted" {
@@ -9759,27 +9782,14 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // argument fails the parse (rule dropped, fail-open).
                     compound.states.push(state);
                     compound.pseudos += 1;
-                } else {
-                    // Valid CSS we can't satisfy YET: parse, count for
-                    // specificity, never match. (Any of these can graduate
-                    // to a real evaluation when the state exists — `:hover`,
-                    // `:checked` & co. all started here.) Interaction
-                    // pseudos are GENUINELY false at rest (no pointer, no
-                    // focus), so a `:not(:focus)` wrapping them correctly
-                    // matches; anything else unsupported is flagged so
-                    // `:not` rejects it rather than inverting it into
-                    // always-match.
+                } else if matches!(
+                    name.as_str(),
+                    "active" | "focus" | "focus-within" | "focus-visible" | "visited"
+                ) {
                     compound.never = true;
-                    compound.never_unknown = !matches!(
-                        name.as_str(),
-                        "active"
-                            | "focus"
-                            | "focus-within"
-                            | "focus-visible"
-                            | "visited"
-                            | "target"
-                    );
                     compound.pseudos += 1;
+                } else {
+                    return None;
                 }
             }
             c if c.is_ascii_whitespace() || c == '>' || c == '+' || c == '~' => break,
@@ -11897,7 +11907,7 @@ impl Compound {
             target: _,
             popover_open,
             never,
-            never_unknown,
+            inert_pseudo_element,
             structural,
             states,
             scope,
@@ -11912,7 +11922,7 @@ impl Compound {
             hover,
             popover_open,
             never,
-            never_unknown,
+            inert_pseudo_element,
             scope,
             root,
             host,
@@ -14544,6 +14554,96 @@ mod tests {
             Some(vec!["span".to_string(), "a".to_string()])
         );
         assert!(SelectorList::parse("span, .x").unwrap().1.is_none());
+    }
+
+    #[test]
+    fn unsupported_pseudos_invalidate_strict_selector_lists() {
+        // Selectors 4 #invalid, #parse-selector and #forgiving-selector:
+        // unknown names are parse failures, including in strict arguments.
+        for selector in [
+            ".image:visible",
+            ".image:VISiBLE",
+            r".image:\76 isible",
+            ":unknown-pseudo",
+            ":unknown-function(.image)",
+            "::unknown-pseudo",
+            ".image, :visible",
+            ":not(.image, :visible)",
+            ":has(.image, :visible)",
+            ":nth-child(1 of .image, :visible)",
+            ":is(.image, :visible):unknown-pseudo",
+            ":hover()",
+            ":checked(x)",
+            "::before(x)",
+            "::hover",
+            ":slotted(.image)",
+            ":dir(invalid)",
+            ":lang()",
+        ] {
+            assert!(SelectorList::parse(selector).is_none(), "{selector}");
+            // The JS query/matches boundary caches failures as failures.
+            assert!(SelectorList::parse_cached(selector).is_none(), "{selector}");
+            assert!(SelectorList::parse_cached(selector).is_none(), "{selector}");
+        }
+        let dom = Dom::parse_document(
+            "<style>.image {color:blue} .image, :visible {color:red}</style>\
+             <img id=cover class=image>",
+        );
+        assert_eq!(
+            dom.computed_value(dom.get_by_id("cover").unwrap(), "color")
+                .as_deref(),
+            Some("blue"),
+            "an unsupported member invalidates the entire style rule"
+        );
+    }
+
+    #[test]
+    fn unsupported_pseudos_are_discarded_only_in_forgiving_lists() {
+        let dom = Dom::parse_document("<img id=cover class=image>");
+        let cover = dom.get_by_id("cover").unwrap();
+        for (selector, expected, specificity) in [
+            (":is(.image, #absent:visible)", true, (0, 1, 0)),
+            (":where(.image, :visible)", true, (0, 0, 0)),
+            (":is(:visible)", false, (0, 0, 0)),
+            (":not(:is(:visible))", true, (0, 0, 0)),
+            (":is(.image, :has(img, :visible))", true, (0, 1, 0)),
+            (":is(.image, #absent::before .image)", true, (0, 1, 0)),
+        ] {
+            let parsed = SelectorList::parse(selector).expect(selector);
+            assert_eq!(dom.matches(cover, &parsed), expected, "{selector}");
+            assert_eq!(parsed.0[0].specificity(), specificity, "{selector}");
+        }
+    }
+
+    #[test]
+    fn unknown_webkit_pseudo_elements_keep_the_required_parsing_quirk() {
+        // Selectors 4 #compat: only double-colon, non-functional names are
+        // accepted. They match nothing and remain invalid in real selectors.
+        let dom = Dom::parse_document("<img id=cover class=image>");
+        let cover = dom.get_by_id("cover").unwrap();
+        let parsed = SelectorList::parse("::-WEBKIT-unknown").unwrap();
+        assert_eq!(parsed.0[0].specificity(), (0, 0, 1));
+        assert!(dom.query(DOCUMENT, &parsed, false).is_empty());
+        assert_eq!(
+            dom.query(
+                DOCUMENT,
+                &SelectorList::parse(".image, ::-webkit-unknown").unwrap(),
+                false
+            ),
+            vec![cover]
+        );
+        for selector in [
+            ":-webkit-unknown",
+            "::-webkit-unknown()",
+            ":not(::-webkit-unknown)",
+            ":has(::-webkit-unknown)",
+            ":nth-child(1 of ::-webkit-unknown)",
+        ] {
+            assert!(SelectorList::parse(selector).is_none(), "{selector}");
+        }
+        let parsed = SelectorList::parse(":is(.image, #absent::-webkit-unknown)").unwrap();
+        assert!(dom.matches(cover, &parsed));
+        assert_eq!(parsed.0[0].specificity(), (0, 1, 0));
     }
 
     #[test]
@@ -19765,7 +19865,7 @@ mod tests {
     }
 
     #[test]
-    fn has_specificity_and_forgiving_and_nesting() {
+    fn has_specificity_and_strict_arguments_and_nesting() {
         // Specificity: `:has()` contributes its most specific argument
         // (Selectors 4 §17), like `:is()` — the anchoring `:scope` adds zero.
         let spec = |s: &str| parse_complex(s).unwrap().specificity();
@@ -19779,18 +19879,18 @@ mod tests {
             (1, 0, 1),
             ":has(> #id) = one id + the tag"
         );
-        // Forgiving list: an invalid arg drops, a valid one survives.
-        assert_eq!(
-            spec(":has(.ok, ::before)"),
-            (0, 1, 0),
-            "pseudo-element arg dropped"
-        );
-        // Nested :has is invalid → that argument drops (forgiving), so a lone
-        // `:has(:has(...))` matches nothing but the rule still parses.
-        assert!(
-            parse_complex(":has(:has(.x))").is_some(),
-            ":has(:has()) parses (the inner arg is dropped, not fatal)"
-        );
+        // Selectors 4 #relational: invalid arguments reject the entire list.
+        for selector in [
+            ":has()",
+            ":has(.ok,)",
+            ":has(.ok, ::before)",
+            ":has(::before .ok)",
+            ":has(:has(.x))",
+            ":has(.ok, :has(.x))",
+            ":has(.ok, :unknown-pseudo)",
+        ] {
+            assert!(parse_complex(selector).is_none(), "{selector}");
+        }
     }
 
     #[test]
