@@ -385,7 +385,7 @@ pub struct Dom {
 pub enum DirtyKind {
     /// A childList or text-content change: the content INSIDE a node changed.
     Content,
-    /// A style transition whose changed declarations are paint/hit-test only.
+    /// A bitmap update or style transition that affects paint/hit-testing only.
     /// Its own border box cannot move, so a frontend that retained its fragment
     /// geometry may patch the selector subject itself. Other consumers walk to
     /// their ordinary safe layout boundary or use the full fallback.
@@ -3112,7 +3112,14 @@ impl Dom {
 
     pub(crate) fn canvas_changed(&mut self, id: NodeId) {
         if self.is_connected(id) {
-            self.touch_content(Some(id));
+            // HTML #the-canvas-element: drawing changes bitmap pixels, not the
+            // element tree, selectors, or natural dimensions. Width/height
+            // attributes still use touch_attr and invalidate geometry normally.
+            self.dirty = true;
+            self.layout_paint_epoch = self.layout_paint_epoch.wrapping_add(1);
+            if !self.dirty_nodes.iter().any(|(node, _)| *node == id) {
+                self.dirty_nodes.push((id, DirtyKind::Paint));
+            }
         }
     }
 

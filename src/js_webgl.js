@@ -1,11 +1,13 @@
 // Private bootstrap factory; consumed by the platform prelude before page code.
 // WebGL 1.0 + Web IDL, official local snapshots 3b7a7538 and 8f18262.
 globalThis.__trust_install_webgl = function(g, adapter) {
+    "use strict";
     const native = g.__webgl; delete g.__webgl;
     const apply = Reflect.apply, get = WeakMap.prototype.get, set = WeakMap.prototype.set;
     const slots = native(0,"slots",[],new WeakMap());
+    const slot = native(0,"slotGetter",[]);
     const canvasContexts = native(0,"canvasSlots",[],new WeakMap());
-    const create = Object.create, define = Object.defineProperty;
+    const asObject = Object, create = Object.create, define = Object.defineProperty;
     const descriptor = Object.getOwnPropertyDescriptor, keys = Object.keys;
     const U8 = Uint8Array, U16 = Uint16Array, I32 = Int32Array, U32 = Uint32Array, F32 = Float32Array;
     const typedProto = Object.getPrototypeOf(U8.prototype);
@@ -13,13 +15,14 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     const typedOffset = descriptor(typedProto,"byteOffset").get;
     const typedLength = descriptor(typedProto,"byteLength").get;
     const typedTag = descriptor(typedProto,Symbol.toStringTag).get;
+    const bufferResizable = descriptor(ArrayBuffer.prototype,"resizable").get;
+    const sharedGrowable = descriptor(SharedArrayBuffer.prototype,"growable").get;
     const copyBytes = U8.prototype.set;
     const objectFinalizer = new FinalizationRegistry(record => {
         const owner=record.owner.deref(),s=owner&&slot(owner);
         if(s&&s.epoch===record.epoch&&!s.lost){native(s.id,record.op,[record.id]);s.objects.delete(record.id);}
     });
     const contextFinalizer = new FinalizationRegistry(id => native(id,"dispose",[]));
-    function slot(value) { return apply(get,slots,[value]); }
     function save(value,record) { apply(set,slots,[value,record]); return value; }
     function context(value) { const s=slot(value); if(!s||s.kind!=="Context")throw new TypeError("Illegal WebGLRenderingContext invocation");return s; }
     function lostValue(s,op) {
@@ -56,13 +59,63 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         if(s.lost)return;
         s.lost=true;s.simulated=simulated;s.restorable=false;s.epoch++;s.errors=[0x9242];
         const ext=s.extensions.get("WEBGL_lose_context");s.extensions.clear();if(ext)s.extensions.set("WEBGL_lose_context",ext);
-        s.refs.clear();s.objects.clear();native(s.id,"dispose",[]);
+        s.refs.clear();s.defaultVertexRefs.clear();s.vertexRefs=s.defaultVertexRefs;s.objects.clear();native(s.id,"dispose",[]);
         adapter.queue(()=>{s.restorable=adapter.fire(s.canvas,WebGLContextEvent,"webglcontextlost","");if(s.restorable&&!simulated)restore(s);});
     }
     function error(s,code) { call(s,"error",[code]); }
     function required(args,n) { if(args.length<n)throw new TypeError("Not enough WebGL arguments"); }
     function number(value,type) { switch(type){case "u":return value>>>0;case "i":return value>>0;case "b":return +!!value;case "f":return Math.fround(+value);case "l":{const n=+value;return Number.isFinite(n)?Math.trunc(n):0;}default:return +value;} }
-    function convert(args,signature) {required(args,signature.length);return Array.from(signature,(t,i)=>number(args[i],t));}
+    function convert(args,signature) {
+        required(args,signature.length);
+        const values=[];
+        for(let i=0;i<signature.length;i++)values[i]=number(args[i],signature[i]);
+        return values;
+    }
+    function scalarValues(args,start,width,integer,values=[]) {
+        const offset=values.length;
+        for(let i=0;i<width;i++)values[offset+i]=number(args[start+i],integer?"i":"f");
+        return values;
+    }
+    function resizableBuffer(buffer) {
+        try {return apply(bufferResizable,buffer,[]);}
+        catch {return apply(sharedGrowable,buffer,[]);}
+    }
+    function numericSequence(data,integer) {
+        // Web IDL #create-sequence-from-iterable uses the iterator protocol,
+        // without Array.from's array-like fallback or IteratorClose on conversion.
+        if(asObject(data)!==data)throw new TypeError("Expected a WebGL numeric sequence");
+        const method=data[Symbol.iterator];
+        if(typeof method!=="function")throw new TypeError("Expected an iterable WebGL numeric sequence");
+        const iterator=apply(method,data,[]);
+        if(asObject(iterator)!==iterator)throw new TypeError("Invalid WebGL numeric iterator");
+        const next=iterator.next, values=[];
+        while(true) {
+            const result=apply(next,iterator,[]);
+            if(asObject(result)!==result)throw new TypeError("Invalid WebGL numeric iterator result");
+            if(result.done)return values;
+            if(values.length>=1_048_572)throw new RangeError("WebGL argument budget exceeded");
+            values[values.length]=number(result.value,integer?"i":"f");
+        }
+    }
+    function uniformList(s,id,width,integer,matrix,transpose,data) {
+        // Web IDL #js-to-union selects the matching TypedArray before looking up
+        // @@iterator. Preserve that branch and pass its bytes to the driver bridge;
+        // thousands of matrix uploads must not allocate an iterator and call a JS
+        // number-conversion callback for every already-converted float.
+        if(apply(typedTag,data,[])===(integer?"Int32Array":"Float32Array")) {
+            const buffer=apply(typedBuffer,data,[]);
+            if(resizableBuffer(buffer))throw new TypeError("WebGL numeric lists require a fixed-length buffer");
+            // Conversion still runs for null/foreign locations and a lost context.
+            native(s.id,"uniformTyped",[id,width,+integer,+matrix,+transpose],data);
+            return;
+        }
+        const values=numericSequence(data,integer);
+        if(id<=0)return;
+        if(transpose){error(s,1281);return;}
+        const n=[id,width,+integer,+matrix];
+        for(let i=0;i<values.length;i++)n[4+i]=values[i];
+        call(s,"uniform",n);
+    }
     function resource(s,value,kind,nullable=false) {
         if(value==null&&nullable)return 0;
         const r=slot(value);
@@ -72,9 +125,10 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     }
     class WebGLObject {constructor(){throw new TypeError("Illegal constructor");}get label(){const r=slot(this);if(!r||!r.object)throw new TypeError("Illegal WebGLObject invocation");return r.label;}set label(v){const r=slot(this);if(!r||!r.object)throw new TypeError("Illegal WebGLObject invocation");r.label=`${v}`;}}
     const constructors = {};
-    for(const kind of ["Buffer","Framebuffer","Program","Renderbuffer","Shader","Texture"]) {
+    for(const kind of ["Buffer","Framebuffer","Program","Renderbuffer","Shader","Texture","VertexArrayObjectOES"]) {
         const C=class extends WebGLObject{};define(C,"name",{value:"WebGL"+kind});
-        define(C.prototype,Symbol.toStringTag,{value:"WebGL"+kind,configurable:true});constructors[kind]=C;g["WebGL"+kind]=C;
+        define(C.prototype,Symbol.toStringTag,{value:"WebGL"+kind,configurable:true});constructors[kind]=C;
+        if(kind==="VertexArrayObjectOES")delete C.prototype.constructor;else g["WebGL"+kind]=C;
     }
     class WebGLUniformLocation {constructor(){throw new TypeError("Illegal constructor");}}
     constructors.UniformLocation=WebGLUniformLocation;g.WebGLUniformLocation=WebGLUniformLocation;g.WebGLObject=WebGLObject;
@@ -83,9 +137,54 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         const old=s.objects.get(id);const live=old&&old.deref();if(live)return live;
         const object=save(create(constructors[kind].prototype),{kind,id,context:s.owner,epoch:s.epoch,object:kind!=="UniformLocation",label:"",refs:new Map()});
         s.objects.set(id,new WeakRef(object));
-        objectFinalizer.register(object,{owner:new WeakRef(s.owner),epoch:s.epoch,id,op:"delete"+kind},object);
+        objectFinalizer.register(object,{owner:new WeakRef(s.owner),epoch:s.epoch,id,op:kind==="VertexArrayObjectOES"?"deleteVertexArrayOES":"delete"+kind},object);
         return object;
     }
+    function vertexArrayExtension(value) {
+        const r=slot(value);
+        if(!r||r.kind!=="VertexArrayExtension")throw new TypeError("Illegal OES_vertex_array_object invocation");
+        return r;
+    }
+    function vertexArrayExtensionLive(r,s) {
+        if(r.epoch!==s.epoch){if(!s.lost)error(s,1282);return false;}
+        return !s.lost;
+    }
+    // The extension and its objects have LegacyNoInterfaceObject; their
+    // prototypes remain shared within the realm without a global constructor.
+    const vertexArrayPrototype={
+        createVertexArrayOES(){
+            const r=vertexArrayExtension(this),s=context(r.context);
+            if(!vertexArrayExtensionLive(r,s))return null;
+            return wrap(s,"VertexArrayObjectOES",call(s,"createVertexArrayOES"));
+        },
+        bindVertexArrayOES(value){
+            const r=vertexArrayExtension(this),s=context(r.context);required(arguments,1);
+            const id=resource(s,value,"VertexArrayObjectOES",true);
+            if(id<0||!vertexArrayExtensionLive(r,s))return;
+            if(call(s,"bindVertexArrayOES",[id])===id){
+                s.refs.set("vertexArray",value);
+                s.vertexRefs=value==null?s.defaultVertexRefs:slot(value).refs;
+            }
+        },
+        deleteVertexArrayOES(value){
+            const r=vertexArrayExtension(this),s=context(r.context);required(arguments,1);
+            const id=resource(s,value,"VertexArrayObjectOES",true);
+            if(id<=0||!vertexArrayExtensionLive(r,s))return;
+            call(s,"deleteVertexArrayOES",[id]);objectFinalizer.unregister(value);
+            if(s.refs.get("vertexArray")===value){s.refs.delete("vertexArray");s.vertexRefs=s.defaultVertexRefs;}
+            slot(value).refs.clear();
+        },
+        isVertexArrayOES(value){
+            const r=vertexArrayExtension(this),s=context(r.context);required(arguments,1);
+            if(value==null)return false;
+            const v=slot(value);
+            if(!v||v.kind!=="VertexArrayObjectOES")throw new TypeError("Expected WebGLVertexArrayObjectOES");
+            if(v.context!==s.owner||v.epoch!==s.epoch||!vertexArrayExtensionLive(r,s))return false;
+            return call(s,"isVertexArrayOES",[v.id]);
+        }
+    };
+    define(vertexArrayPrototype,"VERTEX_ARRAY_BINDING_OES",{value:0x85B5,enumerable:true});
+    define(vertexArrayPrototype,Symbol.toStringTag,{value:"OES_vertex_array_object",configurable:true});
     class WebGLActiveInfo {constructor(){throw new TypeError("Illegal constructor");}get size(){return info(this,"ActiveInfo")[0];}get type(){return info(this,"ActiveInfo")[1];}get name(){return info(this,"ActiveInfo")[2];}}
     class WebGLShaderPrecisionFormat {constructor(){throw new TypeError("Illegal constructor");}get rangeMin(){return info(this,"ShaderPrecisionFormat")[0];}get rangeMax(){return info(this,"ShaderPrecisionFormat")[1];}get precision(){return info(this,"ShaderPrecisionFormat")[2];}}
     function info(o,kind){const s=slot(o);if(!s||s.kind!==kind)throw new TypeError("Illegal WebGL info invocation");return s.data;}
@@ -98,7 +197,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         get drawingBufferHeight(){return call(context(this),"height");}
         getContextAttributes(){const s=context(this);if(call(s,"isContextLost"))return null;const a=call(s,"attributes");return {alpha:a[0],depth:a[1],stencil:a[2],antialias:a[3],premultipliedAlpha:a[4],preserveDrawingBuffer:a[5],powerPreference:s.powerPreference,failIfMajorPerformanceCaveat:s.failCaveat,desynchronized:false};}
         getSupportedExtensions(){return call(context(this),"getSupportedExtensions");}
-        getExtension(name){const s=context(this);required(arguments,1);name=`${name}`;if(name.toLowerCase()==="webgl_lose_context"&&s.extensions.has("WEBGL_lose_context"))return s.extensions.get("WEBGL_lose_context");const canonical=(this.getSupportedExtensions()||[]).find(n=>n.toLowerCase()===name.toLowerCase());if(!canonical)return null;if(s.extensions.has(canonical))return s.extensions.get(canonical);if(!call(s,"extension",[],canonical))return null;const ext={};
+        getExtension(name){const s=context(this);required(arguments,1);name=`${name}`;if(name.toLowerCase()==="webgl_lose_context"&&s.extensions.has("WEBGL_lose_context"))return s.extensions.get("WEBGL_lose_context");const canonical=(this.getSupportedExtensions()||[]).find(n=>n.toLowerCase()===name.toLowerCase());if(!canonical)return null;if(s.extensions.has(canonical))return s.extensions.get(canonical);if(!call(s,"extension",[],canonical))return null;const ext=canonical==="OES_vertex_array_object"?save(create(vertexArrayPrototype),{kind:"VertexArrayExtension",context:s.owner,epoch:s.epoch}):{};
         if(canonical==="WEBGL_lose_context") {
             ext.loseContext=function(){if(this!==ext)throw new TypeError("Illegal extension invocation");if(s.lost){if(!s.errors.includes(1282))s.errors.push(1282);}else lose(s,true);};
             ext.restoreContext=function(){if(this!==ext)throw new TypeError("Illegal extension invocation");if(!s.lost||!s.restorable||!s.simulated){if(s.lost){if(!s.errors.includes(1282))s.errors.push(1282);}else error(s,1282);}else restore(s);};
@@ -110,7 +209,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
                 define(method,"name",{value:name});define(method,"length",{value:sig.length});ext[name]=method;
             }
         }s.extensions.set(canonical,ext);return ext;}
-        getParameter(pname){const s=context(this);required(arguments,1);const p=pname>>>0;if((p===0x9245||p===0x9246)&&!s.extensions.has("WEBGL_debug_renderer_info")){error(s,1280);return null;}const result=call(s,"getParameter",[p]);if(result==null)return null;const kind=({34964:"Buffer",34965:"Buffer",35725:"Program",36006:"Framebuffer",36007:"Renderbuffer",32873:"Texture",34068:"Texture"})[p];if(kind)return wrap(s,kind,result);if([3386,2978,3088].includes(p))return new I32(result);if(p===34467)return new U32(result);if([33901,33902,32773,3106,2928].includes(p))return new F32(result);return result;}
+        getParameter(pname){const s=context(this);required(arguments,1);const p=pname>>>0;if((p===0x9245||p===0x9246)&&!s.extensions.has("WEBGL_debug_renderer_info")){error(s,1280);return null;}const result=call(s,"getParameter",[p]);if(result==null)return null;const kind=({34964:"Buffer",34965:"Buffer",35725:"Program",36006:"Framebuffer",36007:"Renderbuffer",32873:"Texture",34068:"Texture",34229:"VertexArrayObjectOES"})[p];if(kind)return wrap(s,kind,result);if([3386,2978,3088].includes(p))return new I32(result);if(p===34467)return new U32(result);if([33901,33902,32773,3106,2928].includes(p))return new F32(result);return result;}
         getShaderPrecisionFormat(type,precision){const s=context(this);const n=convert(arguments,"uu");return makeInfo(WebGLShaderPrecisionFormat,"ShaderPrecisionFormat",call(s,"getShaderPrecisionFormat",n));}
         bufferData(target,data,usage){const s=context(this);required(arguments,3);target=target>>>0;const numeric=typeof data!=="object"&&typeof data!=="function";const size=numeric?number(data,"l"):0;usage=usage>>>0;if(data===null){error(s,1281);return;}call(s,"bufferData",[target,size,usage],numeric?undefined:data);}
         bufferSubData(target,offset,data){const s=context(this);required(arguments,3);call(s,"bufferSubData",[target>>>0,number(offset,"l")],data);}
@@ -121,7 +220,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         bindAttribLocation(program,index,name){const s=context(this);required(arguments,3);const id=resource(s,program,"Program");index=index>>>0;name=`${name}`;if(id>=0)call(s,"bindAttribLocation",[id,index],name);}
         getUniform(program,location){const s=context(this);required(arguments,2);const p=resource(s,program,"Program"),l=resource(s,location,"UniformLocation");if(p<0||l<0)return null;const values=call(s,"getUniform",[p,l]);if(values==null)return null;const kind=call(s,"uniformType",[l]);if(kind===35670)return !!values[0];if([35671,35672,35673].includes(kind))return values.map(Boolean);if(values.length===1)return values[0];return [5124,35667,35668,35669,35678,35680].includes(kind)?new I32(values):new F32(values);}
         getVertexAttrib(index,pname){const s=context(this);const n=convert(arguments,"uu"),v=call(s,"getVertexAttrib",n);if(n[1]===34975)return wrap(s,"Buffer",v);if(n[1]===34342&&v!=null)return new F32(v);return v;}
-        vertexAttribPointer(index,size,type,normalized,stride,offset){const s=context(this);const n=convert(arguments,"uiubil");call(s,"vertexAttribPointer",n);const id=call(s,"getVertexAttrib",[n[0],34975]);if(id!==null)s.refs.set("attrib"+n[0],wrap(s,"Buffer",id));}
+        vertexAttribPointer(index,size,type,normalized,stride,offset){const s=context(this);const n=convert(arguments,"uiubil");const id=call(s,"vertexAttribPointer",n);if(id!==null)s.vertexRefs.set("attrib"+n[0],wrap(s,"Buffer",id));}
         readPixels(x,y,width,height,format,type,pixels){const s=context(this);required(arguments,7);const n=convert(arguments,"iiiiuu");if(pixels==null){error(s,1281);return;}const tag=apply(typedTag,pixels,[]);if(n[5]!==5121||!(tag==="Uint8Array"||tag==="Uint8ClampedArray")){error(s,1282);return;}const buffer=apply(typedBuffer,pixels,[]),offset=apply(typedOffset,pixels,[]),length=apply(typedLength,pixels,[]);const dest=new U8(buffer,offset,length);const result=call(s,"readPixels",n,pixels);if(result)apply(copyBytes,dest,[result]);}
         texImage2D(){textureUpload(context(this),false,arguments);}
         texSubImage2D(){textureUpload(context(this),true,arguments);}
@@ -146,18 +245,20 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     for(const name of keys(simple)){const sig=simple[name];method(name,function(){const s=context(this);const result=call(s,name,convert(arguments,sig));if(queries.has(name))return result;},sig.length);}
     for(const kind of ["Buffer","Framebuffer","Program","Renderbuffer","Shader","Texture"]){
         method("create"+kind,function(){const s=context(this);const n=kind==="Shader"?convert(arguments,"u"):[];return wrap(s,kind,call(s,"create"+kind,n));},kind==="Shader"?1:0);
-        method("delete"+kind,function(value){const s=context(this);required(arguments,1);const id=resource(s,value,kind,true);if(id<0)return;call(s,"delete"+kind,[id]);if(value){objectFinalizer.unregister(value);if(kind!=="Program"||!call(s,"isProgram",[id]))for(const [key,ref] of s.refs)if(ref===value)s.refs.delete(key);}},1);
+        method("delete"+kind,function(value){const s=context(this);required(arguments,1);const id=resource(s,value,kind,true);if(id<0)return;if(kind==="Buffer"&&value){const r=slot(value);if(r.deleted)return;r.deleted=true;}call(s,"delete"+kind,[id]);if(value){objectFinalizer.unregister(value);if(kind!=="Program"||!call(s,"isProgram",[id]))for(const [key,ref] of s.refs)if(ref===value)s.refs.delete(key);if(kind==="Buffer")for(const [key,ref] of s.vertexRefs)if(ref===value)s.vertexRefs.delete(key);}},1);
         method("is"+kind,function(value){const s=context(this);required(arguments,1);if(value==null)return false;const r=slot(value);if(!r||r.kind!==kind)throw new TypeError("Invalid WebGL object");if(r.context!==s.owner||r.epoch!==s.epoch)return false;return call(s,"is"+kind,[r.id]);},1);
     }
-    for(const kind of ["Buffer","Framebuffer","Renderbuffer","Texture"]){method("bind"+kind,function(target,value){const s=context(this);required(arguments,2);target=target>>>0;const id=resource(s,value,kind,true);if(id<0)return;call(s,"bind"+kind,[target,id]);const p=({34962:34964,34963:34965,36160:36006,36161:36007,3553:32873,34067:34068})[target];if(p&&call(s,"getParameter",[p])===id)s.refs.set(kind+":"+target+(kind==="Texture"?":"+call(s,"getParameter",[34016]):""),value);},2);}
+    method("bindBuffer",function(target,value){const s=context(this);required(arguments,2);target=target>>>0;const id=resource(s,value,"Buffer",true);if(id<0)return;if(call(s,"bindBuffer",[target,id])===id)(target===34963?s.vertexRefs:s.refs).set("Buffer:"+target,value);},2);
+    const bindingParameters={36160:36006,36161:36007,3553:32873,34067:34068};
+    for(const kind of ["Framebuffer","Renderbuffer","Texture"]){const name="bind"+kind;method(name,function(target,value){const s=context(this);required(arguments,2);target=target>>>0;const id=resource(s,value,kind,true);if(id<0)return;call(s,name,[target,id]);const p=bindingParameters[target];if(p&&call(s,"getParameter",[p])===id)s.refs.set(kind+":"+target+(kind==="Texture"?":"+call(s,"getParameter",[34016]):""),value);},2);}
     for(const name of ["compileShader","getShaderInfoLog","getShaderSource","getShaderParameter","linkProgram","validateProgram","getProgramInfoLog","getProgramParameter","useProgram"]){const kind=name.includes("Shader")?"Shader":"Program";const count=name.endsWith("Parameter")?2:1;method(name,function(value,pname){const s=context(this);required(arguments,count);const id=resource(s,value,kind,name==="useProgram");const n=[id];if(count===2)n.push(pname>>>0);if(id<0)return null;const result=call(s,name,n);if(name==="useProgram"&&call(s,"getParameter",[35725])===id)s.refs.set("program",value);if(name.startsWith("get"))return result;},count);}
     for(const name of ["attachShader","detachShader"]){method(name,function(program,shader){const s=context(this);required(arguments,2);const p=resource(s,program,"Program"),id=resource(s,shader,"Shader");if(p<0||id<0)return;call(s,name,[p,id]);if(name==="attachShader")slot(program).refs.set(id,shader);else slot(program).refs.delete(id);},2);}
     for(const name of ["getActiveAttrib","getActiveUniform"]){method(name,function(program,index){const s=context(this);required(arguments,2);const p=resource(s,program,"Program");index=index>>>0;if(p<0)return null;return makeInfo(WebGLActiveInfo,"ActiveInfo",call(s,name,[p,index]));},2);}
     for(let width=1;width<=4;width++){
-        for(const integer of [false,true])for(const vector of [false,true]){const name="uniform"+width+(integer?"i":"f")+(vector?"v":"");method(name,function(location){const s=context(this);required(arguments,vector?2:width+1);const id=resource(s,location,"UniformLocation",true);const values=vector?Array.from(arguments[1],v=>number(v,integer?"i":"f")):Array.from({length:width},(_,i)=>number(arguments[i+1],integer?"i":"f"));if(id>=0)call(s,"uniform",[id,width,+integer,0,...values]);},vector?2:width+1);}
-        for(const vector of [false,true]){const name="vertexAttrib"+width+"f"+(vector?"v":"");method(name,function(index){const s=context(this);required(arguments,vector?2:width+1);index=index>>>0;const values=vector?Array.from(arguments[1],v=>number(v,"f")):Array.from({length:width},(_,i)=>number(arguments[i+1],"f"));if(values.length<width){error(s,1281);return;}const v=[0,0,0,1];for(let i=0;i<width;i++)v[i]=values[i];call(s,"vertexAttrib",[index,...v]);},vector?2:width+1);}
+        for(const integer of [false,true])for(const vector of [false,true]){const name="uniform"+width+(integer?"i":"f")+(vector?"v":"");method(name,function(location){const s=context(this);required(arguments,vector?2:width+1);const id=resource(s,location,"UniformLocation",true);if(vector){uniformList(s,id,width,integer,false,false,arguments[1]);return;}const n=scalarValues(arguments,1,width,integer,[id,width,+integer,0]);if(id>=0)call(s,"uniform",n);},vector?2:width+1);}
+        for(const vector of [false,true]){const name="vertexAttrib"+width+"f"+(vector?"v":"");method(name,function(index){const s=context(this);required(arguments,vector?2:width+1);index=index>>>0;const values=vector?Array.from(arguments[1],v=>number(v,"f")):scalarValues(arguments,1,width,false);if(values.length<width){error(s,1281);return;}const n=[index,0,0,0,1];for(let i=0;i<width;i++)n[i+1]=values[i];call(s,"vertexAttrib",n);},vector?2:width+1);}
     }
-    for(let width=2;width<=4;width++){method("uniformMatrix"+width+"fv",function(location,transpose,data){const s=context(this);required(arguments,3);const id=resource(s,location,"UniformLocation",true);transpose=!!transpose;const values=Array.from(data,v=>number(v,"f"));if(id===0)return;if(transpose){error(s,1281);return;}if(id>=0)call(s,"uniform",[id,width*width,0,1,...values]);},3);}
+    for(let width=2;width<=4;width++){method("uniformMatrix"+width+"fv",function(location,transpose,data){const s=context(this);required(arguments,3);const id=resource(s,location,"UniformLocation",true);transpose=!!transpose;uniformList(s,id,width*width,false,true,transpose,data);},3);}
     for(const name of ["enableVertexAttribArray","disableVertexAttribArray"]){method(name,function(index){const s=context(this);call(s,name,convert(arguments,"u"));},1);}
     for(const name of ["compressedTexImage2D","compressedTexSubImage2D"]){method(name,function(){const s=context(this);required(arguments,name==="compressedTexImage2D"?7:8);error(s,1280);},name==="compressedTexImage2D"?7:8);}
     function textureUpload(s,sub,args){
@@ -470,6 +571,16 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     };
     for(const [name,value] of Object.entries(constants))for(const target of [WebGLRenderingContext,WebGLRenderingContext.prototype])define(target,name,{value,enumerable:true});
     for(const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)){if(name!=="constructor")define(WebGLRenderingContext.prototype,name,{...descriptor(WebGLRenderingContext.prototype,name),enumerable:true});}
+    // Native entries share private slots and driver validation with the complete
+    // Web IDL wrappers. Unsupported argument shapes return to those wrappers.
+    for(const proto of [WebGLRenderingContext.prototype,vertexArrayPrototype])for(const name of Object.getOwnPropertyNames(proto)) {
+        const d=descriptor(proto,name);
+        if(name!=="constructor"&&typeof d.value==="function") {
+            const value=native(0,"fastMethod",[],d.value);
+            if(value!==d.value)save(value,{kind:"Method",fallback:d.value});
+            define(proto,name,{...d,value});
+        }
+    }
     define(WebGLRenderingContext.prototype,Symbol.toStringTag,{value:"WebGLRenderingContext",configurable:true});g.WebGLRenderingContext=WebGLRenderingContext;
     return {contexts:canvasContexts,is(value){const s=slot(value);return !!s&&s.kind==="Context";},create(canvas,options){
         if(options!=null&&typeof options!=="object"&&typeof options!=="function")throw new TypeError("Expected WebGL context settings");options=options||{};
@@ -477,6 +588,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         const out={};for(const name of ["alpha","antialias","depth","desynchronized","failIfMajorPerformanceCaveat","powerPreference","premultipliedAlpha","preserveDrawingBuffer","stencil"]){const v=options[name];out[name]=v===undefined?({alpha:true,antialias:true,depth:true,powerPreference:"default",premultipliedAlpha:true})[name]:name==="powerPreference"?`${v}`:!!v;if(name==="powerPreference"&&!["default","low-power","high-performance"].includes(out[name]))throw new TypeError("Invalid powerPreference");}
         const id=adapter.identity(canvas),attributes=[+out.alpha,+out.depth,+!!out.stencil,+out.premultipliedAlpha,+!!out.preserveDrawingBuffer,+!!out.failIfMajorPerformanceCaveat];
         if(!native(id,"init",attributes,adapter.origin)){adapter.fire(canvas,WebGLContextEvent,"webglcontextcreationerror","A robust EGL/GLES drawing buffer could not be created");return null;}
-        const owner=create(WebGLRenderingContext.prototype),s={kind:"Context",owner,canvas,id,attributes,epoch:0,lost:false,errors:[],objects:new Map(),refs:new Map(),extensions:new Map(),powerPreference:out.powerPreference,failCaveat:!!out.failIfMajorPerformanceCaveat};save(owner,s);contextFinalizer.register(owner,id);apply(set,canvasContexts,[canvas,owner]);return owner;
+        const defaultVertexRefs=new Map();
+        const owner=create(WebGLRenderingContext.prototype),s={kind:"Context",owner,canvas,id,attributes,epoch:0,lost:false,errors:[],objects:new Map(),refs:new Map(),defaultVertexRefs,vertexRefs:defaultVertexRefs,extensions:new Map(),powerPreference:out.powerPreference,failCaveat:!!out.failIfMajorPerformanceCaveat};save(owner,s);contextFinalizer.register(owner,id);apply(set,canvasContexts,[canvas,owner]);return owner;
     }};
 };
