@@ -27,6 +27,7 @@ mod input;
 mod invalidation;
 mod properties;
 mod rule_index;
+mod transitions;
 mod xml;
 
 pub type NodeId = usize;
@@ -235,6 +236,7 @@ pub struct Dom {
     cssom_inline: FxHashMap<NodeId, cssom::Declarations>,
     /// Document registrations and the computed-value dependency stack.
     properties: properties::State,
+    transitions: transitions::State,
     /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
     /// Layout-provided query-container content sizes, in untransformed CSS px.
@@ -588,6 +590,7 @@ impl Dom {
             cssom_sheet_versions,
             cssom_inline,
             properties,
+            transitions,
             style_cache,
             container_sizes,
             computed_cache,
@@ -730,6 +733,7 @@ impl Dom {
         }
         fixed_map!(external_sheets, (NodeId, String));
         bytes = bytes.saturating_add(properties.retained_bytes());
+        bytes = bytes.saturating_add(transitions.retained_bytes());
         fixed_map!(cssom_sheets, (NodeId, cssom::Sheet));
         fixed_map!(cssom_sheet_versions, (NodeId, u64));
         for sheet in cssom_sheets.values() {
@@ -983,6 +987,7 @@ impl Dom {
             cssom_sheet_versions: FxHashMap::default(),
             cssom_inline: FxHashMap::default(),
             properties: properties::State::default(),
+            transitions: transitions::State::default(),
             style_cache: RefCell::new(None),
             container_sizes: RefCell::new(FxHashMap::default()),
             computed_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
@@ -4075,6 +4080,12 @@ impl Dom {
     /// here, so a property inherits everywhere by being marked `inherited`
     /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
+        if let Some(value) = self.transitions.value(id, name) {
+            return Some(value);
+        }
+        // Explicitly inherited lengths can depend on an ancestor's current
+        // transition. Keep animation-origin values out of the base-style memo.
+        let interpolating = self.transitions.affects_computation(name);
         if name.starts_with("--") {
             return self.custom_prop(id, name);
         }
@@ -4107,7 +4118,7 @@ impl Dom {
         // value too. The same style/font invalidation that protects inherited
         // results protects these reads; formatting-dependent used values and
         // var() substitution still happen in their respective consumers.
-        if let Some(hit) = self.computed_cache_get(id, idx) {
+        if !interpolating && let Some(hit) = self.computed_cache_get(id, idx) {
             return hit;
         }
         let parent_computed = || {
@@ -4174,7 +4185,9 @@ impl Dom {
         } else {
             v
         };
-        self.computed_cache_put(id, idx, v.clone());
+        if !interpolating {
+            self.computed_cache_put(id, idx, v.clone());
+        }
         v
     }
 
@@ -10489,6 +10502,10 @@ const PROPS: &[PropDef] = &[
     prop("animation-delay", false, false),
     prop("animation-play-state", false, false),
     prop("animation", false, false),
+    prop("transition-property", false, false),
+    prop("transition-duration", false, false),
+    prop("transition-timing-function", false, false),
+    prop("transition-delay", false, false),
     prop("margin-top", false, true),
     prop("margin-bottom", false, true),
     prop("margin-left", false, true),
@@ -10726,6 +10743,9 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "list-style-position" => Some("outside"),
         "list-style-type" => Some("disc"),
         "opacity" => Some("1"),
+        "transition-property" => Some("all"),
+        "transition-duration" | "transition-delay" => Some("0s"),
+        "transition-timing-function" => Some("ease"),
         "clip-path" => Some("none"),
         "-webkit-line-clamp" => Some("none"),
         "-webkit-box-orient" => Some("horizontal"),
@@ -11013,6 +11033,12 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .map(|(name, _)| (name, pending.clone()))
                 .collect();
         }
+    }
+    if prop == "transition" {
+        return transitions::expand(value);
+    }
+    if prop.starts_with("transition-") && !transitions::valid_longhand(prop, value) {
+        return Vec::new();
     }
     if prop == "overflow" {
         // CSS Overflow 3 #overflow-control / CSS Cascade 5 #shorthand:

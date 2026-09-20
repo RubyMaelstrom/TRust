@@ -1838,6 +1838,16 @@
             if (phase && trust.performanceLifecycle) trust.performanceLifecycle(phase + 'End');
         }
     };
+    trust.dispatchCssTransitionEvents = function (json) {
+        for (const [id, propertyName, type, elapsedTime] of JSON.parse(json)) {
+            const target = wrap(id);
+            if (target) dispatch(target, createTrustedEvent(TransitionEvent, type,
+                { bubbles: true, propertyName, elapsedTime, pseudoElement: "" }), false);
+        }
+    };
+    trust.updateCssTransitions = function () {
+        trust.dispatchCssTransitionEvents(__dom_transition_events());
+    };
     trust.setDocumentReadiness = function (value) {
         const previous = realmRootFrame ? realmRootFrame.__trustReadyState : trust.readyState;
         if (previous === value) return;
@@ -13089,7 +13099,10 @@
     pristineAnimationFrameMethods = animationFrameMethods();
     topAnimationFrameMethods = pristineAnimationFrameMethods;
     function runAnimationFrameCallbacks(now, runScroll = true) {
-        if (runScroll) trust.runScrollSteps();
+        if (runScroll) {
+            trust.runScrollSteps();
+            trust.updateCssTransitions();
+        }
         // HTML "run the animation frame callbacks": snapshot the callback-map
         // keys, then remove each callback immediately before invoking it. A
         // callback queued during this pass is therefore deferred to the next
@@ -13131,6 +13144,9 @@
             // Window's eventual clock origin.
             const frameTime = __epoch0 + absMs - agentTimeOffset;
             trust.runScrollSteps();
+            // HTML #update-the-rendering / Web Animations #animation-frame-loop:
+            // sample effects and dispatch their events before invoking rAF.
+            trust.updateCssTransitions();
             let count = 0;
             for (const [documentTrust, active] of records)
                 if (active()) count += documentTrust.runRenderingFrame(frameTime, true);

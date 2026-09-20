@@ -684,6 +684,15 @@ impl Dom {
         }
     }
 
+    /// Animation-origin values can affect explicit inheritance and containing
+    /// block constraints, but cannot change selectors or base declarations.
+    pub(super) fn invalidate_transition_layout(&mut self, changed: &[NodeId]) {
+        self.invalidate_activation_layout(changed);
+        if changed.iter().any(|&id| self.ancestor_is_svg(id)) {
+            self.invalidate_svg_layout();
+        }
+    }
+
     fn invalidate_layout_ancestors(&mut self, node: NodeId) {
         let mut next = Some(node);
         while let Some(id) = next {
@@ -785,6 +794,7 @@ impl Dom {
             self.invalidate_svg_layout();
         }
         for id in affected {
+            self.transitions.invalidate(id);
             if selectors {
                 self.selector_cache.get_mut().invalidate(id);
             }

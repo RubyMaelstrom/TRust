@@ -944,6 +944,7 @@ impl HostGc for HostState {
 struct RealmClock {
     origin_ms: f64,
     offset_ms: Cell<f64>,
+    animation_sample: Cell<Option<f64>>,
 }
 
 impl RealmClock {
@@ -951,6 +952,7 @@ impl RealmClock {
         Self {
             origin_ms: crate::performance::now_ms(),
             offset_ms: Cell::new(0.0),
+            animation_sample: Cell::new(None),
         }
     }
 
@@ -967,6 +969,31 @@ impl RealmClock {
             let offset = epoch_ms - crate::performance::now_ms();
             self.offset_ms.set(self.offset_ms.get().max(offset));
         }
+    }
+}
+
+/// Web Animations #document-timelines / HTML #update-the-rendering: callbacks,
+/// CSSOM, ResizeObserver and paint share one animation sample in this frame.
+/// Nested geometry flushes must not advance time and invalidate layout again.
+struct CssAnimationSample {
+    clock: Rc<RealmClock>,
+    previous: Option<f64>,
+}
+impl CssAnimationSample {
+    fn new(ctx: &mut Ctx) -> Self {
+        let clock = ctx.host_mut::<HostState>().expect("DOM host").clock.clone();
+        let previous = clock.animation_sample.get();
+        if previous.is_none() {
+            clock
+                .animation_sample
+                .set(Some((clock.now_ms() - clock.origin_ms) / 1000.));
+        }
+        Self { clock, previous }
+    }
+}
+impl Drop for CssAnimationSample {
+    fn drop(&mut self) {
+        self.clock.animation_sample.set(self.previous);
     }
 }
 
@@ -1680,7 +1707,9 @@ mod desktop {
             virtual_origin = now - elapsed;
             let deadline = trust_number(&mut page, "nextDeadline");
             let timer_due = deadline.is_some_and(|deadline| deadline <= now);
-            if trust_bool(&mut page, "hasRenderingUpdate") {
+            if page.dom.borrow().css_transition_work_pending()
+                || trust_bool(&mut page, "hasRenderingUpdate")
+            {
                 page.render_pending = true;
             }
             if page.render_pending && render_deadline.is_none() {
@@ -1954,6 +1983,8 @@ mod desktop {
                     prepare_unbounded_task(&interrupt);
                     let real_now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let animation_frame = trust_bool(&mut page, "nextDeadlineIsAnimationFrame");
+                    let _animation_sample =
+                        animation_frame.then(|| CssAnimationSample::new(page.engine.ctx()));
                     if page.task_trace.is_some() {
                         let queues = call_trust(&mut page, "taskQueueState", &[], "task trace")
                             .map(|value| value_string(&mut page.engine, &value))
@@ -2032,6 +2063,7 @@ mod desktop {
                 Wake::Render => {
                     render_deadline = None;
                     prepare_unbounded_task(&interrupt);
+                    let _animation_sample = CssAnimationSample::new(page.engine.ctx());
                     let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
                     let _ = call_trust(
                         &mut page,
@@ -2524,6 +2556,7 @@ mod desktop {
 
     fn has_resident_work(page: &mut LumenPage, has_interaction: bool) -> bool {
         if has_interaction
+            || page.dom.borrow().css_transition_work_pending()
             || page.dom.borrow().hover_css_affects_rendering()
             || !page.dom.borrow().hover_hosts_is_empty()
         {
@@ -2930,6 +2963,7 @@ mod desktop {
     /// notification on its own task source after recording intersections; its
     /// callbacks cannot force another layout inside this rendering opportunity.
     fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
+        let _animation_sample = CssAnimationSample::new(page.engine.ctx());
         let mut rendered = extract_live(page);
         // CSSOM View §13.1 compares each nested Document's viewport after the
         // layout pass that established its iframe dimensions. The parent
@@ -3734,6 +3768,7 @@ mod desktop {
         render_now: bool,
         run_scroll_steps: bool,
     ) -> bool {
+        let _animation_sample = render_now.then(|| CssAnimationSample::new(page.engine.ctx()));
         if page.outcome.panicked {
             let errors = std::mem::take(&mut page.outcome.errors);
             let _ = events.blocking_send(PageEvt::Trouble(errors));
@@ -3745,6 +3780,13 @@ mod desktop {
             // this also covers updates with no animation callbacks queued.
             let _ = trust_number(page, "runScrollSteps");
             checkpoint(page, "scroll steps");
+        }
+        if render_now && run_scroll_steps {
+            // The regular rAF path dispatches these before its callbacks.
+            // Immediate interaction rendering has no rAF callback phase, but
+            // still follows HTML's scroll -> animation event ordering.
+            let _ = call_trust(page, "updateCssTransitions", &[], "CSS transition events");
+            checkpoint(page, "CSS transition events");
         }
         for (url, replace) in take_history_updates(page) {
             page.dom
@@ -4273,6 +4315,38 @@ mod desktop {
             })
             .await
             .expect("queued native edits timed out");
+        }
+
+        #[tokio::test]
+        async fn css_transitions_render_intermediate_geometry_and_dispatch_completion() {
+            let html = r#"<!doctype html><style>#box{height:0px;transition:height 1s linear}#box.open{height:100px}</style>
+            <input id=editor><div id=box></div><output id=result></output><script>
+            const box=document.getElementById('box'), result=document.getElementById('result');
+            let middle=false, sequence=[];
+            new ResizeObserver(entries=>{const h=entries[0].contentRect.height;if(h>0&&h<100)middle=true}).observe(box);
+            for(const type of ['transitionrun','transitionstart','transitionend']) box.addEventListener(type,e=>{
+                if(e.propertyName!=='height'||!e.isTrusted||!e.bubbles)throw Error('transition event');
+                sequence.push(type);
+                if(type==='transitionend')result.textContent='DONE:'+middle+':'+sequence.join(',')+':'+Math.round(box.getBoundingClientRect().height);
+            });
+            document.getElementById('editor').oninput=()=>{box.className='open';void box.offsetHeight};
+            </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30),async {
+                while !matches!(events.recv().await,Some(PageEvt::Updated{..})) {}
+                handle.try_send_user(PageCmd::SetValue{node,value:"a".into(),checked:None,commit:false}).unwrap();
+                loop {match events.recv().await {
+                    Some(PageEvt::Updated{html,outcome})=>{
+                        assert!(outcome.errors.is_empty(),"{:?}",outcome.errors);
+                        if html.contains("DONE:") {
+                            assert!(html.contains(">DONE:true:transitionrun,transitionstart,transitionend:100</output>"),"{html}");break;
+                        }
+                    }
+                    Some(PageEvt::Trouble(errors))=>panic!("{errors:?}"),
+                    Some(_)=>{},None=>panic!("transition page ended"),
+                }}
+            }).await.expect("CSS transition never completed");
         }
 
         #[tokio::test]
@@ -6443,6 +6517,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__worker_self_post", 1, host_worker_self_post),
     ("__worker_self_close", 0, host_worker_self_close),
     ("__dom_computed", 2, host_computed_style),
+    ("__dom_transition_events", 0, host_transition_events),
     ("__dom_offset_style", 1, host_offset_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
@@ -11391,6 +11466,27 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
 /// One current fragment transaction for CSSOM, observers and rendering. DOM,
 /// resources/viewport (explicit invalidation), and activation metadata all
 /// participate in freshness. Paint is a later, independently lazy consumer.
+fn sync_css_transitions(ctx: &mut Ctx) {
+    let (dom, seconds) = {
+        let state = ctx.host_mut::<HostState>().expect("DOM host");
+        (
+            state.dom.clone(),
+            state
+                .clock
+                .animation_sample
+                .get()
+                .unwrap_or_else(|| (state.clock.now_ms() - state.clock.origin_ms) / 1000.),
+        )
+    };
+    dom.borrow_mut().update_css_transitions(seconds);
+}
+
+fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    sync_css_transitions(ctx);
+    let events = host_dom(ctx).borrow_mut().take_css_transition_events();
+    Ok(Value::from_string(serde_json::to_string(&events).unwrap()))
+}
+
 fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {
     ensure_host_geometry(ctx, reason, None)
 }
@@ -11400,6 +11496,7 @@ fn ensure_host_geometry(
     reason: &'static str,
     requested_box: Option<crate::dom::NodeId>,
 ) -> Rc<RefCell<LumenGeomCache>> {
+    sync_css_transitions(ctx);
     let (dom_handle, base, viewport, cache, images) = {
         let state = ctx
             .host_mut::<HostState>()
@@ -11649,6 +11746,7 @@ fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<
 /// CSSOM §7.2/§9 resolved-value backing. Grid track lists are used values captured by the same
 /// layout pass; all other properties come from the canonical DOM cascade.
 fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    sync_css_transitions(ctx);
     let name = host_arg_string(ctx, args, 1);
     {
         let dom = host_dom(ctx);
@@ -11766,6 +11864,8 @@ fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 /// CSSOM View §6 bounding-box backing, sourced directly from canonical layout fragments.
 fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    // Sample before the lazy rectangle fast path tests cache freshness.
+    sync_css_transitions(ctx);
     let dom_handle = host_dom(ctx);
     let cache = ctx
         .host_mut::<HostState>()
@@ -12997,6 +13097,75 @@ mod tests {
     }
 
     #[test]
+    fn css_transition_events_precede_animation_frame_callbacks() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><div id=box style='height:0px;transition:height 1s linear'></div>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const box=document.getElementById('box'), seen=[];
+            for(const type of ['transitionrun','transitionstart'])
+                box.addEventListener(type,()=>seen.push(type));
+            void getComputedStyle(box).height;
+            box.style.height='100px';
+            void getComputedStyle(box).height;
+            requestAnimationFrame(()=>seen.push('raf'));
+            __trust.runRenderingFrame(performance.now());
+            return seen.join(',');
+        })()"#
+            ),
+            "transitionrun,transitionstart,raf"
+        );
+    }
+
+    #[test]
+    fn css_transition_geometry_reads_share_the_rendering_sample() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><div id=box style='height:0px;transition:height 1s linear'></div>",
+        )));
+        let clock = Rc::new(RealmClock::new());
+        let mut engine = configured_engine(HostState::new(dom, clock.clone()), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "getComputedStyle(document.getElementById('box')).height"
+            ),
+            "0px"
+        );
+        string_value(
+            &mut engine,
+            "document.getElementById('box').style.height='100px';getComputedStyle(document.getElementById('box')).height",
+        );
+        let sample = CssAnimationSample::new(engine.ctx());
+        let before = string_value(
+            &mut engine,
+            "document.getElementById('box').getBoundingClientRect().height",
+        );
+        clock.set_epoch_ms(clock.now_ms() + 500.);
+        let during = string_value(
+            &mut engine,
+            "document.getElementById('box').getBoundingClientRect().height",
+        );
+        assert_eq!(
+            before, during,
+            "CSSOM must not resample time inside the frame"
+        );
+        drop(sample);
+        let after = string_value(
+            &mut engine,
+            "document.getElementById('box').getBoundingClientRect().height",
+        );
+        assert!(
+            after.parse::<f64>().unwrap() > before.parse::<f64>().unwrap() + 40.,
+            "before={before} during={during} after={after}"
+        );
+    }
+
+    #[test]
     fn overflow_shorthand_resets_axes_through_the_cascade_and_cssom() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<!doctype html><style>
@@ -14072,7 +14241,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 165, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 166, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -14083,7 +14252,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 165);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 166);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

@@ -603,6 +603,24 @@ fn get(property: &str, declarations: &[(String, String, bool)]) -> String {
     }
     let v: Vec<_> = values.iter().map(|v| v.1.as_str()).collect();
     match property {
+        "transition" => {
+            let lists: Vec<_> = v.iter().map(|v| split_top_level_commas(v)).collect();
+            if lists.iter().any(|list| list.len() != lists[0].len()) {
+                return String::new();
+            }
+            (0..lists[0].len())
+                .map(|i| {
+                    format!(
+                        "{} {} {} {}",
+                        lists[0][i].trim(),
+                        lists[1][i].trim(),
+                        lists[2][i].trim(),
+                        lists[3][i].trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
         "background" => background_value(&v),
         "white-space" => match v.as_slice() {
             ["collapse", "wrap"] => "normal".into(),
@@ -735,6 +753,7 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
         "place-self",
         "white-space",
         "overflow",
+        "transition",
     ];
     let mut done = FxHashSet::default();
     let mut result = Vec::new();
@@ -831,6 +850,20 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transition_shorthand_preserves_lists_and_rejects_unrepresentable_values() {
+        let declarations = parse(
+            "transition:height 0.3s ease-in-out, margin-top 1s cubic-bezier(0, 0, 1, 1) -100ms",
+        );
+        let serialized = get("transition", &declarations);
+        assert_eq!(expanded("transition", &serialized), declarations);
+        assert!(!serialized.contains(",  "));
+        let unequal = parse("transition:height 1s;transition-property:height,width");
+        assert_eq!(get("transition", &unequal), "");
+        let important = parse("transition:height 1s;transition-delay:2s!important");
+        assert_eq!(get("transition", &important), "");
+    }
 
     #[test]
     fn background_shorthand_cssom_preserves_layers_resets_and_pending_values() {
