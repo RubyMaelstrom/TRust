@@ -27,6 +27,7 @@ mod input;
 mod invalidation;
 mod properties;
 mod rule_index;
+pub(crate) mod shadow;
 mod transitions;
 mod xml;
 
@@ -186,6 +187,7 @@ pub struct Dom {
     shadow_roots: FxHashMap<NodeId, NodeId>,
     /// and the reverse: shadow root fragment → host element.
     shadow_hosts: FxHashMap<NodeId, NodeId>,
+    shadow_data: FxHashMap<NodeId, shadow::ShadowRootData>,
     /// Set by every tree/attribute mutation; the living page takes it
     /// to decide whether a dispatch warrants re-extraction at all.
     dirty: bool,
@@ -575,6 +577,7 @@ impl Dom {
             canvases,
             shadow_roots,
             shadow_hosts,
+            shadow_data,
             dirty,
             epoch,
             window_names_epoch,
@@ -726,6 +729,7 @@ impl Dom {
             Err(_) => unavailable += 1,
         }
         fixed_map!(shadow_hosts, (NodeId, NodeId));
+        fixed_map!(shadow_data, (NodeId, shadow::ShadowRootData));
         fixed_map!(geometry_dirty_nodes, (NodeId, DirtyKind));
         fixed_map!(adopted_styles, (NodeId, String));
         for text in adopted_styles.values() {
@@ -972,6 +976,7 @@ impl Dom {
             canvases: RefCell::new(FxHashMap::default()),
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
+            shadow_data: FxHashMap::default(),
             dirty: false,
             epoch: 0,
             window_names_epoch: 0,
@@ -1514,6 +1519,13 @@ impl Dom {
     pub fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
         let host = self.nodes[id].parent?;
         let shadow = self.shadow_root(host)?;
+        if self
+            .shadow_data
+            .get(&shadow)
+            .is_some_and(|data| data.manual_slot_assignment)
+        {
+            return None;
+        }
         let wanted = self.attr(id, "slot").unwrap_or("").trim();
         self.descendants(shadow).find(|&candidate| {
             self.tag_name(candidate) == Some("slot")
@@ -2409,8 +2421,13 @@ impl Dom {
 
     /// Parse a full HTML document into a fresh arena.
     pub fn parse_document(html: &str) -> Self {
+        Self::parse_html_document(html, true)
+    }
+
+    fn parse_html_document(html: &str, allow_declarative_shadow_roots: bool) -> Self {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
+            allow_declarative_shadow_roots,
         };
         html5ever::parse_document(sink, ParseOpts::default()).one(StrTendril::from(html))
     }
@@ -2423,6 +2440,7 @@ impl Dom {
     fn parse_text_document(text: &str) -> Self {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
+            allow_declarative_shadow_roots: false,
         };
         let mut parser = html5ever::parse_document(sink, ParseOpts::default());
         parser.process(StrTendril::from("<!doctype html><pre>\n"));
@@ -6011,7 +6029,8 @@ impl Dom {
     /// Raw hrefs of external stylesheets, document order, so the fetch
     /// pipeline can resolve and download them before scripts run.
     pub fn stylesheet_links(&self) -> Vec<String> {
-        self.descendants(DOCUMENT)
+        self.shadow_including_subtree(DOCUMENT)
+            .into_iter()
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(str::to_string))
             .collect()
@@ -6023,7 +6042,8 @@ impl Dom {
     /// uses this before the resident actor starts so first layout can shape
     /// with inline-declared web fonts.
     pub(crate) fn inline_stylesheets(&self) -> Vec<String> {
-        self.descendants(DOCUMENT)
+        self.shadow_including_subtree(DOCUMENT)
+            .into_iter()
             .filter(|&id| self.tag_name(id) == Some("style"))
             .map(|id| self.text_content(id))
             .collect()
@@ -6039,17 +6059,21 @@ impl Dom {
             return;
         }
         let links: Vec<(NodeId, String)> = self
-            .descendants(DOCUMENT)
+            .shadow_including_subtree(DOCUMENT)
+            .into_iter()
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(|h| (id, h.to_string())))
             .collect();
         for (href, css) in sheets {
-            // First not-yet-attached link with this href (duplicate hrefs
-            // attach to successive links, as before).
-            let hit = links
+            // A fetched URL can be linked from several independent shadow
+            // scopes. Each link owns a sheet, even when prefetch deduplicates
+            // the response body (HTML #rel-stylesheet).
+            let hits: Vec<_> = links
                 .iter()
-                .find(|(id, h)| !self.external_sheets.contains_key(id) && h == href);
-            if let Some(&(id, _)) = hit {
+                .filter(|(id, h)| !self.external_sheets.contains_key(id) && h == href)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in hits {
                 self.external_sheets.insert(id, css.clone());
                 self.touch_style_at(id);
             }
@@ -6071,8 +6095,8 @@ impl Dom {
 
     /// Attach a shadow root (a fragment) to a host element; rendering
     /// flattens it in place of the host's light children, with `<slot>`
-    /// projection. Idempotent per host, like the real API isn't — pages
-    /// that double-attach get the same root back rather than a throw.
+    /// projection. Internal idempotent allocator; the parser and DOM API
+    /// validate attachment separately in `shadow`.
     pub fn attach_shadow(&mut self, host: NodeId) -> NodeId {
         if let Some(&root) = self.shadow_roots.get(&host) {
             return root;
@@ -6082,6 +6106,8 @@ impl Dom {
         self.set_owner_document_subtree(root, owner_document);
         self.shadow_roots.insert(host, root);
         self.shadow_hosts.insert(root, host);
+        self.shadow_data
+            .insert(root, shadow::ShadowRootData::default());
         // Attaching changes only this host's composed contents. Preserve the
         // host as the mutation target: if it is connected the normal boundary
         // logic updates it; if it is a custom element being constructed in a
@@ -6164,11 +6190,11 @@ impl Dom {
     /// Node ids in the shadow-including inclusive subtree rooted at `root`.
     ///
     /// This is the DOM Standard's shadow-including traversal, with the shadow
-    /// root node itself included as well as its children. The JavaScript
-    /// binding uses it only when a subtree changes connectedness: wrappers for
-    /// connected platform objects retain identity and custom-element/shadow
-    /// state, while wrappers below a detached root can return to weak storage.
-    pub(crate) fn wrapper_subtree_ids(&self, root: NodeId) -> Vec<NodeId> {
+    /// root node itself included as well as its children. Resource discovery
+    /// must reach declarative roots while excluding inert template contents.
+    /// The JavaScript binding also uses this when subtree connectedness changes
+    /// to retain connected wrappers and release detached wrappers to weak storage.
+    pub(crate) fn shadow_including_subtree(&self, root: NodeId) -> Vec<NodeId> {
         if !self.is_valid(root) {
             return Vec::new();
         }
@@ -6284,6 +6310,13 @@ impl Dom {
             match cur {
                 Some(p) => {
                     if let Some(&h) = self.shadow_hosts.get(&p) {
+                        if self
+                            .shadow_data
+                            .get(&p)
+                            .is_some_and(|data| data.manual_slot_assignment)
+                        {
+                            return Vec::new();
+                        }
                         break h;
                     }
                     cur = self.nodes[p].parent;
@@ -6631,7 +6664,7 @@ impl Dom {
             ("button", "formaction"),
         ];
         let mut edits: Vec<(NodeId, &'static str, String)> = Vec::new();
-        for id in self.descendants(root) {
+        for id in self.shadow_including_subtree(root) {
             let Some(tag) = self.tag_name(id) else {
                 continue;
             };
@@ -6879,6 +6912,19 @@ impl Dom {
                 self.append(copy, cc);
             }
         }
+        // DOM #concept-node-clone copies a clonable shadow tree even for a
+        // shallow host clone; its shadow children are always copied deeply.
+        if let Some(root) = self.shadow_root(id)
+            && let Some(data) = self.shadow_data.get(&root).copied()
+            && data.clonable
+        {
+            let copy_root = self.attach_shadow(copy);
+            self.shadow_data.insert(copy_root, data);
+            for child in self.children(root) {
+                let cc = self.clone_subtree(child, true);
+                self.append(copy_root, cc);
+            }
+        }
         copy
     }
 
@@ -6887,6 +6933,9 @@ impl Dom {
     pub fn parse_fragment_into(&mut self, context_tag: &str, html: &str) -> Vec<NodeId> {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
+            // HTML #dom-element-innerhtml / fragment parsing defaults to
+            // disallowing declarative roots, unlike navigation parsing.
+            allow_declarative_shadow_roots: false,
         };
         let context = QualName::new(None, ns!(html), context_tag.to_ascii_lowercase().into());
         let frag: Dom =
@@ -6909,7 +6958,8 @@ impl Dom {
     /// which breaks any consumer that reads `newDocument.head`/`.body` separately
     /// (a view-transitions swap, most notably).
     pub fn parse_document_into(&mut self, html: &str) -> NodeId {
-        let src = Dom::parse_document(html);
+        // DOMParser's new Document keeps allow declarative shadow roots false.
+        let src = Dom::parse_html_document(html, false);
         let doc = self.new_node(NodeData::Document);
         self.nodes[doc].owner_document = doc;
         self.document_modes.insert(doc, src.document_mode(DOCUMENT));
@@ -6963,6 +7013,16 @@ impl Dom {
         for c in other.child_iter(id) {
             let cc = self.transplant(other, c);
             self.append_fresh(copy, cc);
+        }
+        // This is an arena transfer (e.g. an iframe navigation), not cloneNode:
+        // preserve every parsed shadow tree regardless of its clonable flag.
+        if let Some(root) = other.shadow_root(id) {
+            let copy_root = self.attach_shadow(copy);
+            self.shadow_data.insert(copy_root, other.shadow_data[&root]);
+            for child in other.child_iter(root) {
+                let cc = self.transplant(other, child);
+                self.append_fresh(copy_root, cc);
+            }
         }
         copy
     }
@@ -8301,14 +8361,14 @@ impl Dom {
         }
     }
 
-    /// All `<script>` elements in document order, as (src-attr, inline
-    /// source, type-attr) — the execution schedule for the active JavaScript
-    /// backend.
-    /// Every `<script>` in document order: `(src, inline text, type, node)`.
+    /// Connected scripts in parser creation order: `(src, inline text, type, node)`.
+    /// Used to initialize the execution schedule after navigation parsing.
     /// The node id lets the runner expose `document.currentScript` while a
     /// classic script executes.
     pub fn scripts(&self) -> Vec<(Option<String>, String, Option<String>, NodeId)> {
-        self.descendants(DOCUMENT)
+        let mut scripts: Vec<_> = self
+            .shadow_including_subtree(DOCUMENT)
+            .into_iter()
             .filter(|&d| self.tag_name(d) == Some("script"))
             .map(|d| {
                 (
@@ -8318,7 +8378,13 @@ impl Dom {
                     d,
                 )
             })
-            .collect()
+            .collect();
+        // HTML #parsing-main-inhead / #parsing-main-incdata: parser scripts
+        // execute in token order. Shadow-including order visits a shadow root
+        // before all light children, including scripts preceding its template.
+        // Arena IDs are allocated monotonically by the tree builder.
+        scripts.sort_unstable_by_key(|script| script.3);
+        scripts
     }
 
     /// querySelector(All): match descendants of `root` against a
@@ -14864,6 +14930,7 @@ fn json_string(s: &str) -> String {
 
 struct Sink {
     dom: RefCell<Dom>,
+    allow_declarative_shadow_roots: bool,
 }
 
 impl TreeSink for Sink {
@@ -14952,6 +15019,21 @@ impl TreeSink for Sink {
             } => *c,
             _ => panic!("get_template_contents on a non-template"),
         }
+    }
+
+    fn allow_declarative_shadow_roots(&self, _parent: &NodeId) -> bool {
+        self.allow_declarative_shadow_roots
+    }
+
+    fn attach_declarative_shadow(
+        &self,
+        host: &NodeId,
+        template: &NodeId,
+        _attrs: &[Attribute],
+    ) -> bool {
+        self.dom
+            .borrow_mut()
+            .attach_declarative_shadow(*host, *template)
     }
 
     fn same_node(&self, x: &NodeId, y: &NodeId) -> bool {

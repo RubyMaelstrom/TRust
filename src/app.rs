@@ -335,6 +335,7 @@ pub(crate) struct EncKey {
     pub(crate) url: String,
     pub(crate) w: u16,
     pub(crate) h: u16,
+    pub(crate) image_clip: Option<crate::layout2::ImageClip>,
     pub(crate) crop: bool,
     /// `image-rendering: pixelated` on the element: encode upscales with
     /// nearest-neighbor (hard-edged blocks — a scannable QR), not Lanczos.
@@ -353,6 +354,7 @@ impl EncKey {
             url: url.to_string(),
             w: item.width,
             h: item.height,
+            image_clip: item.image_clip,
             crop: item.crop,
             pixelated: item.pixelated,
             tint: Some(svg_tint()),
@@ -4324,6 +4326,7 @@ impl App {
                     key.crop,
                     key.pixelated,
                     key.tint,
+                    key.image_clip,
                 )
                 .ok()
                 .map(|(protocol, _)| protocol)?;
@@ -4392,8 +4395,14 @@ impl App {
                         pixelated: i.pixelated,
                     })
                     .collect();
-                let protocol =
-                    crate::img::encode_composite(&picker, box_size, &refs, Some(tint)).ok()?;
+                let protocol = crate::img::encode_composite(
+                    &picker,
+                    box_size,
+                    &refs,
+                    Some(tint),
+                    key.image_clip,
+                )
+                .ok()?;
                 protocol.prewarm_sixel_cache();
                 Some(protocol)
             }))
@@ -10105,6 +10114,7 @@ mod tests {
             url: String::from("https://example.com/a.png"),
             w: 4,
             h: 2,
+            image_clip: None,
             crop: false,
             pixelated: false,
             tint: Some(super::svg_tint()),
@@ -15110,6 +15120,7 @@ mod tests {
                     })
                     .expect("fixture label");
                 doc.rows[row_index].items.push(crate::layout2::Item {
+                    image_clip: None,
                     col,
                     width: 2,
                     height: 1,

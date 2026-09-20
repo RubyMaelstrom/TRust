@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Declarative Shadow DOM navigation</title>
+<style>body { margin: 0; font: 16px sans-serif } a { display: none }</style>
+<div id="navigation"><script>globalThis.shadowScriptOrder = ['before'];</script>
+<template shadowrootmode="open" shadowrootclonable>
+  <style>
+    :host { display: block }
+    nav { display: flex; gap: 24px; padding: 16px; background: #003087; color: white }
+    a, button { color: inherit; font: inherit }
+  </style>
+  <script>
+    globalThis.shadowScriptRan = document.currentScript === null;
+    shadowScriptOrder.push('shadow');
+  </script>
+  <nav><a href="/personal">Personal</a><a href="/business">Business</a>
+    <a href="/login" id="login">Log in</a><button id="menu">Menu</button></nav>
+</template><script>shadowScriptOrder.push('after');</script></div>
+<p id="result">Navigation should appear above, including the Log in link.</p>
+<script>
+const root = document.getElementById('navigation').shadowRoot;
+if (!globalThis.shadowScriptRan) throw Error('Shadow script did not execute with null currentScript');
+if (shadowScriptOrder.join() !== 'before,shadow,after') throw Error('Parser script order changed');
+root.getElementById('menu').addEventListener('click', () => {
+  document.getElementById('result').textContent = 'Menu activated';
+});
+root.getElementById('login').setAttribute('data-ready', 'yes');
+</script>

@@ -1431,6 +1431,7 @@ fn page_media_fallback(model: &terminal::TerminalPaintModel, cols: usize, rows: 
                 pixelated: false,
                 invisible: false,
                 terminal_band: None,
+                image_clip: None,
             }
         }
         None => Item {
@@ -1447,6 +1448,7 @@ fn page_media_fallback(model: &terminal::TerminalPaintModel, cols: usize, rows: 
             pixelated: false,
             invisible: false,
             terminal_band: None,
+            image_clip: None,
         },
     };
     let extra = usize::from(item.height.max(1)) - 1;
@@ -1504,6 +1506,125 @@ mod tests {
             .flat_map(|row| row.items.iter())
             .map(|item| item.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn terminal_image_occlusion_keeps_later_menu_and_source_pixels() {
+        use ratatui::{
+            buffer::Buffer,
+            layout::{Rect, Size},
+            widgets::Widget,
+        };
+        use ratatui_image::{picker::Picker, sliced::SlicedImage};
+        let html = r#"<body style="margin:0"><img src="background.png" style="display:block;width:160px;height:160px">
+            <div style="position:absolute;left:32px;top:32px;width:80px;height:64px;background:white;z-index:2">Menu</div>"#;
+        let images = HashMap::from([("http://e.com/background.png".into(), (160, 160))]);
+        let output = lay_images(html, 24, &images);
+        assert!(terminal_text(&output).contains("Menu"));
+        let pieces: Vec<_> = output
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.items
+                    .iter()
+                    .filter(|item| item.image.is_some())
+                    .map(move |item| (row, item))
+            })
+            .collect();
+        assert!(pieces.len() > 1, "a partly covered image must be sliced");
+        let mut coverage = [false; 20 * 10];
+        let picker = Picker::halfblocks();
+        let font = picker.font_size();
+        let pixels = image::RgbaImage::from_fn(
+            20 * u32::from(font.width),
+            10 * u32::from(font.height),
+            |x, y| {
+                image::Rgba([
+                    (x / u32::from(font.width) * 10) as u8,
+                    (y / u32::from(font.height) * 20) as u8,
+                    80,
+                    255,
+                ])
+            },
+        );
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let area = Rect::new(0, 0, 24, 12);
+        let mut expected = Buffer::empty(area);
+        let (full, _) = crate::img::encode_sliced_bytes(
+            &picker,
+            &png,
+            Size::new(20, 10),
+            false,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        SlicedImage::new(&full, (0, 0).into()).render(area, &mut expected);
+        let mut actual = Buffer::empty(area);
+        for row in 2..6 {
+            for col in 4..14 {
+                actual[(col, row)].set_symbol("M");
+            }
+        }
+        for (row, item) in pieces {
+            let clip = item.image_clip.expect("source rectangle");
+            assert_eq!((clip.source_width, clip.source_height), (20, 10));
+            for y in row..row + usize::from(item.height) {
+                for x in usize::from(item.col)..usize::from(item.col + item.width) {
+                    assert!(
+                        !(2..6).contains(&y) || !(4..14).contains(&x),
+                        "image covered menu at {x},{y}"
+                    );
+                    assert!(!coverage[y * 20 + x], "overlapping image slices");
+                    coverage[y * 20 + x] = true;
+                }
+            }
+            let (proto, _) = crate::img::encode_sliced_bytes(
+                &picker,
+                &png,
+                Size::new(item.width, item.height),
+                false,
+                true,
+                None,
+                Some(clip),
+            )
+            .unwrap();
+            SlicedImage::new(&proto, (item.col as i16, row as i16).into())
+                .render(area, &mut actual);
+        }
+        for y in 0..10u16 {
+            for x in 0..20u16 {
+                if (2..6).contains(&y) && (4..14).contains(&x) {
+                    assert_eq!(actual[(x, y)].symbol(), "M");
+                } else {
+                    assert!(coverage[usize::from(y) * 20 + usize::from(x)]);
+                    assert_eq!(actual[(x, y)].symbol(), expected[(x, y)].symbol());
+                    // Half-block encoding filters at each crop's boundary;
+                    // allow that small rounding change, but not a shifted
+                    // source column (10 red levels) or row (20 green levels).
+                    for (actual, expected) in [
+                        (actual[(x, y)].fg, expected[(x, y)].fg),
+                        (actual[(x, y)].bg, expected[(x, y)].bg),
+                    ] {
+                        match (actual, expected) {
+                            (
+                                ratatui::style::Color::Rgb(r, g, b),
+                                ratatui::style::Color::Rgb(er, eg, eb),
+                            ) => assert!(
+                                r.abs_diff(er) <= 3 && g.abs_diff(eg) <= 3 && b.abs_diff(eb) <= 3,
+                                "source pixels shifted at {x},{y}: {actual:?} vs {expected:?}"
+                            ),
+                            _ => assert_eq!(actual, expected),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5462,6 +5583,7 @@ mod tests {
                 pixelated: false,
                 invisible: false,
                 terminal_band: Some(band),
+                image_clip: None,
             }
         }
 

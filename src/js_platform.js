@@ -371,13 +371,29 @@
                 parts[0], parts[1], parts[2]
             );
             rememberElement(w, id);
+        } else if (t === 11) {
+            const info = __dom_shadow_info(id);
+            w = info ? new ShadowRoot(id) : new DocumentFragment(id);
+            // Parsed roots already exist before any wrapper. Recognize them
+            // even when first reached through child.parentNode/getRootNode.
+            rememberWrapper(id, w, knownConnected);
+            if (info) {
+                w.__host = wrap(info[0]);
+                w.__mode = info[1] ? "closed" : "open";
+                w.__delegatesFocus = info[2];
+                w.__serializable = info[3];
+                w.__clonable = info[4];
+                w.__slotAssignment = info[5] ? "manual" : "named";
+                w.__host.__sr = w;
+                if (info[1]) CLOSED_SHADOW_HOSTS.add(info[0]);
+            }
+            return w;
         } else {
             w = t === 9 ? (__dom_document_content_type(id) === "text/html" ? new Document(id) : new XMLDocument(id, XML_DOCUMENT_TOKEN))
                 : t === 3 ? new Text(id)
                 : t === 4 ? new CDATASection(id)
                 : t === 7 ? new ProcessingInstruction(id)
                 : t === 8 ? new Comment(id)
-                : t === 11 ? new DocumentFragment(id)
                 : new Node(id);
         }
         return rememberWrapper(id, w, knownConnected);
@@ -4807,35 +4823,44 @@
         // element has no `content` property, so a framework's `.content = …`
         // property binding (lit's PropertyPart) now sets a plain expando here.
         attachShadow(init) {
-            const id = __dom_attach_shadow(this.__id);
-            let sr = cachedWrapper(id);
-            if (!(sr instanceof ShadowRoot)) {
-                sr = new ShadowRoot(id);
-                rememberWrapper(id, sr);
+            if (!init || (typeof init !== "object" && typeof init !== "function"))
+                throw new TypeError("ShadowRootInit is required");
+            const mode = domString(init.mode);
+            if (mode !== "open" && mode !== "closed") throw new TypeError("Invalid shadow root mode");
+            const delegatesFocus = !!init.delegatesFocus;
+            const serializable = !!init.serializable;
+            const clonable = !!init.clonable;
+            const slotAssignment = init.slotAssignment === undefined ? "named" : domString(init.slotAssignment);
+            if (slotAssignment !== "named" && slotAssignment !== "manual")
+                throw new TypeError("Invalid slot assignment");
+            const previous = wrap(__dom_shadow_root(this.__id));
+            const removed = previous ? Array.from(previous.childNodes) : [];
+            const removedIds = previous ? snapshotRemovedWrapperSubtrees(previous, removed.map(n => n.__id)) : [];
+            const id = __dom_attach_shadow(this.__id, mode === "closed", delegatesFocus,
+                serializable, clonable, slotAssignment === "manual");
+            if (id === null) throw new DOMException("Cannot attach a shadow root", "NotSupportedError");
+            const sr = wrap(id);
+            if (removed.length) {
+                syncKnownWrapperRetention(removedIds, false);
+                // DOM #concept-attach-a-shadow-root removes each child in
+                // tree order. Record the same sibling boundaries as those
+                // sequential removals, after native validation succeeds.
+                for (let i = 0; i < removed.length; i++) {
+                    if (CE.defs.size) ceDisconnect(removed[i]);
+                    destroyFrameNavigablesIn(removed[i]);
+                    if (MO.length && moHasChildList) moNotify({
+                        type: "childList", target: sr, removedNodes: [removed[i]],
+                        previousSibling: null, nextSibling: removed[i + 1] || null,
+                    });
+                }
+                slotQueueCheck(sr);
             }
-            sr.__host = this;
-            sr.__mode = init && init.mode === "closed" ? "closed" : "open";
-            if (sr.__mode === "closed") CLOSED_SHADOW_HOSTS.add(this.__id);
-            else CLOSED_SHADOW_HOSTS.delete(this.__id);
-            this.__sr = sr;
             return sr;
         }
         get shadowRoot() {
             if (CLOSED_SHADOW_HOSTS.has(this.__id)) return null;
-            let root = this.__sr;
-            if (!root) {
-                const id = __dom_shadow_root(this.__id);
-                if (id === null || id === undefined) return null;
-                root = cachedWrapper(id);
-                if (!(root instanceof ShadowRoot)) {
-                    root = new ShadowRoot(id);
-                    rememberWrapper(id, root);
-                }
-                root.__host = this;
-                root.__mode = "open";
-                this.__sr = root;
-            }
-            return root.__mode === "open" ? root : null;
+            const root = this.__sr || wrap(__dom_shadow_root(this.__id));
+            return root && root.__mode === "open" ? root : null;
         }
         // ElementInternals, minimally: form components construct with
         // this unguarded (archive.org's dropdowns) — always-valid,
@@ -6606,6 +6631,24 @@
     // <template>.content is the inert fragment its markup parses into (read-only).
     class HTMLTemplateElement extends HTMLElement {
         get content() { return wrap(__dom_template_content(this.__id)); }
+        // HTML #dom-template-shadowRootMode is also the standard feature
+        // detection surface used by declarative-shadow polyfills.
+        get shadowRootMode() {
+            const mode = (this.getAttribute("shadowrootmode") || "").replace(/[A-Z]/g, c => c.toLowerCase());
+            return mode === "open" || mode === "closed" ? mode : "";
+        }
+        set shadowRootMode(value) { this.setAttribute("shadowrootmode", domString(value)); }
+        get shadowRootDelegatesFocus() { return this.hasAttribute("shadowrootdelegatesfocus"); }
+        set shadowRootDelegatesFocus(value) { this.toggleAttribute("shadowrootdelegatesfocus", !!value); }
+        get shadowRootSerializable() { return this.hasAttribute("shadowrootserializable"); }
+        set shadowRootSerializable(value) { this.toggleAttribute("shadowrootserializable", !!value); }
+        get shadowRootClonable() { return this.hasAttribute("shadowrootclonable"); }
+        set shadowRootClonable(value) { this.toggleAttribute("shadowrootclonable", !!value); }
+        get shadowRootSlotAssignment() {
+            const value = (this.getAttribute("shadowrootslotassignment") || "").replace(/[A-Z]/g, c => c.toLowerCase());
+            return value === "manual" ? "manual" : "named";
+        }
+        set shadowRootSlotAssignment(value) { this.setAttribute("shadowrootslotassignment", domString(value)); }
     }
     // HTMLMetaElement.content reflects the `content` attribute (pixiv stashes
     // boot config as JSON in <meta content='{…}'> and does JSON.parse(meta.content)).
@@ -7631,7 +7674,15 @@
             if (oldDocument !== this) ceAdopt(node, oldDocument, this);
             return node;
         }
-        get forms() { return this.querySelectorAll("form"); }
+        get forms() {
+            // HTML #dom-document-forms: SameObject live HTMLCollection, with
+            // DOM #dom-htmlcollection-nameditem name/ID lookup.
+            let collections = ELEMENT_COLLECTIONS.get(this);
+            if (!collections) ELEMENT_COLLECTIONS.set(this, collections = new Map());
+            let forms = collections.get("forms");
+            if (!forms) collections.set("forms", forms = tagNameCollection(this, "form", HTML_NS));
+            return forms;
+        }
         get links() { return this.querySelectorAll("a[href]"); }
         get images() { return this.querySelectorAll("img"); }
         // The arena keeps script ELEMENTS (only the render serializer drops
@@ -8891,12 +8942,16 @@
             return node.innerHTML !== undefined ? node.innerHTML : "";
         }
     }
-    class ShadowRoot extends Node {
+    class ShadowRoot extends DocumentFragment {
         get nodeType() { return 11; }
         get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "ShadowRoot"; }
         get host() { return this.__host || null; }
         get mode() { return this.__mode || "open"; }
+        get delegatesFocus() { return !!this.__delegatesFocus; }
+        get serializable() { return !!this.__serializable; }
+        get clonable() { return !!this.__clonable; }
+        get slotAssignment() { return this.__slotAssignment || "named"; }
         get activeElement() { return activeElementFor(this); }
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
@@ -9916,7 +9971,9 @@
     function collectionNamedItem(list, name) {
         if (name === "") return null;
         for (const element of list) {
-            if (element.id === name || (element.namespaceURI === HTML_NS && element.getAttribute("name") === name))
+            // A form's named getter can shadow .id and .getAttribute.
+            if (__dom_get_attr(element.__id, "id") === name ||
+                (element.__trustNS === HTML_NS && __dom_get_attr(element.__id, "name") === name))
                 return element;
         }
         return null;
@@ -9986,8 +10043,8 @@
                 const list = resolve(), keys = [];
                 for (let i = 0; i < list.length; i++) keys.push(String(i));
                 for (const element of list) {
-                    const names = [element.id];
-                    if (element.namespaceURI === HTML_NS) names.push(element.getAttribute("name"));
+                    const names = [__dom_get_attr(element.__id, "id")];
+                    if (element.__trustNS === HTML_NS) names.push(__dom_get_attr(element.__id, "name"));
                     for (const name of names) {
                         if (name && nodeListArrayIndex(name) < 0 && !Reflect.has(t, name) && !keys.includes(name)) keys.push(name);
                     }
@@ -14243,7 +14300,23 @@
         return { bytes: Array.isArray(obj.__parts) ? __blobBytes(obj) : "", type: obj.type || "",
             origin: entry.origin, originKey: entry.originKey };
     }
+    const urlWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
     class URL {
+        // URL Standard #dom-url-parse / #dom-url-canparse (local snapshot
+        // 55d66993). Conversion errors propagate; only parser failure is null.
+        static parse(url, base = undefined) {
+            if (!arguments.length) throw new TypeError("URL.parse requires a URL");
+            const parts = __url_parse(urlWellFormed(domString(url)), base === undefined ? null : urlWellFormed(domString(base)));
+            if (!parts) return null;
+            const result = Object.create(URL.prototype);
+            result.__p = parts;
+            result.__sp = null;
+            return result;
+        }
+        static canParse(url, base = undefined) {
+            if (!arguments.length) throw new TypeError("URL.canParse requires a URL");
+            return __url_parse(urlWellFormed(domString(url)), base === undefined ? null : urlWellFormed(domString(base))) !== null;
+        }
         // A WHATWG URL is a LIVE object: assigning any component re-serializes
         // href (and every other component). We keep the parsed parts in `__p`
         // (the 11-tuple __url_parse returns) and expose each field as an

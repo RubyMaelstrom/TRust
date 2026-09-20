@@ -422,6 +422,20 @@
         if (!p) throw new TypeError("Invalid URL: " + url);
         this.__p = p; this.__sp = null;
     }
+    // URL Standard #dom-url-parse / #dom-url-canparse, exposed in workers too.
+    const urlWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
+    URL.parse = function parse(url, base = undefined) {
+        if (!arguments.length) throw new TypeError("URL.parse requires a URL");
+        var parts = __url_parse(urlWellFormed(`${url}`), base === undefined ? null : urlWellFormed(`${base}`));
+        if (!parts) return null;
+        var result = Object.create(URL.prototype);
+        result.__p = parts; result.__sp = null;
+        return result;
+    };
+    URL.canParse = function canParse(url, base = undefined) {
+        if (!arguments.length) throw new TypeError("URL.canParse requires a URL");
+        return __url_parse(urlWellFormed(`${url}`), base === undefined ? null : urlWellFormed(`${base}`)) !== null;
+    };
     function urlAccessor(i, which) {
         return which
             ? { get: function () { return this.__p[i]; }, set: function (v) { var r = __url_set(this.__p[0], which, String(v)); if (r) this.__p = r; } }
