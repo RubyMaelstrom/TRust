@@ -189,6 +189,8 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# HTML enumerated shadowrootmode values match ASCII case-insensitively.
+html5ever = { path = "vendor/html5ever-0.39.0" }
 # Bound eager GLSL macro expansion before intermediate allocations.
 glsl-lang-pp = { path = "vendor/glsl-lang-pp-0.8.1" }
 # Shared Telnet VT engine: owned conformance/resize fixes, see README.trust.txt.

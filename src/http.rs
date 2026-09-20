@@ -8377,6 +8377,50 @@ mod tests {
     }
 
     #[test]
+    fn declarative_shadow_navigation_is_painted_and_linked_in_both_adapters() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom =
+            crate::dom::Dom::parse_document(include_str!("fixtures/declarative_shadow.html"));
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_viewport_px(1024.0, 768.0);
+        let host = dom.get_by_id("navigation").unwrap();
+        let root = dom.shadow_root(host).unwrap();
+        let login = dom.query(
+            root,
+            &crate::dom::SelectorList::parse("#login").unwrap(),
+            true,
+        )[0];
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(1024.0, 768.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let bounds = rendered.layout.boxes[&login];
+        assert!(bounds.width > 0.0 && bounds.height > 0.0);
+        assert!(rendered.semantics.nodes.iter().any(|node| {
+            node.dom_node == Some(login) && node.role == crate::accessibility::Role::Link
+        }));
+        assert!(rendered.layout.paint.primitives.iter().any(|command| {
+            matches!(command, crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                if shaped.text.contains("Log in"))
+        }));
+        let doc = adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            rendered,
+            crate::layout2::TerminalViewport::new(128, 48, 8.0, 16.0),
+            &Default::default(),
+        );
+        assert!(doc.rows.iter().flat_map(|row| &row.items).any(|item| {
+            matches!(&item.link, Some(Link::Http(url)) if url.as_str() == "https://example.test/login")
+        }));
+    }
+
+    #[test]
     fn canonical_render_discovers_shadow_controls_images_and_flat_ancestry() {
         // CSS Shadow 1 §4.1 makes the flattened tree the input to box
         // construction. The typed presentation metadata must use the same

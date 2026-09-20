@@ -1050,7 +1050,7 @@ pub(crate) fn external_resources_at(
             });
         }
     }
-    for node in dom.descendants(DOCUMENT) {
+    for node in dom.shadow_including_subtree(DOCUMENT) {
         let tag = dom.tag_name(node);
         let rel_has = |name: &str| {
             dom.attr(node, "rel").is_some_and(|rel| {
@@ -1134,7 +1134,7 @@ pub fn sprite_use_sheets(html: &str) -> Vec<String> {
     let dom = Dom::parse_document(html);
     let mut seen = std::collections::HashSet::new();
     let mut sheets = Vec::new();
-    for node in dom.descendants(DOCUMENT) {
+    for node in dom.shadow_including_subtree(DOCUMENT) {
         if dom.tag_name(node) != Some("use") {
             continue;
         }
@@ -1160,7 +1160,7 @@ pub fn module_preloads(html: &str) -> Vec<String> {
     let dom = Dom::parse_document(html);
     let mut seen = std::collections::HashSet::new();
     let mut targets = Vec::new();
-    for node in dom.descendants(DOCUMENT) {
+    for node in dom.shadow_including_subtree(DOCUMENT) {
         let target = match dom.tag_name(node) {
             Some("link")
                 if dom.attr(node, "rel").is_some_and(|rel| {

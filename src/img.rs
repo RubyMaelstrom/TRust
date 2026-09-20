@@ -1205,8 +1205,33 @@ pub fn encode_sliced_bytes(
     crop: bool,
     pixelated: bool,
     tint: Option<SvgTint>,
+    clip: Option<crate::layout2::ImageClip>,
 ) -> Result<(SlicedProtocol, ImageInfo), String> {
-    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop, tint)?;
+    let source_size = clip.map_or(size, |clip| {
+        Size::new(clip.source_width, clip.source_height)
+    });
+    let (image, info, svg_fitted) = decode_for_box(bytes, picker, source_size, crop, tint)?;
+    if let Some(clip) = clip {
+        let filter = if pixelated {
+            FilterType::Nearest
+        } else {
+            FilterType::Lanczos3
+        };
+        let font = picker.font_size();
+        let fitted = if crop && !svg_fitted {
+            image.resize_to_fill(
+                u32::from(source_size.width) * u32::from(font.width),
+                u32::from(source_size.height) * u32::from(font.height),
+                filter,
+            )
+        } else {
+            Resize::Scale(Some(filter)).resize(&image, font, source_size, None)
+        };
+        let clipped = clip_cell_image(picker, fitted, clip)?;
+        return SlicedProtocol::new_with_resize(picker, clipped, size, Resize::Fit(None))
+            .map(|protocol| (protocol, info))
+            .map_err(|error| error.to_string());
+    }
     encode_sliced(picker, image, size, crop && !svg_fitted, pixelated)
         .map(|protocol| (protocol, info))
 }
@@ -1314,17 +1339,40 @@ pub fn encode_composite(
     union: Size,
     layers: &[CompositeInput<'_>],
     tint: Option<SvgTint>,
+    clip: Option<crate::layout2::ImageClip>,
 ) -> Result<SlicedProtocol, String> {
-    let canvas = composite_canvas(picker, union, layers, tint)?;
+    let source = clip.map_or(union, |clip| {
+        Size::new(clip.source_width, clip.source_height)
+    });
+    let canvas = DynamicImage::ImageRgba8(composite_canvas(picker, source, layers, tint)?);
+    let canvas = if let Some(clip) = clip {
+        clip_cell_image(picker, canvas, clip)?
+    } else {
+        canvas
+    };
     // The canvas is already union-pixel-sized, so the encode neither rescales
     // nor pads (`Resize::Fit(None)`); transparent gaps ride into the terminal.
-    SlicedProtocol::new_with_resize(
-        picker,
-        DynamicImage::ImageRgba8(canvas),
-        union,
-        Resize::Fit(None),
-    )
-    .map_err(|e| e.to_string())
+    SlicedProtocol::new_with_resize(picker, canvas, union, Resize::Fit(None))
+        .map_err(|e| e.to_string())
+}
+
+/// CSS 2 Appendix E: crop only after fitting to the original replaced-content
+/// box. Horizontal terminal slices must be encoded separately: SlicedImage
+/// only supports skipping rows, so moving its left edge would repeat pixels.
+fn clip_cell_image(
+    picker: &Picker,
+    image: DynamicImage,
+    clip: crate::layout2::ImageClip,
+) -> Result<DynamicImage, String> {
+    let font = picker.font_size();
+    let x = u32::from(clip.col) * u32::from(font.width);
+    let y = u32::from(clip.row) * u32::from(font.height);
+    let width = u32::from(clip.width) * u32::from(font.width);
+    let height = u32::from(clip.height) * u32::from(font.height);
+    if width == 0 || height == 0 || x + width > image.width() || y + height > image.height() {
+        return Err("Invalid visible image rectangle".into());
+    }
+    Ok(image.crop_imm(x, y, width, height))
 }
 
 /// Build the composited union canvas (the alpha-blend core of
@@ -1586,7 +1634,7 @@ mod tests {
 
         // The sliced path (inline page images; cached sequence).
         let (proto, _) =
-            encode_sliced_bytes(&picker, &png, Size::new(2, 1), false, false, None).unwrap();
+            encode_sliced_bytes(&picker, &png, Size::new(2, 1), false, false, None, None).unwrap();
         let mut buf = Buffer::empty(area);
         ratatui_image::sliced::SlicedImage::new(&proto, (0, 0).into()).render(area, &mut buf);
         let sym = buf.cell((0, 0)).expect("anchor cell").symbol();

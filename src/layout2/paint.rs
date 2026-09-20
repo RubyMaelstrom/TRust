@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use crate::doc::Link;
 use crate::dom::{Dom, NodeId};
 use crate::layout2::{
-    Carousel, CompositeLayer, Emphasis, FixedItem, HitBox, Item, ItemKind, NO_NODE, Region, Row,
-    display_width, truncate_to_width,
+    Carousel, CompositeLayer, Emphasis, FixedItem, HitBox, ImageClip, Item, ItemKind, NO_NODE,
+    Region, Row, display_width, truncate_to_width,
 };
 
 /// The overlap-composite side-table produced by a paint pass (P8): a synthetic
@@ -2331,6 +2331,7 @@ fn inflow_content(
                     pixelated: p.item.pixelated,
                     invisible: p.item.invisible,
                     terminal_band: placement.band,
+                    image_clip: None,
                 };
                 if matches!(item.link, None | Some(Link::JsClick { .. }))
                     && let Some(link) = dom.editing_link(item.node)
@@ -2791,6 +2792,7 @@ fn border_item(node: NodeId, text: String) -> Item {
         pixelated: false,
         invisible: false,
         terminal_band: None,
+        image_clip: None,
     }
 }
 
@@ -3286,34 +3288,32 @@ fn composite(
         if p.item.image.is_none() || p.item.invisible || consumed[i] {
             continue;
         }
-        let survives = (p.row..p.row + p.item.height.max(1) as usize)
-            .any(|r| grid.get(r).is_some_and(|g| !g.owned(i).is_empty()));
-        if !survives {
+        let clips = visible_image_clips(
+            &grid,
+            &[i],
+            p.row,
+            p.col,
+            p.item.width,
+            p.item.height.max(1),
+        );
+        if clips.is_empty() {
             continue;
         }
-        let (c0, c1) = (p.col, p.col + u32::from(p.item.width));
-        for r in p.row..p.row + p.item.height.max(1) as usize {
-            while pixels.len() <= r {
-                pixels.push(Vec::new());
-            }
-            pixels[r].push((c0, c1));
-        }
+        reserve_image_pixels(&mut pixels, &clips, p.row, p.col);
         ensure_rows(&mut rows, p.row + p.item.height.max(1) as usize);
         let mut item = p.item.clone();
         item.col = p.col.min(u16::MAX as u32) as u16;
-        rows[p.row].items.push(item);
+        emit_image_clips(&mut rows, item, p.row, clips);
     }
     // Emit each composite group as ONE image item over its union box, keyed by a
     // synthetic `x-trust-composite:` URL the app resolves to `composites`.
     for g in &groups {
         // Survives if any member still owns any cell (not fully covered by later
         // external content painted over the whole union).
-        let survives = g.members.iter().any(|&m| {
-            let p = placed[m].as_ref().unwrap();
-            (p.row..p.row + p.item.height.max(1) as usize)
-                .any(|r| grid.get(r).is_some_and(|gr| !gr.owned(m).is_empty()))
-        });
-        if !survives {
+        let width = g.w.min(u32::from(u16::MAX)) as u16;
+        let height = g.h.min(usize::from(u16::MAX)) as u16;
+        let clips = visible_image_clips(&grid, &g.members, g.row, g.col, width, height);
+        if clips.is_empty() {
             continue;
         }
         let layers: Vec<CompositeLayer> = g
@@ -3333,17 +3333,11 @@ fn composite(
             })
             .collect();
         let key = composite_key(&layers);
-        let (c0, c1) = (g.col, g.col + g.w);
-        for r in g.row..g.row + g.h {
-            while pixels.len() <= r {
-                pixels.push(Vec::new());
-            }
-            pixels[r].push((c0, c1));
-        }
+        reserve_image_pixels(&mut pixels, &clips, g.row, g.col);
         ensure_rows(&mut rows, g.row + g.h);
         // Hover / selection map the union to the BASE (bottom) image's node/link.
         let base = placed[g.members[0]].as_ref().unwrap();
-        rows[g.row].items.push(Item {
+        let item = Item {
             col: g.col.min(u32::from(u16::MAX)) as u16,
             width: g.w.min(u32::from(u16::MAX)) as u16,
             height: g.h.min(usize::from(u16::MAX)) as u16,
@@ -3357,7 +3351,9 @@ fn composite(
             pixelated: false,
             invisible: false,
             terminal_band: base.item.terminal_band,
-        });
+            image_clip: None,
+        };
+        emit_image_clips(&mut rows, item, g.row, clips);
         composites.insert(key, layers);
     }
     // ---- emission pass 2: preserved text runs, then sliceable items ----
@@ -3449,6 +3445,7 @@ fn composite(
             pixelated: false,
             invisible: true,
             terminal_band: None,
+            image_clip: None,
         });
         rows[hit.row].hits.push(HitBox {
             col: hit.col.min(u32::from(u16::MAX)) as u16,
@@ -3459,6 +3456,103 @@ fn composite(
         });
     }
     rows
+}
+
+/// CSS 2 Appendix E (#painting-order): later backgrounds, text, and stacking
+/// contexts cover earlier images. Keep the exact surviving cells through the
+/// delayed terminal-image pass instead of repainting an entire surviving box.
+/// Local CSSWG snapshot 81c27f68 (2026-09-06).
+fn visible_image_clips(
+    grid: &[RowSpans],
+    owners: &[usize],
+    top: usize,
+    left: u32,
+    width: u16,
+    height: u16,
+) -> Vec<ImageClip> {
+    let mut clips: Vec<ImageClip> = Vec::new();
+    let mut previous = HashMap::<(u16, u16), usize>::new();
+    for row in 0..height {
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        if let Some(line) = grid.get(top + usize::from(row)) {
+            for &(start, end, owner) in &line.spans {
+                if !owners.contains(&owner) {
+                    continue;
+                }
+                let start = start.max(left);
+                let end = end.min(left + u32::from(width));
+                if start >= end {
+                    continue;
+                }
+                if let Some(last) = spans.last_mut()
+                    && last.1 == start
+                {
+                    last.1 = end;
+                } else {
+                    spans.push((start, end));
+                }
+            }
+        }
+        let mut current = HashMap::new();
+        for (start, end) in spans {
+            let key = ((start - left) as u16, (end - start) as u16);
+            let index = if let Some(&index) = previous.get(&key) {
+                clips[index].height += 1;
+                index
+            } else {
+                clips.push(ImageClip {
+                    source_width: width,
+                    source_height: height,
+                    col: key.0,
+                    row,
+                    width: key.1,
+                    height: 1,
+                });
+                clips.len() - 1
+            };
+            current.insert(key, index);
+        }
+        previous = current;
+    }
+    clips
+}
+
+fn emit_image_clips(rows: &mut [Row], item: Item, top: usize, clips: Vec<ImageClip>) {
+    if clips.len() == 1
+        && clips[0].col == 0
+        && clips[0].row == 0
+        && clips[0].width == item.width
+        && clips[0].height == item.height.max(1)
+    {
+        rows[top].items.push(item);
+        return;
+    }
+    for clip in clips {
+        let mut piece = item.clone();
+        piece.col = piece.col.saturating_add(clip.col);
+        piece.width = clip.width;
+        piece.height = clip.height;
+        piece.text.clear();
+        piece.image_clip = Some(clip);
+        rows[top + usize::from(clip.row)].items.push(piece);
+    }
+}
+
+fn reserve_image_pixels(
+    pixels: &mut Vec<Vec<(u32, u32)>>,
+    clips: &[ImageClip],
+    top: usize,
+    left: u32,
+) {
+    for clip in clips {
+        let start = top + usize::from(clip.row);
+        let end = start + usize::from(clip.height);
+        pixels.resize_with(pixels.len().max(end), Vec::new);
+        let x = left + u32::from(clip.col);
+        for row in &mut pixels[start..end] {
+            row.push((x, x + u32::from(clip.width)));
+        }
+    }
 }
 
 /// One placed (viewport-clipped) inline item, ready to emit: its top row/col in

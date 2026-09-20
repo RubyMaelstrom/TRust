@@ -1431,6 +1431,7 @@ mod tests {
                 pixelated: false,
                 invisible: false,
                 terminal_band: None,
+                image_clip: None,
             }],
             hits: Vec::new(),
         }

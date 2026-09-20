@@ -94,6 +94,10 @@ shader, and API tests, use `cargo test --lib webgl -- --include-ignored`.
 Import maps resolve static and dynamic module imports, including scoped
 mappings, blocked specifiers, and integrity metadata.
 
+HTML navigation supports declarative Shadow DOM, including nested roots and
+shadow-scoped stylesheets. Scripts can access open roots and initialize their
+controls; ordinary `innerHTML` and `DOMParser` parsing keep declarations inert.
+
 Web Audio context construction and lifecycle are available so applications can
 initialize their interface before starting audio. Audio graph nodes, decoding,
 worklets, offline rendering, and playback are not implemented yet. Contexts

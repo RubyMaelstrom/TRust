@@ -257,6 +257,17 @@ pub enum ItemKind {
     HitRegion,
 }
 
+/// Visible portion of an image, relative to its original terminal-cell box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageClip {
+    pub source_width: u16,
+    pub source_height: u16,
+    pub col: u16,
+    pub row: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// One positioned inline box on a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -309,6 +320,9 @@ pub struct Item {
     /// This is not an overflow clip; canonical CSS clipping remains decisive.
     /// `None` is used by synthetic/non-layout items.
     pub terminal_band: Option<(u16, u16)>,
+    /// A surviving rectangle of an occluded image. Fit the source to its
+    /// original box before cropping this portion; never rescale the portion.
+    pub image_clip: Option<ImageClip>,
 }
 
 /// Inline text emphasis, set by tags (`<b>`/`<i>`/`<u>`/`<s>`) and by CSS

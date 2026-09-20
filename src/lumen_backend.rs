@@ -6491,7 +6491,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__html_dda", 0, host_html_dda),
     ("__url_parse", 2, host_url_parse),
     ("__url_set", 3, host_url_set),
-    ("__dom_attach_shadow", 1, host_attach_shadow),
+    ("__dom_attach_shadow", 6, host_attach_shadow),
+    ("__dom_shadow_info", 1, host_shadow_info),
     ("__dom_shadow_root", 1, host_shadow_root),
     ("__dom_adopt_styles", 2, host_adopt_styles),
     ("__css_parse", 1, host_css_parse),
@@ -8172,6 +8173,16 @@ fn queue_resource_error(ctx: &mut Ctx, node_id: usize, kind: LumenResourceKind, 
     }
 }
 
+fn classic_current_script(ctx: &mut Ctx, node_id: usize) -> Value {
+    // HTML #execute-the-script-element snapshots null for a classic script
+    // whose root is a shadow root, even if script later moves the element.
+    if host_dom(ctx).borrow().in_shadow_tree(node_id) {
+        Value::Null
+    } else {
+        Value::Num(node_id as f64)
+    }
+}
+
 fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: String) {
     let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
     let trust = host_trust(ctx).ok();
@@ -8179,7 +8190,8 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
         .as_ref()
         .and_then(|trust| ctx.member_get(trust, "currentScript").ok());
     if let Some(trust) = trust.as_ref() {
-        let _ = ctx.member_set(trust, "currentScript", Value::Num(node_id as f64));
+        let current = classic_current_script(ctx, node_id);
+        let _ = ctx.member_set(trust, "currentScript", current);
     }
     match ctx.eval_classic_script_interruptible(&source) {
         Ok(Ok(_)) => {}
@@ -9770,9 +9782,8 @@ fn run_injected_classic_task(
         "bindFrameForNode",
         &[Value::Num(node_id as f64)],
     );
-    let _ = engine
-        .ctx()
-        .member_set(&trust, "currentScript", Value::Num(node_id as f64));
+    let current = classic_current_script(engine.ctx(), node_id);
+    let _ = engine.ctx().member_set(&trust, "currentScript", current);
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.eval_value_interruptible(source)
     }));
@@ -11156,7 +11167,7 @@ fn host_wrapper_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     let ids = {
         let dom = dom.borrow();
         host_arg_node(&dom, args, 0)
-            .map(|root| dom.wrapper_subtree_ids(root))
+            .map(|root| dom.shadow_including_subtree(root))
             .unwrap_or_default()
     };
     Ok(host_ids_array(ctx, ids))
@@ -11171,7 +11182,7 @@ fn host_rendering_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     let ids = {
         let dom = dom.borrow();
         let mut ids = host_arg_node(&dom, args, 0)
-            .map(|root| dom.wrapper_subtree_ids(root))
+            .map(|root| dom.shadow_including_subtree(root))
             .unwrap_or_default();
         ids.retain(|&id| matches!(dom.tag_name(id), Some("iframe" | "frame")));
         ids
@@ -11206,10 +11217,36 @@ fn host_html_dda(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, 
 }
 
 fn host_attach_shadow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let flag = |index| matches!(args.get(index), Some(Value::Bool(true)));
+    let options = crate::dom::shadow::ShadowRootData {
+        closed: flag(1),
+        delegates_focus: flag(2),
+        serializable: flag(3),
+        clonable: flag(4),
+        manual_slot_assignment: flag(5),
+        ..Default::default()
+    };
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    let root = host_arg_node(&dom, args, 0).map(|host| dom.attach_shadow(host));
+    let root =
+        host_arg_node(&dom, args, 0).and_then(|host| dom.attach_shadow_with_options(host, options));
     Ok(host_id_value(root))
+}
+
+fn host_shadow_info(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let Some((host, data)) = host_arg_node(&dom, args, 0).and_then(|id| dom.shadow_info(id)) else {
+        return Ok(Value::Null);
+    };
+    Ok(ctx.make_array(vec![
+        Value::Num(host as f64),
+        Value::Bool(data.closed),
+        Value::Bool(data.delegates_focus),
+        Value::Bool(data.serializable),
+        Value::Bool(data.clonable),
+        Value::Bool(data.manual_slot_assignment),
+    ]))
 }
 
 fn host_shadow_root(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -13577,6 +13614,84 @@ mod tests {
     }
 
     #[test]
+    fn declarative_shadow_wrappers_hydration_and_closed_roots() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    r#"<!doctype html>
+                    <div id=host><template shadowrootmode=open shadowrootdelegatesfocus shadowrootclonable>
+                        <button id=login>Log in</button></template></div>
+                    <div id=closed><template shadowrootmode=closed shadowrootserializable>
+                        <a>Closed navigation</a></template></div>"#,
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const check = (v, message) => { if (!v) throw Error(message); };
+            check(Object.prototype.hasOwnProperty.call(HTMLTemplateElement.prototype, 'shadowRootMode'), 'feature detection');
+            const template = document.createElement('template');
+            template.shadowRootMode = 'OPEN';
+            template.shadowRootDelegatesFocus = true;
+            check(template.shadowRootMode === 'open' && template.getAttribute('shadowrootmode') === 'OPEN', 'mode reflection');
+            check(template.hasAttribute('shadowrootdelegatesfocus'), 'boolean reflection');
+            template.shadowRootMode = 'invalid';
+            check(template.shadowRootMode === '', 'invalid mode reflection');
+            const host = document.getElementById('host');
+            const root = host.shadowRoot;
+            check(root instanceof ShadowRoot && root instanceof DocumentFragment, 'root interfaces');
+            check(root.host === host && root.mode === 'open', 'root identity');
+            check(root.delegatesFocus && root.clonable && root.slotAssignment === 'named', 'root flags');
+            check(document.querySelector('#login') === null && host.children.length === 0, 'encapsulation');
+            const login = root.getElementById('login');
+            check(login.parentNode === root && login.getRootNode() === root, 'parent identity');
+            let clicked = false;
+            login.addEventListener('click', () => { clicked = true; });
+            login.click();
+            check(clicked, 'parsed shadow event handler');
+            const copy = host.cloneNode(false);
+            check(copy.shadowRoot.getElementById('login').textContent === 'Log in', 'shallow host clone');
+            const observer = new MutationObserver(() => {});
+            observer.observe(root, {childList:true});
+            const reclaimed = host.attachShadow({mode:'open'});
+            check(reclaimed === root && !root.firstChild && root.delegatesFocus, 'declarative reclaim');
+            check(login.parentNode === null && !login.isConnected, 'removed child');
+            check(observer.takeRecords().some(r => Array.from(r.removedNodes).includes(login)), 'removal observation');
+            let duplicate = false;
+            try { host.attachShadow({mode:'open'}); } catch (e) { duplicate = e.name === 'NotSupportedError'; }
+            check(duplicate, 'second script attachment must throw');
+            const closed = document.getElementById('closed');
+            check(closed.shadowRoot === null, 'closed root privacy');
+            let mismatch = false;
+            try { closed.attachShadow({mode:'open'}); } catch (e) { mismatch = e.name === 'NotSupportedError'; }
+            check(mismatch && closed.shadowRoot === null, 'mismatched mode');
+            const hidden = closed.attachShadow({mode:'closed'});
+            check(hidden.mode === 'closed' && hidden.serializable && !hidden.firstChild, 'closed reclaim');
+            check(closed.shadowRoot === null, 'closed root stays closed');
+            return 'declarative-shadow-ok';
+        })()"#
+            ),
+            "declarative-shadow-ok"
+        );
+    }
+
+    #[test]
+    fn declarative_shadow_navigation_survives_script_execution_and_live_serialization() {
+        let (html, outcome) = transform(
+            include_str!("fixtures/declarative_shadow.html"),
+            &crate::js::PageEnv::bare(DEFAULT_URL),
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!outcome.panicked);
+        assert!(html.contains("data-ready=\"yes\""), "{html}");
+        assert!(html.contains("Log in"), "{html}");
+    }
+
+    #[test]
     fn text_control_selection_and_native_input_events_follow_the_editing_algorithms() {
         let mut engine = configured_engine(
             HostState::new(
@@ -13979,6 +14094,105 @@ mod tests {
     }
 
     #[test]
+    fn url_static_parsers_follow_url_standard_in_windows_and_workers() {
+        for worker in [false, true] {
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            eval(
+                &mut engine,
+                if worker {
+                    crate::js::worker_prelude()
+                } else {
+                    crate::js::PRELUDE
+                },
+                "URL prelude",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const check = (v, message) => { if (!v) throw Error(message); };
+                const parse = URL.parse, canParse = URL.canParse;
+                check(parse.length === 1 && canParse.length === 1, 'optional base arity');
+                const url = parse.call(null, '../login?next=home', 'https://example.test/account/');
+                check(url instanceof URL && url.href === 'https://example.test/login?next=home', 'relative parsing');
+                url.searchParams.set('next', 'settings');
+                check(url.href.endsWith('?next=settings'), 'live query');
+                url.search = '?ok=yes';
+                check(url.searchParams.get('ok') === 'yes', 'live parameters');
+                check(parse('relative') === null && !canParse('relative'), 'invalid input');
+                check(parse('https://example.test/', null) === null, 'null base is a string');
+                check(!canParse('https://example.test/', 'invalid'), 'invalid base checked first');
+                check(canParse('https://example.test/', undefined), 'omitted base');
+                check(parse('https://example.test/\ud800').pathname === '/%EF%BF%BD', 'USVString conversion');
+                for (const method of [parse, canParse]) {
+                    for (const args of [[], [Symbol()], ['https://example.test/', Symbol()]]) {
+                        let threw = false;
+                        try { method(...args); } catch(e) { threw = e instanceof TypeError; }
+                        check(threw, 'argument conversion');
+                    }
+                    const sentinel = {};
+                    let threw = false;
+                    try { method('invalid', {toString(){throw sentinel;}}); } catch(e) { threw = e === sentinel; }
+                    check(threw, 'conversion errors must propagate');
+                }
+                class Derived extends URL {}
+                check(!(Derived.parse('https://example.test/') instanceof Derived), 'new URL object');
+                return 'url-static-ok';
+            })()"#
+                ),
+                "url-static-ok",
+                "worker={worker}"
+            );
+        }
+    }
+
+    #[test]
+    fn document_forms_is_a_live_named_html_collection() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    r#"<!doctype html>
+                <form id=challenge><input name=id><input name=getAttribute></form>
+                <form name=challenge></form><div id=host><template shadowrootmode=open>
+                <form id=hidden></form></template></div>"#,
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const check = (v, message) => { if (!v) throw Error(message); };
+            const forms = document.forms, first = forms[0], second = forms[1];
+            check(forms === document.forms && forms instanceof HTMLCollection, 'SameObject HTMLCollection');
+            check(forms.length === 2 && forms.hidden === undefined, 'document scope');
+            check(forms.challenge === first && forms.namedItem('challenge') === first, 'ID before later name');
+            check(Object.getOwnPropertyDescriptor(forms, 'challenge').enumerable === false, 'named property');
+            first.remove();
+            check(forms.length === 1 && forms.challenge === second, 'live removal');
+            const extra = document.createElement('form');
+            extra.name = 'newForm'; document.body.appendChild(extra);
+            check(forms.newForm === extra && forms.length === 2, 'live insertion');
+            extra.name = 'renamed';
+            check(forms.newForm === undefined && forms.renamed === extra, 'live name change');
+            check(forms.item(99) === null && forms.namedItem('missing') === null, 'absent items');
+            return 'document-forms-ok';
+        })()"#
+            ),
+            "document-forms-ok"
+        );
+    }
+
+    #[test]
     fn console_clear_is_callable_in_window_and_worker() {
         for worker in [false, true] {
             let mut engine = configured_engine_before_prelude(
@@ -14265,7 +14479,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 167, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 168, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -14276,7 +14490,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 167);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 168);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
