@@ -94,6 +94,12 @@ shader, and API tests, use `cargo test --lib webgl -- --include-ignored`.
 Import maps resolve static and dynamic module imports, including scoped
 mappings, blocked specifiers, and integrity metadata.
 
+Web Audio context construction and lifecycle are available so applications can
+initialize their interface before starting audio. Audio graph nodes, decoding,
+worklets, offline rendering, and playback are not implemented yet. Contexts
+remain suspended with a stationary clock; renderer acquisition reports an
+asynchronous error, and `resume()` rejects with `NotSupportedError`.
+
 Number inputs provide desktop spin buttons and Up/Down keyboard stepping.
 The shared DOM implements `stepUp()`, `stepDown()`, and `valueAsNumber` for
 number, range, date, month, week, time, and datetime-local inputs, including
