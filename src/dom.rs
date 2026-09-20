@@ -175,6 +175,9 @@ pub struct Dom {
     /// Only detached non-HTML documents need an entry. Kept in the arena so
     /// wrapper collection/recreation cannot change a node's document type.
     document_content_types: FxHashMap<NodeId, String>,
+    /// HTML's parser selects the mode; omission means DOM's no-quirks default.
+    /// Frame document entries use the arena's embedding-frame document root.
+    document_modes: FxHashMap<NodeId, QuirksMode>,
     input_values: FxHashMap<NodeId, input::InputValue>,
     control_selections: FxHashMap<NodeId, crate::doc::ControlSelection>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
@@ -564,6 +567,7 @@ impl Dom {
         let Dom {
             nodes,
             document_content_types,
+            document_modes,
             input_values,
             control_selections,
             canvases,
@@ -683,6 +687,7 @@ impl Dom {
             }};
         }
         fixed_map!(document_content_types, (NodeId, String));
+        fixed_map!(document_modes, (NodeId, QuirksMode));
         fixed_map!(input_values, (NodeId, input::InputValue));
         fixed_map!(control_selections, (NodeId, crate::doc::ControlSelection));
         for value in input_values.values() {
@@ -957,6 +962,7 @@ impl Dom {
         let mut dom = Dom {
             nodes: Vec::new(),
             document_content_types: FxHashMap::default(),
+            document_modes: FxHashMap::default(),
             input_values: FxHashMap::default(),
             control_selections: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
@@ -2560,6 +2566,13 @@ impl Dom {
             .unwrap_or("text/html")
     }
 
+    pub fn document_mode(&self, doc: NodeId) -> QuirksMode {
+        self.document_modes
+            .get(&doc)
+            .copied()
+            .unwrap_or(QuirksMode::NoQuirks)
+    }
+
     /// Unlink a node from its parent and siblings (the node and its
     /// subtree stay in the arena; arenas only ever grow — page-lifetime
     /// memory is the deal).
@@ -3018,6 +3031,55 @@ impl Dom {
                             },
                         )
                 }
+            })
+            .collect()
+    }
+
+    /// DOM #concept-getelementsbyclassname and #concept-ordered-set-parser
+    /// (2026-09-06 local snapshot). Class names are literal tokens, not CSS
+    /// selectors. In particular, NBSP and vertical tab are not separators.
+    pub fn elements_by_class_name(
+        &self,
+        root: NodeId,
+        names: &str,
+        document_root: bool,
+    ) -> Vec<NodeId> {
+        fn tokens(s: &str) -> impl Iterator<Item = &str> {
+            s.split(['\t', '\n', '\x0c', '\r', ' '])
+                .filter(|token| !token.is_empty())
+        }
+        if !self.is_valid(root) {
+            return Vec::new();
+        }
+        let mut classes = Vec::new();
+        for token in tokens(names) {
+            if !classes.contains(&token) {
+                classes.push(token);
+            }
+        }
+        if classes.is_empty() {
+            return Vec::new();
+        }
+        let frame = if document_root && matches!(self.tag_name(root), Some("iframe" | "frame")) {
+            Some(root)
+        } else {
+            self.frame_owner(root)
+        };
+        let document = frame.unwrap_or(self.nodes[root].owner_document);
+        let quirks = self.document_mode(document) == QuirksMode::Quirks;
+        self.descendants(root)
+            .filter(|&id| {
+                self.get_attribute(id, "class").is_some_and(|value| {
+                    classes.iter().all(|wanted| {
+                        tokens(value).any(|actual| {
+                            if quirks {
+                                actual.eq_ignore_ascii_case(wanted)
+                            } else {
+                                actual == *wanted
+                            }
+                        })
+                    })
+                }) && self.frame_owner(id) == frame
             })
             .collect()
     }
@@ -6494,6 +6556,8 @@ impl Dom {
         }
         let new_html = self.transplant(doc, src_html);
         self.append(frame, new_html);
+        self.document_modes
+            .insert(frame, doc.document_mode(DOCUMENT));
         self.properties.javascript.remove(&frame);
         self.properties.document_bases.remove(&frame);
         self.adopted_styles.remove(&frame);
@@ -6721,7 +6785,8 @@ impl Dom {
     /// deep (webcomponents-loader probes exactly this).
     pub fn clone_subtree(&mut self, id: NodeId, deep: bool) -> NodeId {
         let data = match &self.nodes[id].data {
-            NodeData::Document | NodeData::Fragment => NodeData::Fragment,
+            NodeData::Document => NodeData::Document,
+            NodeData::Fragment => NodeData::Fragment,
             NodeData::Doctype => NodeData::Doctype,
             NodeData::Comment(t) => NodeData::Comment(t.clone()),
             NodeData::CData(t) => NodeData::CData(t.clone()),
@@ -6744,6 +6809,14 @@ impl Dom {
             _ => None,
         };
         let copy = self.new_node(data);
+        if matches!(self.nodes[id].data, NodeData::Document) {
+            self.nodes[copy].owner_document = copy;
+            self.document_modes.insert(copy, self.document_mode(id));
+            self.document_content_types
+                .insert(copy, self.document_content_type(id).to_owned());
+        } else {
+            self.nodes[copy].owner_document = self.nodes[id].owner_document;
+        }
         if let Some(value) = self.input_values.get(&id).cloned() {
             self.input_values.insert(copy, value);
         }
@@ -6801,6 +6874,7 @@ impl Dom {
         let src = Dom::parse_document(html);
         let doc = self.new_node(NodeData::Document);
         self.nodes[doc].owner_document = doc;
+        self.document_modes.insert(doc, src.document_mode(DOCUMENT));
         for c in src.child_iter(DOCUMENT) {
             let cc = self.transplant(&src, c);
             self.append(doc, cc);
@@ -14809,7 +14883,9 @@ impl TreeSink for Sink {
         x == y
     }
 
-    fn set_quirks_mode(&self, _mode: QuirksMode) {}
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.dom.borrow_mut().document_modes.insert(DOCUMENT, mode);
+    }
 
     fn append_before_sibling(&self, sibling: &NodeId, new_node: NodeOrText<NodeId>) {
         let mut dom = self.dom.borrow_mut();

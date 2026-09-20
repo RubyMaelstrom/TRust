@@ -4508,7 +4508,10 @@
             if (arguments.length < 2) throw new TypeError("getElementsByTagNameNS requires two arguments");
             return tagNameCollection(this, domString(name), namespace == null ? null : domString(namespace));
         }
-        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
+        getElementsByClassName(names) {
+            if (!arguments.length) throw new TypeError("getElementsByClassName requires class names");
+            return classNameCollection(this, domString(names));
+        }
         // nodeType and the tag are IMMUTABLE for a node: `wrap()` already
         // dispatched this class BY node type, and an element's local name never
         // changes. So return a constant nodeType (no `__dom_node_type` syscall)
@@ -7358,6 +7361,7 @@
         get head() { return this.querySelector("head"); }
         get readyState() { return trust.readyState; }
         get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(this.__id); }
+        get compatMode() { return __dom_document_quirks(this.__id) ? "BackCompat" : "CSS1Compat"; }
         // CSS Font Loading Module Level 3 §4.2: a document's font source is a
         // stable FontFaceSet.  Its setlike collection is independent per
         // Document, including detached documents created by DOMParser.
@@ -7560,7 +7564,10 @@
             if (arguments.length < 2) throw new TypeError("getElementsByTagNameNS requires two arguments");
             return tagNameCollection(this, domString(name), namespace == null ? null : domString(namespace));
         }
-        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
+        getElementsByClassName(names) {
+            if (!arguments.length) throw new TypeError("getElementsByClassName requires class names");
+            return classNameCollection(this, domString(names));
+        }
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
@@ -8458,7 +8465,7 @@
         querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
 
-        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
+
     }
     class Comment extends CharacterData { get nodeType() { return 8; } get nodeName() { return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; } }
     // Lit walks comment markers with one of these.
@@ -8731,7 +8738,7 @@
         querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
 
-        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
+
     }
 
     // WHATWG DOM §4.2.2.3 "Finding slots and slottables". Direct assignment is
@@ -9697,6 +9704,20 @@
             const current = __dom_epoch();
             if (epoch !== current) {
                 const result = __dom_elements_by_tag(root.__id, name, namespace);
+                list = makeStaticNodeList(result[0], result[1], result[2]);
+                epoch = result[1];
+            }
+            return list;
+        });
+    }
+    // DOM #concept-getelementsbyclassname / #concept-collection-live: moves,
+    // removals and class changes must be visible even in a synchronous loop.
+    function classNameCollection(root, names) {
+        let epoch = -1, list;
+        return makeHTMLCollection(() => {
+            const current = __dom_epoch();
+            if (epoch !== current) {
+                const result = __dom_elements_by_class(root.__id, names, root.nodeType === 9);
                 list = makeStaticNodeList(result[0], result[1], result[2]);
                 epoch = result[1];
             }

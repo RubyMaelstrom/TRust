@@ -6344,6 +6344,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_parse_document", 2, host_parse_document),
     ("__dom_create_document", 1, host_create_document),
     ("__dom_document_content_type", 1, host_document_content_type),
+    ("__dom_document_quirks", 1, host_document_quirks),
     ("__dom_pi_target", 1, host_pi_target),
     ("__dom_create_comment", 0, host_create_comment),
     ("__dom_append", 2, host_append),
@@ -6391,6 +6392,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_insert_adjacent", 3, host_insert_adjacent),
     ("__dom_query", 3, host_query),
     ("__dom_elements_by_tag", 3, host_elements_by_tag),
+    ("__dom_elements_by_class", 3, host_elements_by_class),
     ("__dom_matches", 2, host_matches),
     ("__dom_get_by_id", 1, host_get_by_id),
     ("__dom_upgrade_candidates", 2, host_upgrade_candidates),
@@ -10262,6 +10264,14 @@ fn host_document_content_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     Ok(Value::Str(content_type.to_owned().into()))
 }
 
+fn host_document_quirks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Bool(host_arg_node(&dom, args, 0).is_some_and(
+        |id| dom.document_mode(id) == html5ever::tree_builder::QuirksMode::Quirks,
+    )))
+}
+
 fn host_pi_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -10942,6 +10952,25 @@ fn host_elements_by_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         (
             root.map_or_else(Vec::new, |root| {
                 dom.elements_by_tag_name(root, &name, namespace.as_deref())
+            }),
+            dom.epoch(),
+            root.is_some_and(|root| dom.is_connected(root)),
+        )
+    };
+    let ids = host_ids_array(ctx, ids);
+    Ok(ctx.make_array(vec![ids, Value::Num(epoch as f64), Value::Bool(connected)]))
+}
+
+fn host_elements_by_class(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let names = host_arg_string(ctx, args, 1);
+    let document_root = matches!(args.get(2), Some(Value::Bool(true)));
+    let dom = host_dom(ctx);
+    let (ids, epoch, connected) = {
+        let dom = dom.borrow();
+        let root = host_arg_node(&dom, args, 0);
+        (
+            root.map_or_else(Vec::new, |root| {
+                dom.elements_by_class_name(root, &names, document_root)
             }),
             dom.epoch(),
             root.is_some_and(|root| dom.is_connected(root)),
@@ -12610,6 +12639,93 @@ mod tests {
             ),
             "ok"
         );
+    }
+
+    #[test]
+    fn class_name_collections_are_live_literal_and_document_scoped() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let dom = Rc::new(RefCell::new(Dom::parse_document(
+                "<!doctype html><main id=root class=row><div id=a class='row A'></div><div id=b class=row></div></main>",
+            )));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const root = document.getElementById('root');
+                root.querySelectorAll = () => { throw new Error('not a selector'); };
+                const rows = root.getElementsByClassName('row');
+                const snapshot = document.querySelectorAll('#root > div');
+                if (!(rows instanceof HTMLCollection) || rows.length !== 2 || rows.namedItem('a') !== rows[0]) return 'type or root';
+                const target = document.createElement('section');
+                document.body.appendChild(target);
+                let moves = 0;
+                while (rows.length && moves < 5) { target.appendChild(rows[0]); moves++; }
+                if (moves !== 2 || rows.length || snapshot.length !== 2) return 'live move loop';
+                root.appendChild(target.firstChild);
+                if (rows.length !== 1 || rows.item(0).id !== 'a' || rows.item(1) !== null) return 'append';
+                rows[0].className = 'changed';
+                if (rows.length) return 'class mutation';
+                root.firstChild.classList.add('row');
+                if (rows.length !== 1) return 'classList mutation';
+                root.appendChild(target.firstChild);
+                root.insertBefore(rows[1], rows[0]);
+                if (rows[0].id !== 'b') return 'reorder';
+                rows[0].remove();
+                if (rows.length !== 1 || rows.namedItem('b') !== null) return 'remove';
+                root.firstChild.className = 'a:b . x[y] slash\\word one\u00a0two vt\u000btoken';
+                for (const names of ['a:b', '.', 'x[y]', 'slash\\word', 'one\u00a0two', 'vt\u000btoken', ' a:b\t.\n.\r\fx[y] ']) {
+                    if (root.getElementsByClassName(names).length !== 1) return 'literal: ' + names;
+                }
+                for (const names of ['', ' \t\n\r\f', 'one', 'two', 'vt', 'token']) {
+                    const empty = root.getElementsByClassName(names);
+                    if (!(empty instanceof HTMLCollection) || empty.length) return 'empty or whitespace';
+                }
+                const shadow = root.attachShadow({mode:'open'});
+                shadow.innerHTML = '<i class=row></i>';
+                const template = document.createElement('template'); template.innerHTML = '<i class=row></i>';
+                root.appendChild(template);
+                if (rows.length || 'getElementsByClassName' in shadow || 'getElementsByClassName' in template.content) return 'tree boundaries';
+                for (const owner of [document, root]) {
+                    let missing = false, symbol = false;
+                    try { owner.getElementsByClassName(); } catch(e) { missing = e instanceof TypeError; }
+                    try { owner.getElementsByClassName(Symbol()); } catch(e) { symbol = e instanceof TypeError; }
+                    if (!missing || !symbol) return 'DOMString conversion';
+                }
+                const parser = new DOMParser();
+                const quirks = parser.parseFromString('<div class="MiXeD Ä"></div>', 'text/html');
+                const standard = parser.parseFromString('<!doctype html><div class="MiXeD Ä"></div>', 'text/html');
+                const limited = parser.parseFromString('<!doctype html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><div class="MiXeD Ä"></div>', 'text/html');
+                if (quirks.compatMode !== 'BackCompat' || standard.compatMode !== 'CSS1Compat' || limited.compatMode !== 'CSS1Compat') return 'parser mode';
+                for (const doc of [standard, limited]) {
+                    if (doc.getElementsByClassName('mixed').length || doc.getElementsByClassName('MiXeD').length !== 1) return 'standards case';
+                }
+                if (quirks.getElementsByClassName('mixed').length !== 1 || quirks.getElementsByClassName('ä').length) return 'quirks case';
+                const cloned = quirks.cloneNode(true);
+                if (cloned.nodeType !== 9 || cloned.compatMode !== 'BackCompat' || cloned.getElementsByClassName('mixed').length !== 1) return 'cloned document';
+                const section = quirks.createElement('section');
+                section.innerHTML = '<b class=MiXeD></b>';
+                quirks.body.appendChild(section);
+                const adopted = section.getElementsByClassName('mixed');
+                if (adopted.length !== 1) return 'before adoption';
+                standard.body.appendChild(section);
+                if (adopted.length !== 0) return 'adopted mode';
+                const xml = parser.parseFromString('<r><x class="MiXeD"/></r>', 'application/xml');
+                if (xml.getElementsByClassName('mixed').length || xml.getElementsByClassName('MiXeD').length !== 1) return 'XML case';
+                const frame = document.createElement('iframe'); document.body.appendChild(frame);
+                const child = frame.contentDocument;
+                child.body.innerHTML = '<b class=frameOnly></b>';
+                if (document.getElementsByClassName('frameOnly').length || frame.getElementsByClassName('frameOnly').length || child.getElementsByClassName('frameOnly').length !== 1) return 'frame boundary';
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
