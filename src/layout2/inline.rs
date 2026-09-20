@@ -529,7 +529,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Lay the IFC's content. `root` is the block container's own inline
     /// context (text directly under the block uses it).
     pub fn run(&mut self, content: &'t [Inline], root: &InlineStyle) {
-        let root = self.form_context(root.node, root);
+        let mut root = self.form_context(root.node, root);
+        // CSS 2 #propdef-vertical-align is not inherited. Its accumulated
+        // aligned-subtree offset only belongs to the enclosing line; a new
+        // inline formatting context starts at its own baseline. In particular
+        // a table cell's top/middle alignment must not align every descendant.
+        root.vertical_align = VerticalAlign::Baseline;
         self.strut = crate::text::shape(" ", &root.text_style());
         for inl in content {
             self.walk(inl, &root);
@@ -1262,6 +1267,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// second replaced element inside the first one.
     pub fn block_atom_content(&mut self, a: &Atom, ctx: &InlineStyle) {
         self.position_inline_atoms = false;
+        // The outer atomic box has already consumed vertical-align. Its
+        // synthetic content line exports the control's internal baseline.
+        let mut context = ctx.clone();
+        context.vertical_align = VerticalAlign::Baseline;
+        let ctx = &context;
         let AtomKind::Control { form, field } = &a.kind else {
             // CSS 2.2 #line-height / #propdef-vertical-align apply a strut
             // and vertical-align to inline-level boxes. This synthetic line
@@ -1643,6 +1653,21 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         } else {
             [0.0; 2]
         };
+        let height = geometry.box_height + vertical_edges[0] + vertical_edges[1];
+        // HTML #the-input-element-as-a-button / CSS 2 #line-height: text
+        // controls export their internal text baseline, including when the
+        // label is empty. A transform changes paint, not that baseline.
+        let baseline = shaped
+            .as_ref()
+            .filter(|_| {
+                item.kind == ItemKind::Form
+                    && self.dom.tag_name(item.node) == Some("input")
+                    && !matches!(
+                        self.dom.input_type(item.node).as_str(),
+                        "checkbox" | "radio" | "range" | "image" | "file" | "color"
+                    )
+            })
+            .map(|text| vertical_edges[0] + geometry.paint_y + text.baseline);
         self.cur.push(Piece {
             x,
             y: 0.0,
@@ -1653,8 +1678,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             paint_y: geometry.paint_y,
             paint_width: geometry.paint_width,
             paint_height: geometry.paint_height,
-            ascent: geometry.box_height + vertical_edges[0] + vertical_edges[1],
-            descent: 0.0,
+            ascent: baseline.unwrap_or(height),
+            descent: baseline.map_or(0.0, |baseline| height - baseline),
             vertical_align,
             item,
             shaped,

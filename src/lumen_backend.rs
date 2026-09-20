@@ -44,6 +44,7 @@ struct LumenGeomCache {
     /// complete current fragment tree. Scroll, frame, paint and observer
     /// consumers finish the projection without repeating layout.
     complete_geometry: bool,
+    viewport_fixed_roots: Vec<crate::dom::NodeId>,
     boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
@@ -62,6 +63,7 @@ impl LumenGeomCache {
             presentation_epoch: u64::MAX,
             paint_epoch: u64::MAX,
             complete_geometry: false,
+            viewport_fixed_roots: Vec::new(),
             boxes: Default::default(),
             tracks: Default::default(),
             scrolling_areas: Default::default(),
@@ -639,6 +641,10 @@ impl RetainedMemory for HostState {
 
         if let Ok(cache) = geom_cache.try_borrow() {
             let mut bytes = std::mem::size_of_val(geom_cache.as_ref())
+                .saturating_add(
+                    cache.viewport_fixed_roots.capacity()
+                        * std::mem::size_of::<crate::dom::NodeId>(),
+                )
                 .saturating_add(cache.boxes.capacity().saturating_mul(std::mem::size_of::<(
                     crate::dom::NodeId,
                     crate::layout2::PxRect,
@@ -11460,6 +11466,7 @@ fn ensure_host_geometry(
             );
         }
         cached.complete_geometry = measured.complete_geometry;
+        cached.viewport_fixed_roots = measured.viewport_fixed_roots;
         cached.boxes = measured.boxes;
         cached.tracks = measured.tracks;
         cached.scrolling_areas = measured.scrolling_areas;
@@ -11871,14 +11878,33 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
             rect.left -= f64::from(viewport.x);
             rect.top -= f64::from(viewport.y);
         }
-        Some(rect)
+        // CSS Position 3 #fixed-cb and CSSOM View #dom-element-getclientrects:
+        // viewport-fixed fragments already use viewport coordinates. Keep the
+        // fragment's actual containing-block choice (including transforms),
+        // rather than guessing from this element's own position property.
+        let dom = dom_handle.borrow();
+        let owner = dom.frame_owner(id);
+        let mut current = Some(id);
+        let mut viewport_fixed = false;
+        while let Some(node) = current {
+            if Some(node) == owner {
+                break;
+            }
+            if cached.viewport_fixed_roots.contains(&node) {
+                viewport_fixed = true;
+                break;
+            }
+            current = dom.parent_composed(node);
+        }
+        Some((rect, viewport_fixed))
     });
     Ok(match rect {
-        Some(rect) => ctx.make_array(vec![
+        Some((rect, viewport_fixed)) => ctx.make_array(vec![
             Value::Num(rect.left),
             Value::Num(rect.top),
             Value::Num(rect.width),
             Value::Num(rect.height),
+            Value::Bool(viewport_fixed),
         ]),
         None => Value::Null,
     })
@@ -12971,6 +12997,41 @@ mod tests {
     }
 
     #[test]
+    fn client_rects_keep_viewport_fixed_descendants_stationary_while_scrolling() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0;width:2000px;height:2000px}
+            #fixed{position:fixed;left:20px;top:30px;width:80px;height:50px}
+            #child{width:20px;height:10px} #flow{width:20px;height:10px}
+            #transformed{transform:translateX(0);height:80px}
+            #local{position:fixed;top:5px;left:7px;width:10px;height:10px}
+            </style><div id=fixed><div id=child></div></div><div id=flow></div>
+            <div id=transformed><div id=local></div></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const fixed=document.getElementById('fixed'), child=document.getElementById('child');
+            const flow=document.getElementById('flow'), local=document.getElementById('local');
+            const before=[fixed,child,flow,local].map(e=>e.getBoundingClientRect());
+            __trust.setScroll(100,200);
+            const after=[fixed,child,flow,local].map(e=>e.getBoundingClientRect());
+            for(let i=0;i<4;i++) {
+                const dx=before[i].x-after[i].x, dy=before[i].y-after[i].y;
+                if(dx!==(i<2?0:100)||dy!==(i<2?0:200)) return 'scroll '+i+': '+dx+','+dy;
+            }
+            if(fixed.getClientRects()[0].top!==30 || fixed.offsetTop!==30) return 'rect interfaces';
+            if(before[0].top!==30) return 'snapshot';
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
     fn lazy_border_box_projection_keeps_scroll_inline_and_frame_geometry_current() {
         // CSSOM View #dom-element-getboundingclientrect / #dom-element-scrollwidth:
         // a border rectangle and a scrolling area are distinct projections of
@@ -13973,7 +14034,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 163, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 165, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -13984,7 +14045,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 163);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 165);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
