@@ -15,6 +15,49 @@ pub(crate) struct Sheet {
 }
 
 impl Dom {
+    /// CSSOM View §7 reads computed positioning state, not an author-visible
+    /// `getComputedStyle()` call. Keep this small native query allocation-light:
+    /// offset walks can inspect the same ancestors thousands of times in a task.
+    /// Bits 0/1 identify fixed/other non-static positioning; bit 2 identifies a
+    /// fixed-position containing block (which also contains absolute positions).
+    pub(crate) fn cssom_offset_style(&self, id: NodeId) -> u8 {
+        let value = |property: &str| self.computed_value(id, property).unwrap_or_default();
+        let position = value("position");
+        let mut flags = if position.is_empty() || position.eq_ignore_ascii_case("static") {
+            0
+        } else if position.eq_ignore_ascii_case("fixed") {
+            1
+        } else {
+            2
+        };
+        let non_none = |property| {
+            let value = value(property);
+            !value.is_empty() && !value.eq_ignore_ascii_case("none")
+        };
+        // Transforms 1 §3, Positioned Layout 3 §2.1, Containment 2 §3.2/§3.4,
+        // and Will Change §2. Filter Effects 1 §5 excludes each Document root.
+        let root = self.style_scope_root_element(id) == Some(id);
+        let fixed_block = ["transform", "perspective", "backdrop-filter"]
+            .into_iter()
+            .any(non_none)
+            || (!root && non_none("filter"))
+            || value("contain").split_ascii_whitespace().any(|token| {
+                ["layout", "paint", "strict", "content"]
+                    .iter()
+                    .any(|keyword| token.eq_ignore_ascii_case(keyword))
+            })
+            || value("will-change").split(',').any(|token| {
+                ["transform", "perspective", "backdrop-filter", "contain"]
+                    .iter()
+                    .any(|keyword| token.trim().eq_ignore_ascii_case(keyword))
+                    || (!root && token.trim().eq_ignore_ascii_case("filter"))
+            });
+        if fixed_block {
+            flags |= 4;
+        }
+        flags
+    }
+
     pub(crate) fn set_cssom_inline(&mut self, id: NodeId, declarations: Declarations) {
         if id >= self.nodes.len() || self.tag_name(id).is_none() {
             return;
@@ -401,7 +444,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "container-type" => one_of("normal size inline-size"),
         "interactivity" => one_of("auto inert"),
         "isolation" => one_of("auto isolate"),
-        "filter" => value == "none",
+        "filter" => crate::layout2::filter::color_filters(value).is_some(),
         "clip-path" => value == "none" || crate::layout2::clip_path::supports(value),
         "z-index" => value == "auto" || value.parse::<i32>().is_ok(),
         "order" => value.parse::<i32>().is_ok(),

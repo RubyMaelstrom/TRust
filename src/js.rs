@@ -142,6 +142,9 @@ pub struct PageEnv {
     pub viewport: (u16, u16),
     pub cell_px: (u16, u16),
     pub device_pixel_ratio: f32,
+    /// Retain metadata for CSS-pixel-to-terminal-cell adaptation. Native
+    /// windows consume the graphical product directly and can omit this work.
+    pub(crate) terminal_presentation: bool,
     /// Client-window origin in CSS pixels; zero when the frontend has no
     /// screen coordinates (CSSOM View #dom-window-screenx).
     pub screen_position: (i32, i32),
@@ -163,6 +166,7 @@ impl PageEnv {
             viewport: (80, 24),
             cell_px: (8, 16),
             device_pixel_ratio: 1.0,
+            terminal_presentation: true,
             screen_position: (0, 0),
             externals: Vec::new(),
             sheets: Vec::new(),
@@ -265,6 +269,14 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
     crate::lumen_backend::transform(html, env)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextEdit {
+    pub input_type: String,
+    pub data: Option<String>,
+    pub selection: Option<crate::doc::ControlSelection>,
+    pub composing: bool,
+}
+
 #[derive(Debug)]
 pub enum PageCmd {
     Click(usize),
@@ -310,10 +322,25 @@ pub enum PageCmd {
         node: Option<usize>,
         input: crate::core::KeyInput,
     },
+    /// A text-control key whose insertion default runs against the actor's
+    /// current value/UTF-16 selection. Releases have no insertion text.
+    /// This retains keyboard/input ordering without a presentation round trip.
+    EditKey {
+        node: usize,
+        input: crate::core::KeyInput,
+        text: Option<String>,
+    },
     SetValue {
         node: usize,
         value: String,
         checked: Option<bool>,
+        /// The terminal's whole-field editor has an explicit commit action.
+        commit: bool,
+    },
+    EditText {
+        node: usize,
+        value: String,
+        edit: TextEdit,
     },
     StepNumber {
         node: usize,
@@ -373,7 +400,9 @@ impl PageCmd {
                 | Self::PointerButton { .. }
                 | Self::Focus(_)
                 | Self::Key { .. }
+                | Self::EditKey { .. }
                 | Self::SetValue { .. }
+                | Self::EditText { .. }
                 | Self::StepNumber { .. }
                 | Self::Submit { .. }
                 | Self::Scroll { .. }
@@ -432,6 +461,9 @@ pub enum PageEvt {
         url: String,
         replace: bool,
     },
+    HistoryTraverse {
+        delta: i32,
+    },
     ScrollToFragment(String),
     PointerLock {
         request: u64,
@@ -441,7 +473,8 @@ pub enum PageEvt {
     Trouble(Vec<String>),
     Settled,
     /// Acknowledges a native key. Suppress the frontend default when canceled
-    /// by keyboard handlers or inapplicable (e.g. Enter in a formless input).
+    /// by keyboard handlers, already applied by the actor, or inapplicable
+    /// (e.g. Enter in a formless input).
     KeyDefault {
         prevented: bool,
     },

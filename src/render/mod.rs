@@ -242,10 +242,12 @@ pub enum BlendMode {
     Exclusion,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompositingLayer {
     pub opacity: f32,
     pub blend: BlendMode,
+    /// Ordered straight-alpha sRGB color operations, before group opacity.
+    pub color_filters: Arc<[[f32; 20]]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1199,6 +1201,9 @@ pub enum SceneDamage {
 /// replay both complete lists to recover their active transforms and clips,
 /// then union the old and new painted bounds. Removed paint is included so
 /// stale pixels are always cleared by the replacement crop.
+/// Equal-length lists can contain separated leaf changes with identical
+/// paint scopes between them. Compare those commands individually: an
+/// unchanged clip between two edits does not invalidate the whole canvas.
 pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
     if old.viewport != new.viewport || old.canvas_images != new.canvas_images {
         return SceneDamage::Full;
@@ -1220,17 +1225,27 @@ pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
         .count();
     let old_changed = prefix..old.primitives.len() - suffix;
     let new_changed = prefix..new.primitives.len() - suffix;
-    if old.primitives[old_changed.clone()]
-        .iter()
-        .chain(&new.primitives[new_changed.clone()])
-        .any(command_changes_paint_state)
-    {
+    let aligned = old.primitives.len() == new.primitives.len();
+    let state_changed = if aligned {
+        old.primitives[old_changed.clone()]
+            .iter()
+            .zip(&new.primitives[new_changed.clone()])
+            .any(|(old, new)| {
+                (command_changes_paint_state(old) || command_changes_paint_state(new)) && old != new
+            })
+    } else {
+        old.primitives[old_changed.clone()]
+            .iter()
+            .chain(&new.primitives[new_changed.clone()])
+            .any(command_changes_paint_state)
+    };
+    if state_changed {
         return SceneDamage::Full;
     }
-    let Some(old_bounds) = changed_command_bounds(old, old_changed) else {
+    let Some(old_bounds) = changed_command_bounds(old, old_changed, aligned.then_some(new)) else {
         return SceneDamage::Full;
     };
-    let Some(new_bounds) = changed_command_bounds(new, new_changed) else {
+    let Some(new_bounds) = changed_command_bounds(new, new_changed, aligned.then_some(old)) else {
         return SceneDamage::Full;
     };
     let bounds = match (old_bounds, new_bounds) {
@@ -1321,6 +1336,7 @@ fn command_changes_paint_state(command: &DisplayCommand) -> bool {
 fn changed_command_bounds(
     scene: &Scene,
     changed: std::ops::Range<usize>,
+    aligned_other: Option<&Scene>,
 ) -> Option<Option<CssRect>> {
     let mut transforms = vec![Affine2d::IDENTITY];
     let mut clips = vec![CssRect::new(
@@ -1334,6 +1350,7 @@ fn changed_command_bounds(
         let transform = *transforms.last()?;
         let clip = *clips.last()?;
         if changed.contains(&index)
+            && aligned_other.is_none_or(|other| other.primitives[index] != *command)
             && let Some(command_bounds) = leaf_command_bounds(command)
         {
             let command_bounds = transformed_css_bounds(command_bounds, transform);
@@ -3132,6 +3149,106 @@ pub fn paint_rich_editor_overlay(
     primitives.push(Primitive::PopClip);
 }
 
+/// HTML #the-input-element-as-a-text-entry-widget / CSS UI #the-insertion-caret:
+/// edit the existing control's text in its original paint/clip/transform scope.
+/// Its CSS background, border, padding, and stacking order remain authoritative.
+/// Glyphs, selection and caret all come from the same shaped editor line.
+pub fn paint_native_input(
+    primitives: &mut Vec<Primitive>,
+    line: &crate::text::EditorLine,
+    presentation: &crate::layout2::RichEditorPresentation,
+    scroll_x: &mut f32,
+) {
+    let Some(input) = &presentation.native_input else {
+        return;
+    };
+    let Some(index) = primitives.iter().position(
+        |command| matches!(command, Primitive::GlyphRun { node, .. } if *node == input.node),
+    ) else {
+        return;
+    };
+    let Primitive::GlyphRun {
+        mut origin,
+        shaped: old,
+        color,
+        decoration,
+        shadows,
+        clip,
+        node,
+        link,
+    } = primitives[index].clone()
+    else {
+        return;
+    };
+    let Some(clip) = clip else { return };
+    // The label's canonical line is vertically centered in the content box.
+    // Preserve that center if editing/preedit supplies different font metrics.
+    origin.y += (old.line_height - line.shaped.line_height) / 2.0;
+    if let Some(caret) = line.caret {
+        let left = origin.x + caret.x;
+        let right = left + caret.width;
+        if right - *scroll_x > clip.x + clip.width {
+            *scroll_x = right - clip.x - clip.width;
+        }
+        if left - *scroll_x < clip.x {
+            *scroll_x = left - clip.x;
+        }
+    }
+    *scroll_x = scroll_x.max(0.0);
+    origin.x -= *scroll_x;
+    let mut replacement = vec![Primitive::PushClip(PaintShape::Rect(clip))];
+    for selection in &line.selection {
+        replacement.push(Primitive::FillRect {
+            rect: CssRect::new(
+                origin.x + selection.x,
+                origin.y + selection.y,
+                selection.width,
+                selection.height,
+            ),
+            color: PaintColor::Rgba(88, 148, 255, 90),
+        });
+    }
+    let shaped = if line.shaped.text.is_empty() && !input.placeholder.is_empty() {
+        crate::text::shape(&input.placeholder, &presentation.style)
+    } else {
+        line.shaped.clone()
+    };
+    replacement.push(Primitive::GlyphRun {
+        origin,
+        shaped,
+        color,
+        decoration,
+        shadows,
+        clip: Some(clip),
+        node,
+        link,
+    });
+    for underline in &line.underlines {
+        replacement.push(Primitive::FillRect {
+            rect: CssRect::new(
+                origin.x + underline.x,
+                origin.y + underline.y,
+                underline.width,
+                underline.height,
+            ),
+            color,
+        });
+    }
+    if let Some(caret) = line.caret {
+        replacement.push(Primitive::FillRect {
+            rect: CssRect::new(
+                origin.x + caret.x,
+                origin.y + caret.y,
+                caret.width,
+                caret.height,
+            ),
+            color: presentation.caret_color,
+        });
+    }
+    replacement.push(Primitive::PopClip);
+    primitives.splice(index..=index, replacement);
+}
+
 /// Present only the pending glyphs of a plain editing paragraph. Its CSS
 /// surface remains in the retained scene; rich markup uses canonical paint.
 /// The actor remains authoritative and replaces this preview after input's
@@ -3505,6 +3622,68 @@ mod tests {
             scene_damage(&old, &new),
             SceneDamage::Partial(CssRect::new(23.0, 13.0, 39.0, 24.0))
         );
+    }
+
+    #[test]
+    fn separated_leaf_changes_preserve_unchanged_scopes_and_limit_damage() {
+        // CSS 2 Appendix E / CSS Masking #clipping-paths: replay the full
+        // paint order and cumulative clips, but unchanged intervening drawing
+        // contributes no damage. Actual scope changes still require fallback.
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut old = desktop_shell(viewport, &snapshot());
+        old.primitives = vec![
+            DisplayCommand::FillRect {
+                rect: CssRect::new(0.0, 0.0, 200.0, 120.0),
+                color: PaintColor::Window,
+            },
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(20.0, 10.0, 40.0, 40.0))),
+            DisplayCommand::PushTransform(Affine2d::translate(10.0, 5.0)),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(15.0, 10.0, 5.0, 5.0),
+                color: PaintColor::Accent,
+            },
+            DisplayCommand::PopTransform,
+            DisplayCommand::PopClip,
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(100.0, 80.0, 80.0, 40.0))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(100.0, 80.0, 80.0, 40.0),
+                color: PaintColor::Accent,
+            },
+            DisplayCommand::PopClip,
+            DisplayCommand::PushLayer(CompositingLayer {
+                opacity: 0.6,
+                blend: BlendMode::Multiply,
+                color_filters: Default::default(),
+            }),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(40.0, 15.0, 3.0, 16.0),
+                color: PaintColor::Accent,
+            },
+            DisplayCommand::PopLayer,
+        ];
+        let mut new = old.clone();
+        if let DisplayCommand::FillRect { color, .. } = &mut new.primitives[3] {
+            *color = PaintColor::Rgba(20, 30, 40, 255);
+        }
+        if let DisplayCommand::FillRect { rect, .. } = &mut new.primitives[10] {
+            rect.x = 45.0;
+        }
+        let expected = SceneDamage::Partial(CssRect::new(23.0, 13.0, 27.0, 20.0));
+        assert_eq!(scene_damage(&old, &new), expected);
+        assert_eq!(scene_damage(&new, &old), expected, "include removed pixels");
+
+        let mut changed_clip = new.clone();
+        changed_clip.primitives[6] =
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(110.0, 80.0, 70.0, 40.0)));
+        assert_eq!(scene_damage(&old, &changed_clip), SceneDamage::Full);
+        let mut changed_layer = new.clone();
+        if let DisplayCommand::PushLayer(layer) = &mut changed_layer.primitives[9] {
+            layer.opacity = 0.4;
+        }
+        assert_eq!(scene_damage(&old, &changed_layer), SceneDamage::Full);
+        new.primitives.remove(7);
+        assert_eq!(scene_damage(&old, &new), SceneDamage::Full);
     }
 
     #[test]

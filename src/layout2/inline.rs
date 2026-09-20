@@ -233,6 +233,9 @@ impl Piece {
 pub(crate) struct AtomBoxSize {
     pub width: f32,
     pub height: f32,
+    /// Exported baseline measured from the margin-box top. Absence means
+    /// the bottom margin edge (CSS 2 §10.8.1).
+    pub baseline: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1111,6 +1114,61 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// sizes the content; the surrounding inline context controls wrapping.
     fn atom(&mut self, a: &Atom, ctx: &InlineStyle, can_wrap: bool) {
         match &a.kind {
+            AtomKind::GeneratedImage { url } => {
+                // CSS 2 #content: unavailable generated images are omitted.
+                // Resource discovery is independent of this zero-size state,
+                // and decoded natural dimensions trigger ordinary relayout.
+                let Some((mut width, mut height)) =
+                    crate::responsive_image::density_corrected_size(self.images.get(url), 1.0)
+                else {
+                    return;
+                };
+                // CSS Images 3 #sizing / CSS 2 #inline-replaced-width:
+                // generated images are anonymous replaced elements with auto
+                // dimensions. A ratio-only SVG has no natural pixel width;
+                // the decoder's fallback raster is not an intrinsic size.
+                // Match ordinary replaced images' containing-block constraint
+                // when this is a definite layout, preserving intrinsic probes.
+                if !self.measuring
+                    && let Some(ratio) = crate::img::svg_url_ratio_only(url)
+                        .or_else(|| crate::img::svg_ratio_only_get(url))
+                        .filter(|ratio| ratio.is_finite() && *ratio > 0.)
+                {
+                    width = self.cb_w_px.max(0.);
+                    height = width / ratio;
+                }
+                self.place_atom(
+                    AtomGeometry {
+                        box_width: width,
+                        box_height: height,
+                        paint_x: 0.0,
+                        paint_y: 0.0,
+                        paint_width: width,
+                        paint_height: height,
+                    },
+                    InlineItem {
+                        text: String::new(),
+                        terminal_text: None,
+                        kind: ItemKind::Image,
+                        graphical_image: Some(url.clone()),
+                        image: Some(url.clone()),
+                        emph: ctx.emph,
+                        style_node: ctx.node,
+                        pseudo: ctx.pseudo,
+                        node: NO_NODE,
+                        link: ctx.link.clone(),
+                        crop: false,
+                        pixelated: false,
+                        invisible: ctx.invisible,
+                    },
+                    None,
+                    false,
+                    false,
+                    ctx.vertical_align,
+                    Self::space_advance(ctx),
+                    can_wrap,
+                );
+            }
             AtomKind::Img {
                 url,
                 density,
@@ -1139,7 +1197,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     } else {
                         ControlWidthBasis::ContainingBlock(self.cb_w_px)
                     },
-                    self.cap,
+                    // The intrinsic probe's narrow available width asks the
+                    // line breaker to take soft breaks, not to shrink atomic
+                    // controls. In particular nowrap min-content must retain
+                    // the complete sequence of control margin boxes.
+                    if self.measuring {
+                        f32::INFINITY
+                    } else {
+                        self.cap
+                    },
                     ctx,
                     self.vp,
                 );
@@ -1237,7 +1303,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shaped.runs.clear();
             shaped.clusters.clear();
         }
-        let width = shaped.advance.min(self.cap).max(0.0);
+        // CSS Display #blockify changes the outer display, not the text
+        // viewport of the control. Its content box is the editing line's
+        // available width even when the current label is empty or short.
+        // Using the old glyph advance here clips each newly typed character
+        // and makes the desktop scroll a short value unnecessarily.
+        let width = self.cap.max(0.0);
         let height = self
             .cb_h_px
             .unwrap_or(shaped.line_height)
@@ -1648,13 +1719,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             Self::space_advance(ctx),
             ctx.ws.wraps(),
         );
+        if let Some(baseline) = sz.baseline
+            && let Some(piece) = self.cur.last_mut()
+        {
+            piece.ascent = baseline;
+            piece.descent = sz.height - baseline;
+        }
     }
 
     /// Consume the owed inline-box edge width without quantization.
     fn take_gap(&mut self) -> f32 {
-        let gap = self.pending_gap_px.max(0.0);
-        self.pending_gap_px = 0.0;
-        gap
+        // CSS 2 #margin-properties / #inline-formatting: horizontal margins
+        // can be negative. They move the next box's origin and reduce the
+        // occupied line width, including during intrinsic measurement.
+        std::mem::take(&mut self.pending_gap_px)
     }
 
     fn soft_break(&mut self) {

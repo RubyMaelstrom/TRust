@@ -195,7 +195,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
         css_size: fragment.css_size,
         content_size: fragment.content_size,
         content_offset: fragment.content_offset,
-        paint: fragment.paint,
+        paint: fragment.paint.clone(),
         clip: fragment.clip,
         kind,
         children,
@@ -204,7 +204,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
 
 /// The painter-facing summary of a box's stacking/positioning style
 /// (§9.9/Appendix E, css-position-3 §2.2, css-transforms-1 §3).
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PaintFlags {
     /// CSS Lists 3: an outside marker follows the list item's border box,
     /// rather than scrolling with that item's own contents.
@@ -221,6 +221,7 @@ pub(crate) struct PaintFlags {
     pub z: Option<i32>,
     /// Exact group opacity retained from the typed box snapshot.
     pub opacity: f32,
+    pub color_filters: std::sync::Arc<[[f32; 20]]>,
     /// Paints a background over the border box in display-list order.
     pub bg: bool,
     /// CSS UI 4 §3 outline decoration. Unlike `border`, this is paint-only and
@@ -248,6 +249,7 @@ impl Default for PaintFlags {
             sc: false,
             z: None,
             opacity: 1.0,
+            color_filters: Default::default(),
             bg: false,
             outline: Outline::NONE,
             cb_abs: false,
@@ -268,10 +270,13 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         sc: s.stacking_context(item),
         z: s.z_index,
         opacity: s.opacity,
+        color_filters: s.color_filters.clone(),
         bg: s.bg,
         outline: s.outline,
-        cb_abs: s.position.positioned() || s.has_transform,
-        cb_fixed: s.has_transform,
+        cb_abs: s.position.positioned()
+            || s.has_transform
+            || (s.filter_containing_block && !s.color_filters.is_empty()),
+        cb_fixed: s.has_transform || (s.filter_containing_block && !s.color_filters.is_empty()),
         // Set on the laid float fragment by `lay_inlines`, not from style
         // (positioning wins over `float`, so the style bit alone is ambiguous).
         float: false,
@@ -779,11 +784,12 @@ impl Flow<'_> {
         if avoids_floats && !fc.is_empty() {
             let top = cur.preview();
             let (float_l, float_r, float_bottom) = fc.exclusion_band(top);
-            let band_l = cb_x.max(float_l);
-            let band_r = (cb_x + cb_w).min(float_r);
             let mr = s.margin[RIGHT].resolve(Some(cb_w)).unwrap_or(0.0);
-            let left = (cb_x + h.ml).max(band_l);
-            let right = (cb_x + cb_w - mr).min(band_r);
+            // CSS 2 §8.3/§9.5: exclude the actual float boxes, retaining
+            // negative margins outside the CB on an unconstrained side.
+            // An ended float leaves both limits unbounded.
+            let left = (cb_x + h.ml).max(float_l);
+            let right = (cb_x + cb_w - mr).min(float_r);
             let available_border = (right - left).max(0.0);
             let used_border = h.bp_l + h.content_w + h.bp_r;
             let min_border = h.bp_l + h.min_w + h.bp_r;
@@ -793,7 +799,7 @@ impl Flow<'_> {
                     .max(h.min_w)
                     .min(h.content_w);
             } else if available_border >= used_border {
-                x_border = left.min(right - used_border).max(band_l);
+                x_border = left.min(right - used_border).max(float_l);
             } else if float_bottom > top {
                 // CSS 2.2 §9.5 explicitly permits clearing the formatting-
                 // context root when there is insufficient adjacent space.
@@ -3602,7 +3608,7 @@ impl Flow<'_> {
                     // siblings; the terminal painter continues to consume the
                     // separate fixed list.
                     let fixed_index = fixed_out.len();
-                    let paint = laid.paint;
+                    let paint = laid.paint.clone();
                     fixed_out.push(laid);
                     f.children.insert(
                         i,
@@ -4060,6 +4066,27 @@ impl Flow<'_> {
                 (frag, anchors) = self.item_frag(ab, content_w, cb_w, Some(clamped), parent_inl);
             }
         }
+        // CSS 2 §10.8.1, refined by CSS Align 3 #baseline-export: export
+        // the last normal-flow line unless this is a block-axis scroll
+        // container. Overflow:clip does not create a scroll container.
+        // Inspect fragments before this box's relative/transform offset.
+        let value = |prop| match s.pseudo {
+            Some((origin, pseudo)) => self.dom.pseudo_style(origin, pseudo, prop),
+            None if ab.node != NO_NODE => self.dom.computed_value_resolved(ab.node, prop),
+            None => None,
+        };
+        let shorthand = value("overflow").unwrap_or_else(|| "visible".into());
+        let mut tokens = shorthand.split_whitespace();
+        let x = tokens.next().unwrap_or("visible");
+        let y = tokens.next().unwrap_or(x);
+        let x = value("overflow-x").unwrap_or_else(|| x.into());
+        let y = value("overflow-y").unwrap_or_else(|| y.into());
+        let scrollable = |axis: &str| matches!(axis, "hidden" | "auto" | "scroll" | "overlay");
+        let scrolls_block = scrollable(&y) || (y == "visible" && scrollable(&x));
+        let baseline = (matches!(ab.content, Content::Blocks(_) | Content::Inlines(_))
+            && !scrolls_block)
+            .then(|| inline_block_baseline(self.dom, &frag).map(|baseline| m[TOP] + baseline))
+            .flatten();
         // CSS Transforms 1 #transform-rendering and CSS Position 3
         // #relpos-insets: visual offsets move the atomic inline's fragment,
         // descendants, and anchors, but not its margin-box space on the line.
@@ -4078,6 +4105,7 @@ impl Flow<'_> {
             mh: m[TOP] + frag.h + m[BOTTOM],
             ml: m[LEFT],
             mt: m[TOP],
+            baseline,
             frag,
             anchors,
         }
@@ -4134,6 +4162,7 @@ impl Flow<'_> {
             atom_sizes.push(AtomBoxSize {
                 width: pa.mw.max(0.0),
                 height: pa.mh.max(0.0),
+                baseline: pa.baseline,
             });
             prelaid_atoms.push(Some(pa));
         }
@@ -4393,8 +4422,35 @@ struct PrelaidAtom<'t> {
     mh: f32,
     ml: f32,
     mt: f32,
+    baseline: Option<f32>,
     frag: Frag<'t>,
     anchors: Vec<(NodeId, f32)>,
+}
+
+/// Last line in normal-flow tree order. Atomic inline fragments are appended
+/// beside their containing line; that line already incorporates their
+/// alignment, so its baseline takes precedence over descendants' lines.
+fn inline_block_baseline(dom: &Dom, fragment: &Frag<'_>) -> Option<f32> {
+    if fragment.paint.float || matches!(fragment.kind, FragKind::Oof(..) | FragKind::Fixed(_))
+        // CSS Align 3 preserves CSS 2's exclusion of table baselines here.
+        || (fragment.node != NO_NODE && matches!(dom.effective_display(fragment.node).as_deref(), Some("table" | "inline-table")))
+    {
+        return None;
+    }
+    if let FragKind::Line(line) = &fragment.kind {
+        return Some(line.baseline);
+    }
+    if let Some(line) = fragment
+        .children
+        .iter()
+        .rev()
+        .find(|child| matches!(child.kind, FragKind::Line(_)))
+    {
+        return inline_block_baseline(dom, line).map(|baseline| line.y - fragment.y + baseline);
+    }
+    fragment.children.iter().rev().find_map(|child| {
+        inline_block_baseline(dom, child).map(|baseline| child.y - fragment.y + baseline)
+    })
 }
 
 /// The result of laying one inline formatting context: its line boxes, the

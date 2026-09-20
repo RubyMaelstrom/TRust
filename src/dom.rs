@@ -8,7 +8,7 @@
 //! with the page.
 
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -176,6 +176,7 @@ pub struct Dom {
     /// wrapper collection/recreation cannot change a node's document type.
     document_content_types: FxHashMap<NodeId, String>,
     input_values: FxHashMap<NodeId, input::InputValue>,
+    control_selections: FxHashMap<NodeId, crate::doc::ControlSelection>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
     /// host element → shadow root fragment (attachShadow).
     shadow_roots: FxHashMap<NodeId, NodeId>,
@@ -187,6 +188,10 @@ pub struct Dom {
     /// Monotonic mutation counter (bumped with `dirty`); synchronous geometry
     /// and content-dependent visibility observe every mutation.
     epoch: u64,
+    /// HTML #dom-window-nameditem depends on element names and document-tree
+    /// order, not style attributes or control values. A scalar revision lets
+    /// the platform reuse its candidate snapshot without exporting it again.
+    window_names_epoch: u64,
     /// Broad computed-style invalidation, independent of the observable DOM
     /// revision. Proven local mutations evict only their dependent elements.
     style_value_epoch: u64,
@@ -290,6 +295,12 @@ pub struct Dom {
     /// current DOM epoch; the next tree/attribute/text mutation drops the map
     /// wholesale, so old page-sized strings are not retained forever.
     serialization_cache: RefCell<SerializationCache>,
+    /// HTML #document-base-url uses the first base[href] in the node
+    /// Document's tree. Image selection asks this repeatedly within one
+    /// immutable layout/paint transaction. Retain one search result (including
+    /// absence), keyed by both arena revision and document; no URLs or retired
+    /// document trees are retained, and every DOM mutation expires the search.
+    resource_base_element_cache: Cell<Option<(u64, NodeId, Option<NodeId>)>>,
     /// The CSS-pixel viewport used to evaluate `@media` queries when the
     /// cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
@@ -554,11 +565,13 @@ impl Dom {
             nodes,
             document_content_types,
             input_values,
+            control_selections,
             canvases,
             shadow_roots,
             shadow_hosts,
             dirty,
             epoch,
+            window_names_epoch,
             style_value_epoch,
             layout_cache,
             box_tree_cache,
@@ -586,6 +599,7 @@ impl Dom {
             font_units_cache,
             decoration_cache,
             serialization_cache,
+            resource_base_element_cache: _, // Inline IDs/revision only; no owned allocation.
             viewport_px,
             device_pixel_ratio,
             scroll_state,
@@ -608,6 +622,7 @@ impl Dom {
         let _ = (
             dirty,
             epoch,
+            window_names_epoch,
             style_value_epoch,
             geometry_dirty_attributed,
             style_epoch,
@@ -669,6 +684,7 @@ impl Dom {
         }
         fixed_map!(document_content_types, (NodeId, String));
         fixed_map!(input_values, (NodeId, input::InputValue));
+        fixed_map!(control_selections, (NodeId, crate::doc::ControlSelection));
         for value in input_values.values() {
             bytes = bytes.saturating_add(value.value.capacity());
             bytes = bytes.saturating_add(value.editing.as_ref().map_or(0, String::capacity));
@@ -942,11 +958,13 @@ impl Dom {
             nodes: Vec::new(),
             document_content_types: FxHashMap::default(),
             input_values: FxHashMap::default(),
+            control_selections: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
             dirty: false,
             epoch: 0,
+            window_names_epoch: 0,
             style_value_epoch: 0,
             layout_cache: RefCell::new(crate::layout2::LayoutCache::default()),
             box_tree_cache: RefCell::new(crate::layout2::BoxTreeCache::default()),
@@ -974,6 +992,7 @@ impl Dom {
             font_units_cache: RefCell::new(NodeCache::default()),
             decoration_cache: RefCell::new(NodeCache::default()),
             serialization_cache: RefCell::new((u64::MAX, FxHashMap::default())),
+            resource_base_element_cache: Cell::new(None),
             viewport_px: (0.0, 0.0),
             device_pixel_ratio: 1.0,
             scroll_state: FxHashMap::default(),
@@ -1040,6 +1059,22 @@ impl Dom {
     ) {
         if self.render_clickables != clickables || self.render_live != live {
             self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+            // DOM #concept-event-listener and CSS Display #box-tree: listener
+            // registration does not change computed styles. Only the adapter's
+            // activation links (inherited by inline descendants) and fallback
+            // content need rebuilding. Retain independent formatting contexts.
+            if self.render_live != live {
+                self.layout_cache.get_mut().clear();
+                self.box_tree_cache.get_mut().clear();
+            } else {
+                let changed: Vec<_> = self
+                    .render_clickables
+                    .symmetric_difference(&clickables)
+                    .copied()
+                    .filter(|&node| self.is_valid(node))
+                    .collect();
+                self.invalidate_activation_layout(&changed);
+            }
         }
         self.render_clickables = clickables;
         self.render_live = live;
@@ -1509,9 +1544,15 @@ impl Dom {
         self.epoch
     }
 
+    pub(crate) fn window_names_epoch(&self) -> u64 {
+        self.window_names_epoch
+    }
+
     /// The common core of every mutation: the dirty bit for the living page +
     /// the epoch for the cached visibility cascade.
+    #[track_caller]
     fn mark(&mut self) {
+        self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
         self.selector_epoch = self.selector_epoch.wrapping_add(1);
         self.invalidate_all_style_values();
         self.mark_dom_revision();
@@ -1570,6 +1611,7 @@ impl Dom {
     /// An UNATTRIBUTED mutation — one we can't pin to a single element (a global
     /// stylesheet/viewport change). Forces the next render to a full relayout
     /// (no incremental patch), since it may have changed anything.
+    #[track_caller]
     fn touch(&mut self) {
         self.mark();
         self.dirty_attributed = false;
@@ -1578,6 +1620,16 @@ impl Dom {
 
     /// An attribute change on `id` (its own styling/box may have changed).
     fn touch_attr(&mut self, id: NodeId, name: &str) {
+        if name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name") {
+            self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
+        }
+        if casc_diag_on() && matches!(self.tag_name(id), Some("html" | "body")) {
+            eprintln!(
+                "DIAGINVALID root-attribute node={id} tag={:?} name={name} value={:?}",
+                self.tag_name(id),
+                self.attr(id, name)
+            );
+        }
         // HTML #the-page: body link hints style links throughout the document,
         // including elements outside the body's descendant subtree.
         if self.tag_name(id) == Some("body")
@@ -1606,6 +1658,7 @@ impl Dom {
     /// (a changed stylesheet can restyle anything, so no incremental patch
     /// is sound). This is the ONLY writer of `style_epoch`, which keeps the
     /// "style epoch never advances without the main epoch" invariant.
+    #[track_caller]
     fn touch_style(&mut self) {
         self.style_epoch = self.style_epoch.wrapping_add(1);
         self.touch();
@@ -1618,6 +1671,7 @@ impl Dom {
     /// cascade epoch still change; retain the concrete target so the live-page
     /// pipeline can discard it as detached. If that tree is later inserted,
     /// the insertion path independently invalidates the connected sheet set.
+    #[track_caller]
     fn touch_style_at(&mut self, scope: NodeId) {
         self.style_epoch = self.style_epoch.wrapping_add(1);
         if self.is_connected(scope) {
@@ -1688,6 +1742,9 @@ impl Dom {
     /// no-op for the rendered tree (detaching an already-orphan node) — still
     /// dirties the epoch but records no target and does NOT force a full relayout.
     fn touch_content(&mut self, id: Option<NodeId>) {
+        // Conservatively includes text-only changes; every element-tree
+        // insertion, removal, replacement and adoption passes this boundary.
+        self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
         if let Some(parent) = id {
             if self.tag_name(parent) == Some("style") {
                 self.reset_cssom_sheet(parent);
@@ -2926,6 +2983,43 @@ impl Dom {
             NodeData::Element { name, .. } => name.prefix.as_deref(),
             _ => None,
         }
+    }
+
+    /// DOM #concept-getelementsbytagname / #concept-getelementsbytagnamens
+    /// (local 2026-09-06 snapshot). These match names, not CSS selectors, and
+    /// walk ordinary descendants without crossing shadow/template trees.
+    pub fn elements_by_tag_name(
+        &self,
+        root: NodeId,
+        qualified: &str,
+        namespace: Option<&str>,
+    ) -> Vec<NodeId> {
+        if !self.is_valid(root) {
+            return Vec::new();
+        }
+        let html = self.document_content_type(self.nodes[root].owner_document) == "text/html";
+        let folded = qualified.to_ascii_lowercase();
+        self.descendants(root)
+            .filter(|&id| {
+                let NodeData::Element { name, .. } = &self.nodes[id].data else {
+                    return false;
+                };
+                if let Some(namespace) = namespace {
+                    (namespace == "*" || name.ns.as_ref() == namespace)
+                        && (qualified == "*" || name.local.as_ref() == qualified)
+                } else {
+                    qualified == "*"
+                        || attribute_name_matches(
+                            name,
+                            if html && name.ns == ns!(html) {
+                                &folded
+                            } else {
+                                qualified
+                            },
+                        )
+                }
+            })
+            .collect()
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
@@ -4968,11 +5062,51 @@ impl Dom {
         properties::substitute(self, id, pseudo, value)
     }
 
-    /// The resolved `content` text for an element's `::before`/`::after`
-    /// box, or `None` when no rule sets it (or it resolves to `none`/an
-    /// unavailable resource content). Reads the pseudo's bucket of
-    /// the element's winner maps (inline styles can't target a pseudo).
+    /// Textual projection of generated content. Image items still generate a
+    /// pseudo box but contribute no characters to this projection.
     pub fn pseudo_content(&self, id: NodeId, which: PseudoEl) -> Option<String> {
+        self.pseudo_content_items(id, which).map(|items| {
+            items
+                .into_iter()
+                .filter_map(|item| match item {
+                    GeneratedContent::Text(text) => Some(text),
+                    GeneratedContent::Image(_) => None,
+                })
+                .collect()
+        })
+    }
+
+    /// CSS Content 3 #replaced: a single image replaces the element's normal
+    /// contents, without changing its DOM children or HTML image request.
+    pub(crate) fn content_replacement_image(&self, id: NodeId) -> Option<String> {
+        generated::replacement_image(&self.computed_value_resolved(id, "content")?)
+    }
+
+    /// CSS 2 #content / CSS Pseudo 4 #generated-content: preserve the ordered
+    /// sequence of text and anonymous replaced images, including empty text.
+    /// Baked snapshots carry resolved items so counters and quotes are not
+    /// recomputed in their stylesheet-free presentation arena.
+    pub(crate) fn pseudo_content_items(
+        &self,
+        id: NodeId,
+        which: PseudoEl,
+    ) -> Option<Vec<GeneratedContent>> {
+        let attr = match which {
+            PseudoEl::Before => "data-trust-before-items",
+            PseudoEl::After => "data-trust-after-items",
+        };
+        if let Some(baked) = self.attr(id, attr)
+            && let Ok(items) = serde_json::from_str(baked)
+        {
+            return Some(items);
+        }
+        let attr = match which {
+            PseudoEl::Before => "data-trust-before",
+            PseudoEl::After => "data-trust-after",
+        };
+        if let Some(text) = self.attr(id, attr) {
+            return Some(vec![GeneratedContent::Text(text.to_string())]);
+        }
         let raw = self.pseudo_style(id, which, "content").or_else(|| {
             (self.tag_name(id) == Some("q")).then(|| {
                 if which == PseudoEl::Before {
@@ -5156,7 +5290,7 @@ impl Dom {
     /// we can't resolve (`counter()`, `url()`, quote keywords) is dropped
     /// whole. The old single-component reader mangled the common
     /// `content:"(" attr(data-n) ")"` decoration idiom.
-    fn parse_content_value(&self, id: NodeId, raw: &str) -> Option<String> {
+    fn parse_content_value(&self, id: NodeId, raw: &str) -> Option<Vec<GeneratedContent>> {
         generated::simple_content(self, id, raw)
     }
 
@@ -5178,6 +5312,196 @@ impl Dom {
             cur = p;
         }
         cur
+    }
+
+    /// HTML #reset-the-form-owner: resolve association in the element's own
+    /// tree, without invoking author-overridable DOM properties along the walk.
+    /// The legacy image lookup used by #dom-form-nameditem uses ancestors only.
+    pub(crate) fn form_owner(&self, id: NodeId) -> Option<NodeId> {
+        let is_form = |node| {
+            self.tag_name(node) == Some("form")
+                && self.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml")
+        };
+        let scope = self.tree_scope(id);
+        if self.tag_name(id) != Some("img")
+            && let Some(name) = self.attr(id, "form")
+            && self.is_connected(id)
+        {
+            if name.is_empty() {
+                return None;
+            }
+            return self
+                .descendants(scope)
+                .find(|&node| self.attr(node, "id") == Some(name) && self.tree_scope(node) == scope)
+                .filter(|&node| is_form(node));
+        }
+        let mut parent = self.nodes[id].parent;
+        while let Some(node) = parent {
+            // An iframe is only an arena parent, not a DOM ancestor of its
+            // content Document. Detached form roots still count as ancestors.
+            if node == scope && matches!(self.tag_name(node), Some("iframe" | "frame")) {
+                break;
+            }
+            if is_form(node) {
+                return Some(node);
+            }
+            parent = self.nodes[node].parent;
+        }
+        None
+    }
+
+    /// HTML #dom-form-elements / #dom-form-nameditem candidate snapshot.
+    /// The JS legacy platform object retains liveness and its past-names map;
+    /// this walk reads native names/ownership without invoking author getters.
+    pub(crate) fn form_named_items(&self, form: NodeId) -> Vec<NodeId> {
+        let scope = self.tree_scope(form);
+        self.descendants(scope)
+            .filter(|&node| {
+                let tag = self.tag_name(node);
+                matches!(
+                    tag,
+                    Some(
+                        "button"
+                            | "fieldset"
+                            | "input"
+                            | "object"
+                            | "output"
+                            | "select"
+                            | "textarea"
+                            | "img"
+                    )
+                ) && self.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml")
+                    && !(tag == Some("input") && self.input_type(node) == "image")
+                    && self.tree_scope(node) == scope
+                    && self.form_owner(node) == Some(form)
+            })
+            .collect()
+    }
+
+    /// HTML #dom-window-nameditem / #document-tree-child-browsing-context.
+    /// Internal named-property lookup reads canonical names in tree order;
+    /// author-overridden querySelectorAll/getAttribute/localName are not steps
+    /// of this algorithm. Nested Documents share this arena, but not its names.
+    pub(crate) fn window_named_items(
+        &self,
+        document: NodeId,
+    ) -> impl Iterator<Item = (NodeId, bool, &str, &str)> {
+        self.descendants(document).filter_map(move |node| {
+            let tag = self.tag_name(node)?;
+            let html = self.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml");
+            let frame = html && matches!(tag, "iframe" | "frame");
+            let id = self.attr(node, "id").unwrap_or("");
+            let name = if html && matches!(tag, "embed" | "form" | "img" | "object") {
+                self.attr(node, "name").unwrap_or("")
+            } else {
+                ""
+            };
+            (frame || !id.is_empty() || !name.is_empty())
+                .then_some((node, frame, id, name))
+                .filter(|_| self.tree_scope(node) == document)
+        })
+    }
+
+    /// Retained font environment for the tree where the font-family reference
+    /// was declared. CSS Shadow 1 #shadow-names preserves this reference during
+    /// inheritance; a child document always starts a separate environment.
+    pub(crate) fn document_font_set(
+        &self,
+        id: NodeId,
+    ) -> Option<std::sync::Arc<crate::text::FontSet>> {
+        self.scope_font_set(id)?;
+        let mut source = id;
+        loop {
+            if self.cascaded(source, "font-family").is_some_and(|value| {
+                !value.trim().eq_ignore_ascii_case("inherit")
+                    && !value.trim().eq_ignore_ascii_case("unset")
+            }) {
+                break;
+            }
+            let Some(parent) = self.style_parent(source) else {
+                break;
+            };
+            source = parent;
+        }
+        self.scope_font_set(source)
+    }
+
+    pub(crate) fn scope_font_set(
+        &self,
+        id: NodeId,
+    ) -> Option<std::sync::Arc<crate::text::FontSet>> {
+        let index = self.style_index();
+        let mut scope = self.tree_scope(id);
+        loop {
+            if let Some(fonts) = index.font_sets.get(&scope) {
+                return Some(fonts.clone());
+            }
+            let host = self.shadow_hosts.get(&scope)?;
+            scope = self.tree_scope(*host);
+        }
+    }
+
+    fn build_font_sets(
+        &self,
+        mut faces: FxHashMap<NodeId, Vec<crate::http::CssFontFace>>,
+        sets: &mut FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
+    ) {
+        // CSS Fonts 4 #font-face-rule / #font-fetching-requirements. Data
+        // sources can be activated immediately when an applicable sheet is
+        // attached, including dynamic sheets and child navigables. Network
+        // sources continue to use the HTTP preload pipeline.
+        let mut scopes: Vec<_> = faces.keys().copied().collect();
+        scopes.sort_unstable();
+        for scope in scopes {
+            let mut pending = vec![scope];
+            let mut ancestor = scope;
+            while let Some(host) = self.shadow_hosts.get(&ancestor) {
+                ancestor = self.tree_scope(*host);
+                if sets.contains_key(&ancestor) {
+                    break;
+                }
+                pending.push(ancestor);
+            }
+            for scope in pending.into_iter().rev() {
+                if sets.contains_key(&scope) {
+                    continue;
+                }
+                let fonts = faces
+                    .remove(&scope)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|face| {
+                        for source in face.sources {
+                            if !source.starts_with("data:") {
+                                break;
+                            }
+                            if let Some(font) =
+                                crate::img::decode_data_url(&source).and_then(|bytes| {
+                                    crate::font_system::PageFont::from_web_resource(
+                                        face.family.clone(),
+                                        bytes,
+                                    )
+                                })
+                            {
+                                return Some(font);
+                            }
+                        }
+                        None
+                    })
+                    .collect::<Vec<_>>();
+                let parent = self
+                    .shadow_hosts
+                    .get(&scope)
+                    .and_then(|host| sets.get(&self.tree_scope(*host)));
+                let child_document = matches!(self.tag_name(scope), Some("iframe" | "frame"));
+                if !fonts.is_empty() || child_document || parent.is_some() {
+                    let foreground =
+                        !child_document && self.registration_document(scope) == DOCUMENT;
+                    let set = crate::text::FontSet::new(fonts, parent, foreground);
+                    sets.insert(scope, set);
+                }
+            }
+        }
     }
 
     /// CSS parent without crossing from a child document element to its
@@ -5223,6 +5547,7 @@ impl Dom {
 
     fn build_style_index(&self) -> StyleIndex {
         let mut index = StyleIndex::default();
+        let mut font_faces: FxHashMap<NodeId, Vec<crate::http::CssFontFace>> = FxHashMap::default();
         let mut order = 0;
         let media = MediaEnvironment {
             viewport: self.viewport_px,
@@ -5235,6 +5560,13 @@ impl Dom {
         let mut layer_regs: std::collections::HashMap<NodeId, LayerRegistry> =
             std::collections::HashMap::new();
         for id in self.composed_descendants(DOCUMENT) {
+            if matches!(self.tag_name(id), Some("iframe" | "frame"))
+                && self.frame_body(id).is_some()
+            {
+                // Each content Document has an independent font environment,
+                // including when it declares no downloadable fonts at all.
+                font_faces.entry(id).or_default();
+            }
             let css: Cow<str> = match self.tag_name(id) {
                 Some("style") if self.style_sheet_applies(id) => match self.cssom_sheets.get(&id) {
                     Some(sheet) => Cow::Borrowed(&sheet.text),
@@ -5272,6 +5604,7 @@ impl Dom {
                 &mut index.keyframes,
                 index.counter_styles.entry(scope).or_default(),
                 index.properties.entry(document).or_default(),
+                font_faces.entry(scope).or_default(),
                 base.as_ref(),
                 media,
                 layer_regs.entry(scope).or_default(),
@@ -5316,6 +5649,7 @@ impl Dom {
                     &mut index.keyframes,
                     index.counter_styles.entry(*scope).or_default(),
                     index.properties.entry(document).or_default(),
+                    font_faces.entry(*scope).or_default(),
                     base.as_ref(),
                     media,
                     layer_regs.entry(*scope).or_default(),
@@ -5331,6 +5665,7 @@ impl Dom {
                 }
             }
         }
+        self.build_font_sets(font_faces, &mut index.font_sets);
         index.has_opacity = index
             .scopes
             .values()
@@ -6030,11 +6365,19 @@ impl Dom {
             .document_bases
             .get(&root)
             .unwrap_or(page_url);
-        let first_base = self.descendants(root).find(|&node| {
-            self.tag_name(node) == Some("base")
-                && self.attr(node, "href").is_some()
-                && self.frame_owner(node) == owner
-        });
+        let first_base = match self.resource_base_element_cache.get() {
+            Some((epoch, document, first)) if epoch == self.epoch && document == root => first,
+            _ => {
+                let first = self.descendants(root).find(|&node| {
+                    self.tag_name(node) == Some("base")
+                        && self.attr(node, "href").is_some()
+                        && self.frame_owner(node) == owner
+                });
+                self.resource_base_element_cache
+                    .set(Some((self.epoch, root, first)));
+                first
+            }
+        };
         first_base
             .and_then(|node| fallback.join(self.attr(node, "href")?.trim()).ok())
             .unwrap_or_else(|| fallback.clone())
@@ -6363,6 +6706,10 @@ impl Dom {
                 };
                 self.replace_all_children(id, children);
             }
+        }
+        self.clamp_control_selection(id);
+        if let Some(parent) = parent {
+            self.clamp_control_selection(parent);
         }
     }
 
@@ -7680,6 +8027,20 @@ impl Dom {
                 out.push_str(&escape_attr(&t));
                 out.push('"');
 
+                if let Some(items) = self.pseudo_content_items(id, which)
+                    && items
+                        .iter()
+                        .any(|item| matches!(item, GeneratedContent::Image(_)))
+                {
+                    out.push(' ');
+                    out.push_str(attr);
+                    out.push_str("-items=\"");
+                    out.push_str(&escape_attr(
+                        &serde_json::to_string(&items).expect("generated content serializes"),
+                    ));
+                    out.push('"');
+                }
+
                 // CSS Pseudo 4 §4.1: ::before/::after are fully styleable
                 // child boxes. The layout arena re-parses this snapshot without
                 // the resident document's stylesheets, so preserve the pseudo's
@@ -8712,6 +9073,12 @@ enum Combinator {
 pub enum PseudoEl {
     Before,
     After,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum GeneratedContent {
+    Text(String),
+    Image(String),
 }
 
 #[derive(Default)]
@@ -10070,7 +10437,7 @@ const PROPS: &[PropDef] = &[
     prop("text-decoration-color", false, true),
     prop("text-decoration-style", false, true),
     prop("text-shadow", true, true),
-    prop("content", false, false),
+    prop("content", false, true),
     prop("counter-reset", false, false),
     prop("counter-increment", false, false),
     prop("counter-set", false, false),
@@ -11546,16 +11913,10 @@ fn bg_color_token(t: &str) -> bool {
 /// `repeat(2, 1fr)` track keeps its inner contents). `None` if there is no
 /// top-level slash. Used for the `grid-template: rows / columns` shorthand.
 fn split_top_level_slash(value: &str) -> Option<(&str, &str)> {
-    let mut depth = 0i32;
-    for (i, b) in value.bytes().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'/' if depth == 0 => return Some((&value[..i], &value[i + 1..])),
-            _ => {}
-        }
-    }
-    None
+    // CSS Syntax 3 #consume-component-value: delimiters inside strings,
+    // escapes and nested functions do not separate top-level values.
+    let parts = split_top_level(value, '/');
+    (parts.len() > 1).then(|| (parts[0], &value[parts[0].len() + 1..]))
 }
 
 /// The top/right/bottom/left values of a CSS 1–4-value box shorthand. Splits
@@ -11835,6 +12196,7 @@ impl CascadeWinner {
 /// document sheets never reach in.
 #[derive(Default)]
 struct StyleIndex {
+    font_sets: FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
     has_container_queries: bool,
     has_revert_layer: bool,
     selector_dependencies: invalidation::SelectorDependencies,
@@ -12056,6 +12418,7 @@ impl RuleBuckets {
 impl StyleIndex {
     fn retained_memory(&self) -> (usize, bool) {
         let StyleIndex {
+            font_sets,
             has_container_queries,
             has_revert_layer,
             selector_dependencies,
@@ -12202,7 +12565,12 @@ impl StyleIndex {
                 .saturating_add(id.as_ref().map_or(0, String::capacity))
                 .saturating_add(class.as_ref().map_or(0, String::capacity));
         }
-        let opaque = !scopes.is_empty()
+        // Fontique owns immutable font bytes and collection metadata shared
+        // with layout snapshots. Account for the map and report opaque storage.
+        bytes += font_sets.capacity()
+            * std::mem::size_of::<(NodeId, std::sync::Arc<crate::text::FontSet>)>();
+        let opaque = !font_sets.is_empty()
+            || !scopes.is_empty()
             || !buckets.is_empty()
             || !keyframes.is_empty()
             || !hover_buckets.is_empty()
@@ -12948,6 +13316,7 @@ fn parse_sheet(
     keyframes: &mut FxHashMap<String, KeyframesRule>,
     counter_styles: &mut counter_styles::Styles,
     properties: &mut properties::Registry,
+    fonts: &mut Vec<crate::http::CssFontFace>,
     base: Option<&url::Url>,
     media: MediaEnvironment,
     layers: &mut LayerRegistry,
@@ -13016,6 +13385,17 @@ fn parse_sheet(
             // last rule of a given name wins. Store supported property tracks
             // in sorted offset order; duplicate offsets cascade in rule order.
             let lower = after.trim_start().to_ascii_lowercase();
+            if let Some(prelude) = lower.strip_prefix("font-face")
+                && prelude.trim_start().starts_with('{')
+                && let Some(brace) = after.find('{')
+            {
+                let (block, tail) = take_block(&after[brace..]);
+                if let Some(face) = crate::http::font_face_descriptors(block) {
+                    fonts.push(face);
+                }
+                rest = tail;
+                continue;
+            }
             if let Some(rest_name) = lower
                 .strip_prefix("keyframes")
                 .or_else(|| lower.strip_prefix("-webkit-keyframes"))
@@ -13051,6 +13431,7 @@ fn parse_sheet(
                         keyframes,
                         counter_styles,
                         properties,
+                        fonts,
                         base,
                         media,
                         layers,
@@ -13085,6 +13466,7 @@ fn parse_sheet(
                         keyframes,
                         counter_styles,
                         properties,
+                        fonts,
                         base,
                         media,
                         layers,
@@ -13147,6 +13529,7 @@ fn parse_sheet(
                         keyframes,
                         counter_styles,
                         properties,
+                        fonts,
                         base,
                         media,
                         layers,
@@ -13175,6 +13558,7 @@ fn parse_sheet(
                     keyframes,
                     counter_styles,
                     properties,
+                    fonts,
                     base,
                     media,
                     layers,
@@ -13204,6 +13588,7 @@ fn parse_sheet(
                     keyframes,
                     counter_styles,
                     properties,
+                    fonts,
                     base,
                     media,
                     layers,

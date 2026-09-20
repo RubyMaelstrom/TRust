@@ -192,6 +192,15 @@ impl NumberConstraints {
 }
 
 /// One control in an HTML form, in document order.
+/// HTML text-control selection, in UTF-16 code units. Negative direction is
+/// backward, positive is forward, and zero is the platform's "none" direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlSelection {
+    pub start: u32,
+    pub end: u32,
+    pub direction: i8,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
@@ -205,6 +214,7 @@ pub struct Field {
     pub label: String,
     pub kind: FieldKind,
     pub number: Option<NumberConstraints>,
+    pub selection: Option<ControlSelection>,
     /// Original DOM node id inside the living page actor, when this
     /// field came from a live JS render.
     pub live_node: Option<usize>,
@@ -788,6 +798,7 @@ mod tests {
             label: String::new(),
             kind,
             number: None,
+            selection: None,
             live_node: None,
         }
     }

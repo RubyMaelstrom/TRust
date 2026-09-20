@@ -42,6 +42,7 @@ mod boundary;
 mod clamp;
 pub(crate) mod clip_path;
 mod contract;
+pub(crate) mod filter;
 mod flex;
 mod float;
 mod flow;
@@ -295,7 +296,9 @@ pub struct GraphicalLayout {
 #[derive(Clone, Debug)]
 struct GraphicalPaintCache {
     fragments: std::sync::Arc<LayoutFragments>,
-    terminal: terminal::TerminalPaintModel,
+    /// Native-window actors omit this adapter-only payload. Layout entry
+    /// points intended for terminal adaptation always retain it.
+    terminal: Option<terminal::TerminalPaintModel>,
 }
 
 impl std::ops::Deref for GraphicalPaintCache {
@@ -324,6 +327,15 @@ pub struct RichEditorPresentation {
     /// A single unformatted editing paragraph can present a pending native
     /// edit using its existing CSS text style while the actor handles input.
     pub pending_text: Option<PendingEditorText>,
+    /// One-line HTML widgets retain their CSS surface and replace only the
+    /// label with the editor's shaped glyphs, selection, and caret.
+    pub native_input: Option<NativeInputPresentation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeInputPresentation {
+    pub node: NodeId,
+    pub placeholder: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -352,6 +364,51 @@ pub(crate) fn rich_editor_presentation(
         }
         let parent = if f.node == NO_NODE { parent } else { f.node };
         f.children.iter().find_map(|f| first_line(f, parent))
+    }
+    let native_input = dom.tag_name(node) == Some("input")
+        && matches!(
+            dom.input_type(node).as_str(),
+            "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+        );
+    if native_input {
+        let bounds = layout.boxes.get(&node)?;
+        let (origin, clip) = layout.paint.primitives.iter().find_map(|command| {
+            if let crate::render::DisplayCommand::GlyphRun {
+                node: id,
+                origin,
+                clip,
+                ..
+            } = command
+                && *id == node
+            {
+                Some((*origin, *clip))
+            } else {
+                None
+            }
+        })?;
+        let style =
+            style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), base).text_style();
+        let caret_color = dom
+            .computed_value_resolved(node, "caret-color")
+            .filter(|v| !matches!(v.trim(), "auto" | "currentcolor" | "currentColor"))
+            .or_else(|| dom.computed_value_resolved(node, "color"))
+            .as_deref()
+            .and_then(crate::render::PaintColor::parse_css)
+            .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+        return Some(RichEditorPresentation {
+            style,
+            caret_color,
+            origin: crate::core::CssPoint::new(
+                origin.x - bounds.left as f32,
+                origin.y - bounds.top as f32,
+            ),
+            width: clip.map_or(bounds.width as f32, |clip| clip.width),
+            pending_text: None,
+            native_input: Some(NativeInputPresentation {
+                node,
+                placeholder: dom.attr(node, "placeholder").unwrap_or_default().to_owned(),
+            }),
+        });
     }
     if !dom.is_contenteditable_host(node) {
         return None;
@@ -416,6 +473,7 @@ pub(crate) fn rich_editor_presentation(
         origin: crate::core::CssPoint::new(line.x - host.x, line.y - host.y),
         width: host.content_size.map_or(host.w, |s| s[0]),
         pending_text,
+        native_input: None,
     })
 }
 
@@ -504,7 +562,7 @@ fn graphical_paint_cache(
 ) -> Option<GraphicalPaintCache> {
     Some(GraphicalPaintCache {
         fragments: LayoutFragments::retain(root, fixed, top_layer, flow_bottom, viewport, anchors)?,
-        terminal,
+        terminal: Some(terminal),
     })
 }
 
@@ -538,10 +596,11 @@ pub fn repaint_graphical(
     layout.paint = paint;
     layout.patch_boundaries = patch_boundaries;
     layout.boundaries = boundaries;
-    if let Some(cache) = &mut layout.paint_cache {
-        cache.terminal =
-            terminal::TerminalPaintModel::from_layout(dom, base, controls, &layout.boxes);
-        cache.terminal.capture_page_media(dom, base, images);
+    if let Some(cache) = &mut layout.paint_cache
+        && let Some(terminal) = &mut cache.terminal
+    {
+        *terminal = terminal::TerminalPaintModel::from_layout(dom, base, controls, &layout.boxes);
+        terminal.capture_page_media(dom, base, images);
     }
     true
 }
@@ -639,6 +698,7 @@ fn empty_graphical_layout(viewport: Viewport) -> GraphicalLayout {
 /// Paint an already-current geometry transaction. The caller must validate
 /// the DOM, resource, viewport and activation-metadata inputs before reuse.
 /// This never constructs boxes, shapes text, or runs flow layout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_retained_layout(
     dom: &Dom,
     base: &Url,
@@ -647,7 +707,9 @@ pub(crate) fn paint_retained_layout(
     fragments: std::sync::Arc<LayoutFragments>,
     boxes: HashMap<NodeId, PxRect>,
     grid_tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+    terminal_presentation: bool,
 ) -> GraphicalLayout {
+    let started = std::env::var_os("TRUST_DIAG_FRAME").map(|_| std::time::Instant::now());
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
@@ -659,9 +721,20 @@ pub(crate) fn paint_retained_layout(
         fragments.viewport.width,
         fragments.viewport.height,
     );
+    let painted = started.map(|started| started.elapsed());
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
-    let mut terminal = terminal::TerminalPaintModel::from_layout(dom, base, controls, &boxes);
-    terminal.capture_page_media(dom, base, images);
+    let terminal = terminal_presentation.then(|| {
+        let mut terminal = terminal::TerminalPaintModel::from_layout(dom, base, controls, &boxes);
+        terminal.capture_page_media(dom, base, images);
+        terminal
+    });
+    if let (Some(started), Some(painted)) = (started, painted) {
+        eprintln!(
+            "DIAGPAINT graphics={}us terminal={}us",
+            painted.as_micros(),
+            (started.elapsed() - painted).as_micros(),
+        );
+    }
     GraphicalLayout {
         paint,
         inline_anchor_y: missing_inline_anchors(&fragments.anchors, &boxes),
@@ -703,13 +776,18 @@ pub(crate) fn paint_retained_hit_test(
 /// contract. This is the only terminal adapter boundary: it clones retained
 /// fragments because scroll-region extraction windows/empties its working
 /// copy, while the canonical pixel layout remains reusable by other adapters
-/// and by repaint.
+/// and by repaint. A native-window-only retained paint has no terminal
+/// metadata and returns empty output, as does a layout without fragments.
 pub fn adapt_terminal(
     layout: &PixelLayout,
     viewport: TerminalViewport,
     alpha: &HashMap<String, bool>,
 ) -> Output {
-    let Some(cache) = &layout.paint_cache else {
+    let Some((cache, terminal)) = layout
+        .paint_cache
+        .as_ref()
+        .and_then(|cache| cache.terminal.as_ref().map(|terminal| (cache, terminal)))
+    else {
         return Output {
             rows: Vec::new(),
             anchor_rows: HashMap::new(),
@@ -757,14 +835,9 @@ pub fn adapt_terminal(
             attach(&mut entry.fragment, &canvases);
         }
     }
-    let candidates = boundary::collect(
-        &cache.terminal,
-        &root,
-        viewport.cell_width,
-        viewport.cell_height,
-    );
+    let candidates = boundary::collect(terminal, &root, viewport.cell_width, viewport.cell_height);
     let out = terminal::paint(
-        &cache.terminal,
+        terminal,
         &mut root,
         &fixed,
         &top_layer,
@@ -777,7 +850,7 @@ pub fn adapt_terminal(
     );
     let boundaries = filter_boundaries(candidates, &out.regions, &out.carousels);
     let mut rows = out.rows;
-    page_media_fallback(&cache.terminal, viewport.columns, &mut rows);
+    page_media_fallback(terminal, viewport.columns, &mut rows);
     Output {
         rows,
         anchor_rows: out.anchor_rows,
@@ -1851,6 +1924,306 @@ mod tests {
         );
         let (_, v) = find(&out, "▶ Video");
         assert_eq!(v.col, 120, "margin-left:50% of 1920px = 960px = col 120");
+    }
+
+    #[test]
+    fn css_inline_block_exports_last_normal_flow_baseline() {
+        // CSS 2 §10.8.1: a visible-overflow inline-block exports its last
+        // in-flow line, not its bottom edge or a floated/positioned child's line.
+        for (extra, overflow) in [
+            ("", "visible"),
+            ("", "clip"),
+            ("<i style='float:left'>FLOAT</i>", "visible"),
+            ("<i style='position:absolute;top:200px'>ABS</i>", "visible"),
+            ("<table><tr><td>TABLE</td></tr></table>", "visible"),
+        ] {
+            let layout = lay_graphical(
+                &format!(
+                    "<body style='margin:0;font:16px/24px monospace'><span style='display:inline-block;overflow:{overflow};padding:3px;margin-top:7px'>first<br>last{extra}</span>outside</body>"
+                ),
+                500.,
+                &Default::default(),
+            );
+            let baseline = |text: &str| {
+                layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .find_map(|p| match p {
+                        crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                            if shaped.text == text =>
+                        {
+                            Some(origin.y + shaped.baseline)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            assert!(
+                (baseline("last") - baseline("outside")).abs() < 0.01,
+                "{extra}"
+            );
+        }
+        let layout = lay_graphical(
+            "<body style='margin:0;font:16px/24px monospace'><span style='display:inline-block'><span style='display:inline-block'><span style='display:inline-block;vertical-align:top;width:100px;height:48px'></span></span></span></body>",
+            500.,
+            &Default::default(),
+        );
+        assert!((layout.paint.lines[0].rect.height - 48.).abs() < 0.01);
+    }
+
+    #[test]
+    fn css_inline_block_hidden_overflow_exports_bottom_margin_edge() {
+        let dom = Dom::parse_document(
+            "<body style='margin:0;font:16px/24px monospace'><span id=box style='display:inline-block;overflow:hidden;margin-bottom:5px'>inside</span>outside</body>",
+        );
+        let layout = lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            Viewport::new(500., 300.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let bounds = layout.boxes[&dom.get_by_id("box").unwrap()];
+        let baseline = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|p| match p {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                    if shaped.text == "outside" =>
+                {
+                    Some(origin.y + shaped.baseline)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!((f64::from(baseline) - bounds.top - bounds.height - 5.).abs() < 0.01);
+    }
+
+    #[test]
+    fn css_inline_nowrap_intrinsic_width_preserves_control_sizes() {
+        // CSS 2 §10.3.7 + CSS Text nowrap: an intrinsic probe takes legal
+        // breaks; it must not squeeze controls to the probe's available width.
+        let base = Url::parse("https://example.test/").unwrap();
+        for width in ["width:140px", ""] {
+            let dom = Dom::parse_document(&format!(
+                "<body style='margin:0'><div style='position:relative;width:60px'><div id=menu style='position:absolute;white-space:nowrap'><input id=a size=16 style='{width};border:0;padding:0'><input id=b size=17 style='{width};border:0;padding:0'></div></div></body>"
+            ));
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(500., 300.),
+                &forms,
+                &controls,
+                &Default::default(),
+            );
+            let bounds = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+            let (menu, a, b) = (bounds("menu"), bounds("a"), bounds("b"));
+            assert!(menu.width > 100., "{menu:?}");
+            assert!(
+                (menu.width - a.width - b.width).abs() < 0.01,
+                "{width}: {menu:?}, {a:?}, {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn css_inline_float_exclusion_preserves_negative_margins_on_unfloated_side() {
+        // CSS 2 §9.5 excludes actual float margin boxes. It does not erase
+        // negative margins on the opposite side or below completed floats.
+        for side in ["left", "right"] {
+            for gap in [0, 80] {
+                let dom = Dom::parse_document(&format!(
+                    "<style>body{{margin:0}}#parent{{margin:0 40px}}#float{{float:{side};width:60px;height:40px}}#gap{{height:{gap}px}}#box{{overflow:hidden;margin-{}:-40px;padding-{}:40px;height:20px}}</style><div id=parent><div id=float></div><div id=gap></div><div id=box>x</div></div>",
+                    if side == "right" { "left" } else { "right" },
+                    if side == "right" { "left" } else { "right" }
+                ));
+                let layout = lay_out_graphical(
+                    &dom,
+                    &Url::parse("https://example.test/").unwrap(),
+                    Viewport::new(400., 300.),
+                    &[],
+                    &Default::default(),
+                    &Default::default(),
+                );
+                let b = layout.boxes[&dom.get_by_id("box").unwrap()];
+                if side == "right" {
+                    assert!(b.left.abs() < 0.01, "{side}/{gap}: {b:?}");
+                } else {
+                    assert!(
+                        (b.left + b.width - 400.).abs() < 0.01,
+                        "{side}/{gap}: {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negative_inline_margins_position_controls_and_preserve_wrapping_space() {
+        let base = Url::parse("https://example.test/").unwrap();
+        for tag in ["img", "input"] {
+            let dom = Dom::parse_document(&format!(
+                "<style>body{{margin:0}}#line{{width:120px;line-height:20px}}\
+                 img,input{{display:inline;box-sizing:border-box;width:20px;height:20px;\
+                 border:0;padding:0;margin:0;vertical-align:top}}\
+                 #first{{width:40px}}#overlap{{width:80px;margin-left:-15px;margin-right:-7px}}</style>\
+                 <div id=line><{tag} src=photo.png id=first><{tag} src=photo.png id=overlap><{tag} src=photo.png id=last></div>"
+            ));
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(400., 300.),
+                &forms,
+                &controls,
+                &Default::default(),
+            );
+            let bounds = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+            let (first, overlap, last) = (bounds("first"), bounds("overlap"), bounds("last"));
+            assert!((overlap.left - 25.).abs() < 0.01, "{tag}: {overlap:?}");
+            assert!((last.left - 98.).abs() < 0.01, "{tag}: {last:?}");
+            assert!(
+                (last.top - first.top).abs() < 0.01,
+                "{tag}: no spurious line break"
+            );
+            assert!(
+                (overlap.width - 80.).abs() < 0.01,
+                "margin does not shrink border box"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_font_references_keep_their_scope_when_inherited_by_pseudos() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mono = crate::img::base64_encode(include_bytes!(
+            "../../assets/fonts/dejavu/DejaVuSansMono.ttf"
+        ));
+        let sans =
+            crate::img::base64_encode(include_bytes!("../../assets/fonts/dejavu/DejaVuSans.ttf"));
+        let mut dom = Dom::parse_document(&format!(
+            "<style>@font-face{{font-family:ScopedFace;src:url(data:font/ttf;base64,{mono})}}\
+             body{{font:20px ScopedFace}}</style><section id=host></section>"
+        ));
+        let root = dom.attach_shadow(dom.get_by_id("host").unwrap());
+        let sheet = dom.create_element("style");
+        dom.set_text(
+            sheet,
+            &format!(
+                "@font-face{{font-family:ScopedFace;src:url(data:font/ttf;base64,{sans})}}\
+             .local{{font-family:ScopedFace}}span::before{{content:'Wi';font-family:inherit}}"
+            ),
+        );
+        dom.append(root, sheet);
+        for local in [false, true] {
+            let node = dom.create_element("span");
+            if local {
+                dom.set_attr(node, "class", "local");
+            }
+            dom.append(root, node);
+            let style = style::InlineStyle::derive(&dom, node, &style::InlineStyle::root(), &base);
+            for style in [
+                style.clone(),
+                style.with_pseudo(&dom, Some((node, crate::dom::PseudoEl::Before))),
+            ] {
+                let style = style.text_style();
+                let wide = crate::text::shape("W", &style).advance;
+                let narrow = crate::text::shape("i", &style).advance;
+                assert_eq!(
+                    (wide - narrow).abs() < 0.01,
+                    !local,
+                    "inherited references use the outer font; local declarations use the shadow font"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_fonts_follow_stylesheet_lifetime_and_document_scope() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let font = crate::img::base64_encode(include_bytes!(
+            "../../assets/fonts/dejavu/DejaVuSansMono.ttf"
+        ));
+        let sheet = format!(
+            "@font-face{{font-family:EmbeddedScope;src:url(data:font/ttf;base64,{font})}} p{{font:20px EmbeddedScope,sans-serif}}"
+        );
+        let mut dom = Dom::parse_document(
+            "<style>p{font:20px EmbeddedScope,sans-serif}</style><p id=parent>Wi</p><iframe id=one></iframe><iframe id=two></iframe>",
+        );
+        let one = dom.get_by_id("one").unwrap();
+        let two = dom.get_by_id("two").unwrap();
+        dom.install_frame_document(
+            one,
+            &format!("<style id=face>{sheet}</style><p id=child>Wi</p>"),
+            base.as_str(),
+        );
+        dom.install_frame_document(
+            two,
+            "<style>p{font:20px EmbeddedScope,sans-serif}</style><p id=sibling>Wi</p>",
+            base.as_str(),
+        );
+        let child = dom
+            .descendants(one)
+            .find(|&id| dom.attr(id, "id") == Some("child"))
+            .unwrap();
+        let sibling = dom
+            .descendants(two)
+            .find(|&id| dom.attr(id, "id") == Some("sibling"))
+            .unwrap();
+        let parent = dom.get_by_id("parent").unwrap();
+        let style = |dom: &Dom, node| {
+            style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), &base).text_style()
+        };
+        let widths = |s: &crate::text::TextStyle| {
+            (
+                crate::text::shape("W", s).advance,
+                crate::text::shape("i", s).advance,
+            )
+        };
+        let child_style = style(&dom, child);
+        let retained_widths = widths(&child_style);
+        let (wide, narrow) = retained_widths;
+        assert!(
+            (wide - narrow).abs() < 0.01,
+            "embedded monospace font must shape child text"
+        );
+        for node in [parent, sibling] {
+            let (wide, narrow) = widths(&style(&dom, node));
+            assert!(
+                wide > narrow * 1.5,
+                "child font must not leak to its parent or sibling"
+            );
+        }
+        let face = dom
+            .descendants(one)
+            .find(|&id| dom.attr(id, "id") == Some("face"))
+            .unwrap();
+        dom.detach(face);
+        let (wide, narrow) = widths(&style(&dom, child));
+        assert!(wide > narrow * 1.5, "removing the sheet removes its font");
+        assert_eq!(
+            widths(&child_style),
+            retained_widths,
+            "retained layout keeps its immutable environment"
+        );
+        let new_sheet = dom.create_element("style");
+        dom.set_text(new_sheet, &format!("@media (min-width:99999px){{{sheet}}}"));
+        dom.append(dom.frame_body(one).unwrap(), new_sheet);
+        let (wide, narrow) = widths(&style(&dom, child));
+        assert!(
+            wide > narrow * 1.5,
+            "inactive conditional rules cannot activate fonts"
+        );
+        dom.set_text(new_sheet, &sheet);
+        let (wide, narrow) = widths(&style(&dom, child));
+        assert!(
+            (wide - narrow).abs() < 0.01,
+            "dynamic sheet text activates embedded fonts"
+        );
     }
 
     #[test]

@@ -268,6 +268,7 @@ struct HostState {
     import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
     history_slots: Option<Value>,
+    history_traversals: Vec<(u64, i32)>,
     pointer_lock_state: Option<Value>,
     navigator_slots: Option<Value>,
     screen_slots: Option<Value>,
@@ -284,11 +285,21 @@ struct HostState {
 impl HostState {
     fn new(dom: Rc<RefCell<Dom>>, clock: Rc<RealmClock>) -> Self {
         static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        {
+        let (viewport, device_pixel_ratio) = {
             let mut dom = dom.borrow_mut();
-            dom.set_viewport_px(DEFAULT_VIEWPORT.width, DEFAULT_VIEWPORT.height);
-            dom.set_device_pixel_ratio(1.0);
-        }
+            let (width, height) = dom.viewport_px();
+            let viewport = if width == 0.0 && height == 0.0 {
+                dom.set_viewport_px(DEFAULT_VIEWPORT.width, DEFAULT_VIEWPORT.height);
+                DEFAULT_VIEWPORT
+            } else {
+                crate::layout2::Viewport::new(width, height)
+            };
+            // Media Queries 4 §4.1/§5.1 and CSSOM View §4: stylesheet
+            // queries, matchMedia(), and geometry must use the same initial
+            // environment. Do not replace the configured Document viewport
+            // with test defaults while constructing its Window host.
+            (viewport, dom.device_pixel_ratio())
+        };
         Self {
             message_ports: Default::default(),
             dom,
@@ -296,8 +307,8 @@ impl HostState {
             base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
             storage: Default::default(),
             blobs: Default::default(),
-            viewport: Cell::new(DEFAULT_VIEWPORT),
-            device_pixel_ratio: Cell::new(1.0),
+            viewport: Cell::new(viewport),
+            device_pixel_ratio: Cell::new(device_pixel_ratio),
             screen_position: Cell::new((0, 0)),
             geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
             images: Default::default(),
@@ -325,6 +336,7 @@ impl HostState {
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
             history_slots: None,
+            history_traversals: Vec::new(),
             pointer_lock_state: None,
             navigator_slots: None,
             screen_slots: None,
@@ -514,6 +526,7 @@ impl RetainedMemory for HostState {
             import_maps,
             permission_slots,
             history_slots,
+            history_traversals,
             pointer_lock_state,
             navigator_slots,
             screen_slots,
@@ -830,6 +843,13 @@ impl RetainedMemory for HostState {
         }
         if let Some(value) = permission_slots {
             visitor.value(value);
+        }
+        if history_traversals.capacity() != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.history-traversals",
+                history_traversals.as_ptr() as usize,
+                history_traversals.capacity() * std::mem::size_of::<(u64, i32)>(),
+            ));
         }
         if let Some(value) = history_slots {
             visitor.value(value);
@@ -1197,6 +1217,24 @@ mod desktop {
     /// ordinary task. Model a foreground 60 Hz display; if rendering is slow,
     /// re-arming from the next pending update naturally drops missed frames.
     const RENDER_INTERVAL: Duration = Duration::from_micros(16_667);
+    // HTML #event-loop-processing-model permits selecting more than one
+    // already-queued input task before rendering. Allow up to two display
+    // intervals of input work: one moderately expensive edit must not force
+    // a full intermediate paint while later keys accumulate. An empty input
+    // queue still yields immediately, and timers/rendering get their bounded
+    // turn even during a continuous stream. Tasks/checkpoints are not merged.
+    const INPUT_BURST_BUDGET: Duration = Duration::from_micros(33_334);
+    // Leave one display interval for ready background tasks. A host response
+    // can queue a networking task at its checkpoint; a four-millisecond
+    // budget often expired during that handoff, adding another input/render
+    // cycle before its callback. Count and time still bound this preference,
+    // and each selected task/checkpoint runs to completion.
+    const BACKGROUND_SERVICE_BUDGET: Duration = RENDER_INTERVAL;
+    // A short native-input burst is a poor place for an optional full cycle
+    // scan. HTML's checkpoints still complete, including ClearKeptObjects;
+    // ECMA-262 #sec-liveness permits servicing the request after input quiets.
+    // Lumen's allocation safepoints/limits remain active throughout this hint.
+    const INPUT_GC_QUIET_INTERVAL: Duration = Duration::from_millis(150);
 
     /// Run the Lumen page pipeline as a one-shot transformation.
     ///
@@ -1215,6 +1253,7 @@ mod desktop {
             viewport: env.viewport,
             cell_px: env.cell_px,
             device_pixel_ratio: env.device_pixel_ratio,
+            terminal_presentation: env.terminal_presentation,
             screen_position: env.screen_position,
             externals: env.externals.clone(),
             sheets: env.sheets.clone(),
@@ -1361,6 +1400,7 @@ mod desktop {
         outcome: Outcome,
         started: Instant,
         last_render: Option<crate::http::RenderedPage>,
+        terminal_presentation: bool,
         #[cfg(test)]
         last_diagnostic_render: Option<String>,
         live_regions: HashSet<usize>,
@@ -1390,6 +1430,7 @@ mod desktop {
         Timer,
         Render,
         Lifecycle,
+        Maintenance,
     }
 
     struct InteractionTurn {
@@ -1586,10 +1627,17 @@ mod desktop {
             .expect("trust Lumen page actor runtime");
         let wall_origin = Instant::now();
         let mut virtual_origin = trust_number(&mut page, "now").unwrap_or(0.0);
+        // Rotate background sources independently of input and rendering.
+        // Resetting this preference on every key/frame lets a stream of short
+        // timers consume every service opportunity before ready networking.
         let mut prefer_timer = false;
         let mut prefer_platform = false;
         let mut deferred_host_task = None;
         let mut render_deadline = None;
+        let mut last_render_opportunity = Instant::now();
+        let mut interaction_burst_started: Option<Instant> = None;
+        let mut background_service: Option<(Instant, usize)> = None;
+        let mut task_gc_defer_until: Option<Instant> = None;
 
         'event_loop: loop {
             if matches!(
@@ -1597,6 +1645,23 @@ mod desktop {
                 Some(lumen::InterruptReason::Cancelled)
             ) {
                 break;
+            }
+            if task_gc_defer_until.is_some_and(|until| until <= Instant::now()) {
+                task_gc_defer_until = None;
+            }
+            let defer_task_gc = task_gc_defer_until.is_some()
+                || !interactions.is_empty()
+                || hover.has_changed().unwrap_or(false);
+            page.engine.defer_task_garbage_collection(defer_task_gc);
+            if !defer_task_gc && page.engine.has_pending_task_garbage_collection() {
+                let started = Instant::now();
+                page.engine.collect_pending_task_garbage();
+                if page.task_trace.is_some() {
+                    eprintln!(
+                        "lumen: deferred collection elapsed={:.3}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
             let elapsed = wall_origin.elapsed().as_secs_f64() * 1000.0;
             let observed_now = trust_number(&mut page, "now").unwrap_or(virtual_origin + elapsed);
@@ -1608,7 +1673,15 @@ mod desktop {
                 page.render_pending = true;
             }
             if page.render_pending && render_deadline.is_none() {
-                render_deadline = Some(Instant::now() + RENDER_INTERVAL);
+                // Input need not wait an extra frame after its task finishes.
+                // Keep the ordinary-task coalescing interval for background
+                // messages/resources (HTML #event-loop-processing-model).
+                let origin = if interaction_burst_started.is_some() {
+                    last_render_opportunity
+                } else {
+                    Instant::now()
+                };
+                render_deadline = Some(origin + RENDER_INTERVAL);
             }
             let render_due = render_deadline.is_some_and(|deadline| deadline <= Instant::now());
             let platform_ready = trust_bool(&mut page, "hasPlatformTask");
@@ -1623,9 +1696,21 @@ mod desktop {
                 && !trust_bool(&mut page, "hasInitialFramesPending");
 
             let mut immediate = None;
-            if let Ok(command) = interactions.try_recv() {
+            // User interaction retains priority and FIFO order, but a stream
+            // of already queued native keys must leave rendering/timers able
+            // to run. HTML #event-loop-processing-model permits this bounded
+            // task-source preference; no event or checkpoint is coalesced.
+            // Service several short ready tasks between input bursts. A
+            // single task per paint makes timers/messages accumulate even
+            // when each callback is cheap. Bound this preference by both
+            // time and count; an individual HTML task still runs to completion.
+            let yield_interactions = background_service.is_some_and(|(started, count)| {
+                count == 0 || (count < 8 && started.elapsed() < BACKGROUND_SERVICE_BUDGET)
+            }) || interaction_burst_started
+                .is_some_and(|started| started.elapsed() >= INPUT_BURST_BUDGET);
+            if !yield_interactions && let Ok(command) = interactions.try_recv() {
                 immediate = Some(Wake::Interaction(Some(command)));
-            } else if hover.has_changed().unwrap_or(false) {
+            } else if !yield_interactions && hover.has_changed().unwrap_or(false) {
                 immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
             // HTML §8.1.7 lets a user agent choose among runnable task queues while preserving
             // FIFO order within each task source. Browser-state changes such as a viewport resize
@@ -1660,6 +1745,10 @@ mod desktop {
                 // No page-owned source was runnable, so drain the command lane
                 // without manufacturing an idle turn solely for alternation.
                 immediate = Some(Wake::Cmd(Some(command)));
+            } else if let Ok(command) = interactions.try_recv() {
+                immediate = Some(Wake::Interaction(Some(command)));
+            } else if hover.has_changed().unwrap_or(false) {
+                immediate = Some(Wake::Hover(Some(*hover.borrow_and_update())));
             } else if let Some(deadline) = idle_deadline {
                 immediate = Some(Wake::Idle(deadline));
             }
@@ -1668,12 +1757,21 @@ mod desktop {
                 .map(|deadline| Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0));
             let render_wait =
                 render_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-            let (wait, timeout_wake) = match (timer_wait, render_wait) {
+            let (mut wait, mut timeout_wake) = match (timer_wait, render_wait) {
                 (Some(timer), Some(render)) if render < timer => (Some(render), Wake::Render),
                 (Some(timer), _) => (Some(timer), Wake::Timer),
                 (None, Some(render)) => (Some(render), Wake::Render),
                 (None, None) => (None, Wake::Timer),
             };
+            // One maintenance wake ends the hint even on an otherwise quiet
+            // document. No polling or repeated idle collections are needed.
+            if let Some(until) = task_gc_defer_until {
+                let gc_wait = until.saturating_duration_since(Instant::now());
+                if wait.is_none_or(|wait| gc_wait < wait) {
+                    wait = Some(gc_wait);
+                    timeout_wake = Wake::Maintenance;
+                }
+            }
             let wake = immediate.unwrap_or_else(|| {
                 // Lumen's forced host collection is an idle hook, not a task-
                 // boundary hook. A future timer/animation-frame deadline means
@@ -1682,7 +1780,7 @@ mod desktop {
                 // collection before every 16 ms animation sleep made a large
                 // YouTube heap consume a core while callbacks made no DOM
                 // changes. Collect only before a genuinely indefinite park.
-                if wait.is_none() {
+                if wait.is_none() && !defer_task_gc {
                     page.engine.collect_garbage_at_idle();
                 }
                 interrupt.set_deadline(None);
@@ -1700,12 +1798,28 @@ mod desktop {
 
             let _interaction = match &wake {
                 Wake::Interaction(Some(_)) | Wake::Hover(Some(_)) => {
+                    task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
+                    page.engine.defer_task_garbage_collection(true);
+                    background_service = None;
+                    interaction_burst_started.get_or_insert_with(Instant::now);
                     Some(InteractionTurn::begin(&interaction_running, &interrupt))
                 }
                 Wake::Cmd(Some(command)) if command.is_user_interaction() => {
+                    task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
+                    page.engine.defer_task_garbage_collection(true);
+                    background_service = None;
+                    interaction_burst_started.get_or_insert_with(Instant::now);
                     Some(InteractionTurn::begin(&interaction_running, &interrupt))
                 }
-                _ => None,
+                _ => {
+                    interaction_burst_started = None;
+                    if let Some((started, count)) = background_service {
+                        background_service = (count + 1 < 8
+                            && started.elapsed() < BACKGROUND_SERVICE_BUDGET)
+                            .then_some((started, count + 1));
+                    }
+                    None
+                }
             };
 
             if let Some(trace) = page.task_trace.as_mut() {
@@ -1720,15 +1834,16 @@ mod desktop {
                     Wake::Timer => trace.timer_turns += 1,
                     Wake::Render => {}
                     Wake::Lifecycle => trace.lifecycle_turns += 1,
+                    Wake::Maintenance => {}
                 }
             }
 
             match wake {
+                Wake::Maintenance => {}
                 Wake::Interaction(Some(command)) | Wake::Cmd(Some(command)) => {
                     if !dispatch_command(&mut page, command, &events, &interrupt) {
                         break;
                     }
-                    prefer_timer = true;
                     prefer_command = false;
                 }
                 Wake::Hover(Some(hover)) => {
@@ -1744,7 +1859,6 @@ mod desktop {
                     ) {
                         break;
                     }
-                    prefer_timer = true;
                 }
                 Wake::Interaction(None) | Wake::Cmd(None) | Wake::Hover(None) => break,
                 Wake::Host(Some(task)) => {
@@ -1838,7 +1952,17 @@ mod desktop {
                         );
                     }
                     let timer_started = Instant::now();
-                    let ran = dispatch_timer_task(&mut page, real_now, "timer task");
+                    let ran = if animation_frame {
+                        call_trust(
+                            &mut page,
+                            "runRenderingFrame",
+                            &[Value::Num(real_now)],
+                            "animation frame",
+                        )
+                        .is_some_and(|v| v.as_num_opt().is_some_and(|n| n > 0.0))
+                    } else {
+                        dispatch_timer_task(&mut page, real_now, "timer task")
+                    };
                     if page.task_trace.is_some() {
                         eprintln!(
                             "lumen: timer task end ran={ran} elapsed={:.3}s",
@@ -1864,7 +1988,14 @@ mod desktop {
                     if !finished {
                         break;
                     }
-                    prefer_timer = false;
+                    if animation_frame {
+                        last_render_opportunity = Instant::now();
+                        render_deadline = None;
+                        background_service = Some((Instant::now(), 0));
+                    }
+                    if !animation_frame {
+                        prefer_timer = false;
+                    }
                     prefer_command = true;
                 }
                 Wake::Lifecycle => {
@@ -1889,10 +2020,22 @@ mod desktop {
                 }
                 Wake::Render => {
                     render_deadline = None;
-                    if !finish_task_with_ack(&mut page, &events, false) {
+                    prepare_unbounded_task(&interrupt);
+                    let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
+                    let _ = call_trust(
+                        &mut page,
+                        "runRenderingFrame",
+                        &[Value::Num(now)],
+                        "animation frame",
+                    );
+                    checkpoint(&mut page, "animation frame");
+                    if !finish_task_maybe_render(&mut page, &events, false, true, false) {
                         break;
                     }
-                    prefer_timer = true;
+                    last_render_opportunity = Instant::now();
+                    // Rendering must leave time for the other task sources,
+                    // including multiple already-ready short callbacks.
+                    background_service = Some((Instant::now(), 0));
                     prefer_command = true;
                 }
             }
@@ -2061,6 +2204,7 @@ mod desktop {
             outcome,
             started,
             last_render: None,
+            terminal_presentation: env.terminal_presentation,
             #[cfg(test)]
             last_diagnostic_render: None,
             live_regions: HashSet::new(),
@@ -2403,6 +2547,10 @@ mod desktop {
             || trust_bool(page, "hasIdleRequest")
             || trust_bool(page, "hasScrollWork")
             || trust_bool(page, "hasResizeObserver")
+            // Intersection Observer §3.3: observed targets can change at a
+            // later viewport/scroll update even after initial timers end.
+            || trust_bool(page, "hasIntersectionObserver")
+            || trust_bool(page, "hasRenderingUpdate")
             || trust_bool(page, "hasInitialFramesPending")
     }
 
@@ -2459,9 +2607,18 @@ mod desktop {
     }
 
     fn call_trust(page: &mut LumenPage, name: &str, args: &[Value], label: &str) -> Option<Value> {
+        let started = page.task_trace.as_ref().map(|_| Instant::now());
         let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine_call_trust(&mut page.engine, name, args)
         }));
+        if let Some(started) = started
+            && started.elapsed() >= Duration::from_millis(10)
+        {
+            eprintln!(
+                "lumen: {name} elapsed={:.3}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
         match called {
             Ok(Ok(value)) => Some(value),
             Ok(Err(error)) => {
@@ -2539,7 +2696,7 @@ mod desktop {
         {
             eprintln!("lumen: engine-metrics: {metrics}");
         }
-        if page.task_trace.is_some() && started.elapsed() >= Duration::from_secs(1) {
+        if page.task_trace.is_some() && started.elapsed() >= Duration::from_millis(10) {
             eprintln!(
                 "lumen: {label} checkpoint elapsed={:.3}s",
                 started.elapsed().as_secs_f64()
@@ -2731,6 +2888,7 @@ mod desktop {
                             fragments.clone(),
                             cached.boxes.clone(),
                             cached.tracks.clone(),
+                            page.terminal_presentation,
                         )
                     } else {
                         // No root or an unresolved placeholder: preserve the
@@ -2852,6 +3010,86 @@ mod desktop {
     // Command dispatch and event-tail handling are kept below the shared
     // extraction helpers so every task follows the same task → checkpoint →
     // rendering-update sequence from HTML §8.1.7.3.
+
+    fn dispatch_key_command(
+        page: &mut LumenPage,
+        events: &tokio::sync::mpsc::Sender<PageEvt>,
+        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        node: Option<usize>,
+        input: crate::core::KeyInput,
+        edit_key: Option<Option<String>>,
+    ) -> bool {
+        prepare_interaction(page, interrupt);
+        let key = key_name(&input.key);
+        let released = input.state == crate::core::KeyState::Released;
+        let prevented = call_trust(
+            page,
+            "key",
+            &[
+                node.map_or(Value::Null, |node| Value::Num(node as f64)),
+                Value::from_string(key),
+                Value::from_string(input.code),
+                Value::Bool(input.repeat),
+                Value::Bool(input.composing),
+                Value::Bool(input.modifiers.shift),
+                Value::Bool(input.modifiers.control),
+                Value::Bool(input.modifiers.alt),
+                Value::Bool(input.modifiers.meta),
+                Value::Bool(released),
+                Value::Num(input.location as f64),
+            ],
+            if released { "keyup" } else { "keydown" },
+        )
+        .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+        checkpoint(page, if released { "keyup" } else { "keydown" });
+        if let Some((url, replace)) = take_navigation(page) {
+            return send_navigation(events, url, replace);
+        }
+        if !released
+            && !prevented
+            && !input.composing
+            && let (Some(node), Some(Some(text))) = (node, edit_key.as_ref())
+        {
+            let _ = call_trust(
+                page,
+                "formInsertText",
+                &[Value::Num(node as f64), Value::from_string(text.clone())],
+                "text key default",
+            );
+            checkpoint(page, "text key default");
+        }
+        let click_submit = take_click_submit(page);
+        let finished = if edit_key.is_some() {
+            finish_internal_task(page, events)
+        } else {
+            finish_task_with_ack(page, events, click_submit.is_none())
+        };
+        if !finished {
+            return false;
+        }
+        if let Some((form, submitter, submission)) = click_submit {
+            // The authored key action already activated this submitter. Acknowledge
+            // the key before submission so subsequent key-up/default replies stay FIFO.
+            if events
+                .blocking_send(PageEvt::KeyDefault { prevented: true })
+                .is_err()
+            {
+                return false;
+            }
+            return events
+                .blocking_send(PageEvt::SubmitForm {
+                    form,
+                    submitter: Some(submitter),
+                    submission,
+                })
+                .is_ok();
+        }
+        events
+            .blocking_send(PageEvt::KeyDefault {
+                prevented: prevented || edit_key.is_some(),
+            })
+            .is_ok()
+    }
 
     fn dispatch_command(
         page: &mut LumenPage,
@@ -3013,75 +3251,62 @@ mod desktop {
                 true
             }
             PageCmd::Key { node, input } => {
-                prepare_interaction(page, interrupt);
-                let key = key_name(&input.key);
-                let released = input.state == crate::core::KeyState::Released;
-                let prevented = call_trust(
-                    page,
-                    "key",
-                    &[
-                        node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                        Value::from_string(key),
-                        Value::from_string(input.code),
-                        Value::Bool(input.repeat),
-                        Value::Bool(input.composing),
-                        Value::Bool(input.modifiers.shift),
-                        Value::Bool(input.modifiers.control),
-                        Value::Bool(input.modifiers.alt),
-                        Value::Bool(input.modifiers.meta),
-                        Value::Bool(released),
-                        Value::Num(input.location as f64),
-                    ],
-                    if released { "keyup" } else { "keydown" },
-                )
-                .is_some_and(|value| page.engine.ctx().to_boolean(&value));
-                checkpoint(page, if released { "keyup" } else { "keydown" });
-                if let Some((url, replace)) = take_navigation(page) {
-                    return send_navigation(events, url, replace);
-                }
-                let click_submit = take_click_submit(page);
-                if !finish_task_with_ack(page, events, click_submit.is_none()) {
-                    return false;
-                }
-                if let Some((form, submitter, submission)) = click_submit {
-                    // The authored key action already activated this submitter. Acknowledge
-                    // the key before submission so subsequent key-up/default replies stay FIFO.
-                    if events
-                        .blocking_send(PageEvt::KeyDefault { prevented: true })
-                        .is_err()
-                    {
-                        return false;
-                    }
-                    return events
-                        .blocking_send(PageEvt::SubmitForm {
-                            form,
-                            submitter: Some(submitter),
-                            submission,
-                        })
-                        .is_ok();
-                }
-                events
-                    .blocking_send(PageEvt::KeyDefault { prevented })
-                    .is_ok()
+                dispatch_key_command(page, events, interrupt, node, input, None)
+            }
+            PageCmd::EditKey { node, input, text } => {
+                dispatch_key_command(page, events, interrupt, Some(node), input, Some(text))
             }
             PageCmd::SetValue {
                 node,
                 value,
                 checked,
+                commit,
             } => {
                 prepare_interaction(page, interrupt);
                 let checked = checked.map_or(Value::Null, Value::Bool);
-                let _ = call_trust(
+                let result = call_trust(
                     page,
-                    "formSet",
+                    if commit { "formCommit" } else { "formSet" },
                     &[Value::Num(node as f64), Value::from_string(value), checked],
                     "form input",
                 );
+                if result.is_some_and(|v| value_is_nullish(&v)) {
+                    // A canceled beforeinput must restore an optimistic native
+                    // editor even when the canonical DOM did not change.
+                    page.last_render = None;
+                }
                 checkpoint(page, "form input");
                 // HTML #update-the-rendering is a separate task source. An
                 // input listener is not a request to lay out the entire page
                 // after every character. Preserve every input event/checkpoint,
                 // then publish one presentation for the accumulated edits.
+                page.pending_form_acknowledgements.push(node);
+                page.render_pending = true;
+                finish_internal_task(page, events)
+            }
+            PageCmd::EditText { node, value, edit } => {
+                prepare_interaction(page, interrupt);
+                let selection = edit.selection;
+                let result = call_trust(
+                    page,
+                    "formSet",
+                    &[
+                        Value::Num(node as f64),
+                        Value::from_string(value),
+                        Value::Null,
+                        Value::from_string(edit.input_type),
+                        edit.data.map_or(Value::Null, Value::from_string),
+                        selection.map_or(Value::Null, |s| Value::Num(s.start as f64)),
+                        selection.map_or(Value::Null, |s| Value::Num(s.end as f64)),
+                        selection.map_or(Value::Null, |s| Value::Num(s.direction as f64)),
+                        Value::Bool(edit.composing),
+                    ],
+                    "text input",
+                );
+                if result.is_some_and(|v| value_is_nullish(&v)) {
+                    page.last_render = None;
+                }
+                checkpoint(page, "text input");
                 page.pending_form_acknowledgements.push(node);
                 page.render_pending = true;
                 finish_internal_task(page, events)
@@ -3524,6 +3749,26 @@ mod desktop {
         if let Some((url, replace)) = take_navigation(page) {
             return send_navigation(events, url, replace);
         }
+        let traversals = {
+            let state = page
+                .engine
+                .ctx()
+                .host_mut::<HostState>()
+                .expect("History host");
+            std::mem::take(&mut state.history_traversals)
+                .into_iter()
+                .filter(|(context, _)| *context == 0 || state.window_realms.contains_key(context))
+                .map(|(_, delta)| delta)
+                .collect::<Vec<_>>()
+        };
+        for delta in traversals {
+            if events
+                .blocking_send(PageEvt::HistoryTraverse { delta })
+                .is_err()
+            {
+                return false;
+            }
+        }
         let fragment = take_scroll_fragment(page);
         if let Some(value) = call_trust(page, "takePointerLockRequest", &[], "pointer lock request")
             && !value_is_nullish(&value)
@@ -3601,7 +3846,7 @@ mod desktop {
             }
             let render_started = Instant::now();
             let (html, rendered, _) = render_with_observers(page);
-            if page.task_trace.is_some() && render_started.elapsed() >= Duration::from_secs(1) {
+            if page.task_trace.is_some() && render_started.elapsed() >= Duration::from_millis(10) {
                 eprintln!(
                     "lumen: rendering update elapsed={:.3}s boxes={} html={}B",
                     render_started.elapsed().as_secs_f64(),
@@ -3985,6 +4230,7 @@ mod desktop {
                             node,
                             value: "a".repeat(length),
                             checked: None,
+                            commit: false,
                         })
                         .unwrap();
                 }
@@ -4016,6 +4262,455 @@ mod desktop {
             })
             .await
             .expect("queued native edits timed out");
+        }
+
+        #[tokio::test]
+        async fn native_text_rendering_runs_animation_before_resize_observation() {
+            // HTML #update-the-rendering: rAF is part of this rendering
+            // opportunity, before style/layout/ResizeObserver, even when
+            // native editing made the page dirty before the rAF timer expires.
+            let html = r#"<input id=editor><div id=box style="width:10px;height:10px"></div>
+                <output id=result></output><script>
+                const editor=document.getElementById('editor'), box=document.getElementById('box');
+                const result=document.getElementById('result'), seen=[];
+                new ResizeObserver(entries=>{
+                    seen.push(Math.round(entries[0].contentRect.width));
+                    result.textContent='SIZES:'+seen.join(',');
+                }).observe(box);
+                editor.oninput=()=>{
+                    box.style.width='20px';
+                    requestAnimationFrame(()=>{box.style.width='30px'});
+                };
+                </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle
+                    .try_send_user(PageCmd::EditKey {
+                        node,
+                        input: crate::core::KeyInput {
+                            key: crate::core::Key::Character("a".into()),
+                            code: "KeyA".into(),
+                            location: 0,
+                            state: crate::core::KeyState::Pressed,
+                            modifiers: Default::default(),
+                            repeat: false,
+                            composing: false,
+                        },
+                        text: Some("a".into()),
+                    })
+                    .unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(!html.contains(">SIZES:10,20"), "{html}");
+                            if html.contains(">SIZES:10,30</output>") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before rendering"),
+                    }
+                }
+            })
+            .await
+            .expect("animation/observer rendering timed out");
+        }
+
+        #[tokio::test]
+        async fn native_text_bursts_preserve_timer_and_message_progress() {
+            // HTML #event-loop-processing-model: selecting short background
+            // tasks between native input bursts must preserve FIFO within each
+            // source, run each checkpoint, and let all sources keep progressing.
+            let html = r#"<input id=editor><output id=result></output><script>
+                const editor=document.getElementById('editor'), result=document.getElementById('result');
+                let inputs=0, timers=0, messages=0, jobs=0, frames=0, progress=false;
+                const check=(ok,label)=>{if(!ok)throw Error(label)};
+                function report() {
+                    if(inputs===20 && timers===60 && messages===20 && jobs===80 && frames>0) {
+                        check(progress,'other task sources waited for all native keys');
+                        result.textContent='FAIR_COMPLETE';
+                    }
+                }
+                addEventListener('message',e=>{
+                    check(e.data===messages++,'message FIFO');
+                    queueMicrotask(()=>{jobs++; report()});
+                });
+                editor.oninput=()=>{
+                    const index=inputs++;
+                    if(index>0 && index<19 && timers>0 && messages>0 && frames>0) progress=true;
+                    for(let i=0;i<3;i++) setTimeout(()=>{
+                        check(timers===index*3+i,'timer FIFO');
+                        check(jobs===timers+messages,'previous task checkpoint');
+                        timers++; queueMicrotask(()=>{jobs++; report()});
+                    },0);
+                    postMessage(index,'*');
+                    requestAnimationFrame(()=>{frames++; report()});
+                    // Ensure rendering opportunities occur inside this finite
+                    // input stream, independently of machine execution speed.
+                    const end=performance.now()+18;
+                    while(performance.now()<end) {}
+                };
+                </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                for _ in 0..20 {
+                    handle
+                        .user_input_sender()
+                        .send(PageCmd::EditKey {
+                            node,
+                            input: crate::core::KeyInput {
+                                key: crate::core::Key::Character("a".into()),
+                                code: "KeyA".into(),
+                                location: 0,
+                                state: crate::core::KeyState::Pressed,
+                                modifiers: Default::default(),
+                                repeat: false,
+                                composing: false,
+                            },
+                            text: Some("a".into()),
+                        })
+                        .await
+                        .unwrap();
+                }
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains(">FAIR_COMPLETE</output>") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed during native input burst"),
+                    }
+                }
+            })
+            .await
+            .expect("native input starved another task source");
+        }
+
+        #[tokio::test]
+        async fn native_input_and_rendering_preserve_network_source_rotation() {
+            // HTML #event-loop-processing-model: selecting input/rendering
+            // must not restart rotation among other runnable task sources.
+            // The timer exceeds the small service budget, so every background
+            // opportunity is one task. Resetting preference on each key would
+            // choose timers repeatedly and strand all ready XHR callbacks.
+            let html = r#"<input id=editor><output id=result></output><script>
+                const editor=document.getElementById('editor'), result=document.getElementById('result');
+                let inputs=0, timers=0, loads=0, jobs=0, frames=0, progress=false;
+                const check=(ok,label)=>{if(!ok)throw Error(label)};
+                const busy=ms=>{const end=performance.now()+ms;while(performance.now()<end){}};
+                function report() {
+                    if(inputs===20 && timers===20 && loads===20 && jobs===40 && frames>0) {
+                        check(progress,'network callbacks waited for the entire input stream');
+                        result.textContent='NETWORK_ROTATION_COMPLETE';
+                    }
+                }
+                editor.oninput=()=>{
+                    const index=inputs++;
+                    setTimeout(()=>{
+                        check(timers===index,'timer FIFO');
+                        check(jobs===timers+loads,'previous task checkpoint');
+                        busy(24); timers++; queueMicrotask(()=>{jobs++;report()});
+                    },0);
+                    const xhr=new XMLHttpRequest();
+                    xhr.open('GET','data:text/plain,'+index);
+                    xhr.onload=()=>{
+                        check(xhr.responseText===String(loads),'network FIFO');
+                        check(jobs===timers+loads,'network follows previous task checkpoint');
+                        if(inputs<20)progress=true;
+                        loads++; queueMicrotask(()=>{jobs++;report()});
+                    };
+                    xhr.send();
+                    requestAnimationFrame(()=>{frames++;report()});
+                    busy(20);
+                };
+                </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                for _ in 0..20 {
+                    handle
+                        .user_input_sender()
+                        .send(PageCmd::EditKey {
+                            node,
+                            input: crate::core::KeyInput {
+                                key: crate::core::Key::Character("a".into()),
+                                code: "KeyA".into(),
+                                location: 0,
+                                state: crate::core::KeyState::Pressed,
+                                modifiers: Default::default(),
+                                repeat: false,
+                                composing: false,
+                            },
+                            text: Some("a".into()),
+                        })
+                        .await
+                        .unwrap();
+                }
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains(">NETWORK_ROTATION_COMPLETE</output>") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed during native input burst"),
+                    }
+                }
+            })
+            .await
+            .expect("networking failed to progress during native input");
+        }
+
+        #[tokio::test]
+        async fn native_text_gc_deferral_ends_with_future_page_work_pending() {
+            // Collection timing is a host policy, not a WeakRef guarantee.
+            // Exercise the maintenance wake: a future timer must not keep the
+            // input hint active indefinitely, and the input checkpoint still
+            // drains jobs before a collection may clear their kept objects.
+            let html = r#"<input id=editor><output id=result></output><script>
+                const editor=document.getElementById('editor'), result=document.getElementById('result');
+                let garbage, weak, jobs=0;
+                editor.oninput=()=>{
+                    garbage=[];
+                    for(let i=0;i<12000;i++){let o={};o.self=o;garbage.push(o)}
+                    weak=new WeakRef(garbage[0]);
+                    garbage=null;
+                    queueMicrotask(()=>{
+                        if(weak.deref()===undefined) throw Error('kept object lost during job');
+                        jobs++;
+                        result.textContent='CHECKPOINT';
+                    });
+                    setTimeout(()=>{
+                        if(jobs!==1) throw Error('input checkpoint delayed');
+                        if(weak.deref()!==undefined) throw Error('input GC hint did not expire');
+                        result.textContent='COLLECTED';
+                    },1000);
+                };
+                </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle
+                    .try_send_user(PageCmd::EditKey {
+                        node,
+                        input: crate::core::KeyInput {
+                            key: crate::core::Key::Character("a".into()),
+                            code: "KeyA".into(),
+                            location: 0,
+                            state: crate::core::KeyState::Pressed,
+                            modifiers: Default::default(),
+                            repeat: false,
+                            composing: false,
+                        },
+                        text: Some("a".into()),
+                    })
+                    .unwrap();
+                let mut saw_checkpoint = false;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            saw_checkpoint |= html.contains(">CHECKPOINT</output>");
+                            if html.contains(">COLLECTED</output>") {
+                                assert!(saw_checkpoint, "input jobs were not rendered promptly");
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before deferred collection"),
+                    }
+                }
+            })
+            .await
+            .expect("deferred input collection did not complete");
+        }
+
+        #[tokio::test]
+        async fn native_text_keys_observe_cancellation_and_canonical_utf16_selection() {
+            let html = r#"<input id=editor value=old><p id=status>ready</p><script>
+                const editor=document.getElementById('editor'), status=document.getElementById('status');
+                const events=[], inputs=[];
+                const check=(ok,label)=>{if(!ok)throw Error(label)};
+                editor.onkeydown=e=>{
+                    events.push('down:'+e.key);
+                    if(e.key==='a') queueMicrotask(()=>{
+                        editor.value='Q🙂Z'; editor.setSelectionRange(1,3,'backward');
+                    });
+                    if(e.key==='x') e.preventDefault();
+                    if(e.key==='r') editor.readOnly=true;
+                };
+                editor.onbeforeinput=e=>{
+                    check(e.isTrusted && e.cancelable && e.inputType==='insertText','beforeinput flags');
+                    events.push('before:'+e.data);
+                    if(e.data==='q') e.preventDefault();
+                };
+                editor.oninput=e=>{
+                    check(e.isTrusted && !e.cancelable,'input flags');
+                    events.push('input:'+e.data); inputs.push(e.data);
+                    if(e.data==='a') queueMicrotask(()=>{
+                        editor.value='['+editor.value+']'; editor.setSelectionRange(2,2);
+                    });
+                };
+                editor.onkeyup=e=>{
+                    events.push('up:'+e.key);
+                    if(e.key==='a') {
+                        check(editor.value==='[QaZ]' && editor.selectionStart===2,'input checkpoint');
+                        queueMicrotask(()=>editor.setSelectionRange(1,2));
+                    }
+                    if(e.key==='r') {
+                        check(editor.value==='[b🦀aZ]' && editor.selectionStart===4,'canonical insertion');
+                        check(inputs.join(',')==='a,b,🦀','canceled input');
+                        check(events.join('|')==='down:a|before:a|input:a|up:a|down:b|before:b|input:b|up:b|down:x|up:x|down:q|before:q|up:q|down:🦀|before:🦀|input:🦀|up:🦀|down:r|up:r','event order');
+                        status.textContent='KEYS_COMPLETE';
+                    }
+                };
+            </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                for key in ["a", "b", "x", "q", "🦀", "r"] {
+                    for state in [
+                        crate::core::KeyState::Pressed,
+                        crate::core::KeyState::Released,
+                    ] {
+                        handle
+                            .try_send_user(PageCmd::EditKey {
+                                node,
+                                input: crate::core::KeyInput {
+                                    key: crate::core::Key::Character(key.into()),
+                                    code: String::new(),
+                                    location: 0,
+                                    state,
+                                    modifiers: Default::default(),
+                                    repeat: false,
+                                    composing: false,
+                                },
+                                text: (state == crate::core::KeyState::Pressed).then(|| key.into()),
+                            })
+                            .unwrap();
+                    }
+                }
+                let mut keys = 0;
+                let mut painted = false;
+                while keys < 12 || !painted {
+                    match events.recv().await {
+                        Some(PageEvt::KeyDefault { prevented }) => {
+                            assert!(prevented, "actor-owned default must not be applied twice");
+                            keys += 1;
+                        }
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains(">KEYS_COMPLETE</p>") {
+                                let rendered = outcome.rendered.unwrap();
+                                let field = rendered
+                                    .forms
+                                    .iter()
+                                    .flat_map(|form| &form.fields)
+                                    .find(|field| field.live_node == Some(node))
+                                    .unwrap();
+                                assert_eq!(field.value, "[b🦀aZ]");
+                                assert_eq!(field.selection.unwrap().start, 4);
+                                painted = true;
+                            }
+                        }
+                        Some(PageEvt::FormValueApplied { .. }) => panic!(
+                            "actor-owned edits must not acknowledge unrelated optimistic edits"
+                        ),
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed during queued typing"),
+                    }
+                }
+            })
+            .await
+            .expect("native text-key sequence timed out");
+        }
+
+        #[tokio::test]
+        async fn native_key_queued_after_edit_observes_input_checkpoint_before_default() {
+            // UI Events keyboard order is a task-order constraint. The native
+            // frontend may enqueue keyup behind EditText without waiting for
+            // a paint acknowledgement; script changes still reach its next
+            // editing default before KeyDefault is delivered.
+            let html = r#"<input id=editor><p id=status>ready</p><script>
+                const editor = document.getElementById('editor');
+                const status = document.getElementById('status');
+                editor.oninput = () => queueMicrotask(() => {
+                    editor.value = editor.value.toUpperCase();
+                    editor.setSelectionRange(1, 1);
+                });
+                editor.onkeyup = () => {
+                    if (editor.value !== 'HELLO' || editor.selectionStart !== 1)
+                        throw Error('keyup overtook input checkpoint');
+                    editor.value += '!'; status.textContent = 'RELEASED';
+                };
+            </script>"#;
+            let node = Dom::parse_document(html).get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle
+                    .try_send_user(PageCmd::SetValue {
+                        node,
+                        value: "hello".into(),
+                        checked: None,
+                        commit: false,
+                    })
+                    .unwrap();
+                handle
+                    .try_send_user(PageCmd::Key {
+                        node: Some(node),
+                        input: crate::core::KeyInput {
+                            key: crate::core::Key::Character("o".into()),
+                            code: "KeyO".into(),
+                            location: 0,
+                            state: crate::core::KeyState::Released,
+                            modifiers: Default::default(),
+                            repeat: false,
+                            composing: false,
+                        },
+                    })
+                    .unwrap();
+                let (mut acknowledged, mut rendered) = (false, false);
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            rendered |= html.contains("RELEASED");
+                        }
+                        Some(PageEvt::FormValueApplied { node: applied }) => {
+                            assert_eq!(applied, node);
+                            acknowledged = true;
+                        }
+                        Some(PageEvt::KeyDefault { .. }) => {
+                            assert!(acknowledged && rendered);
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("queued key: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before queued key acknowledgement"),
+                    }
+                }
+            })
+            .await
+            .expect("queued key acknowledgement timed out");
         }
 
         #[tokio::test]
@@ -4058,6 +4753,7 @@ mod desktop {
                                 node,
                                 value: "hello".into(),
                                 checked: None,
+                                commit: false,
                             }
                         })
                         .unwrap();
@@ -4148,6 +4844,7 @@ mod desktop {
                             node: input,
                             value: "cats & dogs".into(),
                             checked: None,
+                            commit: false,
                         })
                         .unwrap();
                     handle
@@ -4226,6 +4923,7 @@ mod desktop {
                         node: field,
                         value: "saved draft".to_string(),
                         checked: None,
+                        commit: false,
                     })
                     .unwrap();
                 handle.try_send_user(PageCmd::Focus(None)).unwrap();
@@ -4765,6 +5463,69 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn actor_reports_history_delta_after_click_and_restores_state_on_reply() {
+            let html = r#"<!doctype html><body><button id=target>open</button><output id=result></output>
+                <script>
+                    history.replaceState({view:'start'}, '', null);
+                    target.onclick=()=>{history.pushState({view:'detail'}, '', '#detail');history.go(-1)};
+                    onpopstate=e=>{result.textContent=e.state.view+':'+location.hash};
+                </script>"#;
+            let target = Dom::parse_document(html).get_by_id("target").unwrap();
+            let (handle, mut events) =
+                spawn_page(html.into(), PageEnv::bare("https://example.test/start"));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle.try_send_user(PageCmd::Click(target)).unwrap();
+                let mut saw_push = false;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::HistoryUpdate {
+                            url,
+                            replace: false,
+                        }) => {
+                            assert!(url.ends_with("#detail"));
+                            saw_push = true;
+                        }
+                        Some(PageEvt::HistoryTraverse { delta }) => {
+                            assert!(saw_push, "push precedes traversal");
+                            assert_eq!(delta, -1);
+                            break;
+                        }
+                        Some(PageEvt::Navigate(url) | PageEvt::Replace(url)) => {
+                            panic!("unexpected navigation {url}")
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("history task failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed"),
+                    }
+                }
+                handle
+                    .try_send_user(PageCmd::TraverseHistory {
+                        url: "https://example.test/start".into(),
+                        delta: -1,
+                    })
+                    .unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("start:</output>") => {
+                            break;
+                        }
+                        Some(PageEvt::Patched { patches, .. })
+                            if patches.iter().any(|p| p.html.contains("start:")) =>
+                        {
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("restore failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed"),
+                    }
+                }
+            })
+            .await
+            .expect("history traversal timed out");
+        }
+
+        #[tokio::test]
         async fn actor_reports_spa_history_urls_without_cross_document_navigation() {
             // YouTube's anchor handler cancels the default navigation and then
             // commits /watch with history.pushState(). HTML makes this a
@@ -5027,6 +5788,42 @@ mod desktop {
                 settled_before_timer < 16,
                 "the actor drained the browser command queue before selecting the timer"
             );
+        }
+
+        #[tokio::test]
+        async fn child_observer_registration_requests_its_initial_rendering_opportunity() {
+            // Intersection Observer #pending-initial-observation: observing
+            // a child target needs an update even without a DOM mutation or
+            // animation-frame callback in either Document.
+            let html = r#"<!doctype html><body><iframe style="width:300px;height:200px"
+                srcdoc="<body><div id='target' style='width:40px;height:30px'>waiting</div><script>
+                setTimeout(() => {
+                    const target=document.getElementById('target');
+                    const observer=new IntersectionObserver(entries => {
+                        if(entries[0].isIntersecting) {
+                            target.textContent='CHILD OBSERVED'; observer.disconnect();
+                        }
+                    }); observer.observe(target);
+                }, 100);
+                </script>"></iframe><script>void 0;</script></body>"#;
+            let (_handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(
+                            PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome },
+                        ) if html.contains(">CHILD OBSERVED</div>") => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("child observer: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page retired before child observation"),
+                    }
+                }
+            })
+            .await
+            .expect("child initial intersection notification timed out");
         }
 
         #[tokio::test]
@@ -5550,6 +6347,10 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_owner_document", 1, host_owner_document),
     ("__dom_adopt", 2, host_adopt),
     ("__dom_parent", 1, host_parent),
+    ("__dom_form_owner", 1, host_form_owner),
+    ("__dom_form_named_items", 1, host_form_named_items),
+    ("__dom_window_named_items", 1, host_window_named_items),
+    ("__dom_window_names_epoch", 0, host_window_names_epoch),
     ("__dom_frame_owner", 1, host_frame_owner),
     ("__dom_is_connected", 1, host_is_connected),
     ("__dom_connected_many", 1, host_connected_many),
@@ -5584,11 +6385,13 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_outer_html", 1, host_outer_html),
     ("__dom_insert_adjacent", 3, host_insert_adjacent),
     ("__dom_query", 3, host_query),
+    ("__dom_elements_by_tag", 3, host_elements_by_tag),
     ("__dom_matches", 2, host_matches),
     ("__dom_get_by_id", 1, host_get_by_id),
     ("__dom_upgrade_candidates", 2, host_upgrade_candidates),
     ("__dom_ce_candidates", 1, host_ce_candidates),
     ("__dom_wrapper_subtree", 1, host_wrapper_subtree),
+    ("__dom_rendering_frames", 1, host_rendering_frames),
     ("__dom_clone", 2, host_clone),
     ("__dom_doc_element", 0, host_doc_element),
     ("__html_dda", 0, host_html_dda),
@@ -5627,6 +6430,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__worker_self_post", 1, host_worker_self_post),
     ("__worker_self_close", 0, host_worker_self_close),
     ("__dom_computed", 2, host_computed_style),
+    ("__dom_offset_style", 1, host_offset_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
     ("__match_media", 3, host_match_media),
@@ -5655,6 +6459,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__crypto_aes_gcm", 6, host_crypto_aes_gcm),
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
+    ("__text_decode_utf8", 3, host_text_decode_utf8),
     ("__body_buffer", 1, host_body_buffer),
     ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, host_dom_popover),
@@ -5849,6 +6654,12 @@ fn host_history_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     if op == "slots" {
         return Ok(state.history_slots.get_or_insert(value).clone());
     }
+    if op == "traverse" {
+        let delta = value.as_num_opt().unwrap_or(0.) as i32;
+        let context = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
+        state.history_traversals.push((context, delta));
+        return Ok(Value::Undefined);
+    }
     let context = value.as_num_opt().unwrap_or(0.) as u64;
     Ok(Value::Bool(
         context == 0 || state.window_realms.contains_key(&context),
@@ -5906,17 +6717,23 @@ fn host_callback_api(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     ));
     let name = host_arg_string(ctx, args, 1);
     let length = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.) as usize;
+    let entry_settings = matches!(args.get(3), Some(Value::Bool(true)));
     let retained = operation.clone();
     Ok(ctx.new_native_fn_with_retained_memory(
         &name,
         length,
         Rc::new(move |ctx, this, args| {
-            let source = ctx.script_caller_global();
+            let incumbent = ctx.script_caller_global();
+            let source = if entry_settings {
+                ctx.script_entry_global()
+            } else {
+                incumbent.clone()
+            };
             let arguments = ctx.make_array(args.to_vec());
             ctx.invoke(
                 operation.0.clone(),
                 Value::Undefined,
-                &[source, this, arguments],
+                &[source, this, arguments, incumbent],
             )
         }),
         retained,
@@ -5941,7 +6758,9 @@ fn host_invoke_callback(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     for index in 0..length as usize {
         arguments.push(ctx.member_get(&list, &index.to_string())?);
     }
-    ctx.with_callback_script_caller(&source, |ctx| ctx.invoke(callback, this, &arguments))
+    ctx.with_callback_script_caller(&source, |ctx| {
+        ctx.invoke_callback_entry(callback, this, &arguments)
+    })
 }
 
 fn lumen_registry_matches_canonical_boundary() -> bool {
@@ -6752,6 +7571,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         _ => String::from("text/html"),
     };
     let navigation_timing = args.get(10).cloned().unwrap_or(Value::Null);
+    let about_base_url = args.get(11).cloned().unwrap_or(Value::Null);
     let snapshot = platform_prelude_snapshot().map_err(|error| {
         ctx.make_error(
             "SyntaxError",
@@ -6829,6 +7649,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         realm_ctx.member_set(&config, "url", Value::from_string(url.clone()))?;
         realm_ctx.member_set(&config, "referrer", Value::from_string(referrer.clone()))?;
         realm_ctx.member_set(&config, "navigationTiming", navigation_timing.clone())?;
+        realm_ctx.member_set(&config, "aboutBaseURL", about_base_url.clone())?;
         realm_ctx.member_set(
             &config,
             "documentContentType",
@@ -9533,6 +10354,54 @@ fn host_parent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
     ))
 }
 
+fn host_form_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(host_id_value(
+        host_arg_node(&dom, args, 0).and_then(|id| dom.form_owner(id)),
+    ))
+}
+
+fn host_form_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let handle = host_dom(ctx);
+    let dom = handle.borrow();
+    let mut items = Vec::new();
+    if let Some(form) = host_arg_node(&dom, args, 0) {
+        for node in dom.form_named_items(form) {
+            let id = dom.attr(node, "id").unwrap_or("");
+            let name = dom.attr(node, "name").unwrap_or("");
+            let image = dom.tag_name(node) == Some("img");
+            if image && id.is_empty() && name.is_empty() {
+                continue;
+            }
+            items.extend([
+                Value::Num(node as f64),
+                Value::Bool(image),
+                Value::from_string(id.to_owned()),
+                Value::from_string(name.to_owned()),
+            ]);
+        }
+    }
+    Ok(ctx.make_array(items))
+}
+
+fn host_window_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let handle = host_dom(ctx);
+    let dom = handle.borrow();
+    let mut items = Vec::new();
+    if let Some(document) = host_arg_node(&dom, args, 0) {
+        for (node, frame, id, name) in dom.window_named_items(document) {
+            items.extend([
+                Value::Num(node as f64),
+                Value::Bool(frame),
+                Value::from_string(id.to_owned()),
+                Value::from_string(name.to_owned()),
+            ]);
+        }
+    }
+    Ok(ctx.make_array(items))
+}
+
 /// HTML child-navigable ownership crosses DOM shadow-root/host links. It
 /// must not depend on which Realm has already constructed a wrapper for the
 /// root, or whether the shadow root is exposed to author JavaScript.
@@ -9587,6 +10456,12 @@ fn host_connected_many(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 fn host_dom_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let epoch = dom.borrow().epoch();
+    Ok(Value::Num(epoch as f64))
+}
+
+fn host_window_names_epoch(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let epoch = dom.borrow().window_names_epoch();
     Ok(Value::Num(epoch as f64))
 }
 
@@ -9823,11 +10698,39 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     let arg = args.get(2).cloned().unwrap_or(Value::Undefined);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    let Some(id) = host_arg_node(&dom, args, 0).filter(|id| dom.tag_name(*id) == Some("input"))
+    let Some(id) = host_arg_node(&dom, args, 0)
+        .filter(|id| matches!(dom.tag_name(*id), Some("input" | "textarea")))
     else {
         return Ok(Value::Null);
     };
     Ok(match op.as_str() {
+        "selection-get" => match dom.control_selection(id) {
+            Some(s) => ctx.make_array(vec![
+                Value::Num(s.start as f64),
+                Value::Num(s.end as f64),
+                Value::Num(s.direction as f64),
+            ]),
+            None => Value::Null,
+        },
+        "selection-set" => {
+            let mut values = [0.0; 3];
+            for (index, value) in values.iter_mut().enumerate() {
+                *value = ctx
+                    .member_get(&arg, &index.to_string())
+                    .ok()
+                    .and_then(|v| v.as_num_opt())
+                    .unwrap_or(0.0);
+            }
+            Value::Bool(dom.set_control_selection(
+                id,
+                crate::doc::ControlSelection {
+                    start: values[0] as u32,
+                    end: values[1] as u32,
+                    direction: values[2] as i8,
+                },
+            ))
+        }
+        _ if dom.tag_name(id) != Some("input") => Value::Null,
         "type" => Value::from_string(dom.input_type(id)),
         "get" => Value::from_string(dom.input_value(id)),
         "set" | "user" => {
@@ -10020,6 +10923,29 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(Value::Undefined)
 }
 
+fn host_elements_by_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = host_arg_string(ctx, args, 1);
+    let namespace = match args.get(2) {
+        None | Some(Value::Undefined) => None,
+        Some(Value::Null) => Some(String::new()),
+        _ => Some(host_arg_string(ctx, args, 2)),
+    };
+    let dom = host_dom(ctx);
+    let (ids, epoch, connected) = {
+        let dom = dom.borrow();
+        let root = host_arg_node(&dom, args, 0);
+        (
+            root.map_or_else(Vec::new, |root| {
+                dom.elements_by_tag_name(root, &name, namespace.as_deref())
+            }),
+            dom.epoch(),
+            root.is_some_and(|root| dom.is_connected(root)),
+        )
+    };
+    let ids = host_ids_array(ctx, ids);
+    Ok(ctx.make_array(vec![ids, Value::Num(epoch as f64), Value::Bool(connected)]))
+}
+
 fn host_query(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let selector = host_arg_string(ctx, args, 1);
     let first_only = matches!(args.get(2), Some(Value::Bool(true)));
@@ -10093,6 +11019,23 @@ fn host_wrapper_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         host_arg_node(&dom, args, 0)
             .map(|root| dom.wrapper_subtree_ids(root))
             .unwrap_or_default()
+    };
+    Ok(host_ids_array(ctx, ids))
+}
+
+/// HTML #update-the-rendering orders child Documents by their containers'
+/// shadow-including tree order (DOM #concept-shadow-including-tree-order).
+/// Filter in the canonical arena so scheduling does not allocate/iterate a
+/// JavaScript entry for every unrelated node after each input/DOM mutation.
+fn host_rendering_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let ids = {
+        let dom = dom.borrow();
+        let mut ids = host_arg_node(&dom, args, 0)
+            .map(|root| dom.wrapper_subtree_ids(root))
+            .unwrap_or_default();
+        ids.retain(|&id| matches!(dom.tag_name(id), Some("iframe" | "frame")));
+        ids
     };
     Ok(host_ids_array(ctx, ids))
 }
@@ -10660,6 +11603,17 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
             None => Value::Null,
         },
     )
+}
+
+fn host_offset_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    if host_dom(ctx).borrow().has_container_queries() {
+        let _ = ensure_host_geom_cache(ctx, "offset-container-query");
+    }
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Num(
+        host_arg_node(&dom, args, 0).map_or(0.0, |id| f64::from(dom.cssom_offset_style(id))),
+    ))
 }
 
 /// CSSOM View §4.1: parse and evaluate the media query list against the document environment.
@@ -11309,6 +12263,60 @@ fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ctx.make_uint8array(text.as_bytes())
 }
 
+/// Encoding #utf-8-decoder and #concept-encoding-process. Rust's UTF-8
+/// validator reports the same maximal valid prefix of an ill-formed sequence:
+/// consume that prefix and restore the non-continuation byte, or retain an
+/// incomplete sequence until the stream ends. Bulk validation avoids a JS
+/// property read and string allocation for every response byte.
+fn host_text_decode_utf8(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let bytes = args
+        .first()
+        .and_then(|value| ctx.buffer_source_bytes(value, true))
+        .ok_or_else(|| ctx.make_error("TypeError", "Text is not an attached BufferSource"))?;
+    let stream = matches!(args.get(1), Some(Value::Bool(true)));
+    let fatal = matches!(args.get(2), Some(Value::Bool(true)));
+    let mut remaining = bytes.as_slice();
+    let mut output = String::new();
+    let mut failed = false;
+    loop {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                output.push_str(text);
+                remaining = &[];
+                break;
+            }
+            Err(error) => {
+                let (valid, rest) = remaining.split_at(error.valid_up_to());
+                output.push_str(std::str::from_utf8(valid).expect("validated UTF-8 prefix"));
+                remaining = rest;
+                match error.error_len() {
+                    None if stream => break,
+                    length => {
+                        remaining = &remaining[length.unwrap_or(remaining.len())..];
+                        if fatal {
+                            failed = true;
+                            break;
+                        }
+                        output.push('\u{fffd}');
+                    }
+                }
+            }
+        }
+    }
+    if remaining.is_empty() && !failed {
+        // The common complete-response path needs no state tuple or byte view.
+        return Ok(Value::from_string(output));
+    }
+    // TextDecoder.decode throws before serializing on a fatal error. Preserve
+    // its unconsumed I/O queue so a later streaming call can resume correctly.
+    let pending = ctx.make_uint8array(remaining)?;
+    Ok(ctx.make_array(vec![
+        Value::from_string(output),
+        pending,
+        Value::Bool(failed),
+    ]))
+}
+
 /// Fetch #concept-bodyinit-extract: take a byte-exact snapshot of a BufferSource,
 /// including a view's offset and length, without reading author properties or
 /// converting binary data into a JavaScript string. Web IDL excludes shared,
@@ -11454,6 +12462,100 @@ fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_collections_stay_live_across_detached_moves_and_iteration() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document("<!doctype html><body>")));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const source = document.createElement('div');
+            source.innerHTML = '<i id=first></i>text<!--comment--><b name=last></b>';
+            const nodes = source.childNodes, elements = source.children;
+            if (!(nodes instanceof NodeList) || !(elements instanceof HTMLCollection) ||
+                nodes !== source.childNodes || elements !== source.children) return 'identity';
+            if (nodes.length !== 4 || elements.length !== 2 || elements.namedItem('last') !== nodes[3]) return 'initial';
+            const staticList = source.querySelectorAll('*');
+            const fragment = document.createDocumentFragment(), moved = fragment.childNodes;
+            let count = 0;
+            while (nodes.length && count++ < 10) fragment.appendChild(nodes[0]);
+            if (count !== 4 || nodes.length || elements.length || moved.length !== 4 || staticList.length !== 2) return 'move';
+            document.body.appendChild(fragment);
+            if (moved.length || document.body.childNodes.length !== 4) return 'fragment insertion';
+            source.append(document.createElement('a'), document.createTextNode('x'));
+            const iterator = nodes.values();
+            if (iterator.next().value !== source.firstChild) return 'iterator start';
+            source.appendChild(document.createElement('u'));
+            if (Array.from(iterator).length !== 2) return 'iterator liveness';
+            const seen = [];
+            nodes.forEach((node, index, list) => {
+                if (list !== nodes) throw new Error('callback receiver');
+                seen.push(node);
+                if (!index) source.appendChild(document.createElement('em'));
+            });
+            if (seen.length !== 3 || nodes.length !== 4) return 'forEach length';
+            nodes[0].remove();
+            if (nodes.item(0).nodeType !== 3 || nodes.item(50) !== null || nodes[50] !== undefined || '3' in nodes) return 'indices';
+            if (Reflect.set(nodes, '0', null) || Reflect.defineProperty(nodes, '0', {value:null})) return 'readonly';
+            const observed = new MutationObserver(() => {});
+            observed.observe(source, {childList:true});
+            const old = Array.from(nodes);
+            source.textContent = 'replacement';
+            const records = observed.takeRecords();
+            if (records.length !== 1 || records[0].removedNodes.length !== old.length ||
+                records[0].removedNodes[0] !== old[0] || nodes.length !== 1) return 'observer snapshot';
+            source.innerHTML = '<strong id=new></strong>';
+            if (elements.length !== 1 || elements.namedItem('new') !== source.firstChild) return 'replace';
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn tag_name_collections_are_live_and_do_not_parse_selectors() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><div id=root><p id=first></p><svg><linearGradient id=gradient /></svg></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const root = document.getElementById('root');
+            root.querySelectorAll = () => { throw new Error('must not parse selectors'); };
+            const list = root.getElementsByTagName('P');
+            if (!(list instanceof HTMLCollection) || list.length !== 1 || list.namedItem('first') !== list[0]) return 'collection';
+            const added = document.createElement('p'); added.id = 'second'; root.appendChild(added);
+            if (list.length !== 2 || list[1] !== added) return 'append';
+            list[0].remove();
+            if (list.length !== 1 || list.item(0) !== added || list.item(1) !== null) return 'remove';
+            if (root.getElementsByTagName('div').length || root.getElementsByTagName('.').length || root.getElementsByTagName('').length) return 'name matching';
+            if (root.getElementsByTagName('linearGradient').length !== 1 || root.getElementsByTagName('lineargradient').length) return 'foreign case';
+            const shadow = root.attachShadow({mode:'open'}); shadow.innerHTML = '<p></p>';
+            if (list.length !== 1) return 'shadow boundary';
+            const xml = new DOMParser().parseFromString('<r xmlns:fd="urn:feed"><fd:body id="body"/><Body/><body/></r>', 'application/xml');
+            const bodies = xml.getElementsByTagName('fd:body');
+            if (bodies.length !== 1 || bodies[0].localName !== 'body') return 'qualified name';
+            if (xml.getElementsByTagName('Body').length !== 1 || xml.getElementsByTagName('BODY').length) return 'XML case';
+            if (xml.getElementsByTagNameNS('urn:feed', 'body')[0] !== bodies[0]) return 'namespace';
+            if (xml.getElementsByTagNameNS('*', 'body').length !== 2 || xml.getElementsByTagNameNS('', 'body').length !== 1) return 'namespace wildcard';
+            const clone = bodies[0].cloneNode(true); xml.documentElement.appendChild(clone);
+            if (bodies.length !== 2) return 'XML live';
+            if (xml.getElementsByTagName('*').length !== 5) return 'wildcard';
+            let rejected = false;
+            try { xml.querySelectorAll('fd:body'); } catch(e) { rejected = e.name === 'SyntaxError'; }
+            return rejected ? 'ok' : 'CSS syntax';
+        })()"#
+            ),
+            "ok"
+        );
+    }
 
     #[test]
     fn selector_syntax_errors_enable_library_visibility_fallback() {
@@ -11643,6 +12745,7 @@ mod tests {
                 fragments.clone(),
                 cached.boxes.clone(),
                 cached.tracks.clone(),
+                true,
             )
         };
         assert_eq!(
@@ -11886,6 +12989,100 @@ mod tests {
             HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
             DEFAULT_URL,
         )
+    }
+
+    #[test]
+    fn text_control_selection_and_native_input_events_follow_the_editing_algorithms() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><input id=q value='A😀BC'><input id=other><textarea id=area></textarea>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const check=(v,m)=>{if(!v)throw Error(m)};
+            const q=document.getElementById('q'), other=document.getElementById('other');
+            check(q.selectionStart===0 && q.selectionEnd===0,'initial cursor');
+            q.setSelectionRange(1,3,'backward');
+            check(q.selectionStart===1 && q.selectionEnd===3 && q.selectionDirection==='backward','UTF16 selection');
+            q.value=q.value; check(q.selectionStart===1,'same value preserves selection');
+            q.focus();
+            const events=[];
+            for(const t of ['beforeinput','input','change','blur']) q.addEventListener(t,e=> {
+                check(e.isTrusted,'native event trust');
+                if(t==='beforeinput') {
+                    check(e instanceof InputEvent && e.cancelable && e.composed && e.data==='X' && e.inputType==='insertText','beforeinput metadata');
+                    check(q.value==='A😀BC' && q.selectionEnd===3,'beforeinput old value and selection');
+                }
+                if(t==='input') check(!e.cancelable && e.composed && q.value==='AXBC' && q.selectionStart===2,'input committed value and cursor');
+                events.push(t);
+            });
+            __trust.formSet(q.__id,'AXBC',null,'insertText','X',2,2,0,false);
+            check(events.join()==='beforeinput,input','no per-character change');
+            other.focus(); check(events.join()==='beforeinput,input,change,blur','change before blur');
+            other.focus(); other.value='programmatic';
+            let changes=0; other.onchange=()=>changes++; q.focus();
+            check(changes===0,'script value does not produce change');
+            q.onbeforeinput=e=>e.preventDefault();
+            // Use a separate control so metadata assertions above describe one edit.
+            other.focus(); other.onbeforeinput=e=>e.preventDefault();
+            check(__trust.formSet(other.__id,'cancelled',null,'insertText','!',0,0,0,false)===null,'canceled edit result');
+            check(other.value==='programmatic' && other.selectionStart===12,'canceled edit preserves state');
+            other.onbeforeinput=null; other.setSelectionRange(4,1,'invalid');
+            check(other.selectionStart===1 && other.selectionEnd===1 && other.selectionDirection==='none','reversed range');
+            other.selectionStart=5; check(other.selectionStart===5 && other.selectionEnd===5,'start expands end');
+            other.selectionEnd=2; check(other.selectionStart===2 && other.selectionEnd===2,'end collapses start');
+            other.setSelectionRange(-1,-1); check(other.selectionStart===12,'unsigned long conversion');
+            other.type='number'; check(other.selectionStart===null && other.selectionDirection===null,'non-text getters');
+            let invalid=false;try{other.setSelectionRange(0,1)}catch(e){invalid=e.name==='InvalidStateError'}
+            check(invalid,'non-text setter throws');
+            const area=document.getElementById('area'); area.value='A\r\n😀B';
+            check(area.value==='A\n😀B' && area.selectionStart===5,'textarea API value');
+            area.setSelectionRange(2,4,'backward'); check(area.selectionDirection==='backward','textarea direction');
+            return 'text-controls-ok';
+        })()"#
+            ),
+            "text-controls-ok"
+        );
+    }
+
+    #[test]
+    fn first_script_media_queries_and_geometry_use_the_configured_environment() {
+        for (width, density, expected) in [
+            (1920, 1.0, "1920,1,true,false,600,10"),
+            (960, 2.0, "960,2,false,true,300,20"),
+            (1920, 2.0, "1920,2,true,true,600,20"),
+        ] {
+            let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+            env.viewport = (width, 800);
+            env.cell_px = (1, 1);
+            env.device_pixel_ratio = density;
+            let (html, outcome) = transform(
+                r#"<!doctype html><style>
+                    #grid { width:300px; height:10px }
+                    @media (min-width:1500px) { #grid { width:600px } }
+                    @media (min-resolution:2dppx) { #grid { height:20px } }
+                </style><div id=grid></div><script>
+                    const grid = document.getElementById('grid');
+                    grid.setAttribute('data-first', [innerWidth,devicePixelRatio,
+                        matchMedia('(min-width:1500px)').matches,
+                        matchMedia('(min-resolution:2dppx)').matches,
+                        grid.clientWidth,grid.clientHeight].join());
+                </script>"#,
+                &env,
+            );
+            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+            assert!(
+                html.contains(&format!("data-first=\"{expected}\"")),
+                "{html}"
+            );
+        }
     }
 
     #[test]
@@ -12483,7 +13680,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 155, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 163, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -12494,7 +13691,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 155);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 163);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -12568,6 +13765,153 @@ mod tests {
             ),
             "true|1|true|true|true|true|0|undefined"
         );
+    }
+
+    #[test]
+    fn window_named_visibility_checks_support_before_prototypes() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"(function () {
+                    const html = document.createElement('html'), body = document.createElement('body');
+                    document.appendChild(html); html.appendChild(body);
+                    const element = document.createElement('b'); element.id = 'supportedName'; body.appendChild(element);
+                    const global = window, prototype = Object.getPrototypeOf(global);
+                    const properties = Object.getPrototypeOf(Window.prototype);
+                    const get = Object.getOwnPropertyDescriptor, set = Object.setPrototypeOf;
+                    let calls = 0, absent, present, hidden, revoke = false;
+                    const target = Object.create(prototype);
+                    const probe = new Proxy(target, {
+                        getOwnPropertyDescriptor(t, key) {
+                            calls++;
+                            if (revoke && key === 'supportedName') { revoke = false; element.removeAttribute('id'); }
+                            return get(t, key);
+                        }
+                    });
+                    try {
+                        set(global, probe);
+                        absent = get(properties, 'unsupportedName');
+                        if (absent !== undefined || calls !== 0) throw Error('unsupported name traversed prototypes');
+                        present = get(properties, 'supportedName');
+                        if (!present || present.value !== element || calls === 0) throw Error('supported name visibility');
+                        Object.defineProperty(target, 'supportedName', {value: 42, configurable: true});
+                        hidden = get(properties, 'supportedName');
+                        if (hidden !== undefined) throw Error('prototype property must mask the named value');
+                        delete target.supportedName; revoke = true;
+                        const removed = get(properties, 'supportedName');
+                        if (!removed || !(removed.value instanceof HTMLCollection) || removed.value.length !== 0)
+                            throw Error('named getter must observe removal during prototype visibility');
+                        if (get(properties, 'supportedName') !== undefined) throw Error('later lookup must see unsupported name');
+                    } finally { set(global, prototype); }
+                    return 'window-named-visibility-ok';
+                })()"##
+                ),
+                "window-named-visibility-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_named_access_uses_native_names_and_document_tree_order() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"(function () {
+                    function assert(value, message) { if (!value) throw Error(message); }
+                    const html = document.createElement('html'), body = document.createElement('body');
+                    document.appendChild(html); html.appendChild(body);
+                    body.innerHTML = '<form name="named"><input id="entry"></form><img id="named" name="named">' +
+                        '<div name="excluded"></div><svg><g id="vector"></g></svg><div id="host"></div>';
+                    const form = body.firstElementChild, image = form.nextElementSibling;
+                    const input = form.firstElementChild;
+                    const vector = document.getElementById('vector');
+                    const host = document.getElementById('host');
+                    host.attachShadow({mode:'open'}).innerHTML = '<b id="shadowOnly"></b>';
+                    const foreign = document.createElementNS('urn:foreign', 'img');
+                    foreign.setAttribute('name', 'foreignName'); body.appendChild(foreign);
+                    const frame = document.createElement('iframe'); frame.name = 'child'; body.appendChild(frame);
+                    const child = frame.contentWindow;
+                    child.document.body.innerHTML = '<b id="childOnly"></b><iframe name="grandchild"></iframe>';
+                    const first = window.named;
+                    assert(first instanceof HTMLCollection && first.length === 2 && first[0] === form && first[1] === image,
+                        'tree order, name/id union, duplicate element suppression');
+                    assert(window.vector === vector && window.child === child && length === 1, 'ID and child navigable');
+                    assert(!('excluded' in window) && !('foreignName' in window) && !('shadowOnly' in window) &&
+                        !('childOnly' in window) && !('grandchild' in window), 'element eligibility and document boundaries');
+                    assert(child.childOnly === child.document.body.firstElementChild && child.length === 1,
+                        'child names use its own document');
+                    const nativeNames = __dom_window_named_items;
+                    let exports = 0;
+                    __dom_window_named_items = function (id) { exports++; return nativeNames(id); };
+                    try {
+                        for (const value of ['t', 'ty', 'typing']) {
+                            input.value = value; body.style.color = value === 't' ? 'red' : 'blue';
+                            input.className = value; input.title = value;
+                            assert(window.named === first && first.length === 2 && window.entry === input,
+                                'unrelated mutations preserve live named values');
+                        }
+                        assert(exports === 0, 'typing and styling do not re-export the named candidate tree');
+                    } finally { __dom_window_named_items = nativeNames; }
+                    body.insertBefore(image, form);
+                    assert(first[0] === image && first[1] === form, 'saved collection follows reordering');
+                    image.name = 'renamed'; image.removeAttribute('id');
+                    assert(window.named === form && first.length === 1 && window.renamed === image, 'rename');
+                    image.remove(); assert(!('renamed' in window), 'removal');
+                    body.appendChild(image); image.name = 'named';
+                    assert(window.named === first && first.length === 2, 'restored collection identity');
+                    child.document.body.appendChild(image);
+                    assert(window.named === form && first.length === 1 &&
+                        child.named === child.document.body.lastElementChild && child.named.__id === image.__id,
+                        'adoption transfers names between document trees');
+                    body.appendChild(image);
+                    assert(window.named === first && first[1] === image && !('named' in child),
+                        'adoption back refreshes both document indexes');
+                    vector.id = 'renamedVector';
+                    assert(!('vector' in window) && window.renamedVector === vector, 'foreign element ID mutation');
+                    vector.id = 'vector';
+                    child.name = 'newChild';
+                    assert(!('child' in window) && window.newChild === child, 'target name without DOM mutation');
+                    const getAttribute = Element.prototype.getAttribute;
+                    const localName = Object.getOwnPropertyDescriptor(Element.prototype, 'localName');
+                    const query = document.querySelectorAll;
+                    let calls = 0;
+                    function poisoned() { calls++; throw Error('author override'); }
+                    input.value = 'next value';
+                    try {
+                        Element.prototype.getAttribute = poisoned;
+                        Object.defineProperty(Element.prototype, 'localName', {configurable:true, get:poisoned});
+                        document.querySelectorAll = poisoned;
+                        assert(window.named === first && first.length === 2 && window.vector === vector &&
+                            !('missingName' in window), 'canonical lookup after mutation');
+                        assert(calls === 0, 'UA named-property algorithm must not call author DOM methods');
+                    } finally {
+                        Element.prototype.getAttribute = getAttribute;
+                        Object.defineProperty(Element.prototype, 'localName', localName);
+                        document.querySelectorAll = query;
+                    }
+                    const opaque = document.createElement('iframe');
+                    opaque.name = 'blockedName'; opaque.src = 'data:text/html,opaque';
+                    body.appendChild(opaque); __trust.hydrateFrames();
+                    const later = document.createElement('iframe'); later.name = 'blockedName'; body.appendChild(later);
+                    assert(!('blockedName' in window), 'first cross-origin target masks a later same-origin name');
+                    opaque.remove();
+                    assert(window.blockedName === later.contentWindow, 'next target becomes visible after removal');
+                    return 'window-native-names-ok';
+                })()"##
+                ),
+                "window-native-names-ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
@@ -16960,8 +18304,8 @@ mod tests {
                 "<!doctype html><html><head><title>x</title></head><body><p>y</p></body></html>",
                 "text/html"
             );
-            const parsedHtml = parsed.childNodes.find(node => node.nodeType === 1);
-            const parsedSections = parsedHtml.children.map(node => node.localName).join(",");
+            const parsedHtml = Array.from(parsed.childNodes).find(node => node.nodeType === 1);
+            const parsedSections = Array.from(parsedHtml.children).map(node => node.localName).join(",");
             const adopted = parsed.adoptNode(root);
 
             const foreignParent = document.createElement("aside");
@@ -17361,6 +18705,119 @@ mod tests {
     }
 
     #[test]
+    fn listener_discovery_tracks_once_abort_connection_and_child_retirement() {
+        // DOM #add-an-event-listener, #remove-an-event-listener and
+        // #concept-event-listener-invoke. Discovery caches must follow the
+        // actual lists, including removal before a once callback is invoked.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                r#"
+                const html = document.createElement('html');
+                const body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const button = document.createElement('button'); body.appendChild(button);
+                const has = (kind, el) => __trust[kind]().includes(el.__id);
+                const check = (value, label) => { if (!value) throw Error(label); };
+                check(!has('clickables', button) && !has('hoverables', button), 'empty');
+                const click = () => {};
+                button.addEventListener('click', click);
+                button.addEventListener('click', click, {once:true});
+                button.click();
+                check(has('clickables', button), 'duplicate must not change once');
+                __trust.clickables().length = 0;
+                check(has('clickables', button), 'returned list is a snapshot');
+                button.removeEventListener('click', click, true);
+                check(has('clickables', button), 'capture mismatch');
+                button.removeEventListener('click', click);
+                check(!has('clickables', button), 'explicit removal');
+                // Event types are exact strings. Network/keyboard listener
+                // churn must preserve both presentation projections while
+                // the corresponding event callbacks still run normally.
+                button.addEventListener('Click', click);
+                check(!has('clickables', button), 'event type is case sensitive');
+                button.removeEventListener('Click', click);
+                button.addEventListener('click', click);
+                button.addEventListener('pointermove', click);
+                check(has('clickables', button) && has('hoverables', button), 'warm both projections');
+                let otherEvents = 0;
+                const other = () => { otherEvents++; };
+                const xhr = new XMLHttpRequest();
+                xhr.addEventListener('readystatechange', other, {once:true});
+                button.addEventListener('keydown', other);
+                xhr.dispatchEvent(new Event('readystatechange'));
+                button.dispatchEvent(new Event('keydown'));
+                button.removeEventListener('keydown', other);
+                check(otherEvents === 2 && has('clickables', button) && has('hoverables', button),
+                    'unrelated event lists remain independent');
+                button.removeEventListener('click', click);
+                check(!has('clickables', button) && has('hoverables', button), 'remove only click');
+                button.addEventListener('mouseenter', click);
+                button.removeEventListener('pointermove', click);
+                check(has('hoverables', button), 'another hover type retains membership');
+                button.removeEventListener('mouseenter', click);
+                check(!has('hoverables', button), 'remove only hover');
+                button.addEventListener('click', () => {
+                    check(!has('clickables', button), 'once removed before callback');
+                }, {once:true});
+                check(has('clickables', button), 'once addition'); button.click();
+                const abort = new AbortController();
+                button.addEventListener('pointermove', click, {signal:abort.signal});
+                button.addEventListener('click', click, {signal:abort.signal});
+                check(has('hoverables', button) && has('clickables', button), 'signal addition');
+                abort.abort();
+                check(!has('hoverables', button) && !has('clickables', button), 'abort removal');
+                button.addEventListener('click', click, {signal:abort.signal});
+                check(!has('clickables', button), 'already aborted');
+                button.addEventListener('mouseover', click);
+                button.addEventListener('click', click);
+                check(has('hoverables', button) && has('clickables', button), 'connected');
+                button.remove();
+                check(!has('hoverables', button) && !has('clickables', button), 'detached');
+                button.addEventListener('pointermove', other);
+                button.removeEventListener('mouseover', click);
+                check(!has('hoverables', button), 'detached registration is not a render target');
+                body.appendChild(button);
+                check(has('hoverables', button) && has('clickables', button), 'reattached');
+                button.removeEventListener('pointermove', other);
+                check(!has('hoverables', button) && has('clickables', button), 'reattached list is current');
+                button.onpointerenter = click;
+                check(has('hoverables', button), 'event handler property adds membership');
+                button.onpointerenter = null;
+                check(!has('hoverables', button), 'event handler property removes membership');
+                const frame = document.createElement('iframe'); body.appendChild(frame);
+                const child = frame.contentDocument.createElement('button');
+                frame.contentDocument.body.appendChild(child);
+                __trust.clickables(); __trust.hoverables();
+                child.addEventListener('click', click);
+                child.addEventListener('mouseenter', click);
+                check(has('clickables', child) && has('hoverables', child), 'child registration');
+                child.removeEventListener('click', click);
+                check(!has('clickables', child) && has('hoverables', child), 'child removal');
+                frame.remove();
+                check(!has('clickables', child) && !has('hoverables', child), 'child retirement');
+                globalThis.discoveryResult = 'ok';
+                "#,
+                "listener discovery",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "discoveryResult"),
+                "ok",
+                "{tier:?}"
+            );
+            assert_eq!(
+                string_value(&mut engine, "__trust.takeErrors()"),
+                "",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn detached_node_listeners_remain_observable_without_staying_render_roots() {
         // DOM removal does not erase a Node's event listener list: retained
         // detached nodes still dispatch, and reinsertion restores them to the
@@ -17620,6 +19077,58 @@ mod tests {
             string_value(&mut engine, "hyperlinkSetterResult"),
             "https://example.com/player?hostBridge=1#destination|https://example.com/player?hostBridge=1#destination|/player|?hostBridge=1|#destination|https://example.test/new|false|:"
         );
+    }
+
+    #[test]
+    fn aria_string_attributes_reflect_nullable_values_on_all_elements() {
+        // WAI-ARIA snapshot 2f5c69b0 #ARIAMixin / #idl-reflection-attribute-values;
+        // HTML #reflect and Web IDL nullable DOMString conversion.
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            function check(condition, message) { if (!condition) throw Error(message); }
+            const elements = [document.createElement('div'),
+                document.createElementNS('http://www.w3.org/2000/svg','g'),
+                document.createElementNS('urn:test','thing')];
+            for (const el of elements) {
+                for (const property of ['role','ariaLabel','ariaAutoComplete','ariaMultiLine',
+                    'ariaColIndexText','ariaBrailleRoleDescription','ariaReadOnly','ariaValueNow']) {
+                    const attribute = property === 'role' ? 'role' : 'aria-' + property.slice(4).toLowerCase();
+                    check(el[property] === null, 'missing ' + property);
+                    const d = Object.getOwnPropertyDescriptor(Element.prototype,property);
+                    check(d.enumerable && d.configurable && !el.hasOwnProperty(property), 'descriptor');
+                    el.setAttribute(attribute,'MiXeD invalid token');
+                    check(el[property] === 'MiXeD invalid token','raw attribute read');
+                    el[property] = false;
+                    check(el.getAttribute(attribute) === 'false','boolean is a string');
+                    el[property] = '';
+                    check(el[property] === '' && el.hasAttribute(attribute),'empty is present');
+                    el[property] = null;
+                    check(el[property] === null && !el.hasAttribute(attribute),'null removes');
+                    el[property] = 'temporary'; el[property] = undefined;
+                    check(el[property] === null && !el.hasAttribute(attribute),'undefined removes');
+                    el[property] = { [Symbol.toPrimitive](hint) { return hint; } };
+                    check(el[property] === 'string','DOMString conversion hint');
+                    try { el[property] = Symbol('invalid'); throw Error('accepted symbol'); }
+                    catch(e) { check(e instanceof TypeError && el[property] === 'string','symbol throws'); }
+                    el.removeAttribute(attribute); check(el[property] === null,'removed externally');
+                }
+            }
+            const descriptor = Object.getOwnPropertyDescriptor(Element.prototype,'ariaLabel');
+            for (const receiver of [null,document,{},Object.create(Element.prototype),new Proxy(elements[0],{})]) {
+                try { descriptor.get.call(receiver); throw Error('accepted receiver'); }
+                catch(e) { check(e instanceof TypeError,'getter brand'); }
+                try { descriptor.set.call(receiver,'label'); throw Error('accepted receiver'); }
+                catch(e) { check(e instanceof TypeError,'setter brand'); }
+            }
+            const el=elements[0], observer=new MutationObserver(()=>{});
+            observer.observe(el,{attributes:true,attributeOldValue:true});
+            el.ariaLabel='Suggestion'; el.ariaLabel=null;
+            const records=observer.takeRecords();
+            check(records.length===2 && records[0].attributeName==='aria-label'
+                && records[0].oldValue===null && records[1].oldValue==='Suggestion','attribute mutations');
+            globalThis.ariaReflectionPassed=true;
+        "#, "ARIA nullable attribute reflection").unwrap();
+        assert_eq!(string_value(&mut engine, "ariaReflectionPassed"), "true");
     }
 
     #[test]
@@ -18701,6 +20210,62 @@ mod tests {
             string_value(&mut engine, "permissionRealmResult"),
             "TypeError|InvalidStateError:true|TypeError|false"
         );
+    }
+
+    #[test]
+    fn history_delta_methods_preserve_receiver_conversion_and_async_state() {
+        // HTML #delta-traverse / #restore-the-history-object-state;
+        // Web IDL #js-long. The frontend chooses a valid target asynchronously.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                    Rc::new(RealmClock::new()),
+                ),
+                "https://example.test/start",
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                const check=(ok,msg)=>{if(!ok)throw Error(msg)};
+                const throws=(f,name)=>{try{f()}catch(e){check(e.name===name,'wrong error '+e);return}throw Error('missing '+name)};
+                const frame=document.createElement('iframe');document.body.append(frame);
+                const childHistory=frame.contentWindow.history, borrowedGo=childHistory.go;
+                history.pushState({n:1},'', '#one');
+                history.state.n=99;
+                history.pushState({n:2},'', '#two');
+                history.pushState({n:3},'', '#three');
+                let events=[];
+                addEventListener('popstate',e=>{events.push('pop:'+e.state.n);check(e.isTrusted,'trusted popstate')});
+                addEventListener('hashchange',()=>events.push('hash'));
+                frame.remove();
+                borrowedGo.call(history, -2.8);
+                check(location.hash==='#three'&&history.state.n===3&&!events.length,'traversal must be asynchronous');
+                __trust.traverseHistory('https://example.test/start#one',-2);
+                check(history.state.n===1&&location.hash==='#one','restore serialized state');
+                check(events.join(',')==='pop:1','popstate before queued hashchange');
+                __trust.runPlatformTask();
+                check(events.join(',')==='pop:1,hash','queued hashchange');
+                history.forward(); history.back(); history.go(4294967295);
+                let converted=false;
+                throws(()=>borrowedGo.call({}, {valueOf(){converted=true;return 1}}),'TypeError');
+                check(!converted,'brand before conversion');
+                throws(()=>borrowedGo.call(childHistory, Symbol()),'TypeError');
+                throws(()=>borrowedGo.call(childHistory, -1),'SecurityError');
+                throws(()=>history.go(1n),'TypeError');
+                for(const value of [undefined,null,NaN,Infinity,0]){
+                    history.go(value);
+                    const request=__trust.takeNavigationRequest();
+                    check(request&&request[0]===location.href&&request[1]==='reload','zero delta reload');
+                }
+            "#, "history delta methods").unwrap();
+            let pending = &engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .history_traversals;
+            assert_eq!(pending, &[(0, -2), (0, 1), (0, -1), (0, -1)], "{tier:?}");
+        }
     }
 
     #[test]
@@ -20046,7 +21611,7 @@ mod tests {
             runtime.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
         let address = listener.local_addr().unwrap();
         let (request_tx, request_rx) = std::sync::mpsc::channel();
-        runtime.spawn(async move {
+        let serve = async move {
             for _ in 0..2 {
                 let Ok(Ok((mut socket, _))) =
                     tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
@@ -20090,7 +21655,7 @@ mod tests {
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
-        });
+        };
 
         let page = url::Url::parse(&format!("http://{address}/speedometer/index.html")).unwrap();
         let cache = Arc::new(crate::http::PageCache::default());
@@ -20099,6 +21664,10 @@ mod tests {
         let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
         state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
         let mut engine = configured_engine(state, page.as_str());
+        // Start the request deadline after unrelated platform bootstrap.
+        // Compiling the initial prelude can otherwise exhaust the server's
+        // accept timeout before this test initiates its first navigation.
+        runtime.spawn(serve);
 
         eval(
             &mut engine,
@@ -20356,6 +21925,95 @@ mod tests {
             string_value(&mut engine, "recreatedIframeRegistryResult"),
             "first|true|FirstFrameDefinition|SecondFrameDefinition|second"
         );
+    }
+
+    #[test]
+    fn location_navigation_uses_the_entry_document_base_across_frame_realms() {
+        // HTML #dom-location-replace / #entry-settings-object / #fallback-base-url.
+        let mut engine = platform_engine();
+        eval(&mut engine,r##"
+            function check(x,m) { if(!x) throw Error(m); }
+            const html=document.createElement('html'),head=document.createElement('head'),body=document.createElement('body');
+            document.appendChild(html);html.appendChild(head);html.appendChild(body);
+            const base=document.createElement('base');base.href='https://example.org/parent/';head.appendChild(base);
+            const frame=document.createElement('iframe');body.appendChild(frame);
+            const child=frame.contentWindow;
+            check(child.location.href==='about:blank','initial URL');
+            check(child.document.baseURI==='https://example.org/parent/','inherited blank base');
+            base.href='https://example.org/changed/';
+            check(child.document.baseURI==='https://example.org/parent/','base captured at creation');
+            child.eval("const b=document.createElement('base');b.href='https://example.org/child/';document.head.appendChild(b);globalThis.go=()=>location.replace('inside');");
+            child.location.replace('preview?q=test');
+            check(child.__trust.navigation==='https://example.org/changed/preview?q=test','parent entry replace');
+            child.go();
+            check(child.__trust.navigation==='https://example.org/changed/inside','foreign function retains entry');
+            child.location.assign('assigned');
+            check(child.__trust.navigation==='https://example.org/changed/assigned','assign entry');
+            child.location.href='setter';
+            check(child.__trust.navigation==='https://example.org/changed/setter','href entry');
+            child.location='window-setter';
+            check(child.__trust.navigation==='https://example.org/changed/window-setter','Window.location forwards entry');
+            child.eval("document.body.addEventListener('click',go)");
+            child.document.body.dispatchEvent(new child.Event('click'));
+            check(child.__trust.navigation==='https://example.org/child/inside','event callback enters child');
+            check(location.href==='https://example.com/','parent not navigated');
+            globalThis.locationEntryPassed=true;
+        "##,"Location entry settings and blank base").unwrap();
+        assert_eq!(string_value(&mut engine, "locationEntryPassed"), "true");
+    }
+
+    #[test]
+    fn child_location_navigation_loads_its_document_without_changing_frame_attributes() {
+        // HTML #location-object-navigate targets the Location's navigable;
+        // #process-the-iframe-attributes is a different navigation trigger.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"(() => {
+                const check=(v,m)=>{if(!v)throw Error(m)};
+                const page=html=>URL.createObjectURL(new Blob([html],{type:'text/html'}));
+                const html=document.createElement('html'),body=document.createElement('body');
+                document.appendChild(html);html.appendChild(body);
+                const f=document.createElement('iframe');f.srcdoc='<p>original</p>';body.appendChild(f);
+                __trust.hydrateFrames();
+                while(__trust.hasPlatformTask())__trust.runPlatformTask();
+                const original=f.contentDocument, attr=f.srcdoc;
+                let loads=0;f.onload=()=>loads++;
+                f.contentWindow.location.replace(page('<body><p id="new">replacement</p></body>'));
+                check(__trust.takeNavigationRequest()===null,'parent has no navigation');
+                check(f.contentDocument===original,'load stays asynchronous');
+                while(__trust.hasPlatformTask())__trust.runPlatformTask();
+                check(f.contentDocument!==original,'document replaced');
+                check(f.contentDocument.getElementById('new')?.textContent==='replacement','new document parsed: '+f.contentDocument.body.innerHTML+' '+__trust.takeErrors());
+                check(f.srcdoc===attr && !f.hasAttribute('src'),'content attributes preserved');
+                check(f.contentDocument.getElementById('new')!==null,'getter does not restore srcdoc');
+                check(loads===1,'one frame load');
+                f.contentWindow.location.reload();
+                __trust.takeNavigationRequest();
+                while(__trust.hasPlatformTask())__trust.runPlatformTask();
+                check(loads===2,'equal URL reload not deduplicated');
+                const inner=f.contentDocument.createElement('iframe');f.contentDocument.body.appendChild(inner);
+                inner.contentWindow.location.href=f.contentWindow.URL.createObjectURL(
+                    new f.contentWindow.Blob(['<p id="nested">nested</p>'],{type:'text/html'}));
+                __trust.takeNavigationRequest();
+                while(__trust.hasPlatformTask())__trust.runPlatformTask();
+                check(inner.contentDocument.getElementById('nested')?.textContent==='nested','descendant signal drained: '+inner.contentDocument.body.innerHTML+' '+__trust.takeErrors());
+                check(location.href==='https://example.com/','top document preserved');
+                f.contentWindow.location.assign(page('<p>cancelled</p>'));
+                __trust.takeNavigationRequest();f.remove();
+                while(__trust.hasPlatformTask())__trust.runPlatformTask();
+                check(f.contentWindow===null && loads===2,'removed navigable remains destroyed');
+                return 'child-location-navigation-ok';
+            })()"##
+                ),
+                "child-location-navigation-ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
@@ -21178,6 +22836,32 @@ mod tests {
     }
 
     #[test]
+    fn submit_method_can_plan_navigation_inside_a_canceled_submit_event() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            body.innerHTML = '<form action="/search"><input name=q value=query><button>go</button></form>';
+            const form = document.querySelector('form');
+            let events = 0;
+            form.addEventListener('submit', event => {
+                events++;
+                event.preventDefault();
+                form.requestSubmit(); // The event-dispatching path still guards recursion.
+                form.submit();
+            });
+            __trust.click(form.querySelector('button').__id);
+            const planned = __trust.takeFormSubmit();
+            globalThis.submitInsideEvent = events + '|' + planned + '|' + __trust.takeFormSubmit();
+            globalThis.expectedSubmitInsideEvent = '1|' + form.__id + ',|';
+        "#, "submit inside canceled event").unwrap();
+        assert_eq!(
+            string_value(&mut engine, "submitInsideEvent"),
+            string_value(&mut engine, "expectedSubmitInsideEvent")
+        );
+    }
+
+    #[test]
     fn iframe_native_click_enters_the_target_realm() {
         // DOM dispatch uses the hit target's listener list, not a wrapper in
         // the embedding Window. Exercise the same entry point as PageCmd::Click.
@@ -21211,6 +22895,46 @@ mod tests {
             string_value(&mut engine, "nativeFrameClickResult"),
             "true|true|true|true|true|document|window|0"
         );
+    }
+
+    #[test]
+    fn iframe_native_text_insertion_uses_child_selection_and_event_realm() {
+        // UI Events #events-inputevents / HTML #textFieldSelection: a native
+        // insertion targets the control's Document and its current UTF-16 range.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"(() => {
+                const html=document.createElement('html'), body=document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const frame=document.createElement('iframe');
+                frame.srcdoc='<input id=q value="A🙂Z"><script>'+
+                    'const q=document.getElementById("q"), seen=[];'+
+                    'q.setSelectionRange(1,3,"backward");'+
+                    'q.onbeforeinput=e=>{seen.push(e instanceof InputEvent,e.view===window,'+
+                    'e.isTrusted,e.data,q.value,q.selectionStart,q.selectionEnd);'+
+                    'if(e.data==="x")e.preventDefault()};'+
+                    'q.oninput=e=>{seen.push(e instanceof InputEvent,e.view===window,'+
+                    'e.isTrusted,q.value,q.selectionStart);'+
+                    'document.body.setAttribute("data-seen",seen.join("|"))};'+
+                    '<\/script>';
+                body.appendChild(frame); __trust.hydrateFrames();
+                let parentEvents=0; document.oninput=()=>parentEvents++;
+                const q=frame.contentDocument.getElementById('q');
+                __trust.formInsertText(q.__id,'🦀');
+                const seen=frame.contentDocument.body.getAttribute('data-seen');
+                const canceled=__trust.formInsertText(q.__id,'x')===null;
+                return [seen,q.value,q.selectionStart,canceled,parentEvents].join('|');
+            })()"##
+                ),
+                "true|true|true|🦀|A🙂Z|1|3|true|true|true|A🦀Z|3|A🦀Z|3|true|0",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
@@ -21461,6 +23185,71 @@ mod tests {
     }
 
     #[test]
+    fn offset_geometry_uses_live_canonical_style_without_author_style_calls() {
+        // CSSOM View §7 queries computed values directly; it never invokes the
+        // replaceable Window.getComputedStyle operation. Keep synchronous style
+        // and tree changes visible, including child-Document roots and slots.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let result = eval_value(&mut engine, r##"
+                document.append(document.createElement('html'));
+                document.documentElement.innerHTML = '<head><style>html,body{margin:0} ' +
+                    '#parent{position:relative;border:3px solid;padding:9px}' +
+                    '#child{position:absolute;left:7px;top:11px;width:20px;height:15px}' +
+                    '#fixed{position:fixed;width:10px;height:10px}</style></head>' +
+                    '<body><div id="parent"><div id="child"></div><div id="fixed"></div></div></body>';
+                const parent = document.getElementById('parent');
+                const child = document.getElementById('child');
+                const fixed = document.getElementById('fixed');
+                function check(value, message) { if (!value) throw Error(message); }
+                window.getComputedStyle = () => { throw Error('author style operation invoked'); };
+                for (let i=0; i<50; ++i) {
+                    check(child.offsetParent === parent, 'positioned ancestor');
+                    check(child.offsetLeft === 7 && child.offsetTop === 11, 'padding edge');
+                }
+                check(fixed.offsetParent === null, 'viewport fixed');
+                for (const declaration of ['transform:translateX(0)', 'filter:brightness(1)',
+                    'contain:layout', 'contain:paint']) {
+                    parent.style.cssText = declaration;
+                    check(fixed.offsetParent === parent, 'fixed containing block ' + declaration);
+                    parent.style.cssText = '';
+                    check(fixed.offsetParent === null, 'removed containing block');
+                }
+                parent.style.position = 'static';
+                check(child.offsetParent === document.body, 'live inline style');
+                document.styleSheets[0].insertRule('#parent{position:relative!important}', 0);
+                check(child.offsetParent === parent, 'live stylesheet');
+                document.documentElement.style.filter = 'brightness(1)';
+                check(fixed.offsetParent === null, 'document root filter exception');
+                document.documentElement.style.transform = 'translateX(0)';
+                check(fixed.offsetParent === document.documentElement, 'root transform');
+                document.documentElement.style.cssText = '';
+                parent.remove();
+                check(child.offsetParent === null && child.offsetLeft === 0, 'detached');
+                document.body.append(parent);
+                check(child.offsetParent === parent, 'reattached');
+                const host = document.createElement('div');
+                document.body.append(host);
+                host.attachShadow({mode:'open'}).innerHTML = '<section style="position:relative"><slot></slot></section>';
+                host.append(child);
+                check(child.offsetParent === host.shadowRoot.firstChild, 'flat tree ancestor');
+                const frame = document.createElement('iframe');
+                frame.srcdoc = '<style>html{filter:brightness(1)}#fixed{position:fixed}</style><div id="fixed">x</div>';
+                document.body.append(frame); __trust.hydrateFrames();
+                check(frame.contentDocument.getElementById('fixed').offsetParent === null, 'child root filter exception');
+                check(__trust.takeErrors().length === 0, 'platform errors');
+                'offset-style-ok'
+            "##, "canonical offset styles").unwrap();
+            assert!(
+                matches!(result, Value::Str(ref s) if s.as_ref() == "offset-style-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn inner_html_descendants_are_queryable_synchronously_after_insertion() {
         // HTML §13.3 appends text in script-data/raw-text parents literally
         // during fragment serialization; normal text is escaped. DOM §4.2.6
@@ -21567,6 +23356,20 @@ mod tests {
             assert_eq!(
                 string_value(&mut engine, include_str!("fixtures/console_state.mjs")),
                 "console-state-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decoder_utf8_preserves_stream_errors_and_bom_state() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/text_decoder_utf8.mjs")),
+                "text-decoder-utf8-ok",
                 "{tier:?}"
             );
         }
@@ -21788,6 +23591,188 @@ mod tests {
                 "[ioResult.firstQueued, ioResult.callbackWasSync, ioResult.hadTask, ioResult.taken, ioResult.secondQueued, ioResult.duplicateQueued, ioResult.ranTask, ioResult.callbacks, ioResult.entries].join(',')"
             ),
             "1,false,true,1,1,0,true,1,1"
+        );
+    }
+
+    #[test]
+    fn rendering_frame_discovery_filters_nodes_without_changing_shadow_tree_order() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(function(){
+                    const html=document.createElement('html'), body=document.createElement('body');
+                    document.appendChild(html); html.appendChild(body);
+                    const host=document.createElement('div'); body.appendChild(host);
+                    const shadow=host.attachShadow({mode:'closed'});
+                    const first=document.createElement('iframe'), second=document.createElement('iframe');
+                    const detached=document.createElement('iframe');
+                    shadow.appendChild(first); body.appendChild(second);
+                    for(let i=0;i<128;i++)body.appendChild(document.createElement('span'));
+                    const order=[], a=first.contentWindow, b=second.contentWindow;
+                    function ids(){return __dom_rendering_frames(document.__id).join();}
+                    if(ids()!==[first.__id,second.__id].join())throw Error('shadow order '+ids());
+                    a.requestAnimationFrame(()=>order.push('a'));
+                    b.requestAnimationFrame(()=>order.push('b'));
+                    __trust.runRenderingFrame(__trust.now());
+                    if(order.join()!=='a,b')throw Error('callback order '+order);
+                    // A non-tree edit invalidates the epoch without altering containers.
+                    host.setAttribute('data-state','typing');
+                    if(ids()!==[first.__id,second.__id].join())throw Error('attribute edit');
+                    body.insertBefore(second,host);
+                    if(ids()!==[second.__id,first.__id].join())throw Error('move order '+ids());
+                    host.remove();
+                    if(ids()!==String(second.__id))throw Error('retired shadow subtree '+ids());
+                    if(__dom_rendering_frames(-1).length)throw Error('invalid root');
+                    return __trust.takeErrors() || 'ok';
+                })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_frame_snapshots_documents_and_defers_reentrant_callbacks() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(function(){
+                const html=document.createElement('html'), body=document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const a=document.createElement('iframe'), b=document.createElement('iframe');
+                body.appendChild(a); body.appendChild(b);
+                const aw=a.contentWindow, bw=b.contentWindow, order=[], times=[];
+                body.insertBefore(b,a);
+                aw.requestAnimationFrame(()=>order.push('retired'));
+                bw.requestAnimationFrame(t=>{
+                    order.push('b'); times.push(bw.performance.timeOrigin+t);
+                    bw.requestAnimationFrame(()=>order.push('b2'));
+                });
+                requestAnimationFrame(t=>{
+                    order.push('root'); times.push(performance.timeOrigin+t);
+                    a.remove();
+                    requestAnimationFrame(()=>order.push('root2'));
+                    const c=document.createElement('iframe'); body.appendChild(c);
+                    c.contentWindow.requestAnimationFrame(()=>order.push('new-child'));
+                });
+                __trust.runRenderingFrame(__trust.now());
+                if(order.join()!=='root,b')throw Error('first frame '+order);
+                if(Math.abs(times[0]-times[1])>1)throw Error('frame timestamps '+times);
+                __trust.runRenderingFrame(__trust.now());
+                if(order.join()!=='root,b,root2,b2,new-child')throw Error('second frame '+order);
+                return __trust.takeErrors() || 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_observers_include_child_realms_in_document_order() {
+        // HTML #update-the-rendering visits fully active Documents in
+        // shadow-including container order. IO §3.2 queues notifications;
+        // ResizeObserver §3.4 broadcasts during the rendering opportunity.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><html><body></body></html>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            r#"
+            globalThis.observerOrder = [];
+            function frame(container, before) {
+                const f = document.createElement('iframe');
+                f.style.cssText = 'width:300px;height:200px;border:0';
+                container.insertBefore(f, before || null);
+                return f;
+            }
+            const second = frame(document.body);
+            const host = document.createElement('div');
+            document.body.insertBefore(host, second);
+            const first = frame(host.attachShadow({mode:'closed'}));
+            const a = first.contentWindow, b = second.contentWindow;
+            a.eval(`const nested = document.createElement('iframe');
+                nested.style.cssText='width:150px;height:100px;border:0';
+                document.body.appendChild(nested); globalThis.nestedWindow=nested.contentWindow;`);
+            const grandchild = a.nestedWindow;
+            function observe(w, label) {
+                w.observerLabel = label;
+                w.eval(`globalThis.box = document.createElement('div');
+                    box.style.cssText='width:120px;height:10px';
+                    document.body.insertBefore(box,document.body.firstChild);
+                    globalThis.ioCalls=0;
+                    globalThis.io=new IntersectionObserver(entries=>{
+                        ioCalls++; globalThis.visible=entries[0].isIntersecting;
+                    }); io.observe(box);
+                    globalThis.ro=new ResizeObserver(()=>top.observerOrder.push(observerLabel));
+                    ro.observe(box);`);
+            }
+            observe(a,'first'); observe(grandchild,'grandchild'); observe(b,'second');
+            globalThis.childRequestedRender=__trust.hasRenderingUpdate();
+            globalThis.childKeepsObserver=__trust.hasResizeObserver();
+            observe(window,'parent');
+            globalThis.resized=__trust.updateResizes();
+            globalThis.queued=__trust.updateIntersections();
+            globalThis.wasSync=[ioCalls,a.ioCalls,grandchild.ioCalls,b.ioCalls].join(',');
+            globalThis.again=[__trust.updateResizes(),__trust.updateIntersections(),
+                __trust.hasRenderingUpdate()].join(',');
+            for(let i=0;i<64&&__trust.hasPlatformTask();i++) __trust.runPlatformTask();
+            globalThis.notified=[ioCalls,a.ioCalls,grandchild.ioCalls,b.ioCalls,
+                a.visible,grandchild.visible,b.visible].join(',');
+            // Removing an embedding node retires its Window's observers/tasks.
+            b.io.unobserve(b.box); b.io.observe(b.box);
+            __trust.updateIntersections();
+            second.remove(); b.box.style.width='130px';
+            __trust.updateResizes();
+            for(let i=0;i<64&&__trust.hasPlatformTask();i++) __trust.runPlatformTask();
+            globalThis.retiredCalls=b.ioCalls;
+            // A parent's ResizeObserver may retire an entire later subtree
+            // after the Document list was snapshotted for this phase.
+            const discard=new ResizeObserver(()=>host.remove()); discard.observe(box);
+            box.style.width='130px'; a.box.style.width='140px'; grandchild.box.style.width='140px';
+            globalThis.retirementBroadcasts=__trust.updateResizes();
+        "#,
+            "nested rendering observers",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "String(childRequestedRender)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(childKeepsObserver)"),
+            "true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "observerOrder.join(',')"),
+            "parent,first,grandchild,second,parent"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(retirementBroadcasts)"),
+            "2"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[resized,queued,wasSync,again,notified,retiredCalls].join('|')"
+            ),
+            "4|4|0,0,0,0|0,0,false|1,1,1,1,true,true,true|1"
         );
     }
 

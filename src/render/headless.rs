@@ -206,6 +206,109 @@ mod tests {
     "#;
 
     #[test]
+    fn transformed_generated_image_keeps_ancestor_clip_in_parent_coordinates() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>
+            body{margin:0;background:white}
+            #icon{position:absolute;left:40px;top:40px;width:20px;height:20px;overflow:hidden}
+            #icon::after{content:url(sprite.png);display:inline-block;position:relative;
+                transform:scale(.5);transform-origin:-80px 0}
+        </style><span id=icon></span>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let source = "https://example.test/sprite.png";
+        let sizes = [(source.to_string(), (160, 40))].into_iter().collect();
+        let store = ImageStore::default();
+        let mut pixels = vec![0; 160 * 40 * 4];
+        for row in pixels.as_chunks_mut::<{ 160 * 4 }>().0 {
+            for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                pixel.copy_from_slice(if (80..120).contains(&x) {
+                    &[240, 20, 40, 255]
+                } else {
+                    &[0, 180, 60, 255]
+                });
+            }
+        }
+        store.insert(
+            super::super::ImageHandle::for_source(source),
+            super::super::ImageResource {
+                width: 160,
+                height: 40,
+                rgba: std::sync::Arc::from(pixels),
+                has_alpha: false,
+            },
+        );
+        let frame = render_dom_with_resources(
+            &dom,
+            &base,
+            CssSize::new(100., 100.),
+            &[],
+            &Default::default(),
+            &sizes,
+            store,
+        )
+        .unwrap();
+        let pixel = |x: usize, y: usize| &frame.pixels[(y * 100 + x) * 4..(y * 100 + x + 1) * 4];
+        assert_eq!(pixel(50, 50), &[240, 20, 40, 255]);
+        assert_eq!(pixel(39, 50), &[255, 255, 255, 255]);
+        assert_eq!(pixel(60, 50), &[255, 255, 255, 255]);
+        assert_eq!(pixel(50, 60), &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn css_color_filters_preserve_groups_alpha_and_operation_order_on_both_backends() {
+        let html = r#"<!doctype html><style>
+            body{margin:0;background:white} .tile{position:absolute;top:0;width:32px;height:32px;background:rgb(200,100,50)}
+            #group{left:0;filter:brightness(.5)} #group span{position:absolute;left:8px;top:8px;width:16px;height:16px;background:rgba(0,0,255,.5)}
+            #alpha{left:40px;filter:brightness(.5);background:rgba(200,0,0,.5)}
+            #chain{left:80px;filter:brightness(2) brightness(.5)}
+            #reverse{left:120px;filter:brightness(.5) brightness(2)}
+            #invert{left:160px;filter:invert(.5)}
+            #opacity{left:200px;filter:opacity(.5);opacity:.5}
+        </style><div class=tile id=group><span></span></div><div class=tile id=alpha></div><div class=tile id=chain></div><div class=tile id=reverse></div><div class=tile id=invert></div><div class=tile id=opacity></div>"#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(html);
+        let scene = scene_for_dom(
+            &dom,
+            &base,
+            CssSize::new(240., 48.),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+            ImageStore::default(),
+        );
+        let cpu = VelloCpuRenderer::new().render_rgba(&scene).unwrap();
+        let check = |frame: &OwnedRgbaFrame| {
+            for (x, y, expected) in [
+                (4, 4, [100, 50, 25, 255]),
+                (12, 12, [50, 25, 76, 255]),
+                (44, 4, [177, 127, 127, 255]),
+                (84, 4, [128, 100, 50, 255]),
+                (124, 4, [200, 100, 50, 255]),
+                (164, 4, [128, 128, 128, 255]),
+                (204, 4, [241, 216, 204, 255]),
+                (236, 4, [255, 255, 255, 255]),
+            ] {
+                let actual = &frame.pixels[(y * 240 + x) * 4..(y * 240 + x + 1) * 4];
+                assert!(
+                    actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2),
+                    "pixel ({x},{y}): {actual:?}, expected {expected:?}"
+                );
+            }
+        };
+        check(&cpu);
+        if let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) {
+            let gpu = hybrid.render_rgba(&scene).unwrap();
+            check(&gpu);
+            let difference = compare_rgba(&cpu, &gpu, 2).unwrap();
+            assert!(difference.fraction_over_tolerance < 0.01, "{difference:?}");
+        }
+    }
+
+    #[test]
     fn legacy_html_colors_reach_desktop_pixels_without_a_stylesheet() {
         // HTML #the-page / #phrasing-content-3: these hints must reach the
         // same cascade and canvas painting path as authored CSS.
@@ -869,8 +972,15 @@ mod tests {
                 for rect in &image_rects {
                     let mut compared = 0;
                     let mut wrong = 0;
-                    for y in rect.y as usize..(rect.y + rect.height) as usize {
-                        for x in rect.x as usize..(rect.x + rect.width) as usize {
+                    // A visible-overflow inline-block can export a baseline
+                    // below its own bottom edge and move the next icon partly
+                    // outside the viewport. Compare its visible intersection.
+                    let right =
+                        ((rect.x + rect.width).max(0.) as usize).min(actual.size.width as usize);
+                    let bottom =
+                        ((rect.y + rect.height).max(0.) as usize).min(actual.size.height as usize);
+                    for y in rect.y.max(0.) as usize..bottom {
+                        for x in rect.x.max(0.) as usize..right {
                             let offset = (y * actual.size.width as usize + x) * 4;
                             for channel in 0..4 {
                                 compared += 1;

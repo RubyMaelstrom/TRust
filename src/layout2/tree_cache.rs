@@ -112,6 +112,7 @@ impl BoxTreeCache {
 fn atom_bytes(atom: &Atom) -> usize {
     match &atom.kind {
         AtomKind::Img { url, alt, .. } => url.as_ref().map_or(0, String::capacity) + alt.capacity(),
+        AtomKind::GeneratedImage { url } => url.capacity(),
         AtomKind::Control { .. } | AtomKind::Media { .. } => 0,
     }
 }
@@ -228,10 +229,28 @@ mod tests {
             measured.fragments.unwrap(),
             measured.boxes,
             measured.tracks,
+            true,
         );
         let mut full = optimized.clone();
-        full.paint_cache.as_mut().unwrap().terminal =
-            crate::layout2::terminal::TerminalPaintModel::from_dom(&dom, &base, &controls);
+        let native = paint_retained_layout(
+            &dom,
+            &base,
+            &controls,
+            &images,
+            optimized.paint_cache.as_ref().unwrap().fragments.clone(),
+            optimized.boxes.clone(),
+            optimized.grid_tracks.clone(),
+            false,
+        );
+        let mut expected_native = optimized.clone();
+        expected_native.paint_cache.as_mut().unwrap().terminal = None;
+        assert!(
+            native.presentation_eq(&expected_native),
+            "native-only painting must preserve all graphics, geometry, and hit-test metadata"
+        );
+        full.paint_cache.as_mut().unwrap().terminal = Some(
+            crate::layout2::terminal::TerminalPaintModel::from_dom(&dom, &base, &controls),
+        );
         let viewport = TerminalViewport::new(90, 30, 8., 16.);
         let optimized = adapt_terminal(&optimized, viewport, &Default::default());
         let full = adapt_terminal(&full, viewport, &Default::default());
@@ -254,6 +273,7 @@ mod tests {
             warm.fragments.unwrap(),
             warm.boxes.clone(),
             warm.tracks.clone(),
+            true,
         );
         dom.force_cold_style_layout_for_test();
         let cold = measure(dom);
@@ -273,6 +293,7 @@ mod tests {
             cold.fragments.unwrap(),
             cold.boxes,
             cold.tracks,
+            true,
         );
         assert!(
             paint.presentation_eq(&cold_paint),

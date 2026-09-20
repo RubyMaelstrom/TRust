@@ -6,14 +6,28 @@ use counter_styles::{identifier, valid_name};
 
 #[derive(Default)]
 pub(super) struct Generated {
-    pub content: FxHashMap<(NodeId, u8), String>,
+    pub content: FxHashMap<(NodeId, u8), Vec<GeneratedContent>>,
     pub list_items: FxHashMap<NodeId, i64>,
     pub dynamic: bool,
 }
 impl Generated {
     pub fn retained_bytes(&self) -> usize {
-        self.content.capacity() * std::mem::size_of::<((NodeId, u8), String)>()
-            + self.content.values().map(String::capacity).sum::<usize>()
+        self.content.capacity() * std::mem::size_of::<((NodeId, u8), Vec<GeneratedContent>)>()
+            + self
+                .content
+                .values()
+                .map(|items| {
+                    items.capacity() * std::mem::size_of::<GeneratedContent>()
+                        + items
+                            .iter()
+                            .map(|item| match item {
+                                GeneratedContent::Text(s) | GeneratedContent::Image(s) => {
+                                    s.capacity()
+                                }
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
             + self.list_items.capacity() * std::mem::size_of::<(NodeId, i64)>()
     }
 }
@@ -76,6 +90,7 @@ pub(super) fn valid_changes(value: &str, property: &str) -> bool {
 #[derive(Clone)]
 enum Token {
     Text(String),
+    Image(String),
     Attribute(String, String),
     Counter {
         name: String,
@@ -97,6 +112,13 @@ fn content(raw: &str) -> Option<Vec<Token>> {
         .map(|token| {
             if let Some(text) = unquote_css(token) {
                 return Some(Token::Text(text));
+            }
+            let mut input = cssparser::ParserInput::new(token);
+            let mut parser = cssparser::Parser::new(&mut input);
+            if let Ok(url) = parser.expect_url().map(|s| s.to_string())
+                && parser.is_exhausted()
+            {
+                return Some(Token::Image(url));
             }
             match token {
                 "open-quote" | "close-quote" | "no-open-quote" | "no-close-quote" => {
@@ -148,18 +170,30 @@ fn content(raw: &str) -> Option<Vec<Token>> {
         })
         .collect()
 }
-pub(super) fn simple_content(dom: &Dom, id: NodeId, raw: &str) -> Option<String> {
-    let mut out = String::new();
+pub(super) fn simple_content(dom: &Dom, id: NodeId, raw: &str) -> Option<Vec<GeneratedContent>> {
+    let mut out = Vec::new();
     for token in content(raw)? {
         match token {
-            Token::Text(s) => out.push_str(&s),
-            Token::Attribute(name, fallback) => {
-                out.push_str(dom.attr(id, &name).unwrap_or(&fallback))
-            }
+            Token::Text(s) => out.push(GeneratedContent::Text(s)),
+            Token::Image(s) => out.push(GeneratedContent::Image(s)),
+            Token::Attribute(name, fallback) => out.push(GeneratedContent::Text(
+                dom.attr(id, &name).unwrap_or(&fallback).to_string(),
+            )),
             _ => return None,
         }
     }
     Some(out)
+}
+
+pub(super) fn replacement_image(raw: &str) -> Option<String> {
+    let mut tokens = content(raw)?;
+    if tokens.len() != 1 {
+        return None;
+    }
+    match tokens.pop()? {
+        Token::Image(source) => Some(source),
+        _ => None,
+    }
 }
 struct Event {
     node: NodeId,
@@ -490,9 +524,16 @@ fn run(dom: &Dom, events: &[Event], starts: Option<&[i64]>) -> (Generated, Vec<i
             let styles = styles.unwrap_or(&empty);
             let marks = quotes(dom, event);
             let mut text = String::new();
+            let mut items = Vec::new();
             for token in tokens {
                 match token {
                     Token::Text(s) => text.push_str(s),
+                    Token::Image(s) => {
+                        if !text.is_empty() {
+                            items.push(GeneratedContent::Text(std::mem::take(&mut text)));
+                        }
+                        items.push(GeneratedContent::Image(s.clone()));
+                    }
                     Token::Attribute(name, fallback) => {
                         text.push_str(dom.attr(event.node, name).unwrap_or(fallback))
                     }
@@ -548,9 +589,12 @@ fn run(dom: &Dom, events: &[Event], starts: Option<&[i64]>) -> (Generated, Vec<i
                 }
             }
             if let Some(p) = event.pseudo {
+                if !text.is_empty() || items.is_empty() {
+                    items.push(GeneratedContent::Text(text));
+                }
                 out.content.insert(
                     (event.node, if p == PseudoEl::Before { 0 } else { 1 }),
-                    text,
+                    items,
                 );
             }
         }

@@ -145,6 +145,7 @@ impl VelloCpuRenderer {
             scene.viewport.css.height,
         ));
         self.context.set_transform(device);
+        let mut layer_filters = Vec::new();
         for command in &scene.primitives {
             match command {
                 DisplayCommand::Fill { shape, brush } => {
@@ -221,8 +222,25 @@ impl VelloCpuRenderer {
                         None,
                         None,
                     );
+                    // Nest in reverse so the first CSS function runs first.
+                    // Each layer clamps separately before the next operation.
+                    for matrix in layer.color_filters.iter().rev() {
+                        self.context.push_layer(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(vello_color_filter(matrix)),
+                        );
+                    }
+                    layer_filters.push(layer.color_filters.len());
                 }
-                DisplayCommand::PopLayer => self.context.pop_layer(),
+                DisplayCommand::PopLayer => {
+                    for _ in 0..layer_filters.pop().unwrap_or(0) {
+                        self.context.pop_layer();
+                    }
+                    self.context.pop_layer();
+                }
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky
                 | DisplayCommand::BeginScroll(_)
@@ -757,6 +775,12 @@ pub(super) fn vello_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
     vello_cpu::peniko::BlendMode::new(mix, Compose::SrcOver)
 }
 
+pub(super) fn vello_color_filter(matrix: &[f32; 20]) -> vello_common::filter_effects::Filter {
+    vello_common::filter_effects::Filter::from_primitive(
+        vello_common::filter_effects::FilterPrimitive::ColorMatrix { matrix: *matrix },
+    )
+}
+
 pub(super) fn vello_affine(affine: Affine2d) -> Affine {
     Affine::new(affine.0.map(f64::from))
 }
@@ -1224,6 +1248,7 @@ mod tests {
                 DisplayCommand::PushLayer(super::super::CompositingLayer {
                     opacity: 0.6,
                     blend: BlendMode::Multiply,
+                    color_filters: Default::default(),
                 }),
                 DisplayCommand::PushTransform(Affine2d([0.9, 0.2, -0.1, 0.8, -3.5, 6.25])),
                 DisplayCommand::PushClip(PaintShape::Polygon {

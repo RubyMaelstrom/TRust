@@ -270,6 +270,7 @@ mod tests {
             first.fragments.unwrap(),
             first.boxes,
             first.tracks,
+            true,
         );
         assert_eq!(
             layout_pass_count(),
@@ -317,6 +318,7 @@ mod tests {
                 measured.fragments.unwrap(),
                 measured.boxes.clone(),
                 measured.tracks.clone(),
+                true,
             );
             let mut cold_dom = Dom::parse_document(html);
             cold_dom.set_attr(cold_dom.get_by_id("outer").unwrap(), "style", &style);

@@ -73,6 +73,11 @@ struct ClipAncestry {
 
 struct Builder<'a, 't> {
     dom: &'a Dom,
+    /// CSS Backgrounds 3 #body-background: canvas propagation is constant
+    /// during this immutable paint transaction. Recompute for each paint so
+    /// root/body style changes cannot leave a stale source behind.
+    document_root: Option<NodeId>,
+    canvas_background_source: Option<NodeId>,
     base: &'a Url,
     images: &'a ImageSizes,
     fixed: &'a [Frag<'t>],
@@ -115,6 +120,7 @@ struct Builder<'a, 't> {
     /// inherited from outside a transformed stacking context must be pushed
     /// before that transform and retained for the context's descendants.
     hard_clips: Vec<CssRect>,
+    transformed_clips: Vec<CssRect>,
     /// Scrollports already emitted around the current paint subtree. Scroll
     /// clipping is in the scroll container's coordinate system, so a
     /// descendant stacking-context transform must be nested inside these
@@ -139,8 +145,11 @@ impl<'a, 't> Builder<'a, 't> {
         viewport_w: f32,
         viewport_h: f32,
     ) -> Self {
+        let document_root = dom.document_element();
         let mut this = Self {
             dom,
+            document_root,
+            canvas_background_source: document_root.map(|root| canvas_background_node(dom, root)),
             base,
             images,
             fixed,
@@ -165,6 +174,7 @@ impl<'a, 't> Builder<'a, 't> {
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
             hard_clips: Vec::new(),
+            transformed_clips: Vec::new(),
             scroll_nodes: Vec::new(),
         };
         this.collect_legacy_clips(root);
@@ -310,7 +320,7 @@ impl<'a, 't> Builder<'a, 't> {
     }
 
     fn replaced_image(&mut self, node: NodeId, source: Option<&String>) -> Option<ImageHandle> {
-        if node != NO_NODE && self.dom.canvas_size(node).is_some() {
+        if source.is_none() && node != NO_NODE && self.dom.canvas_size(node).is_some() {
             let canvas = self.dom.canvas_image(node)?;
             let handle = canvas.handle;
             if self.image_handles.insert(handle) {
@@ -323,7 +333,12 @@ impl<'a, 't> Builder<'a, 't> {
     }
 
     fn effective_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
+        // An ancestor clip already established outside a transformed subtree
+        // must not also become a primitive-local clip inside that transform.
+        // CSS Transforms 1 #transform-rendering keeps the ancestor's coordinate
+        // system fixed; reapplying it clips sprite images before their offset.
         self.clip_chain(node, hard)
+            .filter(|clip| !self.transformed_clips.contains(clip))
     }
 
     fn ancestor_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
@@ -929,14 +944,14 @@ pub(super) fn paint<'t>(
     // the canvas instead. Its image positioning area remains the root box,
     // while its painting area is the complete canvas, including the margins
     // around a centered body and any viewport space below the document.
-    let root_background = if root.node != NO_NODE && dom.document_element() == Some(root.node) {
+    let root_background = if root.node != NO_NODE && builder.document_root == Some(root.node) {
         let canvas = CssRect::new(
             0.0,
             0.0,
             viewport_w.max(root.x + root.w).max(1.0),
             viewport_h.max(flow_bottom).max(root.max_bottom()).max(1.0),
         );
-        let style_node = canvas_background_node(dom, root.node);
+        let style_node = builder.canvas_background_source.unwrap_or(root.node);
         paint_background_images_for_style(
             root,
             PaintStyle::Element(style_node),
@@ -1017,7 +1032,14 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     // ancestor scrollport before this stacking context's transform, so the
     // scrollport remains fixed in its own coordinate system instead of being
     // scaled/translated along with the page layer.
-    let scroll_depth = builder.push_scroll_ancestors(fragment.node);
+    let scroll_depth = if let Some((origin, _)) = fragment.paint.pseudo {
+        // CSS Pseudo 4 #generated-content: a generated box is a child of its
+        // originating element. Its host's overflow belongs outside the
+        // pseudo-element's transform, just like a real child's ancestor clip.
+        builder.push_scroll_content_chain(origin)
+    } else {
+        builder.push_scroll_ancestors(fragment.node)
+    };
     let sticky = builder
         .sticky_constraints
         .iter()
@@ -1040,9 +1062,12 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     // parent stacking context. `Frag::clip` is already in absolute parent
     // coordinates, so establish it before the child's transform; pushing it
     // afterwards would transform the ancestor clip a second time.
-    let context_clip = transform
-        .and_then(|_| builder.ancestor_clip(fragment.node, fragment.clip))
-        .is_some_and(|clip| builder.push_hard_clip(clip));
+    let inherited_clip =
+        transform.and_then(|_| builder.ancestor_clip(fragment.node, fragment.clip));
+    let context_clip = inherited_clip.is_some_and(|clip| builder.push_hard_clip(clip));
+    if let Some(clip) = inherited_clip {
+        builder.transformed_clips.push(clip);
+    }
     let transformed = if let Some(transform) = transform {
         builder
             .commands
@@ -1114,6 +1139,9 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
     if context_clip {
         builder.pop_hard_clip();
+    }
+    if inherited_clip.is_some() {
+        builder.transformed_clips.pop();
     }
     if animation.is_some() {
         builder.commands.push(DisplayCommand::EndCssAnimation);
@@ -1515,11 +1543,8 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         let radii = border_radii(builder.dom, style, rect);
         let shape = rounded_shape(rect, radii);
         paint_box_shadows(builder.dom, style, &shape, builder);
-        let is_root = builder.dom.document_element() == Some(fragment.node);
-        let is_canvas_body = builder
-            .dom
-            .document_element()
-            .is_some_and(|root| canvas_background_node(builder.dom, root) == fragment.node)
+        let is_root = builder.document_root == Some(fragment.node);
+        let is_canvas_body = builder.canvas_background_source == Some(fragment.node)
             || nested_canvas_background_source(builder.dom, fragment.node) == Some(fragment.node);
         if !is_root && !is_canvas_body {
             if fragment.node != NO_NODE {
@@ -1714,10 +1739,37 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 clip = intersect_css_rects(clip, label_rect);
             }
             if let Some(shaped) = &piece.shaped {
-                let origin = CssPoint::new(
+                let mut origin = CssPoint::new(
                     fragment.x + piece.x + piece.paint_x,
                     fragment.y + piece.y + piece.paint_y,
                 );
+                if form_piece && style_node != NO_NODE {
+                    // CSS Text 3 #text-indent-property: the control's inner
+                    // line inherits indentation, including negative lengths.
+                    // Move its text, never its content clip or hit target.
+                    let indent = builder
+                        .dom
+                        .computed_value_resolved(style_node, "text-indent")
+                        .and_then(|v| {
+                            Len::parse(
+                                &v,
+                                Units::of(builder.dom, style_node),
+                                Vp {
+                                    w: builder.viewport_w,
+                                    h: builder.viewport_h,
+                                },
+                            )
+                        })
+                        .and_then(|v| v.resolve(Some(piece.paint_width)))
+                        .unwrap_or(0.0);
+                    origin.x += indent;
+                    let spare = (piece.paint_width - indent - shaped.advance).max(0.0);
+                    origin.x += match super::style::block_align(builder.dom, style_node) {
+                        super::style::Align2::Center => spare / 2.0,
+                        super::style::Align2::Right => spare,
+                        _ => 0.0,
+                    };
+                }
                 let color = match piece.item.pseudo {
                     Some((node, pseudo)) => text_color_for_style(
                         builder.dom,
@@ -2289,12 +2341,13 @@ fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) -> bool {
         .as_deref()
         .map(blend_mode)
         .unwrap_or_default();
-    if opacity < 1.0 || blend != BlendMode::Normal {
+    if opacity < 1.0 || blend != BlendMode::Normal || !fragment.paint.color_filters.is_empty() {
         builder
             .commands
             .push(DisplayCommand::PushLayer(CompositingLayer {
                 opacity,
                 blend,
+                color_filters: fragment.paint.color_filters.clone(),
             }));
         true
     } else {
@@ -2458,6 +2511,17 @@ fn paint_background_images_for_style(
     let Some(value) = style.value(builder.dom, "background-image") else {
         return;
     };
+    let images = split_top_level(&value, ',');
+    // CSS Backgrounds 3 #background-image: `none` counts as a layer but
+    // draws nothing. Preserve indices in mixed lists (and the separately
+    // painted color's bottom-layer clip), while avoiding image geometry and
+    // style resolution when no layer can draw an image.
+    if images
+        .iter()
+        .all(|layer| layer.trim().is_empty() || layer.trim().eq_ignore_ascii_case("none"))
+    {
+        return;
+    }
     let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     let padding_box = padding_box_with_style(fragment);
     let content_box = content_box_with_style(builder.dom, fragment, padding_box);
@@ -2481,7 +2545,6 @@ fn paint_background_images_for_style(
     let repeat_layers = split_top_level(&repeat_value, ',');
     let position_layers = split_top_level(&position_value, ',');
     let size_layers = split_top_level(&size_value, ',');
-    let images = split_top_level(&value, ',');
     // CSS Backgrounds paints the first listed layer closest to the viewer, so
     // emit in reverse order after the background color.
     for (index, layer) in images.iter().enumerate().rev() {
@@ -2518,6 +2581,13 @@ fn paint_background_images_for_style(
             let repeat = parse_background_repeat(layer_value(&repeat_layers, index, "repeat"));
             let position = layer_value(&position_layers, index, "0% 0%");
             let size = layer_value(&size_layers, index, "auto auto");
+            // CSS Backgrounds 3 #background-size: auto/auto with a natural
+            // ratio but neither natural dimension uses contain. SVG decoder
+            // fallback pixels are not intrinsic width/height. This also keeps
+            // the exact ratio for contain/cover and a single definite axis.
+            let ratio_only = crate::img::svg_url_ratio_only(&source)
+                .or_else(|| crate::img::svg_ratio_only_get(&source))
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
             let natural = builder
                 .images
                 .get(&source)
@@ -2525,7 +2595,7 @@ fn paint_background_images_for_style(
                 .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
                 .map(|(w, h)| (w as f32, h as f32))
                 .unwrap_or((300.0, 150.0));
-            let (mut tile_w, mut tile_h) = background_size(size, natural, positioning);
+            let (mut tile_w, mut tile_h) = background_size(size, natural, positioning, ratio_only);
             if !tile_w.is_finite() || !tile_h.is_finite() || tile_w <= 0.0 || tile_h <= 0.0 {
                 continue;
             }
@@ -2788,7 +2858,15 @@ fn content_box_with_style(dom: &Dom, fragment: &Frag<'_>, padding: CssRect) -> C
     )
 }
 
-fn background_size(value: &str, natural: (f32, f32), area: CssRect) -> (f32, f32) {
+fn background_size(
+    value: &str,
+    natural: (f32, f32),
+    area: CssRect,
+    ratio_only: Option<f32>,
+) -> (f32, f32) {
+    // Keep a nonzero ratio basis even for a zero-size positioning area: a
+    // definite background width/height must still resolve its other axis.
+    let natural = ratio_only.map_or(natural, |ratio| (ratio, 1.0));
     let tokens = split_ws(value);
     if tokens
         .first()
@@ -2814,6 +2892,10 @@ fn background_size(value: &str, natural: (f32, f32), area: CssRect) -> (f32, f32
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => (w, natural.1 * w / natural.0),
         (None, Some(h)) => (natural.0 * h / natural.1, h),
+        _ if ratio_only.is_some() => {
+            let scale = (area.width / natural.0).min(area.height / natural.1);
+            (natural.0 * scale, natural.1 * scale)
+        }
         _ => natural,
     }
 }
@@ -4241,6 +4323,149 @@ mod tests {
             &Default::default(),
         );
         (dom, layout)
+    }
+
+    #[test]
+    fn canvas_background_source_is_recomputed_after_root_style_changes() {
+        let mut dom = Dom::parse_document(
+            r#"<html style="background:transparent"><body style="margin:8px;background:#123456"><div style="height:20px"></div></body></html>"#,
+        );
+        let root = dom.document_element().unwrap();
+        let body_color = PaintColor::Rgba(18, 52, 86, 255);
+        let root_color = PaintColor::Rgba(101, 67, 33, 255);
+        for (style, expected_canvas, body_fills) in [
+            ("background:transparent", body_color, 0),
+            ("background:#654321", root_color, 1),
+            ("background:transparent", body_color, 0),
+        ] {
+            dom.set_attr(root, "style", style);
+            let layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://example.test/").unwrap(),
+                crate::layout2::Viewport::new(800., 600.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            assert_eq!(layout.paint.background, Some(expected_canvas));
+            assert_eq!(
+                layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .filter(|command| matches!(
+                        command,
+                        DisplayCommand::Fill { brush: PaintBrush::Solid(color), .. }
+                            if *color == body_color
+                    ))
+                    .count(),
+                body_fills,
+                "a propagated body background must not paint twice: {style}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_background_layers_preserve_image_indices_and_color_clip() {
+        // CSS Backgrounds 3 #background-image / #background-color: `none`
+        // still occupies its index, including the bottom layer's color clip.
+        for (images, gradient_clip) in [
+            ("none, none", None),
+            (
+                "none, linear-gradient(red, blue)",
+                Some(CssRect::new(14., 14., 80., 40.)),
+            ),
+            (
+                "linear-gradient(red, blue), none",
+                Some(CssRect::new(0., 0., 108., 68.)),
+            ),
+        ] {
+            let (_, layout) = render_fixture(&format!(
+                r#"<body style="margin:0"><div style="width:80px;height:40px;padding:10px;border:4px solid black;background-color:#123456;background-image:{images};background-clip:border-box,content-box"></div>"#
+            ));
+            let color_rect = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    DisplayCommand::Fill {
+                        shape: PaintShape::Rect(rect),
+                        brush: PaintBrush::Solid(PaintColor::Rgba(18, 52, 86, 255)),
+                    } => Some(*rect),
+                    _ => None,
+                });
+            assert_eq!(
+                color_rect,
+                Some(CssRect::new(14., 14., 80., 40.)),
+                "{images}"
+            );
+            let gradient_rects: Vec<_> = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    DisplayCommand::Fill {
+                        shape: PaintShape::Rect(rect),
+                        brush: PaintBrush::LinearGradient { .. },
+                    } => Some(*rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                gradient_rects,
+                gradient_clip.into_iter().collect::<Vec<_>>(),
+                "{images}"
+            );
+        }
+    }
+
+    #[test]
+    fn ratio_only_svg_background_auto_uses_the_positioning_area() {
+        // CSS Backgrounds 3 #background-size: with neither natural dimension,
+        // auto/auto uses contain. A decoder's fallback raster is not a natural
+        // dimension. One definite axis still resolves the other by the ratio.
+        let external = "https://example.test/ratio-only-background.svg";
+        crate::img::record_svg_intrinsic_metadata(
+            external,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 40"/>"#,
+        );
+        assert_eq!(
+            background_size("20px auto", (300., 150.), CssRect::default(), Some(2.)),
+            (20., 10.)
+        );
+        assert_eq!(
+            background_size("auto", (18., 9.), CssRect::new(0., 0., 80., 60.), None),
+            (18., 9.)
+        );
+        for source in [
+            external,
+            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2080%2040'/%3E",
+        ] {
+            for (size, expected) in [
+                ("auto", (80., 40.)),
+                ("contain", (80., 40.)),
+                ("cover", (120., 60.)),
+                ("20px auto", (20., 10.)),
+                ("auto 30px", (60., 30.)),
+                ("50% auto", (40., 20.)),
+                ("16px 36px", (16., 36.)),
+            ] {
+                let (dom, layout) = render_fixture(&format!(
+                    r#"<div id=tile style="width:80px;height:60px;background-image:url(&quot;{source}&quot;);background-repeat:no-repeat;background-size:{size}"></div>"#
+                ));
+                let node = dom.get_by_id("tile").unwrap();
+                let rect = layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .find_map(|command| match command {
+                        DisplayCommand::Image { node: n, rect, .. } if *n == node => Some(*rect),
+                        _ => None,
+                    })
+                    .expect("background image tile");
+                assert_eq!((rect.width, rect.height), expected, "{source}: {size}");
+            }
+        }
     }
 
     #[test]
