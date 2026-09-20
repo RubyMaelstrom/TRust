@@ -625,7 +625,9 @@ fn get(property: &str, declarations: &[(String, String, bool)]) -> String {
         }
         "font" if v.len() == 5 => format!("{} {} {} / {} {}", v[0], v[1], v[2], v[3], v[4]),
         "grid-row" | "grid-column" | "grid-area" => v.join(" / "),
-        "gap" | "place-items" | "place-self" | "place-content" if v.len() == 2 && v[0] == v[1] => {
+        "gap" | "place-items" | "place-self" | "place-content" | "overflow"
+            if v.len() == 2 && v[0] == v[1] =>
+        {
             v[0].into()
         }
         "border-radius" if v.len() == 4 => {
@@ -732,6 +734,7 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
         "place-items",
         "place-self",
         "white-space",
+        "overflow",
     ];
     let mut done = FxHashSet::default();
     let mut result = Vec::new();
