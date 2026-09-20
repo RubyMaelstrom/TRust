@@ -1092,6 +1092,7 @@ pub fn measure_boxes_css(
 
 #[derive(Default)]
 pub(crate) struct RetainedMeasurement {
+    pub complete_geometry: bool,
     pub boxes: HashMap<NodeId, PxRect>,
     pub tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     pub scrolling_areas: HashMap<NodeId, PxRect>,
@@ -1111,12 +1112,27 @@ pub(crate) fn measure_retained_layout(
     controls: &ControlMap,
     images: &ImageSizes,
 ) -> RetainedMeasurement {
+    measure_retained_layout_for_box(dom, base, viewport, forms, controls, images, None)
+}
+
+/// Keep the same complete layout, while allowing a rectangle-only consumer
+/// to defer projecting unrelated boxes and scrolling areas from its fragments.
+pub(crate) fn measure_retained_layout_for_box(
+    dom: &Dom,
+    base: &Url,
+    viewport: Viewport,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+    requested_box: Option<NodeId>,
+) -> RetainedMeasurement {
     session::with_layout(dom, base, viewport, forms, controls, images, |layout| {
         let Some(layout) = layout else {
-            return RetainedMeasurement::default();
+            return RetainedMeasurement {
+                complete_geometry: true,
+                ..Default::default()
+            };
         };
-        let (boxes, scrolling_areas, frame_viewports) =
-            measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
         let fragments = LayoutFragments::retain(
             &layout.root,
             &layout.fixed,
@@ -1125,7 +1141,20 @@ pub(crate) fn measure_retained_layout(
             viewport,
             &layout.anchors,
         );
+        let single_box = fragments.as_ref().and_then(|fragments| {
+            let node = requested_box?;
+            fragments.single_border_box(node).map(|rect| (node, rect))
+        });
+        let (boxes, scrolling_areas, frame_viewports) = match single_box {
+            Some((node, rect)) => (
+                HashMap::from([(node, rect)]),
+                HashMap::new(),
+                HashMap::new(),
+            ),
+            None => measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer),
+        };
         RetainedMeasurement {
+            complete_geometry: single_box.is_none(),
             boxes,
             tracks: layout.tracks,
             scrolling_areas,

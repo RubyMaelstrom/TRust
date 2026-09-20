@@ -45,6 +45,22 @@ pub(crate) struct LayoutFragments {
 }
 
 impl LayoutFragments {
+    pub(crate) fn single_border_box(&self, node: NodeId) -> Option<PxRect> {
+        measure::single_border_box(&self.root, &self.fixed, &self.top_layer, node)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn measure_boxes(
+        &self,
+        dom: &Dom,
+    ) -> (
+        HashMap<NodeId, PxRect>,
+        HashMap<NodeId, PxRect>,
+        HashMap<NodeId, crate::render::CssRect>,
+    ) {
+        measure::boxes(dom, &self.root, &self.fixed, &self.top_layer)
+    }
+
     pub(super) fn retain(
         root: &flow::Frag<'_>,
         fixed: &[flow::Frag<'_>],
