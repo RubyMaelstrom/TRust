@@ -324,6 +324,28 @@ mod tests {
     <section id=stable><article><a href=/next>linked text</a><span>another item</span></article></section></main>"#;
 
     #[test]
+    fn transition_frames_reuse_independent_subtrees_and_match_cold_layout() {
+        let mut dom = Dom::parse_document(HTML);
+        let changing = dom.get_by_id("changing").unwrap();
+        dom.set_attr(changing, "style", "height:40px;transition:height 1s linear");
+        dom.update_css_transitions(0.);
+        dom.set_attr(
+            changing,
+            "style",
+            "height:140px;transition:height 1s linear",
+        );
+        dom.update_css_transitions(1.);
+        for time in [1.25, 1.5, 2.] {
+            measure(&dom);
+            let stable = block(&dom, "stable");
+            dom.update_css_transitions(time);
+            measure(&dom);
+            assert!(Arc::ptr_eq(&stable, &block(&dom, "stable")));
+            equivalent_to_cold(&mut dom);
+        }
+    }
+
+    #[test]
     fn immutable_subtrees_survive_local_attributes_and_child_list_edits() {
         let mut dom = Dom::parse_document(HTML);
         let list = dom.get_by_id("list").unwrap();
