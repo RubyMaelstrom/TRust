@@ -2066,9 +2066,9 @@ impl DesktopApp {
     }
 
     fn css_animation_elapsed(&mut self) -> f32 {
-        if !self.css_animations_active() {
-            return 0.0;
-        }
+        // Web Animations #document-timelines: focus affects frame scheduling,
+        // not the document's monotonically increasing timeline. A redraw on
+        // blur must not rewind filled animations to their first keyframe.
         let generation = self.browser.document_generation();
         if self.css_animation_generation != generation {
             self.css_animation_generation = generation;
