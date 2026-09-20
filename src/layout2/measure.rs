@@ -22,6 +22,47 @@ use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind, TopFrag};
 
+/// CSSOM View #dom-element-getboundingclientrect: a single generated border
+/// box already is its element's bounding box. This projection needs neither
+/// composed ancestor unions nor unrelated scrolling areas. Multiple boxes,
+/// inline content, and table cells keep the complete measurement path.
+pub(super) fn single_border_box(
+    root: &Frag<'_>,
+    fixed: &[Frag<'_>],
+    top_layer: &[TopFrag<'_>],
+    node: NodeId,
+) -> Option<PxRect> {
+    fn visit(frag: &Frag<'_>, node: NodeId, found: &mut Option<PxRect>) -> Option<()> {
+        if frag.node == node && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_)) {
+            if found.is_some() || !matches!(frag.kind, FragKind::Block) {
+                return None;
+            }
+            *found = Some(PxRect {
+                left: f64::from(frag.x),
+                top: f64::from(frag.y),
+                // Match the fragment edge arithmetic used by `boxes`.
+                width: f64::from((frag.x + frag.w) - frag.x),
+                height: f64::from((frag.y + frag.h) - frag.y),
+                css_width: frag.css_size.map(|size| f64::from(size[0])),
+                css_height: frag.css_size.map(|size| f64::from(size[1])),
+            });
+        }
+        for child in &frag.children {
+            visit(child, node, found)?;
+        }
+        Some(())
+    }
+    let mut found = None;
+    visit(root, node, &mut found)?;
+    for frag in fixed {
+        visit(frag, node, &mut found)?;
+    }
+    for top in top_layer {
+        visit(&top.fragment, node, &mut found)?;
+    }
+    found
+}
+
 /// Canonical fragment rectangle in CSS pixels. CSSOM View geometry is read
 /// before any terminal adaptation or device-pixel presentation.
 #[derive(Copy, Clone)]

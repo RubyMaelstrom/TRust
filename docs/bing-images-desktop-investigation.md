@@ -7,23 +7,25 @@ search results, or browser-identity spoofing were added.
 
 ## Current responsiveness checkpoint
 
-The latest native release reviewed here is pass 46. Its immediate unprobed
-capture is one character short and its suggestions lag the query. **Brave parity
-is not yet achieved.** Pass 46 passed its focused conformance, DOM, layout,
-strict Clippy and release checks (6m52s). The parallel full suite crashed in
-the system Vulkan loader; the isolated serial renderer suite passed.
-No binary is installed or promoted.
+The latest native release reviewed here is pass 47. One immediate unprobed
+capture is one character short; both unprobed trials show stale suggestions. **Brave parity
+is not yet achieved.** The complete serial suite passed: 1,896 tests passed,
+27 ignored, none failed. Strict all-target Clippy, formatting, whitespace checks,
+and the standard release build also passed. The earlier parallel-suite Vulkan
+loader crash did not recur in this complete serial run; its cause is not claimed
+fixed. No binary is installed or promoted. Work pauses at this tested checkpoint
+at the user's request.
 
-The matched-width physical-key comparison is below. These are single live-page
-trials; pass 46 needs a clean repeat because an attempted crash-debugger launch
-briefly overlapped the measured run. Its separate unprobed capture and CPU
-measurement had no such overlap. The suggestion row filters out ancillary XHRs.
+The matched-width physical-key comparison below uses pass 47's second measured
+trial and a fresh Brave reference. Two pass-47 trials around a pass-46 baseline
+did not establish a material latency improvement. These are live-page trials,
+not a confidence interval. The suggestion row filters out ancillary XHRs.
 
-| Metric, median / maximum | TRust pass 46 | Brave 1.95.104 |
+| Metric, median / maximum | TRust pass 47 | Brave 1.95.104 |
 | --- | --- | --- |
-| Native key to input event | 24.3 / 49.9 ms | 4.2 / 10.8 ms |
-| Native key to rAF callback | 44.0 / 90.3 ms | 6.5 / 16.8 ms |
-| Network completion to suggestion XHR delivery | 709 / 1110 ms | 6.1 / 14.1 ms |
+| Native key to input event | 22.7 / 53.2 ms | 3.1 / 12.4 ms |
+| Native key to rAF callback | 41.0 / 98.2 ms | 4.1 / 14.8 ms |
+| Network completion to suggestion XHR delivery | 809 / 1192 ms | 4.2 / 5.1 ms |
 
 rAF runs before presentation: these are not key-to-photon numbers. The physical
 burst contains 26 characters with 25 ms key-down and 25 ms key-up spacing. Both
@@ -31,9 +33,11 @@ browsers displayed a 1920×1080 page, while Brave's separate 40px sidebar is
 excluded from the gallery's comparison area. Probed runs measure events; separate
 unprobed TRust captures check that diagnostics are not the source of the symptom.
 
-- [TRust immediate, unprobed](../target/bing-review/pass46-unprobed-immediate.png)
-- [TRust settled, unprobed](../target/bing-review/pass46-unprobed-settled.png)
-- [Brave immediate, measured](../target/bing-review/brave-pass44-wall-immediate.png)
+- [TRust immediate, unprobed](../target/bing-review/pass47-unprobed-immediate.png)
+- [TRust settled, unprobed](../target/bing-review/pass47-unprobed-settled.png)
+- [TRust repeat immediate, unprobed](../target/bing-review/pass47-unprobed-repeat-immediate.png)
+- [TRust repeat settled, unprobed](../target/bing-review/pass47-unprobed-repeat-settled.png)
+- [Brave immediate, measured](../target/bing-review/brave-pass47-wall-immediate.png)
 - [Interactive native comparison](../target/bing-review/visual-comparison.html)
 
 ## Method and evidence
@@ -862,8 +866,88 @@ The complete two-thread test run terminated with SIGSEGV. The core places the
 crashing thread in `loader_scanned_icd_add` in `libvulkan.so.1`, while another
 thread was entering the NVIDIA driver through D-Bus. This identifies the crash
 site, not a proven root cause. All 18 isolated renderer tests passed serially
-(1 ignored). A clean complete suite remains outstanding.
+(1 ignored). The subsequent complete serial pass-47 suite passed, as recorded
+below; this does not establish the cause of the earlier parallel crash.
 
 The imported upstream renderer sources contain existing trailing whitespace in
 `pixmap.rs`, `clear.wesl` and `render.wesl`. It was retained to avoid mechanical
 vendor edits; browser source and subsequent diffs pass whitespace checks.
+
+
+A clean pass-46 repeat measured 22.6/49.5 ms native-key-to-input,
+42.8/96.5 ms native-key-to-rAF, and 839/1200 ms suggestion delivery, with 9
+callbacks during typing. Restricting the diagnostic process to the machine's
+faster cores produced similar values (23.2/49.1 ms, 44.4/94.1 ms, and
+799/1138 ms, also 9 callbacks). The pinned immediate and settled native images
+were inspected; suggestions still trailed the visible text. No affinity policy
+was added to the browser. CPU placement did not explain the queue backlog.
+
+## Pass 47 — lazy projection of CSSOM rectangles and pause checkpoint
+
+A single-element rectangle read previously built geometry and scrolling-area
+maps for every laid-out element. The new path still performs the complete
+current layout, including its container-query convergence, but reads a unique
+block border box directly from the completed fragments. Inline/multiple boxes,
+tables, child-document coordinates and viewport queries retain full projection.
+A subsequent scrolling-area, observer, hit-test or rendering query completes
+those maps from the same fragments without a second layout. Existing revision,
+resource, viewport and activation invalidation remains authoritative.
+
+Authority: CSSOM View's getClientRects/getBoundingClientRect algorithms at
+`/big/web-standards/repositories/w3c/csswg-drafts/cssom-view-1/Overview.bs:1298`,
+local CSSWG snapshot `81c27f68690138345b2b3b6af8ccc42dad3dca1d`.
+Focused regressions pass for layout/paint reuse, fixed and zero-sized rectangles,
+scrolling areas, wrapped inline fallback, hidden boxes, snapshot immutability,
+mutations between reads and nested-document coordinates.
+
+The focused tests ran first, followed by `cargo test -- --test-threads=1`:
+1,832 library tests passed (25 ignored), 49 desktop tests passed (2 ignored),
+and 15 other binary tests passed. No tests failed. Strict
+`cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
+`git diff --check`, and `cargo build --release` passed. The standard release
+build took 7m15s; the copied native benchmark artifact matches SHA-256
+`efc892fa0011972f32b098e92e73512da298fb0933efa42a57589f0003c902c2`.
+Logs are `pass47-full-suite.log`, `pass47-clippy.log`, and
+`pass47-release-build-concurrent.log` in the evidence directory.
+
+After builds and tests finished, the same physical 26-character burst was run
+in the order pass 47 A, pass 46, pass 47 B, followed by separate unprobed visual
+checks and a fresh Brave reference. Other user applications remained running.
+No CPU affinity policy was applied.
+
+| Trial | Key → input median/max | Key → rAF median/max | Suggestion delivery median/max | Suggestion callbacks during typing |
+| --- | --- | --- | --- | --- |
+| Pass 47 A | 19.8/53.0 ms | 40.2/98.4 ms | 814/1206 ms | 9 |
+| Pass 46 interleaved | 20.9/49.0 ms | 41.3/93.0 ms | 734/1155 ms | 9 |
+| Pass 47 B | 22.7/53.2 ms | 41.0/98.2 ms | 809/1192 ms | 9 |
+| Brave fresh reference | 3.1/12.4 ms | 4.1/14.8 ms | 4.2/5.1 ms | 24 |
+
+The 26 suggestion requests' median network durations were 85.8, 78.5, 84.8,
+and 78.3 ms respectively. The much longer TRust delay occurs after network
+completion. Its actor used 1.31–1.32 CPU seconds during each approximately
+1.37–1.40-second measured injection, and 1.31 CPU seconds during the first
+1.313-second unprobed burst. Combined with the earlier native profile, this
+points to CPU demand in the actor's synchronous geometry and presentation work.
+The latest change avoids unnecessary full geometry projections but has not
+demonstrated a material end-to-end latency gain in these trials.
+
+Both measured pass-47 immediate and settled native captures were visually
+inspected. The field contained the complete query immediately, but suggestions
+were still for an earlier prefix; the settled dropdown caught up. The first
+unprobed immediate capture was missing the final `k` and also had stale
+suggestions; its three-second capture had the full query but a closed dropdown.
+That observation is retained rather than treating settled appearance as a
+successful responsiveness result. The fresh Brave immediate and settled native
+captures were also inspected: text and suggestions were current in both.
+An additional unprobed TRust repeat, also visually inspected, had the full query
+but stale suggestions immediately; its three-second capture showed current
+suggestions. Its actor used 1.29 CPU seconds during a 1.311-second burst.
+
+Pass-47 measured RSS varied from 972356–1048396 KiB before typing to
+1015572–1104120 KiB peak and 878044–963748 KiB after three seconds. Live image
+content differed between runs, so this is not a controlled memory comparison.
+
+The unresolved acceptance issue is responsiveness under autocomplete load.
+Further optimization is paused after this validation and latency checkpoint,
+as requested. All changes remain general web-platform behavior; no Bing-specific
+path, script rewrite, or CSS override was introduced.

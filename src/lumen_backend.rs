@@ -40,6 +40,10 @@ struct LumenGeomCache {
     epoch: u64,
     presentation_epoch: u64,
     paint_epoch: u64,
+    /// A rectangle-only read may have projected just one element from the
+    /// complete current fragment tree. Scroll, frame, paint and observer
+    /// consumers finish the projection without repeating layout.
+    complete_geometry: bool,
     boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
@@ -57,6 +61,7 @@ impl LumenGeomCache {
             epoch: u64::MAX,
             presentation_epoch: u64::MAX,
             paint_epoch: u64::MAX,
+            complete_geometry: false,
             boxes: Default::default(),
             tracks: Default::default(),
             scrolling_areas: Default::default(),
@@ -11352,6 +11357,14 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
 /// resources/viewport (explicit invalidation), and activation metadata all
 /// participate in freshness. Paint is a later, independently lazy consumer.
 fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {
+    ensure_host_geometry(ctx, reason, None)
+}
+
+fn ensure_host_geometry(
+    ctx: &mut Ctx,
+    reason: &'static str,
+    requested_box: Option<crate::dom::NodeId>,
+) -> Rc<RefCell<LumenGeomCache>> {
     let (dom_handle, base, viewport, cache, images) = {
         let state = ctx
             .host_mut::<HostState>()
@@ -11374,14 +11387,26 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
             .is_some()
             .then(Instant::now);
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
-        let measured = crate::layout2::measure_retained_layout(
-            &dom,
-            &base,
-            viewport,
-            &forms,
-            &controls,
-            &images.borrow(),
-        );
+        let measured = if requested_box.is_some() {
+            crate::layout2::measure_retained_layout_for_box(
+                &dom,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                &images.borrow(),
+                requested_box,
+            )
+        } else {
+            crate::layout2::measure_retained_layout(
+                &dom,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                &images.borrow(),
+            )
+        };
         if let Some(measure_started) = measure_started {
             let cascade = crate::dom::take_casc_diag();
             eprintln!(
@@ -11405,6 +11430,7 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
                 measured.work.tree_builds,
             );
         }
+        cached.complete_geometry = measured.complete_geometry;
         cached.boxes = measured.boxes;
         cached.tracks = measured.tracks;
         cached.scrolling_areas = measured.scrolling_areas;
@@ -11414,6 +11440,22 @@ fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<Lum
         cached.epoch = epoch;
         cached.presentation_epoch = dom.layout_presentation_epoch();
         cached.top_document_valid = true;
+    }
+    if !cached.complete_geometry
+        && !requested_box.is_some_and(|node| cached.boxes.contains_key(&node))
+        && let Some(fragments) = cached.fragments.clone()
+    {
+        if let Some((node, rect)) = requested_box
+            .and_then(|node| fragments.single_border_box(node).map(|rect| (node, rect)))
+        {
+            cached.boxes.insert(node, rect);
+        } else {
+            let (boxes, scrolling_areas, frame_viewports) = fragments.measure_boxes(&dom);
+            cached.boxes = boxes;
+            cached.scrolling_areas = scrolling_areas;
+            cached.frame_viewports = frame_viewports;
+            cached.complete_geometry = true;
+        }
     }
     drop(cached);
     drop(dom);
@@ -11694,28 +11736,41 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         .expect("HostState installed before any Lumen host call")
         .geom_cache
         .clone();
-    let (id, epoch, presentation_epoch, top_level_frame) = {
+    let (id, epoch, presentation_epoch, top_level_frame, requested_box) = {
         let dom = dom_handle.borrow();
         let id = host_arg_node(&dom, args, 0);
         let top_level_frame = id.is_some_and(|id| {
             matches!(dom.tag_name(id), Some("iframe" | "frame")) && dom.frame_owner(id).is_none()
+        });
+        // Child rectangles also need their container's content-box origin;
+        // viewport requests and tables retain the complete projection.
+        let requested_box = id.filter(|&id| {
+            !matches!(args.get(1), Some(Value::Bool(true)))
+                && !matches!(dom.tag_name(id), Some("iframe" | "frame"))
+                && dom.frame_owner(id).is_none()
+                && !dom
+                    .computed_value_resolved(id, "display")
+                    .is_some_and(|display| display.contains("table"))
         });
         (
             id,
             dom.epoch(),
             dom.layout_presentation_epoch(),
             top_level_frame,
+            requested_box,
         )
     };
-    let (cached_epoch, cached_presentation_epoch, top_document_valid) = {
+    let (cached_epoch, cached_presentation_epoch, top_document_valid, available) = {
         let cached = cache.borrow();
         (
             cached.epoch,
             cached.presentation_epoch,
             cached.top_document_valid,
+            cached.complete_geometry
+                || requested_box.is_some_and(|id| cached.boxes.contains_key(&id)),
         )
     };
-    let reuse_cached = if cached_presentation_epoch != presentation_epoch {
+    let reuse_cached = if cached_presentation_epoch != presentation_epoch || !available {
         false
     } else if cached_epoch == epoch {
         true
@@ -11760,7 +11815,7 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     let cache = if reuse_cached {
         cache
     } else {
-        ensure_host_geom_cache(ctx, "bounding-rect")
+        ensure_host_geometry(ctx, "bounding-rect", requested_box)
     };
     let rect = id.and_then(|id| {
         let cached = cache.borrow();
@@ -12717,7 +12772,19 @@ mod tests {
             ),
             "120"
         );
+        {
+            let cache = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .geom_cache
+                .borrow();
+            assert!(!cache.complete_geometry);
+            assert_eq!(cache.boxes.len(), 1);
+            assert!(cache.scrolling_areas.is_empty());
+        }
         let cache = ensure_host_geom_cache(engine.ctx(), "test-repeat");
+        assert!(cache.borrow().complete_geometry);
         assert_eq!(crate::layout2::layout_pass_count(), start + 1);
         assert!(
             cache.borrow().paint.is_none(),
@@ -12785,6 +12852,116 @@ mod tests {
             &fragments,
             cache.borrow().fragments.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn lazy_border_box_projection_keeps_scroll_inline_and_frame_geometry_current() {
+        // CSSOM View #dom-element-getboundingclientrect / #dom-element-scrollwidth:
+        // a border rectangle and a scrolling area are distinct projections of
+        // the same current layout. Returned rectangles remain snapshots.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<style>
+            body { margin:0 }
+            #box { width:80px; height:20px; padding:2px; border:3px solid }
+            #scroll { width:120px; height:60px; overflow:auto }
+            #wide { width:250px; height:80px }
+            #fixed { position:fixed; left:200px; top:100px; width:30px; height:40px }
+            #zero { position:absolute; left:3px; top:4px; width:0; height:0 }
+            #wrap { width:80px }
+            iframe { width:180px; height:80px; border:3px solid }
+            </style><div id=box></div><div id=scroll><div id=wide></div></div>
+            <div id=fixed></div><div id=zero></div>
+            <div id=wrap><span id=inline>several words wrapping onto more lines</span></div>
+            <iframe id=frame></iframe>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        let start = crate::layout2::layout_pass_count();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                var box=document.getElementById('box');
+                var before=box.getBoundingClientRect();
+                var fixed=document.getElementById('fixed').getBoundingClientRect();
+                var zero=document.getElementById('zero').getBoundingClientRect();
+                JSON.stringify([before.width,before.height,fixed.x,fixed.y,
+                    fixed.width,fixed.height,zero.x,zero.y,zero.width,zero.height])
+            "#
+            ),
+            "[90,30,200,100,30,40,3,4,0,0]"
+        );
+        assert_eq!(crate::layout2::layout_pass_count(), start + 1);
+        let cache = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .geom_cache
+            .clone();
+        assert!(!cache.borrow().complete_geometry);
+        assert_eq!(cache.borrow().boxes.len(), 3);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('scroll').scrollWidth)"
+            ),
+            "250"
+        );
+        assert!(cache.borrow().complete_geometry);
+        assert_eq!(crate::layout2::layout_pass_count(), start + 1);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                box.style.width='110px';
+                JSON.stringify([before.width,box.getBoundingClientRect().width])
+            "#
+            ),
+            "[90,120]"
+        );
+        assert!(!cache.borrow().complete_geometry);
+        assert_eq!(crate::layout2::layout_pass_count(), start + 2);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                var inline=document.getElementById('inline').getBoundingClientRect();
+                String(inline.width>0 && inline.height>20)
+            "#
+            ),
+            "true"
+        );
+        assert!(cache.borrow().complete_geometry);
+        assert_eq!(crate::layout2::layout_pass_count(), start + 2);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                box.style.display='none';
+                var hidden=box.getBoundingClientRect();
+                JSON.stringify([hidden.x,hidden.y,hidden.width,hidden.height])
+            "#
+            ),
+            "[0,0,0,0]"
+        );
+        assert!(cache.borrow().complete_geometry);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                var frame=document.getElementById('frame');
+                var child=frame.contentDocument;
+                child.body.innerHTML='<div id=inside style="width:37px;height:19px"></div>';
+                var inside=child.getElementById('inside');
+                var childBefore=inside.getBoundingClientRect();
+                var frameBefore=frame.getBoundingClientRect();
+                inside.style.width='57px';
+                JSON.stringify([childBefore.x,childBefore.width,frameBefore.width,
+                    frame.getBoundingClientRect().width,inside.getBoundingClientRect().width])
+            "#
+            ),
+            "[8,37,186,186,57]"
+        );
     }
 
     #[test]
