@@ -75,5 +75,31 @@
     __trust.click(button.__id);
     assert(child.seen.map(s => s.split(':')[0]).join() === 'pointerdown,pointerup,click', 'canceled pointer suppresses compatibility mouse only');
     assert(child.document.activeElement !== button, 'canceled mousedown does not focus on click');
+    // A percent-sized embedded slider must retain both its painted endpoint
+    // and its document mouseup target beyond the 300px default object width.
+    body.style.width = '400px';
+    frame.setAttribute('width', '100%'); frame.setAttribute('height', '150'); frame.style.border = '0';
+    child.eval(`
+        document.body.style.margin = '0';
+        document.body.innerHTML = '<div id="track" style="width:360px;height:40px">' +
+            '<button id="thumb" style="width:40px;height:40px">Drag</button></div>';
+        globalThis.dragging = false; globalThis.dragMoves = 0;
+        document.getElementById('thumb').addEventListener('mousedown', () => dragging = true);
+        document.addEventListener('mousemove', () => { if (dragging) dragMoves++; });
+        document.addEventListener('mouseup', event => {
+            dragging = false; globalThis.releasedAt = event.clientX;
+        });
+    `);
+    const thumb = child.document.getElementById('thumb'), track = child.document.getElementById('track');
+    const sliderRect = frame.getBoundingClientRect();
+    assert(sliderRect.width === 400 && child.innerWidth === 400,
+        'percentage iframe viewport: ' + sliderRect.width + '/' + child.innerWidth + '/' + frame.getAttribute('width'));
+    __trust.pointerButton(thumb.__id, true, sliderRect.left + 20, sliderRect.top + 20);
+    __trust.hover(track.__id, sliderRect.left + 340, sliderRect.top + 20);
+    assert(child.dragging && child.dragMoves === 1, 'embedded slider drag');
+    __trust.pointerButton(track.__id, false, sliderRect.left + 340, sliderRect.top + 20);
+    __trust.hover(track.__id, sliderRect.left + 350, sliderRect.top + 20);
+    assert(!child.dragging && child.releasedAt === 340 && child.dragMoves === 1,
+        'document mouseup releases the thumb and later motion does not drag');
     return 'native-frame-input-ok';
 })()

@@ -10974,15 +10974,20 @@
             }
         }
         // Target names/origins can change without changing element records.
-        // Preserve first-child precedence and the same-origin filter on every
-        // relevant document or navigable revision.
+        // Preserve first-child precedence on every document/navigable revision.
         namedFrames = new Map();
         const seenNames = new Set();
         for (const element of windowFrames) {
             const name = navigableName(element);
             if (name && !seenNames.has(name)) {
                 seenNames.add(name);
-                if (frameSameOrigin(frameURLFor(element), element)) namedFrames.set(name, element);
+                // Interop exception to HTML's current same-origin-only target
+                // name set: Chrome and Firefox also expose a cross-origin
+                // child's WindowProxy when its target name matches the
+                // container's name attribute. A child-chosen name alone must
+                // not expose it. See https://github.com/whatwg/html/issues/12663.
+                if (frameSameOrigin(frameURLFor(element), element) ||
+                    __dom_get_attr(element.__id, 'name') === name) namedFrames.set(name, element);
             }
         }
     }
@@ -12861,7 +12866,10 @@
         originKey: inheritedMessageState ? inheritedMessageState.originKey
             : messageOrigin === "null" ? Symbol() : messageOrigin,
         sourceFor(receiver) {
-            return realmRootFrame && receiver === cfg.parentWindow ? realmRootFrame.contentWindow : g;
+            // HTML #window-post-message-steps exposes the sender's WindowProxy
+            // for sibling recipients too, preserving identity with the
+            // embedder's named/indexed access instead of leaking the raw Realm.
+            return realmRootFrame && receiver !== g ? realmRootFrame.contentWindow : g;
         },
         serialize(value, transfer) { return serializeMessage(value, transfer); },
         enqueue(wire, origin, source, ports, targetOrigin, buffers) {

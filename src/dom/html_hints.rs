@@ -1,4 +1,4 @@
-//! HTML rendering's legacy color and font presentational hints.
+//! HTML rendering's legacy presentational hints.
 //!
 //! WHATWG HTML snapshot e5071a20c8569 (2026-09-06), #the-page,
 //! #phrasing-content-3, #tables-2, #the-hr-element-2 and #the-marquee-element-2;
@@ -17,6 +17,16 @@ impl Dom {
             return;
         }
         let tag = self.tag_name(id).unwrap_or("");
+        // HTML #dimRendering maps iframe dimensions to CSS hints, including
+        // percentages. Keep these in the cascade so both the live box tree
+        // and presentation snapshots use them, and author `auto` can win.
+        if tag == "iframe" {
+            for property in ["width", "height"] {
+                if let Some(value) = self.attr(id, property).and_then(dimension_value) {
+                    hint(property, value);
+                }
+            }
+        }
         if matches!(
             tag,
             "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "marquee"
@@ -83,6 +93,37 @@ impl Dom {
 
 fn ascii_whitespace(ch: char) -> bool {
     matches!(ch, '\t' | '\n' | '\u{000c}' | '\r' | ' ')
+}
+
+/// HTML #rules-for-parsing-dimension-values (snapshot e5071a20c8569).
+/// Leading ASCII whitespace and trailing garbage are allowed; a sign or a
+/// leading dot fails, and only an immediately following '%' is a percentage.
+fn dimension_value(input: &str) -> Option<String> {
+    let bytes = input.trim_start_matches(ascii_whitespace).as_bytes();
+    if !bytes.first()?.is_ascii_digit() {
+        return None;
+    }
+    let mut position = 0;
+    let mut value = 0.0_f64;
+    while let Some(digit) = bytes.get(position).filter(|digit| digit.is_ascii_digit()) {
+        value = (value * 10.0 + f64::from(digit - b'0')).min(f64::from(f32::MAX));
+        position += 1;
+    }
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let mut divisor = 1.0;
+        while let Some(digit) = bytes.get(position).filter(|digit| digit.is_ascii_digit()) {
+            divisor *= 10.0;
+            value += f64::from(digit - b'0') / divisor;
+            position += 1;
+        }
+    }
+    let unit = if bytes.get(position) == Some(&b'%') {
+        "%"
+    } else {
+        "px"
+    };
+    Some(format!("{value}{unit}"))
 }
 
 /// HTML #rules-for-parsing-a-legacy-colour-value. In particular, this is not
@@ -213,6 +254,40 @@ fn legacy_font_size(input: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iframe_dimension_hints_follow_html_parsing_and_cascade() {
+        for (input, expected) in [
+            ("100%", Some("100%")),
+            (" \t75.5%ignored", Some("75.5%")),
+            ("25.%", Some("25%")),
+            ("0%", Some("0%")),
+            ("100 %", Some("100px")),
+            ("32px", Some("32px")),
+            ("1e2", Some("1px")),
+            ("+20", None),
+            ("-20", None),
+            (".5", None),
+            ("\u{a0}20", None),
+            ("", None),
+        ] {
+            assert_eq!(dimension_value(input).as_deref(), expected, "{input:?}");
+        }
+        let mut dom = Dom::parse_document(
+            r#"<style>@layer sizing { #f { height:auto } }</style>
+            <iframe id=f width="100%" height="80%"></iframe>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        assert_eq!(dom.computed_value(frame, "width").as_deref(), Some("100%"));
+        assert_eq!(dom.computed_value(frame, "height").as_deref(), Some("auto"));
+        dom.set_attr(frame, "width", "75%");
+        assert_eq!(dom.computed_value(frame, "width").as_deref(), Some("75%"));
+        dom.set_attr(frame, "style", "width:auto");
+        assert_eq!(dom.computed_value(frame, "width").as_deref(), Some("auto"));
+        let snapshot = dom.serialize(frame);
+        assert!(snapshot.contains("width:300px"), "{snapshot}");
+        assert!(snapshot.contains("height:150px"), "{snapshot}");
+    }
 
     #[test]
     fn legacy_color_follows_html_code_point_and_component_rules() {

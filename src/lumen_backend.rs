@@ -14698,8 +14698,13 @@ mod tests {
                         document.querySelectorAll = query;
                     }
                     const opaque = document.createElement('iframe');
-                    opaque.name = 'blockedName'; opaque.src = 'data:text/html,opaque';
+                    opaque.name = 'declaredName'; opaque.src = 'data:text/html,opaque';
                     body.appendChild(opaque); __trust.hydrateFrames();
+                    assert(window.declaredName === opaque.contentWindow &&
+                        typeof frames.declaredName.postMessage === 'function', 'declared cross-origin child name');
+                    assert(frames.declaredName.document === null, 'named access preserves the contentWindow facade');
+                    opaque.__contentRealmWindow.name = 'blockedName';
+                    assert(!('declaredName' in window), 'container name alone does not override the target name');
                     const later = document.createElement('iframe'); later.name = 'blockedName'; body.appendChild(later);
                     assert(!('blockedName' in window), 'first cross-origin target masks a later same-origin name');
                     opaque.remove();
