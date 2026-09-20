@@ -4452,7 +4452,8 @@
         const rect = offsetBoxRect(element);
         if (!rect) return null;
         const view = element.ownerDocument && element.ownerDocument.defaultView || g;
-        return new DOMRect(rect[0] - (view.scrollX || 0), rect[1] - (view.scrollY || 0),
+        const sx = rect[4] ? 0 : (view.scrollX || 0), sy = rect[4] ? 0 : (view.scrollY || 0);
+        return new DOMRect(rect[0] - sx, rect[1] - sy,
             rect[2], rect[3]);
     }
     const offsetStyle = g.__dom_offset_style;

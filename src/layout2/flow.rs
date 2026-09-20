@@ -4085,7 +4085,8 @@ impl Flow<'_> {
         let y = value("overflow-y").unwrap_or_else(|| y.into());
         let scrollable = |axis: &str| matches!(axis, "hidden" | "auto" | "scroll" | "overlay");
         let scrolls_block = scrollable(&y) || (y == "visible" && scrollable(&x));
-        let baseline = (matches!(ab.content, Content::Blocks(_) | Content::Inlines(_))
+        let baseline = ((matches!(ab.content, Content::Blocks(_) | Content::Inlines(_))
+            || matches!(&ab.content, Content::Atomic(atom) if matches!(atom.kind, AtomKind::Control { .. })))
             && !scrolls_block)
             .then(|| inline_block_baseline(self.dom, &frag).map(|baseline| m[TOP] + baseline))
             .flatten();

@@ -1093,6 +1093,7 @@ pub fn measure_boxes_css(
 #[derive(Default)]
 pub(crate) struct RetainedMeasurement {
     pub complete_geometry: bool,
+    pub viewport_fixed_roots: Vec<NodeId>,
     pub boxes: HashMap<NodeId, PxRect>,
     pub tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     pub scrolling_areas: HashMap<NodeId, PxRect>,
@@ -1155,6 +1156,18 @@ pub(crate) fn measure_retained_layout_for_box(
         };
         RetainedMeasurement {
             complete_geometry: single_box.is_none(),
+            viewport_fixed_roots: layout
+                .fixed
+                .iter()
+                .map(|fragment| fragment.node)
+                .chain(
+                    layout
+                        .top_layer
+                        .iter()
+                        .filter(|top| top.fixed)
+                        .map(|top| top.fragment.node),
+                )
+                .collect(),
             boxes,
             tracks: layout.tracks,
             scrolling_areas,
@@ -8104,6 +8117,50 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_tables_ignore_root_padding_but_retain_cell_padding() {
+        for display in ["table", "inline-table"] {
+            for collapse in ["collapse", "separate"] {
+                let dom = Dom::parse_document(&format!(
+                    r#"<!doctype html><style>body{{margin:0}}
+                    #table{{display:{display};border-collapse:{collapse};border-spacing:0;padding:6px 16px}}
+                    #cell{{display:table-cell;padding:3px 8px}}
+                    #child{{width:40px;height:20px}}
+                    </style><div id=table><div id=cell><div id=child></div></div></div>"#
+                ));
+                let layout = lay_out_graphical(
+                    &dom,
+                    &Url::parse("https://example.test/").unwrap(),
+                    Viewport::new(640., 480.),
+                    &[],
+                    &HashMap::new(),
+                    &HashMap::new(),
+                );
+                let table = rect(&dom, &layout.boxes, "table");
+                let cell = rect(&dom, &layout.boxes, "cell");
+                let child = rect(&dom, &layout.boxes, "child");
+                let (x, y) = if collapse == "collapse" {
+                    (0., 0.)
+                } else {
+                    (16., 6.)
+                };
+                assert_eq!(
+                    (cell.left - table.left, cell.top - table.top),
+                    (x, y),
+                    "{display}/{collapse}"
+                );
+                assert_eq!((child.left - cell.left, child.top - cell.top), (8., 3.));
+                assert_eq!(table.width, 56. + 2. * x);
+                assert_eq!(table.height, 26. + 2. * y);
+                assert_eq!(
+                    dom.computed_value_resolved(node_by_id(&dom, "table"), "padding-left")
+                        .as_deref(),
+                    Some("16px")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn css_padding_suppresses_cellpadding() {
         // The presentational-hint priority: a cell with ANY CSS padding ignores
         // the `cellpadding` attribute, so its content is not inset.
@@ -8634,6 +8691,94 @@ mod tests {
         assert_eq!(retained.paint.lines, full.paint.lines);
         assert_eq!(retained.paint.image_requests, full.paint.image_requests);
         assert_eq!(retained.boundaries, full.boundaries);
+    }
+
+    #[test]
+    fn table_cell_alignment_does_not_leak_into_nested_inline_baselines() {
+        let mut offsets = Vec::new();
+        for alignment in ["top", "middle", "bottom"] {
+            let dom = Dom::parse_document(&format!(
+                r#"<!doctype html><style>
+            body{{margin:0}} table{{border-collapse:collapse}}td{{padding:0;vertical-align:{alignment}}}
+            .line{{display:inline-block;font:18px/20px sans-serif;white-space:nowrap}}
+            input{{width:40px;height:40px;padding:0;border:0;margin:0;font:inherit;transform:scale(.5)}}
+            #icon{{display:inline-block}} img{{width:18px;height:18px}}
+            </style><table><tr><td><div class=line><input id=control type=button value=""><span id=icon><img id=image src=icon.png></span></div></td><td><div style="height:100px;width:1px"></div></td></tr></table>"#
+            ));
+            let base = Url::parse("https://example.test/").unwrap();
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(640., 480.),
+                &forms,
+                &controls,
+                &HashMap::new(),
+            );
+            let control = rect(&dom, &layout.boxes, "control");
+            let icon = rect(&dom, &layout.boxes, "icon");
+            let offset = icon.top - control.top;
+            assert!(
+                (5. ..15.).contains(&offset),
+                "{alignment}: {offset}, {control:?} {icon:?}"
+            );
+            offsets.push(offset);
+        }
+        for offset in &offsets[1..] {
+            assert!((offset - offsets[0]).abs() < 0.01, "{offsets:?}");
+        }
+    }
+
+    #[test]
+    fn graphical_inline_replaced_transforms_preserve_flow_and_scale_hits() {
+        use crate::core::{CssPoint, CssSize};
+        let dom = Dom::parse_document(
+            r#"<!doctype html><style>
+            body { margin:0 } form { margin:0; font:16px/40px sans-serif }
+            input,img { width:40px; height:40px; padding:0; border:0;
+                margin:0 5px; vertical-align:top; transform:scale(.5) }
+            input { background:linear-gradient(red,blue); color:transparent }
+            </style><form><input id=control type=submit value=Go><img id=image src=sample.png><span id=after>after</span></form>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(640., 480.),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let control = rect(&dom, &layout.boxes, "control");
+        let image = rect(&dom, &layout.boxes, "image");
+        assert_eq!(
+            (control.left, control.top, control.width, control.height),
+            (5., 0., 40., 40.)
+        );
+        assert_eq!(
+            (image.left, image.top, image.width, image.height),
+            (55., 0., 40., 40.)
+        );
+        assert_eq!(rect(&dom, &layout.boxes, "after").left, 100.);
+        for (name, rect) in [("control", control), ("image", image)] {
+            let node = node_by_id(&dom, name);
+            let hits = crate::render::page_element_hits_at(
+                &layout.paint,
+                CssSize::new(640., 480.),
+                CssPoint::default(),
+                CssPoint::new(rect.left as f32 + 28., 28.),
+            );
+            let hit = hits
+                .iter()
+                .filter(|hit| hit.node == node)
+                .max_by(|a, b| a.rect.width.total_cmp(&b.rect.width))
+                .unwrap();
+            assert_eq!(hit.rect.width, 20., "{name}");
+            assert_eq!(hit.rect.height, 20., "{name}");
+            assert_eq!(hit.rect.x, rect.left as f32 + 10., "{name}");
+            assert_eq!(hit.rect.y, 10., "{name}");
+        }
     }
 
     #[test]
