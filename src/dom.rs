@@ -6528,6 +6528,9 @@ impl Dom {
             self.computed_value_resolved(id, property)
                 .filter(|value| value.trim() != "auto")
                 .or_else(|| {
+                    if self.tag_name(id) == Some("iframe") {
+                        return None;
+                    }
                     self.attr(id, attr)
                         .and_then(|value| value.trim().parse::<f32>().ok())
                         .filter(|value| value.is_finite() && *value >= 0.0)

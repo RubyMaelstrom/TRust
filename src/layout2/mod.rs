@@ -4291,6 +4291,51 @@ mod tests {
     }
 
     #[test]
+    fn iframe_percentage_attributes_size_live_and_serialized_viewports() {
+        // HTML #dimRendering / #rules-for-parsing-dimension-values: an iframe's
+        // percentage hint resolves against its containing block. Child content
+        // and CSSOM geometry must see the same viewport as either frontend.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div style="width:512px;height:400px">
+            <iframe id=f width="75%" height="50%" style="border:0"></iframe></div></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(frame,
+            r#"<body style="margin:0"><div id=track style="width:100%;height:40px;background:blue"></div></body>"#,
+            "https://frame.test/widget").unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        for (style, expected) in [
+            ("border:0", (384., 200.)),
+            ("border:0;width:auto;height:auto", (300., 150.)),
+        ] {
+            dom.set_attr(frame, "style", style);
+            let snapshot = Dom::parse_document(&dom.serialize(crate::dom::DOCUMENT));
+            for tree in [&dom, &snapshot] {
+                let frame = tree
+                    .get_by_id("f")
+                    .or_else(|| {
+                        tree.descendants(crate::dom::DOCUMENT)
+                            .find(|&node| tree.attr(node, "data-trust-frame").is_some())
+                    })
+                    .unwrap();
+                let layout = lay_out_graphical(
+                    tree,
+                    &base,
+                    Viewport::new(800., 600.),
+                    &[],
+                    &HashMap::new(),
+                    &HashMap::new(),
+                );
+                let geometry = &layout.boxes[&frame];
+                assert!((geometry.width - expected.0).abs() < 0.1, "{geometry:?}");
+                assert!((geometry.height - expected.1).abs() < 0.1, "{geometry:?}");
+                let track = tree.get_by_id("track").unwrap();
+                assert!((layout.boxes[&track].width - expected.0).abs() < 0.1);
+            }
+        }
+    }
+
+    #[test]
     fn serialized_frame_keeps_fixed_viewport_and_flex_body_alignment() {
         // The resident page actor serializes its live DOM before the native
         // frontend reparses and lays it out. That adapter must preserve the

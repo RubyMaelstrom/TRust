@@ -69,6 +69,33 @@
     opaque.contentWindow.postMessage('ping', '*');
     drain();
     assert(received.some(event => event.data === 'reply:ping'), 'cross-origin proxy reply');
+    // Cross-origin siblings use their embedder-declared names to establish a
+    // channel. Interop exception tracked in whatwg/html#12663; message origin,
+    // source and transferred endpoints still follow HTML web messaging.
+    const recipient = document.createElement('iframe');
+    recipient.name = 'channelRecipient';
+    recipient.src = 'data:text/html,' + encodeURIComponent(`<script>
+        addEventListener('message', event => {
+            if (event.origin !== 'null' || event.source !== parent.frames.channelSender)
+                throw Error('sibling message source/origin: ' + event.origin + ' / ' +
+                    (event.source === parent.frames.channelSender));
+            event.ports[0].postMessage('sibling-channel-ok');
+        });
+    <\/script>`);
+    body.appendChild(recipient);
+    __trust.hydrateFrames();
+    const sender = document.createElement('iframe');
+    sender.name = 'channelSender';
+    sender.src = 'data:text/html,' + encodeURIComponent(`<script>
+        const channel = new MessageChannel();
+        channel.port1.onmessage = event => parent.postMessage(event.data, '*');
+        parent.frames.channelRecipient.postMessage('connect', '*', [channel.port2]);
+    <\/script>`);
+    body.appendChild(sender);
+    __trust.hydrateFrames();
+    drain();
+    assert(received.some(event => event.data === 'sibling-channel-ok'),
+        'named sibling transferred channel: ' + __trust.takeErrors());
     const channel = new MessageChannel();
     const queued = { value: 1 };
     channel.port1.postMessage(queued);

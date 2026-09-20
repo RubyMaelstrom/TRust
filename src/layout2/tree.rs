@@ -620,6 +620,13 @@ impl Builder<'_> {
         let body = self.dom.frame_body(id);
         let mut style = BoxStyle::of(self.dom, id, self.vp);
         let dimension = |name: &str, fallback: f32| {
+            // Iframe dimension attributes already participate in the cascade.
+            // An authored auto must use the default object size, not revive
+            // the lower-priority attribute. Legacy <frame> still uses its
+            // existing fallback path.
+            if self.dom.tag_name(id) == Some("iframe") {
+                return fallback;
+            }
             self.dom
                 .attr(id, name)
                 .and_then(|value| value.trim().parse::<f32>().ok())
