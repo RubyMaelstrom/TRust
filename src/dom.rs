@@ -3389,7 +3389,8 @@ impl Dom {
         // `position` is checked first so the hot path short-circuits for the
         // overwhelming majority of nodes that aren't absolutely positioned.
         if self.cascaded(id, "position").as_deref() == Some("absolute")
-            && self.cascaded(id, "overflow").as_deref() == Some("hidden")
+            && self.computed_value_resolved(id, "overflow-x").as_deref() == Some("hidden")
+            && self.computed_value_resolved(id, "overflow-y").as_deref() == Some("hidden")
             && self
                 .cascaded(id, "width")
                 .as_deref()
@@ -3460,9 +3461,9 @@ impl Dom {
                 toks.peek().is_some() && toks.all(|t| matches!(t, "hidden" | "clip"))
             })
         };
-        let overflow = self.cascaded(id, "overflow");
+        let overflow = self.computed_value_resolved(id, "overflow");
         let zero = |prop| {
-            self.cascaded(id, prop)
+            self.computed_value_resolved(id, prop)
                 .as_deref()
                 .is_some_and(css_len_is_zero)
         };
@@ -4183,6 +4184,20 @@ impl Dom {
     /// `marginRight` back as the substituted value). A no-op when the value
     /// has no `var(`.
     pub fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
+        if name == "overflow" {
+            let x = self.computed_value_resolved(id, "overflow-x");
+            let y = self.computed_value_resolved(id, "overflow-y");
+            if x.is_none() && y.is_none() {
+                return None;
+            }
+            let x = x.as_deref().unwrap_or("visible");
+            let y = y.as_deref().unwrap_or("visible");
+            return Some(if x == y {
+                x.to_string()
+            } else {
+                format!("{x} {y}")
+            });
+        }
         let value = self
             .computed_value(id, name)
             .map(|v| self.resolve_vars(id, &v))?;
@@ -10998,6 +11013,30 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .map(|(name, _)| (name, pending.clone()))
                 .collect();
         }
+    }
+    if prop == "overflow" {
+        // CSS Overflow 3 #overflow-control / CSS Cascade 5 #shorthand:
+        // expand in place so specificity, importance and declaration order
+        // compare the same longhands, including a later reset to visible.
+        let tokens = split_top_level_ws(value);
+        let (x, y) = match tokens.as_slice() {
+            [x] => (*x, *x),
+            [x, y] if wide_keyword(x).is_none() && wide_keyword(y).is_none() => (*x, *y),
+            _ => return Vec::new(),
+        };
+        if [x, y].into_iter().any(|v| {
+            wide_keyword(v).is_none()
+                && !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"
+                )
+        }) {
+            return Vec::new();
+        }
+        return vec![
+            ("overflow-x".into(), x.into()),
+            ("overflow-y".into(), y.into()),
+        ];
     }
     if prop == "white-space" {
         if wide_keyword(value).is_some() {

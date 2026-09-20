@@ -12997,6 +12997,44 @@ mod tests {
     }
 
     #[test]
+    fn overflow_shorthand_resets_axes_through_the_cascade_and_cssom() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>
+            .list { overflow-y:hidden }
+            #list { overflow:visible }
+            #important { overflow-y:hidden!important; overflow:visible }
+            #vars { --axes:clip auto; overflow:var(--axes) }
+            </style><div id=list class=list></div><div id=important></div><div id=vars></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const list=document.getElementById('list'), style=list.style;
+            function axes(e) { const s=getComputedStyle(e); return [s.overflowX,s.overflowY].join(','); }
+            if(axes(list)!=='visible,visible') return 'specificity '+axes(list);
+            if(getComputedStyle(document.getElementById('important')).overflowY!=='hidden') return 'important';
+            if(axes(document.getElementById('vars'))!=='clip,auto') return 'variables';
+            style.cssText='overflow-y:hidden;overflow:visible';
+            if(style.overflowY!=='visible'||style.overflowX!=='visible'||style.overflow!=='visible') return 'CSSOM expansion';
+            style.overflow='hidden scroll';
+            if(style.overflowX!=='hidden'||style.overflowY!=='scroll'||style.overflow!=='hidden scroll') return 'two axes';
+            style.overflow='visible bogus';
+            if(style.overflow!=='hidden scroll') return 'invalid grammar';
+            style.overflow='var(--axes)'; style.setProperty('--axes','visible visible');
+            if(axes(list)!=='visible,visible') return 'inline variables';
+            style.removeProperty('overflow');
+            if(style.overflowX!==''||style.overflowY!=='') return 'shorthand removal';
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
     fn client_rects_keep_viewport_fixed_descendants_stationary_while_scrolling() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<!doctype html><style>body{margin:0;width:2000px;height:2000px}
