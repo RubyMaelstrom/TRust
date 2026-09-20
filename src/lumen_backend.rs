@@ -274,6 +274,7 @@ struct HostState {
     webgl: HashMap<usize, crate::webgl::Context>,
     import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
+    audio_context_slots: Option<Value>,
     history_slots: Option<Value>,
     history_traversals: Vec<(u64, i32)>,
     pointer_lock_state: Option<Value>,
@@ -342,6 +343,7 @@ impl HostState {
             webgl: HashMap::new(),
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
+            audio_context_slots: None,
             history_slots: None,
             history_traversals: Vec::new(),
             pointer_lock_state: None,
@@ -532,6 +534,7 @@ impl RetainedMemory for HostState {
             webgl,
             import_maps,
             permission_slots,
+            audio_context_slots,
             history_slots,
             history_traversals,
             pointer_lock_state,
@@ -853,6 +856,9 @@ impl RetainedMemory for HostState {
             ));
         }
         if let Some(value) = permission_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = audio_context_slots {
             visitor.value(value);
         }
         if history_traversals.capacity() != 0 {
@@ -6408,6 +6414,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__callback_api", 3, host_callback_api),
     ("__invoke_callback", 4, host_invoke_callback),
     ("__permissions_binding", 2, host_permissions_binding),
+    ("__audio_context_binding", 2, host_audio_context_binding),
     ("__history_binding", 2, host_history_binding),
     ("__pointer_lock_state", 1, host_pointer_lock_state),
     ("__navigator_binding", 1, host_navigator_binding),
@@ -6747,6 +6754,23 @@ fn host_history_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
         let context = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.) as u64;
         state.history_traversals.push((context, delta));
         return Ok(Value::Undefined);
+    }
+    let context = value.as_num_opt().unwrap_or(0.) as u64;
+    Ok(Value::Bool(
+        context == 0 || state.window_realms.contains_key(&context),
+    ))
+}
+
+/// Web Audio context brands are shared by same-Agent Window Realms. Retain
+/// only the WeakMap, and check the associated Document on lifecycle operations.
+fn host_audio_context_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("AudioContext requires HostState");
+    if op == "slots" {
+        return Ok(state.audio_context_slots.get_or_insert(value).clone());
     }
     let context = value.as_num_opt().unwrap_or(0.) as u64;
     Ok(Value::Bool(
@@ -14241,7 +14265,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 166, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 167, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -14252,7 +14276,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 166);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 167);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -14635,6 +14659,146 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn audio_context_lifecycle_without_a_renderer() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/audio_context.mjs")),
+                "audio-context-pending",
+                "{tier:?}"
+            );
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "audioResumeResult + '|' + audioSuspendResult + '|' + audioBrandResult"
+                ),
+                "pending|suspended|TypeError"
+            );
+            for _ in 0..100 {
+                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
+                    break;
+                }
+                eval(&mut engine, "__trust.runPlatformTask()", "audio task").unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "[audioResumeResult, audioEvents.join(','), audioContext.state, audioContext.currentTime, __trust.hasPlatformTask()].join('|')"
+                ),
+                "NotSupportedError|error,new-handler,after-handler|suspended|0|false",
+                "{tier:?}"
+            );
+            eval(&mut engine, r#"
+                audioEvents.length = 0;
+                audioContext.onstatechange = event => {
+                    assertAudio(event.isTrusted && event.target === audioContext, 'trusted state event');
+                    audioEvents.push('closed-event');
+                };
+                audioContext.close().then(() => audioEvents.push('closed-promise'));
+                assertAudio(audioContext.state === 'closed', 'close changes control state synchronously');
+                Promise.all(['resume', 'suspend', 'close'].map(method =>
+                    audioContext[method]().catch(error => error.name))).then(results => {
+                        globalThis.audioClosedResults = results.join(',');
+                    });
+            "#, "close audio context").unwrap();
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(string_value(&mut engine, "audioEvents.length"), "0");
+            for _ in 0..10 {
+                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
+                    break;
+                }
+                eval(&mut engine, "__trust.runPlatformTask()", "audio close task").unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "[audioEvents.join(','), audioClosedResults, audioContext.currentTime, __trust.hasPlatformTask(), __trust.takeErrors()].join('|')"
+                ),
+                "closed-promise,closed-event|InvalidStateError,InvalidStateError,InvalidStateError|0|false|",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_context_construction_does_not_abort_module_ui() {
+        let html = r#"<!doctype html><div id="root"></div><script type="module">
+            const context = new AudioContext({latencyHint: 0.03});
+            const root = document.getElementById('root');
+            root.innerHTML = '<button>Start audio</button><output>Ready</output>';
+            context.resume().catch(error => root.querySelector('output').textContent = error.name);
+        </script>"#;
+        let (rendered, outcome) =
+            crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!outcome.panicked);
+        assert!(rendered.contains(">Start audio</button>"), "{rendered}");
+        assert!(
+            rendered.contains(">NotSupportedError</output>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn audio_context_window_ownership_and_worker_exposure() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><body></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            r#"
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            const foreign = frame.contentWindow;
+            const context = new foreign.AudioContext();
+            const getter = Object.getOwnPropertyDescriptor(BaseAudioContext.prototype, 'state').get;
+            if (getter.call(context) !== 'suspended') throw Error('cross-realm context getter');
+            frame.remove();
+            try { new foreign.AudioContext(); throw Error('inactive constructor accepted'); }
+            catch (error) { if (error.name !== 'InvalidStateError') throw error; }
+            Promise.all([AudioContext.prototype.resume.call(context).catch(error => error.name),
+                context.close().catch(error => error.name)]).then(results => {
+                    globalThis.audioRealmResult = results.join('|');
+                });
+        "#,
+            "audio context realm ownership",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "audioRealmResult"),
+            "InvalidStateError|InvalidStateError"
+        );
+
+        let mut worker = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        eval(&mut worker, crate::js::worker_prelude(), "worker prelude").unwrap();
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "typeof AudioContext + '|' + typeof BaseAudioContext"
+            ),
+            "undefined|undefined"
+        );
     }
 
     #[test]

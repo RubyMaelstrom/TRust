@@ -5436,6 +5436,177 @@
         get videoHeight() { return 0; }
     }
     class HTMLAudioElement extends HTMLMediaElement {}
+
+    // Web Audio 1.1, local WebAudio/web-audio-api@2047f16 (2026-09-06):
+    // #AudioContext-constructors, #AudioContext-methods, #sample-rates.
+    // Context construction is distinct from acquiring a renderer. Applications
+    // can create a suspended context while assembling their interface. TRust
+    // has no audio graph renderer yet: acquisition fails asynchronously and
+    // resume rejects, without advancing the sample clock or reporting playback.
+    // Only the context lifecycle is implemented here; graph nodes, decoding,
+    // offline rendering and worklets must not advertise fabricated support.
+    function installAudioContexts() {
+        const binding = g.__audio_context_binding;
+        delete g.__audio_context_binding;
+        const slots = binding("slots", new WeakMap()), token = {};
+        const get = WeakMap.prototype.get.bind(slots), set = WeakMap.prototype.set.bind(slots);
+        const PromiseCtor = Promise, Exception = DOMException;
+        const finite = Number.isFinite, fround = Math.fround;
+        const define = Object.defineProperty;
+        function record(context) {
+            const state = get(context);
+            if (!state) throw new TypeError("Illegal AudioContext invocation");
+            return state;
+        }
+        function requireActive(contextId) {
+            if (!binding("active", contextId))
+                throw new Exception("Document is not fully active", "InvalidStateError");
+        }
+        function requireOpen(context) {
+            const state = record(context);
+            requireActive(state.contextId);
+            if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
+            return state;
+        }
+        function enumValue(value, choices) {
+            const text = `${value}`;
+            if (!choices.includes(text)) throw new TypeError("Invalid AudioContext option");
+            return text;
+        }
+        function options(value) {
+            if (value != null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeError("AudioContext options must be a dictionary");
+            // Web IDL #js-to-dictionary: get and convert each member once, in
+            // lexicographic order, before executing constructor validation.
+            const latency = value == null ? undefined : value.latencyHint;
+            if (latency !== undefined) {
+                if (typeof latency === "number") {
+                    if (!finite(latency)) throw new TypeError("Latency must be finite");
+                } else enumValue(latency, ["balanced", "interactive", "playback"]);
+            }
+            let quantum = value == null ? undefined : value.renderSizeHint;
+            let hardware = false;
+            if (quantum === undefined) quantum = 128;
+            else if (typeof quantum === "number") quantum = quantum >>> 0;
+            else {
+                hardware = enumValue(quantum, ["default", "hardware"]) === "hardware";
+                quantum = hardware ? 0 : 128;
+            }
+            let rate = value == null ? undefined : value.sampleRate;
+            if (rate === undefined) rate = 48000;
+            else {
+                rate = fround(+rate);
+                if (!finite(rate)) throw new TypeError("Sample rate must be a finite float");
+            }
+            const sink = value == null ? undefined : value.sinkId;
+            if (sink !== undefined) {
+                if (sink === null || typeof sink === "object" || typeof sink === "function") {
+                    const type = sink === null ? undefined : sink.type;
+                    if (type === undefined) throw new TypeError("Audio sink type is required");
+                    enumValue(type, ["none"]);
+                } else `${sink}`;
+            }
+            return {rate, quantum, hardware};
+        }
+        class BaseAudioContext extends EventTarget {
+            constructor(key, state) {
+                if (key !== token) throw new TypeError("Illegal constructor");
+                super();
+                set(this, state);
+            }
+            get sampleRate() { return record(this).rate; }
+            get currentTime() { record(this); return 0; }
+            get state() { return record(this).closed ? "closed" : "suspended"; }
+            get renderQuantumSize() { return record(this).quantum; }
+        }
+        class AudioContext extends BaseAudioContext {
+            constructor(contextOptions = undefined) {
+                const state = options(contextOptions);
+                requireActive(storageContextId);
+                if (state.rate < 3000 || state.rate > 768000)
+                    throw new Exception("Unsupported sample rate", "NotSupportedError");
+                if ((!state.hardware && state.quantum < 1) || state.quantum > 6 * state.rate)
+                    throw new Exception("Unsupported render quantum size", "NotSupportedError");
+                state.closed = false;
+                state.contextId = storageContextId;
+                state.handlers = Object.create(null);
+                super(token, state);
+                state.enqueue = fn => __queue_dom_task(fn);
+                state.fire = type => dispatch(this, createTrustedEvent(Event, type), false);
+                state.add = (type, fn) => addL(this, type, fn, false);
+                state.remove = (type, fn) => removeL(this, type, fn, false);
+                // Sending a control message to start processing: acquisition
+                // failure queues an error event; it does not throw out of the
+                // constructor or start a timer to imitate an audio clock.
+                state.enqueue(() => {
+                    if (!state.closed) state.fire("error");
+                });
+            }
+            get baseLatency() { record(this); return 0; }
+            get outputLatency() { record(this); return 0; }
+            getOutputTimestamp() {
+                record(this);
+                return {contextTime: 0, performanceTime: 0};
+            }
+            resume() {
+                return new PromiseCtor((resolve, reject) => {
+                    const state = requireOpen(this);
+                    state.enqueue(() => reject(new Exception(
+                        "No Web Audio renderer is available", "NotSupportedError")));
+                });
+            }
+            suspend() {
+                return new PromiseCtor(resolve => {
+                    requireOpen(this);
+                    // Already suspended: resolve without a spurious statechange.
+                    resolve();
+                });
+            }
+            close() {
+                return new PromiseCtor(resolve => {
+                    const state = requireOpen(this);
+                    state.closed = true;
+                    state.enqueue(() => {
+                        resolve();
+                        state.enqueue(() => state.fire("statechange"));
+                    });
+                });
+            }
+        }
+        // HTML event handler activation preserves the listener's original
+        // position when a non-null handler is replaced. Keep slots private.
+        for (const [proto, type] of [[BaseAudioContext.prototype, "statechange"],
+            [AudioContext.prototype, "error"]]) {
+            define(proto, "on" + type, {
+                configurable: true, enumerable: true,
+                get() { const handler = record(this).handlers[type]; return handler ? handler.value : null; },
+                set(value) {
+                    const state = record(this), handlers = state.handlers;
+                    let handler = handlers[type];
+                    value = typeof value === "function" ? value : null;
+                    if (value === null) {
+                        if (handler) state.remove(type, handler.listener);
+                        delete handlers[type];
+                    } else if (handler) handler.value = value;
+                    else {
+                        handler = {value, listener: event => handler.value.call(this, event)};
+                        handlers[type] = handler;
+                        state.add(type, handler.listener);
+                    }
+                }
+            });
+        }
+        for (const ctor of [BaseAudioContext, AudioContext]) {
+            for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
+                if (name === "constructor") continue;
+                const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);
+                descriptor.enumerable = true;
+                define(ctor.prototype, name, descriptor);
+            }
+            define(ctor.prototype, Symbol.toStringTag, {value: ctor.name, configurable: true});
+            define(g, ctor.name, {value: ctor, writable: true, configurable: true});
+        }
+    }
     for (const [name,value] of [["NETWORK_EMPTY",0],["NETWORK_IDLE",1],["NETWORK_LOADING",2],
         ["NETWORK_NO_SOURCE",3],["HAVE_NOTHING",0],["HAVE_METADATA",1],["HAVE_CURRENT_DATA",2],
         ["HAVE_FUTURE_DATA",3],["HAVE_ENOUGH_DATA",4]]) {
@@ -12566,6 +12737,7 @@
         for (const k in legacy) { DOMException[k] = legacy[k]; DOMException.prototype[k] = legacy[k]; }
     }
     g.DOMException = DOMException;
+    installAudioContexts();
 
     // Bound wrappers (installEventHandlers calls them unbound), routing
     // through the shared options-aware registry.
