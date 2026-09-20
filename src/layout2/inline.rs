@@ -1767,6 +1767,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// A forced break always terminates the current line — an empty one
     /// still yields a line box (`<br><br>` shows a blank row).
     pub fn forced_break(&mut self) {
+        self.pen += self.take_gap();
         self.flush_line(true);
     }
 
@@ -1924,6 +1925,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         Vec<FloatPlace>,
         Vec<AtomBoxPlace>,
     ) {
+        // CSS 2 #inline-formatting / CSS Sizing 3 #intrinsic-contribution:
+        // closing inline edges are real space, not collapsible whitespace.
+        // Include the trailing margin/border/padding even without a following
+        // text run to consume it (e.g. an image in an anonymous table cell).
+        self.pen += self.take_gap();
         self.flush_line(false);
         if self.align == Align2::Justify {
             let n = self.lines.len();
