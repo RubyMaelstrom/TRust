@@ -428,7 +428,7 @@ struct ScrollBox {
 }
 
 /// Per-epoch memo for `computed_value`: the epoch the entries are valid for,
-/// and inherited results keyed `(node, property index)`. FxHash: the keys
+/// and results keyed `(node, property index)`. FxHash: the keys
 /// are arena-internal, so SipHash's DoS resistance buys nothing.
 // Numeric computed lengths (notably inherited line-height:ch/ex) also depend
 // on the installed font metrics, independently of DOM/style invalidation.
@@ -4040,7 +4040,11 @@ impl Dom {
         {
             return Some(String::from("hidden"));
         }
-        if inherited && let Some(hit) = self.computed_cache_get(id, idx) {
+        // CSS Cascade 5 #computed: non-inherited properties have one current
+        // value too. The same style/font invalidation that protects inherited
+        // results protects these reads; formatting-dependent used values and
+        // var() substitution still happen in their respective consumers.
+        if let Some(hit) = self.computed_cache_get(id, idx) {
             return hit;
         }
         let parent_computed = || {
@@ -4107,9 +4111,7 @@ impl Dom {
         } else {
             v
         };
-        if inherited {
-            self.computed_cache_put(id, idx, v.clone());
-        }
+        self.computed_cache_put(id, idx, v.clone());
         v
     }
 
@@ -4122,20 +4124,20 @@ impl Dom {
         let value = self
             .computed_value(id, name)
             .map(|v| self.resolve_vars(id, &v))?;
-        let inherited = prop_index(name).is_some_and(|index| PROPS[index].inherited);
-        match properties::ident(&value).as_deref().and_then(wide_keyword) {
+        let inherited = || prop_index(name).is_some_and(|index| PROPS[index].inherited);
+        match resolved_wide_keyword(&value) {
             Some(WideKeyword::Initial) => None,
             Some(WideKeyword::Inherit) => self
                 .style_parent(id)
                 .and_then(|parent| self.computed_value_resolved(parent, name)),
-            Some(WideKeyword::Unset) => inherited
+            Some(WideKeyword::Unset) => inherited()
                 .then(|| {
                     self.style_parent(id)
                         .and_then(|parent| self.computed_value_resolved(parent, name))
                 })
                 .flatten(),
             Some(WideKeyword::Revert) => self.ua_default(id, name).or_else(|| {
-                inherited
+                inherited()
                     .then(|| {
                         self.style_parent(id)
                             .and_then(|parent| self.computed_value_resolved(parent, name))
@@ -10279,6 +10281,23 @@ fn wide_keyword(v: &str) -> Option<WideKeyword> {
         Some(WideKeyword::Revert)
     } else {
         None
+    }
+}
+
+/// CSS Syntax 3 #consume-token: an ordinary number, hash, string, or an
+/// identifier beginning with another ASCII letter cannot be a CSS-wide
+/// keyword. Keep tokenization for possible keywords, comments and escapes;
+/// in particular, a textual prefix is never sufficient to accept a keyword.
+fn resolved_wide_keyword(value: &str) -> Option<WideKeyword> {
+    let first = value
+        .trim_start_matches([' ', '\t', '\n', '\r', '\u{000c}'])
+        .as_bytes()
+        .first();
+    match first {
+        Some(b'i' | b'I' | b'u' | b'U' | b'r' | b'R' | b'/' | b'\\' | 0x80..=0xff) => {
+            properties::ident(value).as_deref().and_then(wide_keyword)
+        }
+        _ => None,
     }
 }
 

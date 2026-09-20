@@ -1223,6 +1223,76 @@ mod tests {
     }
 
     #[test]
+    fn noninherited_values_remain_current_across_warm_style_reads() {
+        // CSS Cascade 5 #computed / #inherit / #inherit-initial: explicit
+        // inheritance also applies to normally non-inherited properties.
+        // Their computed percentage remains a percentage until layout.
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            #parent { width:50%; --edge:3px; opacity:.7 }
+            #leaf { width:inherit; padding-left:var(--edge); opacity:unset }
+            #parent.changed { width:75%; --edge:9px }
+            #parent:has(.flag) #leaf { opacity:.4 }
+            #leaf:empty { margin-left:7px }
+            </style><div id=parent><div id=leaf>text</div></div>"#,
+        );
+        let parent = dom.get_by_id("parent").unwrap();
+        let leaf = dom.get_by_id("leaf").unwrap();
+        for _ in 0..2 {
+            assert_eq!(dom.computed_value(leaf, "width").as_deref(), Some("50%"));
+            assert_eq!(
+                dom.computed_value_resolved(leaf, "padding-left").as_deref(),
+                Some("3px")
+            );
+            assert_eq!(dom.computed_value(leaf, "opacity"), None);
+            assert_eq!(dom.computed_value(leaf, "margin-left"), None);
+        }
+        dom.set_attr(parent, "class", "changed");
+        assert_eq!(dom.computed_value(leaf, "width").as_deref(), Some("75%"));
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "padding-left").as_deref(),
+            Some("9px")
+        );
+        dom.set_text(leaf, "");
+        assert_eq!(
+            dom.computed_value(leaf, "margin-left").as_deref(),
+            Some("7px")
+        );
+        let flag = dom.create_element("span");
+        dom.set_attr(flag, "class", "flag");
+        dom.append(parent, flag);
+        assert_eq!(dom.computed_value(leaf, "opacity").as_deref(), Some(".4"));
+        assert_style_values_match_cold(&mut dom);
+        dom.detach(flag);
+        assert_eq!(dom.computed_value(leaf, "opacity"), None);
+        dom.set_attr(leaf, "style", "width:initial;opacity:inherit");
+        assert_eq!(dom.computed_value(leaf, "width"), None);
+        assert_eq!(dom.computed_value(leaf, "opacity").as_deref(), Some(".7"));
+        assert_style_values_match_cold(&mut dom);
+
+        // CSS Syntax 3 #consume-token / #consume-ident-like-token: escaped
+        // and commented keywords still take the complete tokenizer path.
+        for keyword in ["inherit", "INHERIT", r"\69 nherit", "/*a*/inherit/*b*/"] {
+            dom.set_attr(leaf, "style", &format!("width:var(--missing,{keyword})"));
+            assert_eq!(
+                dom.computed_value_resolved(leaf, "width").as_deref(),
+                Some("75%")
+            );
+        }
+        for value in ["25%", "calc(20px + 3%)", "auto"] {
+            dom.set_attr(
+                leaf,
+                "style",
+                &format!("--value:{value};width:var(--value)"),
+            );
+            assert_eq!(
+                dom.computed_value_resolved(leaf, "width").as_deref(),
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
     fn computed_styles_survive_text_ticks_and_unrelated_attribute_writes() {
         let mut dom = Dom::parse_document(
             r#"<style>
