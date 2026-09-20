@@ -880,7 +880,7 @@ impl BrowserController {
     /// commit path used by an HTML form submission.
     pub fn post(&mut self, url: url::Url, body: String) -> ActionOutcome {
         let generation_before = self.generation;
-        self.begin_post(url, body);
+        self.begin_post(url, body, None);
         self.invalidation.request_redraw();
         ActionOutcome {
             invalidated: true,
@@ -2839,7 +2839,7 @@ impl BrowserController {
                 target.set_query((!body.is_empty()).then_some(body.as_str()));
                 self.begin_page_fetch(Link::Http(target), false, NavigationIntent::New);
             }
-            FormMethod::Post => self.begin_post(form.action, body),
+            FormMethod::Post => self.begin_form_post(form.action, body),
         }
     }
 
@@ -2849,14 +2849,28 @@ impl BrowserController {
             return;
         };
         if submission.method.eq_ignore_ascii_case("post") {
-            self.begin_post(action, submission.body);
+            self.begin_form_post(action, submission.body);
         } else if !submission.method.eq_ignore_ascii_case("dialog") {
             action.set_query((!submission.body.is_empty()).then_some(&submission.body));
             self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New);
         }
     }
 
-    fn begin_post(&mut self, url: url::Url, body: String) {
+    fn begin_form_post(&mut self, url: url::Url, body: String) {
+        // HTML #plan-to-navigate / #process-a-navigate-fetch retain the form
+        // document as the fetch client (local snapshot e5071a20, 2026-09-06).
+        // Capture it before retiring the actor so Fetch can derive Origin,
+        // Referer, Fetch Metadata and SameSite cookies from the real source.
+        // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#plan-to-navigate
+        // https://fetch.spec.whatwg.org/#append-a-request-origin-header
+        let source = self.current.as_ref().and_then(|page| match &page.target {
+            Link::Http(url) => Some(url.clone()),
+            _ => None,
+        });
+        self.begin_post(url, body, source);
+    }
+
+    fn begin_post(&mut self, url: url::Url, body: String, source: Option<url::Url>) {
         if crate::media::is_youtube_video_url(&url) {
             self.delegate_external_media(url);
             return;
@@ -2883,7 +2897,7 @@ impl BrowserController {
             let result = fetch_protocol_interactive(
                 &target,
                 false,
-                None,
+                source.as_ref(),
                 window_environment,
                 storage,
                 Some(body),
@@ -3291,6 +3305,177 @@ fn split_host_port(address: &str) -> (&str, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn form_post_preserves_source_context_through_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // HTML #concept-form-submit / #process-a-navigate-fetch and
+        // Fetch #append-a-request-origin-header: a form keeps its document
+        // client, including when the resident actor has already serialized it.
+        for path in ["static", "live", "command"] {
+            for source_kind in ["same-origin", "cross-site", "opaque"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let cookie_path = format!("/form-context-{}/", address.port());
+                let action =
+                    url::Url::parse(&format!("http://{address}{cookie_path}session")).unwrap();
+                let source = match source_kind {
+                    "same-origin" => action.join("login?return_to=%2F#credentials").unwrap(),
+                    "cross-site" => {
+                        url::Url::parse("http://source.example.test/login?private=1#form").unwrap()
+                    }
+                    _ => url::Url::parse("file:///tmp/login.html").unwrap(),
+                };
+                for same_site in ["Strict", "Lax"] {
+                    http::set_cookie_from_js(
+                        &action,
+                        &format!(
+                            "form_{same_site}=present; Path={cookie_path}; SameSite={same_site}"
+                        ),
+                    );
+                }
+                let server = tokio::spawn(async move {
+                    let mut requests = Vec::new();
+                    for hop in 0..2 {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            head.push(stream.read_u8().await.unwrap());
+                            assert!(head.len() < 16384);
+                        }
+                        let head = String::from_utf8(head).unwrap();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("Content-Length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        let mut body = vec![0; length];
+                        stream.read_exact(&mut body).await.unwrap();
+                        requests.push((head, body));
+                        let response = if hop == 0 {
+                            format!(
+                                "HTTP/1.1 303 See Other\r\nLocation: {cookie_path}accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        } else {
+                            String::from(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                            )
+                        };
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                    requests
+                });
+                let mut browser =
+                    BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+                browser.current = Some(BrowserPage {
+                    target: Link::Http(source.clone()),
+                    fallback_http: false,
+                    document: FetchedDocument::Internal(Vec::new()),
+                    status: String::from("Ready"),
+                    rendered: None,
+                    rendered_revision: 1,
+                    revision: 1,
+                });
+                let dom = crate::dom::Dom::parse_document(
+                    r#"<form method="post"><input type="hidden" name="token" value="a+b/=&amp;"><input name="login" value="someone"><button name="commit" value="Sign in">Sign in</button></form>"#,
+                );
+                let mut form = http::extract_forms_arena(&dom, &action, None).0.remove(0);
+                form.action = action.clone();
+                let body = "token=a%2Bb%2F%3D%26&login=someone&commit=Sign+in";
+                match path {
+                    "static" => {
+                        browser.handle_action(UserAction::SubmitForm {
+                            form,
+                            submitter: Some(2),
+                        });
+                    }
+                    "live" => {
+                        browser.handle_page_event(crate::js::PageEvt::SubmitForm {
+                            form: 1,
+                            submitter: Some(4),
+                            submission: Some(crate::js::FormSubmission {
+                                action: action.to_string(),
+                                method: "post".into(),
+                                body: body.into(),
+                            }),
+                        });
+                    }
+                    _ => {
+                        browser.post(action.clone(), body.into());
+                    }
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    browser.task.take().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                browser.process_async_events();
+                assert_eq!(
+                    browser.current_page().unwrap().address(),
+                    action.join("accepted").unwrap().as_str()
+                );
+                let requests = server.await.unwrap();
+                let command = path == "command";
+                let origin = if command || source_kind == "opaque" {
+                    String::from("null")
+                } else {
+                    source.origin().ascii_serialization()
+                };
+                let site = if command {
+                    "none"
+                } else if source_kind == "opaque" {
+                    "cross-site"
+                } else {
+                    source_kind
+                };
+                let referer = if command || source_kind == "opaque" {
+                    None
+                } else if source_kind == "same-origin" {
+                    Some(source.as_str().split('#').next().unwrap().to_string())
+                } else {
+                    Some(String::from("http://source.example.test/"))
+                };
+                for (hop, (head, payload)) in requests.iter().enumerate() {
+                    let header = |name: &str| {
+                        head.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case(name).then(|| value.trim())
+                        })
+                    };
+                    assert_eq!(
+                        header("Origin"),
+                        (hop == 0).then_some(origin.as_str()),
+                        "{path} {source_kind}: {head}"
+                    );
+                    assert_eq!(header("Referer"), referer.as_deref());
+                    assert_eq!(header("Sec-Fetch-Site"), Some(site));
+                    assert_eq!(header("Sec-Fetch-Mode"), Some("navigate"));
+                    assert_eq!(header("Sec-Fetch-Dest"), Some("document"));
+                    let cookies = header("Cookie").unwrap_or_default();
+                    let same_site = command || source_kind == "same-origin";
+                    assert_eq!(cookies.contains("form_Strict=present"), same_site);
+                    assert_eq!(cookies.contains("form_Lax=present"), same_site || hop == 1);
+                    if hop == 0 {
+                        assert!(head.starts_with(&format!("POST {} HTTP/1.1\r\n", action.path())));
+                        assert_eq!(
+                            header("Content-Type"),
+                            Some("application/x-www-form-urlencoded")
+                        );
+                        assert_eq!(payload, body.as_bytes());
+                    } else {
+                        assert!(head.starts_with("GET "));
+                        assert!(payload.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn document_scripts_use_the_window_size_after_fetch_completes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4297,6 +4482,7 @@ mod tests {
         browser.begin_post(
             url::Url::parse("https://www.youtube.com/watch?v=posted123").unwrap(),
             String::from("ignored=body"),
+            None,
         );
         let (url, _) = browser.take_external_media().unwrap();
         assert_eq!(url.query(), Some("v=posted123"));
