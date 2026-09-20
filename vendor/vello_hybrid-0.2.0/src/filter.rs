@@ -31,7 +31,7 @@ pub(crate) const FILTER_ATLAS_PADDING: u16 = MAX_KERNEL_SIZE as u16 / 2;
 
 // Since we store in RGBA32 texture.
 const BYTES_PER_TEXEL: usize = 16;
-const FILTER_SIZE_BYTES: usize = 48;
+const FILTER_SIZE_BYTES: usize = 96;
 const FILTER_SIZE_U32: usize = FILTER_SIZE_BYTES / 4;
 const COMPOSITE_ORIGINAL_SHIFT: u32 = 13;
 const COMPOSITE_ORIGINAL_MASK: u32 = 1 << COMPOSITE_ORIGINAL_SHIFT;
@@ -62,6 +62,7 @@ pub(crate) mod filter_type {
     pub(crate) const FLOOD: u32 = 1;
     pub(crate) const GAUSSIAN_BLUR: u32 = 2;
     pub(crate) const DROP_SHADOW: u32 = 3;
+    pub(crate) const COLOR_MATRIX: u32 = 4;
 }
 
 pub(crate) mod edge_mode {
@@ -81,6 +82,7 @@ pub(crate) mod pass_kind {
     pub(crate) const UPSCALE: u32 = 6;
     pub(crate) const COMPOSITE_DROP_SHADOW: u32 = 7;
     pub(crate) const COLORIZE: u32 = 8;
+    pub(crate) const COLOR_MATRIX: u32 = 9;
 }
 
 pub(crate) fn edge_mode_to_gpu(mode: EdgeMode) -> u32 {
@@ -197,7 +199,7 @@ pub(crate) struct GpuOffset {
     pub header: u32,
     pub dx: f32,
     pub dy: f32,
-    pub _padding: [u32; 9],
+    pub _padding: [u32; 21],
 }
 
 impl From<&Offset> for GpuOffset {
@@ -206,7 +208,7 @@ impl From<&Offset> for GpuOffset {
             header: pack_header(filter_type::OFFSET),
             dx: offset.dx,
             dy: offset.dy,
-            _padding: [0; 9],
+            _padding: [0; 21],
         }
     }
 }
@@ -216,7 +218,7 @@ impl From<&Offset> for GpuOffset {
 pub(crate) struct GpuFlood {
     pub header: u32,
     pub color: u32,
-    pub _padding: [u32; 10],
+    pub _padding: [u32; 22],
 }
 
 impl From<&Flood> for GpuFlood {
@@ -224,7 +226,7 @@ impl From<&Flood> for GpuFlood {
         Self {
             header: pack_header(filter_type::FLOOD),
             color: flood.color.premultiply().to_rgba8().to_u32(),
-            _padding: [0; 10],
+            _padding: [0; 22],
         }
     }
 }
@@ -237,7 +239,7 @@ pub(crate) struct GpuGaussianBlur {
     pub linear_weights: [f32; MAX_TAPS_PER_SIDE],
     pub linear_offsets: [f32; MAX_TAPS_PER_SIDE],
     // Needed since drop shadow has a bigger footprint.
-    pub _padding: [u32; 4],
+    pub _padding: [u32; 16],
 }
 
 impl From<&GaussianBlur> for GpuGaussianBlur {
@@ -261,7 +263,7 @@ impl From<&GaussianBlur> for GpuGaussianBlur {
             center_weight: lk.center_weight,
             linear_weights: lk.weights,
             linear_offsets: lk.offsets,
-            _padding: [0; 4],
+            _padding: [0; 16],
         }
     }
 }
@@ -276,7 +278,7 @@ pub(crate) struct GpuDropShadow {
     pub dx: f32,
     pub dy: f32,
     pub color: u32,
-    pub _padding: [u32; 1],
+    pub _padding: [u32; 13],
 }
 
 impl From<&DropShadow> for GpuDropShadow {
@@ -305,7 +307,7 @@ impl From<&DropShadow> for GpuDropShadow {
             dx: shadow.dx,
             dy: shadow.dy,
             color: shadow.color.premultiply().to_rgba8().to_u32(),
-            _padding: [0; 1],
+            _padding: [0; 13],
         }
     }
 }
@@ -343,7 +345,16 @@ impl GpuFilterData {
     }
 }
 
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Zeroable, Pod)]
+struct GpuColorMatrix {
+    header: u32,
+    padding: [u32; 3],
+    matrix: [f32; 20],
+}
+
 trait CastToFilterData: Pod {}
+impl CastToFilterData for GpuColorMatrix {}
 
 impl CastToFilterData for GpuOffset {}
 impl CastToFilterData for GpuFlood {}
@@ -359,6 +370,9 @@ impl<T: CastToFilterData> From<T> for GpuFilterData {
 impl From<&PreparedFilter> for GpuFilterData {
     fn from(filter: &PreparedFilter) -> Self {
         match filter {
+            PreparedFilter::ColorMatrix(matrix) => GpuColorMatrix {
+                header: pack_header(filter_type::COLOR_MATRIX), padding: [0; 3], matrix: *matrix,
+            }.into(),
             PreparedFilter::Offset(f) => GpuOffset::from(f).into(),
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
             PreparedFilter::GaussianBlur(f) => GpuGaussianBlur::from(f).into(),
@@ -435,6 +449,7 @@ impl FilterPassPlan {
             }
 
             match filter.gpu_filter.filter_type() {
+                filter_type::COLOR_MATRIX => builder.emit(pass_kind::COLOR_MATRIX),
                 filter_type::OFFSET => {
                     builder.emit(pass_kind::OFFSET);
                 }

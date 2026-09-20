@@ -5908,8 +5908,6 @@ dependencies = [
 [[package]]
 name = "vello_common"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb2141a2bca6e6d598e471fd4d1d7eed8e020aad6a28187edda07f091a325dd"
 dependencies = [
  "bytemuck",
  "fearless_simd",
@@ -5924,8 +5922,6 @@ dependencies = [
 [[package]]
 name = "vello_cpu"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ace506ca414548966fcf3c283be94eb1cad8254de488791ee698bf438b0890a9"
 dependencies = [
  "bytemuck",
  "glifo",
@@ -5950,8 +5946,6 @@ dependencies = [
 [[package]]
 name = "vello_sparse_shaders"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86e5fd6b8d73d641ffe8522f05e2d5a7f23620005dfc1a7f49488790b9970267"
 dependencies = [
  "wesl",
  "wesl-macros",

@@ -206,10 +206,14 @@ crossterm = { path = "vendor/crossterm-0.29.0" }
 # image-rs/image-webp#178 until its fix ships in a crates.io release.
 image-webp = { path = "vendor/image-webp-0.2.4" }
 # Vello Hybrid 0.2 is the current release, but upstream still pins wgpu 29.
-# TRust carries this source-identical compatibility fork so the desktop uses
-# wgpu 30's panic-safe SurfaceTexture teardown (gfx-rs/wgpu#9678). Keep the
-# renderer changes confined to the fork and drop the patch when Vello updates.
+# TRust's fork uses wgpu 30's panic-safe SurfaceTexture teardown
+# (gfx-rs/wgpu#9678) and implements the color-matrix filter shared below.
 vello_hybrid = { path = "vendor/vello_hybrid-0.2.0" }
+# Native CSS color filters share a matrix contract across the CPU and GPU
+# backends. These 0.2.0 forks add the missing primitive without a version bump.
+vello_common = { path = "vendor/vello_common-0.2.0" }
+vello_cpu = { path = "vendor/vello_cpu-0.2.0" }
+vello_sparse_shaders = { path = "vendor/vello_sparse_shaders-0.2.0" }
 # TRust's owned Wasmi 1.1.0 forks provide the pure-Rust WebAssembly interpreter.
 # Local changes include JavaScript memory synchronization and reference tracing,
 # exception support, and interpreter cache and dirty-range optimizations.
