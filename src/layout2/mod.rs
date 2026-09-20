@@ -8117,6 +8117,29 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_table_cells_include_trailing_inline_margins() {
+        for margin in [8., -2.] {
+            for tail in ["", "<br>"] {
+                let dom = Dom::parse_document(&format!(
+                    "<!doctype html><style>body{{margin:0}}#table{{display:table;border-collapse:collapse}}img{{display:inline-block;width:40px;height:40px;margin:4px {margin}px 0 4px}}#cell{{display:table-cell;width:20px}}</style><div id=table><img id=image src=icon.png>{tail}<div id=cell>text</div></div>"
+                ));
+                let layout = lay_out_graphical(
+                    &dom,
+                    &Url::parse("https://example.test/").unwrap(),
+                    Viewport::new(640., 480.),
+                    &[],
+                    &HashMap::new(),
+                    &HashMap::new(),
+                );
+                let image = rect(&dom, &layout.boxes, "image");
+                let cell = rect(&dom, &layout.boxes, "cell");
+                assert_eq!(image.left, 4.);
+                assert_eq!(cell.left, 44. + margin, "{margin}/{tail}");
+            }
+        }
+    }
+
+    #[test]
     fn collapsed_tables_ignore_root_padding_but_retain_cell_padding() {
         for display in ["table", "inline-table"] {
             for collapse in ["collapse", "separate"] {
