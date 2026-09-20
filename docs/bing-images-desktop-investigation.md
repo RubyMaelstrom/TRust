@@ -5,16 +5,202 @@ with LibreWolf as the primary visual reference. This is a standards investigatio
 not a Bing compatibility mode. No domain checks, rewritten site CSS, fabricated
 search results, or browser-identity spoofing were added.
 
-## Current responsiveness checkpoint
+## Rendering and functionality follow-up (passes 48–56)
 
-The latest native release reviewed here is pass 47. One immediate unprobed
+The follow-up investigates SafeSearch, Filter animation, the hamburger menu,
+continued image loading, and the floating search header. Changes are shared
+standards implementations unless the defect is in desktop presentation itself.
+The follow-up is saved in coherent commits; release and native verification details are below.
+
+| Symptom | General defect and correction |
+| --- | --- |
+| SafeSearch label absent | A formatting context containing only floats incorrectly moved its top edge to the float's bottom. Preserve the containing block's original top and include float extents in its auto height. |
+| SafeSearch popup clipped | `overflow` was not expanded into both longhands before the cascade, so an older `overflow-y:hidden` survived a higher-priority `overflow:visible`. Expand the shorthand with normal order, specificity, importance, variable substitution, and CSSOM behavior. |
+| Menu and subsequent image batches stalled | `getElementsByClassName` returned a static result. Author code repeatedly moving or removing the first member of a live collection could never finish. Implement a live HTMLCollection with literal class tokens, ASCII whitespace, and document-mode-dependent case matching. Preserve parser document modes through frames, detached documents, and cloning. |
+| Floating thumbnails disappear on blur | Desktop painting reset the CSS animation time to zero whenever focus was lost. Keep document time monotonic; focus may reduce rendering frequency but must not rewind the animation. |
+| Floating search magnifier too large | Inline replaced elements discarded their transform/compositing scope. Retain that scope for painting and hit testing while preserving their untransformed space in inline flow. |
+| Camera icon too high | Table-cell vertical alignment leaked into nested inline formatting contexts. Start each context at its own baseline, and export the internal text baseline of text input/button controls, including empty labels. |
+| Floating suggestion thumbnails/text displaced | Collapsed-border tables incorrectly applied padding to the table root, while line endings discarded the image’s trailing margin. Use zero table-root padding in that model and include closing inline edges in line/intrinsic widths, including negative margins and forced breaks. |
+| Floating suggestions do not track scrolling | CSSOM subtracted document scroll from boxes already positioned in viewport coordinates. Preserve the containing-block decision from layout; descendants of a viewport-fixed box remain stationary, while fixed boxes captured by a transformed ancestor scroll with that ancestor. |
+| Filter instantly changes size/spacing | Implement CSS transitions for box lengths/percentages and opacity in the canonical style system, including list matching, easing, delays, reversal shortening, retargeting, cancellation, and trusted transition events. Layout, CSSOM, observers, and rendering consume the same intermediate values. |
+
+Transition presentation revisions do not mutate the DOM or invalidate live
+collections. Detection reuses the cascade's dependency invalidation, so text
+entry does not require resolving nineteen properties on every unchanged
+element. Active transitions schedule rendering opportunities and cease doing so
+when their final events have been delivered. A rendering update uses one animation
+timestamp across CSSOM reads, observers and paint. Intermediate values invalidate
+only the affected formatting subtrees. Pixel/percentage endpoints avoid unnecessary
+font-metric resolution. Transition events are sorted by scheduled time, tree order,
+generation and property, and delivered before animation-frame callbacks.
+
+Native profiling also found that the selector dependency index assigned the
+broadest dependency of any class selector to every class mutation. Adding a
+panel-only class could therefore discard the adjacent image grid. The index now
+tracks changed class tokens separately from raw `[class]` selectors. It retains
+conservative handling for relational selectors, filtered child indexes, shadow
+boundaries, and mutations whose previous value is unavailable. Focused tests
+compare cached selector matches against a full scan and both native and terminal
+painting against cold layout.
+
+### Native evidence
+
+Acceptance uses the actual release desktop window in the isolated Wayland
+session described below. Repeated native reviews verify:
+
+- [SafeSearch's three choices](../target/bing-review/pass56-safesearch.png)
+  are visible inside the popup.
+- [The hamburger menu](../target/bing-review/pass56-menu.png) opens.
+- Repeated physical scrolling loads **51, then 86, then 121 image-result anchors**
+  in passes 51 and 55. [The later results](../target/bing-review/pass55-pagination-2.png) also show a different suggestion group in the fixed header. Earlier independent trials loaded 50 → 85 → 120. This checks
+  successive network-backed expansions, not just movement within the first batch.
+- [Loss of focus to a second native window](../target/bing-review/pass56-floating-unfocused.png)
+  leaves the populated floating header visible.
+- [The corrected floating header](../target/bing-review/pass56-floating.png)
+  is compared with a [fresh native Brave reference](../target/bing-review/pass53-brave-floating.png).
+  Brave’s page is 1920px wide, with its separate 40px sidebar outside that width.
+  The first related thumbnail begins at x=382px, spans 40px, and is followed by
+  an 8px margin before text at x=430px. The camera sits on the input’s baseline;
+  the search magnifier retains the author’s scale transform.
+- Filter is reviewed with successive unmodified compositor captures during both
+  opening and closing, as well as [its settled state](../target/bing-review/pass56-filter-open-settled.png).
+  In the final unprobed run, with the cookie banner dismissed, the gallery's top
+  edge moves 206 → 239 → 242px on opening and 242 → 218 → 209 → 206px on closing.
+  The captures are about 55–75ms apart. This confirms real intermediate painting,
+  but opening skips most of the movement and **does not meet the smoothness target**.
+  The gallery includes a frame scrubber to inspect the originals.
+
+Pass 56 repeats the floating-header, focus-loss and pagination checks with the
+final executable and diagnostic tracing disabled. Its [later result batch](../target/bing-review/pass56-pagination-2.png)
+again shows new images and changed header suggestions. Search text remains
+slightly gray in the floating header compared with Brave; its actual value is
+retained, so this is a color difference, not a reappearing placeholder.
+
+The [comparison gallery](../target/bing-review/visual-comparison.html) keeps the
+native originals available alongside reference captures. Screenshots are local
+investigation artifacts under `target/`, not committed image assets.
+
+The complete serial suite in pass 55 passed **1,915 tests**, with 27 ignored and
+none failed (1,851 library tests plus 64 binary tests). The final class-dependency
+refinement passes **250 DOM tests, 479 layout tests, and 37 resident-actor tests**,
+plus the focused class regressions. Strict all-target Clippy, formatting, and
+whitespace checks pass on this source. `cargo build --release` succeeds for
+source commit `f763f43`. The native executable reviewed in pass 56 is byte-identical
+to `target/release/trust-desktop`, SHA-256
+`8deedb4d95cee8a0d3dfc2109d381c349844e0c6d0e6d238559f6974831a08d2`.
+The terminal release executable was also built; [both hashes](../target/bing-review/pass56-release-sha256.txt)
+and the [release log](../target/bing-review/pass56-release.log) are retained.
+
+### Final typing check (pass 56)
+
+After the compiler and test jobs finished, the final release was exercised with
+26 physical keys, 25ms down and 25ms up per key, entering
+`this is how it should look`. A separate unprobed trial shows all characters and
+the aligned caret in the immediate capture, but suggestions still correspond to
+an earlier query. The three-second settled capture has the current suggestions.
+A fresh Brave run uses the same 1920×1080 page dimensions and key injector.
+
+| Metric, median / maximum | TRust pass 56 | Brave 1.95.104 |
+| --- | --- | --- |
+| Native key to input event | 22.7 / 50.8 ms | 2.6 / 10.8 ms |
+| Native key to rAF callback | 46.2 / 96.8 ms | 4.9 / 18.1 ms |
+| Suggestion request network duration | 72.3 / 129.8 ms | 78.9 / 166.5 ms |
+| Network completion to suggestion XHR delivery | 792.2 / 1169.5 ms | 4.3 / 11.9 ms |
+
+Both measured trials record all 26 input events and all 26 suggestion responses.
+Nine suggestion responses are delivered before TRust's final-query rAF callback,
+compared with 23 in Brave. The similar network durations and much larger delivery
+delay locate the principal remaining autocomplete delay after the network
+request, rather than attributing it to Bing's service. These are single live-page
+trials, not confidence intervals. The rAF callback precedes presentation, so the
+table does not measure key-to-photon latency. The result remains comparable to
+the earlier pass-47 checkpoint and does not establish a responsiveness gain from
+this rendering follow-up.
+
+- [Unprobed immediate capture](../target/bing-review/pass56-unprobed-immediate.png)
+  and [settled capture](../target/bing-review/pass56-unprobed-settled.png).
+- [Brave immediate capture](../target/bing-review/brave-pass56-wall-immediate.png)
+  and [settled capture](../target/bing-review/brave-pass56-wall-settled.png).
+- [TRust event measurements](../target/bing-review/pass56-wall-latencies.json)
+  and [Brave event measurements](../target/bing-review/brave-pass56-wall-latencies.json).
+
+### Saved implementation commits
+
+| Commit | Change |
+| --- | --- |
+| `db4b041` | Preserve float-only formatting-context geometry. |
+| `797a629` | Implement live class collections and document-mode matching. |
+| `3796339` | Preserve the CSS animation clock across focus changes. |
+| `df28c3b` | Correct inline transforms, table baselines and fixed rectangles. |
+| `bfdf6a4` | Cascade overflow through its axis longhands. |
+| `dfcec6b` | Retain trailing inline edges in line and intrinsic widths. |
+| `978f50a` | Implement canonical transitions for box dimensions and opacity. |
+| `f763f43` | Limit class invalidation using changed selector tokens. |
+
+### Standards and regression scope
+
+All clauses were read from the local official snapshot fetched 6 September 2026,
+not claimed as newly checked upstream text. The revision identities are in the
+standards table later in this report. This follow-up additionally uses:
+
+- WHATWG DOM, `concept-getelementsbyclassname`, old-style collections, document
+  mode, and cloning; WHATWG HTML parser quirks-mode handling; Infra ASCII whitespace.
+- CSS 2, auto heights of block formatting context roots, `vertical-align`, and
+  inline-block baseline export and inline formatting; CSS Sizing 3 outer sizes and intrinsic contributions; HTML input-as-button layout; CSS Align 3 baseline export.
+- CSS Cascade 5 shorthand expansion; CSS Overflow 3 `overflow` and axis longhands;
+  CSSOM shorthand serialization.
+- CSS Tables 3 `collapsed-style-overrides`; CSS Transforms 1 `transform-rendering`;
+  CSS Positioned Layout 3 fixed containing blocks; CSSOM View client rectangles.
+- Web Animations document timelines; CSS Transitions 1 `starting`, `reversing`,
+  `application`, `complete`, and `transition-events`; CSS Transitions 2 transition generation and composite ordering; CSS Easing 1 Bézier and step functions; HTML rendering-update ordering.
+
+The corresponding local clauses and official anchors include:
+
+| Behavior | Local source in the recorded snapshot | Official clause |
+| --- | --- | --- |
+| Class dependency invalidation | [Selectors 4](/big/web-standards/repositories/w3c/csswg-drafts/selectors-4/Overview.bs:2345) | [Class selectors](https://drafts.csswg.org/selectors-4/#class-html), [logical combinations](https://drafts.csswg.org/selectors-4/#logical-combination), and [combinators](https://drafts.csswg.org/selectors-4/#combinators) |
+| Live class collections | [DOM source](/big/web-standards/repositories/whatwg/dom/dom.bs:5522) | [Class-name matching](https://dom.spec.whatwg.org/#concept-getelementsbyclassname) and [live collections](https://dom.spec.whatwg.org/#old-style-collections) |
+| Collapsed table padding | [CSS Tables 3](/big/web-standards/repositories/w3c/csswg-drafts/css-tables-3/Overview.bs:1115) | [Collapsed-border overrides](https://drafts.csswg.org/css-tables-3/#collapsed-style-overrides) |
+| Inline replaced transforms | [CSS Transforms 1](/big/web-standards/repositories/w3c/csswg-drafts/css-transforms-1/Overview.bs:180) | [Transform rendering](https://drafts.csswg.org/css-transforms-1/#transform-rendering) |
+| Transition start/reversal | [CSS Transitions 1](/big/web-standards/repositories/w3c/csswg-drafts/css-transitions-1/Overview.bs:548) | [Starting transitions](https://drafts.csswg.org/css-transitions-1/#starting) and [reversal shortening](https://drafts.csswg.org/css-transitions-1/#reversing) |
+| Stable document time and event order | [Web Animations 1](/big/web-standards/repositories/w3c/csswg-drafts/web-animations-1/Overview.bs:700), [HTML rendering](/big/web-standards/repositories/whatwg/html/source:123280) | [Document timelines](https://drafts.csswg.org/web-animations-1/#document-timelines), [animation events](https://drafts.csswg.org/web-animations-1/#animation-frame-loop), [composite order](https://drafts.csswg.org/css-transitions-2/#animation-composite-order) |
+
+Focused regressions cover live collections across execution tiers and document
+modes, float-only clipping geometry, cascade and CSSOM overflow behavior,
+viewport-fixed versus transformed-local-fixed geometry, transformed replaced
+paint/hits, collapsed versus separate table padding, and nested baselines for
+top-, middle-, and bottom-aligned cells. Transition tests exercise actual layout,
+percentage interpolation, reversal, retargeting, negative/positive delays,
+cancellation, inherited dimensions, clipping, dependency invalidation, CSSOM
+lists, and resident-actor delivery of intermediate ResizeObserver geometry and
+trusted completion events.
+
+### Remaining boundaries
+
+This adds interpolation for nineteen box/opacity properties; it is not a claim
+of complete CSS Transitions or Web Animations support. Other animation types,
+pseudo-element transitions, and broader CSS animation lifecycle behavior remain
+outside this implementation. CSSOM rectangles for transformed elements still
+have existing limitations even though the search icon's paint and hit region
+now scale correctly. A separate existing missing `outerHTML` setter was observed
+when following a related-search link through the site's soft navigation; that
+path is not included in the successful fresh-page menu/pagination checks.
+
+The final native captures and typing measurements leave Filter frame pacing and
+autocomplete latency as distinct acceptance issues. Visual and functional
+improvements here do not establish Brave responsiveness parity.
+No installed executable is overwritten and no repository is pushed.
+
+## Earlier responsiveness checkpoint (pass 47)
+
+The earlier responsiveness checkpoint reviewed pass 47. One immediate unprobed
 capture is one character short; both unprobed trials show stale suggestions. **Brave parity
 is not yet achieved.** The complete serial suite passed: 1,896 tests passed,
 27 ignored, none failed. Strict all-target Clippy, formatting, whitespace checks,
 and the standard release build also passed. The earlier parallel-suite Vulkan
 loader crash did not recur in this complete serial run; its cause is not claimed
-fixed. No binary is installed or promoted. Work pauses at this tested checkpoint
-at the user's request.
+fixed. No binary is installed or promoted. That phase paused at the user's request; the rendering and functionality
+follow-up above resumes investigation.
 
 The matched-width physical-key comparison below uses pass 47's second measured
 trial and a fresh Brave reference. Two pass-47 trials around a pass-46 baseline
