@@ -10734,6 +10734,29 @@ mod tests {
     }
 
     #[test]
+    fn float_only_bfc_keeps_its_top_edge_and_nonzero_clipping_box() {
+        // CSS 2 #root-height: include participating floats' bottom margin
+        // edges without moving the formatting-context root's top edge.
+        for context in ["overflow:hidden", "overflow-y:hidden", "display:flow-root"] {
+            let html = format!(
+                r#"<body style="margin:0"><span style="display:inline-block">
+                <ul id="list" style="{context};margin:0;padding:0;list-style:none">
+                  <li id="first" style="float:left;width:80px;height:30px">first</li>
+                  <li id="second" style="float:left;width:60px;height:20px;margin-bottom:15px">second</li>
+                </ul></span><div id="after">after</div></body>"#
+            );
+            let (dom, boxes) = measure(&html, 40, 20);
+            let list = rect(&dom, &boxes, "list");
+            let first = rect(&dom, &boxes, "first");
+            let second = rect(&dom, &boxes, "second");
+            assert_eq!(list.top, first.top, "{context}: preserve top edge");
+            assert_eq!(list.height, 35.0, "{context}: include bottom margin");
+            assert_eq!(second.left, first.left + 80.0, "{context}");
+            assert!(rect(&dom, &boxes, "after").top >= list.top + list.height);
+        }
+    }
+
+    #[test]
     fn an_auto_width_bfc_uses_the_remaining_band_beside_a_float() {
         // CSS 2.2 §9.5: the BFC root's BORDER box may be narrowed beside a
         // float, but must not overlap the float's MARGIN box. This is the

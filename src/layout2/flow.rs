@@ -1208,9 +1208,11 @@ impl Flow<'_> {
                 cur.y = fb;
                 cur.pos = 0.0;
                 cur.neg = 0.0;
-                // The float extends past the last in-flow content: our
-                // border-top edge exists even if no line box flushed.
-                y_border.get_or_insert(fb - bt);
+                // CSS 2 #root-height increases the bottom edge; it must
+                // preserve the original top even when only floats exist.
+                // Moving that top to the float bottom produced a zero-height
+                // clipping box around otherwise correctly positioned floats.
+                y_border.get_or_insert(box_top);
             }
         }
 
