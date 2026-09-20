@@ -19,6 +19,8 @@ pub(super) enum Impact {
 #[derive(Default)]
 pub(super) struct SelectorDependencies {
     attributes: FxHashMap<String, Impact>,
+    class_tokens: FxHashMap<String, Impact>,
+    raw_class_impact: Option<Impact>,
     relational: Vec<RelationalDependency>,
     structural: Vec<StructureDependency>,
     empty: bool,
@@ -375,9 +377,35 @@ impl SelectorDependencies {
         (siblings, children)
     }
 
-    pub(super) fn attribute(&self, dom: &Dom, node: NodeId, name: &str) -> Option<Impact> {
+    fn attribute_change(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        name: &str,
+        old_class: Option<&str>,
+    ) -> Option<Impact> {
         let name = name.to_ascii_lowercase();
-        let impact = self.attributes.get(name.as_str()).copied();
+        let mut impact = self.attributes.get(name.as_str()).copied();
+        if name == "class"
+            && let Some(old_class) = old_class
+        {
+            // Selectors 4 #class-html / #logical-combination: only changed
+            // membership can affect a .class test, including one in :not().
+            // Raw [class] selectors still observe spelling/order/whitespace.
+            // Fold dependency keys conservatively for quirks-mode matching;
+            // compare the input sets before folding so case changes in a
+            // standards-mode document still invalidate their exact matches.
+            let old: FxHashSet<_> = old_class.split_ascii_whitespace().collect();
+            let new: FxHashSet<_> = dom
+                .attr(node, "class")
+                .unwrap_or("")
+                .split_ascii_whitespace()
+                .collect();
+            impact = self.raw_class_impact;
+            for token in old.symmetric_difference(&new) {
+                impact = impact.max(self.class_tokens.get(&token.to_ascii_lowercase()).copied());
+            }
+        }
         if impact == Some(Impact::All)
             || (self.text_direction
                 && ((name == "value" && dom.text_may_change_direction(node))
@@ -402,6 +430,12 @@ impl SelectorDependencies {
     pub(super) fn retained_bytes(&self) -> usize {
         self.attributes.capacity() * std::mem::size_of::<(String, Impact)>()
             + self.attributes.keys().map(String::capacity).sum::<usize>()
+            + self.class_tokens.capacity() * std::mem::size_of::<(String, Impact)>()
+            + self
+                .class_tokens
+                .keys()
+                .map(String::capacity)
+                .sum::<usize>()
             + self.relational.capacity() * std::mem::size_of::<RelationalDependency>()
             + self
                 .relational
@@ -469,9 +503,18 @@ impl SelectorDependencies {
         }
         if !classes.is_empty() {
             self.add("class", impact);
+            for class in classes {
+                self.class_tokens
+                    .entry(class.to_ascii_lowercase())
+                    .and_modify(|old| *old = (*old).max(impact))
+                    .or_insert(impact);
+            }
         }
         for attribute in attrs {
             self.add(&attribute.name, impact);
+            if attribute.name.eq_ignore_ascii_case("class") {
+                self.raw_class_impact = self.raw_class_impact.max(Some(impact));
+            }
         }
         for selector in nots
             .iter()
@@ -589,7 +632,12 @@ impl Dom {
         self.layout_cache.get_mut().cold = true;
     }
 
-    pub(super) fn invalidate_attribute_selectors(&mut self, node: NodeId, name: &str) -> Impact {
+    pub(super) fn invalidate_attribute_selectors(
+        &mut self,
+        node: NodeId,
+        name: &str,
+        old_class: Option<&str>,
+    ) -> Impact {
         // DOM §4.2.2: `slot` and a slot's `name` change distribution without
         // a child-list mutation. That is an implicit cross-tree dependency,
         // including for state resolved through the style parent, even when
@@ -604,9 +652,9 @@ impl Dom {
         let impact = {
             let cache = self.style_cache.borrow();
             match cache.as_ref() {
-                Some((epoch, index)) if *epoch == self.style_epoch => {
-                    index.selector_dependencies.attribute(self, node, name)
-                }
+                Some((epoch, index)) if *epoch == self.style_epoch => index
+                    .selector_dependencies
+                    .attribute_change(self, node, name, old_class),
                 // No current rule index: no proof of independence.
                 _ => Some(Impact::All),
             }
@@ -1402,6 +1450,82 @@ mod tests {
             .get(node, dom.selector_epoch)
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn class_invalidation_uses_changed_tokens_without_unrelated_sibling_dependencies() {
+        let mut dom = Dom::parse_document(
+            "<!doctype html><style>.unrelated + div {height:70px}.panel.open{height:30px}.panel:not(.open){height:10px}</style><main><div id=panel class=panel></div><div id=stable>stable</div></main>",
+        );
+        let panel = dom.get_by_id("panel").unwrap();
+        let stable = cached(&dom, "stable");
+        for class in [
+            "panel open",
+            "panel\topen open",
+            "panel OPEN",
+            "panel",
+            "unrelated",
+        ] {
+            dom.set_attr(panel, "class", class);
+            assert_matches_full_scan(&dom);
+            if class != "unrelated" {
+                assert!(
+                    std::rc::Rc::ptr_eq(&stable, &cached(&dom, "stable")),
+                    "{class}"
+                );
+                assert_eq!(
+                    dom.computed_value_resolved(panel, "height").as_deref(),
+                    Some(if class.split_ascii_whitespace().any(|c| c == "open") {
+                        "30px"
+                    } else {
+                        "10px"
+                    })
+                );
+            } else {
+                assert_eq!(
+                    dom.computed_value_resolved(dom.get_by_id("stable").unwrap(), "height")
+                        .as_deref(),
+                    Some("70px")
+                );
+            }
+        }
+        dom.remove_attr(panel, "class");
+        assert_matches_full_scan(&dom);
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("stable").unwrap(), "height"),
+            None
+        );
+    }
+
+    #[test]
+    fn class_invalidation_preserves_raw_relational_and_filtered_index_dependencies() {
+        for rule in [
+            "[class='a b'] + div {width:12px}",
+            ".root:has(.hit) .target{height:34px}",
+            "div:nth-child(2 of .hit) .target{width:56px}",
+            ":is(.on,.off) ~ div .target{margin-top:7px}",
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                "<!doctype html><style>{rule}</style><main class=root><div id=first class=hit></div><div id=second class=hit><span class=target></span></div><div class=target></div></main>"
+            ));
+            let first = dom.get_by_id("first").unwrap();
+            let second = dom.get_by_id("second").unwrap();
+            for class in ["a b", "b a", "hit on", "off", "", "hit"] {
+                dom.set_attr(first, "class", class);
+                assert_matches_full_scan(&dom);
+                assert_eq!(
+                    dom.computed_value_resolved(second, "width").as_deref(),
+                    if class == "a b" && rule.starts_with("[class") {
+                        Some("12px")
+                    } else {
+                        None
+                    }
+                );
+            }
+            dom.remove_attr(first, "class");
+            dom.remove_attr(second, "class");
+            assert_matches_full_scan(&dom);
+        }
     }
 
     #[test]
