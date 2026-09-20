@@ -11,6 +11,68 @@ pub(super) struct InputValue {
 }
 
 impl Dom {
+    pub fn control_selection(&self, id: NodeId) -> Option<crate::doc::ControlSelection> {
+        let value = match self.tag_name(id) {
+            Some("input")
+                if matches!(
+                    self.input_type(id).as_str(),
+                    "text" | "search" | "url" | "tel" | "password"
+                ) =>
+            {
+                self.input_value(id)
+            }
+            Some("textarea") => self
+                .text_content(id)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n"),
+            _ => return None,
+        };
+        let mut selection = self
+            .control_selections
+            .get(&id)
+            .copied()
+            .unwrap_or_default();
+        let length = value.encode_utf16().count() as u32;
+        selection.end = selection.end.min(length);
+        selection.start = selection.start.min(selection.end);
+        Some(selection)
+    }
+
+    pub(crate) fn set_control_selection(
+        &mut self,
+        id: NodeId,
+        mut selection: crate::doc::ControlSelection,
+    ) -> bool {
+        let Some(previous) = self.control_selection(id) else {
+            return false;
+        };
+        // HTML #set-the-selection-range clamps to the relevant value and
+        // collapses a reversed range at its end. Selection is UI state, not a
+        // DOM mutation or a reason to invalidate the layout fragment cache.
+        let value = if self.tag_name(id) == Some("input") {
+            self.input_value(id)
+        } else {
+            self.text_content(id)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+        };
+        selection.end = selection.end.min(value.encode_utf16().count() as u32);
+        selection.start = selection.start.min(selection.end);
+        selection.direction = selection.direction.signum();
+        self.control_selections.insert(id, selection);
+        let changed = previous != selection;
+        self.dirty |= changed;
+        changed
+    }
+
+    pub(super) fn clamp_control_selection(&mut self, id: NodeId) {
+        if self.control_selections.contains_key(&id)
+            && let Some(selection) = self.control_selection(id)
+        {
+            self.control_selections.insert(id, selection);
+        }
+    }
+
     pub(super) fn write_input_presentation(&self, id: NodeId, out: &mut String) {
         if self.tag_name(id) != Some("input") || !self.input_values.contains_key(&id) {
             return;
@@ -88,7 +150,9 @@ impl Dom {
         let sanitized = self.sanitize_input_value(id, value);
         let bad_input =
             user && !value.is_empty() && sanitized.is_empty() && self.numeric_input(id).is_some();
-        let changed = self.input_value(id) != sanitized || self.input_bad_input(id) != bad_input;
+        let value_changed = self.input_value(id) != sanitized;
+        let changed = value_changed || self.input_bad_input(id) != bad_input;
+        let end = sanitized.encode_utf16().count() as u32;
         let editing = bad_input.then(|| value.to_string());
         let changed = changed || self.input_editing_value(id) != editing.as_deref();
         self.input_values.insert(
@@ -101,8 +165,19 @@ impl Dom {
             },
         );
         if changed {
-            self.touch_content(Some(id));
+            self.touch_input_value(id);
         }
+        if value_changed && !user {
+            self.set_control_selection(
+                id,
+                crate::doc::ControlSelection {
+                    start: end,
+                    end,
+                    direction: 0,
+                },
+            );
+        }
+        self.clamp_control_selection(id);
         changed
     }
     pub(crate) fn input_bad_input(&self, id: NodeId) -> bool {
@@ -129,8 +204,9 @@ impl Dom {
             })
     }
     pub(crate) fn reset_input_value(&mut self, id: NodeId) {
+        self.control_selections.remove(&id);
         if self.input_values.remove(&id).is_some() {
-            self.touch_content(Some(id));
+            self.touch_input_value(id);
         }
     }
     pub(super) fn input_attribute_changed(
@@ -170,6 +246,13 @@ impl Dom {
                     },
                 );
             }
+            if !matches!(
+                old_type.as_str(),
+                "text" | "search" | "url" | "tel" | "password"
+            ) {
+                self.control_selections.remove(&id);
+            }
+            self.clamp_control_selection(id);
             return;
         }
         if attr.eq_ignore_ascii_case("value")
@@ -177,6 +260,7 @@ impl Dom {
         {
             self.input_values.remove(&id);
         }
+        self.clamp_control_selection(id);
         if (self.input_type(id) == "range"
             && ["min", "max", "step"]
                 .iter()

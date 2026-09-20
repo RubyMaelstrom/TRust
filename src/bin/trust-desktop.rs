@@ -654,6 +654,24 @@ impl FocusTarget {
 struct PendingPageKey {
     form: Option<(usize, usize)>,
     input: KeyInput,
+    text: Option<String>,
+    actor_default: bool,
+}
+
+fn actor_text_key(input: &KeyInput, text: Option<&str>, control: &trust::doc::Field) -> bool {
+    input.state == KeyState::Released
+        || (input.state == KeyState::Pressed
+            && !input.composing
+            && !input.modifiers.control
+            && !input.modifiers.alt
+            && !input.modifiers.meta
+            && matches!(input.key, Key::Character(_))
+            && text.is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control))
+            && matches!(
+                control.kind,
+                FieldKind::Text | FieldKind::Password | FieldKind::Textarea
+            )
+            && control.selection.is_some())
 }
 
 fn sync_editor_value(editor: &mut TextEditor, value: &str) {
@@ -1405,6 +1423,7 @@ struct DesktopApp {
     file_action_selected: usize,
     downloads_in_flight: usize,
     form_editor: Option<TextEditor>,
+    form_scroll_x: f32,
     composing: bool,
     page_layout: Option<PageLayoutCache>,
     protocol_page: Option<ProtocolPageCache>,
@@ -1443,6 +1462,7 @@ struct DesktopApp {
     gopher_query: Option<trust::gopher::GopherUrl>,
     gemini_input: bool,
     pending_page_keys: VecDeque<PendingPageKey>,
+    queued_form_keys: VecDeque<PendingPageKey>,
     keyboard_target: Option<PageHit>,
     pressed_hit: Option<PageHit>,
     pressed_control: Option<ControlId>,
@@ -1750,6 +1770,7 @@ impl DesktopApp {
             file_action_selected: 0,
             downloads_in_flight: 0,
             form_editor: None,
+            form_scroll_x: 0.0,
             composing: false,
             page_layout: None,
             protocol_page: None,
@@ -1785,6 +1806,7 @@ impl DesktopApp {
             gopher_query: None,
             gemini_input: false,
             pending_page_keys: VecDeque::new(),
+            queued_form_keys: VecDeque::new(),
             keyboard_target: None,
             pressed_hit: None,
             pressed_control: None,
@@ -2176,6 +2198,7 @@ impl DesktopApp {
         if leaves_keyboard_target {
             self.keyboard_target = None;
             self.pending_page_keys.clear();
+            self.queued_form_keys.clear();
         }
         let outcome = self.browser.handle_action(action);
         self.sync_pointer_lock();
@@ -2222,10 +2245,20 @@ impl DesktopApp {
     /// Editing APIs leave editing-host insertion to the user agent;
     /// HTML §4.10.22.2 defines Enter submission for single-line text controls.
     fn apply_page_key_defaults(&mut self) {
+        if matches!(self.focus, FocusTarget::Form { .. }) {
+            self.ensure_page_layout(self.browser_viewport());
+            self.sync_focused_form();
+        }
         while let Some(prevented) = self.browser.take_page_key_default() {
             let Some(pending) = self.pending_page_keys.pop_front() else {
                 continue;
             };
+            if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
+                eprintln!(
+                    "desktop: key default key={:?} state={:?} prevented={prevented} form={:?} focus={:?}",
+                    pending.input.key, pending.input.state, pending.form, self.focus
+                );
+            }
             let Some((form, field)) = pending.form else {
                 if !prevented
                     && self.focus == FocusTarget::Page
@@ -2238,7 +2271,10 @@ impl DesktopApp {
                 }
                 continue;
             };
-            if prevented || self.focus != (FocusTarget::Form { form, field }) {
+            if prevented
+                || self.focus != (FocusTarget::Form { form, field })
+                || pending.input.state != KeyState::Pressed
+            {
                 continue;
             }
             let kind = self
@@ -2267,18 +2303,24 @@ impl DesktopApp {
                     self.finish_text_edit();
                     self.submit_form_default(form);
                 }
-                Some(FieldKind::Textarea)
-                    if self
-                        .form_editor
-                        .as_mut()
-                        .is_some_and(|editor| editor.handle_key(&pending.input)) =>
-                {
-                    self.finish_text_edit();
-                    self.request_redraw();
+                _ => {
+                    if let Some(editor) = &mut self.form_editor {
+                        let consumed = editor.handle_key(&pending.input);
+                        if !consumed && let Some(text) = &pending.text {
+                            editor.replace_selection(text);
+                        }
+                        self.finish_text_edit_as(match pending.input.key {
+                            Key::Backspace => Some("deleteContentBackward"),
+                            Key::Delete => Some("deleteContentForward"),
+                            Key::Enter => Some("insertLineBreak"),
+                            _ => None,
+                        });
+                        self.request_redraw();
+                    }
                 }
-                _ => {}
             }
         }
+        self.dispatch_next_form_key();
     }
 
     /// Activate a form's HTML default button for an un-canceled Enter on a
@@ -2328,6 +2370,7 @@ impl DesktopApp {
         if outcome.loading_retired {
             let had_pending_key = !self.pending_page_keys.is_empty();
             self.pending_page_keys.clear();
+            self.queued_form_keys.clear();
             if had_pending_key {
                 self.set_focus(FocusTarget::Page);
             }
@@ -2732,7 +2775,11 @@ impl DesktopApp {
             } else {
                 self.focus
             };
-            for pending in &mut self.pending_page_keys {
+            for pending in self
+                .pending_page_keys
+                .iter_mut()
+                .chain(self.queued_form_keys.iter_mut())
+            {
                 if let Some(indices) = pending.form {
                     // Keep the FIFO acknowledgement slot if its target was
                     // removed, but prevent its default from reaching a new field.
@@ -3318,6 +3365,18 @@ impl DesktopApp {
         if let Some(presentation) = cache.document.rich_editors.get(&node) {
             if let Some(editor) = &mut self.form_editor {
                 editor.set_width(presentation.width);
+                if presentation.native_input.is_some() {
+                    let password =
+                        cache.document.forms[form].fields[field].kind == FieldKind::Password;
+                    let line = editor.line_layout(password);
+                    trust::render::paint_native_input(
+                        &mut scene.primitives,
+                        &line,
+                        presentation,
+                        &mut self.form_scroll_x,
+                    );
+                    return;
+                }
                 let visual = Self::editor_visual(editor, false);
                 if cache.document.forms[form].fields[field]
                     .live_node
@@ -3627,6 +3686,10 @@ impl DesktopApp {
     }
 
     fn finish_text_edit(&mut self) {
+        self.finish_text_edit_as(None);
+    }
+
+    fn finish_text_edit_as(&mut self, input_type: Option<&str>) {
         if self.focus == FocusTarget::Page && self.terminal.is_some() {
             self.session_history.detach();
         }
@@ -3636,6 +3699,7 @@ impl DesktopApp {
         let Some(value) = self.form_editor.as_ref().map(TextEditor::text) else {
             return;
         };
+        let selection = self.form_editor.as_ref().map(TextEditor::control_selection);
         let Some(cache) = &mut self.page_layout else {
             return;
         };
@@ -3653,17 +3717,55 @@ impl DesktopApp {
             }
             return;
         }
-        if control.editing_value() == value {
+        let selection = control.selection.and(selection);
+        if control.editing_value() == value && control.selection == selection {
             return;
         }
+        let previous = control.editing_value();
+        let mut prefix = 0;
+        for (a, b) in previous.chars().zip(value.chars()) {
+            if a != b {
+                break;
+            }
+            prefix += a.len_utf8();
+        }
+        let mut new_end = value.len();
+        for (a, b) in previous[prefix..]
+            .chars()
+            .rev()
+            .zip(value[prefix..].chars().rev())
+        {
+            if a != b {
+                break;
+            }
+            new_end -= b.len_utf8();
+        }
+        let data = (new_end > prefix).then(|| value[prefix..new_end].to_owned());
+        let inferred = if previous == value {
+            ""
+        } else if data.is_some() {
+            "insertText"
+        } else if selection
+            .zip(control.selection)
+            .is_some_and(|(now, before)| now.start >= before.start)
+        {
+            "deleteContentForward"
+        } else {
+            "deleteContentBackward"
+        };
+        let edit = trust::js::TextEdit {
+            input_type: input_type.unwrap_or(inferred).to_owned(),
+            data,
+            selection,
+            composing: self.composing,
+        };
         control.set_editing_value(value.clone());
+        control.selection = selection;
         let actor = control.live_node;
         let _ = control;
-        self.dispatch(UserAction::SetFormValue {
-            actor,
-            value,
-            checked: None,
-        });
+        if let Some(node) = actor {
+            self.dispatch(UserAction::EditFormText { node, value, edit });
+        }
         self.relayout_cached_page();
     }
 
@@ -3690,6 +3792,11 @@ impl DesktopApp {
             && let Some(editor) = self.form_editor.as_mut()
         {
             sync_editor_value(editor, control.editing_value());
+            if let Some(selection) = control.selection
+                && editor.control_selection() != selection
+            {
+                editor.set_control_selection(selection);
+            }
         }
     }
 
@@ -3718,7 +3825,7 @@ impl DesktopApp {
             let _ = clipboard.set_text(text);
             if cut && let Some(editor) = self.active_editor_mut() {
                 editor.delete_selection();
-                self.finish_text_edit();
+                self.finish_text_edit_as(Some("deleteByCut"));
                 self.request_redraw();
             }
         }
@@ -3743,7 +3850,7 @@ impl DesktopApp {
         }
         if let Some(editor) = self.active_editor_mut() {
             editor.replace_selection(&text);
-            self.finish_text_edit();
+            self.finish_text_edit_as(Some("insertFromPaste"));
             self.request_redraw();
         }
     }
@@ -3898,12 +4005,12 @@ impl DesktopApp {
         true
     }
 
-    /// Send Enter through the resident page before the desktop editor applies
-    /// its local default. This is the path that lets contenteditable chat
-    /// composers cancel the default newline and activate their authored Send
-    /// button, while ordinary uncanceled contenteditable Enter still inserts a
-    /// newline when the actor reports that default is allowed.
-    fn dispatch_live_form_key(&mut self, input: &KeyInput) -> bool {
+    /// UI Events #events-keyboard-event-order: send every key to the focused
+    /// control, then apply its uncanceled editing default before sending the
+    /// following key (including keyup). The actor and native editor exchange
+    /// acknowledgements asynchronously; sending releases eagerly would let a
+    /// keyup handler observe the value from before its keydown's default.
+    fn dispatch_live_form_key(&mut self, input: &KeyInput, text: Option<String>) -> bool {
         if !self.browser.page_is_live() {
             return false;
         }
@@ -3919,26 +4026,74 @@ impl DesktopApp {
         let Some(control) = control else {
             return false;
         };
-        let number_step =
-            matches!(input.key, Key::ArrowUp | Key::ArrowDown) && control.kind == FieldKind::Number;
-        if input.key != Key::Enter && !number_step {
+        if control.live_node.is_none() {
             return false;
         }
-        let Some(node) = control.live_node else {
-            return false;
-        };
-        // The text edit must reach the actor before its keydown, so a page
-        // handler reading the editor's value sees the latest native input.
-        self.finish_text_edit();
-        self.pending_page_keys.push_back(PendingPageKey {
+        if self.queued_form_keys.len() + self.pending_page_keys.len() >= 4096 {
+            self.stop_current_page();
+            return true;
+        }
+        self.queued_form_keys.push_back(PendingPageKey {
             form: Some((form, field)),
             input: input.clone(),
+            text,
+            actor_default: false,
         });
-        self.dispatch(UserAction::PageKey {
-            node,
-            input: input.clone(),
-        });
+        self.dispatch_next_form_key();
         true
+    }
+
+    fn dispatch_next_form_key(&mut self) {
+        if self
+            .pending_page_keys
+            .iter()
+            .any(|key| key.input.state == KeyState::Pressed && !key.actor_default)
+        {
+            return;
+        }
+        // UI Events #events-keyboard-event-order requires the previous edit
+        // and its input checkpoint before the next key, not a separate paint.
+        // Actor-owned insertions/releases may share the FIFO lane. A key that
+        // needs native glyph navigation/IME remains a barrier; its KeyDefault
+        // follows presentation so it accepts script value/selection first.
+        while let Some(mut pending) = self.queued_form_keys.pop_front() {
+            let Some((form, field)) = pending.form else {
+                continue;
+            };
+            if self.focus != (FocusTarget::Form { form, field }) {
+                continue;
+            }
+            let Some(control) = self
+                .page_layout
+                .as_ref()
+                .and_then(|page| page.document.forms.get(form))
+                .and_then(|form| form.fields.get(field))
+            else {
+                continue;
+            };
+            let Some(node) = control.live_node else {
+                continue;
+            };
+            pending.actor_default =
+                actor_text_key(&pending.input, pending.text.as_deref(), control);
+            let input = pending.input.clone();
+            let actor_default = pending.actor_default;
+            let text = if input.state == KeyState::Pressed {
+                pending.text.clone()
+            } else {
+                None
+            };
+            self.pending_page_keys.push_back(pending);
+            if actor_default {
+                // Keyboard handlers, UTF-16 insertion and input checkpoints
+                // share the actor's FIFO lane. Native glyph navigation/IME
+                // still require the presentation acknowledgement below.
+                self.dispatch(UserAction::PageEditKey { node, input, text });
+            } else {
+                self.dispatch(UserAction::PageKey { node, input });
+                break;
+            }
+        }
     }
 
     fn apply_gopherus_position(&mut self, position: GopherusPosition) {
@@ -4170,6 +4325,8 @@ impl DesktopApp {
             self.pending_page_keys.push_back(PendingPageKey {
                 form: None,
                 input: input.clone(),
+                text: None,
+                actor_default: false,
             });
             self.dispatch(UserAction::Key(input));
             return;
@@ -4180,10 +4337,16 @@ impl DesktopApp {
         {
             return;
         }
-        if pressed
-            && (input.key == Key::Enter || matches!(input.key, Key::ArrowUp | Key::ArrowDown))
-            && self.dispatch_live_form_key(&input)
-        {
+        let edit_text = (pressed && !input.composing && !command && !input.modifiers.alt)
+            .then(|| {
+                event
+                    .text
+                    .as_ref()
+                    .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+            })
+            .flatten()
+            .filter(|s| !s.is_empty());
+        if self.dispatch_live_form_key(&input, edit_text) {
             return;
         }
         if pressed {
@@ -4499,6 +4662,49 @@ impl DesktopApp {
                     LogicalSize::new(f64::from(area.width), f64::from(area.height)),
                 );
             }
+            return;
+        }
+        if let FocusTarget::Form { form, field } = self.focus
+            && let (Some(page), Some(scene), Some(editor), Some(window)) = (
+                &self.page_layout,
+                &self.scene,
+                &mut self.form_editor,
+                &self.window,
+            )
+            && let Some((&node, _)) = page
+                .document
+                .controls
+                .iter()
+                .find(|(_, indices)| **indices == (form, field))
+            && let (Some(bounds), Some(presentation)) = (
+                page.layout.boxes.get(&node),
+                page.document.rich_editors.get(&node),
+            )
+            && presentation.native_input.is_some()
+        {
+            let line = editor
+                .line_layout(page.document.forms[form].fields[field].kind == FieldKind::Password);
+            let area = line.caret.unwrap_or(line.ime);
+            window.set_ime_cursor_area(
+                LogicalPosition::new(
+                    f64::from(
+                        scene.content_viewport.x
+                            + bounds.left as f32
+                            + presentation.origin.x
+                            + area.x
+                            - self.browser.interaction().scroll.x
+                            - self.form_scroll_x,
+                    ),
+                    f64::from(
+                        scene.content_viewport.y
+                            + bounds.top as f32
+                            + presentation.origin.y
+                            + area.y
+                            - self.browser.interaction().scroll.y,
+                    ),
+                ),
+                LogicalSize::new(f64::from(area.width), f64::from(area.height)),
+            );
             return;
         }
         let focus = self.focus;
@@ -5326,6 +5532,7 @@ impl DesktopApp {
             }
             _ => None,
         };
+        self.form_scroll_x = 0.0;
         self.set_focus(FocusTarget::Form { form, field });
         self.scroll_control_into_view(form, field);
     }
@@ -5410,7 +5617,8 @@ impl DesktopApp {
                     .map_or(CssPoint::new(6.0, 5.0), |p| p.origin);
                 Some(CssPoint::new(
                     scene.content_viewport.x + bounds.left as f32 + inset.x
-                        - self.browser.interaction().scroll.x,
+                        - self.browser.interaction().scroll.x
+                        - self.form_scroll_x,
                     scene.content_viewport.y + bounds.top as f32 + inset.y
                         - self.browser.interaction().scroll.y,
                 ))
@@ -5418,13 +5626,21 @@ impl DesktopApp {
         });
         if let Some(origin) = origin {
             let point = self.pointer;
+            let password = self
+                .page_layout
+                .as_ref()
+                .and_then(|page| page.document.forms.get(form))
+                .and_then(|form| form.fields.get(field))
+                .is_some_and(|field| field.kind == FieldKind::Password);
             if let Some(editor) = &mut self.form_editor {
-                editor.move_to_point(
+                editor.move_to_line_point(
                     (point.x - origin.x).max(0.0),
                     (point.y - origin.y).max(0.0),
                     false,
+                    password,
                 );
             }
+            self.finish_text_edit();
         }
     }
 
@@ -8114,6 +8330,97 @@ mod tests {
             ))
         );
         assert_eq!(resolve_dead_page_href(&base, ""), None);
+    }
+
+    #[test]
+    fn cpu_separated_text_and_caret_damage_matches_full_frames() {
+        for scale in [1.0, 1.5, 2.0] {
+            let viewport = ViewportMetrics::from_physical(
+                PhysicalSize::new((192.0 * scale) as u32, (120.0 * scale) as u32),
+                ScaleFactor::new(scale),
+            );
+            let clip = CssRect::new(10.0, 10.0, 150.0, 40.0);
+            let style = trust::text::TextStyle::default();
+            let old = Scene {
+                viewport,
+                primitives: vec![
+                    DisplayCommand::FillRect {
+                        rect: CssRect::new(0.0, 0.0, 192.0, 120.0),
+                        color: PaintColor::Window,
+                    },
+                    DisplayCommand::PushClip(trust::render::PaintShape::RoundedRect {
+                        rect: clip,
+                        radii: trust::render::CornerRadii {
+                            corners: [(5.0, 5.0); 4],
+                        },
+                    }),
+                    DisplayCommand::PushTransform(trust::render::Affine2d::translate(0.25, 0.5)),
+                    DisplayCommand::GlyphRun {
+                        origin: CssPoint::new(20.0, 16.0),
+                        shaped: trust::text::shape("ty", &style),
+                        color: PaintColor::Rgba(20, 30, 40, 255),
+                        decoration: trust::render::TextDecorationPaint {
+                            color: PaintColor::Rgba(20, 30, 40, 255),
+                            style: trust::render::DecorationStyle::Solid,
+                        },
+                        shadows: Vec::new(),
+                        clip: Some(clip),
+                        node: 1,
+                        link: None,
+                    },
+                    DisplayCommand::PopTransform,
+                    DisplayCommand::PopClip,
+                    DisplayCommand::PushClip(trust::render::PaintShape::Rect(CssRect::new(
+                        0.0, 80.0, 192.0, 40.0,
+                    ))),
+                    DisplayCommand::FillRect {
+                        rect: CssRect::new(0.0, 80.0, 192.0, 40.0),
+                        color: PaintColor::Rgba(20, 150, 80, 255),
+                    },
+                    DisplayCommand::PopClip,
+                    DisplayCommand::PushLayer(trust::render::CompositingLayer {
+                        opacity: 0.75,
+                        blend: trust::render::BlendMode::Multiply,
+                        color_filters: Default::default(),
+                    }),
+                    DisplayCommand::FillRect {
+                        rect: CssRect::new(42.0, 16.0, 1.0, 19.0),
+                        color: PaintColor::Rgba(20, 30, 40, 255),
+                    },
+                    DisplayCommand::PopLayer,
+                ],
+                controls: Vec::new(),
+                content_viewport: CssRect::new(0.0, 0.0, 192.0, 120.0),
+                image_store: ImageStore::default(),
+                canvas_images: Default::default(),
+                page_scroll_containers: Vec::new(),
+                page_size: CssSize::new(192.0, 120.0),
+            };
+            let mut new = old.clone();
+            if let DisplayCommand::GlyphRun { shaped, .. } = &mut new.primitives[3] {
+                *shaped = trust::text::shape("type", &style);
+            }
+            if let DisplayCommand::FillRect { rect, .. } = &mut new.primitives[10] {
+                rect.x = 60.0;
+            }
+            let SceneDamage::Partial(damage) = scene_damage(&old, &new) else {
+                panic!("separated text/caret changes must retain unchanged scopes")
+            };
+            assert!(
+                damage.y + damage.height < 80.0,
+                "unchanged panel was damaged"
+            );
+            let mut retained = CpuDesktopRenderer::new();
+            retained.render(&old, None).unwrap();
+            for scene in [&new, &old] {
+                let partial = retained.render(scene, Some(damage)).unwrap().to_vec();
+                let full = CpuDesktopRenderer::new()
+                    .render(scene, None)
+                    .unwrap()
+                    .to_vec();
+                assert_eq!(partial, full, "scale={scale}");
+            }
+        }
     }
 
     #[test]

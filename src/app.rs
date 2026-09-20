@@ -95,6 +95,7 @@ pub struct BrowserView {
 /// double-submits), so its doc stays; its images still drop (`doc_image_keep`)
 /// and are refetched on restore.
 struct HistEntry {
+    same_document_generation: Option<u64>,
     /// Where the page came from — the refetch target once `doc` is evicted.
     url: Link,
     pos: ViewPos,
@@ -623,8 +624,9 @@ pub struct App {
     /// A deep back/forward is refetching an evicted trail entry: the next
     /// fetched document completes the travel (pop the entry, park the
     /// current doc on the opposite stack) instead of pushing history.
-    /// `Some(true)` = forward. Cleared by any other navigation intent.
-    pending_travel: Option<bool>,
+    /// Signed traversal delta. Cleared by any other navigation intent.
+    pending_travel: Option<i32>,
+    document_generation: u64,
     /// The document on screen is a direct POST result (`Response.from_post`)
     /// — recorded so its trail entry is marked exempt when navigated away
     /// from. Restored from the entry on travel.
@@ -902,6 +904,7 @@ impl App {
             replace_nav: false,
             declarative_refresh: None,
             pending_travel: None,
+            document_generation: 0,
             current_from_post: false,
             nav_from_post: false,
             bells_seen: 0,
@@ -5919,6 +5922,7 @@ impl App {
             node,
             value,
             checked,
+            commit: true,
         }) {
             Ok(()) => {
                 self.page_busy = true;
@@ -5994,6 +5998,7 @@ impl App {
         // History API URL writes are same-document updates, not fetch
         // navigations. Preserve their task order while coalescing renders.
         let mut history_updates: Vec<(String, bool)> = Vec::new();
+        let mut history_traversals = Vec::new();
         // A same-document fragment scroll the page requested; applied AFTER the
         // render below so it targets the freshly-rendered doc's `anchor_rows`.
         // Newest wins.
@@ -6050,6 +6055,7 @@ impl App {
                 Some(PageEvt::Navigate(url)) => navigate = Some((url, false, false)),
                 Some(PageEvt::Replace(url)) => navigate = Some((url, true, false)),
                 Some(PageEvt::Reload(url)) => navigate = Some((url, true, true)),
+                Some(PageEvt::HistoryTraverse { delta }) => history_traversals.push(delta),
                 Some(PageEvt::HistoryUpdate { url, replace }) => {
                     history_updates.push((url, replace));
                 }
@@ -6103,6 +6109,15 @@ impl App {
         }
         for (url, replace) in history_updates {
             self.apply_same_document_history_update(&url, replace);
+        }
+        for delta in history_traversals {
+            if self
+                .browser
+                .as_ref()
+                .is_some_and(|g| crate::history::entry(&g.history, &g.forward, delta).is_some())
+            {
+                self.browser_travel_delta(delta);
+            }
         }
         if !trouble.is_empty() {
             self.page_js_errors.extend(trouble.iter().cloned());
@@ -6160,7 +6175,7 @@ impl App {
     /// this must neither fetch nor replace that realm. It does, however, pass
     /// the new active URL through the same external-media policy as every
     /// other browser navigation surface.
-    fn apply_same_document_history_update(&mut self, address: &str, _replace: bool) {
+    fn apply_same_document_history_update(&mut self, address: &str, replace: bool) {
         let Ok(url) = url::Url::parse(address) else {
             self.status = String::from("page supplied an invalid same-document URL");
             self.notice = true;
@@ -6168,6 +6183,22 @@ impl App {
         };
         let referrer = self.http_referrer();
         if let Some(g) = &mut self.browser {
+            if !replace {
+                g.history.push(HistEntry {
+                    same_document_generation: Some(self.document_generation),
+                    url: g.doc.url.clone(),
+                    pos: ViewPos {
+                        selected: g.selected,
+                        sel_item: g.sel_item,
+                        was_live: self.live_page.is_some(),
+                    },
+                    scroll: g.scroll,
+                    post: self.current_from_post,
+                    doc: None,
+                });
+                g.forward.clear();
+                Self::enforce_retention(g);
+            }
             g.doc.url = Link::Http(url.clone());
         }
         if crate::media::is_youtube_video_url(&url) {
@@ -6913,6 +6944,7 @@ impl App {
     /// back/forward (`pending_travel`) completes its trail shuffle here
     /// instead; a pending reload (`replace_nav`) swaps in place.
     fn navigate_to(&mut self, doc: Doc) {
+        self.document_generation = self.document_generation.wrapping_add(1);
         // A new page replaces any image that was being viewed, and ends
         // whatever living page came before it (freeze: its last render
         // is already the doc going into history).
@@ -6940,18 +6972,14 @@ impl App {
             // plain push if the trail changed underneath the fetch (every
             // trail mutation clears `pending_travel`, so it shouldn't).
             Some(g)
-                if travel
-                    .is_some_and(|fwd| !if fwd { &g.forward } else { &g.history }.is_empty()) =>
+                if travel.is_some_and(|delta| {
+                    crate::history::entry(&g.history, &g.forward, delta).is_some()
+                }) =>
             {
-                let fwd = travel == Some(true);
-                let entry = if fwd {
-                    g.forward.pop()
-                } else {
-                    g.history.pop()
-                }
-                .unwrap();
+                let delta = travel.expect("validated traversal");
                 let old = std::mem::replace(&mut g.doc, doc);
                 let parked = HistEntry {
+                    same_document_generation: None,
                     url: old.url.clone(),
                     pos: ViewPos {
                         selected: g.selected,
@@ -6962,11 +6990,9 @@ impl App {
                     post: self.current_from_post,
                     doc: Some(old),
                 };
-                if fwd {
-                    g.history.push(parked);
-                } else {
-                    g.forward.push(parked);
-                }
+                let entry =
+                    crate::history::traverse(&mut g.history, &mut g.forward, Some(parked), delta)
+                        .expect("validated traversal");
                 // The content is fresh, so saved selection indices are stale
                 // (same rule as revive): restore the scroll clamped to the
                 // new extent and let the tail re-pick a visible selection.
@@ -6990,6 +7016,7 @@ impl App {
             Some(g) => {
                 let old = std::mem::replace(&mut g.doc, doc);
                 let entry = HistEntry {
+                    same_document_generation: None,
                     url: old.url.clone(),
                     pos: ViewPos {
                         selected: g.selected,
@@ -8899,10 +8926,15 @@ impl App {
     /// and the arriving response completes the travel in `navigate_to` —
     /// until then the trail is untouched, so a failed fetch changes nothing.
     fn browser_travel(&mut self, forward: bool) {
+        self.browser_travel_delta(if forward { 1 } else { -1 });
+    }
+
+    fn browser_travel_delta(&mut self, delta: i32) {
+        let forward = delta > 0;
         if self
             .browser
             .as_ref()
-            .is_some_and(|g| !if forward { &g.forward } else { &g.history }.is_empty())
+            .is_some_and(|g| crate::history::entry(&g.history, &g.forward, delta).is_some())
         {
             self.retire_fetch("Incomplete reply: left this page");
             self.replace_nav = false;
@@ -8916,12 +8948,7 @@ impl App {
         // (it degrades to a plain navigation push if it still lands).
         self.pending_travel = None;
         let Some(g) = &mut self.browser else { return };
-        let src = if forward {
-            &mut g.forward
-        } else {
-            &mut g.history
-        };
-        let Some(top) = src.last() else {
+        let Some(top) = crate::history::entry(&g.history, &g.forward, delta) else {
             self.status = if forward {
                 String::from("Nothing forward in history.")
             } else {
@@ -8932,17 +8959,57 @@ impl App {
             self.notice = true;
             return;
         };
+        if top.same_document_generation == Some(self.document_generation) && was_live {
+            let parked = HistEntry {
+                same_document_generation: Some(self.document_generation),
+                url: g.doc.url.clone(),
+                pos: ViewPos {
+                    selected: g.selected,
+                    sel_item: g.sel_item,
+                    was_live,
+                },
+                scroll: g.scroll,
+                post: self.current_from_post,
+                doc: None,
+            };
+            let entry =
+                crate::history::traverse(&mut g.history, &mut g.forward, Some(parked), delta)
+                    .expect("validated traversal");
+            g.doc.url = entry.url;
+            g.scroll = entry.scroll;
+            g.selected = entry.pos.selected;
+            g.sel_item = entry.pos.sel_item;
+            g.sel_fixed = None;
+            if let Some(page) = &self.live_page {
+                let _ = page.try_send_user(crate::js::PageCmd::TraverseHistory {
+                    url: g.doc.url.to_string(),
+                    delta,
+                });
+            }
+            self.sync_page_scroll();
+            return;
+        }
         if top.doc.is_none() {
             // Deep travel: the doc was evicted (strict memory, depth-1
             // retention). Refetch it; the response completes the shuffle.
             let url = top.url.clone();
             self.start_fetch_with_timing(url, false, None, http::NavigationType::BackForward);
-            self.pending_travel = Some(forward);
+            self.pending_travel = Some(delta);
             return;
         }
-        let entry = src.pop().expect("just peeked");
-        let old = std::mem::replace(&mut g.doc, entry.doc.expect("just checked"));
+        let target_index = if forward {
+            g.forward.len()
+        } else {
+            g.history.len()
+        } - delta.unsigned_abs() as usize;
+        let target = if forward {
+            &mut g.forward[target_index]
+        } else {
+            &mut g.history[target_index]
+        };
+        let old = std::mem::replace(&mut g.doc, target.doc.take().expect("just checked"));
         let parked = HistEntry {
+            same_document_generation: None,
             url: old.url.clone(),
             pos: ViewPos {
                 selected: g.selected,
@@ -8953,11 +9020,9 @@ impl App {
             post: self.current_from_post,
             doc: Some(old),
         };
-        if forward {
-            g.history.push(parked);
-        } else {
-            g.forward.push(parked);
-        }
+        let entry = crate::history::traverse(&mut g.history, &mut g.forward, Some(parked), delta)
+            .expect("validated traversal");
+        self.document_generation = self.document_generation.wrapping_add(1);
         // The old top of the receiving stack just became non-adjacent.
         Self::enforce_retention(g);
         g.selected = entry.pos.selected;
@@ -10366,7 +10431,7 @@ mod tests {
         assert!(g.history[0].doc.is_none(), "the deep about entry evicts");
         app.browser_back(); // /a, adjacent
         app.browser_back(); // about:help — deep, refetches
-        assert_eq!(app.pending_travel, Some(false));
+        assert_eq!(app.pending_travel, Some(-1));
         let msg = app
             .fetch_rx
             .as_mut()
@@ -12488,6 +12553,7 @@ mod tests {
     /// with an empty saved selection.
     fn entry(doc: crate::doc::Doc, was_live: bool, scroll: usize) -> super::HistEntry {
         super::HistEntry {
+            same_document_generation: None,
             url: doc.url.clone(),
             pos: super::ViewPos {
                 selected: None,
@@ -13006,6 +13072,38 @@ mod tests {
     }
 
     #[test]
+    fn script_history_delta_preserves_terminal_actor_and_scroll() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/start"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        for n in 1..=3 {
+            app.browser.as_mut().unwrap().scroll = n * 10;
+            app.apply_same_document_history_update(&format!("https://example.com/{n}"), false);
+        }
+        app.on_page_evt_inner(crate::js::PageEvt::HistoryTraverse { delta: -2 });
+        let view = app.browser.as_ref().unwrap();
+        assert_eq!(view.doc.url.to_string(), "https://example.com/1");
+        assert_eq!(view.scroll, 20);
+        assert_eq!((view.history.len(), view.forward.len()), (1, 2));
+        assert!(app.live_page.is_some());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::TraverseHistory { delta: -2, .. })
+        ));
+        app.on_page_evt_inner(crate::js::PageEvt::HistoryTraverse { delta: 2 });
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.url.to_string(),
+            "https://example.com/3"
+        );
+        app.on_page_evt_inner(crate::js::PageEvt::HistoryTraverse { delta: i32::MIN });
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.url.to_string(),
+            "https://example.com/3"
+        );
+    }
+
+    #[test]
     fn back_then_forward_round_trips() {
         // Back parks the current doc on the forward stack (it used to be
         // dropped outright); forward restores it, position and all.
@@ -13151,7 +13249,7 @@ mod tests {
 
         app.browser_back(); // deep: /a was evicted → refetch
         assert!(app.fetch_rx.is_some(), "deep back starts a refetch");
-        assert_eq!(app.pending_travel, Some(false));
+        assert_eq!(app.pending_travel, Some(-1));
         let g = app.browser.as_ref().unwrap();
         assert!(
             matches!(&g.doc.url, Link::Http(u) if u.path() == "/b"),
@@ -13178,7 +13276,7 @@ mod tests {
             matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/b")
         );
         app.browser_forward();
-        assert_eq!(app.pending_travel, Some(true), "deep forward refetches");
+        assert_eq!(app.pending_travel, Some(1), "deep forward refetches");
         assert!(app.fetch_rx.is_some());
     }
 
@@ -13190,7 +13288,7 @@ mod tests {
         app.navigate_to(http_doc("/c"));
         app.browser_back(); // /b, adjacent
         app.browser_back(); // deep → refetch starts
-        assert_eq!(app.pending_travel, Some(false));
+        assert_eq!(app.pending_travel, Some(-1));
 
         let target = app.browser.as_ref().unwrap().history[0].url.clone();
         app.on_fetch(super::FetchMsg {

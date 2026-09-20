@@ -647,6 +647,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resource_base_selection_tracks_tree_order_mutations_and_fallbacks() {
+        // HTML #document-base-url / #set-the-frozen-base-url: only the first
+        // base with href participates. Warm repeated image selection before
+        // every mutation, including a cached absence and changed fallback URL.
+        let page = Url::parse("https://parent.test/original/page").unwrap();
+        let other = Url::parse("https://other.test/new/page").unwrap();
+        let mut dom = Dom::parse_document(
+            "<head><base id=first target=_blank><base id=second></head>\
+             <body><img id=a src=a.png><img id=b src=b.png><div id=host></div></body>",
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        let first = dom.get_by_id("first").unwrap();
+        let second = dom.get_by_id("second").unwrap();
+        let viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let check = |dom: &Dom, page: &Url, directory: &str| {
+            for _ in 0..3 {
+                for (node, file) in [(a, "a.png"), (b, "b.png")] {
+                    assert_eq!(
+                        select(dom, node, page, viewport, 1.0).unwrap().source,
+                        format!("{directory}{file}")
+                    );
+                }
+            }
+        };
+        check(&dom, &page, "https://parent.test/original/");
+        check(&dom, &other, "https://other.test/new/");
+        dom.set_attr(second, "href", "/second/");
+        check(&dom, &page, "https://parent.test/second/");
+        dom.set_attr(first, "href", "/first/");
+        check(&dom, &page, "https://parent.test/first/");
+        dom.set_attr(first, "href", "http://[");
+        check(&dom, &page, "https://parent.test/original/");
+        dom.remove_attr(first, "href");
+        check(&dom, &page, "https://parent.test/second/");
+        dom.set_attr(first, "href", "/first/");
+        let head = dom.node(first).parent.unwrap();
+        dom.append(head, first);
+        check(&dom, &page, "https://parent.test/second/");
+        dom.detach(second);
+        check(&dom, &page, "https://parent.test/first/");
+        dom.detach(first);
+        let shadow = dom.attach_shadow(dom.get_by_id("host").unwrap());
+        dom.append(shadow, first);
+        check(&dom, &page, "https://parent.test/original/");
+        dom.append(head, first);
+        check(&dom, &other, "https://other.test/first/");
+    }
+
+    #[test]
     fn image_selection_keeps_dynamic_frame_urls_in_the_owning_document() {
         let page = Url::parse("https://parent.test/page").unwrap();
         let mut dom = Dom::parse_document("<img id=root src='root.png'><iframe id=frame></iframe>");

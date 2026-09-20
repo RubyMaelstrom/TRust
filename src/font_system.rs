@@ -62,6 +62,93 @@ impl AsRef<[u8]> for EmbeddedFont {
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 static SVG_CATALOG: OnceLock<SvgCatalog> = OnceLock::new();
 static PAGE_FONT_EPOCH: AtomicU64 = AtomicU64::new(0);
+static NEXT_FONT_SET: AtomicU64 = AtomicU64::new(1);
+static FONT_SOURCES: OnceLock<SourceCache> = OnceLock::new();
+
+fn font_source_cache() -> SourceCache {
+    // Font environments choose faces independently, but installed faces keep
+    // the same immutable resource while retained glyph runs still use them.
+    // Fontique's shared backing holds weak blobs, so this does not pin font
+    // bytes after every context and rendered snapshot has released them.
+    FONT_SOURCES.get_or_init(SourceCache::new_shared).clone()
+}
+
+/// Immutable CSS font environment retained by layout snapshots. A child
+/// document starts from installed fonts, never the embedding document's web
+/// fonts (CSS Fonts 4 #font-face-rule). Identity also separates shaping caches.
+pub struct FontSet {
+    id: u64,
+    collection: Collection,
+}
+
+impl std::fmt::Debug for FontSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontSet").field("id", &self.id).finish()
+    }
+}
+
+impl PartialEq for FontSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl FontSet {
+    pub(crate) fn new(
+        fonts: Vec<PageFont>,
+        parent: Option<&Arc<Self>>,
+        foreground: bool,
+    ) -> Arc<Self> {
+        let mut collection = if let Some(parent) = parent {
+            parent.collection.clone()
+        } else if foreground {
+            font_context().collection
+        } else {
+            catalog().base_text_collection.clone()
+        };
+        let mut declared = HashSet::new();
+        for font in fonts {
+            // CSS Shadow 1 #shadow-names: a local @font-face family hides
+            // the same tree-scoped name in ancestor trees. Clear it once per
+            // local family, retaining all of this scope's declared faces.
+            if declared.insert(font.family.case_fold().collect::<String>())
+                && let Some(family_id) = collection.family_id(&font.family)
+                && let Some(family) = collection.family(family_id)
+            {
+                for inherited in family.fonts() {
+                    collection.unregister_font(
+                        family_id,
+                        inherited.width(),
+                        inherited.style(),
+                        inherited.weight(),
+                    );
+                }
+            }
+            collection.register_fonts(
+                Blob::new(Arc::new(font.bytes)),
+                Some(FontInfoOverride {
+                    family_name: Some(&font.family),
+                    ..FontInfoOverride::default()
+                }),
+            );
+        }
+        Arc::new(Self {
+            id: NEXT_FONT_SET.fetch_add(1, Ordering::Relaxed),
+            collection,
+        })
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn context(&self) -> FontContext {
+        FontContext {
+            collection: self.collection.clone(),
+            source_cache: font_source_cache(),
+        }
+    }
+}
 
 struct Catalog {
     alias_candidates: HashMap<String, Vec<String>>,
@@ -154,7 +241,7 @@ pub(crate) fn font_context() -> FontContext {
             .clone();
         FontContext {
             collection,
-            source_cache: SourceCache::default(),
+            source_cache: font_source_cache(),
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]

@@ -278,6 +278,11 @@ pub enum UserAction {
         value: String,
         checked: Option<bool>,
     },
+    EditFormText {
+        node: usize,
+        value: String,
+        edit: crate::js::TextEdit,
+    },
     StepNumber {
         node: usize,
         direction: i8,
@@ -288,6 +293,11 @@ pub enum UserAction {
     PageKey {
         node: usize,
         input: KeyInput,
+    },
+    PageEditKey {
+        node: usize,
+        input: KeyInput,
+        text: Option<String>,
     },
     /// Submit through the live actor first, falling back to HTML's native
     /// application/x-www-form-urlencoded submission when not canceled.
@@ -432,15 +442,14 @@ enum NavigationIntent {
     New,
     Replace,
     Reload,
-    Back,
-    Forward,
+    Traverse(i32),
 }
 
 impl NavigationIntent {
     fn timing_type(self) -> http::NavigationType {
         match self {
             Self::Reload => http::NavigationType::Reload,
-            Self::Back | Self::Forward => http::NavigationType::BackForward,
+            Self::Traverse(_) => http::NavigationType::BackForward,
             Self::New | Self::Replace => http::NavigationType::Navigate,
         }
     }
@@ -550,6 +559,14 @@ pub struct ActionOutcome {
     pub loading_retired: bool,
 }
 
+/// Latest native geometry, including while a document fetch is in flight.
+#[derive(Clone, Copy)]
+struct WindowEnvironment {
+    viewport: CssSize,
+    device_pixel_ratio: f32,
+    screen_position: (i32, i32),
+}
+
 /// Durable browser/protocol controller shared by native frontends.
 ///
 /// It owns navigation state and production fetch tasks, but no Ratatui,
@@ -592,6 +609,7 @@ pub struct BrowserController {
     document_generation: u64,
     status: String,
     viewport: CssSize,
+    window_environment: tokio::sync::watch::Sender<WindowEnvironment>,
     device_pixel_ratio: f32,
     screen_position: (i32, i32),
     interaction: InteractionState,
@@ -655,6 +673,12 @@ impl BrowserController {
             document_generation: 0,
             status: String::from("Ready"),
             viewport,
+            window_environment: tokio::sync::watch::channel(WindowEnvironment {
+                viewport,
+                device_pixel_ratio: 1.0,
+                screen_position: (0, 0),
+            })
+            .0,
             device_pixel_ratio: 1.0,
             screen_position: (0, 0),
             interaction: InteractionState::default(),
@@ -779,8 +803,8 @@ impl BrowserController {
     }
 
     /// Take the next resident-page keyboard default result. `true` suppresses
-    /// the native default (canceled keydown/keypress, IME composition, or Enter
-    /// in a formless input); `false` lets the frontend apply editing/submission.
+    /// the native default (canceled, already applied by the actor, composing,
+    /// or Enter in a formless input); `false` allows editing/submission.
     pub fn take_page_key_default(&mut self) -> Option<bool> {
         self.page_key_defaults.pop_front()
     }
@@ -1024,6 +1048,8 @@ impl BrowserController {
                     false
                 } else {
                     self.viewport = size;
+                    self.window_environment
+                        .send_modify(|env| env.viewport = size);
                     self.send_live(crate::js::PageCmd::Viewport(layout_viewport(size)));
                     true
                 }
@@ -1038,6 +1064,8 @@ impl BrowserController {
                     false
                 } else {
                     self.device_pixel_ratio = ratio;
+                    self.window_environment
+                        .send_modify(|env| env.device_pixel_ratio = ratio);
                     self.send_live(crate::js::PageCmd::DevicePixelRatio(ratio));
                     true
                 }
@@ -1045,6 +1073,8 @@ impl BrowserController {
             UserAction::ScreenPosition(x, y) => {
                 if self.screen_position != (x, y) {
                     self.screen_position = (x, y);
+                    self.window_environment
+                        .send_modify(|env| env.screen_position = (x, y));
                     self.send_live(crate::js::PageCmd::ScreenPosition(x, y));
                 }
                 false
@@ -1131,8 +1161,15 @@ impl BrowserController {
                         node,
                         value,
                         checked,
+                        commit: false,
                     })
                 {
+                    *self.pending_form_values.entry(node).or_default() += 1;
+                }
+                true
+            }
+            UserAction::EditFormText { node, value, edit } => {
+                if self.send_user(crate::js::PageCmd::EditText { node, value, edit }) {
                     *self.pending_form_values.entry(node).or_default() += 1;
                 }
                 true
@@ -1142,6 +1179,13 @@ impl BrowserController {
                     node: Some(node),
                     input,
                 });
+                false
+            }
+            UserAction::PageEditKey { node, input, text } => {
+                // No optimistic native value is ahead of the DOM here. Each
+                // published presentation may therefore update the editor even
+                // when further actor-owned keystrokes are already queued.
+                self.send_user(crate::js::PageCmd::EditKey { node, input, text });
                 false
             }
             UserAction::StepNumber {
@@ -1373,11 +1417,12 @@ impl BrowserController {
     }
 
     fn begin_history(&mut self, forward: bool) -> bool {
-        let entry = if forward {
-            self.forward.last()
-        } else {
-            self.back.last()
-        };
+        self.begin_history_delta(if forward { 1 } else { -1 })
+    }
+
+    fn begin_history_delta(&mut self, delta: i32) -> bool {
+        let forward = delta > 0;
+        let entry = crate::history::entry(&self.back, &self.forward, delta);
         self.gemini_prompt = None;
         let Some(entry) = entry.cloned() else {
             self.status = if forward {
@@ -1389,20 +1434,14 @@ impl BrowserController {
         };
         if entry.same_document_generation == Some(self.document_generation) {
             let previous = self.same_document_history_entry();
-            if forward {
-                self.forward.pop();
-                self.back.extend(previous);
-            } else {
-                self.back.pop();
-                self.forward.extend(previous);
-            }
+            crate::history::traverse(&mut self.back, &mut self.forward, previous, delta);
             let address = entry.target.to_string();
             self.apply_same_document_history_update(&address, true);
             self.pending_fragment = None;
             self.interaction.scroll = entry.scroll;
             self.send_user(crate::js::PageCmd::TraverseHistory {
                 url: address,
-                delta: if forward { 1 } else { -1 },
+                delta,
             });
             self.send_user(crate::js::PageCmd::Scroll {
                 x: f64::from(entry.scroll.x),
@@ -1429,36 +1468,20 @@ impl BrowserController {
                 generation,
                 target: entry.target,
                 fallback_http: false,
-                intent: if forward {
-                    NavigationIntent::Forward
-                } else {
-                    NavigationIntent::Back
-                },
+                intent: NavigationIntent::Traverse(delta),
             });
             self.finish_fetch(generation, Ok(document));
             self.interaction.scroll = entry.scroll;
             return true;
         }
         if let Some(source) = entry.internal_source {
-            self.begin_internal_gemtext(
-                entry.target,
-                source,
-                if forward {
-                    NavigationIntent::Forward
-                } else {
-                    NavigationIntent::Back
-                },
-            );
+            self.begin_internal_gemtext(entry.target, source, NavigationIntent::Traverse(delta));
             return true;
         }
         self.begin_fetch(
             entry.target,
             entry.fallback_http,
-            if forward {
-                NavigationIntent::Forward
-            } else {
-                NavigationIntent::Back
-            },
+            NavigationIntent::Traverse(delta),
         );
         true
     }
@@ -1517,9 +1540,7 @@ impl BrowserController {
             intent,
         });
         let tx = self.tx.clone();
-        let viewport = self.viewport;
-        let device_pixel_ratio = self.device_pixel_ratio;
-        let screen_position = self.screen_position;
+        let window_environment = self.window_environment.subscribe();
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
             if let Link::Gemini(url) = &target {
@@ -1545,6 +1566,11 @@ impl BrowserController {
                         let final_url = response.url.public_url();
                         match gemini::image_response(response) {
                             Ok(response) => {
+                                let WindowEnvironment {
+                                    viewport,
+                                    device_pixel_ratio,
+                                    screen_position,
+                                } = *window_environment.borrow();
                                 let size = (
                                     viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
                                     viewport.height.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -1670,9 +1696,7 @@ impl BrowserController {
                 &target,
                 fallback_http,
                 None,
-                viewport,
-                device_pixel_ratio,
-                screen_position,
+                window_environment,
                 storage,
                 None,
                 intent,
@@ -2240,8 +2264,9 @@ impl BrowserController {
                 }
                 if let FetchedDocument::Dict(dict) = &mut document {
                     let entry = match pending.intent {
-                        NavigationIntent::Back => self.back.last(),
-                        NavigationIntent::Forward => self.forward.last(),
+                        NavigationIntent::Traverse(delta) => {
+                            crate::history::entry(&self.back, &self.forward, delta)
+                        }
                         _ => None,
                     };
                     if let Some(view) = entry.and_then(|entry| entry.dict_view.as_ref()) {
@@ -2297,19 +2322,15 @@ impl BrowserController {
                         self.forward.clear();
                     }
                     NavigationIntent::Replace | NavigationIntent::Reload => {}
-                    NavigationIntent::Back => {
-                        let _ = self.back.pop();
-                        if let Some(old) = old {
-                            self.forward
-                                .push(HistoryEntry::from_page(old, self.interaction.scroll));
-                        }
-                    }
-                    NavigationIntent::Forward => {
-                        let _ = self.forward.pop();
-                        if let Some(old) = old {
-                            self.back
-                                .push(HistoryEntry::from_page(old, self.interaction.scroll));
-                        }
+                    NavigationIntent::Traverse(delta) => {
+                        let previous =
+                            old.map(|old| HistoryEntry::from_page(old, self.interaction.scroll));
+                        crate::history::traverse(
+                            &mut self.back,
+                            &mut self.forward,
+                            previous,
+                            delta,
+                        );
                     }
                 }
                 self.trim_gopher_history();
@@ -2669,6 +2690,14 @@ impl BrowserController {
             PageEvt::Replace(address) => {
                 self.begin_page_address(&address, NavigationIntent::Replace)
             }
+            PageEvt::HistoryTraverse { delta } => {
+                // An absent target is a silent no-op for the History API.
+                if crate::history::entry(&self.back, &self.forward, delta).is_some() {
+                    self.begin_history_delta(delta)
+                } else {
+                    false
+                }
+            }
             PageEvt::HistoryUpdate { url, replace } => {
                 self.apply_same_document_history_update(&url, replace)
             }
@@ -2848,18 +2877,14 @@ impl BrowserController {
             intent: NavigationIntent::New,
         });
         let tx = self.tx.clone();
-        let viewport = self.viewport;
-        let device_pixel_ratio = self.device_pixel_ratio;
-        let screen_position = self.screen_position;
+        let window_environment = self.window_environment.subscribe();
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
             let result = fetch_protocol_interactive(
                 &target,
                 false,
                 None,
-                viewport,
-                device_pixel_ratio,
-                screen_position,
+                window_environment,
                 storage,
                 Some(body),
                 NavigationIntent::New,
@@ -2948,9 +2973,7 @@ async fn fetch_protocol_interactive(
     target: &Link,
     fallback_http: bool,
     referrer: Option<&url::Url>,
-    viewport: CssSize,
-    device_pixel_ratio: f32,
-    screen_position: (i32, i32),
+    window_environment: tokio::sync::watch::Receiver<WindowEnvironment>,
     storage: crate::js::WebStorage,
     post_body: Option<String>,
     intent: NavigationIntent,
@@ -2980,6 +3003,11 @@ async fn fetch_protocol_interactive(
         } else {
             gopher::representation(url, gopher::fetch(url).await?)?
         };
+        let WindowEnvironment {
+            viewport,
+            device_pixel_ratio,
+            screen_position,
+        } = *window_environment.borrow();
         let size = (
             viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
             viewport.height.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -3054,6 +3082,14 @@ async fn fetch_protocol_interactive(
         // The legacy API accepts a terminal viewport and cell size. A one-pixel
         // cell is the explicit desktop adapter, so the actor's CSSOM viewport
         // is exactly the desktop's CSS-pixel viewport and never device pixels.
+        // CSSOM View #dom-window-innerwidth: a fetch can outlive any number of
+        // native resizes. Seed the new realm with the current environment,
+        // rather than the dimensions captured when navigation was requested.
+        let WindowEnvironment {
+            viewport,
+            device_pixel_ratio,
+            screen_position,
+        } = *window_environment.borrow();
         let css_viewport = (
             viewport.width.round().clamp(1.0, f32::from(u16::MAX)) as u16,
             viewport.height.round().clamp(1.0, f32::from(u16::MAX)) as u16,
@@ -3255,6 +3291,63 @@ fn split_host_port(address: &str) -> (&str, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn document_scripts_use_the_window_size_after_fetch_completes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!(
+            "http://{}/viewport",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (environment, receiver) = tokio::sync::watch::channel(WindowEnvironment {
+            viewport: CssSize::new(960., 640.),
+            device_pixel_ratio: 1.,
+            screen_position: (0, 0),
+        });
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() < 16384);
+            }
+            environment.send_replace(WindowEnvironment {
+                viewport: CssSize::new(1440., 900.),
+                device_pixel_ratio: 2.,
+                screen_position: (25, 30),
+            });
+            let body = "<!doctype html><script>console.log('GEOMETRY '+innerWidth+' '+innerHeight+' '+devicePixelRatio+' '+screenX+' '+screenY)</script>";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        let result = fetch_protocol_interactive(
+            &Link::Http(url),
+            false,
+            None,
+            receiver,
+            Default::default(),
+            None,
+            NavigationIntent::New,
+        )
+        .await
+        .unwrap();
+        let InteractiveFetch::Document(FetchedDocument::Http(response)) = result else {
+            panic!("HTML document")
+        };
+        assert!(
+            response
+                .js
+                .as_ref()
+                .unwrap()
+                .console
+                .iter()
+                .any(|line| line.contains("GEOMETRY 1440 900 2 25 30")),
+            "{:?}",
+            response.js
+        );
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn gopher_plus_desktop_routes_views_and_information_by_representation() {
         for (tls, (kind, command, bytes, expected)) in [
@@ -3746,6 +3839,16 @@ mod tests {
             assert!(
                 matches!(rx.try_recv(), Ok(crate::js::PageCmd::Key { node: Some(42), input: actual }) if actual == input)
             );
+            let text = (state == KeyState::Pressed).then(|| String::from("z"));
+            browser.handle_action(UserAction::PageEditKey {
+                node: 42,
+                input: input.clone(),
+                text: text.clone(),
+            });
+            assert!(
+                matches!(rx.try_recv(), Ok(crate::js::PageCmd::EditKey { node: 42, input: actual, text: inserted }) if actual == input && inserted == text)
+            );
+            assert!(!browser.form_value_pending(42));
         }
         browser.handle_page_event(crate::js::PageEvt::KeyDefault { prevented: true });
         browser.handle_page_event(crate::js::PageEvt::KeyDefault { prevented: false });
@@ -4381,6 +4484,45 @@ mod tests {
     }
 
     #[test]
+    fn script_history_delta_keeps_the_live_document_and_intermediate_entries() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url::Url::parse("https://example.test/start").unwrap()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: "Ready".into(),
+            rendered: None,
+            rendered_revision: 0,
+            revision: 1,
+        });
+        for n in 1..=3 {
+            browser.interaction.scroll.y = n as f32 * 10.0;
+            browser.apply_same_document_history_update(&format!("https://example.test/{n}"), false);
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.handle_page_event(crate::js::PageEvt::HistoryTraverse { delta: -2 });
+        assert_eq!(browser.snapshot().address, "https://example.test/1");
+        assert_eq!(browser.interaction.scroll.y, 20.0);
+        assert!(browser.page_is_live() && browser.pending.is_none());
+        assert_eq!((browser.back.len(), browser.forward.len()), (1, 2));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::TraverseHistory { delta: -2, .. })
+        ));
+        browser.handle_page_event(crate::js::PageEvt::HistoryTraverse { delta: i32::MIN });
+        assert_eq!(browser.snapshot().address, "https://example.test/1");
+        browser.handle_page_event(crate::js::PageEvt::HistoryTraverse { delta: 2 });
+        assert_eq!(browser.snapshot().address, "https://example.test/3");
+        assert_eq!((browser.back.len(), browser.forward.len()), (3, 0));
+    }
+
+    #[test]
     fn fragment_navigation_and_history_keep_the_document_and_scroll() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4576,7 +4718,7 @@ mod tests {
             generation: 4,
             target: target("one.example"),
             fallback_http: false,
-            intent: NavigationIntent::Back,
+            intent: NavigationIntent::Traverse(-1),
         });
         assert!(browser.snapshot().can_go_back);
         assert!(browser.finish_fetch(4, Ok(FetchedDocument::Gopher(vec![4].into()))));
@@ -4915,9 +5057,12 @@ mod whois_tests {
             &Link::Http(url.clone()),
             false,
             None,
-            CssSize::new(800.0, 600.0),
-            1.0,
-            (0, 0),
+            tokio::sync::watch::channel(WindowEnvironment {
+                viewport: CssSize::new(800.0, 600.0),
+                device_pixel_ratio: 1.0,
+                screen_position: (0, 0),
+            })
+            .1,
             Default::default(),
             None,
             NavigationIntent::New,
@@ -5096,7 +5241,7 @@ mod dict_tests {
         assert_eq!(page.section, crate::dict::Section::Raw);
         assert_eq!(page.selected, 1);
         browser.open_internal_gemtext("about:help", b"# Help".to_vec());
-        start(&mut browser, 3, NavigationIntent::Back);
+        start(&mut browser, 3, NavigationIntent::Traverse(-1));
         browser.update_dict(3, reply(true));
         let FetchedDocument::Dict(page) = &browser.current.as_ref().unwrap().document else {
             panic!()

@@ -48,6 +48,9 @@ pub(crate) enum AtomKind {
         dimension_source: NodeId,
         alt: String,
     },
+    /// CSS generated content's anonymous replaced image, sized by its natural
+    /// dimensions rather than the originating element's dimensions.
+    GeneratedImage { url: String },
     /// A form control, rendered as its widget label (`Field::row_label`).
     Control { form: usize, field: usize },
     /// A `<video>`/`<audio>` media representation (the "play in mpv"
@@ -440,7 +443,14 @@ impl Builder<'_> {
         // §2: an absolutely positioned box is still out of flow. Feed SVG into
         // the same position/float classification below as every other replaced
         // element instead of returning an in-flow atom early.
-        let rep = if tag == "svg" {
+        let rep = if let Some(source) = self.dom.content_replacement_image(id) {
+            Replaced::Atom(AtomKind::Img {
+                url: self.base.join(&source).ok().map(|u| u.to_string()),
+                density: 1.0,
+                dimension_source: id,
+                alt: String::new(),
+            })
+        } else if tag == "svg" {
             match self.dom.svg_image_data(id, Some(self.base)) {
                 Some((source, alt)) => Replaced::Atom(AtomKind::Img {
                     url: Some(source),
@@ -1011,11 +1021,19 @@ impl Builder<'_> {
         // padding aspect-ratio reservations and collapses abspos descendants.
         // Live snapshots bake content + pseudo declarations into data attrs;
         // direct layouts read the same values from the resident cascade.
-        if let Some(pseudo) = self.pseudo(id, PseudoEl::Before, "data-trust-before") {
-            out.insert(0, pseudo);
+        if let Some(pseudo) = self.pseudo(id, PseudoEl::Before) {
+            match pseudo {
+                Built::Hoist(kids) => {
+                    out.splice(0..0, kids);
+                }
+                other => out.insert(0, other),
+            }
         }
-        if let Some(pseudo) = self.pseudo(id, PseudoEl::After, "data-trust-after") {
-            out.push(pseudo);
+        if let Some(pseudo) = self.pseudo(id, PseudoEl::After) {
+            match pseudo {
+                Built::Hoist(kids) => out.extend(kids),
+                other => out.push(other),
+            }
         }
         out
     }
@@ -1024,11 +1042,23 @@ impl Builder<'_> {
     /// not have DOM node identities, so their fragments use `NO_NODE`; their
     /// originating element remains the inheritance source in
     /// `pseudo_layout_value` and the surrounding inline context.
-    fn pseudo(&self, id: NodeId, which: PseudoEl, attr: &str) -> Option<Built> {
-        let text = match self.dom.attr(id, attr) {
-            Some(text) => text.to_string(),
-            None => self.dom.pseudo_content(id, which)?,
-        };
+    fn pseudo(&self, id: NodeId, which: PseudoEl) -> Option<Built> {
+        let content = self.dom.pseudo_content_items(id, which)?;
+        let kids: Vec<Inline> = content
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::dom::GeneratedContent::Text(text) => {
+                    (!text.is_empty()).then_some(Inline::Text(text))
+                }
+                crate::dom::GeneratedContent::Image(source) => {
+                    let url = self.base.join(&source).ok()?.to_string();
+                    Some(Inline::Atom(Atom {
+                        node: crate::layout2::NO_NODE,
+                        kind: AtomKind::GeneratedImage { url },
+                    }))
+                }
+            })
+            .collect();
         let display = self
             .dom
             .pseudo_layout_value(id, which, "display")
@@ -1038,14 +1068,10 @@ impl Builder<'_> {
             return None;
         }
         if display == "contents" {
-            return (!text.is_empty()).then_some(Built::Inline(Inline::Text(text)));
+            return Some(Built::Hoist(kids.into_iter().map(Built::Inline).collect()));
         }
 
         let style = BoxStyle::of_pseudo(self.dom, id, which, self.vp);
-        let kids: Vec<Inline> = (!text.is_empty())
-            .then_some(Inline::Text(text))
-            .into_iter()
-            .collect();
         let block_level = matches!(
             display.as_str(),
             "block" | "flow-root" | "list-item" | "flex" | "grid" | "table"

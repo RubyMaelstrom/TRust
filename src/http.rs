@@ -4306,13 +4306,14 @@ pub async fn execute_js_for_device(
     device_pixel_ratio: f32,
     storage: crate::js::WebStorage,
 ) -> Response {
-    execute_js_for_window(
+    execute_js_with_presentation(
         response,
         viewport,
         cell_px,
         device_pixel_ratio,
         (0, 0),
         storage,
+        true,
     )
     .await
 }
@@ -4380,12 +4381,33 @@ pub(crate) fn prefetch_page_scripts(
 }
 
 pub(crate) async fn execute_js_for_window(
+    response: Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+    device_pixel_ratio: f32,
+    screen_position: (i32, i32),
+    storage: crate::js::WebStorage,
+) -> Response {
+    execute_js_with_presentation(
+        response,
+        viewport,
+        cell_px,
+        device_pixel_ratio,
+        screen_position,
+        storage,
+        false,
+    )
+    .await
+}
+
+async fn execute_js_with_presentation(
     mut response: Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
     screen_position: (i32, i32),
     storage: crate::js::WebStorage,
+    terminal_presentation: bool,
 ) -> Response {
     let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
         device_pixel_ratio
@@ -4578,6 +4600,7 @@ pub(crate) async fn execute_js_for_window(
         cell_px,
         device_pixel_ratio,
         screen_position,
+        terminal_presentation,
         externals: Vec::new(),
         sheets,
         cache,
@@ -5186,9 +5209,9 @@ fn css_unescape_url(raw: &str) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CssFontFace {
-    family: String,
-    sources: Vec<String>,
+pub(crate) struct CssFontFace {
+    pub family: String,
+    pub sources: Vec<String>,
 }
 
 fn stylesheet_font_faces(css: &str) -> Vec<CssFontFace> {
@@ -5205,39 +5228,46 @@ fn stylesheet_font_faces(css: &str) -> Vec<CssFontFace> {
             break;
         };
         let block = &css[open + 1..close];
-        let mut family = None;
-        let mut sources = Vec::new();
-        for declaration in block.split(';') {
-            let Some((name, value)) = declaration.split_once(':') else {
-                continue;
-            };
-            if name.trim().eq_ignore_ascii_case("font-family") {
-                family = Some(unquote_css_url(value));
-            } else if name.trim().eq_ignore_ascii_case("src") {
-                let value_lower = value.to_ascii_lowercase();
-                let mut source_cursor = 0usize;
-                while let Some(relative) = value_lower[source_cursor..].find("url(") {
-                    let args = source_cursor + relative + 4;
-                    let Some(end) = value[args..].find(')') else {
-                        break;
-                    };
-                    sources.push(unquote_css_url(&value[args..args + end]));
-                    source_cursor = args + end + 1;
-                }
-            }
-        }
-        if let Some(family) = family
-            && !family.trim().is_empty()
-            && !sources.is_empty()
-        {
-            sources.retain(|url| !url.trim().is_empty());
-            if !sources.is_empty() {
-                faces.push(CssFontFace { family, sources });
-            }
+        if let Some(face) = font_face_descriptors(block) {
+            faces.push(face);
         }
         cursor = close + 1;
     }
     faces
+}
+
+pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
+    let mut family = None;
+    let mut sources = Vec::new();
+    // CSS Syntax: semicolons inside strings/functions are component
+    // values, not declaration separators (notably data: font URLs).
+    for declaration in crate::dom::split_top_level(block, ';') {
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("font-family") {
+            family = Some(unquote_css_url(value));
+        } else if name.trim().eq_ignore_ascii_case("src") {
+            sources.clear();
+            for source in crate::dom::split_top_level(value, ',') {
+                let mut input = cssparser::ParserInput::new(source);
+                let mut parser = cssparser::Parser::new(&mut input);
+                if let Ok(url) = parser.expect_url() {
+                    sources.push(url.to_string());
+                }
+            }
+        }
+    }
+    if let Some(family) = family
+        && !family.trim().is_empty()
+        && !sources.is_empty()
+    {
+        sources.retain(|url| !url.trim().is_empty());
+        if !sources.is_empty() {
+            return Some(CssFontFace { family, sources });
+        }
+    }
+    None
 }
 
 fn css_block_end(css: &str, open: usize) -> Option<usize> {
@@ -5293,8 +5323,9 @@ fn document_font_faces(
                 .into_iter()
                 .filter_map(|source| document_base.join(&source).ok())
                 .filter(|url| {
-                    matches!(url.scheme(), "http" | "https" | "file")
-                        && subresource_allowed(page_url, url)
+                    url.scheme() == "data"
+                        || (matches!(url.scheme(), "http" | "https" | "file")
+                            && subresource_allowed(page_url, url))
                 })
                 .collect::<Vec<_>>();
             (!sources.is_empty()).then_some((face.family, sources))
@@ -5308,6 +5339,17 @@ async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_
         // CSS Fonts 4 §4.3.3: try external references in specified order and
         // proceed to the next item when loading or format decoding fails.
         for url in sources {
+            // CSS Fonts #font-fetching-requirements / Fetch's data-URL
+            // processor: local data URLs are valid font sources, with no
+            // HTTP request or cross-origin response headers required.
+            if url.scheme() == "data" {
+                if let Some(font) = crate::img::decode_data_url(url.as_str()).and_then(|bytes| {
+                    crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
+                }) {
+                    return Some(font);
+                }
+                continue;
+            }
             let Ok(response) = fetch(&Request::subresource(
                 url,
                 page_url,
@@ -6631,11 +6673,46 @@ fn collect_image_urls_for_boxes(
         if dom.tag_name(id).is_none() || boxes.is_some_and(|boxes| !boxes.contains_key(&id)) {
             continue;
         }
-        for property in ["background-image", "list-style-image", "cursor"] {
+        for property in ["background-image", "list-style-image", "cursor", "content"] {
             let Some(value) = dom.computed_value_resolved(id, property) else {
                 continue;
             };
             for source in css_image_sources(&value) {
+                let Some(url) = resolve_css_image_source(base, &source) else {
+                    continue;
+                };
+                if dom.resource_cookies_restricted(id) {
+                    cookie_restricted.insert(url.clone());
+                }
+                if !urls.contains(&url) {
+                    urls.push(url.clone());
+                }
+                if !eager.contains(&url) {
+                    eager.push(url);
+                }
+            }
+        }
+        // CSS 2 #content: generated images participate in resource discovery
+        // even before they have natural dimensions (and therefore paint no
+        // pixels). Include pseudo backgrounds through the same cascade.
+        for pseudo in [crate::dom::PseudoEl::Before, crate::dom::PseudoEl::After] {
+            let Some(items) = dom.pseudo_content_items(id, pseudo) else {
+                continue;
+            };
+            if dom.pseudo_layout_value(id, pseudo, "display").as_deref() == Some("none") {
+                continue;
+            }
+            let mut sources: Vec<_> = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::dom::GeneratedContent::Image(source) => Some(source),
+                    _ => None,
+                })
+                .collect();
+            if let Some(value) = dom.pseudo_layout_value(id, pseudo, "background-image") {
+                sources.extend(css_image_sources(&value));
+            }
+            for source in sources {
                 let Some(url) = resolve_css_image_source(base, &source) else {
                     continue;
                 };
@@ -6867,7 +6944,7 @@ fn walk_forms_arena(
                 // visible `[ Submit ]` flex item.
             }
             Some(tag @ ("input" | "button" | "select" | "textarea")) => {
-                let Some(field) = field_from_arena(dom, child, tag) else {
+                let Some(mut field) = field_from_arena(dom, child, tag) else {
                     continue;
                 };
                 // WHATWG HTML §4.10.6 says that a <button> is labeled by
@@ -6882,12 +6959,12 @@ fn walk_forms_arena(
                 if current.is_none() && tag == "button" {
                     continue;
                 }
-                // A formless submit control (a bare <button>/<input type=submit>
-                // with no form owner) has nothing to submit — its onClick is the
-                // whole interaction, so leave it to the JsClick stub path rather
-                // than claiming it as a form field here.
+                // HTML #submit-button-state-(type=submit) suppresses submission
+                // without a form owner, not the widget. Keep an input button's
+                // value, CSS box and click target in the presentation model.
+                // The resident DOM retains its real type and activation rules.
                 if current.is_none() && field.kind == FieldKind::Submit {
-                    continue;
+                    field.kind = FieldKind::Button;
                 }
                 // Bind to the enclosing <form>, or to the lazily-created
                 // implicit form for an editable control with no form owner: a
@@ -6952,6 +7029,7 @@ fn walk_forms_arena(
                     label: contenteditable_placeholder(dom, child),
                     kind: FieldKind::Textarea,
                     number: None,
+                    selection: None,
                     live_node: live_node(dom, child),
                 });
                 map.insert(child, (form, forms[form].fields.len() - 1));
@@ -7082,6 +7160,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 label,
                 kind: FieldKind::Textarea,
                 number: None,
+                selection: dom.control_selection(id),
                 live_node: live_node(dom, id),
             });
         }
@@ -7115,6 +7194,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 label,
                 kind: FieldKind::Select(options),
                 number: None,
+                selection: None,
                 live_node: live_node(dom, id),
             });
         }
@@ -7147,6 +7227,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
         label,
         kind,
         number,
+        selection: dom.control_selection(id),
         live_node: live_node(dom, id),
     })
 }
@@ -8173,6 +8254,25 @@ mod tests {
         assert_eq!(
             faces[1].1[0].as_str(),
             "https://cdn.example.test/fonts/external.woff2"
+        );
+    }
+
+    #[test]
+    fn font_face_data_urls_are_complete_css_tokens_and_keep_source_order() {
+        let page = Url::parse("https://example.test/page").unwrap();
+        let faces = document_font_faces(
+            r#"<style>@font-face{font-family:Embedded;
+                src:url(old.woff2);src:url("data:font/woff2;base64,d09GMg==") format(woff2),
+                url("fallback)with;punctuation.woff2") format("woff2")}</style>"#,
+            &[],
+            &page,
+        );
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].1.len(), 2);
+        assert_eq!(faces[0].1[0].as_str(), "data:font/woff2;base64,d09GMg==");
+        assert_eq!(
+            faces[0].1[1].as_str(),
+            "https://example.test/fallback)with;punctuation.woff2"
         );
     }
 
@@ -11984,6 +12084,7 @@ mod tests {
                     node,
                     value: val,
                     checked: None,
+                    commit: false,
                 })
                 .await
                 .unwrap();
@@ -12280,6 +12381,7 @@ mod tests {
                     node: n,
                     value: "tester@example.com".into(),
                     checked: None,
+                    commit: false,
                 })
                 .await
                 .unwrap();
@@ -12292,6 +12394,7 @@ mod tests {
                     node: n,
                     value: "hunter2password".into(),
                     checked: None,
+                    commit: false,
                 })
                 .await
                 .unwrap();
@@ -16463,6 +16566,371 @@ customElements.define('lit-counter', LitCounter);
         );
         assert!(has_item(&doc, "[ Reject all ]"));
         assert!(has_item(&doc, "[ Accept all ]"));
+    }
+
+    #[test]
+    fn css_content_image_replaces_elements_without_changing_the_dom() {
+        use crate::render::DisplayCommand;
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>
+            body{margin:0} .replacement{content:url(picture.png);width:80px;height:40px}
+            .replacement::before{content:'suppressed'}
+        </style><div class=replacement id=box>normal child</div><img class=replacement id=image src=original.png alt=fallback><canvas class=replacement id=canvas></canvas>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        assert_eq!(
+            dom.text_content(dom.get_by_id("box").unwrap()),
+            "normal child"
+        );
+        let snapshot = crate::dom::Dom::parse_document(
+            &dom.serialize_live(crate::dom::DOCUMENT, &Default::default()),
+        );
+        let viewport = crate::layout2::Viewport::new(320., 240.);
+        let sizes = [("https://example.test/picture.png".into(), (160, 80))]
+            .into_iter()
+            .collect();
+        for arena in [&dom, &snapshot] {
+            let ready = render_arena(arena, &base, viewport, 1., None, &sizes);
+            assert!(
+                ready
+                    .image_urls
+                    .contains(&"https://example.test/picture.png".into())
+            );
+            let images: Vec<_> = ready
+                .layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|p| match p {
+                    DisplayCommand::Image { rect, .. } => Some(rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(images.len(), 3);
+            assert!(
+                images
+                    .iter()
+                    .all(|rect| rect.width == 80. && rect.height == 40.),
+                "{images:?}"
+            );
+            assert!(!ready.layout.paint.primitives.iter().any(|p| matches!(p, DisplayCommand::GlyphRun { shaped, .. }
+                if shaped.text.contains("normal") || shaped.text.contains("fallback") || shaped.text.contains("suppressed"))));
+        }
+    }
+
+    #[test]
+    fn generated_content_images_survive_discovery_layout_and_snapshots() {
+        use crate::render::DisplayCommand;
+        let base = Url::parse("https://example.test/assets/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>
+            body { margin:0; font:16px/20px monospace; counter-reset:n 2 }
+            #icon { display:inline-block; overflow:hidden; width:30px; height:30px }
+            #icon::before { content:url(sprite.png); display:inline-block; transform:scale(.5); transform-origin:0 0 }
+            #mixed::after { content:'A' url('small\)image.png') counter(n) attr(data-end) / 'accessible'; }
+            #hidden::before { content:url(hidden.png); display:none }
+        </style><span id=icon></span><div id=mixed data-end=Z></div><div id=hidden></div>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let mixed = dom.get_by_id("mixed").unwrap();
+        let items = dom
+            .pseudo_content_items(mixed, crate::dom::PseudoEl::After)
+            .unwrap_or_else(|| {
+                panic!(
+                    "content: {:?}",
+                    dom.pseudo_style(mixed, crate::dom::PseudoEl::After, "content")
+                )
+            });
+        assert_eq!(
+            items,
+            vec![
+                crate::dom::GeneratedContent::Text("A".into()),
+                crate::dom::GeneratedContent::Image("small)image.png".into()),
+                crate::dom::GeneratedContent::Text("2Z".into())
+            ]
+        );
+        let snapshot = crate::dom::Dom::parse_document(
+            &dom.serialize_live(crate::dom::DOCUMENT, &Default::default()),
+        );
+        let viewport = crate::layout2::Viewport::new(320., 200.);
+        let mut sizes = crate::layout2::ImageSizes::new();
+        sizes.insert("https://example.test/assets/sprite.png".into(), (60, 60));
+        sizes.insert(
+            "https://example.test/assets/small)image.png".into(),
+            (20, 10),
+        );
+        for arena in [&dom, &snapshot] {
+            let pending = render_arena(arena, &base, viewport, 1., None, &Default::default());
+            assert!(
+                pending
+                    .image_urls
+                    .contains(&"https://example.test/assets/sprite.png".into())
+            );
+            assert!(!pending.image_urls.iter().any(|s| s.ends_with("hidden.png")));
+            let ready = render_arena(arena, &base, viewport, 1., None, &sizes);
+            let requests = &ready.layout.paint.image_requests;
+            assert_eq!(requests.len(), 2, "{requests:?}");
+            assert!(ready.layout.paint.primitives.iter().any(|p| matches!(p,
+                DisplayCommand::Image { rect, .. } if rect.width==60. && rect.height==60.
+            )));
+            assert!(ready.layout.paint.primitives.iter().any(|p| matches!(p,
+                DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("2Z")
+            )));
+        }
+    }
+
+    #[test]
+    fn generated_ratio_only_svg_uses_its_definite_containing_block() {
+        // CSS Images 3 #sizing: generated images have initial/auto dimensions;
+        // CSS 2 #inline-replaced-width supplies the ratio-only SVG constraint.
+        let base = Url::parse("https://example.test/").unwrap();
+        for (dimensions, expected) in [("", (25., 12.5)), ("width='80' height='40'", (80., 40.))] {
+            let svg = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 1' {dimensions}><path d='M0 0h2v1H0z'/></svg>"
+            );
+            let url = format!(
+                "data:image/svg+xml,{}",
+                url::form_urlencoded::byte_serialize(svg.as_bytes())
+                    .collect::<String>()
+                    .replace('+', "%20")
+            );
+            let dom = crate::dom::Dom::parse_document(&format!(
+                "<style>body{{margin:0}}#icon{{display:flex;width:50px;height:50px;align-items:center;justify-content:center}}\
+                 #icon::before{{content:url(\"{url}\");width:25px;height:25px}}</style><div id=icon></div>"
+            ));
+            let sizes = crate::layout2::ImageSizes::from([(
+                url,
+                if dimensions.is_empty() {
+                    (300, 150)
+                } else {
+                    (80, 40)
+                },
+            )]);
+            let rendered = render_arena(
+                &dom,
+                &base,
+                crate::layout2::Viewport::new(400., 300.),
+                1.,
+                None,
+                &sizes,
+            );
+            let image = rendered
+                .layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|p| match p {
+                    crate::render::DisplayCommand::Image { rect, .. } => Some(rect),
+                    _ => None,
+                })
+                .expect("generated SVG image");
+            assert!(
+                (image.width - expected.0).abs() < 0.01 && (image.height - expected.1).abs() < 0.01,
+                "{dimensions}: {image:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownerless_submit_input_keeps_its_label_surface_and_click_target() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><input type=submit id=action value="Open dialog" style="font:16px sans-serif;padding:8px 15px;background:#eee;border:1px solid #888">"#,
+        );
+        let node = dom.get_by_id("action").unwrap();
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(320., 120.),
+            1.,
+            None,
+            &Default::default(),
+        );
+        let &(form, field) = rendered.controls.get(&node).unwrap();
+        assert_eq!(rendered.forms[form].fields[field].kind, FieldKind::Button);
+        assert!(rendered.layout.boxes[&node].width > 100.);
+        assert!(rendered.layout.paint.primitives.iter().any(|p|matches!(p,
+            crate::render::DisplayCommand::GlyphRun{node:id,shaped,..} if *id==node && shaped.text=="Open dialog"
+        )));
+        assert!(rendered.layout.paint.primitives.iter().any(|p| matches!(p,
+            crate::render::DisplayCommand::HitRegion(hit) if hit.node==node
+        )));
+    }
+
+    #[test]
+    fn form_button_text_indent_moves_the_label_without_moving_its_clip() {
+        let base = Url::parse("https://example.test/").unwrap();
+        for display in ["display:inline-block", "display:block", "float:left"] {
+            let dom = crate::dom::Dom::parse_document(&format!(
+                r#"<!doctype html>
+                <style>body{{margin:0}} input{{{display};font:20px sans-serif;
+                width:40px;height:40px;border:0;padding:0;background:transparent;
+                text-align:left;text-indent:-99em}}</style><form><input id=button type=submit value=Search></form>"#
+            ));
+            let rendered = render_arena(
+                &dom,
+                &base,
+                crate::layout2::Viewport::new(320., 120.),
+                1.,
+                None,
+                &Default::default(),
+            );
+            let button = dom.get_by_id("button").unwrap();
+            let (origin, shaped, clip) = rendered
+                .layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|p| match p {
+                    crate::render::DisplayCommand::GlyphRun {
+                        node,
+                        origin,
+                        shaped,
+                        clip,
+                        ..
+                    } if *node == button => Some((*origin, shaped, clip.unwrap())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing label for {display}"));
+            assert!(
+                origin.x + shaped.advance < clip.x,
+                "hidden label escaped: {display}"
+            );
+            assert!(
+                clip.x >= 0. && clip.width > 0.,
+                "indent moved the clip: {display}"
+            );
+            assert!(rendered.layout.paint.primitives.iter().any(|p| matches!(p,
+                crate::render::DisplayCommand::HitRegion(hit) if hit.node==button && hit.rect.width==40.
+            )), "indent moved the hit target: {display}");
+        }
+    }
+
+    #[test]
+    fn blockified_inputs_keep_the_content_width_during_native_typing() {
+        use crate::render::DisplayCommand;
+        let base = Url::parse("https://example.test/").unwrap();
+        for display in ["block", "flex", "grid"] {
+            let dom = crate::dom::Dom::parse_document(&format!(
+                r#"<style>body{{margin:0}} form{{display:{display}}}
+                input{{display:block;font:20px sans-serif;width:260px;box-sizing:border-box;
+                padding:12px 13px 12px 27px;border:0}}</style><form><input id=q value=a></form>"#,
+            ));
+            let rendered = render_arena(
+                &dom,
+                &base,
+                crate::layout2::Viewport::new(640., 480.),
+                1.,
+                None,
+                &Default::default(),
+            );
+            let node = dom.get_by_id("q").unwrap();
+            let presentation = &rendered.rich_editors[&node];
+            assert!(
+                (presentation.width - 220.).abs() < 0.1,
+                "{display}: {}",
+                presentation.width
+            );
+            let mut editor = crate::text::TextEditor::new(
+                "a longer value",
+                &presentation.style,
+                presentation.width,
+                false,
+            );
+            let mut paint = rendered.layout.paint.primitives.clone();
+            let mut scroll = 0.;
+            crate::render::paint_native_input(
+                &mut paint,
+                &editor.line_layout(false),
+                presentation,
+                &mut scroll,
+            );
+            assert_eq!(scroll, 0., "short text was scrolled in {display}");
+            assert!(paint.iter().any(
+                |p| matches!(p, DisplayCommand::GlyphRun { node: id, origin, clip: Some(clip), .. }
+                if *id == node && (origin.x - 27.).abs() < 0.1 && (clip.width - 220.).abs() < 0.1)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_input_editing_uses_css_glyphs_and_preserves_the_surface() {
+        use crate::render::{DisplayCommand, PaintColor};
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>
+            body{margin:0} input{font:24px monospace;color:#123456;caret-color:#ff00ff;
+            padding:0 13px 0 27px;height:60px;width:260px;box-sizing:border-box;
+            background:transparent;border:0;outline:0}
+            </style><input id=search type=search value="draft" placeholder="Search here">"#,
+        );
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640., 480.),
+            1.,
+            None,
+            &Default::default(),
+        );
+        let node = dom.get_by_id("search").unwrap();
+        let presentation = &rendered.rich_editors[&node];
+        assert!(presentation.native_input.is_some());
+        assert_eq!(presentation.style.size, 24.);
+        let mut editor = crate::text::TextEditor::new(
+            "typed  text",
+            &presentation.style,
+            presentation.width,
+            false,
+        );
+        let line = editor.line_layout(false);
+        let mut paint = rendered.layout.paint.primitives.clone();
+        let surfaces: Vec<_> = paint
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    DisplayCommand::Fill { .. }
+                        | DisplayCommand::FillRect { .. }
+                        | DisplayCommand::Stroke { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let mut scroll = 0.;
+        crate::render::paint_native_input(&mut paint, &line, presentation, &mut scroll);
+        let (origin, shaped, clip) = paint
+            .iter()
+            .find_map(|p| match p {
+                DisplayCommand::GlyphRun {
+                    node: id,
+                    origin,
+                    shaped,
+                    clip,
+                    ..
+                } if *id == node => Some((*origin, shaped, clip.unwrap())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(shaped.text, "typed  text");
+        assert_eq!(shaped.advance, line.shaped.advance);
+        assert!((origin.x - 27.).abs() < 0.1);
+        assert!(origin.y > 10., "text is vertically centered: {origin:?}");
+        assert!((clip.width - 220.).abs() < 0.1);
+        assert!(paint.iter().any(|p| matches!(p, DisplayCommand::FillRect{rect,color}
+            if *color==PaintColor::Rgba(255,0,255,255) && (rect.x-origin.x-line.caret.unwrap().x).abs()<0.01)));
+        for surface in surfaces {
+            assert!(paint.contains(&surface), "CSS surface replaced");
+        }
+        editor.set_text("a long search query with trailing spaces    ");
+        let mut paint = rendered.layout.paint.primitives.clone();
+        crate::render::paint_native_input(
+            &mut paint,
+            &editor.line_layout(false),
+            presentation,
+            &mut scroll,
+        );
+        assert!(scroll > 0., "single-line input must scroll to the caret");
     }
 
     #[test]

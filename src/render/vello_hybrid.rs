@@ -9,8 +9,8 @@
 //! quarantined here: mask layers and complex filter graphs can panic, some
 //! non-isolated destructive blends are unsupported, glyph-atlas caching is
 //! still experimental, and several allocation failures panic instead of
-//! returning `RenderError`. TRust does not emit masks/filter graphs today;
-//! compositing commands use isolated layers, and the desktop contains a
+//! returning `RenderError`. TRust uses isolated single-primitive color filters;
+//! complex graphs and masks are not emitted. The desktop contains a
 //! backend panic/error by dropping Hybrid and replaying the unchanged list on
 //! CPU. Making those failure paths fallible and stabilizing resource lifetime
 //! APIs are good upstream Vello contributions.
@@ -31,7 +31,8 @@ use winit::window::Window;
 use super::vello_cpu::{
     MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, offset_shape, point_bounds,
     rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
-    vello_affine, vello_blend, vello_color, vello_rect, vello_stops, vello_stroke,
+    vello_affine, vello_blend, vello_color, vello_color_filter, vello_rect, vello_stops,
+    vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
@@ -740,6 +741,7 @@ impl VelloHybridRenderer {
             scene.viewport.css.height,
         ));
         target.set_transform(device_transform);
+        let mut layer_filters = Vec::new();
 
         for command in &scene.primitives {
             match command {
@@ -811,8 +813,17 @@ impl VelloHybridRenderer {
                         None,
                         None,
                     );
+                    for matrix in layer.color_filters.iter().rev() {
+                        target.push_layer(None, None, None, None, Some(vello_color_filter(matrix)));
+                    }
+                    layer_filters.push(layer.color_filters.len());
                 }
-                DisplayCommand::PopLayer => target.pop_layer(),
+                DisplayCommand::PopLayer => {
+                    for _ in 0..layer_filters.pop().unwrap_or(0) {
+                        target.pop_layer();
+                    }
+                    target.pop_layer();
+                }
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky
                 | DisplayCommand::BeginScroll(_)

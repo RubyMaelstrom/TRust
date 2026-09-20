@@ -211,6 +211,8 @@ pub(crate) struct BoxStyle {
     /// CSS Masking 1 §5: a clipping path forms a stacking context, but
     /// unlike a transform it does not establish a containing block.
     pub has_clip_path: bool,
+    pub color_filters: std::sync::Arc<[[f32; 20]]>,
+    pub filter_containing_block: bool,
     /// Used `opacity`, clamped to the CSS `<alpha-value>` range. Retaining the
     /// number (rather than the old terminal-only boolean) lets graphical paint
     /// composite the entire stacking context as one group.
@@ -274,6 +276,8 @@ impl BoxStyle {
             ty: (0.0, 0.0),
             has_transform: false,
             has_clip_path: false,
+            color_filters: Default::default(),
+            filter_containing_block: false,
             opacity: 1.0,
             bg: false,
             float: None,
@@ -362,6 +366,12 @@ impl BoxStyle {
             ty,
             has_transform,
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
+            color_filters: cv("filter")
+                .as_deref()
+                .and_then(super::filter::color_filters)
+                .unwrap_or_default()
+                .into(),
+            filter_containing_block: dom.document_element() != Some(id),
             opacity: dom.effective_opacity(id),
             bg: declares_background(dom, id),
             // §9.7: an out-of-flow box computes `float:none` (positioning wins).
@@ -506,6 +516,12 @@ impl BoxStyle {
                 .as_deref()
                 .is_some_and(|value| !matches!(value.trim(), "" | "none")),
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
+            color_filters: cv("filter")
+                .as_deref()
+                .and_then(super::filter::color_filters)
+                .unwrap_or_default()
+                .into(),
+            filter_containing_block: true,
             opacity: cv("opacity")
                 .as_deref()
                 .and_then(|value| {
@@ -534,6 +550,7 @@ impl BoxStyle {
             || matches!(self.position, Pos::Fixed | Pos::Sticky)
             || self.has_transform
             || self.has_clip_path
+            || !self.color_filters.is_empty()
             || self.opacity < 1.0
             || (item && self.z_index.is_some())
     }
@@ -1008,6 +1025,7 @@ pub(crate) struct InlineStyle {
     pub letter: f32,
     pub word: f32,
     pub font_family: String,
+    pub font_set: Option<std::sync::Arc<crate::text::FontSet>>,
     pub language: Option<String>,
     pub font_size: f32,
     pub font_weight: f32,
@@ -1060,6 +1078,7 @@ impl InlineStyle {
             letter: 0.0,
             word: 0.0,
             font_family: String::from("sans-serif"),
+            font_set: None,
             language: None,
             font_size: crate::dom::FONT_SIZE_INITIAL,
             font_weight: 400.0,
@@ -1133,6 +1152,7 @@ impl InlineStyle {
         s.font_family = dom
             .computed_value_resolved(id, "font-family")
             .unwrap_or_else(|| s.font_family.clone());
+        s.font_set = dom.document_font_set(id);
         s.language = dom.inherited_lang(id).map(str::to_string);
         s.font_size = dom.font_px(id);
         s.font_weight = dom
@@ -1248,6 +1268,7 @@ impl InlineStyle {
     pub fn text_style(&self) -> crate::text::TextStyle {
         crate::text::TextStyle {
             family: self.font_family.clone(),
+            font_set: self.font_set.clone(),
             language: self.language.clone(),
             size: self.font_size,
             weight: self.font_weight,
@@ -1286,6 +1307,18 @@ impl InlineStyle {
         };
         if declared("font-family") {
             s.font_family = value("font-family").unwrap_or_else(|| "sans-serif".into());
+            let inherits = dom
+                .pseudo_style(id, which, "font-family")
+                .or_else(|| dom.baked_pseudo_value(id, which, "font-family"))
+                .is_some_and(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "inherit" | "unset" | "revert"
+                    )
+                });
+            if !inherits {
+                s.font_set = dom.scope_font_set(id);
+            }
         }
         if declared("font-weight") {
             s.font_weight = value("font-weight")

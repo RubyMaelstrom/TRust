@@ -19,12 +19,243 @@ pub(super) enum Impact {
 #[derive(Default)]
 pub(super) struct SelectorDependencies {
     attributes: FxHashMap<String, Impact>,
+    relational: Vec<RelationalDependency>,
+    structural: Vec<StructureDependency>,
     empty: bool,
     text_direction: bool,
     text_placeholder: bool,
+    checked: bool,
     structure_global: bool,
-    empty_siblings: bool,
-    sibling_structure: bool,
+}
+
+/// A necessary, positive part of a selector. State/logical/positional tests
+/// are omitted so checking a dependency cannot exclude a future match.
+#[derive(Clone)]
+struct StructureGuard(Vec<StructureStep>);
+
+// true = direct parent, false = any ancestor (the first step has no relation).
+type StructureStep = (bool, Option<String>, Option<String>, Vec<String>);
+
+impl StructureGuard {
+    fn prefix(selector: &Complex, end: usize) -> Self {
+        // Sibling adjacency can change during this mutation. Keep only the
+        // ancestor suffix, whose relationships to an existing child survive.
+        let start = (1..=end)
+            .rev()
+            .find(|&index| {
+                !matches!(
+                    selector.0[index].0,
+                    Combinator::Child | Combinator::Descendant
+                )
+            })
+            .unwrap_or(0);
+        Self(
+            selector.0[start..=end]
+                .iter()
+                .map(|(combinator, compound)| {
+                    (
+                        *combinator == Combinator::Child,
+                        compound.tag.clone(),
+                        compound.id.clone(),
+                        compound.classes.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn matches(&self, dom: &Dom, node: NodeId) -> bool {
+        fn matches(dom: &Dom, node: NodeId, parts: &[StructureStep]) -> bool {
+            let Some(((direct_parent, tag, id, classes), rest)) = parts.split_last() else {
+                return true;
+            };
+            if !dom
+                .tag_name(node)
+                .is_some_and(|name| tag.as_ref().is_none_or(|tag| tag == "*" || tag == name))
+                || id
+                    .as_ref()
+                    .is_some_and(|id| dom.attr(node, "id") != Some(id))
+                || !dom.matches_classes(node, classes)
+            {
+                return false;
+            }
+            if rest.is_empty() {
+                return true;
+            }
+            let mut parent = dom.selector_parent(node);
+            while let Some(node) = parent {
+                if matches(dom, node, rest) {
+                    return true;
+                }
+                if *direct_parent {
+                    break;
+                }
+                parent = dom.selector_parent(node);
+            }
+            false
+        }
+        matches(dom, node, &self.0)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<StructureStep>()
+            + self
+                .0
+                .iter()
+                .map(|(_, tag, id, classes)| {
+                    tag.as_ref().map_or(0, String::capacity)
+                        + id.as_ref().map_or(0, String::capacity)
+                        + classes.capacity() * std::mem::size_of::<String>()
+                        + classes.iter().map(String::capacity).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
+enum StructureDependency {
+    Empty {
+        guards: Vec<StructureGuard>,
+        siblings: bool,
+    },
+    ChildIndex(Vec<StructureGuard>),
+    Siblings {
+        left: StructureGuard,
+        right: StructureGuard,
+    },
+}
+
+impl StructureDependency {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Empty { guards, .. } | Self::ChildIndex(guards) => {
+                guards.capacity() * std::mem::size_of::<StructureGuard>()
+                    + guards
+                        .iter()
+                        .map(StructureGuard::retained_bytes)
+                        .sum::<usize>()
+            }
+            Self::Siblings { left, right } => left.retained_bytes() + right.retained_bytes(),
+        }
+    }
+}
+
+/// Selectors 4 #relative / #relational. A simple forward relative selector
+/// can only observe an anchor's descendants or following-sibling forest.
+/// Positive anchor tests deliberately omit logical/state tests: extra possible
+/// anchors cost work, while excluding a real one could retain stale styles.
+struct RelationalDependency {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
+    anchor_attributes: Vec<String>,
+    attributes: Vec<String>,
+    siblings: bool,
+}
+
+impl RelationalDependency {
+    fn new(anchor: &Compound, argument: &HasArg) -> Option<Self> {
+        let mut attributes = Vec::new();
+        // The first compound is the parser's synthetic :scope anchor.
+        for (_, compound) in argument.complex.0.iter().skip(1) {
+            // Logical arguments can look outside the relative subtree (e.g.
+            // :has(:is(body.theme .hit))); inherited and positional states
+            // have additional dependencies. Retain the full fallback for them.
+            if !compound.nots.is_empty()
+                || !compound.selects.is_empty()
+                || !compound.has.is_empty()
+                || !compound.structural.is_empty()
+                || !compound.states.is_empty()
+                || compound.hover
+                || compound.target
+                || compound.popover_open
+                || compound.scope
+                || compound.root
+                || compound.host
+                || compound.host_inner.is_some()
+                || compound.slotted.is_some()
+                || compound.pseudo.is_some()
+                || compound.inert_pseudo_element
+            {
+                return None;
+            }
+            if compound.id.is_some() {
+                attributes.push(String::from("id"));
+            }
+            if !compound.classes.is_empty() {
+                attributes.push(String::from("class"));
+            }
+            attributes.extend(compound.attrs.iter().map(|a| a.name.to_ascii_lowercase()));
+        }
+        attributes.sort_unstable();
+        attributes.dedup();
+        Some(Self {
+            tag: anchor.tag.clone(),
+            id: anchor.id.clone(),
+            classes: anchor.classes.clone(),
+            anchor_attributes: anchor.attrs.iter().map(|a| a.name.clone()).collect(),
+            attributes,
+            siblings: argument.sibling,
+        })
+    }
+
+    fn possible_anchor(&self, dom: &Dom, node: NodeId) -> bool {
+        dom.tag_name(node).is_some_and(|tag| {
+            self.tag
+                .as_ref()
+                .is_none_or(|want| want == "*" || want == tag)
+                && self
+                    .id
+                    .as_ref()
+                    .is_none_or(|want| dom.attr(node, "id") == Some(want))
+                && dom.matches_classes(node, &self.classes)
+                && self
+                    .anchor_attributes
+                    .iter()
+                    .all(|name| dom.attr(node, name).is_some())
+        })
+    }
+
+    fn may_affect(&self, dom: &Dom, node: NodeId, child_list: bool) -> bool {
+        // Insertion/removal may change the following siblings of any child,
+        // including when the removed child is still linked during invalidation.
+        if child_list
+            && self.siblings
+            && dom
+                .child_iter(node)
+                .any(|child| self.possible_anchor(dom, child))
+        {
+            return true;
+        }
+        let mut next = Some(node);
+        while let Some(node) = next {
+            if self.possible_anchor(dom, node) {
+                return true;
+            }
+            if self.siblings {
+                let mut previous = dom.prev_element_sibling(node);
+                while let Some(sibling) = previous {
+                    if self.possible_anchor(dom, sibling) {
+                        return true;
+                    }
+                    previous = dom.prev_element_sibling(sibling);
+                }
+            }
+            next = dom.selector_parent(node);
+        }
+        false
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.tag.as_ref().map_or(0, String::capacity)
+            + self.id.as_ref().map_or(0, String::capacity)
+            + [&self.classes, &self.anchor_attributes, &self.attributes]
+                .into_iter()
+                .map(|v| {
+                    v.capacity() * std::mem::size_of::<String>()
+                        + v.iter().map(String::capacity).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
 }
 
 impl SelectorDependencies {
@@ -32,19 +263,157 @@ impl SelectorDependencies {
         let mut result = Self::default();
         for rule in rules {
             result.complex(&rule.selector, Impact::Element);
+            result.record_structure(&rule.selector, &[], Impact::Element);
         }
         result
     }
 
-    pub(super) fn attribute(&self, name: &str) -> Option<Impact> {
-        self.attributes
-            .get(name.to_ascii_lowercase().as_str())
-            .copied()
+    /// Selectors 4 #child-index / #the-empty-pseudo / sibling combinators.
+    /// A child-list mutation changes ranks/adjacency of its direct children
+    /// and emptiness of the parent. Rules for other parents cannot observe it.
+    fn record_structure(
+        &mut self,
+        selector: &Complex,
+        inherited: &[StructureGuard],
+        outer: Impact,
+    ) {
+        for (index, (combinator, compound)) in selector.0.iter().enumerate() {
+            if compound.structural.is_empty()
+                && compound.nots.is_empty()
+                && compound.selects.is_empty()
+                && !matches!(
+                    combinator,
+                    Combinator::NextSibling | Combinator::SubsequentSibling
+                )
+            {
+                continue;
+            }
+            let mut guards = inherited.to_vec();
+            guards.push(StructureGuard::prefix(selector, index));
+            let siblings = outer >= Impact::SiblingSubtrees
+                || selector.0[index + 1..].iter().any(|(combinator, _)| {
+                    matches!(
+                        combinator,
+                        Combinator::NextSibling | Combinator::SubsequentSibling
+                    )
+                });
+            if compound
+                .structural
+                .iter()
+                .any(|s| matches!(s, Structural::Empty))
+            {
+                self.structural.push(StructureDependency::Empty {
+                    guards: guards.clone(),
+                    siblings,
+                });
+            }
+            if compound
+                .structural
+                .iter()
+                .any(|s| matches!(s, Structural::Nth { .. }))
+            {
+                self.structural
+                    .push(StructureDependency::ChildIndex(guards.clone()));
+            }
+            if index > 0
+                && matches!(
+                    combinator,
+                    Combinator::NextSibling | Combinator::SubsequentSibling
+                )
+            {
+                self.structural.push(StructureDependency::Siblings {
+                    left: StructureGuard::prefix(selector, index - 1),
+                    right: StructureGuard::prefix(selector, index),
+                });
+            }
+            for inner in compound
+                .nots
+                .iter()
+                .flatten()
+                .chain(compound.selects.iter().flat_map(|(group, _)| group))
+            {
+                // A single-compound logical argument tests this same node.
+                // Complex arguments may test an ancestor/sibling instead;
+                // dropping outer guards for those is conservative.
+                self.record_structure(
+                    inner,
+                    if inner.0.len() == 1 { &guards } else { &[] },
+                    if siblings {
+                        Impact::SiblingSubtrees
+                    } else {
+                        outer
+                    },
+                );
+            }
+        }
+    }
+
+    fn structure_impact(&self, dom: &Dom, parent: NodeId) -> (bool, bool) {
+        let (mut siblings, mut children) = (false, false);
+        for dependency in &self.structural {
+            match dependency {
+                StructureDependency::Empty {
+                    guards,
+                    siblings: affects_siblings,
+                } => {
+                    if guards.iter().all(|guard| guard.matches(dom, parent)) {
+                        children = true;
+                        siblings |= affects_siblings;
+                    }
+                }
+                StructureDependency::ChildIndex(guards) => {
+                    children |= dom
+                        .child_iter(parent)
+                        .any(|node| guards.iter().all(|guard| guard.matches(dom, node)));
+                }
+                StructureDependency::Siblings { left, right } => {
+                    children |= dom.child_iter(parent).any(|node| left.matches(dom, node))
+                        && dom.child_iter(parent).any(|node| right.matches(dom, node));
+                }
+            }
+        }
+        (siblings, children)
+    }
+
+    pub(super) fn attribute(&self, dom: &Dom, node: NodeId, name: &str) -> Option<Impact> {
+        let name = name.to_ascii_lowercase();
+        let impact = self.attributes.get(name.as_str()).copied();
+        if impact == Some(Impact::All)
+            || (self.text_direction
+                && ((name == "value" && dom.text_may_change_direction(node))
+                    // HTML's undefined-dir telephone state is LTR even with
+                    // an RTL parent. Type changes need no automatic ancestor.
+                    || (name == "type" && dom.tag_name(node) == Some("input"))))
+            || (self.checked
+                && matches!(
+                    (dom.tag_name(node), name.as_str()),
+                    (Some("input"), "checked" | "type") | (Some("option"), "selected")
+                ))
+            || self.relational.iter().any(|dependency| {
+                dependency.attributes.contains(&name) && dependency.may_affect(dom, node, false)
+            })
+        {
+            Some(Impact::All)
+        } else {
+            impact
+        }
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
         self.attributes.capacity() * std::mem::size_of::<(String, Impact)>()
             + self.attributes.keys().map(String::capacity).sum::<usize>()
+            + self.relational.capacity() * std::mem::size_of::<RelationalDependency>()
+            + self
+                .relational
+                .iter()
+                .map(RelationalDependency::retained_bytes)
+                .sum::<usize>()
+            + self.structural.capacity() * std::mem::size_of::<StructureDependency>()
+            + self
+                .structural
+                .iter()
+                .map(StructureDependency::retained_bytes)
+                .sum::<usize>()
     }
 
     fn add(&mut self, name: &str, impact: Impact) {
@@ -55,12 +424,6 @@ impl SelectorDependencies {
     }
 
     fn complex(&mut self, selector: &Complex, outer: Impact) {
-        self.sibling_structure |= selector.0.iter().any(|(combinator, _)| {
-            matches!(
-                combinator,
-                Combinator::NextSibling | Combinator::SubsequentSibling
-            )
-        });
         for (index, (_, compound)) in selector.0.iter().enumerate() {
             let mut impact = outer;
             for (combinator, _) in &selector.0[index + 1..] {
@@ -118,14 +481,15 @@ impl SelectorDependencies {
             self.complex(selector, impact);
         }
         for argument in has.iter().flatten() {
-            self.structure_global = true;
-            self.complex(&argument.complex, Impact::All);
+            if let Some(dependency) = RelationalDependency::new(compound, argument) {
+                self.relational.push(dependency);
+            } else {
+                self.structure_global = true;
+                self.complex(&argument.complex, Impact::All);
+            }
         }
         for structural in structural {
-            self.sibling_structure |= !matches!(structural, Structural::Empty);
             self.empty |= matches!(structural, Structural::Empty);
-            self.empty_siblings |=
-                matches!(structural, Structural::Empty) && impact >= Impact::SiblingSubtrees;
             if let Structural::Nth {
                 of: Some(selectors),
                 ..
@@ -149,18 +513,29 @@ impl SelectorDependencies {
             // fieldset/select/optgroup children and moved descendants. A
             // :disabled rule elsewhere is not a document-wide dependency.
             // Link state likewise depends on the element's own href.
+            // HTML #selector-checked observes a control's checkedness or
+            // selectedness, not unrelated child lists. Changes to those
+            // states (including radio-group updates) still invalidate through
+            // checked/selected below; moving a subtree invalidates its styles.
             self.structure_global |= !matches!(
                 state,
-                StatePseudo::AnyLink | StatePseudo::Disabled | StatePseudo::Enabled
+                StatePseudo::AnyLink
+                    | StatePseudo::Checked
+                    | StatePseudo::Disabled
+                    | StatePseudo::Enabled
+                    | StatePseudo::Dir(_)
             );
             self.text_direction |= matches!(state, StatePseudo::Dir(_));
             self.text_placeholder |= matches!(state, StatePseudo::PlaceholderShown);
+            self.checked |= matches!(state, StatePseudo::Checked);
             // HTML state can propagate through fieldsets, radio groups,
             // inherited language/editability, and flat-tree ancestors. Keep
             // these dependencies broad until separately proven and tested.
             let attributes: &[&str] = match state {
                 StatePseudo::AnyLink => &["href"],
-                StatePseudo::Checked => &["checked", "selected", "type"],
+                // Filter by element category at mutation time. A script's
+                // type attribute cannot change a control's checkedness.
+                StatePseudo::Checked => &[],
                 StatePseudo::Indeterminate => &["checked", "name", "type", "value", "form", "id"],
                 StatePseudo::Disabled | StatePseudo::Enabled => &["disabled"],
                 StatePseudo::Required | StatePseudo::Optional => &["required", "type"],
@@ -169,27 +544,43 @@ impl SelectorDependencies {
                 }
                 StatePseudo::PlaceholderShown => &["placeholder", "value"],
                 StatePseudo::Lang(_) => &["lang", "xml:lang"],
-                StatePseudo::Dir(_) => &["dir", "value", "type"],
+                // Value/type only alter directionality where automatic
+                // direction is in use; explicit dir remains conservative.
+                StatePseudo::Dir(_) => &["dir"],
             };
             for name in attributes {
-                self.add(name, Impact::All);
+                self.add(
+                    name,
+                    if matches!(state, StatePseudo::AnyLink) {
+                        impact
+                    } else {
+                        Impact::All
+                    },
+                );
             }
         }
     }
 }
 
 impl Dom {
-    /// DOM #connected / #shadow-trees: an unattached feature-probe shadow
-    /// tree cannot affect selector matching or slot distribution in the live
-    /// document. Keep the conservative cross-tree fallback when a host is
-    /// connected, or when the mutation itself is outside the document.
+    /// DOM #concept-shadow-including-root / CSS Scoping: selector matching,
+    /// inheritance and slot distribution cannot couple separate shadow-
+    /// including trees. A detached feature probe must not make unrelated
+    /// detached construction invalidate the live document's style cache.
     fn shadow_style_dependencies(&self, node: NodeId) -> bool {
-        !self.shadow_roots.is_empty()
-            && (!self.is_connected(node)
-                || self
-                    .shadow_roots
-                    .keys()
-                    .any(|host| self.is_connected(*host)))
+        if self.shadow_roots.is_empty() {
+            return false;
+        }
+        let root = |mut id| {
+            while let Some(parent) = self.parent_composed(id) {
+                id = parent;
+            }
+            id
+        };
+        let mutation_root = root(node);
+        self.shadow_roots
+            .keys()
+            .any(|&host| root(host) == mutation_root)
     }
 
     #[cfg(test)]
@@ -214,7 +605,7 @@ impl Dom {
             let cache = self.style_cache.borrow();
             match cache.as_ref() {
                 Some((epoch, index)) if *epoch == self.style_epoch => {
-                    index.selector_dependencies.attribute(name)
+                    index.selector_dependencies.attribute(self, node, name)
                 }
                 // No current rule index: no proof of independence.
                 _ => Some(Impact::All),
@@ -225,6 +616,14 @@ impl Dom {
         }
         let impact = impact.unwrap_or(Impact::All);
         if impact == Impact::All || self.shadow_style_dependencies(node) {
+            if casc_diag_on() {
+                eprintln!(
+                    "DIAGINVALID attribute node={node} tag={:?} id={:?} name={name} impact={impact:?} shadow={}",
+                    self.tag_name(node),
+                    self.attr(node, "id"),
+                    self.shadow_style_dependencies(node)
+                );
+            }
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             return Impact::All;
         }
@@ -243,10 +642,46 @@ impl Dom {
         impact
     }
 
+    #[track_caller]
     pub(super) fn invalidate_all_style_values(&mut self) {
+        if casc_diag_on() {
+            eprintln!(
+                "DIAGINVALID all-styles caller={}",
+                std::panic::Location::caller()
+            );
+        }
         self.style_value_epoch = self.style_value_epoch.wrapping_add(1);
         self.layout_cache.get_mut().clear();
         self.box_tree_cache.get_mut().clear();
+    }
+
+    /// Activation metadata participates in inline inheritance and anonymous
+    /// fallback boxes, but not in the CSS cascade. Cover both slot distribution
+    /// and ordinary ancestry without expiring unrelated layout or style values.
+    pub(super) fn invalidate_activation_layout(&mut self, changed: &[NodeId]) {
+        let mut invalid = FxHashSet::default();
+        let mut descendants = changed.to_vec();
+        while let Some(node) = descendants.pop() {
+            if invalid.insert(node) {
+                self.push_composed_children(node, &mut descendants);
+                if self.tag_name(node) == Some("slot") {
+                    descendants.extend(self.flat_slot_nodes(node));
+                }
+            }
+        }
+        let mut ancestors = changed.to_vec();
+        let mut visited = FxHashSet::default();
+        while let Some(node) = ancestors.pop() {
+            if visited.insert(node) {
+                invalid.insert(node);
+                ancestors.extend(self.parent_composed(node));
+                ancestors.extend(self.parent_flat(node));
+            }
+        }
+        for node in invalid {
+            self.layout_cache.get_mut().invalidate(node);
+            self.box_tree_cache.get_mut().invalidate(node);
+        }
     }
 
     fn invalidate_layout_ancestors(&mut self, node: NodeId) {
@@ -255,6 +690,23 @@ impl Dom {
             self.layout_cache.get_mut().invalidate(id);
             self.box_tree_cache.get_mut().invalidate(id);
             next = self.nodes[id].parent;
+        }
+    }
+
+    /// SVG 2 #UseShadowTree requires referenced subtree changes to reach every
+    /// instance. Rebuild SVG resources and their containing formatting paths;
+    /// independent HTML formatting contexts do not depend on those resources.
+    /// This deliberately includes every SVG until reference dependencies are
+    /// indexed, covering indirect references and shared arena tree scopes.
+    fn invalidate_svg_layout(&mut self) {
+        let roots: Vec<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(node, _)| (self.tag_name(node) == Some("svg")).then_some(node))
+            .collect();
+        for root in roots {
+            self.invalidate_layout_ancestors(root);
         }
     }
 
@@ -276,10 +728,18 @@ impl Dom {
         // Named associations and SVG use-instance resources can point outside
         // a selector's subject subtree. Keep broad layout invalidation for
         // these until an explicit reference-dependency index is available.
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "id" | "name" | "form" | "for" | "type"
-        ) {
+        if self.is_connected(node)
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "id" | "name" | "form" | "for" | "type"
+            )
+        {
+            if casc_diag_on() {
+                eprintln!(
+                    "DIAGINVALID association node={node} tag={:?} name={name}",
+                    self.tag_name(node)
+                );
+            }
             self.layout_cache.get_mut().clear();
             self.box_tree_cache.get_mut().clear();
         }
@@ -294,6 +754,14 @@ impl Dom {
         let affected: Vec<_> = std::iter::once(root)
             .chain(self.descendants(root))
             .collect();
+        if casc_diag_on() && affected.len() > 256 {
+            eprintln!(
+                "DIAGINVALID subtree node={root} tag={:?} id={:?} selectors={selectors} count={}",
+                self.tag_name(root),
+                self.attr(root, "id"),
+                affected.len()
+            );
+        }
         // Do not scan every cached property in the document for a local
         // update. Property IDs are dense, so eviction is bounded by the dirty
         // subtree's size rather than the total cached document.
@@ -305,13 +773,16 @@ impl Dom {
                 }
             }
         }
-        let external = self.ancestor_is_svg(root)
-            || affected
-                .iter()
-                .any(|&id| matches!(self.tag_name(id), Some("svg" | "meta" | "base")));
-        if external {
+        if affected
+            .iter()
+            .any(|&id| matches!(self.tag_name(id), Some("meta" | "base")))
+        {
             self.layout_cache.get_mut().clear();
             self.box_tree_cache.get_mut().clear();
+        } else if self.ancestor_is_svg(root)
+            || affected.iter().any(|&id| self.tag_name(id) == Some("svg"))
+        {
+            self.invalidate_svg_layout();
         }
         for id in affected {
             if selectors {
@@ -338,16 +809,41 @@ impl Dom {
             .then(|| {
                 let index = self.style_cache.borrow();
                 index.as_ref().and_then(|(epoch, index)| {
-                    (*epoch == self.style_epoch && !index.selector_dependencies.structure_global)
-                        .then_some((
-                            index.selector_dependencies.empty_siblings,
-                            index.selector_dependencies.empty
-                                || index.selector_dependencies.sibling_structure,
-                        ))
+                    (*epoch == self.style_epoch
+                        && !index.selector_dependencies.structure_global
+                        && !index.selector_dependencies.relational.iter().any(|dependency| {
+                            dependency.may_affect(self, parent, true)
+                        })
+                        // Selectors 4 #the-dir-pseudo / HTML directionality:
+                        // only an automatic-direction ancestor can acquire a
+                        // different direction when its descendants change.
+                        && !(index.selector_dependencies.text_direction
+                            && self.text_may_change_direction(parent)))
+                    .then(|| index.selector_dependencies.structure_impact(self, parent))
                 })
             })
             .flatten();
         let Some((empty_siblings, restyle_children)) = local else {
+            if casc_diag_on() {
+                let index = self.style_cache.borrow();
+                eprintln!(
+                    "DIAGINVALID structure node={parent} tag={:?} id={:?} shadow={} dependencies={:?}",
+                    self.tag_name(parent),
+                    self.attr(parent, "id"),
+                    self.shadow_style_dependencies(parent),
+                    index.as_ref().map(|(epoch, index)| (
+                        *epoch == self.style_epoch,
+                        index.selector_dependencies.structure_global,
+                        index
+                            .selector_dependencies
+                            .relational
+                            .iter()
+                            .any(|d| d.may_affect(self, parent, true)),
+                        index.selector_dependencies.text_direction
+                            && self.text_may_change_direction(parent)
+                    ))
+                );
+            }
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             self.invalidate_all_style_values();
             return;
@@ -365,7 +861,7 @@ impl Dom {
                 self.tag_name(parent),
                 // Replacing a body's document-wide link-color hints can
                 // also restyle links outside that body's subtree.
-                Some("html" | "picture" | "select" | "optgroup" | "fieldset" | "form")
+                Some("html" | "picture" | "select" | "optgroup" | "fieldset")
             )
         {
             self.invalidate_style_subtree(root, true);
@@ -373,15 +869,44 @@ impl Dom {
             // Without child-index, sibling, :empty or relational rules, old
             // siblings keep their selectors and inherited styles. The actual
             // inserted/removed subtree is invalidated by the tree operation.
+            // This also holds for a form. HTML #reset-the-form-owner resolves
+            // ownership from the current tree; inserting a measurement span
+            // does not restyle its existing controls. State selectors with
+            // association dependencies retain the global fallback above.
             // Only the parents' formatting structure/flow needs rebuilding.
-            if self.ancestor_is_svg(parent)
-                || matches!(self.tag_name(parent), Some("svg" | "meta" | "base"))
-            {
+            if matches!(self.tag_name(parent), Some("meta" | "base")) {
                 self.layout_cache.get_mut().clear();
                 self.box_tree_cache.get_mut().clear();
+            } else if self.ancestor_is_svg(parent) || self.tag_name(parent) == Some("svg") {
+                self.invalidate_svg_layout();
             }
             self.invalidate_layout_ancestors(parent);
         }
+    }
+
+    pub(super) fn touch_input_value(&mut self, node: NodeId) {
+        // A dirty input value does not mutate its attribute or child list
+        // (HTML #dom-input-value). Keep the state-dependent selector fallback,
+        // but do not discard unrelated trees merely to reshape control text.
+        let independent = !self.shadow_style_dependencies(node)
+            && !self.text_may_change_direction(node)
+            && self
+                .style_cache
+                .borrow()
+                .as_ref()
+                .is_some_and(|(epoch, index)| {
+                    *epoch == self.style_epoch && !index.selector_dependencies.text_placeholder
+                });
+        if !independent {
+            // Placeholder state must invalidate its selector subjects, even
+            // when the value transition leaves the element tree unchanged.
+            self.touch_attr(node, "value");
+            return;
+        }
+        self.invalidate_layout_ancestors(node);
+        self.mark_dom_revision();
+        self.dirty_nodes.push((node, DirtyKind::Content));
+        self.record_geometry_dirty(node, DirtyKind::Content);
     }
 
     /// Character data / replace-all of text children leaves the element tree
@@ -406,8 +931,7 @@ impl Dom {
         if self.ancestor_is_svg(parent) || self.tag_name(parent) == Some("svg") {
             // SVG 2 #UseShadowTree: referenced text changes must propagate to
             // other SVG instances too, not just this element's ancestors.
-            self.layout_cache.get_mut().clear();
-            self.box_tree_cache.get_mut().clear();
+            self.invalidate_svg_layout();
         }
         self.invalidate_layout_ancestors(parent);
         self.mark_dom_revision();
@@ -500,6 +1024,152 @@ mod tests {
             dom.set_attr(child, "class", "wide");
         }
         assert!(std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn form_measurement_children_preserve_independent_control_styles() {
+        let mut dom = Dom::parse_document(
+            "<style>form {font-size:18px} input {color:purple} input:disabled {color:gray}</style>\
+             <form id=entry><input id=editor value=hello><fieldset disabled><input id=disabled></fieldset></form>\
+             <form id=other></form><input id=external form=entry>",
+        );
+        assert_style_values_match_cold(&mut dom);
+        let entry = dom.get_by_id("entry").unwrap();
+        let editor = dom.get_by_id("editor").unwrap();
+        let external = dom.get_by_id("external").unwrap();
+        let probe = dom.create_element("span");
+        dom.set_text(probe, "measurement");
+        for append in [true, false] {
+            let retained = dom.cascaded_maps(editor);
+            if append {
+                dom.append(entry, probe);
+            } else {
+                dom.detach(probe);
+            }
+            assert!(std::rc::Rc::ptr_eq(&retained, &dom.cascaded_maps(editor)));
+            assert_eq!(dom.form_owner(editor), Some(entry));
+            assert_eq!(dom.form_owner(external), Some(entry));
+            assert_style_values_match_cold(&mut dom);
+        }
+        let other = dom.get_by_id("other").unwrap();
+        dom.append(other, editor);
+        assert_eq!(dom.form_owner(editor), Some(other));
+        assert_eq!(dom.form_owner(external), Some(entry));
+        assert_style_values_match_cold(&mut dom);
+
+        // Positional/relational dependencies and inherited form styles still
+        // follow the changed child list (Selectors 4 §§4.5, 14.2, 14.3).
+        let mut dom = Dom::parse_document(
+            "<style>form:empty {color:red} form:has(> span) {font-size:27px}\
+             form > input:last-child {padding-left:9px} form:has(input:required) {color:blue}</style>\
+             <form id=entry><input required></form><form id=other></form>",
+        );
+        assert_style_values_match_cold(&mut dom);
+        let entry = dom.get_by_id("entry").unwrap();
+        let other = dom.get_by_id("other").unwrap();
+        let probe = dom.create_element("span");
+        for parent in [entry, other] {
+            dom.append(parent, probe);
+            assert_style_values_match_cold(&mut dom);
+            dom.detach(probe);
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn structural_rules_only_invalidate_their_possible_parents() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            .menu > li:first-child {color:red}
+            .menu > li:not(:last-child) span {font-size:23px}
+            .menu > li:nth-child(2) + li {padding-left:7px}
+            #empty:not(:empty) + p {color:blue}
+            .cards > :is(article:first-child, article:last-child) {height:40px}
+        </style><header id=header><ul class=menu id=menu><li id=first><span>A</span></li>
+        <li id=second><span>B</span></li><li>C</li></ul><svg width=16 height=16><circle r=7/></svg>
+        </header><div id=empty></div><p>following</p><section class=cards><article>card</article></section>"#,
+        );
+        assert_style_values_match_cold(&mut dom);
+        let header = dom.get_by_id("header").unwrap();
+        let menu = dom.get_by_id("menu").unwrap();
+        let first = dom.get_by_id("first").unwrap();
+        let second = dom.get_by_id("second").unwrap();
+        let probe = dom.create_element("span");
+        dom.set_text(probe, "measurement");
+        for append in [true, false] {
+            let retained = dom.cascaded_maps(first);
+            if append {
+                dom.append(header, probe);
+            } else {
+                dom.detach(probe);
+            }
+            assert!(
+                std::rc::Rc::ptr_eq(&retained, &dom.cascaded_maps(first)),
+                "inserting under the header does not change its nested list's ranks"
+            );
+            assert_style_values_match_cold(&mut dom);
+        }
+        for step in 0..5 {
+            match step {
+                0 => dom.insert_before(menu, second, Some(first)),
+                1 => dom.detach(second),
+                2 => dom.append(menu, second),
+                3 => dom.append(dom.get_by_id("empty").unwrap(), probe),
+                _ => dom.detach(probe),
+            }
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn structural_dependency_guards_cover_new_adjacency_and_logical_ancestors() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            #order .start + .target span {color:red}
+            #order .start ~ .target:not(:last-child) {font-size:25px}
+            .target:not(.start + .target) span {padding-left:9px}
+            section:not(.outer > :first-child) p {height:35px}
+            .outer > :is(:first-child, :last-child) p {color:green}
+            #empty:empty ~ section p {width:90px}
+        </style><div class=outer><div id=empty></div><section id=order>
+        <i class=start id=start></i><b id=gap></b><div class=target id=target><span>T</span><p>P</p></div>
+        <footer id=tail></footer></section><section><p>other</p></section></div>"#,
+        );
+        assert_style_values_match_cold(&mut dom);
+        let order = dom.get_by_id("order").unwrap();
+        let gap = dom.get_by_id("gap").unwrap();
+        let target = dom.get_by_id("target").unwrap();
+        let empty = dom.get_by_id("empty").unwrap();
+        for step in 0..6 {
+            match step {
+                0 => dom.detach(gap), // the formerly non-adjacent pair now matches
+                1 => dom.insert_before(order, gap, Some(target)),
+                2 => dom.detach(dom.get_by_id("tail").unwrap()),
+                3 => dom.append(empty, gap), // :empty affects following sibling forests
+                4 => dom.detach(dom.get_by_id("start").unwrap()),
+                _ => dom.detach(empty), // logical ancestor ranks change
+            }
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn detached_shadow_probe_does_not_invalidate_an_unrelated_measurement_tree() {
+        let mut dom = Dom::parse_document(
+            "<html dir=ltr><style>div:dir(rtl){color:red}</style><body id=body><main id=stable>live</main></body>",
+        );
+        let probe = dom.create_element("probe-host");
+        dom.attach_shadow(probe);
+        let stable = dom.get_by_id("stable").unwrap();
+        let before = dom.cascaded_maps(stable);
+        let measure = dom.create_element("span");
+        dom.set_attr(measure, "style", "position:absolute;white-space:pre");
+        dom.set_text(measure, "typed characters");
+        assert!(std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)));
+        let body = dom.get_by_id("body").unwrap();
+        dom.append(body, measure);
+        dom.detach(measure);
         assert_style_values_match_cold(&mut dom);
     }
 
@@ -655,6 +1325,138 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_relational_anchors_preserve_styles_during_text_measurement() {
+        let mut dom = Dom::parse_document(
+            "<style>.dialog:has(.drop) .label{color:red}\
+             #tools:has(> [data-active]){width:60px}\
+             .previous:has(~ .current){height:35px}</style>\
+             <main><form id=form><input id=input></form><aside id=stable>kept</aside></main>\
+             <section><div class=dialog><i class=label>label</i></div>\
+             <div id=tools></div><div class=previous></div><div></div></section>",
+        );
+        let before = cached(&dom, "stable");
+        let form = dom.get_by_id("form").unwrap();
+        let measure = dom.create_element("span");
+        dom.set_text(measure, "measured text");
+        dom.set_attr(measure, "class", "measurement");
+        dom.append(form, measure);
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable")));
+        dom.set_attr(measure, "class", "drop current");
+        dom.set_attr(measure, "data-active", "");
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable")));
+        assert_matches_full_scan(&dom);
+        dom.detach(measure);
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable")));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn relational_anchor_invalidation_covers_siblings_moves_and_complex_fallbacks() {
+        for selector in [
+            ".anchor:has(> .hit) .label",
+            ".anchor:has(.wrapper > [data-hit]) .label",
+            ".anchor:has(+ .hit) .label",
+            ".anchor:has(~ .wrapper .hit) .label",
+            ":not(.anchor:has(.hit)) > .label",
+            ":is(.anchor:has(.hit)) + .tail .label",
+            ".anchor:has(.hit:first-child) .label",
+            ".anchor:has(:is(.theme .hit)) .label",
+            ".anchor:has(.hit) .label::before",
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                "<style>{selector}{{color:red;width:70px;content:'yes'}}</style>\
+                 <main id=root><section id=anchor class=anchor><i class=label>label</i>\
+                 <div id=inside class=wrapper></div></section>\
+                 <div id=after class='wrapper tail'><b class=label>after</b></div></main>\
+                 <aside id=detached></aside>"
+            ));
+            let root = dom.get_by_id("root").unwrap();
+            let anchor = dom.get_by_id("anchor").unwrap();
+            let inside = dom.get_by_id("inside").unwrap();
+            let after = dom.get_by_id("after").unwrap();
+            let hit = dom.create_element("b");
+            dom.set_attr(hit, "class", "hit");
+            dom.set_attr(hit, "data-hit", "yes");
+            assert_matches_full_scan(&dom);
+            for parent in [anchor, inside, after, root] {
+                dom.append(parent, hit);
+                assert_matches_full_scan(&dom);
+                dom.set_attr(hit, "class", "miss");
+                assert_matches_full_scan(&dom);
+                dom.set_attr(hit, "class", "hit");
+                assert_matches_full_scan(&dom);
+                dom.remove_attr(hit, "data-hit");
+                assert_matches_full_scan(&dom);
+                dom.set_attr(hit, "data-hit", "yes");
+                assert_matches_full_scan(&dom);
+                dom.detach(hit);
+                assert_matches_full_scan(&dom);
+            }
+            dom.insert_before(root, hit, Some(after));
+            assert_matches_full_scan(&dom);
+            dom.append(after, hit);
+            dom.set_attr(root, "class", "theme");
+            assert_matches_full_scan(&dom);
+            dom.remove_attr(root, "class");
+            assert_matches_full_scan(&dom);
+            dom.replace_all_children(after, Vec::new());
+            assert_matches_full_scan(&dom);
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn control_values_and_directional_insertions_preserve_unrelated_styles() {
+        let mut dom = Dom::parse_document(
+            "<style>:dir(rtl){color:red} :dir(ltr){color:green}</style>\
+             <main dir=ltr><form id=form><input id=input></form><aside id=stable>kept</aside></main>\
+             <section id=auto dir=auto><span id=dependent></span></section>",
+        );
+        let stable = cached(&dom, "stable");
+        let input = dom.get_by_id("input").unwrap();
+        dom.set_input_value(input, "typed", true);
+        assert!(std::rc::Rc::ptr_eq(&stable, &cached(&dom, "stable")));
+        let probe = dom.create_element("span");
+        dom.set_text(probe, "measurement");
+        dom.append(dom.get_by_id("form").unwrap(), probe);
+        assert!(std::rc::Rc::ptr_eq(&stable, &cached(&dom, "stable")));
+        assert_style_values_match_cold(&mut dom);
+        let dependent = dom.get_by_id("dependent").unwrap();
+        let before = dom.matched_rules(dependent);
+        dom.set_text(probe, "אבג");
+        dom.append(dom.get_by_id("auto").unwrap(), probe);
+        assert!(
+            !std::rc::Rc::ptr_eq(&before, &dom.matched_rules(dependent)),
+            "automatic directionality must retain full dependency invalidation"
+        );
+        assert_style_values_match_cold(&mut dom);
+        dom.detach(probe);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn input_value_state_invalidates_placeholder_and_directional_subjects() {
+        let mut dom = Dom::parse_document(
+            "<style>input:placeholder-shown + aside{color:red}\
+             form:has(input:placeholder-shown){width:100px}\
+             input:dir(rtl) + aside{font-size:30px}</style>\
+             <form><input id=input placeholder=hint dir=auto><aside id=other>other</aside></form>",
+        );
+        let input = dom.get_by_id("input").unwrap();
+        let other = dom.get_by_id("other").unwrap();
+        assert_style_values_match_cold(&mut dom);
+        for value in ["typed", "אבג", ""] {
+            dom.set_input_value(input, value, true);
+            assert_eq!(
+                dom.computed_value_resolved(other, "color").as_deref() == Some("red"),
+                value.is_empty()
+            );
+            assert_style_values_match_cold(&mut dom);
+            assert_matches_full_scan(&dom);
+        }
+    }
+
+    #[test]
     fn selector_invalidation_preserves_independent_matches_but_updates_cascade() {
         let mut dom = Dom::parse_document(
             r#"<style>
@@ -723,6 +1525,105 @@ mod tests {
         let before = dom.get_by_id("before").unwrap();
         dom.set_attr(before, "data-desc", "yes");
         assert!(std::rc::Rc::ptr_eq(&unrelated, &cached(&dom, "unrelated")));
+    }
+
+    #[test]
+    fn state_attributes_preserve_unrelated_matches_without_losing_dependencies() {
+        let mut dom = Dom::parse_document(
+            r#"<html dir=ltr><style>
+            :dir(rtl) { color:red }
+            input:checked + span { width:20px }
+            a:any-link + span { height:30px }
+            [value=active] + span { color:green }
+            </style><section><input id=query><span id=next>next</span>
+            <input id=automatic dir=auto><span>automatic</span>
+            <input id=check type=checkbox><span>check</span>
+            <a id=link></a><span>link</span></section><aside id=independent>independent</aside>
+            <section dir=rtl><input id=telephone></section>"#,
+        );
+        let independent = cached(&dom, "independent");
+        let query = dom.get_by_id("query").unwrap();
+        dom.set_attr(query, "value", "active");
+        assert!(std::rc::Rc::ptr_eq(
+            &independent,
+            &cached(&dom, "independent")
+        ));
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("next").unwrap(), "color")
+                .as_deref(),
+            Some("green")
+        );
+        dom.set_attr(dom.get_by_id("link").unwrap(), "href", "/target");
+        assert!(std::rc::Rc::ptr_eq(
+            &independent,
+            &cached(&dom, "independent")
+        ));
+        let script = dom.create_element("script");
+        dom.set_attr(script, "type", "text/javascript");
+        assert!(std::rc::Rc::ptr_eq(
+            &independent,
+            &cached(&dom, "independent")
+        ));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+        for (id, attribute, value) in [
+            ("automatic", "value", "שלום"),
+            ("automatic", "type", "tel"),
+            ("telephone", "type", "tel"),
+            ("telephone", "type", "text"),
+            ("check", "checked", ""),
+            ("check", "type", "text"),
+            ("link", "href", ""),
+        ] {
+            dom.set_attr(dom.get_by_id(id).unwrap(), attribute, value);
+            assert_matches_full_scan(&dom);
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn checked_selectors_preserve_styles_during_unrelated_child_mutations() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            input:checked + .label { color:red }
+            option:checked { color:green }
+            #destination input:checked ~ .label { width:15px }
+            </style><form id=search><input id=query></form>
+            <section id=controls><input id=check type=checkbox checked><b class=label id=label>label</b>
+            <select><optgroup id=group><option id=option selected>one</option></optgroup></select></section>
+            <section id=destination></section><aside id=independent>independent</aside>"#,
+        );
+        let independent = cached(&dom, "independent");
+        let label = cached(&dom, "label");
+        let span = dom.create_element("span");
+        dom.set_text(span, "measured text");
+        dom.append(dom.get_by_id("search").unwrap(), span);
+        dom.detach(span);
+        assert!(std::rc::Rc::ptr_eq(
+            &independent,
+            &cached(&dom, "independent")
+        ));
+        assert!(std::rc::Rc::ptr_eq(&label, &cached(&dom, "label")));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+        for (id, attr) in [("check", "checked"), ("option", "selected")] {
+            let node = dom.get_by_id(id).unwrap();
+            dom.remove_attr(node, attr);
+            assert_matches_full_scan(&dom);
+            assert_style_values_match_cold(&mut dom);
+            dom.set_attr(node, attr, "");
+            assert_matches_full_scan(&dom);
+            assert_style_values_match_cold(&mut dom);
+        }
+        dom.append(
+            dom.get_by_id("destination").unwrap(),
+            dom.get_by_id("controls").unwrap(),
+        );
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+        dom.detach(dom.get_by_id("group").unwrap());
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
     }
 
     #[test]

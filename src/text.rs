@@ -29,6 +29,7 @@ use crate::core::{ImeAction, Key, KeyInput, KeyState};
 
 mod layout_cache;
 mod outline;
+pub use crate::font_system::FontSet;
 pub(crate) use outline::{append_text_path, x_height};
 
 /// CSS-facing text style. No Parley, Glifo, or renderer type escapes this
@@ -36,6 +37,7 @@ pub(crate) use outline::{append_text_path, x_height};
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub family: String,
+    pub font_set: Option<Arc<FontSet>>,
     /// Inherited BCP 47 language from HTML `lang`/`xml:lang`. Font fallback
     /// uses this to distinguish locale-specific glyph conventions.
     pub language: Option<String>,
@@ -53,6 +55,7 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             family: String::from("sans-serif"),
+            font_set: None,
             language: None,
             size: 16.0,
             weight: 400.0,
@@ -242,6 +245,7 @@ pub struct EditorLine {
 #[derive(Clone)]
 pub struct TextEditor {
     editor: PlainEditor<()>,
+    font_set: Option<Arc<FontSet>>,
     multiline: bool,
     line_cache: Option<(parley::editing::Generation, bool, Arc<EditorLine>)>,
 }
@@ -285,6 +289,7 @@ impl TextEditor {
         }));
         let mut this = Self {
             editor,
+            font_set: style.font_set.clone(),
             multiline,
             line_cache: None,
         };
@@ -319,6 +324,43 @@ impl TextEditor {
 
     pub fn selection(&self) -> std::ops::Range<usize> {
         self.editor.raw_selection().text_range()
+    }
+
+    pub fn control_selection(&self) -> crate::doc::ControlSelection {
+        let selection = self.editor.raw_selection();
+        let anchor = selection.anchor().index();
+        let focus = selection.focus().index();
+        let units = |byte| self.editor.raw_text()[..byte].encode_utf16().count() as u32;
+        crate::doc::ControlSelection {
+            start: units(anchor.min(focus)),
+            end: units(anchor.max(focus)),
+            direction: if anchor > focus {
+                -1
+            } else if anchor < focus {
+                1
+            } else {
+                0
+            },
+        }
+    }
+
+    pub fn set_control_selection(&mut self, selection: crate::doc::ControlSelection) {
+        let byte = |units: u32| {
+            let mut offset = 0;
+            for (byte, ch) in self.editor.raw_text().char_indices() {
+                if offset >= units {
+                    return byte;
+                }
+                offset += ch.len_utf16() as u32;
+            }
+            self.editor.raw_text().len()
+        };
+        let (start, end) = (byte(selection.start), byte(selection.end));
+        if selection.direction < 0 {
+            self.select_byte_range(end, start);
+        } else {
+            self.select_byte_range(start, end);
+        }
     }
 
     pub fn selected_text(&self) -> Option<&str> {
@@ -457,7 +499,7 @@ impl TextEditor {
 
     pub fn geometry(&mut self) -> (Vec<EditorRect>, Option<EditorRect>, EditorRect) {
         TEXT.with_borrow_mut(|system| {
-            system.refresh_page_fonts();
+            system.select_fonts(self.font_set.as_ref());
             let mut driver = self.editor.driver(&mut system.fonts, &mut system.layouts);
             driver.refresh_layout();
             let selection = driver
@@ -522,6 +564,7 @@ impl TextEditor {
     fn masked_editor(&self) -> Self {
         let mut display = Self {
             editor: self.editor.clone(),
+            font_set: self.font_set.clone(),
             multiline: false,
             line_cache: None,
         };
@@ -544,7 +587,7 @@ impl TextEditor {
 
     fn retain_editor_line(&mut self) -> EditorLine {
         TEXT.with_borrow_mut(|system| {
-            system.refresh_page_fonts();
+            system.select_fonts(self.font_set.as_ref());
             self.editor
                 .refresh_layout(&mut system.fonts, &mut system.layouts);
             let layout = self.editor.try_layout().expect("refreshed editor layout");
@@ -649,7 +692,7 @@ impl TextEditor {
 
     fn drive(&mut self, operation: impl FnOnce(&mut parley::editing::PlainEditorDriver<'_, ()>)) {
         TEXT.with_borrow_mut(|system| {
-            system.refresh_page_fonts();
+            system.select_fonts(self.font_set.as_ref());
             let mut driver = self.editor.driver(&mut system.fonts, &mut system.layouts);
             operation(&mut driver);
         });
@@ -670,6 +713,7 @@ struct TextSystem {
     layouts: LayoutContext<()>,
     color_layouts: LayoutContext<Option<[u8; 3]>>,
     page_font_epoch: u64,
+    active_font_set: u64,
     /// Shaping is pure for a fixed system-font collection and CSS text style.
     /// Inline layout asks for the same spaces, words, labels, and intrinsic
     /// probes many times; retaining those results avoids repeating font
@@ -702,6 +746,7 @@ struct ShapeKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TextStyleKey {
     family: String,
+    font_set: u64,
     language: Option<String>,
     size: u32,
     weight: u32,
@@ -722,6 +767,7 @@ impl From<&TextStyle> for TextStyleKey {
         };
         Self {
             family: style.family.clone(),
+            font_set: style.font_set.as_ref().map_or(0, |fonts| fonts.id()),
             language: style.language.clone(),
             size: style.size.to_bits(),
             weight: style.weight.to_bits(),
@@ -757,6 +803,7 @@ impl TextSystem {
             layouts: LayoutContext::new(),
             color_layouts: LayoutContext::new(),
             page_font_epoch: crate::font_system::page_font_epoch(),
+            active_font_set: 0,
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
@@ -776,7 +823,7 @@ impl TextSystem {
         style: &TextStyle,
         quantize: bool,
     ) -> ShapedText {
-        self.refresh_page_fonts();
+        self.select_fonts(style.font_set.as_ref());
         let key = ShapeKey {
             text: text.to_string(),
             style: style.into(),
@@ -851,7 +898,7 @@ impl TextSystem {
         width: f32,
         breaks: TextBreakStyle,
     ) -> usize {
-        self.refresh_page_fonts();
+        self.select_fonts(style.font_set.as_ref());
         if text.is_empty() || width <= 0.0 || style.size <= 0.0 {
             return 0;
         }
@@ -876,7 +923,7 @@ impl TextSystem {
         width: f32,
         breaks: TextBreakStyle,
     ) -> Vec<ShapedText> {
-        self.refresh_page_fonts();
+        self.select_fonts(style.font_set.as_ref());
         if text.is_empty() || style.size <= 0.0 {
             return Vec::new();
         }
@@ -911,7 +958,7 @@ impl TextSystem {
         style: &TextStyle,
         breaks: TextBreakStyle,
     ) -> (f32, f32) {
-        self.refresh_page_fonts();
+        self.select_fonts(style.font_set.as_ref());
         if text.is_empty() || style.size <= 0.0 {
             return (0.0, 0.0);
         }
@@ -960,6 +1007,16 @@ impl TextSystem {
         self.shape_cache_bytes = 0;
         self.layout_cache = Default::default();
         self.page_font_epoch = epoch;
+        self.active_font_set = 0;
+    }
+
+    fn select_fonts(&mut self, fonts: Option<&Arc<FontSet>>) {
+        self.refresh_page_fonts();
+        let id = fonts.map_or(0, |fonts| fonts.id());
+        if self.active_font_set != id {
+            self.fonts = fonts.map_or_else(crate::font_system::font_context, |f| f.context());
+            self.active_font_set = id;
+        }
     }
 }
 
@@ -1056,7 +1113,7 @@ pub(crate) fn colored_lines(
     colors: impl Iterator<Item = (Range<usize>, [u8; 3])>,
 ) -> Vec<ShapedText> {
     TEXT.with_borrow_mut(|system| {
-        system.refresh_page_fonts();
+        system.select_fonts(style.font_set.as_ref());
         let mut builder = system
             .color_layouts
             .ranged_builder(&mut system.fonts, text, 1.0, true);
@@ -1245,6 +1302,45 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_installed_fonts_survive_environment_switches() {
+        let style = TextStyle::default();
+        let mut system = TextSystem::new();
+        let first = system.shape("retained", &style);
+        let mut child_style = style.clone();
+        child_style.font_set = Some(FontSet::new(Vec::new(), None, false));
+        let child = system.shape("retained", &child_style);
+        assert_eq!(first.runs[0].font, child.runs[0].font);
+        let fresh = TextSystem::new().shape("retained", &style);
+        assert_eq!(first.runs[0].font, fresh.runs[0].font);
+    }
+
+    #[test]
+    fn control_selection_bridges_utf16_offsets_and_visual_direction() {
+        let mut editor = TextEditor::new("A😀éB", &TextStyle::default(), 400.0, false);
+        editor.select_byte_range(7, 1);
+        let selected = crate::doc::ControlSelection {
+            start: 1,
+            end: 4,
+            direction: -1,
+        };
+        assert_eq!(editor.control_selection(), selected);
+        editor.select_all();
+        editor.set_control_selection(selected);
+        assert_eq!(editor.selected_text(), Some("😀é"));
+        assert_eq!(editor.control_selection(), selected);
+        editor.replace_selection("X");
+        assert_eq!(editor.text(), "AXB");
+        assert_eq!(
+            editor.control_selection(),
+            crate::doc::ControlSelection {
+                start: 2,
+                end: 2,
+                direction: 0
+            }
+        );
+    }
 
     #[test]
     fn wrapped_paragraph_retains_line_local_glyphs_and_cluster_ranges() {

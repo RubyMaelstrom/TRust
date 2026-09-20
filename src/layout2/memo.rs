@@ -12,7 +12,7 @@ use super::style::{BoxStyle, InlineStyle};
 use super::tree::BoxNode;
 use super::value::{Len, Node, Vp};
 use super::{ControlMap, Dom, Form, ImageSizes, NodeId};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
 use url::Url;
 
@@ -95,7 +95,8 @@ pub(super) fn box_style_bytes(s: &super::style::BoxStyle) -> usize {
             &s.max_height,
         ])
         .map(len_bytes)
-        .sum()
+        .sum::<usize>()
+        + s.color_filters.len() * size_of::<[f32; 20]>()
 }
 
 fn len_bytes(len: &Len) -> usize {
@@ -148,7 +149,6 @@ struct Environment {
     images: ImageSizes,
     font_epoch: u64,
     image_metadata_epoch: u64,
-    presentation_epoch: u64,
 }
 
 impl Environment {
@@ -262,20 +262,80 @@ impl LayoutCache {
         }
         let font_epoch = crate::font_system::page_font_epoch();
         let image_metadata_epoch = crate::img::svg_intrinsic_epoch();
-        let presentation_epoch = dom.layout_presentation_epoch();
-        let same = self.environment.as_ref().is_some_and(|e| {
+        let same_global = self.environment.as_ref().is_some_and(|e| {
             e.base == *base
                 && e.vp == vp
-                && e.forms == forms
-                && e.controls == *controls
                 && e.images == *images
                 && e.font_epoch == font_epoch
                 && e.image_metadata_epoch == image_metadata_epoch
-                && e.presentation_epoch == presentation_epoch
         });
-        if !same {
+        let same_forms = self
+            .environment
+            .as_ref()
+            .is_some_and(|e| e.forms == forms && e.controls == *controls);
+        if !same_global {
             self.clear();
             dom.box_tree_cache.borrow_mut().clear();
+        } else if !same_forms {
+            // HTML #dom-input-value / CSSOM View #dom-element-getboundingclientrect:
+            // an edit changes the control's contents, not every independent
+            // formatting context. Reflow its ancestors at current constraints;
+            // retain unrelated items even when the frontend supplies form
+            // values separately from the DOM. Include authored buttons, whose
+            // child fragments carry form activation links but are not controls.
+            fn bindings<'a>(
+                forms: &'a [Form],
+                controls: &ControlMap,
+            ) -> FxHashMap<NodeId, ((usize, usize), Option<&'a crate::doc::Field>)> {
+                let mut result = FxHashMap::default();
+                for (form, data) in forms.iter().enumerate() {
+                    for (field, data) in data.fields.iter().enumerate() {
+                        if let Some(node) = data.live_node {
+                            result.insert(node, ((form, field), Some(data)));
+                        }
+                    }
+                }
+                for (&node, &(form, field)) in controls {
+                    result.insert(
+                        node,
+                        (
+                            (form, field),
+                            forms.get(form).and_then(|f| f.fields.get(field)),
+                        ),
+                    );
+                }
+                result
+            }
+            let previous = self.environment.as_ref().unwrap();
+            let old = bindings(&previous.forms, &previous.controls);
+            let new = bindings(forms, controls);
+            let changed: FxHashSet<_> = old
+                .keys()
+                .chain(new.keys())
+                .filter(|node| old.get(node) != new.get(node))
+                .copied()
+                .collect();
+            let mut invalid = FxHashSet::default();
+            let mut ancestors = Vec::new();
+            for node in changed.into_iter().filter(|&node| node < dom.node_count()) {
+                invalid.extend(dom.descendants(node));
+                ancestors.push(node);
+            }
+            let mut visited = FxHashSet::default();
+            while let Some(node) = ancestors.pop() {
+                if visited.insert(node) {
+                    invalid.insert(node);
+                    ancestors.extend(dom.parent_composed(node));
+                    ancestors.extend(dom.parent_flat(node));
+                }
+            }
+            let mut tree = dom.box_tree_cache.borrow_mut();
+            for node in invalid {
+                self.invalidate(node);
+                tree.invalidate(node);
+            }
+        }
+        if !same_global || !same_forms {
             self.environment = Some(Environment {
                 base: base.clone(),
                 vp,
@@ -284,7 +344,6 @@ impl LayoutCache {
                 images: images.clone(),
                 font_epoch,
                 image_metadata_epoch,
-                presentation_epoch,
             });
             self.environment_bytes = self.environment.as_ref().map_or(0, Environment::bytes);
             if self.retained_bytes() > MAX_BYTES {
@@ -495,6 +554,7 @@ mod tests {
             warm.fragments.unwrap(),
             warm.boxes.clone(),
             warm.tracks.clone(),
+            true,
         );
         dom.force_cold_style_layout_for_test();
         let cold = measure_retained_layout(dom, base, viewport, forms, controls, images);
@@ -513,6 +573,7 @@ mod tests {
             cold.fragments.unwrap(),
             cold.boxes,
             cold.tracks,
+            true,
         );
         assert!(
             painted.presentation_eq(&cold),
@@ -579,6 +640,177 @@ mod tests {
             assert!(
                 hits.0 + hits.1 > 0,
                 "unchanged items must survive scrolling followed by text updates"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_measurement_attributes_preserve_live_formatting_contexts() {
+        let mut dom = Dom::parse_document(HTML);
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let images = ImageSizes::new();
+        let controls = ControlMap::new();
+        for tag in ["span", "input", "script"] {
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            let node = dom.create_element(tag);
+            dom.set_attr(node, "id", "probe");
+            dom.set_attr(node, "name", "probe");
+            dom.set_attr(node, "type", "text");
+            let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            assert!(
+                hits.0 + hits.1 > 0,
+                "detached {tag} expired unrelated layout"
+            );
+            dom.append(dom.get_by_id("clock").unwrap(), node);
+            assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+        }
+    }
+
+    #[test]
+    fn activation_changes_reuse_independent_items_and_refresh_descendant_links() {
+        let mut dom = Dom::parse_document(&format!(
+            "{HTML}<div id=host><span id=slotted>projected text</span></div>"
+        ));
+        let host = dom.get_by_id("host").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let anchor = dom.create_element("a");
+        dom.set_attr(anchor, "href", "/shadow-link");
+        let slot = dom.create_element("slot");
+        dom.append(anchor, slot);
+        dom.append(shadow, anchor);
+        let clock = dom.get_by_id("clock").unwrap();
+        let tick = dom.get_by_id("tick").unwrap();
+        let island = dom.get_by_id("island").unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let controls = ControlMap::new();
+        let images = ImageSizes::new();
+        dom.set_render_clickables(Default::default(), true);
+        for clickables in [
+            vec![clock],
+            vec![clock, tick],
+            vec![tick],
+            vec![],
+            vec![anchor],
+            vec![slot],
+            vec![],
+        ] {
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            let epoch = dom.epoch();
+            let presentation = dom.layout_presentation_epoch();
+            dom.set_render_clickables(clickables.into_iter().collect(), true);
+            assert_eq!(dom.epoch(), epoch, "listeners are not DOM mutations");
+            assert_ne!(dom.layout_presentation_epoch(), presentation);
+            assert!(dom.layout_cache.borrow().entries.contains_key(&island));
+            let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            assert!(
+                hits.0 + hits.1 > 0,
+                "listener changes expired independent items"
+            );
+        }
+        for live in [false, true] {
+            dom.set_render_clickables([clock].into_iter().collect(), live);
+            assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+        }
+    }
+
+    #[test]
+    fn svg_resources_and_header_mutations_retain_independent_html_layout() {
+        let mut dom = Dom::parse_document(&format!(
+            r##"{HTML}<style>#clock > :last-child {{ margin-right:2px }}</style>
+            <svg id="definitions" style="display:none"><symbol id="shape" viewBox="0 0 20 20">
+            <path id="path" d="M0 0H20V20Z"/><text id="text">old</text></symbol></svg>
+            <div style="display:flex"><svg width="24" height="24"><use href="#shape"/></svg></div>"##
+        ));
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let images = ImageSizes::new();
+        let controls = ControlMap::new();
+        let header = dom.get_by_id("clock").unwrap();
+        for child in dom.parse_fragment_into(
+            "header",
+            r#"<svg width="16" height="16"><circle r="7" cx="8" cy="8"/></svg>"#,
+        ) {
+            dom.append(header, child);
+        }
+        let probe = dom.create_element("span");
+        dom.set_text(probe, "measurement");
+        dom.set_attr(probe, "style", "position:absolute;visibility:hidden");
+        let path = dom.get_by_id("path").unwrap();
+        let definition = dom.get_by_id("definitions").unwrap();
+        let shape = dom.get_by_id("shape").unwrap();
+        let parent = dom.node(definition).parent.unwrap();
+        for step in 0..8 {
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            match step {
+                0 => dom.append(header, probe),
+                1 => dom.detach(probe),
+                2 => dom.set_attr(path, "d", "M0 0H10V10Z"),
+                3 => dom.set_text(dom.get_by_id("text").unwrap(), "replacement"),
+                4 => dom.detach(path),
+                5 => dom.detach(definition),
+                6 => dom.append(parent, definition),
+                _ => dom.append(shape, path),
+            }
+            let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            assert!(
+                hits.0 + hits.1 > 0,
+                "independent HTML layout expired at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn form_edits_and_associations_reuse_independent_formatting_contexts() {
+        let mut dom = Dom::parse_document(&format!(
+            "{HTML}<form id=entry style='display:flex'><input name=x value=hello><input type=hidden name=h value=secret><button name=send><b>Send</b></button></form>"
+        ));
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let images = ImageSizes::new();
+        let (mut forms, mut controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let island = dom.get_by_id("island").unwrap();
+        let input = *controls.iter().find(|(_, p)| **p == (0, 0)).unwrap().0;
+        let entry = dom.get_by_id("entry").unwrap();
+        let probe = dom.create_element("span");
+        dom.set_attr(probe, "style", "visibility:hidden");
+        dom.set_text(probe, "a transient text measurement");
+        for append in [true, false] {
+            measure_retained_layout(&dom, &base, vp, &forms, &controls, &images);
+            if append {
+                dom.append(entry, probe);
+            } else {
+                dom.detach(probe);
+            }
+            // Reusing controls' styles must still reflow the form around its
+            // changed content, and preserve both frontend paint products.
+            assert_cold(&mut dom, &base, vp, &forms, &controls, &images);
+        }
+        for step in 0..5 {
+            measure_retained_layout(&dom, &base, vp, &forms, &controls, &images);
+            assert!(dom.layout_cache.borrow().entries.contains_key(&island));
+            match step {
+                0 => forms[0].fields[0].value = "edited without mutating an attribute".into(),
+                1 => forms[0].fields[1].kind = crate::doc::FieldKind::Text,
+                2 => {
+                    // Reindex both mapped controls and authored button links.
+                    forms.insert(0, forms[0].clone());
+                    forms[0].fields.clear();
+                    for pair in controls.values_mut() {
+                        pair.0 = 1;
+                    }
+                }
+                3 => {
+                    controls.remove(&input);
+                    forms[1].fields[0].live_node = None;
+                }
+                _ => forms[1].fields.clear(),
+            }
+            let hits = assert_cold(&mut dom, &base, vp, &forms, &controls, &images);
+            assert!(
+                hits.0 + hits.1 > 0,
+                "unrelated items were expired at step {step}"
             );
         }
     }

@@ -141,6 +141,7 @@ impl Flow<'_> {
                         AtomBoxSize {
                             width: w.max(0.0),
                             height: actx.text_style().size.max(1.0),
+                            baseline: None,
                         }
                     })
                     .collect();
@@ -283,6 +284,10 @@ impl Flow<'_> {
     /// applies the special cyclic-percentage constraints around this content.
     fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode, inl: &InlineStyle) -> f32 {
         match &atom.kind {
+            AtomKind::GeneratedImage { url } => {
+                crate::responsive_image::density_corrected_size(self.images.get(url), 1.0)
+                    .map_or(0.0, |(w, _)| w)
+            }
             AtomKind::Img {
                 url,
                 density,

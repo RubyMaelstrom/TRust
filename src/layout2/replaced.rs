@@ -58,10 +58,15 @@ pub(crate) fn size(
         natural,
         url,
     } = image;
-    let natural = dom
-        .canvas_size(node)
+    let replacement = dom.content_replacement_image(node).is_some();
+    let natural = (!replacement)
+        .then(|| dom.canvas_size(node))
+        .flatten()
         .map(|(w, h)| (w as f32, h as f32))
-        .or(natural);
+        .or(natural)
+        // CSS Content 3 #replaced: an unavailable replacement has zero
+        // natural dimensions, never the HTML source's fallback/alt contents.
+        .or_else(|| replacement.then_some((0.0, 0.0)));
     let u = Units::of(dom, node);
     let css = |prop: &str, basis: Option<f32>| {
         dom.computed_value_resolved(node, prop)
@@ -146,7 +151,8 @@ pub(crate) fn size(
         .flatten();
     let ratio = svg_ratio
         .or(inline_svg_ratio)
-        .or_else(|| ratio_of(dom, node, dimension_source, natural));
+        .or_else(|| ratio_of(dom, node, dimension_source, natural))
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
     // own last resort for a ratio-less axis.
@@ -217,7 +223,7 @@ pub(crate) fn size(
         }
         _ => (w0.clamp(min_w, max_w), h0.clamp(min_h, max_h)),
     };
-    let minimum = if dom.canvas_size(node).is_some() {
+    let minimum = if replacement || dom.canvas_size(node).is_some() {
         0.0
     } else {
         1.0
