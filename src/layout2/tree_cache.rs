@@ -324,6 +324,22 @@ mod tests {
     <section id=stable><article><a href=/next>linked text</a><span>another item</span></article></section></main>"#;
 
     #[test]
+    fn local_class_changes_retain_layout_despite_unrelated_sibling_selectors() {
+        let mut dom = Dom::parse_document(&format!(
+            "{HTML}<style>.some-other-class + section{{height:91px}} .local{{height:40px}} .local.open{{height:80px}}</style>"
+        ));
+        let changing = dom.get_by_id("changing").unwrap();
+        for class in ["local", "local open", "local"] {
+            measure(&dom);
+            let stable = block(&dom, "stable");
+            dom.set_attr(changing, "class", class);
+            measure(&dom);
+            assert!(Arc::ptr_eq(&stable, &block(&dom, "stable")));
+            equivalent_to_cold(&mut dom);
+        }
+    }
+
+    #[test]
     fn transition_frames_reuse_independent_subtrees_and_match_cold_layout() {
         let mut dom = Dom::parse_document(HTML);
         let changing = dom.get_by_id("changing").unwrap();

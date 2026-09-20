@@ -1631,6 +1631,10 @@ impl Dom {
 
     /// An attribute change on `id` (its own styling/box may have changed).
     fn touch_attr(&mut self, id: NodeId, name: &str) {
+        self.touch_attr_with_old_class(id, name, None);
+    }
+
+    fn touch_attr_with_old_class(&mut self, id: NodeId, name: &str, old_class: Option<&str>) {
         if name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name") {
             self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
         }
@@ -1655,7 +1659,7 @@ impl Dom {
         if name.eq_ignore_ascii_case("class") {
             self.class_cache.get_mut().invalidate(id);
         }
-        let impact = self.invalidate_attribute_selectors(id, name);
+        let impact = self.invalidate_attribute_selectors(id, name, old_class);
         self.invalidate_attribute_style_values(id, name, impact);
         self.mark_dom_revision();
         self.dirty_nodes.push((id, DirtyKind::Attr));
@@ -3140,6 +3144,9 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        let old_class = name
+            .eq_ignore_ascii_case("class")
+            .then(|| self.attr(id, "class").unwrap_or("").to_owned());
         let old_input_type = (self.tag_name(id) == Some("input")
             && ["type", "min", "max", "step"]
                 .iter()
@@ -3192,7 +3199,7 @@ impl Dom {
                 self.note_cssom_sheet_attribute(id, invalidated_attribute);
                 self.touch_style_at(id);
             }
-            self.touch_attr(id, invalidated_attribute);
+            self.touch_attr_with_old_class(id, invalidated_attribute, old_class.as_deref());
             self.input_attribute_changed(id, invalidated_attribute, old_input_type);
             if canvas_reset {
                 self.reset_canvas(id);
@@ -3201,6 +3208,9 @@ impl Dom {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let old_class = name
+            .eq_ignore_ascii_case("class")
+            .then(|| self.attr(id, "class").unwrap_or("").to_owned());
         let old_input_type = (self.tag_name(id) == Some("input")
             && ["type", "min", "max", "step"]
                 .iter()
@@ -3233,7 +3243,7 @@ impl Dom {
                     self.note_cssom_sheet_attribute(id, name);
                     self.touch_style_at(id);
                 }
-                self.touch_attr(id, name);
+                self.touch_attr_with_old_class(id, name, old_class.as_deref());
                 self.input_attribute_changed(id, name, old_input_type);
                 if self.tag_name(id) == Some("canvas")
                     && (name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height"))
