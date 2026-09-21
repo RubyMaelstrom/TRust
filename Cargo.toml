@@ -3,7 +3,7 @@ name = "TRust"
 version = "0.1.0"
 edition = "2024"
 description = "Telnet in Rust — a GNU-telnet-compatible client and small-net (gopher, TLS) browser with a cyberpunk TUI"
-license = "MIT OR Apache-2.0"
+license = "MPL-2.0"
 
 [lib]
 name = "trust"
