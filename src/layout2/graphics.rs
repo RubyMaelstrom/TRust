@@ -57,6 +57,7 @@ impl PaintStyle {
 
     fn value(self, dom: &Dom, property: &str) -> Option<String> {
         match self {
+            Self::Element(NO_NODE) => None,
             Self::Element(node) => dom.computed_value_resolved(node, property),
             Self::Pseudo(node, pseudo) => dom.pseudo_layout_value(node, pseudo, property),
         }
@@ -1697,6 +1698,19 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 .then(|| builder.ancestor_clip(paint_node, fragment.clip))
                 .flatten()
                 .is_some_and(|clip| builder.push_hard_clip(clip));
+            let writing_transform = line.sideways.then_some(Affine2d([
+                0.,
+                1.,
+                -1.,
+                0.,
+                fragment.x + fragment.y + fragment.w,
+                fragment.y - fragment.x,
+            ]));
+            if let Some(transform) = writing_transform {
+                builder
+                    .commands
+                    .push(DisplayCommand::PushTransform(transform));
+            }
             let form_piece = matches!(piece.item.kind, super::ItemKind::Form);
             let piece_rect = form_piece
                 .then(|| {
@@ -1719,6 +1733,16 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 );
             }
             let mut clip = builder.effective_clip(paint_node, fragment.clip);
+            if writing_transform.is_some() {
+                clip = clip.map(|rect| {
+                    CssRect::new(
+                        fragment.x + rect.y - fragment.y,
+                        fragment.y + fragment.w - (rect.x - fragment.x) - rect.width,
+                        rect.height,
+                        rect.width,
+                    )
+                });
+            }
             if piece_rect.is_some() {
                 // A control's label is clipped to its content paint rectangle,
                 // not merely to the outer border box. This is the same box
@@ -1770,7 +1794,13 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         _ => 0.0,
                     };
                 }
-                let color = match piece.item.pseudo {
+                let paint_style = piece
+                    .item
+                    .pseudo
+                    .map_or(PaintStyle::Element(style_node), |(node, pseudo)| {
+                        PaintStyle::Pseudo(node, pseudo)
+                    });
+                let current_color = match piece.item.pseudo {
                     Some((node, pseudo)) => text_color_for_style(
                         builder.dom,
                         PaintStyle::Pseudo(node, pseudo),
@@ -1778,6 +1808,11 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     ),
                     None => text_color(builder.dom, style_node, piece.item.link.is_some()),
                 };
+                let color = paint_style
+                    .value(builder.dom, "-webkit-text-fill-color")
+                    .as_deref()
+                    .and_then(|value| resolve_color_for_style(builder.dom, paint_style, value))
+                    .unwrap_or(current_color);
                 let mut shaped = shaped.clone();
                 if style_node != NO_NODE {
                     let (underline, strikethrough) = builder.dom.text_decoration(style_node);
@@ -1785,10 +1820,10 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     shaped.strikethrough = strikethrough;
                 }
                 let decoration = TextDecorationPaint {
-                    color: decoration_color(builder.dom, style_node).unwrap_or(color),
+                    color: decoration_color(builder.dom, style_node).unwrap_or(current_color),
                     style: decoration_style(builder.dom, style_node),
                 };
-                let shadows = text_shadows(builder.dom, style_node, color);
+                let shadows = text_shadows(builder.dom, style_node, current_color);
                 builder.push_marquee_content(
                     node,
                     DisplayCommand::GlyphRun {
@@ -1802,6 +1837,51 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         link: piece.item.link.clone(),
                     },
                 );
+                // WHATWG Compatibility #the-webkit-text-stroke-width: stroke
+                // glyph edges even when their foreground fill is transparent.
+                // Reuse the shaped outline (including font variation/skew)
+                // and the shared path command so both raster backends agree.
+                if let Some(width) = paint_style
+                    .value(builder.dom, "-webkit-text-stroke-width")
+                    .as_deref()
+                    .and_then(|value| {
+                        crate::dom::text_stroke_width_px(
+                            value,
+                            super::Units {
+                                fs: shaped.runs.first().map_or(16., |run| run.font_size),
+                                root: builder.dom.root_font_px(),
+                                ch: shaped.runs.first().map_or(8., |run| run.font_size * 0.5),
+                            },
+                            builder.dom.viewport_px(),
+                        )
+                    })
+                    .filter(|width| *width > 0.)
+                {
+                    let stroke_color = paint_style
+                        .value(builder.dom, "-webkit-text-stroke-color")
+                        .as_deref()
+                        .and_then(|value| resolve_color_for_style(builder.dom, paint_style, value))
+                        .unwrap_or(current_color);
+                    let mut path = Vec::new();
+                    crate::text::append_glyph_path(&mut path, &shaped, origin);
+                    if let Some(clip) = clip {
+                        builder.push_marquee_content(
+                            node,
+                            DisplayCommand::PushClip(PaintShape::Rect(clip)),
+                        );
+                    }
+                    builder.push_marquee_content(
+                        node,
+                        DisplayCommand::Stroke {
+                            shape: PaintShape::Path(path),
+                            brush: PaintBrush::Solid(stroke_color),
+                            style: StrokeStyle::solid(width),
+                        },
+                    );
+                    if clip.is_some() {
+                        builder.push_marquee_content(node, DisplayCommand::PopClip);
+                    }
+                }
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
                     builder.push_marquee_content(
                         node,
@@ -1907,6 +1987,9 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         }),
                     );
                 }
+            }
+            if writing_transform.is_some() {
+                builder.commands.push(DisplayCommand::PopTransform);
             }
             if piece_clip {
                 builder.pop_hard_clip();
@@ -4323,6 +4406,107 @@ mod tests {
             &Default::default(),
         );
         (dom, layout)
+    }
+
+    #[test]
+    fn text_stroke_paints_transparent_glyphs_without_changing_layout() {
+        let render = |style: &str| {
+            render_fixture(&format!(
+                "<body style='margin:0;background:white'><div id=x style='font:60px monospace;color:transparent;{style}'>Outline</div></body>"
+            ))
+        };
+        let (plain_dom, plain) = render("");
+        let (dom, stroked) = render("-webkit-text-stroke:2px red");
+        let a = plain.boxes.get(&plain_dom.get_by_id("x").unwrap()).unwrap();
+        let b = stroked.boxes.get(&dom.get_by_id("x").unwrap()).unwrap();
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let frame = crate::render::headless::render_paint(&stroked.paint, CssSize::new(800., 600.))
+            .unwrap();
+        let red = frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 200 && p[1] < 100 && p[2] < 100)
+            .count();
+        assert!(red > 200, "outline must produce visible red ink: {red}");
+        let fill_frame = crate::render::headless::render_paint(
+            &render("-webkit-text-fill-color:red").1.paint,
+            CssSize::new(800., 600.),
+        )
+        .unwrap();
+        let filled = fill_frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 200 && p[1] < 100 && p[2] < 100)
+            .count();
+        assert!(
+            filled > red,
+            "outlined letters must retain hollow interiors: filled={filled}, stroke={red}"
+        );
+    }
+
+    #[test]
+    fn vertical_text_sizes_columns_before_authored_rotation() {
+        for mode in ["vertical-rl", "vertical-lr"] {
+            let (dom, layout) = render_fixture(&format!(
+                "<style>body{{margin:0}}#label{{position:absolute;left:40px;top:30px;font:20px/1 monospace;writing-mode:{mode};transform:rotate(180deg)}}#label span{{color:red}}</style><div id=label><span id=text>ENTRY / POINT</span></div>"
+            ));
+            let label = layout.boxes.get(&dom.get_by_id("label").unwrap()).unwrap();
+            let text = layout.boxes.get(&dom.get_by_id("text").unwrap()).unwrap();
+            assert!((label.width - 20.).abs() < 0.1, "{label:?}");
+            assert!(label.height > 120. && label.height < 200., "{label:?}");
+            assert!(
+                text.width < 30. && text.height > 120.,
+                "inline geometry must be vertical: {text:?}"
+            );
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let mut ink = Vec::new();
+            for (index, pixel) in frame.pixels.as_chunks::<4>().0.iter().enumerate() {
+                if pixel[0] > 160 && pixel[1] < 100 && pixel[2] < 100 {
+                    ink.push(((index % 800) as u32, (index / 800) as u32));
+                }
+            }
+            assert!(ink.len() > 100);
+            assert!(
+                ink.iter().all(|&(x, y)| (39..=61).contains(&x)
+                    && y >= 29
+                    && (y as f64) < 31. + label.height),
+                "paint must stay inside the rotated vertical label"
+            );
+        }
+    }
+
+    #[test]
+    fn vertical_text_wraps_into_columns_and_pseudo_inherits_font() {
+        for mode in ["vertical-rl", "vertical-lr"] {
+            let (dom, layout) = render_fixture(&format!(
+                "<style>body{{margin:0}}#label{{font:20px/1 monospace;writing-mode:{mode};height:72px}}#host{{position:relative;margin-left:80px;font-size:20px}}#host::before{{content:'ENTRY / POINT';position:absolute;left:-30px;top:0;font:.5em/1 monospace;writing-mode:vertical-rl;transform:rotate(180deg)}}</style><div id=label><span id=first>ABCD</span><br><span id=second>EFGH</span></div><div id=host>Heading</div><div id=after>Following</div>"
+            ));
+            let get = |id| layout.boxes.get(&dom.get_by_id(id).unwrap()).unwrap();
+            let first = get("first");
+            let second = get("second");
+            assert!((get("label").width - 40.).abs() < 0.1, "{:?}", get("label"));
+            assert!((get("label").height - 72.).abs() < 0.1);
+            assert_eq!(first.left > second.left, mode == "vertical-rl");
+            assert!(get("after").top >= 90.);
+            let generated = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains("ENTRY") => {
+                        Some(shaped)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(generated.runs[0].font_size, 10.);
+        }
     }
 
     #[test]

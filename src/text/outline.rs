@@ -64,11 +64,10 @@ impl OutlinePen for Pen<'_> {
     }
 }
 
-pub(crate) fn append_text_path(
+pub(crate) fn append_glyph_path(
     path: &mut Vec<PathElement>,
     shaped: &ShapedText,
     origin: CssPoint,
-    decoration: DecorationStyle,
 ) {
     for run in &shaped.runs {
         let Ok(font) =
@@ -104,6 +103,15 @@ pub(crate) fn append_text_path(
             }
         }
     }
+}
+
+pub(crate) fn append_text_path(
+    path: &mut Vec<PathElement>,
+    shaped: &ShapedText,
+    origin: CssPoint,
+    decoration: DecorationStyle,
+) {
+    append_glyph_path(path, shaped, origin);
     // Match the retained text painter's decoration geometry. Decorations
     // participate even when the text's foreground is transparent.
     let thickness = (shaped.line_height / 18.).max(1.);

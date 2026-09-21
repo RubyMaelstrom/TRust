@@ -134,11 +134,20 @@ fn walk(dom: &Dom, f: &Frag<'_>, o: &mut Own) {
             if p.item.node == NO_NODE {
                 continue;
             }
-            let r = Rect {
-                x0: f.x + p.x,
-                y0: f.y + p.y,
-                x1: f.x + p.x + p.box_width,
-                y1: f.y + p.y + p.box_height,
+            let r = if line.sideways {
+                Rect {
+                    x0: f.x + f.w - p.y - p.box_height,
+                    y0: f.y + p.x,
+                    x1: f.x + f.w - p.y,
+                    y1: f.y + p.x + p.box_width,
+                }
+            } else {
+                Rect {
+                    x0: f.x + p.x,
+                    y0: f.y + p.y,
+                    x1: f.x + p.x + p.box_width,
+                    y1: f.y + p.y + p.box_height,
+                }
             };
             o.nodes.insert(p.item.node);
             add(&mut o.own, p.item.node, r);

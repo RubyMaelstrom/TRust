@@ -30,7 +30,7 @@ use crate::core::{ImeAction, Key, KeyInput, KeyState};
 mod layout_cache;
 mod outline;
 pub use crate::font_system::FontSet;
-pub(crate) use outline::{append_text_path, x_height};
+pub(crate) use outline::{append_glyph_path, append_text_path, x_height};
 
 /// CSS-facing text style. No Parley, Glifo, or renderer type escapes this
 /// boundary.

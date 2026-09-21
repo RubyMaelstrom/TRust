@@ -4117,7 +4117,10 @@ impl Dom {
         if name.starts_with("--") {
             return self.custom_prop(id, name);
         }
-        let unit_guard = if matches!(name, "line-height" | "font-weight") {
+        let unit_guard = if matches!(
+            name,
+            "line-height" | "font-weight" | "-webkit-text-stroke-width"
+        ) {
             match self.property_guard(id, None, name) {
                 Some(guard) => Some(guard),
                 None => {
@@ -4154,7 +4157,10 @@ impl Dom {
                 .and_then(|p| self.computed_value(p, name))
         };
         let author = self.cascaded(id, name).map(|value| {
-            if matches!(name, "line-height" | "font-weight") {
+            if matches!(
+                name,
+                "line-height" | "font-weight" | "-webkit-text-stroke-width"
+            ) {
                 self.resolve_vars(id, &value)
             } else {
                 value
@@ -4187,6 +4193,18 @@ impl Dom {
                 } else {
                     crate::layout2::line_height_length(self, id, value).map(|px| format!("{px}px"))
                 }
+            })
+        } else {
+            v
+        };
+        let v = if name == "-webkit-text-stroke-width" {
+            v.and_then(|value| {
+                text_stroke_width_px(
+                    &value,
+                    crate::layout2::Units::of(self, id),
+                    self.viewport_px,
+                )
+                .map(|px| format!("{px}px"))
             })
         } else {
             v
@@ -4400,7 +4418,7 @@ impl Dom {
     /// root's, absolute units and keywords stand alone); with no declaration
     /// the UA factor for the tag applies (headings, `<small>`/`<big>`,
     /// `<sub>`/`<sup>`), else the parent's number is inherited as-is.
-    /// Unresolvable declarations (`calc()`, dangling `var()`) inherit —
+    /// Unresolvable declarations (such as dangling `var()`) inherit —
     /// fail-open, like the rest of the cascade. Memoized per epoch.
     pub(crate) fn font_px(&self, id: NodeId) -> f32 {
         let Some(guard) = self.property_guard(id, None, "font-size") else {
@@ -4426,7 +4444,7 @@ impl Dom {
         let author = self.cascaded(id, "font-size");
         let v = if let Some(raw) = author {
             let decl = self.resolve_vars(id, &raw);
-            font_size_px(&decl, parent_px, root_px).unwrap_or(parent_px)
+            font_size_px_at(&decl, parent_px, root_px, self.viewport_px).unwrap_or(parent_px)
         } else {
             self.tag_name(id)
                 .and_then(ua_font_factor)
@@ -10501,7 +10519,12 @@ fn prop_index(name: &str) -> Option<usize> {
 /// the `inherited=true` rows below. (`visibility` is inherited but a rendered
 /// boundary is by definition visible, so it's a near-no-op; included for rigor.)
 const INHERITED_LAYOUT_PROPS: &[&str] = &[
+    "writing-mode",
+    "text-orientation",
     "color",
+    "-webkit-text-fill-color",
+    "-webkit-text-stroke-color",
+    "-webkit-text-stroke-width",
     "caret-color",
     "text-align",
     "font-size",
@@ -10545,6 +10568,14 @@ const PROPS: &[PropDef] = &[
     // borders and text decorations. Graphical paint must retain it instead of
     // falling back to the terminal theme at the end of layout.
     prop("color", true, true),
+    prop("writing-mode", true, true),
+    prop("text-orientation", true, true),
+    // WHATWG Compatibility #text-fill-and-stroking. The shorthand expands
+    // before cascade; retain its inherited longhands in live snapshots.
+    prop("-webkit-text-stroke", true, false),
+    prop("-webkit-text-fill-color", true, true),
+    prop("-webkit-text-stroke-color", true, true),
+    prop("-webkit-text-stroke-width", true, true),
     prop("caret-color", true, true),
     // SVG 2 §6.6 presentation attributes participate in the CSS cascade.
     // These paint properties are consumed when an inline SVG is serialized
@@ -10802,6 +10833,10 @@ const PROPS: &[PropDef] = &[
 /// the additional visibility/pointer/transform clauses are cited below.
 fn cssom_initial_value(name: &str) -> Option<&'static str> {
     match name {
+        "-webkit-text-fill-color" | "-webkit-text-stroke-color" => Some("currentcolor"),
+        "-webkit-text-stroke-width" => Some("0px"),
+        "writing-mode" => Some("horizontal-tb"),
+        "text-orientation" => Some("mixed"),
         // CSS Display 4 #visibility: inherited, initial visible.
         "visibility" => Some("visible"),
         // CSS UI 4 #pointer-events-control / SVG 2 #PointerEventsProp:
@@ -10958,7 +10993,7 @@ fn classify_font_size_zero(v: &str) -> Option<bool> {
 pub(crate) const FONT_SIZE_INITIAL: f32 = 16.0;
 
 /// Whether a `font` shorthand token is the `<font-size>` component: a
-/// numeric length (`16px`, `1.2em`) or an absolute/relative size keyword.
+/// numeric length, calculation, or absolute/relative size keyword.
 /// (Weight numbers are matched by the shorthand's weight arm first.)
 fn font_size_token(t: &str) -> bool {
     matches!(
@@ -10973,10 +11008,47 @@ fn font_size_token(t: &str) -> bool {
             | "xxx-large"
             | "larger"
             | "smaller"
-    ) || t
-        .as_bytes()
-        .first()
-        .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+    ) || ["calc(", "min(", "max(", "clamp("]
+        .iter()
+        .any(|prefix| t.starts_with(prefix))
+        || t.as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+'))
+}
+
+/// CSS Fonts 4 #font-size-prop / CSS Values 4 #font-relative-lengths:
+/// percentages and local font units use the parent's computed font size;
+/// viewport units use the same CSS viewport as the cascade. Resolve math
+/// before inheritance, and clamp only its final result to the allowed range.
+pub(crate) fn font_size_px_at(
+    value: &str,
+    parent: f32,
+    root: f32,
+    viewport: (f32, f32),
+) -> Option<f32> {
+    if let Some(size) = font_size_px(value, parent, root) {
+        return Some(size);
+    }
+    let units = crate::layout2::Units {
+        fs: parent,
+        root,
+        ch: parent * 0.5,
+    };
+    let vp = crate::layout2::value::Vp {
+        w: viewport.0,
+        h: viewport.1,
+    };
+    let crate::layout2::value::Len::Val(expression) =
+        crate::layout2::value::Len::parse(value, units, vp)?
+    else {
+        return None;
+    };
+    let size = expression.resolve(Some(parent))?;
+    let lower = value.trim().to_ascii_lowercase();
+    let calculation = ["calc(", "min(", "max(", "clamp("]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    (size.is_finite() && (size >= 0. || calculation)).then_some(size.max(0.))
 }
 
 /// The font-size factor the UA stylesheet gives a tag (the HTML spec's
@@ -11052,11 +11124,9 @@ fn parse_alpha(v: &str) -> Option<f32> {
     }
 }
 
-/// CSS Logical Properties → their physical equivalents. TRust renders only
-/// horizontal-tb LTR (no `writing-mode`/`direction` support), so inline =
-/// left/right and block = top/bottom — the mapping is exact for every page
-/// we can render. `margin-inline: auto` is the modern centering idiom;
-/// Mastodon-generation CSS uses the whole family.
+/// CSS Logical Properties → physical equivalents for horizontal-tb LTR.
+/// Orthogonal text layout is supported by layout2, but logical box properties
+/// still need writing-mode-aware cascade mapping instead of this early rewrite.
 fn logical_to_physical(prop: &str) -> Option<&'static str> {
     Some(match prop {
         "margin-inline-start" => "margin-left",
@@ -11112,6 +11182,48 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .map(|(name, _)| (name, pending.clone()))
                 .collect();
         }
+    }
+    if prop == "-webkit-text-stroke" {
+        // WHATWG Compatibility #the-webkit-text-stroke: <line-width> ||
+        // <color>, with omitted components reset to their initial values.
+        let names = ["-webkit-text-stroke-width", "-webkit-text-stroke-color"];
+        if wide_keyword(value).is_some() {
+            return names
+                .into_iter()
+                .map(|name| (name.into(), value.into()))
+                .collect();
+        }
+        let (mut width, mut color) = (None, None);
+        for token in split_top_level_ws(value) {
+            if text_stroke_width_px(
+                token,
+                crate::layout2::Units {
+                    fs: 16.,
+                    root: 16.,
+                    ch: 8.,
+                },
+                (100., 100.),
+            )
+            .is_some()
+            {
+                if width.replace(token).is_some() {
+                    return Vec::new();
+                }
+            } else if wide_keyword(token).is_none() && supports_color_value(token) {
+                if color.replace(token).is_some() {
+                    return Vec::new();
+                }
+            } else {
+                return Vec::new();
+            }
+        }
+        if width.is_none() && color.is_none() {
+            return Vec::new();
+        }
+        return vec![
+            (names[0].into(), width.unwrap_or("0").into()),
+            (names[1].into(), color.unwrap_or("currentcolor").into()),
+        ];
     }
     if prop == "transition" {
         return transitions::expand(value);
@@ -11602,7 +11714,9 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         let (mut style, mut weight, mut size) = (None, None, None);
         let mut size_index = None;
         for (index, tok) in tokens.iter().copied().enumerate() {
-            let t = tok.split('/').next().unwrap_or(tok);
+            // CSS Syntax 3 #consume-component-value: a slash inside a
+            // calculation is not the font-size/line-height separator.
+            let t = split_top_level_slash(tok).map_or(tok, |(size, _)| size);
             match t.to_ascii_lowercase().as_str() {
                 "italic" | "oblique" => style = Some(t.to_string()),
                 "bold" | "bolder" | "lighter" => weight = Some(t.to_string()),
@@ -11627,28 +11741,23 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             return Vec::new();
         };
         let index = size_index.unwrap_or(0);
-        let size_token = tokens[index];
-        let mut line_height = size_token
-            .split_once('/')
-            .map(|(_, height)| height.trim().to_string())
-            .filter(|height| !height.is_empty());
-        let mut family_start = index + 1;
-        if line_height.is_none() && tokens.get(family_start).copied() == Some("/") {
-            line_height = tokens
-                .get(family_start + 1)
-                .map(|height| (*height).to_string());
-            family_start += 2;
-        } else if line_height.is_none()
-            && tokens
-                .get(family_start)
-                .is_some_and(|token| token.starts_with('/'))
-        {
-            line_height = tokens
-                .get(family_start)
-                .map(|height| height.trim_start_matches('/').to_string());
-            family_start += 1;
+        // CSS Fonts 4 #font-prop allows whitespace on either side of '/'.
+        // Rejoin component values so both `16px/ 1.5 serif` and functional
+        // sizes/line heights preserve the following family list intact.
+        let suffix = tokens[index..].join(" ");
+        let suffix = suffix[size.len()..].trim_start();
+        let (line_height, family) = if let Some(rest) = suffix.strip_prefix('/') {
+            let rest = split_top_level_ws(rest);
+            let Some(height) = rest.first() else {
+                return Vec::new();
+            };
+            (Some((*height).to_string()), rest[1..].join(" "))
+        } else {
+            (None, suffix.to_string())
+        };
+        if family.is_empty() || split_top_level_slash(&family).is_some() {
+            return Vec::new();
         }
-        let family = tokens[family_start..].join(" ");
         return vec![
             (
                 "font-style".to_string(),
@@ -13137,6 +13246,22 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     if is_color_property(&k) && !supports_color_value(&value) {
         return None;
     }
+    if k == "-webkit-text-stroke-width"
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && text_stroke_width_px(
+            &value,
+            crate::layout2::Units {
+                fs: 16.,
+                root: 16.,
+                ch: 8.,
+            },
+            (100., 100.),
+        )
+        .is_none()
+    {
+        return None;
+    }
     if matches!(k.as_str(), "-webkit-line-clamp" | "-webkit-box-orient")
         && wide_keyword(&value).is_none()
         && find_var_function(&value).is_none()
@@ -14102,6 +14227,8 @@ fn is_color_property(prop: &str) -> bool {
     matches!(
         prop,
         "color"
+            | "-webkit-text-fill-color"
+            | "-webkit-text-stroke-color"
             | "background-color"
             | "border-top-color"
             | "border-right-color"
@@ -14110,6 +14237,38 @@ fn is_color_property(prop: &str) -> bool {
             | "outline-color"
             | "text-decoration-color"
     )
+}
+
+/// WHATWG Compatibility #the-webkit-text-stroke-width and CSS Values 4:
+/// nonnegative lengths only, with range clamping after math evaluation.
+pub(crate) fn text_stroke_width_px(
+    value: &str,
+    units: crate::layout2::Units,
+    viewport: (f32, f32),
+) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "thin" => return Some(1.),
+        "medium" => return Some(3.),
+        "thick" => return Some(5.),
+        _ => {}
+    }
+    if value.contains('%') || value.parse::<f32>().is_ok_and(|n| n != 0.) {
+        return None;
+    }
+    let length = crate::layout2::value::Len::parse(
+        &value,
+        units,
+        crate::layout2::value::Vp {
+            w: viewport.0,
+            h: viewport.1,
+        },
+    )?
+    .resolve(None)?;
+    let calculation = ["calc(", "min(", "max(", "clamp("]
+        .iter()
+        .any(|prefix| value.starts_with(prefix));
+    (length.is_finite() && (length >= 0. || calculation)).then_some(length.max(0.))
 }
 
 pub(crate) fn supports_color_value(value: &str) -> bool {
@@ -18561,6 +18720,92 @@ mod tests {
             dom.computed_value_resolved(x, "line-height").as_deref(),
             Some("1.5")
         );
+    }
+
+    #[test]
+    fn text_stroke_shorthand_inherits_computed_width_and_rejects_invalid_values() {
+        for invalid in ["-1px", "10%", "2", "red blue", "1px 2px", "1px red garbage"] {
+            let dom = Dom::parse_document(&format!(
+                "<style>#parent{{font-size:20px;--stroke:red .1em;-webkit-text-stroke:var(--stroke);-webkit-text-stroke:{invalid}}}#child{{font-size:40px}}</style><div id=parent><span id=child>text</span></div>"
+            ));
+            for id in ["parent", "child"] {
+                let node = dom.get_by_id(id).unwrap();
+                assert_eq!(
+                    dom.computed_value_resolved(node, "-webkit-text-stroke-width")
+                        .as_deref(),
+                    Some("2px"),
+                    "{invalid} {id}"
+                );
+                assert_eq!(
+                    dom.computed_value_resolved(node, "-webkit-text-stroke-color")
+                        .as_deref(),
+                    Some("red")
+                );
+            }
+        }
+        let dom = Dom::parse_document(
+            "<div id=x style='-webkit-text-stroke:2px red;-webkit-text-stroke:blue'></div>",
+        );
+        let x = dom.get_by_id("x").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(x, "-webkit-text-stroke-width")
+                .as_deref(),
+            Some("0px")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(x, "-webkit-text-stroke-color")
+                .as_deref(),
+            Some("blue")
+        );
+    }
+
+    #[test]
+    fn font_math_shorthand_preserves_components_and_resizes() {
+        for separator in ["/", " /", "/ ", " / "] {
+            let mut dom = Dom::parse_document(&format!(
+                "<style>:root{{--family:'Example / Face',monospace}}\
+                 #x{{font:italic 300 clamp(32px, calc(100vw / 10), 96px){separator}.75 var(--family)}}\
+                 #child{{font-size:50%}}</style><h2 id=x>A<span id=child>B</span></h2>"
+            ));
+            let x = dom.get_by_id("x").unwrap();
+            let child = dom.get_by_id("child").unwrap();
+            for (viewport, size) in [(640., 64.), (1280., 96.), (240., 32.)] {
+                dom.set_viewport_px(viewport, 720.);
+                assert_eq!(dom.font_px(x), size, "separator {separator:?}");
+                assert_eq!(dom.font_px(child), size * 0.5);
+            }
+            assert_eq!(
+                dom.computed_value_resolved(x, "font-weight").as_deref(),
+                Some("300")
+            );
+            assert_eq!(
+                dom.computed_value_resolved(x, "font-style").as_deref(),
+                Some("italic")
+            );
+            assert_eq!(
+                dom.computed_value_resolved(x, "line-height").as_deref(),
+                Some("0.75")
+            );
+            assert_eq!(
+                dom.computed_value_resolved(x, "font-family").as_deref(),
+                Some("'Example / Face',monospace")
+            );
+        }
+    }
+
+    #[test]
+    fn font_math_resolves_parent_root_and_viewport_bases_before_inheritance() {
+        let mut dom = Dom::parse_document(
+            "<style>html{font-size:calc(1rem + 4px)}\
+             #parent{font-size:calc(150% + 1rem + 2vh)}\
+             #zero{font-size:calc(2px - 10px)}</style>\
+             <div id=parent><span id=child>child</span></div><div id=zero>zero</div>",
+        );
+        dom.set_viewport_px(800., 500.);
+        assert_eq!(dom.root_font_px(), 20.);
+        assert_eq!(dom.font_px(dom.get_by_id("parent").unwrap()), 60.);
+        assert_eq!(dom.font_px(dom.get_by_id("child").unwrap()), 60.);
+        assert_eq!(dom.font_px(dom.get_by_id("zero").unwrap()), 0.);
     }
 
     #[test]

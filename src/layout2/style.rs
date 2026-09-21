@@ -169,6 +169,11 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
 pub(crate) struct BoxStyle {
     /// CSS Overflow 4 #webkit-line-clamp, active only for a vertical legacy box.
     pub line_clamp: Option<usize>,
+    /// CSS Writing Modes 4: vertical inline progression, with columns ordered
+    /// right-to-left (`Some(true)`) or left-to-right (`Some(false)`).
+    pub vertical: Option<bool>,
+    /// None is upright; mixed rotates sideways scripts; true rotates all text.
+    pub sideways_text: Option<bool>,
     /// Generated boxes have no DOM node of their own, but CSS Pseudo 4 §4.1
     /// gives them a complete computed style. Retain the originating element
     /// and pseudo identity so graphical paint reads that style rather than
@@ -255,6 +260,8 @@ impl BoxStyle {
     pub fn anonymous() -> BoxStyle {
         BoxStyle {
             line_clamp: None,
+            vertical: None,
+            sideways_text: Some(false),
             pseudo: None,
             size_container: 0,
             margin: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
@@ -323,6 +330,11 @@ impl BoxStyle {
         };
         BoxStyle {
             line_clamp: dom.legacy_line_clamp(id),
+            vertical: vertical_mode(cv("writing-mode").as_deref()),
+            sideways_text: sideways_text(
+                cv("writing-mode").as_deref(),
+                cv("text-orientation").as_deref(),
+            ),
             pseudo: None,
             size_container: dom.size_container_kind(id),
             margin: [
@@ -468,6 +480,11 @@ impl BoxStyle {
         };
         BoxStyle {
             line_clamp: None,
+            vertical: vertical_mode(cv("writing-mode").as_deref()),
+            sideways_text: sideways_text(
+                cv("writing-mode").as_deref(),
+                cv("text-orientation").as_deref(),
+            ),
             pseudo: Some((id, which)),
             size_container: 0,
             margin: [
@@ -1297,7 +1314,14 @@ impl InlineStyle {
         if declared("font-size") {
             s.font_size = value("font-size")
                 .as_deref()
-                .and_then(|v| crate::dom::font_size_px(v, self.font_size, dom.root_font_px()))
+                .and_then(|v| {
+                    crate::dom::font_size_px_at(
+                        v,
+                        self.font_size,
+                        dom.root_font_px(),
+                        dom.viewport_px(),
+                    )
+                })
                 .unwrap_or(crate::dom::FONT_SIZE_INITIAL);
         }
         let u = Units {
@@ -1453,5 +1477,24 @@ pub(crate) fn heading_level(tag: &str) -> Option<u8> {
         "h5" => Some(5),
         "h6" => Some(6),
         _ => None,
+    }
+}
+
+fn vertical_mode(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("vertical-rl" | "sideways-rl") => Some(true),
+        Some("vertical-lr") => Some(false),
+        _ => None,
+    }
+}
+
+fn sideways_text(mode: Option<&str>, orientation: Option<&str>) -> Option<bool> {
+    if mode == Some("sideways-rl") {
+        return Some(true);
+    }
+    match orientation {
+        Some("upright") => None,
+        Some("sideways") => Some(true),
+        _ => Some(false),
     }
 }
