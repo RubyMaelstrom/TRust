@@ -92,9 +92,9 @@ TRUST_NET_DIAG=https://example.test/ \
 
 ### `trust`
 
-The terminal browser accepts `trust [URL-or-host] [port]`. Its interactive
-prompt commands (`open`, `post`, `reload`, `mode`, `send`, `set`, `toggle`, and
-`status`) are documented in the [Driving it section of `README.md`](README.md).
+The terminal browser accepts `trust [URL-or-host] [port]`. Press Ctrl+] and type
+`help` for interactive prompt commands; the help text lives in
+[`src/command.rs`](src/command.rs).
 
 ### `trust-headless`
 
