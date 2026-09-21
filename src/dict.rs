@@ -360,10 +360,9 @@ pub fn command_target(arguments: &str) -> Result<Target, String> {
 }
 
 fn preferences_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
-        .map(|p| p.join("trust/dict.json"))
+    crate::storage::config_directory()
+        .ok()
+        .map(|p| p.join("dict.json"))
 }
 fn preferences() -> serde_json::Map<String, serde_json::Value> {
     let data = preferences_path().and_then(|p| {

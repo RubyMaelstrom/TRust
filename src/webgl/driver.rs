@@ -32,8 +32,16 @@ impl Display {
     fn load() -> Result<Self, String> {
         // SAFETY: only the installed system EGL library is loaded. Its exported
         // functions have the EGL ABI described by these bindings.
-        let api = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
-            .map_err(|e| format!("EGL loader: {e}"))?;
+        // khronos-egl's convenience loader uses Unix .so names on every OS.
+        // WebGL 1.0 §2.1 permits context creation to fail when no suitable
+        // driver exists, but an installed Windows EGL driver must be found.
+        #[cfg(windows)]
+        let api = unsafe {
+            egl::DynamicInstance::<egl::EGL1_5>::load_required_from_filename("libEGL.dll")
+        };
+        #[cfg(not(windows))]
+        let api = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() };
+        let api = api.map_err(|e| format!("EGL loader: {e}"))?;
         let mut last = String::from("No EGL display");
         for surfaceless in [false, true] {
             // EGL_DEFAULT_DISPLAY uses the platform default; the Mesa platform

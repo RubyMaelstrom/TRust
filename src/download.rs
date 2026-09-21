@@ -622,7 +622,7 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
 pub fn save_destination(filename: &str) -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_DOWNLOAD_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
+        .or_else(|| crate::storage::home_directory().map(|home| home.join("Downloads")))
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&base).map_err(|error| error.to_string())?;
     unique_path(&base, filename)
