@@ -588,60 +588,30 @@ pub(crate) fn paint(
     let fixed_under = fixed_under_document(root, fixed.len());
     let mut order: Vec<usize> = (0..fixed.len()).collect();
     order.sort_by_key(|&i| fixed[i].paint.z.unwrap_or(0));
-    let vp_rows = viewport.1;
     let mut fixed_items: Vec<FixedItem> = order
         .into_iter()
         .filter_map(|i| {
             let f = &fixed[i];
-            let col = ((f.x / cell_w).round() as i64).max(0) as usize;
-            let mut row = ((f.y / cell_h).round() as i64).max(0) as usize;
-            if vp_rows > 0 {
-                row = row.min(vp_rows.saturating_sub(1));
-            }
-            let mut ops = Vec::new();
-            let fixed_cols = cols.saturating_sub(col).max(1);
-            let line_rows = line_row_map(dom, f, f.x, f.y, cell_w, cell_h, fixed_cols);
-            build_sc(
-                dom, f, &mut ops, cell_w, cell_h, f.x, f.y, links, &line_rows,
-            );
-            let brows = composite(ops, fixed_cols, alpha, &mut composites);
-            if brows.iter().all(|r| r.items.is_empty()) {
-                return None; // nothing visible: no pinned surface
-            }
-            Some(FixedItem {
-                col: col.min(u16::MAX as usize) as u16,
-                row: row.min(u16::MAX as usize) as u16,
-                rows: brows,
-                z: f.paint.z.unwrap_or(0),
-                under_document: fixed_under.get(i).copied().unwrap_or(false),
-            })
+            let mut item = paint_pinned(dom, f, viewport, cell_w, cell_h, alpha, &mut composites)?;
+            item.under_document = fixed_under.get(i).copied().unwrap_or(false);
+            Some(item)
         })
         .collect();
     // Top-layer entries paint after the root stacking context and ordinary
     // fixed layer. Terminal overlays are viewport-addressed; the graphical
     // display list additionally distinguishes absolute from fixed scrolling.
     for top in top_layer {
-        let f = &top.fragment;
-        let col = ((f.x / cell_w).round() as i64).max(0) as usize;
-        let mut row = ((f.y / cell_h).round() as i64).max(0) as usize;
-        if vp_rows > 0 {
-            row = row.min(vp_rows.saturating_sub(1));
-        }
-        let mut ops = Vec::new();
-        let top_cols = cols.saturating_sub(col).max(1);
-        let line_rows = line_row_map(dom, f, f.x, f.y, cell_w, cell_h, top_cols);
-        build_sc(
-            dom, f, &mut ops, cell_w, cell_h, f.x, f.y, links, &line_rows,
-        );
-        let brows = composite(ops, top_cols, alpha, &mut composites);
-        if !brows.iter().all(|r| r.items.is_empty()) {
-            fixed_items.push(FixedItem {
-                col: col.min(u16::MAX as usize) as u16,
-                row: row.min(u16::MAX as usize) as u16,
-                rows: brows,
-                z: i32::MAX,
-                under_document: false,
-            });
+        if let Some(mut item) = paint_pinned(
+            dom,
+            &top.fragment,
+            viewport,
+            cell_w,
+            cell_h,
+            alpha,
+            &mut composites,
+        ) {
+            item.z = i32::MAX;
+            fixed_items.push(item);
         }
     }
     PaintOut {
@@ -653,6 +623,71 @@ pub(crate) fn paint(
         carousels,
         composites,
     }
+}
+
+/// Paint a pinned surface in viewport coordinates before storing its relative
+/// buffer. CSS Overflow 3 #scrollable clips unreachable content; clamping the
+/// box's origin before painting would instead move off-screen content into
+/// view. Descendants may overflow back into the viewport from any side.
+fn paint_pinned(
+    dom: &TerminalPaintModel,
+    f: &Frag<'_>,
+    viewport: (usize, usize),
+    cell_w: f32,
+    cell_h: f32,
+    alpha: &HashMap<String, bool>,
+    composites: &mut Composites,
+) -> Option<FixedItem> {
+    let mut ops = Vec::new();
+    let line_rows = line_row_map(dom, f, 0.0, 0.0, cell_w, cell_h, viewport.0);
+    build_sc(
+        dom, f, &mut ops, cell_w, cell_h, 0.0, 0.0, &dom.links, &line_rows,
+    );
+    for op in &mut ops {
+        let (Op::Fill { clip, .. } | Op::Item { clip, .. } | Op::Hit { clip, .. }) = op;
+        clip.r0 = clip.r0.max(0);
+        if viewport.1 > 0 {
+            clip.r1 = clip.r1.min(viewport.1 as i64);
+        }
+    }
+    let mut rows = composite(ops, viewport.0, alpha, composites);
+    let first_row = rows
+        .iter()
+        .position(|row| !row.items.is_empty() || !row.hits.is_empty())?;
+    let first_col = rows
+        .iter()
+        .flat_map(|row| {
+            row.items
+                .iter()
+                .map(|item| item.col)
+                .chain(row.hits.iter().map(|hit| hit.col))
+        })
+        .min()?;
+    // Retain the box's own anchor when it precedes its visible content, while
+    // allowing descendants to paint before that anchor. Crop only the buffer;
+    // canonical fragment/CSSOM geometry remains untouched.
+    let row = ((f.y / cell_h).round().max(0.0) as usize).min(first_row);
+    let col = ((f.x / cell_w).round().max(0.0) as u16).min(first_col);
+    rows.drain(..row);
+    for row in &mut rows {
+        for item in &mut row.items {
+            item.col -= col;
+            if let Some((left, right)) = &mut item.terminal_band {
+                *left = left.saturating_sub(col);
+                *right = right.saturating_sub(col);
+            }
+        }
+        for hit in &mut row.hits {
+            hit.col -= col;
+        }
+    }
+    Some(FixedItem {
+        col,
+        row: row.min(u16::MAX as usize) as u16,
+        rows,
+        z: f.paint.z.unwrap_or(0),
+        under_document: false,
+    })
 }
 
 fn collect_inset_bounds(

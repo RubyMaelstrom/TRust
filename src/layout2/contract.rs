@@ -380,9 +380,9 @@ pub struct HitBox {
 /// are captured here (Mastodon's side rails); covering ones stay modals.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FixedItem {
-    /// Column of the box's top-left in the pinned viewport (0-based cells).
+    /// Column of the clipped buffer's top-left in the pinned viewport.
     pub col: u16,
-    /// Row of the box's top-left in the pinned viewport (clamped into view).
+    /// Row of the clipped buffer's top-left in the pinned viewport.
     pub row: u16,
     /// The laid content rows (position-independent, like a scroll-region buffer).
     pub rows: Vec<Row>,

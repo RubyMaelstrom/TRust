@@ -7106,6 +7106,74 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_positioned_boxes_clip_without_losing_visible_descendants() {
+        // CSS Position 3 #insets: negative insets place boxes outside the
+        // viewport without removing their descendants from layout. Painting
+        // clips the unreachable content instead of moving it to row/column 0.
+        let html = r#"<style>body{margin:0;font:16px/16px monospace}</style>
+            <div>Main</div>
+            <div style="position:absolute;left:-9999px;top:0;width:100px;height:16px;background:red">
+                OFFLEFT<span style="position:absolute;left:10015px;top:16px">Visible</span>
+            </div>
+            <div style="position:absolute;left:0;top:-9999px">OFFTOP</div>
+            <div style="position:fixed;left:-9999px;top:0">OFFFIXED</div>"#;
+        let out = lay(html, 80);
+        let (row, main) = find(&out, "Main");
+        assert_eq!((row, main.col), (0, 0));
+        let (row, child) = find(&out, "Visible");
+        assert_eq!((row, child.col), (1, 2));
+        for text in ["OFFLEFT", "OFFTOP", "OFFFIXED"] {
+            assert!(absent(&out, text), "offscreen text leaked: {text}");
+        }
+        assert!(
+            out.fixed.is_empty(),
+            "offscreen fixed text must not move into the viewport: {:?}",
+            out.fixed
+        );
+        let graphical = lay_graphical(html, 640.0, &HashMap::new());
+        let (x, _, _) = graphical_text(&graphical, "Visible");
+        assert_eq!(x, 16.0, "desktop keeps the visible descendant too");
+    }
+
+    #[test]
+    fn offscreen_fixed_boxes_clip_at_viewport_edges() {
+        let out = lay(
+            r#"<style>body{margin:0;font:16px/16px monospace}</style>
+            <div style="position:fixed;left:-9999px;top:0;width:100px">
+                OFFLEFT<span style="position:absolute;left:10015px;top:16px">Child</span>
+            </div>
+            <div style="position:fixed;left:0;top:-9999px">OFFTOP</div>
+            <div style="position:fixed;left:0;top:9999px">OFFBOTTOM</div>
+            <div style="position:fixed;left:9999px;top:0">OFFRIGHT</div>
+            <div style="position:fixed;left:-16px;top:48px;white-space:pre">XXEdge</div>
+            <div style="position:fixed;left:80px;top:-16px">
+                <div>Above</div><div>Below</div>
+            </div>"#,
+            80,
+        );
+        let painted: Vec<_> = out
+            .fixed
+            .iter()
+            .flat_map(|fixed| {
+                fixed.rows.iter().enumerate().flat_map(move |(row, line)| {
+                    line.items.iter().map(move |item| {
+                        (
+                            usize::from(fixed.row) + row,
+                            fixed.col + item.col,
+                            item.text.as_str(),
+                        )
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(painted.len(), 3, "{painted:?}");
+        for expected in [(1, 2, "Child"), (3, 0, "Edge"), (0, 10, "Below")] {
+            assert!(painted.contains(&expected), "{expected:?}: {painted:?}");
+        }
+        assert!(out.fixed.iter().all(|fixed| fixed.rows.len() <= 24));
+    }
+
+    #[test]
     fn visibility_hidden_abspos_keeps_ghost_geometry() {
         let out = lay(
             r#"<body style="margin:0"><div style="position:absolute;left:0;top:16px;visibility:hidden">ghost</div><p style="margin:0">real</p></body>"#,
