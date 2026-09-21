@@ -3431,50 +3431,11 @@ impl Dom {
         {
             return true;
         }
-        // The OTHER visually-hidden idiom: shove an absolutely/fixed-positioned
-        // box far off the top-left corner (`left:-9999px`, `top:-1000px`).
-        // YouTube's "Skip navigation" button hides this way; without honoring it
-        // we clamp the negative offset to row/col 0 in `place_positioned_children`
-        // and the hidden text paints at the very top-left. `position` is checked
-        // first so the hot path short-circuits for non-positioned nodes.
-        if matches!(
-            self.cascaded(id, "position").as_deref(),
-            Some("absolute" | "fixed")
-        ) {
-            // CSS Position 3 §5.1 resolves an over-constrained axis using
-            // the inset equation. When both opposing insets are large and
-            // negative *and* the corresponding margins are auto, those auto
-            // margins absorb the free space and center the replaced box.
-            // Amazon's homepage uses this image-centering idiom:
-            // `left:-9999px; right:-9999px; margin:auto`. A single negative
-            // inset is still the usual screen-reader/off-screen pattern, but
-            // treating either side in isolation incorrectly drops the
-            // centered image from the render tree.
-            let centered_axis = |start: &str, end: &str, margin_start: &str, margin_end: &str| {
-                self.cascaded(id, start)
-                    .as_deref()
-                    .is_some_and(css_len_offscreen_neg)
-                    && self
-                        .cascaded(id, end)
-                        .as_deref()
-                        .is_some_and(css_len_offscreen_neg)
-                    && self.cascaded(id, margin_start).as_deref() == Some("auto")
-                    && self.cascaded(id, margin_end).as_deref() == Some("auto")
-            };
-            let offscreen_x = self
-                .cascaded(id, "left")
-                .as_deref()
-                .is_some_and(css_len_offscreen_neg)
-                && !centered_axis("left", "right", "margin-left", "margin-right");
-            let offscreen_y = self
-                .cascaded(id, "top")
-                .as_deref()
-                .is_some_and(css_len_offscreen_neg)
-                && !centered_axis("top", "bottom", "margin-top", "margin-bottom");
-            if offscreen_x || offscreen_y {
-                return true;
-            }
-        }
+        // CSS Position 3 #insets allows off-screen coordinates without
+        // suppressing box generation. CSSOM View #dom-htmlelement-offsetwidth
+        // and #dom-htmlelement-offsetheight still measure those boxes (font
+        // measurement probes depend on this), and descendants can extend back
+        // into view. Viewport clipping belongs to painting, not this check.
         // A box collapsed to ZERO on an axis, with `overflow:hidden`/`clip` on
         // that axis, clips ALL its content to nothing — the standard "keep it
         // in the DOM but show nothing" idiom (a preloaded hero copy, a closed
@@ -10919,26 +10880,6 @@ fn css_len_at_most_1px(v: &str) -> bool {
     let v = v.trim();
     let n = v.strip_suffix("px").unwrap_or(v).trim();
     n.parse::<f32>().is_ok_and(|x| x <= 1.0)
-}
-
-/// Whether an absolute length pushes a box FAR off-screen — the "shove it past
-/// the corner" visually-hidden idiom (`left:-9999px`, `top:-1000px`, WordPress
-/// `.screen-reader-text`, YouTube's skip-nav). Only absolute units (px/em/rem)
-/// and only past a generous threshold, so legitimate small negative offsets (an
-/// `-1.5rem` footer, a `-1px` overlap) and viewport-relative `%`/`vw` are never
-/// caught.
-fn css_len_offscreen_neg(v: &str) -> bool {
-    let v = v.trim();
-    let (num, mult) = if let Some(n) = v.strip_suffix("px") {
-        (n, 1.0)
-    } else if let Some(n) = v.strip_suffix("rem") {
-        (n, 16.0)
-    } else if let Some(n) = v.strip_suffix("em") {
-        (n, 16.0)
-    } else {
-        (v, 1.0)
-    };
-    num.trim().parse::<f32>().is_ok_and(|x| x * mult <= -999.0)
 }
 
 /// Whether a CSS length/percentage is exactly zero (`0`, `0px`, `0%`, `0em`,
@@ -19074,8 +19015,8 @@ mod tests {
     fn opposing_negative_insets_with_auto_margins_keep_centered_images() {
         // CSS Position 3 §5.1: opposing negative insets with auto margins
         // resolve through the positioning constraint and center the box. This
-        // is the image-centering pattern used by Amazon's gateway cards; a
-        // one-sided negative inset remains an off-screen accessibility box.
+        // is the image-centering pattern used by Amazon's gateway cards.
+        // One-sided negative insets also keep a box for CSSOM measurements.
         let dom = Dom::parse_document(
             "<body>\
              <div id=card style=\"position:relative;width:320px;height:180px\">\
@@ -19087,7 +19028,10 @@ mod tests {
         let centered = dom.get_by_id("centered").unwrap();
         let hidden = dom.get_by_id("hidden").unwrap();
         assert!(!dom.is_hidden(centered), "centered image was hidden");
-        assert!(dom.is_hidden(hidden), "one-sided off-screen text was kept");
+        assert!(
+            !dom.is_hidden(hidden),
+            "offscreen box must remain measurable"
+        );
         assert!(
             dom.serialize(DOCUMENT).contains("card.jpg"),
             "centered image was dropped from the live tree"

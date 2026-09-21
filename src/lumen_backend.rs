@@ -13057,6 +13057,66 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_text_probes_keep_cssom_geometry() {
+        // CSS Position 3 #insets permits negative coordinates. CSSOM View
+        // #dom-htmlelement-offsetwidth/#dom-htmlelement-offsetheight measure
+        // the generated border box, including CSS2 #visibility hidden boxes.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><style>body{margin:0}</style><body></body>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            function check(value, message) { if (!value) throw Error(message); }
+            for (const position of ['absolute', 'fixed']) {
+                const probe = document.createElement('span');
+                probe.style.cssText = 'display:inline-block;left:0;top:0;visibility:hidden;' +
+                    'white-space:pre;font:16px/20px monospace;position:' + position;
+                probe.setAttribute('aria-hidden', 'true');
+                probe.textContent = 'W'.repeat(32);
+                document.body.appendChild(probe);
+                const width = probe.offsetWidth, height = probe.offsetHeight;
+                check(width > 0 && height > 0, position + ' reference size');
+                for (const [left, top, x, y] of [
+                    ['-9999px', '0px', -9999, 0],
+                    ['-9999em', '0px', -159984, 0],
+                    ['0px', '-9999px', 0, -9999],
+                    ['9999px', '0px', 9999, 0],
+                    ['0px', '0px', 0, 0]
+                ]) {
+                    probe.style.left = left;
+                    probe.style.top = top;
+                    const rect = probe.getBoundingClientRect();
+                    const label = position + ' at ' + left + ',' + top;
+                    check(probe.offsetWidth === width && probe.offsetHeight === height,
+                        label + ' dimensions: ' + probe.offsetWidth + ',' + probe.offsetHeight);
+                    check(probe.getClientRects().length === 1, label + ' box');
+                    check(Math.abs(rect.x - x) < .1 && Math.abs(rect.y - y) < .1,
+                        label + ' coordinates: ' + rect.x + ',' + rect.y);
+                }
+                probe.style.left = '-9999px';
+                probe.style.visibility = 'visible';
+                check(probe.offsetWidth === width && probe.offsetHeight === height,
+                    position + ' visible offscreen size');
+                probe.style.display = 'none';
+                check(probe.offsetWidth === 0 && probe.offsetHeight === 0 &&
+                    probe.getClientRects().length === 0, position + ' display:none');
+                probe.style.display = 'inline-block';
+                check(probe.offsetWidth === width, position + ' restored box');
+                probe.remove();
+                check(probe.getClientRects().length === 0, position + ' detached box');
+            }
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
     fn retained_layout_geometry_hit_testing_and_paint_share_one_transaction() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<style>
