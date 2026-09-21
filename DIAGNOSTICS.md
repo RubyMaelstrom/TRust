@@ -270,7 +270,9 @@ engine to carry `href` into `SemanticNode`, not a driver-side guess from geometr
 
 ### Developer replay and spike binaries
 
-These binaries are opt-in targets and do not open the normal browser UI:
+These tools are opt-in targets and do not open the normal browser UI.
+Run the replay tool with `cargo run --release --example trust-browser-replay -- FIXTURE.html`.
+It lives under `target/release/examples/` and is not part of the distributed browsers.
 
 | Binary and input | Meaning | Default |
 |---|---|---:|

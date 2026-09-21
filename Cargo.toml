@@ -22,9 +22,11 @@ name = "trust-lumen-spike"
 path = "src/bin/trust-lumen-spike.rs"
 required-features = ["lumen-spike"]
 
-[[bin]]
+# Developer replay harness, built explicitly with --example; not a release binary.
+[[example]]
 name = "trust-browser-replay"
-path = "src/bin/trust-browser-replay.rs"
+path = "examples/trust-browser-replay.rs"
+test = true
 
 [[bin]]
 name = "trust-headless"
@@ -250,11 +252,10 @@ ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
 # Assertions may disappear in release builds; runtime mutations must not.
 debug_assert_with_mut_call = "deny"
 
-# Optimized binary: whole-program LTO and a single codegen unit trade
-# compile time for speed and size; symbols stripped (panic messages
-# still print, just without a backtrace).
+# Optimized release binaries with ThinLTO to keep rebuilds practical.
+# Symbols are stripped; panic messages still print, without a backtrace.
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
@@ -267,7 +268,7 @@ debug = true
 strip = false
 
 # Fast browser-workload gate: retain optimized/release semantics without paying the production
-# fat-LTO + single-codegen-unit link on every Lumen iteration. Incremental object reuse and broad
+# release-profile link on every Lumen iteration. Incremental object reuse and broad
 # codegen parallelism make subsequent engine edits cheap; `cargo build --release` remains the only
 # acceptance/promotion artifact.
 [profile.browser-check]
