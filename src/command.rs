@@ -146,11 +146,7 @@ pub(crate) fn has_url_scheme(value: &str) -> bool {
 /// Whether a bare COMMAND token should be handled as an address instead of a
 /// search query.
 pub fn looks_like_address(value: &str) -> bool {
-    has_url_scheme(value)
-        || looks_like_host(value)
-        || value.starts_with('/')
-        || value.starts_with("./")
-        || value.starts_with("../")
+    has_url_scheme(value) || looks_like_host(value) || crate::file::is_explicit_path(value)
 }
 
 /// Build the DuckDuckGo Lite URL used when a COMMAND line is neither a

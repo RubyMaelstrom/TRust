@@ -19,7 +19,7 @@ in a sibling checkout. The current integration checkout is laid out as:
 
 ```text
 Code/
-├── Lumen/   # tested engine revision: 8b456e1c3d544111af3dae058becef11f8ce6bb9
+├── Lumen/   # integration revision: 328b4bbd1de1e93547cc74bebe08b98d97088eaa
 └── TRust/
 ```
 
@@ -31,6 +31,29 @@ From `TRust`, `cargo build --release` builds the `trust`, `trust-desktop`,
 `trust-headless`, and developer replay binaries. Lumen is an unconditional
 dependency; no backend-selection feature is needed. Use `--no-default-features`
 to build with the system allocator instead of mimalloc.
+
+Release builds use fat LTO and one codegen unit on every target. Build natively
+on ARM64 Linux or x86-64 Linux with `cargo build --release --locked`. To build
+Windows x64 from Linux, install the `x86_64-pc-windows-msvc` Rust target,
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), Clang/LLD, LLVM tools,
+and Ninja, then run:
+
+```sh
+cargo xwin build --release --locked --target x86_64-pc-windows-msvc
+```
+
+The Windows executables are in `target/x86_64-pc-windows-msvc/release/`.
+With Wine installed, `cargo xwin test --target x86_64-pc-windows-msvc`
+runs Windows tests. Use the same sibling Lumen revision for all three builds;
+TRust embeds the engine crate and provides its own networking and TLS.
+
+On Windows, configuration, bookmarks, and site data default to `%APPDATA%\trust`,
+state/cache to `%LOCALAPPDATA%\trust\state` and `\cache`, and downloads to
+`%USERPROFILE%\Downloads`. Absolute XDG overrides still take precedence, and
+`TRUST_KNOWN_HOSTS`/`TRUST_IDENTITIES` retain their explicit TLS-path overrides.
+WebGL requires an installed EGL/GLES driver exposing `libEGL.dll`; context
+creation can fail when that optional driver is unavailable. Normal page
+rendering retains the software renderer.
 
 Before handing off browser changes, run both `cargo test` and
 `cargo test --release`, then `cargo clippy --all-targets` and

@@ -4406,10 +4406,11 @@ mod tests {
         assert!(matches!(gopher, Link::Gopher(_)));
         assert!(!fallback);
 
-        let (local, fallback) = parse_navigation_target("/tmp/IdleHeart.png").unwrap();
+        let path = std::env::temp_dir().join("IdleHeart.png");
+        let (local, fallback) = parse_navigation_target(path.to_str().unwrap()).unwrap();
         assert!(!fallback);
         assert!(
-            matches!(local, Link::Http(url) if url.scheme() == "file" && url.path() == "/tmp/IdleHeart.png")
+            matches!(local, Link::Http(url) if url.to_file_path().ok().as_ref() == Some(&path))
         );
         let (file_url, fallback) = parse_navigation_target("file:///tmp/IdleHeart.png").unwrap();
         assert!(!fallback);

@@ -33,8 +33,19 @@ fn known_hosts_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("TRUST_KNOWN_HOSTS") {
         return Some(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/trust/known_hosts"))
+    tls_config_directory().map(|dir| dir.join("known_hosts"))
+}
+
+fn tls_config_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        crate::storage::config_directory().ok()
+    }
+    // Preserve the established Unix identity/pin location even with XDG overrides.
+    #[cfg(not(windows))]
+    {
+        crate::storage::home_directory().map(|home| home.join(".config/trust"))
+    }
 }
 
 fn store() -> &'static Mutex<PinStore> {
@@ -275,8 +286,7 @@ fn identities_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TRUST_IDENTITIES") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/trust/identities"))
+    tls_config_directory().map(|dir| dir.join("identities"))
 }
 
 /// The file that holds (or would hold) a host's client identity.

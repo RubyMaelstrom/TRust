@@ -115,7 +115,9 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 # resistance buys nothing for arena-internal keys.
 rustc-hash = "2"
 serde_json = "1"
-serde = "1"
+# Derives are used by our DOM representation; request them explicitly rather
+# than relying on features unified by a platform-specific dependency.
+serde = { version = "1", features = ["derive"] }
 # Fetch Metadata uses HTML's schemeful same-site relation, including private
 # suffixes (e.g. github.io). This compiled PSL has no runtime network refresh;
 # Cargo.lock pins the data revision delivered with each browser build.
@@ -252,7 +254,7 @@ debug_assert_with_mut_call = "deny"
 # compile time for speed and size; symbols stripped (panic messages
 # still print, just without a backtrace).
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
@@ -265,7 +267,7 @@ debug = true
 strip = false
 
 # Fast browser-workload gate: retain optimized/release semantics without paying the production
-# ThinLTO + single-codegen-unit link on every Lumen iteration. Incremental object reuse and broad
+# fat-LTO + single-codegen-unit link on every Lumen iteration. Incremental object reuse and broad
 # codegen parallelism make subsequent engine edits cheap; `cargo build --release` remains the only
 # acceptance/promotion artifact.
 [profile.browser-check]

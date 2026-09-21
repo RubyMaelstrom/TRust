@@ -53,7 +53,7 @@ pub fn url_from_input(input: &str) -> Result<Option<Url>, String> {
         return Err(String::from("Invalid file URL."));
     }
     let path = Path::new(input);
-    let explicit_path = path.is_absolute() || input.starts_with("./") || input.starts_with("../");
+    let explicit_path = is_explicit_path(input);
     // An explicit URL always wins over a coincidentally named relative file.
     // Also avoid a filesystem probe for every network URL typed in the UI.
     if !explicit_path && (crate::command::has_url_scheme(input.trim()) || !path.is_file()) {
@@ -73,6 +73,15 @@ pub fn url_from_input(input: &str) -> Result<Option<Url>, String> {
     Url::parse(url.as_str())
         .map(Some)
         .map_err(|error| format!("invalid local file URL: {error}"))
+}
+
+/// Native path syntax belongs to the address adapter; URL parsing itself
+/// stays platform-independent (WHATWG URL #file-state).
+pub(crate) fn is_explicit_path(input: &str) -> bool {
+    Path::new(input).has_root()
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || (cfg!(windows) && (input.starts_with(r".\") || input.starts_with(r"..\")))
 }
 
 /// URL's file-host state normalizes `localhost` to the empty host. TRust
@@ -312,10 +321,46 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_paths_reach_the_file_url_parser() {
+        for input in [
+            r"C:\Pages\a #1.html",
+            r".\missing page.html",
+            r"..\missing page.html",
+            r"\Pages\missing.html",
+        ] {
+            assert!(crate::command::looks_like_address(input), "{input}");
+            let url = url_from_input(input).unwrap().unwrap();
+            assert!(is_local_url(&url), "{input}");
+            let path = Path::new(input);
+            let expected = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap().join(path)
+            };
+            let expected_url = Url::parse(Url::from_file_path(expected).unwrap().as_str()).unwrap();
+            assert_eq!(url, expected_url, "{input}");
+        }
+        assert_eq!(
+            url_from_input(r"C:\Pages\a #1.html")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "file:///C:/Pages/a%20%231.html"
+        );
+        // URL #file-host-state: localhost is local, UNC servers remain remote.
+        let unc = url_from_input(r"\\server\share\page.html")
+            .unwrap()
+            .unwrap();
+        assert!(!is_local_url(&unc));
+    }
+
     #[tokio::test]
     async fn file_fetch_roundtrips_encoded_names_and_ignores_query_and_fragment() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("Local 🩷 #?%23.HTML");
+        // '?' is a URL delimiter but cannot occur in a Windows filename.
+        let path = dir.path().join("Local 🩷 #%23.HTML");
         std::fs::write(&path, b"<!doctype html><title>local</title>").unwrap();
         let mut url = Url::from_file_path(&path).unwrap();
         url.set_query(Some("version=1"));
