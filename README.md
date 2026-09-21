@@ -14,3 +14,15 @@ Run `trust <address>` in your terminal, or `trust-desktop <address>` for a
 desktop window. Tab opens the command panel to access the address bar or enter
 additional commands. Type `help` for the options. See [INSTALL.md](INSTALL.md)
 for instructions on how to compile it yourself.
+
+**TRust — [Ruby's House](https://rubymaelstrom.com)**
+
+![Ruby's House in TRust, with its house logo rendered inline.](docs/screenshots/trust-rubymaelstrom.png)
+
+**trust-desktop — [InfiniMUD](https://infinimud.com)**
+
+![The InfiniMUD landing page in trust-desktop.](docs/screenshots/trust-desktop-infinimud.png)
+
+**TRust — [Telehack](https://telehack.com)**
+
+![TRust connected to Telehack over Telnet, showing its welcome screen and commands.](docs/screenshots/trust-telehack.png)
