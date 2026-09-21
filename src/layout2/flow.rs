@@ -149,6 +149,8 @@ pub(crate) enum FragKind<'t> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LineFrag {
+    /// Pieces are in inline/block coordinates; the enclosing fragment is physical.
+    pub sideways: bool,
     pub atom_boxes: Vec<Piece>,
     pub band: [f32; 2],
     pub alignment_offset: f32,
@@ -693,7 +695,7 @@ impl Flow<'_> {
         // (§17.5.2) and repositions within its band (§17.4 auto margins /
         // align) — its used content width and border-box left are known only
         // after the column algorithm runs, inside the `Content::Table` arm.
-        let mut h = self.horizontal(b, cb_w, &inl);
+        let mut h = self.horizontal(b, cb_w, cb_h, &inl);
         // CSS 2.1 §10.3.4 says a block-level replaced element's auto width is
         // resolved by the inline-replaced algorithm (§10.3.2), then its
         // margins are solved with the ordinary block equation. The generic
@@ -912,6 +914,20 @@ impl Flow<'_> {
                             // border-top edge coincides with that first flush.
                             y_border = Some(cur.flush_log[log]);
                         }
+                    }
+                    Content::Inlines(_) if self.vertical_text(b) => {
+                        let (lines, _, height) =
+                            self.vertical_lines(b, ifc_cb_h, cb_h, &inl).unwrap();
+                        let yb = *y_border.get_or_insert_with(|| cur.flush());
+                        let top = content_top_of(yb).max(cur.y);
+                        children.extend(self.vertical_fragments(
+                            lines,
+                            content_x,
+                            top,
+                            h.content_w,
+                            s.vertical == Some(true),
+                        ));
+                        cur.y = top + height;
                     }
                     Content::Inlines(inls) => {
                         // Floats are placed at the position the first line box would
@@ -1497,10 +1513,113 @@ impl Flow<'_> {
 
     /// Turn finished line boxes into Line fragments at `x`, advancing the
     /// cursor by each line's height (line boxes pack — no margins between).
+    /// CSS Writing Modes 4 #text-orientation and #orthogonal-flows.
+    /// Shape sideways-script text in logical coordinates, then map its line
+    /// boxes to physical coordinates before measurement or either painter.
+    /// Upright glyphs, replaced content and nested formatting contexts need
+    /// vertical shaping/layout of their own and must not be rotated as text.
+    pub(super) fn vertical_text(&self, b: &BoxNode) -> bool {
+        fn text_only(inls: &[Inline], sideways: bool) -> bool {
+            inls.iter().all(|inline| match inline {
+                Inline::Text(text) => {
+                    sideways
+                        || text
+                            .chars()
+                            .all(|c| c <= '\u{052f}' || ('\u{2000}'..='\u{206f}').contains(&c))
+                }
+                Inline::Br => true,
+                Inline::Box { kids, .. } => text_only(kids, sideways),
+                _ => false,
+            })
+        }
+        b.style.vertical.is_some()
+            && b.style.sideways_text.is_some_and(|sideways| matches!(&b.content, Content::Inlines(inls) if text_only(inls, sideways)))
+    }
+
+    pub(super) fn vertical_lines(
+        &self,
+        b: &BoxNode,
+        height: Option<f32>,
+        available: Option<f32>,
+        parent: &InlineStyle,
+    ) -> Option<(Vec<LineOut>, f32, f32)> {
+        if !self.vertical_text(b) {
+            return None;
+        }
+        let Content::Inlines(inls) = &b.content else {
+            return None;
+        };
+        let inl = parent;
+        let height = height.or_else(|| b.style.height.resolve(available));
+        // #orthogonal-auto / #auto-multicol: short auto-sized orthogonal
+        // contents shrink to their max-content inline size. The initial
+        // containing block supplies the fallback for an indefinite height.
+        let cap = height.or(available).unwrap_or(self.vp.h).max(0.);
+        let probe = |width, align| {
+            let mut ifc = Ifc::new(
+                self.dom,
+                self.base,
+                self.images,
+                self.forms,
+                self.vp,
+                width,
+                None,
+                align,
+                self.indent_px(inl.node, width),
+                None,
+                &[],
+            );
+            ifc.run(inls, inl);
+            ifc.finish().0
+        };
+        let lines = if height.is_some() {
+            probe(cap, block_align(self.dom, inl.node))
+        } else {
+            let max_lines = probe(10_000_000., super::style::Align2::Left);
+            let max = max_lines.iter().map(|line| line.width).fold(0., f32::max);
+            probe(max.min(cap), block_align(self.dom, inl.node))
+        };
+        let block = lines.iter().map(|line| line.height).sum();
+        let inline =
+            height.unwrap_or_else(|| lines.iter().map(|line| line.width).fold(0., f32::max));
+        Some((lines, block, inline))
+    }
+
+    fn vertical_fragments(
+        &self,
+        lines: Vec<LineOut>,
+        x: f32,
+        y: f32,
+        width: f32,
+        right_to_left: bool,
+    ) -> Vec<Frag<'static>> {
+        let mut fragments = Vec::new();
+        self.emit_lines(lines, 0., &mut Cursor::default(), &mut fragments);
+        for f in &mut fragments {
+            let block = f.y;
+            let (inline, thickness) = (f.w, f.h);
+            f.x = x + if right_to_left {
+                width - block - thickness
+            } else {
+                block
+            };
+            f.y = y;
+            f.w = thickness;
+            f.h = inline;
+            if let FragKind::Line(line) = &mut f.kind {
+                line.sideways = true;
+                line.width = thickness;
+                line.height = inline;
+            }
+        }
+        fragments
+    }
+
     fn emit_lines(&self, lines: Vec<LineOut>, x: f32, cur: &mut Cursor, out: &mut Vec<Frag<'_>>) {
         for line in lines {
             let hpx = line.height;
             let line_frag = LineFrag {
+                sideways: false,
                 atom_boxes: line.atom_boxes,
                 band: [line.left, line.right],
                 alignment_offset: line.alignment_offset,
@@ -1665,6 +1784,7 @@ impl Flow<'_> {
             },
             clip: None,
             kind: FragKind::Line(LineFrag {
+                sideways: false,
                 atom_boxes: Vec::new(),
                 band: [0.0, w],
                 alignment_offset: 0.0,
@@ -1687,7 +1807,7 @@ impl Flow<'_> {
     /// query for the css-sizing-3 keywords (`width: min-content`/
     /// `max-content`/`fit-content`), which name the CONTENT size directly —
     /// box-sizing does not apply to them (§5.2.2).
-    fn horizontal(&self, b: &BoxNode, cb_w: f32, inl: &InlineStyle) -> H {
+    fn horizontal(&self, b: &BoxNode, cb_w: f32, cb_h: Option<f32>, inl: &InlineStyle) -> H {
         let s = &b.style;
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
@@ -1761,11 +1881,15 @@ impl Flow<'_> {
         // HTML Rendering #button-layout: an automatic inline size is
         // fit-content, including display:block/flow-root buttons. The block
         // equation still resolves their margins and explicit min/max sizes.
-        let width = spec(&s.width).or_else(|| {
-            (s.width.is_auto() && b.node != NO_NODE && self.dom.tag_name(b.node) == Some("button"))
+        let width = spec(&s.width)
+            .or_else(|| self.vertical_lines(b, None, cb_h, inl).map(|(_, w, _)| w))
+            .or_else(|| {
+                (s.width.is_auto()
+                    && b.node != NO_NODE
+                    && self.dom.tag_name(b.node) == Some("button"))
                 .then(|| self.intrinsic_width_value(&Len::FitContent, b, Some(cb_w), inl))
                 .flatten()
-        });
+            });
         let (ml, w) = solve(width);
         let (ml, w) = if w > max_w {
             solve(Some(max_w))
@@ -2947,6 +3071,17 @@ impl Flow<'_> {
                     ));
                 }
             }
+            Content::Inlines(_) if self.vertical_text(b) => {
+                let (lines, _, height) = self.vertical_lines(b, def_h, None, &inl).unwrap();
+                children.extend(self.vertical_fragments(
+                    lines,
+                    bp_l,
+                    bt,
+                    content_w,
+                    s.vertical == Some(true),
+                ));
+                cur.y = bt + height;
+            }
             Content::Inlines(inls) => {
                 let laid = self.lay_inlines(
                     inls,
@@ -3263,6 +3398,7 @@ impl Flow<'_> {
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
+                sideways: false,
                 atom_boxes: Vec::new(),
                 band: [0.0, r.box_w],
                 alignment_offset: 0.0,
@@ -3788,8 +3924,24 @@ impl Flow<'_> {
                 (Some(l), Some(w), None) => (l, w, ml0),
             }
         };
+        let vertical_inl = if b.node == NO_NODE {
+            ctx.with_pseudo(self.dom, s.pseudo)
+        } else {
+            InlineStyle::derive(self.dom, b.node, ctx, self.base)
+        };
+        let vertical = self.vertical_lines(
+            b,
+            self.height_px(&s.height, s, bp_t, bp_b, Some(cb.h)),
+            Some(
+                (cb.h - top.unwrap_or(0.) - bottom.unwrap_or(0.) - bp_v - m[TOP] - m[BOTTOM])
+                    .max(0.),
+            ),
+            &vertical_inl,
+        );
         let (mut lx, mut used_w, mut ml) = solve_h(replaced.map(|(rw, _)| rw).or_else(|| {
-            spec_w(&s.width).map(|w| w.clamp(min_w, max_w)) // §10.4 on a specified width
+            spec_w(&s.width)
+                .or_else(|| vertical.as_ref().map(|(_, w, _)| *w))
+                .map(|w| w.clamp(min_w, max_w))
         }));
         if replaced.is_none() {
             // §10.4 on a SOLVED width: clamp, then re-solve with the clamped
@@ -3827,6 +3979,7 @@ impl Flow<'_> {
             (Some(t), Some(bm), None) => Some((cb.h - t - bm - m[TOP] - m[BOTTOM] - bp_v).max(0.0)),
             _ => None,
         });
+        let pre_h = pre_h.or_else(|| vertical.as_ref().map(|(_, _, h)| *h));
         let def_h = pre_h.map(|v| {
             if replaced.is_some() {
                 v
@@ -3893,7 +4046,7 @@ impl Flow<'_> {
     /// scroll containers). Flex/grid/table items and out-of-flow boxes lay
     /// through `item_frag`, which establishes its own context directly.
     fn establishes_bfc(&self, b: &BoxNode) -> bool {
-        if b.style.size_container != 0 {
+        if b.style.size_container != 0 || b.style.vertical.is_some() {
             return true;
         }
         if b.node == NO_NODE {

@@ -428,6 +428,8 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "white-space-collapse" => {
             one_of("collapse preserve preserve-breaks preserve-spaces break-spaces")
         }
+        "writing-mode" => one_of("horizontal-tb vertical-rl vertical-lr sideways-rl sideways-lr"),
+        "text-orientation" => one_of("mixed upright sideways"),
         "text-transform" => one_of("none uppercase lowercase capitalize"),
         "text-align" => one_of("start end left right center justify match-parent"),
         "text-overflow" => one_of("clip ellipsis"),
@@ -462,6 +464,16 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         }
         "font-style" => one_of("normal italic oblique"),
         "text-decoration-style" => one_of("solid double dotted dashed wavy"),
+        "-webkit-text-stroke-width" => text_stroke_width_px(
+            value,
+            crate::layout2::Units {
+                fs: 16.,
+                root: 16.,
+                ch: 8.,
+            },
+            (100., 100.),
+        )
+        .is_some(),
         p if p.ends_with("-style") && (p.starts_with("border-") || p == "outline-style") => {
             one_of("none hidden solid double dotted dashed groove ridge inset outset")
                 || p == "outline-style" && value == "auto"

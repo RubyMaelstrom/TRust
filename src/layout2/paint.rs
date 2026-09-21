@@ -1843,6 +1843,14 @@ fn terminal_line_extent(
     let FragKind::Line(line_fragment) = &line.kind else {
         return (1, start_col);
     };
+    if line_fragment.sideways {
+        let rows = line_fragment
+            .pieces
+            .iter()
+            .map(|p| p.item.text.chars().count())
+            .sum::<usize>();
+        return (rows.max(1) as i64, start_col + 1);
+    }
     let mut rows = 1i64;
     let mut span = 1i64;
     let mut pen = start_col;
@@ -2258,6 +2266,43 @@ fn inflow_content(
             hit_op(c, ops, cw, ch, ox, oy, links);
         }
         if let FragKind::Line(line) = &c.kind {
+            if line.sideways {
+                // Terminals cannot turn a glyph sideways. Keep vertical text
+                // in its physical column, spelling it down the terminal rows.
+                let col = ((c.x - ox) / cw).round() as i64;
+                let mut row = ((c.y - oy) / ch).round() as i64;
+                for piece in &line.pieces {
+                    for character in piece.item.text.chars() {
+                        let text = character.to_string();
+                        ops.push(Op::Item {
+                            row,
+                            col,
+                            item: Item {
+                                col: 0,
+                                width: display_width(&text) as u16,
+                                height: 1,
+                                text,
+                                kind: piece.item.kind,
+                                image: None,
+                                emph: piece.item.emph,
+                                node: piece.item.node,
+                                link: piece.item.link.clone(),
+                                crop: false,
+                                pixelated: false,
+                                invisible: piece.item.invisible,
+                                terminal_band: None,
+                                image_clip: None,
+                            },
+                            clip: clip_cells(c.clip, ox, oy, cw, ch),
+                            bounds: clipped_paint_bounds(c.x, c.y, c.x + c.w, c.y + c.h, c.clip),
+                            text_clip_resolved: true,
+                        });
+                        row += 1;
+                    }
+                }
+                previous_line = None;
+                continue;
+            }
             // Proportional CSS advances do not map monotonically to terminal
             // display-cell widths (for example `Multi:` may shape narrower
             // than six 8px cells). Preserve the inline sequence at this final

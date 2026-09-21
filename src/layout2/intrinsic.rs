@@ -117,6 +117,9 @@ impl Flow<'_> {
         } else {
             InlineStyle::derive(self.dom, b.node, inl, self.base)
         };
+        if let Some((_, width, _)) = self.vertical_lines(b, None, None, &here) {
+            return width;
+        }
         match &b.content {
             Content::Blocks(kids) => kids
                 .iter()
