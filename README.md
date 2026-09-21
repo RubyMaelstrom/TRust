@@ -23,6 +23,6 @@ for instructions on how to compile it yourself.
 
 ![The InfiniMUD landing page in trust-desktop.](docs/screenshots/trust-desktop-infinimud.png)
 
-**TRust — [Telehack](https://telehack.com)**
+**TRust — [Telehack](telnet://telehack.com)**
 
 ![TRust connected to Telehack over Telnet, showing its welcome screen and commands.](docs/screenshots/trust-telehack.png)
