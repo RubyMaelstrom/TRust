@@ -323,6 +323,27 @@ Both binaries support `-h`/`--help`.
 | `LUMEN_TRACE_CODE_POINT_ERRORS` | presence flag | Logs the already-converted invalid number, argument index and argument count for at most 32 `String.fromCodePoint` errors per process. Does not repeat coercion or alter exception behavior. Diagnostic numeric inputs may be private; keep captures local. |
 | `TRUST_TRACE_FETCH` | presence flag | Logs every page fetch to stderr as `[fetch-trace] sync|async <METHOD> <url>`, followed by `[fetch-trace] result status=<N> type=<TYPE> len=<N>` when the response resolves through the unbuffered result path. Pair with `TRUST_LUMEN_TRACE` and `--js-diagnostics` to reconstruct a page's script/fetch timeline. |
 
+### Dedicated worker resources
+
+Dedicated workers have no fixed count quota. Each has its own native thread and
+Lumen realm, using Rust's default thread stack instead of a 64 MiB reservation;
+Lumen grows execution-stack segments on demand. Idle workers block on their inbox
+without polling. Creation is constrained by available memory and OS thread
+resources; an OS thread-creation failure queues a Worker `error` event with the
+underlying error message.
+
+Worker messages use a dynamically allocated FIFO, with redundant MessagePort
+wakeups coalesced. Termination cancels that worker's script/module/fetch work
+without cancelling its owner or siblings; document cancellation reaches every
+worker. A completed worker releases its native resources and the host's reference
+to its JavaScript wrapper after queued replies have been dispatched.
+
+Run the resource/lifecycle regressions with `cargo test --lib worker` and
+`cargo test --release --lib worker`. These include 32 simultaneously live workers,
+burst-message ordering, deep execution on the default stack, simulated OS thread
+exhaustion, and cancellation during a stalled worker-script fetch. These checks
+verify browser behavior, not acceptance by any particular challenge provider.
+
 ### Archive SVG / Hybrid image-lifetime regression gate
 
 Run the pixel gates on a machine with a working Hybrid GPU adapter:
