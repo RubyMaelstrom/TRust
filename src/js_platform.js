@@ -64,6 +64,7 @@
     const trust = { errors: [], logs: [], readyState: "loading" };
     g.__trust = trust;
     const childWindowTrusts = new Set();
+    const childActivationWindows = new Set();
     const childRenderingFrames = new Map();
     let renderingChildrenEpoch = -1, renderingChildrenCache = [];
     trust.attachChildWindow = function (childWindow, frame) {
@@ -71,6 +72,7 @@
         if (childTrust && childTrust !== trust) {
             childTrust.oneShot = trust.oneShot;
             childWindowTrusts.add(childTrust);
+            childActivationWindows.add(childWindow);
             childRenderingFrames.set(childTrust, frame.__id);
             renderingChildrenEpoch = -1;
             renderingChildrenCache = [];
@@ -80,6 +82,7 @@
         const childTrust = childWindow && childWindow.__trust;
         if (childTrust) {
             childWindowTrusts.delete(childTrust);
+            childActivationWindows.delete(childWindow);
             childRenderingFrames.delete(childTrust);
             renderingChildrenEpoch = -1;
             renderingChildrenCache = [];
@@ -799,6 +802,7 @@
             hasElementScrollListener: false,
             customElementState: null, customElementRegistry: null,
             scopedGlobalDescriptors: null, authorGlobalDescriptors: null,
+            lastActivation: Infinity,
             // HTML has a 1:1 mapping between a realm, global object, and
             // environment settings object. Lumen uses this opaque token both
             // to restore promise-job settings and to partition module maps.
@@ -1057,8 +1061,10 @@
     const eventsWithListenerExceptions = new WeakSet();
     const pointerEventSlots = g.__pointer_event_slots(new WeakMap());
     delete g.__pointer_event_slots;
+    const nativeMouseConstruction = {};
     function createTrustedEvent(C, type, opts) {
-        const ev = C === PointerEvent ? createPlatformPointerEvent(type, opts) : new C(type, opts);
+        const ev = C === PointerEvent ? createPlatformPointerEvent(type, opts)
+            : C === MouseEvent ? createPlatformMouseEvent(type, opts, MouseEvent.prototype) : new C(type, opts);
         messageApply(trustedEventAdd, trustedEvents, [ev]);
         if (ev instanceof MouseEvent && opts && opts.pageX !== undefined) {
             const state = messageApply(messageWeakGet, pointerEventSlots, [ev]) || pointerCreate(null);
@@ -1067,28 +1073,36 @@
         }
         return ev;
     }
+    // DOM #concept-event-create and the public constructor share the inner
+    // creation steps. Native typed data does not re-enter Web IDL conversion.
+    const eventDefine = Object.defineProperty;
+    const eventTrustedGetter = {get isTrusted() { return messageApply(trustedEventHas, trustedEvents, [this]); }};
+    const getEventTrusted = Object.getOwnPropertyDescriptor(eventTrustedGetter,"isTrusted").get;
+    function initializeEvent(event, type, opts) {
+        event.type = type;
+        event.bubbles = !!(opts && opts.bubbles);
+        event.cancelable = !!(opts && opts.cancelable);
+        event.composed = !!(opts && opts.composed);
+        event.defaultPrevented = false;
+        event.target = null;
+        event.currentTarget = null;
+        event.eventPhase = 0;
+        eventDefine(event, "isTrusted", {
+            configurable: false,
+            enumerable: true,
+            get:getEventTrusted,
+        });
+        // CustomEvent.detail defaults to null. UIEvent supplies its own
+        // numeric default below.
+        event.detail = opts && "detail" in opts ? opts.detail : null;
+        // DOM §2.2: creation time relative to the time origin. This is the
+        // current monotonic clock, not merely the last timer checkpoint.
+        event.timeStamp = trust.performanceTimestamp
+            ? trust.performanceTimestamp(currentTime()) : currentTime();
+    }
     class Event {
         constructor(type, opts) {
-            this.type = String(type);
-            this.bubbles = !!(opts && opts.bubbles);
-            this.cancelable = !!(opts && opts.cancelable);
-            this.composed = !!(opts && opts.composed);
-            this.defaultPrevented = false;
-            this.target = null;
-            this.currentTarget = null;
-            this.eventPhase = 0; // NONE; dispatch sets 1/2/3 per phase
-            Object.defineProperty(this, "isTrusted", {
-                configurable: false,
-                enumerable: true,
-                get() { return messageApply(trustedEventHas, trustedEvents, [this]); },
-            });
-            // CustomEvent.detail defaults to null. UIEvent supplies its own
-            // numeric default below.
-            this.detail = opts && "detail" in opts ? opts.detail : null;
-            // DOM §2.2: creation time relative to the time origin. This is the
-            // current monotonic clock, not merely the last timer checkpoint.
-            this.timeStamp = trust.performanceTimestamp
-                ? trust.performanceTimestamp(currentTime()) : currentTime();
+            initializeEvent(this, String(type), opts);
             // Per-interface EventInit members (MouseEventInit.clientX,
             // KeyboardEventInit.key, MessageEventInit.data, …) become event
             // properties. We don't model each interface's dictionary, so copy
@@ -1176,6 +1190,11 @@
             this.screenX = sx; this.screenY = sy; this.clientX = cx; this.clientY = cy;
             this.ctrlKey = ctrl; this.altKey = alt; this.shiftKey = shift; this.metaKey = meta;
             this.button = button; this.relatedTarget = related;
+            const state = messageApply(messageWeakGet, pointerEventSlots, [this]);
+            if (state) {
+                state.modifiers = (shift?1:0)|(ctrl?2:0)|(alt?4:0)|(meta?8:0);
+                for (let i=0;i<modifierNames.length;i++) state["modifier"+modifierNames[i]]=false;
+            }
         }
         initKeyboardEvent(type, bubbles, cancelable, view, key) {
             this.initEvent(type, bubbles, cancelable);
@@ -1204,8 +1223,39 @@
         }
     }
     const mouseCoordinates = ["clientX", "clientY", "screenX", "screenY", "movementX", "movementY"];
+    const modifierNames = ["AltGraph", "CapsLock", "Fn", "FnLock", "Hyper", "NumLock",
+        "ScrollLock", "Super", "Symbol", "SymbolLock"];
+    function eventModifierState(event, key, kind, count) {
+        const state = messageApply(messageWeakGet, pointerEventSlots, [event]);
+        if (!state || !state[kind]) throw new TypeError("Incompatible event receiver");
+        if (!count) throw new TypeError("Missing modifier name");
+        key = `${key}`;
+        if (key === "Control") return !!(state.modifiers&2);
+        if (key === "Shift") return !!(state.modifiers&1);
+        if (key === "Alt") return !!(state.modifiers&4);
+        if (key === "Meta") return !!(state.modifiers&8);
+        for (let i=0;i<modifierNames.length;i++)
+            if (modifierNames[i]===key) return !!state["modifier" + key];
+        return false;
+    }
+    function mouseOffset(event, horizontal) {
+        const state = messageApply(messageWeakGet, pointerEventSlots, [event]);
+        if (!state || !state.mouse) throw new TypeError("Incompatible MouseEvent receiver");
+        // CSSOM View #extensions-to-the-mouseevent-interface: use the target's
+        // untransformed padding edge during dispatch, page coordinates outside it.
+        // Read layout only when the getter is used, never on the motion hot path.
+        let target = event.target;
+        if (target && target.nodeType !== 1) target = target.parentElement;
+        if (event.eventPhase && target) {
+            const rect = clientBoxRect(target);
+            if (rect) return (horizontal ? event.clientX - rect.x : event.clientY - rect.y)
+                - (parseFloat(__dom_computed(elementIdentity(target),
+                    horizontal ? "border-left-width" : "border-top-width")) || 0);
+        }
+        return horizontal ? event.pageX : event.pageY;
+    }
     class MouseEvent extends UIEvent {
-        constructor(type, opts) {
+        constructor(type, opts = undefined, internal) {
             super(type, opts);
             // CSSOM View #extensions-to-the-mouseevent-interface: coordinates
             // default to zero and use Web IDL finite double conversion. The
@@ -1222,9 +1272,24 @@
             this.ctrlKey = !!this.ctrlKey; this.altKey = !!this.altKey;
             this.shiftKey = !!this.shiftKey; this.metaKey = !!this.metaKey;
             if (this.relatedTarget === undefined) this.relatedTarget = null;
+            // PointerEvent installs the complete inherited slots itself. The
+            // private native path also knows all extended modifier flags are
+            // absent: avoid ten property probes/deletions per motion sample.
+            if (internal === nativeMouseConstruction && new.target === PointerEvent) return;
+            const state = {__proto__:null, mouse:true, modifiers:
+                (this.shiftKey?1:0)|(this.ctrlKey?2:0)|(this.altKey?4:0)|(this.metaKey?8:0)};
+            if (internal !== nativeMouseConstruction) for (let i = 0; i < modifierNames.length; i++) {
+                const key = "modifier" + modifierNames[i];
+                state[key] = !!this[key];
+                delete this[key];
+            }
+            messageApply(messageWeakSet, pointerEventSlots, [this, state]);
         }
         get x() { return this.clientX; }
         get y() { return this.clientY; }
+        get offsetX() { return mouseOffset(this, true); }
+        get offsetY() { return mouseOffset(this, false); }
+        getModifierState(key) { return eventModifierState(this, key, "mouse", arguments.length); }
         get pageX() {
             const state = messageApply(messageWeakGet, pointerEventSlots, [this]);
             return this.eventPhase !== 0 && state && state.pageX !== undefined ? state.pageX
@@ -1236,14 +1301,13 @@
                 : this.clientY + (this.view ? this.view.scrollY || 0 : 0);
         }
     }
-    for (const name of ["x", "y", "pageX", "pageY"]) Object.defineProperty(MouseEvent.prototype, name, {
+    for (const name of ["x", "y", "pageX", "pageY", "offsetX", "offsetY", "getModifierState"]) Object.defineProperty(MouseEvent.prototype, name, {
         ...Object.getOwnPropertyDescriptor(MouseEvent.prototype, name), enumerable: true
     });
     // Pointer Events §PointerEvent / orientation conversion / coalesced events;
     // Web IDL §dictionary, numeric and sequence conversions. Use platform
     // identity shared across this Agent, not mutable prototypes or expandos.
     const pointerDefine = Object.defineProperty, pointerCreate = Object.create;
-    const pointerConstruct = Reflect.construct;
     const pointerString = String, pointerFinite = Number.isFinite;
     const pointerFround = Math.fround, pointerRound = Math.round;
     const pointerAbs = Math.abs, pointerTan = Math.tan, pointerAtan = Math.atan;
@@ -1416,8 +1480,9 @@
             const base = pointerBaseDictionary(source, state);
             pointerOwnDictionary(source, state);
             pointerOrientation(state);
-            super(type, base);
-            state.pointer = true;
+            super(type, base, nativeMouseConstruction);
+            state.pointer = true; state.mouse = true;
+            state.modifiers = (base.shiftKey?1:0)|(base.ctrlKey?2:0)|(base.altKey?4:0)|(base.metaKey?8:0);
             messageApply(messageWeakSet, pointerEventSlots, [this, state]);
         }
     }
@@ -1440,20 +1505,31 @@
         getCoalescedEvents() { return pointerList(this, "coalescedEvents"); },
         getPredictedEvents() { return pointerList(this, "predictedEvents"); }
     };
+    function createPlatformMouseEvent(type, init, prototype) {
+        const event = pointerCreate(prototype);
+        initializeEvent(event, type, init);
+        event.detail = init.detail || 0; event.view = init.view || null;
+        event.clientX = init.clientX ?? 0; event.clientY = init.clientY ?? 0;
+        event.screenX = init.screenX ?? 0; event.screenY = init.screenY ?? 0;
+        event.movementX = init.movementX ?? 0; event.movementY = init.movementY ?? 0;
+        event.button = init.button || 0; event.buttons = init.buttons || 0;
+        event.ctrlKey = !!init.ctrlKey; event.shiftKey = !!init.shiftKey;
+        event.altKey = !!init.altKey; event.metaKey = !!init.metaKey;
+        event.relatedTarget = init.relatedTarget || null;
+        if (prototype === MouseEvent.prototype) messageApply(messageWeakSet, pointerEventSlots, [event, {
+            __proto__:null, mouse:true,
+            modifiers:(init.shiftKey?1:0)|(init.ctrlKey?2:0)|(init.altKey?4:0)|(init.metaKey?8:0)
+        }]);
+        return event;
+    }
     function createPlatformPointerEvent(type, init) {
         // DOM's internal "create an event" and HTML synthetic activation use
         // already-typed, UA-owned attributes. They do not perform JavaScript
         // dictionary conversion. Keep that work on the public constructor path
         // instead of doing 43 member lookups for every real pointer movement.
-        const event = pointerConstruct(MouseEvent, [type, {
-            bubbles:init.bubbles, cancelable:init.cancelable, composed:init.composed,
-            view:init.view, detail:init.detail, button:init.button, buttons:init.buttons,
-            clientX:init.clientX, clientY:init.clientY, screenX:init.screenX, screenY:init.screenY,
-            movementX:init.movementX, movementY:init.movementY,
-            relatedTarget:init.relatedTarget, ctrlKey:init.ctrlKey, altKey:init.altKey,
-            shiftKey:init.shiftKey, metaKey:init.metaKey
-        }], PointerEvent);
-        const state = {__proto__:null, pointer:true,
+        const event = createPlatformMouseEvent(type, init, PointerEvent.prototype);
+        const state = {__proto__:null, pointer:true, mouse:true,
+            modifiers:(init.shiftKey?1:0)|(init.ctrlKey?2:0)|(init.altKey?4:0)|(init.metaKey?8:0),
             pointerId:init.pointerId === undefined ? 0 : init.pointerId,
             pointerType:init.pointerType === undefined ? "" : init.pointerType,
             isPrimary:!!init.isPrimary,
@@ -1469,7 +1545,18 @@
     }
     class WheelEvent extends MouseEvent {}
     class DragEvent extends MouseEvent {}
-    class KeyboardEvent extends UIEvent {}
+    class KeyboardEvent extends UIEvent {
+        constructor(type, opts) {
+            super(type, opts);
+            const state = {keyboard:true};
+            for (const name of ["ctrlKey", "shiftKey", "altKey", "metaKey"]) state[name] = this[name] = !!this[name];
+            state.modifiers = (this.shiftKey?1:0)|(this.ctrlKey?2:0)|(this.altKey?4:0)|(this.metaKey?8:0);
+            for (const name of modifierNames) state["modifier" + name] = !!this["modifier" + name];
+            messageApply(messageWeakSet, pointerEventSlots, [this, state]);
+        }
+        getModifierState(key) { return eventModifierState(this, key, "keyboard", arguments.length); }
+    }
+    Object.defineProperty(KeyboardEvent.prototype, "getModifierState", {enumerable:true});
     class FocusEvent extends UIEvent {}
     class InputEvent extends UIEvent {}
     class TouchEvent extends UIEvent {}
@@ -2675,7 +2762,7 @@
         const pointing = !!(trusted && nativePointerPosition);
         const init = {
             bubbles: true, cancelable: true, composed: true, view: g,
-            detail: pointing ? 1 : 0, button: 0, buttons: 0,
+            detail: pointing ? nativePointerPosition.detail || 1 : 0, button: 0, buttons: 0,
             pointerId: pointing ? 1 : -1, pointerType: pointing ? "mouse" : "",
         };
         if (pointing) Object.assign(init, nativePointerPosition);
@@ -2754,6 +2841,15 @@
         if (record) nativePointerPosition = null;
         const context = { record, handled: false };
         const allowed = dispatch(t, ev, false, false, context);
+        // UI Events #event-type-dblclick: the second click precedes dblclick,
+        // even if its click default action was canceled.
+        if (record && trusted && ev.detail === 2)
+            dispatch(t, createTrustedEvent(MouseEvent, "dblclick", {
+                bubbles:true, cancelable:true, composed:true, view:g, detail:2,
+                clientX:ev.clientX, clientY:ev.clientY, screenX:ev.screenX, screenY:ev.screenY,
+                ctrlKey:ev.ctrlKey, shiftKey:ev.shiftKey, altKey:ev.altKey, metaKey:ev.metaKey,
+                button:0, buttons:ev.buttons
+            }), false);
         return !allowed || context.handled;
     }
     function runClickActivation(t, context) {
@@ -2838,10 +2934,25 @@
         return false;
     }
     trust.click = function (id) {
+        const pending = pointerInput.click;
+        if (pending) {
+            if (pending.owner !== trust) {
+                const result = pending.owner.click(pending.target.__id);
+                trust.lastClickSubmit = pending.owner.lastClickSubmit;
+                pending.owner.lastClickSubmit = null;
+                return result;
+            }
+            pointerInput.click = null;
+            id = pending.target.__id;
+            nativePointerPosition = pending.init;
+        }
+        // The terminal's semantic activation command represents its user's
+        // Enter action. There is no pointer sequence to synthesize in that lane.
+        if (!nativePointerPosition) notifyPointerActivation();
         if (pointerLockState.target && pointerLockState.owner !== trust)
             return pointerLockState.owner.click(pointerLockState.target.__id);
-        notifyPointerActivation();
         const target = pointerLockState.target || wrap(id);
+        pointerInput.clickDefault = target ? {target,owner:trust} : null;
         if (cfg.frameTrace && target) {
             const path = [];
             for (let node = target; node; node = node.parentNode) {
@@ -2851,7 +2962,9 @@
             }
             ftrace("native click realm=" + (realmRootFrame ? realmRootFrame.__id : 0) + " " + path.join(" > "));
         }
-        return activateClick(target, true, true);
+        const handled = activateClick(target, true, true);
+        if (handled) pointerInput.clickDefault = null;
+        return handled;
     };
     // UI Events §3.5: a native keydown is a cancelable event dispatched at
     // the focused element before the user agent performs its default editing
@@ -2888,7 +3001,6 @@
         return 0;
     }
     trust.key = function (id, key, code, repeat, composing, shift, ctrl, alt, meta, released = false, location = 0) {
-        if (!released && key !== "Escape" && !ctrl && !alt && !meta) notifyPointerActivation();
         trust.lastClickSubmit = null;
         // UI Events #events-keyboard-event-order / native-key-up and HTML's
         // focused-area model: resolve each event against *current* focus. Keep
@@ -2905,6 +3017,9 @@
             childTrust.lastClickSubmit = null;
             return prevented;
         }
+        // Browser-reserved shortcuts are intercepted by the frontend. A
+        // modified key that actually reaches this document still activates it.
+        if (!released && key !== "Escape") notifyPointerActivation();
         trust.keyDispatch = true;
         let prevented = false;
         try {
@@ -3001,7 +3116,7 @@
     // on the object, so reuse across a chain would corrupt the sequence.
     let hoverTarget = null;
     let hoveredChildFrame = null;
-    let nativePointerPosition = null, primaryPointerDown = false, suppressCompatibilityMouse = false;
+    let nativePointerPosition = null, suppressCompatibilityMouse = false;
     // The click coordinates above are consumed by activateClick. Retain the
     // actual cursor position independently for an asynchronous lock result,
     // and the last mousemove separately for movementX/movementY deltas.
@@ -3012,9 +3127,86 @@
     const pointerLockState = __pointer_lock_state({target:null, owner:null,
         raw:false, position:null, next:1, queue:[], command:null, blocked:false});
     delete g.__pointer_lock_state;
-    let pointerActivation = -Infinity, pointerRelock = false;
+    // One actual mouse pointer across the page's realms. Capture does not end
+    // at an iframe border, and chorded buttons do not create extra pointers.
+    const pointerInput = pointerLockState.input || (pointerLockState.input = {
+        active:false, buttons:0, document:null, capture:null, pending:null,
+        position:null, modifiers:0, button:-1, suppress:false, downs:new Map(),
+        series:null, click:null
+    });
+    function nativeModifiers() {
+        const bits = pointerInput.modifiers;
+        if (pointerInput.modifierBits !== bits) {
+            pointerInput.modifierBits = bits;
+            pointerInput.modifierValues = {shiftKey:!!(bits&1), ctrlKey:!!(bits&2), altKey:!!(bits&4), metaKey:!!(bits&8)};
+        }
+        return pointerInput.modifierValues;
+    }
+    trust.pointerModifiers = function (bits) { pointerInput.modifiers = bits & 15; };
+    function captureEvent(type, target) {
+        const p = pointerInput.position || {x:0,y:0,screenX:0,screenY:0};
+        const origin = messageWindowState.pointerOrigin();
+        dispatch(target, createTrustedEvent(PointerEvent, type, {
+            bubbles:true, cancelable:false, composed:true, view:g, detail:0,
+            clientX:p.x-origin.x, clientY:p.y-origin.y, screenX:p.screenX, screenY:p.screenY,
+            ...nativeModifiers(), pointerId:1, pointerType:"mouse", isPrimary:true,
+            button:pointerInput.button, buttons:pointerInput.buttons, pressure:pointerInput.buttons ? 0.5 : 0
+        }), false);
+    }
+    function processPointerCapture() {
+        const state = pointerInput;
+        if (!state.capture && !state.pending) return;
+        let previous = state.capture;
+        if (previous && !previous.target.isConnected)
+            previous = state.capture = {...previous, target:previous.target.ownerDocument};
+        if (state.pending && !state.pending.target.isConnected) state.pending = null;
+        if (previous && (!state.pending || previous.target !== state.pending.target))
+            previous.fire("lostpointercapture", previous.target);
+        const pending = state.pending;
+        if (pending && (!previous || previous.target !== pending.target))
+            pending.fire("gotpointercapture", pending.target);
+        state.capture = state.pending;
+    }
+    function capturePointerId(target, id, count) {
+        if (elementIdentity(target) === undefined) throw new TypeError("Expected an Element");
+        if (!count) throw new TypeError("Missing pointerId");
+        return +id | 0;
+    }
+    const pointerCaptureMethods = {
+        setPointerCapture(id) {
+            id = capturePointerId(this,id,arguments.length);
+            if (id !== 1 || !pointerInput.active) throw new DOMException("Unknown pointer", "NotFoundError");
+            if (!this.isConnected || (pointerLockState.target && pointerLockState.target.ownerDocument === this.ownerDocument))
+                throw new DOMException("Cannot capture this pointer", "InvalidStateError");
+            if (!pointerInput.buttons || this.ownerDocument !== pointerInput.document) return;
+            const owner = windowMessageState(this.ownerDocument.defaultView);
+            pointerInput.pending = {target:this, fire:owner.captureEvent};
+        },
+        releasePointerCapture(id) {
+            id = capturePointerId(this,id,arguments.length);
+            if (id !== 1 || !pointerInput.active) throw new DOMException("Unknown pointer", "NotFoundError");
+            if (pointerInput.pending && pointerInput.pending.target === this) pointerInput.pending = null;
+        },
+        hasPointerCapture(id) {
+            id = capturePointerId(this,id,arguments.length);
+            return id === 1 && !!pointerInput.pending && pointerInput.pending.target === this;
+        }
+    };
+    function pointerClickTarget(down, up) {
+        if (!down || !down.isConnected || !up || !up.isConnected) return null;
+        const path = hoverPath(down);
+        for (const node of hoverPath(up)) if (path.includes(node)) return node;
+        return null;
+    }
+    let pointerRelock = false;
+    function hasTransientActivation(state = topWindowState, now = currentTime()) {
+        return now >= state.lastActivation && now < state.lastActivation + 5000;
+    }
     function notifyPointerActivation() {
-        pointerActivation = g.performance.now();
+        // HTML #user-activation-processing-model: the originating Window, all
+        // ancestors, and only its same-origin descendants. No sibling activation.
+        messageWindowState.activateDescendants(messageWindowState.originKey);
+        for (let parent = messageWindowState.parent(); parent; parent = parent.parent()) parent.activate();
         pointerLockState.blocked = false;
     }
     function pointerLockEvent(document, type) {
@@ -3059,16 +3251,24 @@
             __queue_dom_task(() => pointerLockEvent(target.ownerDocument, "pointerlockchange"));
         }
         if (userExit) {
-            pointerRelock = false; pointerActivation = -Infinity; state.blocked = true;
+            pointerRelock = false; state.blocked = true;
             const pending = state.queue.splice(0);
             for (const record of pending) record.owner.pointerLockFailure(record, "NotAllowedError");
             // Also release capture acquired by a native request whose result
             // was still queued when Escape/focus loss reached the actor.
             state.command = [0, null, false];
+            if (pointerInput.buttons && pointerInput.lastTarget) {
+                const target = pointerInput.capture ? pointerInput.capture.target : pointerInput.lastTarget;
+                const owner = windowMessageState(target.ownerDocument.defaultView);
+                if (owner) owner.captureEvent("pointercancel", target);
+            }
+            pointerInput.pending = null; processPointerCapture();
+            pointerInput.downs.clear(); pointerInput.click = null;
         }
         nativePointerPosition = null;
         lastPointerPosition = position; previousPointerMotion = position;
-        lockedButtons = 0; primaryPointerDown = false; suppressCompatibilityMouse = false;
+        lockedButtons = 0; suppressCompatibilityMouse = false;
+        pointerInput.buttons = 0; pointerInput.suppress = false;
     }
     trust.releasePointerLock = releasePointerLock;
     function currentPointerLock() {
@@ -3100,6 +3300,9 @@
             return;
         }
         state.target = record.target; state.owner = trust; state.raw = record.raw;
+        lockedButtons = pointerInput.buttons;
+        pointerInput.pending = null;
+        processPointerCapture();
         state.position = lastPointerPosition || {clientX:0, clientY:0, screenX:0, screenY:0, pageX:0, pageY:0};
         __queue_dom_task(() => {
             pointerLockEvent(record.document, "pointerlockchange");
@@ -3117,7 +3320,7 @@
                 raw, resolve, reject, owner:trust, sent:false};
             let error = null;
             if (!target.isConnected) error = "WrongDocumentError";
-            else if (pointerLockState.blocked || (!pointerRelock && g.performance.now() - pointerActivation >= 5000))
+            else if (pointerLockState.blocked || (!pointerRelock && !hasTransientActivation()))
                 error = "NotAllowedError";
             for (let frame = frameOwnerForNode(target); !error && frame; frame = frameOwnerForNode(frame)) {
                 const sandbox = frame.getAttribute("sandbox");
@@ -3146,9 +3349,19 @@
         const before = lockedButtons;
         const mask = button === 1 ? 4 : button === 2 ? 2 : 1 << button;
         lockedButtons = pressed ? lockedButtons | mask : lockedButtons & ~mask;
-        primaryPointerDown = !!(lockedButtons & 1);
+        pointerInput.active = true; pointerInput.buttons = lockedButtons;
+        pointerInput.document = target.ownerDocument; pointerInput.lastTarget = target;
+        let down = pointerInput.downs.get(button);
+        if (pressed) {
+            const last = pointerInput.series, p = pointerLockState.position;
+            const now = currentTime()+agentTimeOffset;
+            const detail = last && last.target === target && last.button === button && now-last.time<500
+                && Math.abs(last.x-p.screenX)<=4 && Math.abs(last.y-p.screenY)<=4 ? last.detail+1 : 1;
+            down = {target,detail}; pointerInput.downs.set(button,down);
+        }
         const init = {...pointerLockState.position, bubbles:true, cancelable:true, composed:true,
-            view:g, button, buttons:lockedButtons, detail:1, pointerId:1, pointerType:"mouse", isPrimary:true};
+            ...nativeModifiers(), view:g, button, buttons:lockedButtons, detail:down ? down.detail : 1,
+            pointerId:1, pointerType:"mouse", isPrimary:true};
         // Pointer Events #chorded-button-interactions: only the first press
         // and final release produce down/up; intermediate changes are moves.
         const type = !before && pressed ? 'pointerdown' : !lockedButtons && !pressed ? 'pointerup' : 'pointermove';
@@ -3157,7 +3370,15 @@
         if (type === 'pointerdown') suppressCompatibilityMouse = pointer.defaultPrevented;
         if (!suppressCompatibilityMouse)
             dispatch(target, createTrustedEvent(MouseEvent, pressed ? "mousedown" : "mouseup", init), false);
-        if (!pressed) dispatch(target, createTrustedEvent(PointerEvent, button === 0 ? "click" : "auxclick", init), false);
+        if (!pressed) {
+            pointerInput.downs.delete(button);
+            if (button === 2) dispatch(target,createTrustedEvent(PointerEvent,"contextmenu",{...init,detail:0,isPrimary:false}),false);
+            if (down) {
+                pointerInput.series = {target,button,detail:down.detail,time:currentTime()+agentTimeOffset,x:init.screenX,y:init.screenY};
+                dispatch(target, createTrustedEvent(PointerEvent, button === 0 ? "click" : "auxclick", {...init,isPrimary:false}), false);
+                if (button === 0 && down.detail === 2) dispatch(target,createTrustedEvent(MouseEvent,"dblclick",init),false);
+            }
+        }
         if (type === 'pointerup') suppressCompatibilityMouse = false;
     };
     trust.lockedWheel = function (dx, dy) {
@@ -3165,50 +3386,92 @@
         if (!target) return;
         if (pointerLockState.owner !== trust) return pointerLockState.owner.lockedWheel(dx, dy);
         dispatch(target, createTrustedEvent(WheelEvent, "wheel", {...pointerLockState.position,
+            ...nativeModifiers(),
             bubbles:true, cancelable:true, composed:true, view:g, deltaX:dx, deltaY:dy, deltaZ:0, deltaMode:0}), false);
     };
     // UI Events native mouse down/up and Pointer Events compatibility mapping.
     // These entry points receive actual frontend transitions, never fabricated
     // press/release events for HTMLElement.click() or keyboard activation.
-    trust.pointerButton = function (id, pressed, x, y, screenX, screenY) {
-        if (currentPointerLock()) return trust.lockedPointerButton(0, pressed);
-        if (pressed) notifyPointerActivation();
+    trust.pointerButton = function (id, pressed, x, y, screenX, screenY, button = 0, modifiers = 0, routed = false) {
+        if (currentPointerLock()) { pointerInput.modifiers = modifiers; return trust.lockedPointerButton(button, pressed); }
         x = +x || 0; y = +y || 0;
         screenX = screenX === undefined ? x : +screenX || 0;
         screenY = screenY === undefined ? y : +screenY || 0;
+        if (!routed) {
+            const origin = messageWindowState.pointerOrigin();
+            pointerInput.position = {x:x+origin.x,y:y+origin.y,screenX,screenY};
+            pointerInput.active = true; pointerInput.modifiers = modifiers; pointerInput.button = button;
+            const mask = button === 1 ? 4 : button === 2 ? 2 : 1 << button;
+            pointerInput.beforeButtons = pointerInput.buttons;
+            pointerInput.buttons = pressed ? pointerInput.buttons | mask : pointerInput.buttons & ~mask;
+            processPointerCapture();
+        }
+        const hit = id;
+        if (pointerInput.capture && (!routed || id != null)) id = elementIdentity(pointerInput.capture.target);
         const childFrame = nativeInputChildFrame(id);
         if (childFrame) {
             const rect = frameContentClientRect(childFrame);
             const canceled = childFrame.__contentRealmWindow.__trust.pointerButton(id, pressed,
-                x - rect.left, y - rect.top, screenX, screenY);
+                x - rect.left, y - rect.top, screenX, screenY, button, modifiers, true);
             if (pressed && !canceled) trust.focusPage(id);
+            if (!pressed && !pointerInput.buttons) trust.hover(hit,x,y,screenX,screenY,modifiers,false,false);
             return canceled;
         }
         const target = id === null || id === undefined ? g.document.documentElement : wrap(id);
         if (!target) return false;
-        primaryPointerDown = !!pressed;
+        pointerInput.document = target.ownerDocument;
+        pointerInput.lastTarget = target;
+        if (pressed) notifyPointerActivation();
+        const buttons = pointerInput.buttons;
+        const previous = pointerInput.series;
+        let down = pointerInput.downs.get(button);
+        if (pressed) {
+            const now = currentTime() + agentTimeOffset;
+            const detail = previous && previous.target === target && previous.button === button
+                && now - previous.time < 500 && Math.abs(screenX-previous.x) <= 4 && Math.abs(screenY-previous.y) <= 4
+                ? previous.detail + 1 : 1;
+            down = {target, detail}; pointerInput.downs.set(button, down);
+        }
         nativePointerPosition = {
             clientX: x, clientY: y, screenX, screenY,
             pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
+            ...nativeModifiers(), detail:down ? down.detail : 1, button, buttons,
         };
         lastPointerPosition = nativePointerPosition;
+        trust.hover(id,x,y,screenX,screenY,modifiers,true,false);
         const init = Object.assign({bubbles:true, cancelable:true, composed:true, view:g,
-            detail:1, button:0, buttons:pressed ? 1 : 0, pointerId:1, pointerType:"mouse",
-            isPrimary:true, width:1, height:1, pressure:pressed ? 0.5 : 0}, nativePointerPosition);
-        const pointer = createTrustedEvent(PointerEvent, pressed ? "pointerdown" : "pointerup", {...init, detail:0});
+            pointerId:1, pointerType:"mouse", isPrimary:true, width:1, height:1, pressure:buttons ? 0.5 : 0}, nativePointerPosition);
+        const type = !pointerInput.beforeButtons && pressed ? "pointerdown" : !buttons && !pressed ? "pointerup" : "pointermove";
+        const captured = !!pointerInput.capture;
+        const pointer = createTrustedEvent(PointerEvent, type, {...init, detail:0});
         dispatch(target, pointer, false);
-        if (pressed) suppressCompatibilityMouse = pointer.defaultPrevented;
-        let canceled = suppressCompatibilityMouse;
-        if (!suppressCompatibilityMouse) {
-            const mouse = createTrustedEvent(MouseEvent, pressed ? "mousedown" : "mouseup", {
-                bubbles:true, cancelable:true, composed:true, view:g, detail:1,
-                button:0, buttons:pressed ? 1 : 0, ...nativePointerPosition
-            });
+        if (type === "pointerdown") pointerInput.suppress = pointer.defaultPrevented;
+        let canceled = pointerInput.suppress;
+        if (!pointerInput.suppress) {
+            const mouse = createTrustedEvent(MouseEvent, pressed ? "mousedown" : "mouseup", init);
             dispatch(target, mouse, false);
             canceled = mouse.defaultPrevented;
         }
         if (pressed && !canceled) trust.focusPage(id);
-        if (!pressed) suppressCompatibilityMouse = false;
+        if (!pressed) {
+            const clickTarget = captured ? target : pointerClickTarget(down && down.target, target);
+            pointerInput.downs.delete(button);
+            if (clickTarget) {
+                pointerInput.series = {target:clickTarget, button, detail:down ? down.detail : 1,
+                    time:currentTime()+agentTimeOffset, x:screenX, y:screenY};
+                if (button === 0) pointerInput.click = {target:clickTarget, owner:trust, init:nativePointerPosition};
+            }
+            if (type === "pointerup") {
+                pointerInput.pending = null; processPointerCapture(); pointerInput.suppress = false;
+                trust.hover(hit,x,y,screenX,screenY,modifiers,true,false);
+            }
+            if (button === 2) dispatch(target, createTrustedEvent(PointerEvent,"contextmenu", {
+                ...init, detail:0, isPrimary:false, pressure:0
+            }), false);
+            if (button !== 0 && clickTarget) dispatch(clickTarget,createTrustedEvent(PointerEvent,"auxclick", {
+                ...init, isPrimary:false, pressure:0
+            }),false);
+        }
         return canceled;
     };
     // The composed ancestor path (target-first), the same parentNode/__host
@@ -3222,7 +3485,7 @@
     // One pointer/mouse compat pair. over/out/move bubble and are cancelable;
     // enter/leave are neither (Pointer Events event tables).
     function fireHoverPair(name, target, related, bubbling, x, y, screenX, screenY, movementX = 0, movementY = 0) {
-        const buttons = pointerLockState.target ? lockedButtons : primaryPointerDown ? 1 : 0;
+        const buttons = pointerLockState.target ? lockedButtons : pointerInput.buttons;
         const init = {
             bubbles: bubbling, cancelable: bubbling, composed: bubbling,
             clientX: x, clientY: y,
@@ -3230,6 +3493,7 @@
             screenX, screenY, button: buttons & 1 ? 0 : buttons & 2 ? 2 : buttons & 4 ? 1 : 0, buttons,
             relatedTarget: related, view: g, detail: 0,
             movementX, movementY,
+            ...nativeModifiers(),
         };
         const pinit = Object.assign({}, init, {pointerId:1, pointerType:"mouse", isPrimary:true,
             button:-1, pressure:buttons ? 0.5 : 0});
@@ -3239,26 +3503,34 @@
             ...pinit, bubbles:false, cancelable:false, composed:false
         })];
         dispatch(target, createTrustedEvent(PointerEvent, "pointer" + name, pinit), false);
-        if (name !== "move" || !suppressCompatibilityMouse)
+        if (name !== "move" || !(pointerLockState.target ? suppressCompatibilityMouse : pointerInput.suppress))
             dispatch(target, createTrustedEvent(MouseEvent, "mouse" + name, init), false);
     }
     // CSSOM View's MouseEvent extensions distinguish screen coordinates from
     // viewport-relative client coordinates. Keep the frontend's screen space unchanged across
     // nested browsing contexts; only the client pair crosses content-box origins.
-    trust.hover = function (id, x, y, screenX, screenY) {
+    trust.hover = function (id, x, y, screenX, screenY, modifiers = 0, routed = false, motion = true) {
         if (currentPointerLock()) return true;
         // A stale id (the node was detached since the snapshot the app hit-test
         // ran against) wraps to null — degrade to hover-clear, never an error.
-        const childFrame = nativeInputChildFrame(id);
-        const t = childFrame || (id === null || id === undefined ? null : wrap(id));
         x = +x || 0; y = +y || 0;
         screenX = screenX === undefined ? x : +screenX || 0;
         screenY = screenY === undefined ? y : +screenY || 0;
+        if (!routed) {
+            const origin = messageWindowState.pointerOrigin();
+            pointerInput.position = {x:x+origin.x,y:y+origin.y,screenX,screenY};
+            pointerInput.active = true; pointerInput.modifiers = modifiers; pointerInput.button = -1;
+            processPointerCapture();
+        }
+        if (pointerInput.capture && (!routed || id != null)) id = elementIdentity(pointerInput.capture.target);
+        const childFrame = nativeInputChildFrame(id);
+        const t = childFrame || (id === null || id === undefined ? null : wrap(id));
+        if (t && !childFrame) { pointerInput.document = t.ownerDocument; pointerInput.lastTarget = t; }
         function childHover(frame, target) {
             const child = frame.__contentRealmWindow;
             if (!child) return;
             const rect = frameContentClientRect(frame);
-            child.__trust.hover(target, x - rect.left, y - rect.top, screenX, screenY);
+            child.__trust.hover(target, x - rect.left, y - rect.top, screenX, screenY, modifiers, true, motion);
         }
         if (hoveredChildFrame && hoveredChildFrame !== childFrame) childHover(hoveredChildFrame, null);
         hoveredChildFrame = childFrame;
@@ -3286,7 +3558,7 @@
         // The native lane may coalesce samples, but a target transition is not
         // the condition for `pointermove`/`mousemove` dispatch.
         const previous = previousPointerMotion;
-        if (t) fireHoverPair("move", t, null, true, x, y, screenX, screenY,
+        if (t && motion) fireHoverPair("move", t, null, true, x, y, screenX, screenY,
             previous ? screenX - previous.screenX : 0, previous ? screenY - previous.screenY : 0);
         lastPointerPosition = previousPointerMotion = t ? {clientX:x, clientY:y, screenX, screenY,
             pageX:x+(g.scrollX||0), pageY:y+(g.scrollY||0)} : null;
@@ -8113,6 +8385,12 @@
     // owner and re-run its attribute-processing steps; only a top-level choice
     // is returned to the frontend as a page navigation.
     trust.followAnchorDefault = function (nodeId) {
+        const clicked = pointerInput.clickDefault;
+        if (clicked) {
+            if (clicked.owner !== trust) return clicked.owner.followAnchorDefault(clicked.target.__id);
+            pointerInput.clickDefault = null;
+            nodeId = clicked.target.__id;
+        }
         let anchor = pendingClickHyperlink;
         pendingClickHyperlink = null;
         if (!anchor) anchor = hyperlinkActivationTarget(wrap(nodeId));
@@ -10639,6 +10917,9 @@
     pointerDefine(Element.prototype, "requestPointerLock", {
         value:requestPointerLock, writable:true, enumerable:true, configurable:true,
     });
+    // Pointer Events #extensions-to-the-element-interface / capture algorithms.
+    for (const name of ["setPointerCapture", "releasePointerCapture", "hasPointerCapture"])
+        pointerDefine(Element.prototype,name,{value:pointerCaptureMethods[name],writable:true,enumerable:true,configurable:true});
     pointerDefine(Document.prototype, "exitPointerLock", {
         value:function exitPointerLock() {
             if (!(this instanceof Document)) throw new TypeError("Expected a Document");
@@ -11173,6 +11454,15 @@
         define(g,'navigator',{configurable:true,enumerable:true,
             get:named({get(){return associatedNavigator(this);}}.get,'get navigator')});
         if(!worker) {
+            const UserActivation = class UserActivation { constructor() { throw new TypeErrorCtor('Illegal constructor'); } };
+            define(UserActivation.prototype,Symbol.toStringTag,{value:'UserActivation',configurable:true});
+            readonly(UserActivation.prototype,'hasBeenActive','UserActivation',s=>s.now()>=s.window.lastActivation);
+            readonly(UserActivation.prototype,'isActive','UserActivation',s=>hasTransientActivation(s.window,s.now()));
+            const activation=Object.create(UserActivation.prototype);
+            apply(weakSet,slots,[activation,{kind:'UserActivation',window:topWindowState,now:currentTime}]);
+            values.userActivation=activation;
+            readonly(Constructor.prototype,'userActivation',interfaceName,s=>s.values.userActivation);
+            g.UserActivation=UserActivation;
             define(g,'clientInformation',{configurable:true,enumerable:true,
                 get:named({get(){return associatedNavigator(this);}}.get,'get clientInformation'),
                 set:named({set(value){
@@ -12878,6 +13168,23 @@
         && cfg.parentWindow ? windowMessageState(cfg.parentWindow) : null;
     const messageWindowState = {
         window: g,
+        captureEvent,
+        frameRect(id) { return frameContentClientRect(wrap(id)); },
+        pointerOrigin() {
+            const parent = this.parent();
+            if (!parent) return {x:0,y:0};
+            const origin = parent.pointerOrigin(), rect = parent.frameRect(this.frameId);
+            return {x:origin.x+rect.left,y:origin.y+rect.top};
+        },
+        parent() { return cfg.parentWindow ? windowMessageState(cfg.parentWindow) : null; },
+        activate() { topWindowState.lastActivation = currentTime(); },
+        activateDescendants(origin) {
+            if (this.originKey === origin) this.activate();
+            for (const child of childActivationWindows) {
+                const state = windowMessageState(child);
+                if (state) state.activateDescendants(origin);
+            }
+        },
         apiBaseURL() { return documentBaseURL(realmRootFrame); },
         documentURL() { return g.document.URL; },
         frameId: realmRootFrame ? realmRootFrame.__id : 0,

@@ -1627,6 +1627,8 @@ impl App {
                 pressed,
                 x,
                 y,
+                button: 0,
+                metadata: crate::js::PointerMetadata::default(),
             });
         }
     }

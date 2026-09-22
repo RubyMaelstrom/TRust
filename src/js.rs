@@ -295,6 +295,7 @@ pub enum PageCmd {
     },
     /// Unconditional native release (Escape, focus loss, or retired window).
     ReleasePointerLock,
+    InputModifiers(crate::core::Modifiers),
     PointerMotion {
         dx: f64,
         dy: f64,
@@ -307,12 +308,14 @@ pub enum PageCmd {
         dx: f64,
         dy: f64,
     },
-    /// Actual primary-pointer transitions, before the separate click action.
+    /// Actual pointer transitions, before the separate primary click action.
     PointerButton {
         node: Option<usize>,
         pressed: bool,
         x: f64,
         y: f64,
+        button: i16,
+        metadata: PointerMetadata,
     },
     /// Native focus navigation. None focuses the document viewport; a hit on
     /// an element resolves to its nearest click-focusable ancestor.
@@ -367,6 +370,7 @@ pub enum PageCmd {
         node: Option<usize>,
         x: f64,
         y: f64,
+        metadata: PointerMetadata,
     },
     RegionGeom {
         items: Vec<(usize, f64, f64)>,
@@ -394,6 +398,7 @@ impl PageCmd {
                 | Self::TraverseHistory { .. }
                 | Self::PointerLockResult { .. }
                 | Self::ReleasePointerLock
+                | Self::InputModifiers(_)
                 | Self::PointerMotion { .. }
                 | Self::LockedPointerButton { .. }
                 | Self::LockedWheel { .. }
@@ -417,6 +422,24 @@ pub(crate) struct PageHover {
     pub(crate) node: Option<usize>,
     pub(crate) x: f64,
     pub(crate) y: f64,
+    pub(crate) metadata: PointerMetadata,
+}
+
+/// Observed native input, kept intact through coalescing and iframe routing.
+/// Terminals without an exposed screen origin leave `screen` unspecified.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PointerMetadata {
+    pub screen: Option<(f64, f64)>,
+    pub modifiers: crate::core::Modifiers,
+}
+
+impl PointerMetadata {
+    pub(crate) fn modifier_bits(self) -> u8 {
+        u8::from(self.modifiers.shift)
+            | (u8::from(self.modifiers.control) << 1)
+            | (u8::from(self.modifiers.alt) << 2)
+            | (u8::from(self.modifiers.meta) << 3)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,9 +630,31 @@ impl PageHandle {
     }
 
     pub fn send_hover(&self, node: Option<usize>, x: f64, y: f64) -> bool {
-        let hover = PageHover { node, x, y };
+        self.send_hover_with_metadata(node, x, y, PointerMetadata::default())
+    }
+
+    pub fn send_hover_with_metadata(
+        &self,
+        node: Option<usize>,
+        x: f64,
+        y: f64,
+        metadata: PointerMetadata,
+    ) -> bool {
+        let hover = PageHover {
+            node,
+            x,
+            y,
+            metadata,
+        };
         let Some(sender) = self.state.hover.as_ref() else {
-            return self.try_send_user(PageCmd::Hover { node, x, y }).is_ok();
+            return self
+                .try_send_user(PageCmd::Hover {
+                    node,
+                    x,
+                    y,
+                    metadata,
+                })
+                .is_ok();
         };
         sender.send(hover).is_ok()
     }
