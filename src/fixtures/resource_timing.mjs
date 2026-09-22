@@ -2,14 +2,15 @@
 // independently exercised by the native localhost integration tests.
 (function () {
     const check = (ok, message) => { if (!ok) throw Error(message); };
+    const worker = typeof document === 'undefined', host = worker ? __wkr : __trust;
     const p = performance, t = p.timeOrigin;
-    const put = n => __trust.recordResourceTiming({name:'https://original.test/'+n,
+    const put = n => host.recordResourceTiming({name:'https://original.test/'+n,
         initiatorType:'fetch',startTime:t+10,fetchStart:t+10,responseEnd:t+20,
         requestStart:t+11,responseStart:t+15,encodedBodySize:5,decodedBodySize:5,
         transferSize:305,responseStatus:200,nextHopProtocol:'http/1.1',
         renderBlockingStatus:'non-blocking'});
-    const run = () => { let count=0; while (__trust.hasPerformanceTask()) {
-        check(++count<20,'performance tasks do not spin'); __trust.runPerformanceTask();
+    const run = () => { let count=0; while (host.hasPerformanceTask()) {
+        check(++count<20,'performance tasks do not spin'); host.runPerformanceTask();
     }};
     p.clearResourceTimings(); p.setResourceTimingBufferSize(2);
     const events=[], received=[], counts=[];
@@ -45,7 +46,7 @@
     check(p.getEntriesByType('resource').length===0 && p.getEntriesByName(mark.name)[0]===mark,'clear only resources');
     p.onresourcetimingbufferfull=null; p.setResourceTimingBufferSize(0); put(4); run();
     check(received.length===4 && p.getEntriesByType('resource').length===0,'full buffer does not prevent live observation');
-    check(!__trust.hasPerformanceTask(),'unhandled overflow quiesces');
+    check(!host.hasPerformanceTask(),'unhandled overflow quiesces');
     p.setResourceTimingBufferSize(-1); put(5); run();
     check(p.getEntriesByType('resource').length===1,'unsigned long conversion');
     const buffered = new PerformanceObserver(()=>{});
@@ -71,7 +72,7 @@
         input[numbers[i]]=i<14 && expected[numbers[i]]!==0 ? t+expected[numbers[i]] : expected[numbers[i]];
     }
     for(let i=0;i<strings.length;i++) input[strings[i]]=expected[strings[i]]='original-'+i;
-    __trust.recordResourceTiming(input);
+    host.recordResourceTiming(input);
     const snapshot=p.getEntriesByName(input.name)[0];
     for(const name of numbers.concat(strings)) {
         input[name]='changed';check(snapshot[name]===expected[name],'snapshot getter '+name);
@@ -104,5 +105,6 @@
     }
     check(touched===0 && safeJSON.responseEnd===33,'private traversal and own JSON fields');
     p.clearResourceTimings();run();
-    document.body.setAttribute('data-resource-interface','ok');
+    if (!worker) document.body.setAttribute('data-resource-interface','ok');
+    return 'resource-timing-ok';
 })();

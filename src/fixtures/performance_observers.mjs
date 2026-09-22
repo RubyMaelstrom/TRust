@@ -2,10 +2,11 @@
 (function () {
     function check(ok,message) { if(!ok) throw Error(message); }
     function throws(name,fn) { try { fn(); } catch(error) { check(error.name===name,'wrong exception '+error.name);return; }throw Error('missing '+name); }
+    const worker = typeof document === 'undefined', host = worker ? __wkr : __trust;
     performance.clearMarks();performance.clearMeasures();
     check(Object.isFrozen(PerformanceObserver.supportedEntryTypes) &&
         PerformanceObserver.supportedEntryTypes===PerformanceObserver.supportedEntryTypes &&
-        PerformanceObserver.supportedEntryTypes.join(',')==='mark,measure,navigation,resource','truthful stable supported types');
+        PerformanceObserver.supportedEntryTypes.join(',')===(worker ? 'mark,measure,resource' : 'mark,measure,navigation,resource'),'truthful stable supported types');
     throws('TypeError',()=>new PerformanceObserver());
     throws('TypeError',()=>new PerformanceObserver({handleEvent(){}}));
     throws('TypeError',()=>new PerformanceObserverEntryList());
@@ -72,7 +73,7 @@
         globalThis.setTimeout=oldTimeout;globalThis.clearTimeout=oldClear;
         check(calls===2 && retained.getEntries().length===2,'retained callback list remains a snapshot');
         first.disconnect();second.disconnect();performance.clearMarks();performance.clearMeasures();
-        check(!__trust.hasPerformanceTask(),'notification queue drains');
+        check(!host.hasPerformanceTask(),'notification queue drains');
         delete globalThis.performanceObserverCleanup;
     };
 })();

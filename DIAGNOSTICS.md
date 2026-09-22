@@ -53,6 +53,32 @@ and [worker settings](https://html.spec.whatwg.org/multipage/workers.html),
 [CSSOM View mouse coordinates](https://drafts.csswg.org/cssom-view-1/#extensions-to-the-mouseevent-interface),
 and [Fetch](https://fetch.spec.whatwg.org/#fetch-method).
 
+### Worker performance timelines
+
+Workers use the shared User Timing, Resource Timing, and PerformanceObserver
+implementation. Their entry buffers and time origins belong to the worker,
+not its owner Window; navigation timing remains Window-only. Observer delivery
+and resource-buffer-full events run as worker tasks after microtask checkpoints,
+without an extra thread or polling timer.
+
+```sh
+cargo test --release --lib worker_performance
+cargo test --release --lib worker_event_targets
+cargo test --release --lib user_timing_buffers_and_private_slots
+```
+
+The network fixture exercises real classic, module, and blob workers against two
+loopback origins. It checks successful fetches, observer delivery, per-worker
+entry ownership, and Timing-Allow-Origin filtering. Interface/event regressions
+also run in interpreter, bytecode, and JIT tiers. These implement the local
+2026-09-06 snapshots of [HR-Time](https://w3c.github.io/hr-time/#sec-performance),
+[User Timing](https://w3c.github.io/user-timing/),
+[Performance Timeline](https://w3c.github.io/performance-timeline/#queue-the-performanceobserver-task),
+[Resource Timing](https://w3c.github.io/resource-timing/#marking-resource-timing),
+and [DOM event dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch).
+Successful local checks do not establish why a remote challenge accepts or
+rejects a browser.
+
 ### WebAssembly
 
 Compare native WebAssembly execution against the interpreter with the same
