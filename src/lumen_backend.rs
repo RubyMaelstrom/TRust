@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 #[path = "canvas_host.rs"]
 mod canvas_host;
+#[path = "challenge_message_trace.rs"]
+mod challenge_message_trace;
 #[path = "image_bitmap_host.rs"]
 mod image_bitmap_host;
 #[path = "image_host.rs"]
@@ -2317,7 +2319,7 @@ mod desktop {
         // the route from location.pathname, so seeding the realm with `base`
         // collapses every such navigation to the base path.
         let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, navigationTiming: {} }};",
+            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {} }};",
             json_string(response_url.as_str()),
             json_string(crate::locale::LANGUAGE),
             json_string(crate::locale::LANGUAGES[0]),
@@ -2331,6 +2333,7 @@ mod desktop {
             crate::http::GLOBAL_PRIVACY_CONTROL,
             lumen_potentially_trustworthy(&response_url),
             std::env::var_os("TRUST_TRACE_FRAMES").is_some(),
+            std::env::var_os("TRUST_TRACE_CHALLENGE_MESSAGES").is_some(),
             env.navigation_timing
                 .as_ref()
                 .map_or(serde_json::Value::Null, |timing| {
@@ -6607,6 +6610,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__wasm_module_binding", 1, host_wasm_module_binding),
     ("__window_message_binding", 2, host_window_message_binding),
     (
+        "__trace_challenge_message",
+        6,
+        challenge_message_trace::call,
+    ),
+    (
         "__window_screen_coordinate",
         1,
         host_window_screen_coordinate,
@@ -7980,6 +7988,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             "globalPrivacyControl",
             "secureContext",
             "frameTrace",
+            "challengeMessageTrace",
         ] {
             if let Ok(value) = realm_ctx.member_get(&source_config, name) {
                 realm_ctx.member_set(&config, name, value)?;
@@ -14846,7 +14855,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 168, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 169, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -14857,7 +14866,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 168);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 169);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -15138,6 +15147,82 @@ mod tests {
                         "[typeof __callback_api, typeof __invoke_callback, setTimeout.name, setTimeout.length, setInterval.name, setInterval.length, callbackContextInvalid, callbackContextAssimilated].join('|')"
                     ),
                     "undefined|undefined|setTimeout|1|setInterval|1|4|false"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn challenge_message_trace_preserves_window_message_semantics() {
+        for enabled in [false, true] {
+            for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                let mut engine = configured_engine_before_prelude(
+                    HostState::new(
+                        Rc::new(RefCell::new(Dom::new())),
+                        Rc::new(RealmClock::new()),
+                    ),
+                    DEFAULT_URL,
+                );
+                eval(
+                    &mut engine,
+                    &format!(
+                        r#"
+                    globalThis.__trust_cfg.challengeMessageTrace = {enabled};
+                    globalThis.messageTrace = [];
+                    globalThis.__trace_challenge_message = (...args) => messageTrace.push(args);
+                "#
+                    ),
+                    "message trace fixture",
+                )
+                .unwrap();
+                eval_platform_prelude(&mut engine).unwrap();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(
+                    string_value(&mut engine, include_str!("fixtures/window_messages.mjs")),
+                    "window-messages-ok",
+                    "{tier:?}, enabled={enabled}"
+                );
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"
+                    (() => {
+                        function check(ok, label) { if (!ok) throw Error(label); }
+                        check(typeof __trace_challenge_message === 'undefined', 'private hook removed');
+                        messageTrace.length = 0;
+                        let reads = 0, received;
+                        const buffer = new Uint8Array([7,8]).buffer;
+                        const payload = {get event() { reads++; return 'fail'; },
+                            code: 600010, token: 'unchanged-token', buffer};
+                        addEventListener('message', e => {
+                            if (e.data && e.data.token === 'unchanged-token') received = e;
+                        });
+                        postMessage(payload, {transfer:[buffer]});
+                        check(reads === 1 && buffer.byteLength === 0 && !received, 'send semantics');
+                        payload.code = 123456;
+                        while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+                        check(reads === 1 && received.isTrusted && received.data.code === 600010
+                            && new Uint8Array(received.data.buffer).join() === '7,8', 'delivery unchanged');
+                        const enabled = __trust_cfg.challengeMessageTrace;
+                        check(messageTrace.map(x => x[0]).join() ===
+                            (enabled ? 'send,dispatch,dispatched' : ''), 'trace phases');
+                        if (enabled) check(messageTrace[0][1] === messageTrace[1][1], 'same wire snapshot');
+                        messageTrace.length = 0;
+                        postMessage({event:'fail'}, 'https://different.invalid');
+                        while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+                        check(messageTrace.map(x => x[0]).join() ===
+                            (enabled ? 'send,drop-origin' : ''), 'origin filtering unchanged');
+                        messageTrace.length = 0;
+                        let cloneError = false;
+                        try { postMessage(() => {}); } catch(e) { cloneError = e.name === 'DataCloneError'; }
+                        check(cloneError && !messageTrace.length, 'clone error unchanged');
+                        return 'message-trace-ok';
+                    })()
+                "#
+                    ),
+                    "message-trace-ok",
+                    "{tier:?}, enabled={enabled}"
                 );
             }
         }
