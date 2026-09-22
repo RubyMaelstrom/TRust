@@ -47,6 +47,8 @@
     delete g.__dom_fetch_classic_script;
     const makeWindowMessageBinding = g.__window_message_binding;
     delete g.__window_message_binding;
+    const traceChallengeMessage = cfg.challengeMessageTrace ? g.__trace_challenge_message : null;
+    delete g.__trace_challenge_message;
     const makeCallbackAPI = g.__callback_api, invokeCallback = g.__invoke_callback;
     delete g.__callback_api;
     delete g.__invoke_callback;
@@ -13159,7 +13161,9 @@
         if (cfg.frameTrace) ftrace("postMessage send from=" + sender.origin + " to=" + receiver.origin +
             " target=" + String(targetOrigin) + " bytes=" + wire.length + " ports=" + ports.length +
             " source-frame=" + sender.frameId + " receiver-frame=" + receiver.frameId + " event=" + messageKind);
-        receiver.enqueue(wire, sender.origin, sender.sourceFor(receiver.window), ports, targetOrigin, packet.buffers);
+        if (traceChallengeMessage) traceChallengeMessage("send", wire, sender.origin, receiver.origin,
+            sender.frameId, receiver.frameId);
+        receiver.enqueue(wire, sender.origin, sender.sourceFor(receiver.window), ports, targetOrigin, packet.buffers, sender.frameId);
     });
     windowMessageSlots = messaging[0];
     g.postMessage = messaging[1];
@@ -13198,17 +13202,23 @@
             return realmRootFrame && receiver !== g ? realmRootFrame.contentWindow : g;
         },
         serialize(value, transfer) { return serializeMessage(value, transfer); },
-        enqueue(wire, origin, source, ports, targetOrigin, buffers) {
+        enqueue(wire, origin, source, ports, targetOrigin, buffers, sourceFrameId) {
             const frame = trust.__activeFrame || null;
             __queue_message_task(function () {
                 if (cfg.frameTrace) ftrace("postMessage deliver from=" + origin + " to=" + messageWindowState.origin +
                     " target=" + String(targetOrigin) + " bytes=" + wire.length +
                     " frame=" + (frame ? frame.__id : 0) +
                     " realm=" + (realmRootFrame ? realmRootFrame.__id : 0));
-                if (targetOrigin !== "*" && targetOrigin !== messageWindowState.originKey) return;
+                if (targetOrigin !== "*" && targetOrigin !== messageWindowState.originKey) {
+                    if (traceChallengeMessage) traceChallengeMessage("drop-origin", wire, origin,
+                        messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
+                    return;
+                }
                 let packet;
                 try { packet = deserializeMessage({ wire, ports, buffers }); }
                 catch (_) {
+                    if (traceChallengeMessage) traceChallengeMessage("messageerror", wire, origin,
+                        messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
                     dispatch(g, createTrustedEvent(MessageEvent, "messageerror", { origin, source }), false);
                     return;
                 }
@@ -13216,7 +13226,11 @@
                     data: packet.data, origin, source, ports: Object.freeze(packet.ports)
                 });
                 event.__windowTargetSet = true; event.__frameTarget = frame;
+                if (traceChallengeMessage) traceChallengeMessage("dispatch", wire, origin,
+                    messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
                 dispatch(g, event, false);
+                if (traceChallengeMessage) traceChallengeMessage("dispatched", wire, origin,
+                    messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
             });
         }
     };

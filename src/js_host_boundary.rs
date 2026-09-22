@@ -6,6 +6,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__image_bitmap_binding", 3),
     ("__wasm_module_binding", 1),
     ("__window_message_binding", 2),
+    ("__trace_challenge_message", 6),
     ("__message_port_binding", 3),
     ("__window_screen_coordinate", 1),
     ("__callback_api", 3),
