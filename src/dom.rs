@@ -1258,7 +1258,7 @@ impl Dom {
                 rules.iter().any(|rule| {
                     rule_is_paint_only(rule)
                         && rule_uses_hover(rule)
-                        && matches!(rule.selector.0.as_slice(), [(_, compound)] if compound.host)
+                        && matches!(rule.selector.0.as_slice(), [(_, compound)] if compound.allows_shadow_host())
                 })
             }) {
                 out.push(host);
@@ -1413,7 +1413,7 @@ impl Dom {
                 .enumerate()
                 .filter(|(_, rule)| rule_affects_render(rule) && rule_uses_hover(rule))
                 .filter(|(_, rule)| {
-                    matches!(rule.selector.0.as_slice(), [(_, compound)] if compound.host)
+                    matches!(rule.selector.0.as_slice(), [(_, compound)] if compound.allows_shadow_host())
                 })
                 .map(|(ri, rule)| (ri as u32, self.host_rule_matches(host, rule)))
                 .collect();
@@ -5021,10 +5021,14 @@ impl Dom {
         let [(_, c)] = parts.as_slice() else {
             return false;
         };
-        c.host
-            && c.host_inner
-                .as_ref()
-                .is_none_or(|inner| self.matches_compound(host, inner, None))
+        self.matches_compound_in(
+            host,
+            c,
+            SelectorContext {
+                scope: None,
+                shadow_host: Some(host),
+            },
+        )
     }
 
     /// An element's computed value for a custom property (`--foo`): its own
@@ -5865,6 +5869,10 @@ impl Dom {
         let mut candidate_count = 0u64;
         let index = self.style_index();
         let scope = self.tree_scope(id);
+        let context = SelectorContext {
+            scope: None,
+            shadow_host: self.shadow_hosts.get(&scope).copied(),
+        };
         let cached_selectors = self
             .selector_cache
             .borrow()
@@ -5885,7 +5893,7 @@ impl Dom {
                     for ri in candidates {
                         candidate_count += 1;
                         let rule = &rules[ri as usize];
-                        if self.matches_complex(id, &rule.selector.0, None) {
+                        if self.matches_complex_in(id, &rule.selector.0, context) {
                             out.push(ri);
                         }
                     }
@@ -8401,10 +8409,11 @@ impl Dom {
     }
 
     fn matches_scoped(&self, id: NodeId, selectors: &SelectorList, scope: Option<NodeId>) -> bool {
+        let context = self.selector_context(id, scope);
         selectors
             .0
             .iter()
-            .any(|c| self.matches_complex(id, &c.0, scope))
+            .any(|c| self.matches_complex_in(id, &c.0, context))
     }
 
     fn matches_complex(
@@ -8413,36 +8422,61 @@ impl Dom {
         parts: &[(Combinator, Compound)],
         scope: Option<NodeId>,
     ) -> bool {
+        self.matches_complex_in(id, parts, self.selector_context(id, scope))
+    }
+
+    fn selector_context(&self, id: NodeId, scope: Option<NodeId>) -> SelectorContext {
+        SelectorContext {
+            scope,
+            shadow_host: if self.shadow_hosts.is_empty() {
+                None
+            } else {
+                self.shadow_hosts
+                    .get(&self.tree_scope(scope.unwrap_or(id)))
+                    .copied()
+            },
+        }
+    }
+
+    fn matches_complex_in(
+        &self,
+        id: NodeId,
+        parts: &[(Combinator, Compound)],
+        scope: SelectorContext,
+    ) -> bool {
         let Some(((comb, compound), rest)) = parts.split_last() else {
             return false;
         };
-        if !self.matches_compound(id, compound, scope) {
+        if !self.matches_compound_in(id, compound, scope) {
             return false;
         }
         if rest.is_empty() {
             return true;
         }
+        if scope.shadow_host == Some(id) {
+            return false;
+        }
         match comb {
             Combinator::Child => self
-                .selector_parent(id)
-                .is_some_and(|p| self.matches_complex(p, rest, scope)),
+                .selector_parent_in(id, scope)
+                .is_some_and(|p| self.matches_complex_in(p, rest, scope)),
             Combinator::Descendant | Combinator::None => {
-                let mut up = self.selector_parent(id);
+                let mut up = self.selector_parent_in(id, scope);
                 while let Some(a) = up {
-                    if self.matches_complex(a, rest, scope) {
+                    if self.matches_complex_in(a, rest, scope) {
                         return true;
                     }
-                    up = self.selector_parent(a);
+                    up = self.selector_parent_in(a, scope);
                 }
                 false
             }
             Combinator::NextSibling => self
                 .prev_element_sibling(id)
-                .is_some_and(|s| self.matches_complex(s, rest, scope)),
+                .is_some_and(|s| self.matches_complex_in(s, rest, scope)),
             Combinator::SubsequentSibling => {
                 let mut sib = self.prev_element_sibling(id);
                 while let Some(s) = sib {
-                    if self.matches_complex(s, rest, scope) {
+                    if self.matches_complex_in(s, rest, scope) {
                         return true;
                     }
                     sib = self.prev_element_sibling(s);
@@ -8450,6 +8484,19 @@ impl Dom {
                 false
             }
         }
+    }
+
+    fn selector_parent_in(&self, id: NodeId, context: SelectorContext) -> Option<NodeId> {
+        if context.shadow_host == Some(id) {
+            return None;
+        }
+        let parent = self.nodes[id].parent?;
+        if self.shadow_hosts.get(&parent).copied() == context.shadow_host
+            && context.shadow_host.is_some()
+        {
+            return context.shadow_host;
+        }
+        self.selector_parent(id)
     }
 
     /// Parent used by Selectors matching. CSS Shadow 1 §3.2/§4.1 draws an
@@ -8507,7 +8554,7 @@ impl Dom {
         of_type: bool,
         from_end: bool,
         of: Option<&[Complex]>,
-        scope: Option<NodeId>,
+        scope: SelectorContext,
     ) -> Option<i32> {
         let parent = self.nodes[id].parent?;
         let my_tag = self.tag_name(id)?;
@@ -8517,7 +8564,10 @@ impl Dom {
         while let Some(c) = child {
             if let Some(t) = self.tag_name(c)
                 && (!of_type || t == my_tag)
-                && of.is_none_or(|sels| sels.iter().any(|cx| self.matches_complex(c, &cx.0, scope)))
+                && of.is_none_or(|sels| {
+                    sels.iter()
+                        .any(|cx| self.matches_complex_in(c, &cx.0, scope))
+                })
             {
                 count += 1;
                 if c == id {
@@ -8534,7 +8584,7 @@ impl Dom {
         })
     }
 
-    fn matches_structural(&self, id: NodeId, st: &Structural, scope: Option<NodeId>) -> bool {
+    fn matches_structural(&self, id: NodeId, st: &Structural, scope: SelectorContext) -> bool {
         match st {
             Structural::Empty => self.is_element_empty(id),
             Structural::Nth {
@@ -8549,13 +8599,32 @@ impl Dom {
     }
 
     fn matches_compound(&self, id: NodeId, c: &Compound, scope: Option<NodeId>) -> bool {
+        self.matches_compound_in(id, c, self.selector_context(id, scope))
+    }
+
+    fn matches_compound_in(&self, id: NodeId, c: &Compound, scope: SelectorContext) -> bool {
         if c.never {
             return false;
         }
-        // `:host` targets the shadow host, which is NOT inside the shadow tree
-        // these rules are scoped to — it's matched specially in `cascaded`
-        // (`host_rule_matches`), never against in-scope elements here.
-        if c.host {
+        // CSS Shadow 1 #host-element-in-tree: replace the shadow root with
+        // its featureless host while matching in that tree. Selectors 4
+        // #featureless-elements also applies inside logical pseudo-classes.
+        if scope.shadow_host == Some(id) {
+            // The relative-selector anchor inserted for :has() is not an
+            // author simple selector on the featureless host.
+            if c.relative_anchor && scope.scope == Some(id) {
+                return true;
+            }
+            if !c.allows_shadow_host() {
+                return false;
+            }
+            if c.host_inner
+                .as_ref()
+                .is_some_and(|inner| !self.matches_compound(id, inner, None))
+            {
+                return false;
+            }
+        } else if c.host {
             return false;
         }
         // `::slotted()` is matched by `slotted_rule_matches` against the
@@ -8565,7 +8634,7 @@ impl Dom {
             return false;
         }
         // `:scope` matches only the query root (None in the cascade → never).
-        if c.scope && scope != Some(id) {
+        if c.scope && scope.scope != Some(id) {
             return false;
         }
         // Live `:hover`: on the chain under the terminal's pointer. The
@@ -8631,7 +8700,7 @@ impl Dom {
         if !c.selects.iter().all(|(group, _)| {
             group
                 .iter()
-                .any(|cx| self.matches_complex(id, &cx.0, scope))
+                .any(|cx| self.matches_complex_in(id, &cx.0, scope))
         }) {
             return false;
         }
@@ -8641,14 +8710,14 @@ impl Dom {
         if !c
             .has
             .iter()
-            .all(|group| group.iter().any(|h| self.matches_has(id, h)))
+            .all(|group| group.iter().any(|h| self.matches_has(id, h, scope)))
         {
             return false;
         }
         c.nots
             .iter()
             .flatten()
-            .all(|n| !self.matches_complex(id, &n.0, scope))
+            .all(|n| !self.matches_complex_in(id, &n.0, scope))
     }
 
     /// Evaluate one element-state pseudo-class (see [`StatePseudo`]) against
@@ -8940,9 +9009,13 @@ impl Dom {
     /// early-exits on the first match, and bounded by `HAS_MAX_VISITS` so a
     /// pathological `*:has(*)` on a huge subtree can't blow up (the cap is a
     /// hostile-page backstop far above any real selector's reach).
-    fn matches_has(&self, subject: NodeId, h: &HasArg) -> bool {
+    fn matches_has(&self, subject: NodeId, h: &HasArg, mut scope: SelectorContext) -> bool {
+        scope.scope = Some(subject);
         const HAS_MAX_VISITS: usize = 8192;
         let mut stack: Vec<NodeId> = if h.sibling {
+            if scope.shadow_host == Some(subject) {
+                return false;
+            }
             let mut sib = self.next_element_sibling(subject);
             let mut v = Vec::new();
             while let Some(s) = sib {
@@ -8951,9 +9024,13 @@ impl Dom {
             }
             v
         } else {
-            self.child_iter(subject)
-                .filter(|&c| self.tag_name(c).is_some())
-                .collect()
+            self.child_iter(if scope.shadow_host == Some(subject) {
+                self.shadow_roots[&subject]
+            } else {
+                subject
+            })
+            .filter(|&c| self.tag_name(c).is_some())
+            .collect()
         };
         let mut budget = HAS_MAX_VISITS;
         while let Some(node) = stack.pop() {
@@ -8961,7 +9038,7 @@ impl Dom {
                 break;
             }
             budget -= 1;
-            if self.matches_complex(node, &h.complex.0, Some(subject)) {
+            if self.matches_complex_in(node, &h.complex.0, scope) {
                 return true;
             }
             for c in self.child_iter(node) {
@@ -9135,6 +9212,7 @@ fn parse_relative(part: &str) -> Option<HasArg> {
     }
     let scope = Compound {
         scope: true,
+        relative_anchor: true,
         ..Default::default()
     };
     cx.0.insert(0, (Combinator::None, scope));
@@ -9214,6 +9292,14 @@ fn find_var_function(value: &str) -> Option<usize> {
         .as_bytes()
         .windows(4)
         .position(|candidate| candidate.eq_ignore_ascii_case(b"var("))
+}
+
+/// Query scoping and the selector's tree context are distinct (CSS Shadow 1
+/// #selectors-data-model). Keep both stable across combinators and :is/:not.
+#[derive(Clone, Copy)]
+struct SelectorContext {
+    scope: Option<NodeId>,
+    shadow_host: Option<NodeId>,
 }
 
 #[derive(PartialEq)]
@@ -9299,15 +9385,16 @@ struct Compound {
     /// nothing (it silently broke deselection-style code). Inert in the
     /// stylesheet cascade (no query root there).
     scope: bool,
+    /// Internal :has() anchor, distinct from an authored :scope selector.
+    relative_anchor: bool,
     /// `:root`: matches the document root element (`<html>`). The conventional
     /// home of custom-property definitions (`:root { --foo: … }`), so matching
     /// it is what lets `var(--foo)` resolve to a root-defined value.
     root: bool,
     /// `:host` / `:host(<compound>)` (CSS Scoping §3.3): in a shadow root's
     /// stylesheet, targets the SHADOW HOST (the element the root is attached to),
-    /// which lives in the parent tree — so it's matched specially against the
-    /// host in `cascaded`, never via the normal in-scope path (which would test
-    /// it against shadow-internal elements). `host_inner` is the `(…)` argument
+    /// which replaces the shadow root in that selector's tree context.
+    /// `host_inner` is the `(…)` argument
     /// the host must additionally match (`:host(.theme-dark)`).
     host: bool,
     host_inner: Option<Box<Compound>>,
@@ -9577,6 +9664,34 @@ fn attr_op_matches(op: AttrOp, got: &str, want: &str) -> bool {
 }
 
 impl Compound {
+    fn allows_shadow_host(&self) -> bool {
+        let subject_allowed =
+            |cx: &Complex| cx.0.last().is_some_and(|(_, c)| c.allows_shadow_host());
+        self.tag.is_none()
+            && self.id.is_none()
+            && self.classes.is_empty()
+            && self.attrs.is_empty()
+            && !self.hover
+            && !self.target
+            && !self.popover_open
+            && !self.never
+            && !self.inert_pseudo_element
+            && self.structural.is_empty()
+            && self.states.is_empty()
+            && !self.scope
+            && !self.root
+            && self.slotted.is_none()
+            && (self.host || !self.selects.is_empty() || !self.nots.is_empty())
+            && self
+                .selects
+                .iter()
+                .all(|(group, _)| group.iter().any(subject_allowed))
+            && self
+                .nots
+                .iter()
+                .all(|group| group.iter().any(subject_allowed))
+    }
+
     fn has_pseudo_element(&self) -> bool {
         self.pseudo.is_some() || self.slotted.is_some() || self.inert_pseudo_element
     }
@@ -10237,8 +10352,8 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     compound.root = true;
                     compound.pseudos += 1;
                 } else if name == "host" {
-                    // `:host` / `:host(<compound>)`: styles the shadow host.
-                    // Matched against the host in `cascaded`, not here.
+                    // `:host` / `:host(<compound>)`: matches the featureless
+                    // host in the selector's shadow-tree context.
                     compound.host = true;
                     compound.pseudos += 1;
                     if let Some(a) = &arg {
@@ -12560,6 +12675,7 @@ impl Compound {
             structural,
             states,
             scope,
+            relative_anchor: _,
             root,
             host,
             host_inner,
@@ -16421,6 +16537,85 @@ mod tests {
         assert_eq!(dom.font_px(a), 16.0);
         dom.set_attr(a, "style", "font-size: 62.5%");
         assert_eq!(dom.font_px(a), 10.0, "the memo refreshed with the epoch");
+    }
+
+    #[test]
+    fn shadow_host_combinators_size_descendants_without_crossing_tree_boundaries() {
+        // CSS Shadow 1 #host-element-in-tree / #host-selector (local CSSWG
+        // snapshot 81c27f686901): the host replaces the shadow root for matching,
+        // but only explicit host selectors can select that featureless element.
+        let mut dom = Dom::parse_document(
+            "<body><x-loader id=host class=small><x-logo id=light></x-logo></x-loader></body>",
+        );
+        let host = dom.get_by_id("host").unwrap();
+        let root = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css = dom.create_text(":host x-logo{width:64px;height:64px} :host(.small) > x-logo{font-size:64px} :is(:host) > x-logo{line-height:1} :not(:host(.large)) > x-logo{opacity:.5} body :host x-logo{width:900px} x-loader x-logo{height:900px} * > x-logo{min-width:900px} :host.small x-logo{max-width:900px} :not(.large) > x-logo{min-height:900px}");
+        dom.append(style, css);
+        dom.append(root, style);
+        let logo = dom.create_element("x-logo");
+        dom.append(root, logo);
+        for (selector, matches) in [
+            (":host:has(> x-logo)", true),
+            (":has(> x-logo)", false),
+            (":host:has(+ body)", false),
+        ] {
+            let rule = parse_complex(selector).unwrap();
+            assert_eq!(
+                dom.matches_complex_in(
+                    host,
+                    &rule.0,
+                    SelectorContext {
+                        scope: None,
+                        shadow_host: Some(host),
+                    }
+                ),
+                matches,
+                "{selector}"
+            );
+        }
+        for (property, expected) in [
+            ("width", "64px"),
+            ("height", "64px"),
+            ("font-size", "64px"),
+            ("line-height", "1"),
+            ("opacity", ".5"),
+        ] {
+            assert_eq!(
+                dom.computed_style(logo, property).as_deref(),
+                Some(expected),
+                "{property}"
+            );
+        }
+        for property in ["min-width", "max-width", "min-height"] {
+            assert_eq!(dom.computed_style(logo, property), None, "{property}");
+        }
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("light").unwrap(), "width"),
+            None
+        );
+        assert_eq!(
+            dom.query(root, &SelectorList::parse(":host > x-logo").unwrap(), false),
+            vec![logo]
+        );
+        assert!(
+            dom.query(
+                DOCUMENT,
+                &SelectorList::parse(":host x-logo").unwrap(),
+                false
+            )
+            .is_empty()
+        );
+
+        // A nested root gets its own host; outer selectors cannot enter it.
+        let nested = dom.attach_shadow(logo);
+        let inner = dom.create_element("x-logo");
+        dom.append(nested, inner);
+        assert_eq!(dom.computed_style(inner, "width"), None);
+        dom.set_attr(host, "class", "large");
+        assert_eq!(dom.computed_style(logo, "font-size"), None);
+        assert_eq!(dom.computed_style(logo, "opacity"), None);
+        assert_eq!(dom.computed_style(logo, "width").as_deref(), Some("64px"));
     }
 
     #[test]
