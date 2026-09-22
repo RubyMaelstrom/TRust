@@ -321,9 +321,15 @@ current behavior and limits; consult the governing standards before changing it.
 - Bookmarking captures eligible live state. Removing the last web bookmark for
   a site immediately deletes saved state but preserves session memory; undo can
   save that live state again. Expiry and site-requested deletion still apply.
-- Third-party embedded/background requests cannot send/set cookies; third-party
-  frames cannot access localStorage, even for bookmarked sites. Main navigation
-  follows SameSite rules. `set cookies off` disables cookie access/capture
+- Third-party embedded/background requests cannot send/set cookies, except for
+  the user-approved HTTP challenge-cookie policy: HTTPS on the default port at
+  `challenges.cloudflare.com/cdn-cgi/challenge-platform/` may send/set
+  `cf_clearance` and `cf_chl_*` cookies with `Secure; SameSite=None`. These are
+  memory-only, partitioned by the owning top-level schemeful site, and kept
+  separate from first-party cookies even when `Partitioned` is absent. This is
+  a narrow policy exception, not general CHIPS support. Third-party frames still
+  cannot access document cookies or localStorage, even for bookmarked sites.
+  Main navigation follows SameSite rules. `set cookies off` disables cookie access/capture
   without clearing saved cookies or localStorage; cookie deletion does not
   itself delete localStorage.
 - localStorage quotas are 5 MiB per origin and 64 MiB total. Saved files have

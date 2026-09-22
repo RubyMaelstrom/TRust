@@ -83,6 +83,9 @@ pub struct Request {
 #[derive(Clone, Debug)]
 pub(crate) struct CookieContext {
     pub(crate) client: Option<Url>,
+    /// Schemeful site of the owning top-level document, inherited by frames
+    /// and workers. Never derive this from a subresource URL or Referer.
+    pub(crate) top_level_site: Option<String>,
     pub(crate) top_level: bool,
     pub(crate) cross_site_ancestor: bool,
     pub(crate) cross_site_redirect: bool,
@@ -92,6 +95,7 @@ impl CookieContext {
     pub(crate) fn subresource(client: &Url) -> Self {
         Self {
             client: Some(client.clone()),
+            top_level_site: cookie_site(client),
             top_level: false,
             cross_site_ancestor: false,
             cross_site_redirect: false,
@@ -108,13 +112,49 @@ impl CookieContext {
     fn allows(&self, target: &Url) -> bool {
         self.top_level || self.same_site(target)
     }
+
+    fn challenge_partition(&self, target: &Url) -> Option<&str> {
+        (cloudflare_challenge_endpoint(target) && !self.allows(target))
+            .then_some(self.top_level_site.as_deref())
+            .flatten()
+    }
+}
+
+// HTML #obtain-a-site (local 2026-09-06 snapshot): scheme + PSL registrable
+// domain (or host), excluding ports. Opaque/non-web owners get no exception.
+fn cookie_site(url: &Url) -> Option<String> {
+    crate::site_storage::site(url).map(|site| format!("{}://{site}", url.scheme()))
+}
+
+// User-approved cookie-policy exception, not a relaxation of Fetch, SameSite,
+// or domain validation. RFC6265bis #cookie-policy / #third-party-cookies
+// (1057fe0f, 2026-09-06) permits selective access and browser-imposed partitioning.
+// Limit this to the HTTPS challenge endpoint, not *.cloudflare.com or every
+// cookie supplied by Cloudflare. Every exception cookie is partitioned even
+// when a response omits Partitioned; this is not general CHIPS support.
+fn cloudflare_challenge_endpoint(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("challenges.cloudflare.com")
+        && url.port_or_known_default() == Some(443)
+        && url.path().starts_with("/cdn-cgi/challenge-platform/")
+}
+
+fn cloudflare_challenge_cookie(name: &str) -> bool {
+    name == "cf_clearance"
+        || name
+            .strip_prefix("cf_chl_")
+            .is_some_and(|suffix| !suffix.is_empty())
 }
 
 pub(crate) fn request_cookies(request: &Request) -> String {
     let Some(context) = &request.cookie_context else {
         return String::new();
     };
-    if !credentials_included(request) || !context.allows(&request.url) {
+    if !credentials_included(request) {
+        return String::new();
+    }
+    let partition = context.challenge_partition(&request.url);
+    if !context.allows(&request.url) && partition.is_none() {
         return String::new();
     }
     let mut jar = COOKIE_JAR.lock().unwrap();
@@ -129,6 +169,7 @@ pub(crate) fn request_cookies(request: &Request) -> String {
                 request.method.as_str(),
                 "GET" | "HEAD" | "OPTIONS" | "TRACE"
             ),
+        partition,
     )
 }
 
@@ -136,12 +177,22 @@ pub(crate) fn response_cookie(request: &Request, line: &str) {
     // RFC6265bis #third-party-cookies permits this policy, independently of
     // Fetch credentials. Record refusals at this gate as well as parser/store
     // failures, so a received Set-Cookie cannot silently disappear in a trace.
+    let partition = request
+        .cookie_context
+        .as_ref()
+        .and_then(|context| context.challenge_partition(&request.url));
+    let allowed_challenge = partition.is_some()
+        && line
+            .split_once('=')
+            .is_some_and(|(name, _)| cloudflare_challenge_cookie(name.trim_matches([' ', '\t'])));
     let denied = if !credentials_included(request) {
         Some("response-denied-credentials")
     } else {
         match &request.cookie_context {
             None => Some("response-denied-context"),
-            Some(context) if !context.allows(&request.url) => Some("response-denied-third-party"),
+            Some(context) if !context.allows(&request.url) && !allowed_challenge => {
+                Some("response-denied-third-party")
+            }
             Some(_) => None,
         }
     };
@@ -149,7 +200,14 @@ pub(crate) fn response_cookie(request: &Request, line: &str) {
         trace_cookie_line(reason, &request.url, line);
         return;
     }
-    store_cookie(&request.url, line, false);
+    store_cookie_in_partition_at(
+        &mut COOKIE_JAR.lock().unwrap(),
+        &request.url,
+        line,
+        false,
+        cookie_now_ms(),
+        partition,
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2220,8 +2278,8 @@ fn pool_put(key: PoolKey, io: BufReader<Conn>) {
 
 // ---- Live cookie jar with bookmark-controlled persistence -------------
 //
-// Cookies are accepted only in first-party contexts (top-level navigations
-// additionally follow SameSite). Bookmarks control persistence independently.
+// First-party cookies follow SameSite and bookmark-controlled persistence.
+// The approved HTTP challenge exception uses separate, memory-only partitions.
 // Session cookies never touch disk; explicit lifetimes are preserved.
 // `set cookies off` disables access/capture without clearing remembered data.
 
@@ -2236,6 +2294,14 @@ pub(crate) struct Cookie {
     http_only: bool,
     expires_at: Option<i64>, // UTC milliseconds; None means the process session
     same_site: CookieSameSite,
+    /// Browser-imposed isolation for the challenge-only third-party exception.
+    /// None is the ordinary first-party jar. These partitions are always
+    /// cross-site and never visible to document.cookie or persisted on disk.
+    /// Key/replacement isolation follows the CHIPS draft's "Computing the
+    /// cookie partition key" and "Partitioned Cookies with the Same Name/Domain/Path"
+    /// (privacycg/CHIPS fab89df5, local 2026-09-06 snapshot); all exception
+    /// partitions have the cross-site-ancestor bit set, unlike the first-party jar.
+    challenge_site: Option<String>,
     created_at: i64,
     last_access: i64,
 }
@@ -2253,6 +2319,9 @@ impl Cookie {
         serde_json::json!(["cookie", self.name, self.domain, self.host_only, self.path]).to_string()
     }
     fn site(&self) -> Option<String> {
+        if self.challenge_site.is_some() {
+            return None;
+        }
         Url::parse(&format!("https://{}/", self.domain))
             .ok()
             .and_then(|u| crate::site_storage::site(&u))
@@ -2302,6 +2371,7 @@ pub(crate) fn restore_cookie_record(v: &serde_json::Value, site: &str) -> Option
             "None" => CookieSameSite::None,
             _ => return None,
         },
+        challenge_site: None,
         created_at: v["created_at"].as_i64()?,
         last_access: v["last_access"].as_i64()?,
     };
@@ -2374,6 +2444,271 @@ mod cookie_policy_tests {
         assert_eq!(request_cookies(&request), "");
         request.cookie_context = None;
         assert_eq!(request_cookies(&request), "");
+    }
+
+    fn challenge_request(owner: &str, case: &str) -> Request {
+        Request::subresource(
+            url(&format!(
+                "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/{case}"
+            )),
+            &url(owner),
+            "iframe",
+            None,
+        )
+    }
+
+    #[test]
+    fn challenge_cookie_roundtrip_is_isolated_from_other_sites_and_first_party_state() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let request = challenge_request("https://a.challenge-roundtrip.test/", "roundtrip");
+        let path = request.url.path();
+        store_cookie(
+            &request.url,
+            &format!("cf_clearance=first-party; Secure; HttpOnly; SameSite=None; Path={path}"),
+            false,
+        );
+        response_cookie(
+            &request,
+            &format!(
+                "cf_clearance=embedded; Secure; HttpOnly; SameSite=None; Partitioned; Max-Age=600; Path={path}"
+            ),
+        );
+        // Older challenge responses without Partitioned receive the same
+        // browser-imposed isolation. Neither cookie is exposed to page JS.
+        response_cookie(
+            &request,
+            &format!("cf_chl_test=state; Secure; SameSite=None; Path={path}"),
+        );
+        assert_eq!(
+            request_cookies(&request),
+            "cf_clearance=embedded; cf_chl_test=state"
+        );
+        assert_eq!(
+            cookies_for_request(&request.url),
+            "cf_clearance=first-party"
+        );
+        assert_eq!(cookies_for_js(&request.url), "");
+        assert_eq!(
+            request_cookies(&challenge_request(
+                "https://b.challenge-roundtrip.test:8443/",
+                "roundtrip"
+            )),
+            "cf_clearance=embedded; cf_chl_test=state"
+        );
+        for owner in [
+            "https://elsewhere.test/",
+            "http://a.challenge-roundtrip.test/",
+            "file:///tmp/owner.html",
+        ] {
+            assert_eq!(
+                request_cookies(&challenge_request(owner, "roundtrip")),
+                "",
+                "{owner}"
+            );
+        }
+        let jar = COOKIE_JAR.lock().unwrap();
+        let partition: Vec<_> = jar
+            .iter()
+            .filter(|c| c.challenge_site.as_deref() == Some("https://challenge-roundtrip.test"))
+            .collect();
+        assert_eq!(partition.len(), 2);
+        assert!(partition.iter().all(|cookie| cookie.site().is_none()));
+        assert!(partition.iter().any(|cookie| cookie.expires_at.is_some()));
+    }
+
+    #[test]
+    fn challenge_cookie_exception_checks_endpoint_names_credentials_and_global_disable() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let mut request = challenge_request("https://challenge-guards.test/", "guards");
+        let line =
+            "cf_clearance=accepted; Secure; SameSite=None; Path=/cdn-cgi/challenge-platform/guards";
+        for target in [
+            "http://challenges.cloudflare.com/cdn-cgi/challenge-platform/guards",
+            "https://challenges.cloudflare.com:8443/cdn-cgi/challenge-platform/guards",
+            "https://challenges.cloudflare.com.attacker.test/cdn-cgi/challenge-platform/guards",
+            "https://sub.challenges.cloudflare.com/cdn-cgi/challenge-platform/guards",
+            "https://cloudflare.com/cdn-cgi/challenge-platform/guards",
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform-evil/guards",
+            "https://challenges.cloudflare.com/",
+        ] {
+            let mut denied = request.clone();
+            denied.url = url(target);
+            response_cookie(&denied, line);
+            assert_eq!(request_cookies(&denied), "", "{target}");
+        }
+        for line in [
+            "__cf_bm=tracking; Secure; SameSite=None",
+            "unrelated=tracking; Secure; SameSite=None; Partitioned",
+            "cf_chl_=empty-suffix; Secure; SameSite=None",
+            "CF_CLEARANCE=wrong-case; Secure; SameSite=None",
+            "cf_clearance=missing-secure; SameSite=None",
+            "cf_clearance=missing-samesite; Secure",
+            "cf_clearance=lax; Secure; SameSite=Lax",
+            "cf_clearance=strict; Secure; SameSite=Strict",
+            "cf_clearance=bad-domain; Secure; SameSite=None; Domain=attacker.test",
+        ] {
+            response_cookie(&request, line);
+            assert_eq!(request_cookies(&request), "", "{line}");
+        }
+        request.fetch_policy = Some(FetchPolicy {
+            origin: url("https://challenge-guards.test/"),
+            mode: RequestMode::Cors,
+            credentials: CredentialsMode::Omit,
+        });
+        response_cookie(&request, line);
+        assert_eq!(request_cookies(&request), "");
+        request.fetch_policy.as_mut().unwrap().credentials = CredentialsMode::SameOrigin;
+        response_cookie(&request, line);
+        assert_eq!(request_cookies(&request), "");
+        request.fetch_policy.as_mut().unwrap().credentials = CredentialsMode::Include;
+        assert_eq!(request_cookies(&request), "");
+        response_cookie(&request, line);
+        assert_eq!(request_cookies(&request), "cf_clearance=accepted");
+        request.fetch_policy.as_mut().unwrap().credentials = CredentialsMode::Omit;
+        assert_eq!(request_cookies(&request), "");
+        request.fetch_policy = None;
+        set_cookies_enabled(false);
+        assert_eq!(request_cookies(&request), "");
+        response_cookie(&request, &line.replace("accepted", "disabled-write"));
+        set_cookies_enabled(true);
+        assert_eq!(request_cookies(&request), "cf_clearance=accepted");
+        request.cookie_context = None;
+        assert_eq!(request_cookies(&request), "");
+        response_cookie(&request, &line.replace("accepted", "missing-context"));
+    }
+
+    #[test]
+    fn challenge_cookie_replacement_deletion_and_expiry_only_affect_own_partition() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let endpoint =
+            url("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/lifecycle");
+        let mut jar = Vec::new();
+        let line = "cf_clearance=initial; Secure; HttpOnly; SameSite=None; Path=/; Max-Age=60";
+        for partition in [None, Some("https://one.test"), Some("https://two.test")] {
+            store_cookie_in_partition_at(&mut jar, &endpoint, line, false, 1000, partition);
+        }
+        assert_eq!(jar.len(), 3);
+        store_cookie_in_partition_at(
+            &mut jar,
+            &endpoint,
+            &line.replace("initial", "replacement"),
+            false,
+            2000,
+            Some("https://one.test"),
+        );
+        assert_eq!(jar.len(), 3);
+        let one = jar
+            .iter()
+            .find(|c| c.challenge_site.as_deref() == Some("https://one.test"))
+            .unwrap();
+        assert_eq!(one.created_at, 1000);
+        assert_eq!(one.value, "replacement");
+        store_cookie_in_partition_at(
+            &mut jar,
+            &endpoint,
+            "cf_clearance=; Secure; SameSite=None; Path=/; Max-Age=0",
+            false,
+            3000,
+            Some("https://one.test"),
+        );
+        assert_eq!(jar.len(), 2);
+        assert_eq!(
+            cookie_string(
+                &mut jar,
+                &endpoint,
+                3000,
+                false,
+                false,
+                false,
+                Some("https://one.test")
+            ),
+            ""
+        );
+        assert_eq!(
+            cookie_string(
+                &mut jar,
+                &endpoint,
+                3000,
+                false,
+                false,
+                false,
+                Some("https://two.test")
+            ),
+            "cf_clearance=initial"
+        );
+        assert_eq!(
+            cookies_for_request_at(&mut jar, &endpoint, 3000),
+            "cf_clearance=initial"
+        );
+        assert_eq!(
+            cookie_string(
+                &mut jar,
+                &endpoint,
+                62000,
+                false,
+                false,
+                false,
+                Some("https://two.test")
+            ),
+            ""
+        );
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn challenge_cookie_owner_survives_metadata_updates_and_redirects() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let mut request = challenge_request("https://owner.github.io/", "owner");
+        response_cookie(
+            &request,
+            "cf_clearance=owned; Secure; SameSite=None; Path=/cdn-cgi/challenge-platform/owner",
+        );
+        let context = request.cookie_context.as_mut().unwrap();
+        context.client = Some(request.url.clone());
+        context.cross_site_ancestor = true;
+        // A frame's fetch (and a worker inheriting its context) changes client,
+        // not the owning top-level site. Fetch metadata must not erase it.
+        let client = request.url.clone();
+        set_fetch_metadata(&mut request, &client, "empty", "cors");
+        request.fetch_policy = Some(FetchPolicy {
+            origin: client,
+            mode: RequestMode::Cors,
+            credentials: CredentialsMode::SameOrigin,
+        });
+        assert_eq!(request_cookies(&request), "cf_clearance=owned");
+        assert_eq!(
+            request_cookies(&challenge_request("https://other.github.io/", "owner")),
+            ""
+        );
+        let redirected = url("https://elsewhere.test/cdn-cgi/challenge-platform/owner");
+        update_navigation_metadata_for_redirect(&mut request, &redirected);
+        request.url = redirected;
+        request.fetch_policy.as_mut().unwrap().credentials = CredentialsMode::Include;
+        assert_eq!(request_cookies(&request), "");
+    }
+
+    #[test]
+    fn challenge_cookie_trace_attributes_are_fixed_metadata_not_cookie_values() {
+        assert_eq!(
+            cookie_trace_attributes(
+                "cf_clearance=Secure=secret-Partitioned; Secure; HTTPOnly; Partitioned; SameSite=None"
+            ),
+            (true, true, true, "none")
+        );
+        assert_eq!(
+            cookie_trace_attributes("cf_clearance=Secure-HttpOnly-Partitioned-SameSite=None"),
+            (false, false, false, "default")
+        );
+        assert_eq!(
+            cookie_trace_attributes(
+                "cf_clearance=x; SameSite=Strict; SameSite=private-value; Unknown=private-value"
+            ),
+            (false, false, false, "default")
+        );
     }
     #[test]
     fn cookie_policy_navigation_honors_strict_lax_none_and_redirects() {
@@ -2777,8 +3112,46 @@ fn trace_cookie_counts(event: &'static str, url: &Url, status: u16, counts: (usi
 
 pub(crate) fn trace_cookie_line(event: &'static str, url: &Url, line: &str) {
     if cookie_trace_enabled() {
-        trace_cookie_counts(event, url, 0, cookie_trace_counts(std::iter::once(line)));
+        let counts = cookie_trace_counts(std::iter::once(line));
+        trace_cookie_counts(event, url, 0, counts);
+        if counts.1 != 0 {
+            let (secure, http_only, partitioned, same_site) = cookie_trace_attributes(line);
+            eprintln!(
+                "[cookie-attributes] event={event} secure={} httponly={} partitioned={} samesite={same_site}",
+                u8::from(secure),
+                u8::from(http_only),
+                u8::from(partitioned),
+            );
+        }
     }
+}
+
+// Fixed metadata only: do not print arbitrary attribute names or values.
+fn cookie_trace_attributes(line: &str) -> (bool, bool, bool, &'static str) {
+    let (mut secure, mut http_only, mut partitioned, mut same_site) =
+        (false, false, false, "default");
+    for attr in line.split(';').skip(1) {
+        let (key, value) = attr.split_once('=').unwrap_or((attr, ""));
+        match key.trim_matches([' ', '\t']).to_ascii_lowercase().as_str() {
+            "secure" => secure = true,
+            "httponly" => http_only = true,
+            "partitioned" => partitioned = true,
+            "samesite" => {
+                same_site = match value
+                    .trim_matches([' ', '\t'])
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "strict" => "strict",
+                    "lax" => "lax",
+                    "none" => "none",
+                    _ => "default",
+                };
+            }
+            _ => {}
+        }
+    }
+    (secure, http_only, partitioned, same_site)
 }
 
 // Diagnostic-only receipts compare the actual outgoing value byte-for-byte
@@ -2798,7 +3171,11 @@ fn trace_cookie_receipt(cookie: &Cookie, line: &str) {
     };
     let original = original.trim();
     let mut receipts = COOKIE_TRACE_RECEIPTS.lock().unwrap();
-    receipts.retain(|old| !(old.domain == cookie.domain && old.path == cookie.path));
+    receipts.retain(|old| {
+        !(old.domain == cookie.domain
+            && old.path == cookie.path
+            && old.challenge_site == cookie.challenge_site)
+    });
     // Oversized or evicted receipts yield 'unknown', never a false exact match.
     if original.len() > 8192 {
         return;
@@ -2864,6 +3241,17 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
 }
 
 fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, now: i64) {
+    store_cookie_in_partition_at(jar, url, line, from_js, now, None);
+}
+
+fn store_cookie_in_partition_at(
+    jar: &mut Vec<Cookie>,
+    url: &Url,
+    line: &str,
+    from_js: bool,
+    now: i64,
+    challenge_site: Option<&str>,
+) {
     trace_cookie_line(
         if from_js {
             "script-write"
@@ -2982,6 +3370,18 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
     if secure && url.scheme() != "https" || same_site == CookieSameSite::None && !secure {
         return;
     }
+    if challenge_site.is_some()
+        && (from_js
+            || !cloudflare_challenge_endpoint(url)
+            || !cloudflare_challenge_cookie(&name)
+            || !secure
+            || same_site != CookieSameSite::None)
+    {
+        // RFC6265bis #storage-model steps 18–19 still apply in an exception:
+        // a cross-site subresource cannot set Strict/Lax/Default cookies.
+        trace_cookie_line("store-denied-challenge-policy", url, line);
+        return;
+    }
     let lower_name = name.to_ascii_lowercase();
     if lower_name.starts_with("__secure-") && !secure
         || lower_name.starts_with("__host-") && !(secure && host_only && explicit_root_path)
@@ -2999,6 +3399,7 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
         && url.scheme() != "https"
         && jar.iter().any(|c| {
             c.secure
+                && c.challenge_site.as_deref() == challenge_site
                 && c.name == name
                 && (domain_matches(&c.domain, &domain) || domain_matches(&domain, &c.domain))
                 && cookie_path_matches(&path, &c.path)
@@ -3012,6 +3413,7 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
                 && c.domain == domain
                 && c.host_only == host_only
                 && c.path == path
+                && c.challenge_site.as_deref() == challenge_site
                 && c.http_only
         })
     {
@@ -3023,12 +3425,19 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
     let created_at = jar
         .iter()
         .find(|c| {
-            c.name == name && c.domain == domain && c.host_only == host_only && c.path == path
+            c.name == name
+                && c.domain == domain
+                && c.host_only == host_only
+                && c.path == path
+                && c.challenge_site.as_deref() == challenge_site
         })
         .map_or(now, |c| c.created_at);
     jar.retain(|c| {
-        let replaced =
-            c.name == name && c.domain == domain && c.host_only == host_only && c.path == path;
+        let replaced = c.name == name
+            && c.domain == domain
+            && c.host_only == host_only
+            && c.path == path
+            && c.challenge_site.as_deref() == challenge_site;
         if replaced {
             c.persist(true);
         }
@@ -3050,6 +3459,7 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
         http_only,
         expires_at,
         same_site,
+        challenge_site: challenge_site.map(str::to_owned),
         created_at,
         last_access: now,
     };
@@ -3065,7 +3475,15 @@ fn store_cookie_at(jar: &mut Vec<Cookie>, url: &Url, line: &str, from_js: bool, 
             .0;
         jar.remove(oldest).persist(true);
     }
-    trace_cookie_line("stored", url, line);
+    trace_cookie_line(
+        if challenge_site.is_some() {
+            "stored-challenge-partition"
+        } else {
+            "stored"
+        },
+        url,
+        line,
+    );
 }
 
 /// RFC 6265 §5.1.3 domain-match. The suffix form is only valid for DNS host
@@ -3122,7 +3540,7 @@ pub(crate) fn cookies_for_js(page: &Url) -> String {
 }
 
 fn cookies_for_js_at(jar: &mut Vec<Cookie>, page: &Url, now: i64) -> String {
-    cookie_string(jar, page, now, true, true, false)
+    cookie_string(jar, page, now, true, true, false, None)
 }
 
 /// A `document.cookie = "..."` write from page JS. Stored in the same
@@ -3139,7 +3557,7 @@ pub(crate) fn cookies_for_request(url: &Url) -> String {
 
 #[cfg(test)]
 fn cookies_for_request_at(jar: &mut Vec<Cookie>, url: &Url, now: i64) -> String {
-    cookie_string(jar, url, now, false, true, false)
+    cookie_string(jar, url, now, false, true, false, None)
 }
 
 // RFC6265bis #retrieval-algorithm: path length, then original creation time.
@@ -3150,6 +3568,7 @@ fn cookie_string(
     from_js: bool,
     same_site: bool,
     lax_navigation: bool,
+    challenge_site: Option<&str>,
 ) -> String {
     if !cookies_enabled() || !matches!(url.scheme(), "http" | "https") {
         return String::new();
@@ -3159,7 +3578,8 @@ fn cookie_string(
     let mut cookies: Vec<_> = jar
         .iter_mut()
         .filter(|c| {
-            (!from_js || !c.http_only)
+            c.challenge_site.as_deref() == challenge_site
+                && (!from_js || !c.http_only)
                 && (!c.secure || url.scheme() == "https")
                 && cookie_domain_match(&host, c)
                 && (c.host_only || !public_suffix(&c.domain))
@@ -3575,7 +3995,16 @@ async fn exchange(
                 .as_ref()
                 .is_some_and(|context| !context.allows(url))
             {
-                "request-denied-third-party"
+                if request
+                    .cookie_context
+                    .as_ref()
+                    .and_then(|c| c.challenge_partition(url))
+                    .is_some()
+                {
+                    "request-challenge-partition"
+                } else {
+                    "request-denied-third-party"
+                }
             } else {
                 "request"
             },
@@ -6056,6 +6485,9 @@ pub(crate) fn set_fetch_metadata(
         .is_some_and(|c| c.cross_site_ancestor);
     let mut context = CookieContext::subresource(source);
     context.cross_site_ancestor = cross_site_ancestor;
+    if let Some(previous) = &request.cookie_context {
+        context.top_level_site.clone_from(&previous.top_level_site);
+    }
     request.cookie_context = Some(context);
     request.fetch_metadata = Some(FetchMetadata {
         destination,
@@ -6077,6 +6509,7 @@ pub fn set_navigation_metadata(req: &mut Request, referrer: Option<&Url>) {
     req.timing_client = referrer.cloned();
     req.cookie_context = Some(CookieContext {
         client: referrer.cloned(),
+        top_level_site: cookie_site(&req.url),
         top_level: true,
         cross_site_ancestor: false,
         cross_site_redirect: false,
@@ -15060,6 +15493,7 @@ customElements.define('lit-counter', LitCounter);
             http_only: true,
             expires_at: None,
             same_site: CookieSameSite::Default,
+            challenge_site: None,
             created_at: 0,
             last_access: 0,
         };
