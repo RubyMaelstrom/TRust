@@ -762,9 +762,28 @@ pub struct PageTaskScope {
     cancelled: std::sync::atomic::AtomicBool,
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     fetches: std::sync::Mutex<Vec<futures::future::AbortHandle>>,
+    children: std::sync::Mutex<Vec<std::sync::Weak<PageTaskScope>>>,
 }
 
 impl PageTaskScope {
+    /// A worker owns its fetches independently, but still belongs to its document.
+    /// HTML #worker-processing-model / "terminate a worker": retiring that agent
+    /// must release its work without cancelling its owner's or sibling's work.
+    /// Weak registration adds no background task and retains no retired worker.
+    pub fn child(&self) -> std::sync::Arc<Self> {
+        use std::sync::atomic::Ordering;
+
+        let child = std::sync::Arc::new(Self::default());
+        let mut children = self.children.lock().unwrap();
+        children.retain(|child| child.strong_count() != 0);
+        if self.cancelled.load(Ordering::Acquire) {
+            child.cancel();
+        } else {
+            children.push(std::sync::Arc::downgrade(&child));
+        }
+        child
+    }
+
     /// Spawn work owned by one document. HTML §7.5.11 requires aborting every
     /// fetch in a document's context and discarding its pending work when the
     /// document load is stopped; keeping the abort handles in one scope makes
@@ -819,6 +838,11 @@ impl PageTaskScope {
         }
         for fetch in self.fetches.lock().unwrap().drain(..) {
             fetch.abort();
+        }
+        for child in self.children.lock().unwrap().drain(..) {
+            if let Some(child) = child.upgrade() {
+                child.cancel();
+            }
         }
     }
 }
@@ -16356,6 +16380,42 @@ customElements.define('lit-counter', LitCounter);
         ));
         fresh_scope.cancel();
         assert!(waiting.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn worker_task_scopes_cancel_independently_and_follow_document_cancellation() {
+        use std::sync::atomic::Ordering;
+
+        let page = PageTaskScope::default();
+        let worker = page.child();
+        let sibling = page.child();
+        let (page_fetch, _) = futures::future::AbortHandle::new_pair();
+        let (worker_fetch, _) = futures::future::AbortHandle::new_pair();
+        let (sibling_fetch, _) = futures::future::AbortHandle::new_pair();
+        page.track_fetch(page_fetch.clone());
+        worker.track_fetch(worker_fetch.clone());
+        sibling.track_fetch(sibling_fetch.clone());
+
+        worker.cancel();
+        assert!(worker_fetch.is_aborted());
+        assert!(!page_fetch.is_aborted());
+        assert!(!sibling_fetch.is_aborted());
+        let (late_fetch, _) = futures::future::AbortHandle::new_pair();
+        worker.track_fetch(late_fetch.clone());
+        assert!(late_fetch.is_aborted());
+
+        page.cancel();
+        assert!(page_fetch.is_aborted());
+        assert!(sibling_fetch.is_aborted());
+        assert!(page.child().cancelled.load(Ordering::Acquire));
+
+        let page = PageTaskScope::default();
+        for _ in 0..1024 {
+            drop(page.child());
+        }
+        let worker = page.child();
+        assert_eq!(page.children.lock().unwrap().len(), 1);
+        assert_eq!(std::sync::Arc::strong_count(&worker), 1);
     }
 
     /// RFC 9112 §6.3: a response to a HEAD request never has a body, even
