@@ -7284,6 +7284,15 @@ fn prepare_client_request(
     crate::http::set_fetch_metadata(&mut request, origin, "empty", mode.as_str());
     crate::http::set_referrer(&mut request, page);
     if let Some(context) = request.cookie_context.as_mut() {
+        context.top_level_site = state.window_cookie_contexts.get(&0).map_or_else(
+            || {
+                crate::http::CookieContext::subresource(
+                    state.window_request_urls.get(&0).unwrap_or(&state.base),
+                )
+                .top_level_site
+            },
+            |(_, _, owner)| owner.top_level_site.clone(),
+        );
         context.cross_site_ancestor = state
             .window_cookie_contexts
             .values()
@@ -7919,6 +7928,9 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.insert(context, realm.clone());
         let mut cookie_context = crate::http::CookieContext::subresource(&client_url);
+        cookie_context
+            .top_level_site
+            .clone_from(&parent_cookie_context.top_level_site);
         cookie_context.cross_site_ancestor = parent_cookie_context.cross_site_ancestor
             || parent_cookie_context
                 .client
@@ -21693,6 +21705,107 @@ mod tests {
             "SecurityError|true||undefined|undefined|undefined|undefined|undefined|sibling:child=visible|SecurityError|storagePolicy=top"
         );
         assert_eq!(string_value(&mut engine, "fakeCookieDocument"), "");
+    }
+
+    #[test]
+    fn challenge_cookie_partition_follows_nested_realms_and_worker_context() {
+        let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
+        crate::http::set_cookies_enabled(true);
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://frame-challenge-owner.test/",
+        );
+        eval(
+            &mut engine,
+            r#"
+            const frame = document.createElement('iframe');
+            document.appendChild(frame); frame.__contentDoc = undefined;
+            const third = __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
+                'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/frame-test',
+                __trust_cfg, window, window, frame, 0, '');
+            third.eval(`
+                const frame = document.createElement('iframe');
+                document.appendChild(frame); frame.__contentDoc = undefined;
+                __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
+                    'https://nested.example.net/', __trust_cfg, window, top, frame, 0, '');
+                document.cookie = 'cf_chl_script=still-blocked; Secure; SameSite=None';
+                globalThis.cookieVisibility = document.cookie;
+                try { localStorage; cookieVisibility += 'exposed'; }
+                catch (e) { cookieVisibility += e.name; }
+            `);
+            globalThis.challengeCookieVisibility = third.cookieVisibility;
+        "#,
+            "challenge partition inheritance",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "challengeCookieVisibility"),
+            "SecurityError"
+        );
+        let contexts: Vec<_> = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .window_cookie_contexts
+            .values()
+            // Insertion also creates the initial about:blank documents.
+            .filter(|(_, document_url, _)| document_url.scheme() == "https")
+            .map(|(_, _, context)| context.clone())
+            .collect();
+        assert_eq!(contexts.len(), 2);
+        for context in &contexts {
+            assert!(context.cross_site_ancestor);
+            assert_eq!(
+                context.top_level_site.as_deref(),
+                Some("https://frame-challenge-owner.test")
+            );
+        }
+        let context = contexts
+            .into_iter()
+            .find(|c| {
+                c.client
+                    .as_ref()
+                    .is_some_and(|url| url.host_str() == Some("challenges.cloudflare.com"))
+            })
+            .unwrap();
+        let endpoint = context.client.clone().unwrap();
+        let mut request =
+            crate::http::Request::subresource(endpoint.clone(), &endpoint, "empty", None);
+        request.cookie_context = Some(context.clone());
+        request.fetch_policy = Some(crate::http::FetchPolicy {
+            origin: endpoint.clone(),
+            mode: crate::http::RequestMode::Cors,
+            credentials: crate::http::CredentialsMode::SameOrigin,
+        });
+        crate::http::response_cookie(
+            &request,
+            "cf_clearance=frame; Secure; HttpOnly; SameSite=None; Path=/cdn-cgi/challenge-platform/frame-test",
+        );
+        assert_eq!(crate::http::request_cookies(&request), "cf_clearance=frame");
+
+        // run_lumen_worker installs the launch owner's cookie context at id 0.
+        // Test that retrieval keeps that owner rather than using the worker URL.
+        let mut worker = platform_engine();
+        worker
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .window_cookie_contexts
+            .insert(0, (DOCUMENT, endpoint.clone(), context));
+        request.cookie_context = Some(cookie_context_for_id(worker.ctx(), 0));
+        assert_eq!(crate::http::request_cookies(&request), "cf_clearance=frame");
+        assert_eq!(
+            request
+                .cookie_context
+                .as_ref()
+                .unwrap()
+                .top_level_site
+                .as_deref(),
+            Some("https://frame-challenge-owner.test")
+        );
     }
 
     #[test]
