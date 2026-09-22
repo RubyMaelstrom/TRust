@@ -191,8 +191,12 @@ Ordinary release builds produce `trust`, `trust-desktop`, and `trust-headless`.
 `trust-browser-replay` is a developer-only example target, not a distributed
 executable. Run it explicitly with
 `cargo run --release --example trust-browser-replay -- FIXTURE.html`.
-Release uses thin LTO and one codegen unit on all targets. Native ARM64/x86-64
-Linux and Windows cross-build instructions are in `INSTALL.md`; use the same Lumen revision for each. With Wine installed,
+Release uses optimized, incremental, parallel code generation without LTO so
+acceptance testing and local installation stay fast. Public numbered releases
+use `cargo build --profile numbered-release --locked`; that explicit profile
+uses Fat-LTO and one codegen unit and is not part of the ordinary development
+or local-promotion cycle. Native ARM64/x86-64 Linux and Windows cross-build
+instructions are in `INSTALL.md`; use the same Lumen revision for each. With Wine installed,
 `cargo xwin test --target x86_64-pc-windows-msvc` runs the Windows tests.
 
 Focused checks and diagnostics:
@@ -215,6 +219,10 @@ Focused checks and diagnostics:
 The user tests TRust from the release target. Build `target/release/trust` with
 `cargo build --release` for acceptance testing; do not substitute a debug build
 when reproducing or validating user-visible behavior.
+
+Do not substitute the `numbered-release` profile for routine local promotion.
+Build that Fat-LTO artifact only when the user explicitly requests a public,
+numbered release; its binaries land under `target/numbered-release/`.
 
 Do not overwrite the installed executable merely because a release build
 succeeds. Wait until the user explicitly says that the build is tested,

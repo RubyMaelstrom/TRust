@@ -778,9 +778,27 @@ fn parse_transform_list(t: &str) -> Option<Vec<(String, Vec<String>)>> {
         if !KNOWN.contains(&name.as_str()) {
             return None;
         }
-        let close = rest[open..].find(')')? + open;
-        let args = rest[open + 1..close]
-            .split(',')
+        // Transform arguments are component values and may themselves be
+        // functions. CSS Values 4 #component-values / #calc-func permits
+        // e.g. `translateX(calc(1200px + 40px))`; the first `)` closes the
+        // nested math function, not the transform function. Keep the whole
+        // declaration valid until the matching outer parenthesis.
+        let mut depth = 0i32;
+        let close = rest[open..].char_indices().find_map(|(offset, ch)| {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + offset);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })?;
+        let args = super::value::split_args(&rest[open + 1..close])
+            .into_iter()
             .map(|a| a.trim().to_string())
             .collect();
         out.push((name, args));

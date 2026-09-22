@@ -1217,6 +1217,8 @@ fn paint_animation_scope(
                     frame.transform.as_deref()?,
                     fragment.w,
                     fragment.h,
+                    units,
+                    viewport,
                 )?;
                 Some(CssAnimationPoint {
                     offset: frame.offset,
@@ -1270,7 +1272,13 @@ fn complete_animation_track(track: &mut Vec<CssAnimationPoint>) {
     }
 }
 
-fn animation_transform_translation(value: &str, width: f32, height: f32) -> Option<CssPoint> {
+fn animation_transform_translation(
+    value: &str,
+    width: f32,
+    height: f32,
+    units: Units,
+    viewport: Vp,
+) -> Option<CssPoint> {
     if value.trim().eq_ignore_ascii_case("none") {
         return Some(CssPoint::default());
     }
@@ -1278,14 +1286,21 @@ fn animation_transform_translation(value: &str, width: f32, height: f32) -> Opti
     for (name, args) in transform_functions(value)? {
         match name.as_str() {
             "translate" => {
-                result.x += transform_length(args.first()?, width)?;
-                result.y += transform_length(args.get(1).map_or("0", String::as_str), height)?;
+                result.x += transform_length_in(args.first()?, width, units, viewport)?;
+                result.y += transform_length_in(
+                    args.get(1).map_or("0", String::as_str),
+                    height,
+                    units,
+                    viewport,
+                )?;
             }
-            "translatex" => result.x += transform_length(args.first()?, width)?,
-            "translatey" => result.y += transform_length(args.first()?, height)?,
+            "translatex" => result.x += transform_length_in(args.first()?, width, units, viewport)?,
+            "translatey" => {
+                result.y += transform_length_in(args.first()?, height, units, viewport)?
+            }
             "translate3d" => {
-                result.x += transform_length(args.first()?, width)?;
-                result.y += transform_length(args.get(1)?, height)?;
+                result.x += transform_length_in(args.first()?, width, units, viewport)?;
+                result.y += transform_length_in(args.get(1)?, height, units, viewport)?;
             }
             "matrix" if args.len() == 6 => {
                 result.x += args.get(4)?.parse::<f32>().ok()?;
@@ -2440,6 +2455,13 @@ fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) -> bool {
 
 fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_, '_>) -> Option<Affine2d> {
     let style = PaintStyle::of(fragment)?;
+    let context = (
+        Units::of(builder.dom, style.node()),
+        Vp {
+            w: builder.viewport_w,
+            h: builder.viewport_h,
+        },
+    );
     let (matrix, layout_translation) = element_transform(
         builder.dom,
         style,
@@ -2447,6 +2469,7 @@ fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_, '_>) -> Option<Aff
         fragment.h,
         fragment.x,
         fragment.y,
+        context,
     )?;
     // Phase 2 retained translated fragment coordinates for terminal output.
     // Undo that already-applied translation inside the graphical transform so
@@ -3738,7 +3761,9 @@ fn element_transform(
     height: f32,
     x: f32,
     y: f32,
+    context: (Units, Vp),
 ) -> Option<(Affine2d, CssPoint)> {
+    let (units, viewport) = context;
     let transform = style
         .value(dom, "transform")
         .unwrap_or_else(|| "none".into());
@@ -3754,8 +3779,18 @@ fn element_transform(
     let mut layout_translation = CssPoint::default();
     if !translate.trim().eq_ignore_ascii_case("none") {
         let parts = split_ws(&translate);
-        let tx = transform_length(parts.first().copied().unwrap_or("0"), width)?;
-        let ty = transform_length(parts.get(1).copied().unwrap_or("0"), height)?;
+        let tx = transform_length_in(
+            parts.first().copied().unwrap_or("0"),
+            width,
+            units,
+            viewport,
+        )?;
+        let ty = transform_length_in(
+            parts.get(1).copied().unwrap_or("0"),
+            height,
+            units,
+            viewport,
+        )?;
         matrix = matrix.then(Affine2d::translate(tx, ty));
         layout_translation.x += tx;
         layout_translation.y += ty;
@@ -3773,25 +3808,30 @@ fn element_transform(
                     Affine2d(values.try_into().ok()?)
                 }
                 "translate" => {
-                    let tx = transform_length(args.first()?, width)?;
-                    let ty = transform_length(args.get(1).map_or("0", String::as_str), height)?;
+                    let tx = transform_length_in(args.first()?, width, units, viewport)?;
+                    let ty = transform_length_in(
+                        args.get(1).map_or("0", String::as_str),
+                        height,
+                        units,
+                        viewport,
+                    )?;
                     layout_translation.x += tx;
                     layout_translation.y += ty;
                     Affine2d::translate(tx, ty)
                 }
                 "translatex" => {
-                    let tx = transform_length(args.first()?, width)?;
+                    let tx = transform_length_in(args.first()?, width, units, viewport)?;
                     layout_translation.x += tx;
                     Affine2d::translate(tx, 0.0)
                 }
                 "translatey" => {
-                    let ty = transform_length(args.first()?, height)?;
+                    let ty = transform_length_in(args.first()?, height, units, viewport)?;
                     layout_translation.y += ty;
                     Affine2d::translate(0.0, ty)
                 }
                 "translate3d" => {
-                    let tx = transform_length(args.first()?, width)?;
-                    let ty = transform_length(args.get(1)?, height)?;
+                    let tx = transform_length_in(args.first()?, width, units, viewport)?;
+                    let ty = transform_length_in(args.get(1)?, height, units, viewport)?;
                     layout_translation.x += tx;
                     layout_translation.y += ty;
                     Affine2d::translate(tx, ty)
@@ -3829,10 +3869,20 @@ fn element_transform(
         .value(dom, "transform-origin")
         .unwrap_or_else(|| "50% 50%".into());
     let parts = split_ws(&origin);
-    let ox =
-        x - layout_translation.x + transform_origin(parts.first().copied().unwrap_or("50%"), width);
-    let oy =
-        y - layout_translation.y + transform_origin(parts.get(1).copied().unwrap_or("50%"), height);
+    let ox = x - layout_translation.x
+        + transform_origin(
+            parts.first().copied().unwrap_or("50%"),
+            width,
+            units,
+            viewport,
+        );
+    let oy = y - layout_translation.y
+        + transform_origin(
+            parts.get(1).copied().unwrap_or("50%"),
+            height,
+            units,
+            viewport,
+        );
     let around = Affine2d::translate(ox, oy)
         .then(matrix)
         .then(Affine2d::translate(-ox, -oy));
@@ -3902,12 +3952,19 @@ fn transform_length(value: &str, basis: f32) -> Option<f32> {
     px(value)
 }
 
-fn transform_origin(value: &str, basis: f32) -> f32 {
+/// Resolve the `<length-percentage>` grammar used by CSS transform
+/// translations. In particular, math functions remain one component value
+/// and resolve percentages against the transform reference box.
+fn transform_length_in(value: &str, basis: f32, units: Units, viewport: Vp) -> Option<f32> {
+    Len::parse(value, units, viewport)?.resolve(Some(basis))
+}
+
+fn transform_origin(value: &str, basis: f32, units: Units, viewport: Vp) -> f32 {
     match value.trim().to_ascii_lowercase().as_str() {
         "left" | "top" => 0.0,
         "center" => basis / 2.0,
         "right" | "bottom" => basis,
-        other => transform_length(other, basis).unwrap_or(basis / 2.0),
+        other => transform_length_in(other, basis, units, viewport).unwrap_or(basis / 2.0),
     }
 }
 

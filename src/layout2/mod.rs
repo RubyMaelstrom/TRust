@@ -7056,6 +7056,27 @@ mod tests {
     }
 
     #[test]
+    fn transform_translate_accepts_nested_calc_length() {
+        // CSS Transforms 1 #two-d-transform-functions accepts a
+        // <length-percentage>; CSS Values 4 #calc-func makes calc() valid in
+        // that position. Steam's >=1400px carousel uses this exact shape to
+        // move its half-transparent previous/next slides out of the focus
+        // slot: translateX(calc(-756px - 40px)).
+        let html = r#"<body style="margin:0">
+            <div id="slide" style="position:absolute;left:800px;top:0;
+                 width:756px;height:100px;opacity:.5;
+                 transform:translateX(calc(-756px - 40px))">previous</div>
+            </body>"#;
+        let (dom, boxes) = measure(html, 200, 20);
+        let slide = rect(&dom, &boxes, "slide");
+        assert_eq!(slide.left, 4.0, "nested calc() translation must be applied");
+
+        let graphical = lay_graphical(html, 1600.0, &HashMap::new());
+        let (x, _, _) = graphical_text(&graphical, "previous");
+        assert!((x - 4.0).abs() < 0.01, "desktop translation: {x}");
+    }
+
+    #[test]
     fn translate_property_percentage_of_own_border_box() {
         let out = lay(
             r#"<body style="margin:0"><div style="width:160px;translate:100%">x</div></body>"#,
