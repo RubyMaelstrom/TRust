@@ -18861,18 +18861,24 @@
     g.WebAssembly = WebAssembly;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 /*__WASM_END__*/
+    g.__performance_adapter = {
+        config: cfg, add: addL, remove: removeL,
+        bufferFull(target) { dispatch(target,createTrustedEvent(Event,'resourcetimingbufferfull'),false); }
+    };
 /*__PERFORMANCE_BEGIN__*/
-// Window User Timing and Performance Timeline: w3c/user-timing mark-method,
+// Window/Worker User Timing and Performance Timeline: w3c/user-timing mark-method,
 // measure-method; performance-timeline queue-the-performanceobserver-task;
-// Web IDL js-dictionary, js-double, js-default-tojson. September 2026 local
-// snapshots. DedicatedWorker exposure awaits its shared EventTarget foundation;
+// Web IDL js-dictionary, js-double, js-default-tojson. Local 2026-09-06 snapshots:
+// resource-timing@1f9ef25, performance-timeline@8aa7b1d, user-timing@a449dbe.
+// Each global owns its buffers and queues delivery on its own event loop.
 // Navigation Timing is populated from native HTTP and document lifecycle
 // records. HTTP Fetch/XHR entries use native fetch measurements; browser-owned
 // element/preload reporting and experimental navigation IDs remain separate.
 (function () {
     "use strict";
-    const g = globalThis, binding = g.__performance_binding;
+    const g = globalThis, binding = g.__performance_binding, adapter = g.__performance_adapter;
     delete g.__performance_binding;
+    delete g.__performance_adapter;
     const slots = binding(new WeakMap());
     const read = WeakMap.prototype.get.bind(slots), write = WeakMap.prototype.set.bind(slots);
     const apply = Reflect.apply, define = Object.defineProperty, create = Object.create;
@@ -18883,7 +18889,7 @@
     const mapDelete = Function.prototype.call.bind(Map.prototype.delete);
     const finite = Number.isFinite, floor = Math.floor, TypeErrorCtor = TypeError, DOMExceptionCtor = g.DOMException;
     const clone = g.structuredClone, oldPerformance = g.performance;
-    const navigationData = cfg.navigationTiming;
+    const navigationData = adapter.config.navigationTiming;
     const navigationOrigin = navigationData && navigationData.timeOrigin;
     const nativeOrigin = typeof navigationOrigin === 'number' && finite(navigationOrigin) && navigationOrigin > 0
         ? navigationOrigin : oldPerformance.timeOrigin;
@@ -19040,7 +19046,7 @@
         while (state.resourceSecondary.length) {
             const before = state.resourceSecondary.length;
             if (state.resourceCount >= state.resourceLimit)
-                dispatch(oldPerformance,createTrustedEvent(Event,'resourcetimingbufferfull'),false);
+                adapter.bufferFull(oldPerformance);
             let copied = 0;
             while (copied < state.resourceSecondary.length && state.resourceCount < state.resourceLimit) {
                 append(state.entries,state.resourceSecondary[copied++]); state.resourceCount++;
@@ -19209,9 +19215,9 @@
                     const handler = state.resourceHandler;
                     if (typeof handler === 'function') apply(handler,this,[event]);
                 };
-                addL(this,'resourcetimingbufferfull',state.resourceListener,false);
+                adapter.add(this,'resourcetimingbufferfull',state.resourceListener,false);
             } else if (!next && state.resourceListener) {
-                removeL(this,'resourcetimingbufferfull',state.resourceListener,false);
+                adapter.remove(this,'resourcetimingbufferfull',state.resourceListener,false);
                 state.resourceListener = null;
             }
         }
@@ -19228,7 +19234,10 @@
     }
     // PerformanceObserver implementation follows here; all delivery enters
     // the browser/worker's dedicated task source, never an author timer.
-    const supportedTypes = freeze(['mark','measure','navigation','resource']);
+    // Navigation Timing is Window-only; the supported list and observe()
+    // filtering must agree in every global, including workers.
+    const supportedTypes = freeze(worker ? ['mark','measure','resource'] : ['mark','measure','navigation','resource']);
+    const supported = type => type === 'mark' || type === 'measure' || type === 'resource' || (!worker && type === 'navigation');
     function observerOptions(value) {
         const input = dictionary(value);
         const bufferedValue = input == null ? undefined : input.buffered;
@@ -19277,13 +19286,13 @@
                 const types = create(null); let count = 0;
                 for (let i=0;i<converted.entryTypes.length;i++) {
                     const type = converted.entryTypes[i];
-                    if (type === 'mark' || type === 'measure' || type === 'navigation' || type === 'resource') { types[type] = true; count++; }
+                    if (supported(type)) { types[type] = true; count++; }
                 }
                 if (!count) return;
                 state.types = types; register(this,state);
             } else {
                 const type = converted.type;
-                if (type !== 'mark' && type !== 'measure' && type !== 'navigation' && type !== 'resource') return;
+                if (!supported(type)) return;
                 state.types[type] = true; register(this,state);
                 if (converted.buffered) {
                     const entries = state.owner.entries;
@@ -19356,8 +19365,9 @@
     }
     for (const [C,name] of [[Performance,'Performance'],[PerformanceEntry,'PerformanceEntry'],
         [PerformanceMark,'PerformanceMark'],[PerformanceMeasure,'PerformanceMeasure'],
-        [PerformanceResourceTiming,'PerformanceResourceTiming'],[PerformanceNavigationTiming,'PerformanceNavigationTiming'],
+        [PerformanceResourceTiming,'PerformanceResourceTiming'],
         [PerformanceObserver,'PerformanceObserver'],[PerformanceObserverEntryList,'PerformanceObserverEntryList']]) installInterface(C,name);
+    if (!worker) installInterface(PerformanceNavigationTiming,'PerformanceNavigationTiming');
     define(PerformanceEntry,'length',{value:0}); define(PerformanceMark,'length',{value:1});
     for (const name of ['mark','measure']) define(Performance.prototype[name],'length',{value:1});
     for (const name of ['clearMarks','clearMeasures']) define(Performance.prototype[name],'length',{value:0});
@@ -19369,7 +19379,7 @@
     function recordResourceTimingPacked(values) {
         // The native bridge transfers a fresh, dense scalar tuple exclusively
         // to this private backing store. Public entries never expose it. Keep
-        // the recording Window's origin even if its initial blank is replaced.
+        // the recording global's origin even if its initial blank is replaced.
         // Entry creation/queueing is immediate; only field conversion is lazy.
         const origin = owner.timeOrigin;
         const state = {kind:'resource',name:values[0],startTime:values[1]-origin,
@@ -19381,7 +19391,7 @@
     host.recordResourceTimingPacked = recordResourceTimingPacked;
     host.recordResourceTiming = function (data) {
         // Native Fetch's privacy-filtered coarse record, not a page-supplied
-        // URL or a guessed fetch duration. Called in the initiating Window.
+        // URL or a guessed fetch duration. Called in the initiating global.
         if (!data || typeof data.name !== 'string') return;
         // The infrequent container fallback uses a named scalar record. Copy
         // it once so later mutation cannot change an existing entry's values.

@@ -3,7 +3,10 @@
     var portAPI;
     const bitmapTasks = [];
     var cfg = g.__worker_cfg || { id: 0, name: "", type: "classic", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
-    function errStr(where, e) { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
+    function errStr(where, e) {
+        try { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
+        catch (_) { return where + ": exception could not be formatted"; }
+    }
 
     // --- the real-time event-loop core (driven by the Rust worker thread) ---
     var WK = g.__wkr = {
@@ -91,16 +94,25 @@
         WK.timers = WK.timers.filter(function (timer) { return timer.id !== id; });
     }
 
-    // --- EventTarget on the worker global (options-aware: `once`/`signal`
-    // behave per spec, `capture` is stored for removal matching — the worker
-    // global is a flat target, so there is no capture PHASE) ---
+    // DOM #concept-event-dispatch / #concept-event-listener-inner-invoke:
+    // worker targets have no parent, but still invoke capture listeners before
+    // non-capture listeners, both AT_TARGET, and clean up dispatch state.
     var LS = new Map();
     var targetListeners = new WeakMap();
+    const scopeEventSlots = new WeakMap();
+    const scopeEventGet = WeakMap.prototype.get.bind(scopeEventSlots);
+    const scopeEventSet = WeakMap.prototype.set.bind(scopeEventSlots);
+    const scopeDefine = Object.defineProperty;
+    function scopeEventState(event) {
+        const state = scopeEventGet(event);
+        if (!state) throw new TypeError('Illegal Event invocation');
+        return state;
+    }
     function lsFor(type, target) {
         var map = LS;
         if (target && target !== g) {
             map = targetListeners.get(target);
-            if (!map) { map = new Map(); targetListeners.set(target, map); }
+            if (!map) throw new TypeError('Illegal EventTarget invocation');
         }
         var l = map.get(type); if (!l) { l = []; map.set(type, l); } return l;
     }
@@ -114,71 +126,126 @@
         return i;
     }
     g.addEventListener = function (type, fn, options) {
-        if (!(typeof fn === "function" || (fn && typeof fn.handleEvent === "function"))) return;
-        var o = options === true ? { capture: true } : (options && typeof options === "object" ? options : {});
-        if (o.signal && o.signal.aborted) return;
-        var target = this || g, t = String(type), l = lsFor(t, target);
-        if (lsFind(l, fn, !!o.capture) >= 0) return;
-        var entry = { fn: fn, capture: !!o.capture, once: !!o.once, removed: false };
+        // Web IDL callback interfaces retain the object without reading
+        // handleEvent until invocation; its getter may change or throw.
+        var target = this || g, t = `${type}`, l = lsFor(t, target);
+        if (fn != null && typeof fn !== "function" && typeof fn !== "object") throw new TypeError('Expected EventListener');
+        var o = options && (typeof options === "object" || typeof options === "function") ? options : {capture:!!options};
+        var capture = !!o.capture, once = !!o.once, passive = !!o.passive, signal = o.signal;
+        if (fn == null || (signal && signal.aborted)) return;
+        if (lsFind(l, fn, capture) >= 0) return;
+        var entry = { fn: fn, capture: capture, once: once, passive:passive, removed: false };
         if (!l.fns) { l.fns = []; l.caps = []; }
         l.push(entry); l.fns.push(fn); l.caps.push(entry.capture);
-        if (o.signal && typeof o.signal.addEventListener === "function") {
-            o.signal.addEventListener("abort", function () { g.removeEventListener.call(target, t, fn, { capture: entry.capture }); }, { once: true });
+        if (signal && typeof signal.addEventListener === "function") {
+            signal.addEventListener("abort", function () { g.removeEventListener.call(target, t, fn, { capture: entry.capture }); }, { once: true });
         }
     };
     g.removeEventListener = function (type, fn, options) {
-        var capture = options === true || !!(options && options.capture);
-        var l = lsFor(String(type), this);
+        var l = lsFor(`${type}`, this);
+        if (fn != null && typeof fn !== "function" && typeof fn !== "object") throw new TypeError('Expected EventListener');
+        var capture = options && (typeof options === "object" || typeof options === "function") ? !!options.capture : !!options;
         var i = lsFind(l, fn, capture);
         if (i < 0) return;
         l[i].removed = true;
         l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     };
-    var trustedScopeEvents = new WeakSet();
     function dispatchScopeEvent(ev, preserveTrusted, target) {
         target = target || g;
-        if (!preserveTrusted) trustedScopeEvents.delete(ev);
-        ev.target = target; ev.currentTarget = target;
-        var l = lsFor(ev.type, target), snap = l.slice();
-        for (var i = 0; i < snap.length; i++) {
-            var entry = snap[i];
-            if (entry.removed) continue;
-            // `once`: remove through removeEventListener so the parallel
-            // fns/caps arrays stay aligned with the entry list.
-            if (entry.once) g.removeEventListener.call(target, ev.type, entry.fn, { capture: entry.capture });
-            try { (typeof entry.fn === "function") ? entry.fn.call(target, ev) : entry.fn.handleEvent(ev); }
-            catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); }
+        var state = scopeEventState(ev), l = lsFor(state.type, target);
+        if (state.dispatching) throw new g.DOMException('Event is already being dispatched','InvalidStateError');
+        if (!preserveTrusted) state.isTrusted = false;
+        state.dispatching = true; state.target = target; state.currentTarget = target; state.eventPhase = 2;
+        try {
+            for (var phase = 0; phase < 2 && !state.stopped; phase++) {
+                // Clone separately for each invocation, as DOM requires. A
+                // listener added during capture may run during the next phase.
+                var snap = l.slice();
+                for (var i = 0; i < snap.length; i++) {
+                    var entry = snap[i];
+                    if (entry.removed || entry.capture !== (phase === 0)) continue;
+                    if (entry.once) removeListener.call(target, state.type, entry.fn, {capture:entry.capture});
+                    state.passive = entry.passive;
+                    try { (typeof entry.fn === "function") ? entry.fn.call(target, ev) : entry.fn.handleEvent(ev); }
+                    catch (e) { WK.errors.push(errStr(state.type + " handler", e)); }
+                    finally { state.passive = false; }
+                    if (state.immediate) break;
+                }
+            }
+        } finally {
+            state.currentTarget = null; state.eventPhase = 0;
+            state.dispatching = false; state.stopped = false; state.immediate = false;
         }
-        return !ev.defaultPrevented;
+        return !state.defaultPrevented;
     }
-    g.dispatchEvent = function (ev) { return dispatchScopeEvent(ev, false); };
+    g.dispatchEvent = function (ev) { return dispatchScopeEvent(ev, false, this); };
     function fireScope(type, ev) {
         dispatchScopeEvent(ev, true);
     }
 
     // --- Event / MessageEvent / ErrorEvent ---
-    function Event(type, init) {
-        init = init || {}; this.type = String(type); this.bubbles = !!init.bubbles;
-        this.cancelable = !!init.cancelable; this.defaultPrevented = false;
-        this.target = null; this.currentTarget = null; this.timeStamp = Date.now();
-        Object.defineProperty(this, "isTrusted", {
+    function initializeScopeEvent(event, type, init, count) {
+        if (!count) throw new TypeError('Missing event type');
+        type = `${type}`;
+        if (init != null && typeof init !== 'object' && typeof init !== 'function') throw new TypeError('Expected EventInit dictionary');
+        init = init || {};
+        const bubbles = !!init.bubbles, cancelable = !!init.cancelable, composed = !!init.composed;
+        scopeEventSet(event, {type,bubbles,cancelable,composed,defaultPrevented:false,
+            target:null,currentTarget:null,eventPhase:0,isTrusted:false,
+            timeStamp:perfFloor(perfClock()*10)/10-perfOrigin,
+            dispatching:false,stopped:false,immediate:false,passive:false});
+        scopeDefine(event, "isTrusted", {
             configurable: false, enumerable: true,
-            get: function () { return trustedScopeEvents.has(this); }
+            get: function () { return scopeEventState(this).isTrusted; }
         });
     }
-    Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
-    Event.prototype.stopPropagation = function () {}; Event.prototype.stopImmediatePropagation = function () {};
-    function MessageEvent(type, init) { Event.call(this, type, init); init = init || {}; this.data = init.data; this.origin = init.origin || ""; this.lastEventId = init.lastEventId || ""; this.source = init.source || null; this.ports = init.ports || []; }
+    function Event(type, init) {
+        if (!new.target) throw new TypeError('Event requires construction');
+        initializeScopeEvent(this,type,init,arguments.length);
+    }
+    for (const name of ['type','target','currentTarget','eventPhase','bubbles','cancelable','defaultPrevented','composed','timeStamp']) {
+        const get = {get() { return scopeEventState(this)[name]; }}.get;
+        scopeDefine(get,'name',{value:'get '+name,configurable:true});
+        scopeDefine(Event.prototype,name,{get,enumerable:true,configurable:true});
+    }
+    Object.assign(Event.prototype, {
+        preventDefault() { const state=scopeEventState(this); if(state.cancelable && !state.passive)state.defaultPrevented=true; },
+        stopPropagation() { scopeEventState(this).stopped=true; },
+        stopImmediatePropagation() { const state=scopeEventState(this); state.stopped=true;state.immediate=true; },
+        composedPath() { const state=scopeEventState(this); return state.dispatching ? [state.target] : []; },
+        initEvent(type, bubbles=false, cancelable=false) {
+            const state=scopeEventState(this);
+            if(!arguments.length)throw new TypeError('Missing event type');
+            type=`${type}`; bubbles=!!bubbles;cancelable=!!cancelable;
+            if(state.dispatching)return;
+            state.type=type;state.bubbles=bubbles;state.cancelable=cancelable;state.target=null;
+            state.stopped=false;state.immediate=false;state.defaultPrevented=false;state.isTrusted=false;
+        }
+    });
+    Object.defineProperties(Event.prototype, {
+        srcElement:{get() {return scopeEventState(this).target;},enumerable:true,configurable:true},
+        cancelBubble:{get() {return scopeEventState(this).stopped;},set(value) {const state=scopeEventState(this);if(value)state.stopped=true;},enumerable:true,configurable:true},
+        returnValue:{get() {return !scopeEventState(this).defaultPrevented;},set(value) {const state=scopeEventState(this);if(!value && state.cancelable && !state.passive)state.defaultPrevented=true;},enumerable:true,configurable:true}
+    });
+    for (const [name,value] of [['NONE',0],['CAPTURING_PHASE',1],['AT_TARGET',2],['BUBBLING_PHASE',3]]) {
+        scopeDefine(Event,name,{value,enumerable:true}); scopeDefine(Event.prototype,name,{value,enumerable:true});
+    }
+    function MessageEvent(type, init) { if(!new.target)throw new TypeError('MessageEvent requires construction'); initializeScopeEvent(this,type,init,arguments.length); init = init || {}; this.data = init.data; this.origin = init.origin || ""; this.lastEventId = init.lastEventId || ""; this.source = init.source || null; this.ports = init.ports || []; }
     MessageEvent.prototype = Object.create(Event.prototype);
-    function ErrorEvent(type, init) { Event.call(this, type, init); init = init || {}; this.message = init.message || ""; this.filename = init.filename || ""; this.lineno = init.lineno || 0; this.colno = init.colno || 0; this.error = init.error || null; }
+    function ErrorEvent(type, init) { if(!new.target)throw new TypeError('ErrorEvent requires construction'); initializeScopeEvent(this,type,init,arguments.length); init = init || {}; this.message = init.message || ""; this.filename = init.filename || ""; this.lineno = init.lineno || 0; this.colno = init.colno || 0; this.error = init.error || null; }
     ErrorEvent.prototype = Object.create(Event.prototype);
     g.Event = Event; g.MessageEvent = MessageEvent; g.ErrorEvent = ErrorEvent;
-    g.CustomEvent = function CustomEvent(type, init) { MessageEvent.call(this, type, init); this.detail = (init && init.detail !== undefined) ? init.detail : null; };
-    g.CustomEvent.prototype = Object.create(MessageEvent.prototype);
+    g.CustomEvent = function CustomEvent(type, init) { if(!new.target)throw new TypeError('CustomEvent requires construction'); initializeScopeEvent(this,type,init,arguments.length); this.detail = (init && init.detail !== undefined) ? init.detail : null; };
+    g.CustomEvent.prototype = Object.create(Event.prototype);
+    for (const C of [Event,MessageEvent,ErrorEvent,g.CustomEvent]) {
+        scopeDefine(C,'length',{value:1,configurable:true});
+        scopeDefine(C.prototype,'constructor',{value:C,writable:true,configurable:true});
+        scopeDefine(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    }
 
     function trustedScopeEvent(C, type, init) {
         var ev = new C(type, init);
-        trustedScopeEvents.add(ev);
+        scopeEventState(ev).isTrusted = true;
         return ev;
     }
 
@@ -205,9 +272,27 @@
 
     const addListener = g.addEventListener, removeListener = g.removeEventListener;
     g.EventTarget = class EventTarget {
+        constructor() { targetListeners.set(this,new Map()); }
         addEventListener(type, callback, options) { addListener.call(this, type, callback, options); }
         removeEventListener(type, callback, options) { removeListener.call(this, type, callback, options); }
         dispatchEvent(event) { return dispatchScopeEvent(event, false, this); }
+    };
+    scopeDefine(g.EventTarget.prototype,Symbol.toStringTag,{value:'EventTarget',configurable:true});
+    for (const name of ['addEventListener','removeEventListener','dispatchEvent']) {
+        const descriptor=Object.getOwnPropertyDescriptor(g.EventTarget.prototype,name);
+        descriptor.enumerable=true;scopeDefine(g.EventTarget.prototype,name,descriptor);
+        scopeDefine(descriptor.value,'length',{value:name==='dispatchEvent' ? 1 : 2,configurable:true});
+    }
+    // Resource Timing fires at the worker's Performance EventTarget. The
+    // shared implementation receives only the private flat-target adapter,
+    // never a Window or a fabricated Document.
+    g.__performance_adapter = {
+        config: cfg,
+        add(target, type, callback, options) { addListener.call(target,type,callback,options); },
+        remove(target, type, callback, options) { removeListener.call(target,type,callback,options); },
+        bufferFull(target) {
+            dispatchScopeEvent(trustedScopeEvent(Event,'resourcetimingbufferfull',{}),true,target);
+        }
     };
     g.__bitmap_adapter = { queue(fn) { bitmapTasks.push(fn); }, source() { return undefined; } };
     g.__port_adapter = {
@@ -238,10 +323,10 @@
     var perfClock = g.__clock_now, perfFloor = Math.floor;
     delete g.__clock_now;
     var perfOrigin = perfFloor((cfg.timeOrigin === undefined ? perfClock() : cfg.timeOrigin) * 10) / 10;
-    g.performance = {
+    g.performance = Object.assign(new g.EventTarget(), {
         now: function () { return perfFloor(perfClock() * 10) / 10 - perfOrigin; },
         timeOrigin: perfOrigin
-    };
+    });
 
     // --- console: a worker's console isn't surfaced; no-op (never throws) ---
     var noop = function () {};

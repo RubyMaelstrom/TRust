@@ -7402,10 +7402,19 @@ fn record_resource_timing(ctx: &mut Ctx, report: Option<LumenResourceTiming>) {
 
 fn record_resource_timing_ref(ctx: &mut Ctx, report: &LumenResourceTiming) {
     let data = report.data();
-    // Worker Performance/EventTarget integration is independent. Do not let
-    // absent reporting hooks change the completion of the underlying request.
+    // Resource Timing #marking-resource-timing creates the entry in the
+    // initiating global, including WorkerGlobalScope (not its owner Window).
     let value = host_resource_timing_value(ctx, &data);
-    let _ = host_call_trust(ctx, "recordResourceTimingPacked", &[value]);
+    let worker = ctx
+        .host_mut::<HostState>()
+        .is_some_and(|state| state.worker_self.is_some());
+    let global = ctx.global_this();
+    let _ = ctx
+        .member_get(&global, if worker { "__wkr" } else { "__trust" })
+        .and_then(|host| {
+            let function = ctx.member_get(&host, "recordResourceTimingPacked")?;
+            ctx.invoke(function, host, &[value])
+        });
 }
 
 /// XMLHttpRequest's synchronous flag uses HTML's pause semantics. The network future runs on the
@@ -8951,6 +8960,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
     engine.define_global("__wasm_module_binding", 1, host_wasm_module_binding);
     engine.define_global("__permissions_binding", 2, host_permissions_binding);
     engine.define_global("__navigator_binding", 1, host_navigator_binding);
+    engine.define_global("__performance_binding", 1, host_performance_binding);
     // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
     // shared worker prelude can reach, including its independent per-agent
     // WebAssembly store.
@@ -9501,6 +9511,7 @@ fn run_lumen_worker(
         Timer,
         Port,
         Bitmap,
+        Performance,
     }
     let wall_origin = Instant::now();
     let virtual_origin = lumen_worker_now(&mut engine);
@@ -9524,20 +9535,25 @@ fn run_lumen_worker(
             lumen_worker_internal_call(&mut engine, "hasBitmapTask", &[]),
             Ok(Value::Bool(true))
         );
+        let performance_ready = matches!(
+            lumen_worker_internal_call(&mut engine, "hasPerformanceTask", &[]),
+            Ok(Value::Bool(true))
+        );
         // Distinct task sources all make progress. A busy implicit worker port
         // must not starve transferred channels or an already-due timer.
         let mut task = None;
-        for offset in 0..4 {
-            let source = (source_cursor + offset) % 4;
+        for offset in 0..5 {
+            let source = (source_cursor + offset) % 5;
             task = match source {
                 0 => queued_command.take().map(WorkerTask::Command),
                 1 if deadline.is_some_and(|deadline| deadline <= now) => Some(WorkerTask::Timer),
                 2 if port_ready => Some(WorkerTask::Port),
                 3 if bitmap_ready => Some(WorkerTask::Bitmap),
+                4 if performance_ready => Some(WorkerTask::Performance),
                 _ => None,
             };
             if task.is_some() {
-                source_cursor = (source + 1) % 4;
+                source_cursor = (source + 1) % 5;
                 break;
             }
         }
@@ -9581,6 +9597,9 @@ fn run_lumen_worker(
             }
             WorkerTask::Port => lumen_worker_internal_call(&mut engine, "runPortTask", &[]),
             WorkerTask::Bitmap => lumen_worker_internal_call(&mut engine, "runBitmapTask", &[]),
+            WorkerTask::Performance => {
+                lumen_worker_internal_call(&mut engine, "runPerformanceTask", &[])
+            }
             WorkerTask::Timer => {
                 lumen_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
             }
@@ -13919,6 +13938,34 @@ mod tests {
             HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
             DEFAULT_URL,
         )
+    }
+
+    fn worker_platform_engine() -> lumen::Engine {
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        state.worker_self = Some(LumenWorkerSelf {
+            id: 1,
+            events,
+            closed: false,
+            origin: url::Url::parse(DEFAULT_URL).unwrap(),
+        });
+        let origin = clock.origin_ms;
+        let mut engine = lumen::Engine::new();
+        engine.set_wall_clock(move || clock.now_ms());
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(state);
+        install_lumen_worker_boundary(&mut engine);
+        eval(
+            &mut engine,
+            &format!("globalThis.__worker_cfg={{url:'https://example.org/worker.js',timeOrigin:{origin}}}"),
+            "worker config",
+        )
+        .unwrap();
+        assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+        engine
     }
 
     #[test]
@@ -18725,6 +18772,128 @@ mod tests {
         }
         eval(&mut engine, "fetchWorker.terminate()", "cleanup").unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_performance_fetches_are_realm_local_and_observed_as_tasks() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let home = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let cross = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let page = url::Url::parse(&format!("http://{}/", home.local_addr().unwrap())).unwrap();
+        let cross_origin = format!("http://{}", cross.local_addr().unwrap());
+        let script = include_str!("fixtures/worker_performance_fetch.mjs");
+        let mut servers = Vec::new();
+        for (listener, same_origin, requests) in [(home, true, 5), (cross, false, 6)] {
+            servers.push(runtime.spawn(async move {
+                for _ in 0..requests {
+                    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
+                        .await.unwrap().unwrap();
+                    let mut request = Vec::new();
+                    let mut bytes = [0; 4096];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let count = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut bytes))
+                            .await.unwrap().unwrap();
+                        assert_ne!(count, 0);
+                        request.extend_from_slice(&bytes[..count]);
+                        assert!(request.len() <= 8192);
+                    }
+                    let head = String::from_utf8_lossy(&request);
+                    let (mime, body) = if same_origin && head.starts_with("GET /worker.js?") {
+                        ("text/javascript", script)
+                    } else {
+                        assert!(if same_origin {
+                            head.starts_with("GET /payload?")
+                        } else {
+                            head.starts_with("GET /allowed?") || head.starts_with("GET /opaque?")
+                        }, "{head}");
+                        ("text/plain", "body")
+                    };
+                    let tao = if head.starts_with("GET /allowed?") { "Timing-Allow-Origin: *\r\n" } else { "" };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n{tao}Connection: close\r\n\r\n{body}", body.len());
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            }));
+        }
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(&mut engine, &format!(r#"
+            performance.mark('parent-only');
+            globalThis.workerPerformanceResults = [];
+            const source = URL.createObjectURL(new Blob([{}], {{type:'text/javascript'}}));
+            const config = {{home:{}, cross:{}, earliestOrigin:performance.timeOrigin + performance.now()}};
+            globalThis.performanceWorkers = [
+                new Worker('/worker.js?classic', {{name:'classic'}}),
+                new Worker('/worker.js?module', {{name:'module',type:'module'}}),
+                new Worker(source, {{name:'blob'}})
+            ];
+            for (const worker of performanceWorkers) {{
+                worker.onmessage = event => workerPerformanceResults.push(event.data);
+                worker.onerror = event => workerPerformanceResults.push('ERROR:' + event.message);
+                worker.postMessage(config);
+            }}
+        "#, serde_json::to_string(script).unwrap(),
+            serde_json::to_string(&page.origin().ascii_serialization()).unwrap(),
+            serde_json::to_string(&cross_origin).unwrap()), "worker Performance network fixture").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let results = string_value(&mut engine, "workerPerformanceResults.join('|')");
+            assert!(!results.contains("ERROR:"), "{results}");
+            if string_value(&mut engine, "workerPerformanceResults.length === 3") == "true" {
+                assert_eq!(
+                    string_value(&mut engine, "workerPerformanceResults.sort().join('|')"),
+                    "blob:ok|classic:ok|module:ok"
+                );
+                break;
+            }
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        task_rx.recv(),
+                    )
+                    .await
+                })
+                .unwrap_or_else(|_| panic!("worker Performance tasks stalled: {results}"))
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "performance.getEntriesByType('resource').filter(entry=>entry.initiatorType==='fetch').length"
+            ),
+            "0"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        eval(
+            &mut engine,
+            "performanceWorkers.forEach(worker=>worker.terminate())",
+            "worker cleanup",
+        )
+        .unwrap();
+        for server in servers {
+            runtime.block_on(server).unwrap();
+        }
     }
 
     #[test]
@@ -26414,6 +26583,102 @@ mod tests {
     }
 
     #[test]
+    fn worker_performance_interfaces_and_tasks_across_tiers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = worker_platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/user_timing.mjs")),
+                "user-timing-ok",
+                "{tier:?}"
+            );
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/resource_timing.mjs")),
+                "resource-timing-ok",
+                "{tier:?}"
+            );
+            eval(
+                &mut engine,
+                include_str!("fixtures/performance_observers.mjs"),
+                "worker performance observers",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            for expected in [
+                "sync,microtask",
+                "sync,microtask,first,second",
+                "sync,microtask,first,second,first",
+            ] {
+                assert_eq!(
+                    string_value(&mut engine, "performanceObserverResult.join(',')"),
+                    expected,
+                    "{tier:?}"
+                );
+                eval(
+                    &mut engine,
+                    "__wkr.runPerformanceTask()",
+                    "worker performance task",
+                )
+                .unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            eval(
+                &mut engine,
+                "performanceObserverCleanup()",
+                "worker observer cleanup",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/worker_performance.mjs")),
+                "worker-performance-ok",
+                "{tier:?}"
+            );
+            assert_eq!(string_value(&mut engine, "__wkr.takeErrors()"), "");
+            eval(
+                &mut engine,
+                r#"
+                globalThis.workerObserverAfterThrow = false;
+                const throwing = new PerformanceObserver(() => {
+                    throwing.disconnect(); throw {get message(){throw Error('formatting');}};
+                });
+                const remaining = new PerformanceObserver(() => {
+                    workerObserverAfterThrow = true; remaining.disconnect();
+                });
+                throwing.observe({type:'mark'}); remaining.observe({type:'mark'});
+                performance.mark('reported-exception');
+                __wkr.runPerformanceTask();
+            "#,
+                "worker observer exception isolation",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "workerObserverAfterThrow"),
+                "true"
+            );
+            assert!(
+                string_value(&mut engine, "__wkr.takeErrors()")
+                    .contains("PerformanceObserver callback threw")
+            );
+        }
+    }
+
+    #[test]
+    fn worker_event_targets_preserve_dispatch_state_across_tiers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = worker_platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/worker_events.mjs")),
+                "worker-events-ok",
+                "{tier:?}"
+            );
+            assert_eq!(string_value(&mut engine, "__wkr.takeErrors()"), "");
+        }
+    }
+
+    #[test]
     fn user_timing_marks_measures_and_timeline() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
@@ -26514,10 +26779,15 @@ mod tests {
 
     #[test]
     fn user_timing_buffers_and_private_slots_release_cleared_entries() {
-        let mut engine = platform_engine();
-        eval(
-            &mut engine,
-            r#"(() => {
+        for worker_scope in [false, true] {
+            let mut engine = if worker_scope {
+                worker_platform_engine()
+            } else {
+                platform_engine()
+            };
+            eval(
+                &mut engine,
+                r#"(() => {
             const observer = new PerformanceObserver(() => {});
             observer.observe({type:'mark'});
             const mark = performance.mark('retained',{detail:{bytes:new Uint8Array(4096)}});
@@ -26527,39 +26797,40 @@ mod tests {
             globalThis.unrecordedMarkWeak = new WeakRef(new PerformanceMark('unrecorded'));
             performance.clearMarks();
         })()"#,
-            "Performance entry ownership",
-        )
-        .unwrap();
-        run_microtask_checkpoint(&mut engine);
-        for _ in 0..3 {
-            engine.ctx().collect_garbage_for_host();
+                "Performance entry ownership",
+            )
+            .unwrap();
             run_microtask_checkpoint(&mut engine);
-        }
-        assert_eq!(
-            string_value(
+            for _ in 0..3 {
+                engine.ctx().collect_garbage_for_host();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "unrecordedMarkWeak.deref() === undefined && performanceMarkWeak.deref() !== undefined && performanceDetailWeak.deref() !== undefined && performanceObserverWeak.deref() !== undefined"
+                ),
+                "true"
+            );
+            eval(
                 &mut engine,
-                "unrecordedMarkWeak.deref() === undefined && performanceMarkWeak.deref() !== undefined && performanceDetailWeak.deref() !== undefined && performanceObserverWeak.deref() !== undefined"
-            ),
-            "true"
-        );
-        eval(
-            &mut engine,
-            "performanceObserverWeak.deref().disconnect()",
-            "drop pending Performance records",
-        )
-        .unwrap();
-        run_microtask_checkpoint(&mut engine);
-        for _ in 0..3 {
-            engine.ctx().collect_garbage_for_host();
+                "performanceObserverWeak.deref().disconnect()",
+                "drop pending Performance records",
+            )
+            .unwrap();
             run_microtask_checkpoint(&mut engine);
+            for _ in 0..3 {
+                engine.ctx().collect_garbage_for_host();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "performanceMarkWeak.deref() === undefined && performanceDetailWeak.deref() === undefined && performanceObserverWeak.deref() === undefined"
+                ),
+                "true"
+            );
         }
-        assert_eq!(
-            string_value(
-                &mut engine,
-                "performanceMarkWeak.deref() === undefined && performanceDetailWeak.deref() === undefined && performanceObserverWeak.deref() === undefined"
-            ),
-            "true"
-        );
     }
 
     #[test]

@@ -151,7 +151,7 @@ impl NavigationType {
 impl FetchTiming {
     /// Resource Timing #marking-resource-timing / Fetch #fetch-finale. Send
     /// only a privacy-filtered native scalar record across the host boundary.
-    /// The owning Window then converts these coarse shared timestamps against
+    /// The owning Window or worker converts these coarse shared timestamps against
     /// its private time origin; no author-writable Performance getter is used.
     pub(crate) fn resource_data(&self, name: &str, initiator: &str) -> serde_json::Value {
         let coarse = |value: f64| (value * 10.0).floor() / 10.0;
