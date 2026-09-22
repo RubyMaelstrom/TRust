@@ -119,6 +119,32 @@ Trace a normal Lumen page load and its network requests:
 TRUST_NET_TRACE=1 TRUST_LUMEN_TRACE=1 target/release/trust https://example.test/
 ```
 
+Network trace lines include `protocol=h2` / `http/1.1` and `reused=true/false`.
+HTTPS negotiates HTTP/2 automatically through ALPN; no User-Agent changes or
+site-specific transport rules are involved. HTTP/1.1-only and no-ALPN servers
+retain the existing transport, and WebSocket Upgrade uses a separate
+HTTP/1.1-only connector.
+
+Run the bounded, transport-only live HTTP/2 check (no JavaScript or clicks):
+
+```sh
+TRUST_NET_DIAG=https://civitai.red/ \
+  cargo test --release --lib http2_live_transport_probe -- --ignored --nocapture
+```
+
+This makes two GETs through the real browser networking layer, reports status,
+negotiated protocol, connection reuse, body size and challenge presence, and
+expects HTTP/2 200 responses without challenge headers. It is a live acceptance
+check, not a stable offline test or a guarantee that every protected site works.
+The ordinary `cargo test --lib http2` suite uses local TLS servers for ALPN
+fallback, multiplexing, flow control, uploads, disk streaming, cancellation,
+GOAWAY/reset retry safety, response validation, and timing. HTTP/2 receive
+credits are 1 MiB per stream / 8 MiB per connection, not eager allocations;
+uploads stage at most 64 KiB at a time. Header blocks are bounded to 256 KiB
+and 256 fields, with at most 128 interim responses per request. Page-body and
+download limits remain separate. At most 32 recently used origin entries are
+retained for reuse; active streams keep their own session alive when evicted.
+
 Trace terminal redraws, page events, layout, and image work:
 
 ```sh

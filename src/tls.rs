@@ -227,8 +227,12 @@ pub fn ensure_provider() -> Arc<CryptoProvider> {
 /// Mozilla roots — for the public web, where certificates rotate
 /// constantly. Telnet TLS keeps the TOFU `connector` below.
 pub fn webpki_connector() -> TlsConnector {
+    TlsConnector::from(webpki_config().clone())
+}
+
+fn webpki_config() -> &'static Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    let config = CONFIG.get_or_init(|| {
+    CONFIG.get_or_init(|| {
         ensure_provider();
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -237,8 +241,18 @@ pub fn webpki_connector() -> TlsConnector {
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         )
-    });
-    TlsConnector::from(config.clone())
+    })
+}
+
+/// RFC 9113 §§3.2, 9.2 / RFC 7301 §3: negotiate HTTPS independently of
+/// the HTTP/1.1-only WebSocket Upgrade transport. The caller retains this
+/// connector within one network/credentials partition; TLS session tickets
+/// must not link otherwise isolated connection pools (Fetch #connections).
+pub(crate) fn http_connector() -> TlsConnector {
+    let mut config = (**webpki_config()).clone();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.resumption = tokio_rustls::rustls::client::Resumption::in_memory_sessions(32);
+    TlsConnector::from(Arc::new(config))
 }
 
 /// A TLS connector whose TOFU pin is keyed to this `host:port`.
