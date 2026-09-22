@@ -11385,6 +11385,11 @@
     g.devicePixelRatio = cfg.devicePixelRatio; g.pageXOffset = 0; g.pageYOffset = 0;
     g.scrollX = 0; g.scrollY = 0;
     // WHATWG HTML §7.2.5 "The History interface", shared history
+    // (local snapshot e5071a20, 2026-09-06); Web IDL §§js-interfaces,
+    // interface-object, and interface-prototype-object require the exposed
+    // History interface object and its prototype even though History has no
+    // constructor operation. Framework routers legitimately borrow methods as
+    // `History.prototype.replaceState`.
     // push/replace state steps and "can have its URL rewritten". These are
     // same-document updates: clone the state, validate/resolve the optional
     // URL, update Location without hashchange/popstate, then tell the browser
@@ -11462,22 +11467,35 @@
         if (delta === 0) record.reload();
         else historyBinding("traverse", delta, record.context);
     }
-    const historyObject = {
-        get length() { return activeHistoryRecord(this).length; },
-        get state() { return activeHistoryRecord(this).state; },
-        scrollRestoration: "auto",
-        pushState(s, unused, u) { updateHistoryState(this, s, unused, u, false, arguments.length); },
-        replaceState(s, unused, u) { updateHistoryState(this, s, unused, u, true, arguments.length); },
+    class History {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return activeHistoryRecord(this).length; }
+        get state() { return activeHistoryRecord(this).state; }
+        get scrollRestoration() { return activeHistoryRecord(this).scrollRestoration; }
+        set scrollRestoration(value) {
+            const record = activeHistoryRecord(this);
+            value = domString(value);
+            if (value !== "auto" && value !== "manual")
+                throw new TypeError("Invalid scroll restoration mode");
+            record.scrollRestoration = value;
+        }
+        pushState(s, unused, u) { updateHistoryState(this, s, unused, u, false, arguments.length); }
+        replaceState(s, unused, u) { updateHistoryState(this, s, unused, u, true, arguments.length); }
         // HTML #dom-history-go / #delta-traverse: conversion precedes the
         // fully-active check; the traversal is asynchronous and targets the
         // receiver's traversable, even for a borrowed operation.
-        back() { deltaTraverse(this, -1); },
-        forward() { deltaTraverse(this, 1); },
-        go(delta = 0) { historyRecord(this); deltaTraverse(this, (+delta) | 0); },
-    };
+        back() { deltaTraverse(this, -1); }
+        forward() { deltaTraverse(this, 1); }
+        go(delta = 0) { historyRecord(this); deltaTraverse(this, (+delta) | 0); }
+    }
+    Object.defineProperty(History.prototype, Symbol.toStringTag, {
+        value: "History", configurable: true,
+    });
+    const historyObject = Object.create(History.prototype);
     historySet(historyObject, {
         context: Number(cfg.hostSettingsContext) || 0,
         location: locState, length: 1, state: null,
+        scrollRestoration: "auto",
         index: 0, entries: [{url:locState.href, state:null}],
         baseURL() { return documentBaseURL(realmRootFrame); },
         reload: loc.reload.bind(loc),
@@ -11488,6 +11506,7 @@
             trust.historyUpdates.push({ url: parsed[0], replace: !!replace });
         },
     });
+    g.History = History;
     g.history = historyObject;
     // getComputedStyle is now cascade-backed (read-only): __dom_computed
     // returns the inherited / UA-defaulted value for tracked properties and

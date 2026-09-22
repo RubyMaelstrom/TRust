@@ -21273,6 +21273,53 @@ mod tests {
     }
 
     #[test]
+    fn history_interface_exposes_router_compatible_prototype() {
+        // WHATWG HTML #the-history-interface and Web IDL #js-interfaces /
+        // #interface-object / #interface-prototype-object: History is exposed
+        // as a non-constructible interface object even though its instance is
+        // supplied by Window.history. Framer and similar routers borrow
+        // History.prototype.replaceState during startup.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                    Rc::new(RealmClock::new()),
+                ),
+                "https://example.test/blog/article",
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const check = (ok, message) => { if (!ok) throw Error(message); };
+                    check(typeof window.History === 'function', 'History interface missing');
+                    check(window.history instanceof window.History, 'history brand missing');
+                    check(Object.getPrototypeOf(window.history) === window.History.prototype,
+                        'history prototype missing');
+                    check(window.History.prototype.replaceState === window.history.replaceState,
+                        'replaceState is not inherited');
+                    window.History.prototype.replaceState.call(window.history, {route:'article'}, '', null);
+                    const updates = JSON.parse(__trust.takeHistoryUpdates());
+                    check(updates.length === 1 && updates[0].replace, 'borrowed replaceState failed');
+                    check(window.history.state.route === 'article', 'history state missing');
+                    check(window.history.scrollRestoration === 'auto', 'default restoration mode');
+                    window.history.scrollRestoration = 'manual';
+                    check(window.history.scrollRestoration === 'manual', 'restoration setter failed');
+                    let threw = false;
+                    try { new window.History(); } catch (error) { threw = error instanceof TypeError; }
+                    check(threw, 'History must not be constructible');
+                    return 'history-interface-ok';
+                })()"#,
+                ),
+                "history-interface-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn history_state_methods_use_the_receiver_across_window_realms() {
         // Local WHATWG HTML snapshot e5071a20 (2026-09-06):
         // #shared-history-push/replace-state-steps, #can-have-its-url-rewritten,
