@@ -2,7 +2,7 @@
 //! ownership of the queue, not its messages, and the receiving queue starts disabled.
 //! Local WHATWG HTML snapshot e5071a20 (2026-09-06), #transferMessagePort.
 
-use super::{Ctx, HostState, LumenHostTask, LumenWorkerCtl, Value, host_arg_string};
+use super::{Ctx, HostState, LumenHostTask, LumenWorkerInbox, Value, host_arg_string};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, Weak,
@@ -17,7 +17,7 @@ pub(super) enum Wake {
     #[default]
     None,
     Page(tokio::sync::mpsc::WeakUnboundedSender<LumenHostTask>),
-    Worker(Weak<std::sync::mpsc::SyncSender<LumenWorkerCtl>>),
+    Worker(Weak<LumenWorkerInbox>),
 }
 
 impl Wake {
@@ -31,9 +31,7 @@ impl Wake {
             }
             Self::Worker(sender) => {
                 if let Some(sender) = sender.upgrade() {
-                    // A full inbox already wakes the worker. Its loop checks port readiness
-                    // between commands, so a redundant wake may safely be coalesced.
-                    let _ = sender.try_send(LumenWorkerCtl::PortReady);
+                    sender.wake_ports();
                 }
             }
         }

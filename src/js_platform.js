@@ -17486,6 +17486,13 @@
         const w = trust.workers[id];
         if (w) w.__fire("error", createTrustedEvent(ErrorEvent, "error", { message: String(msg), cancelable: true }));
     };
+    trust.workerExited = function (id) {
+        // HTML #worker-processing-model: once the agent and its queued replies
+        // have finished, the host must not retain its wrapper/listener closures.
+        const w = trust.workers[id];
+        if (w) w.__id = -1;
+        delete trust.workers[id];
+    };
 
     // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
     // blob the `__http_fetch` syscalls forward to the request. Lets a page's

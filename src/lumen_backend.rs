@@ -180,13 +180,47 @@ struct LumenWebSockets {
 
 enum LumenWorkerCtl {
     Message(String),
-    PortReady,
+    PortReady(Arc<std::sync::atomic::AtomicBool>),
     Terminate,
 }
 
+/// A dynamically allocated FIFO: HTML #message-port-post-message-steps queues
+/// every posted message, including while the worker is still starting. A fixed
+/// try_send inbox silently lost messages. Only redundant port wakes coalesce;
+/// actual messages are never discarded to make room for another message.
+struct LumenWorkerInbox {
+    sender: std::sync::mpsc::Sender<LumenWorkerCtl>,
+    port_wake_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LumenWorkerInbox {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<LumenWorkerCtl>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                sender,
+                port_wake_pending: Arc::default(),
+            }),
+            receiver,
+        )
+    }
+
+    fn wake_ports(&self) {
+        if !self
+            .port_wake_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = self
+                .sender
+                .send(LumenWorkerCtl::PortReady(self.port_wake_pending.clone()));
+        }
+    }
+}
+
 struct LumenWorkerHandle {
-    ctl: Arc<std::sync::mpsc::SyncSender<LumenWorkerCtl>>,
+    ctl: Arc<LumenWorkerInbox>,
     interrupt: Arc<lumen::RuntimeInterrupt>,
+    tasks: Arc<crate::http::PageTaskScope>,
     /// HTML Worker.outside port belongs to its constructor's settings Realm,
     /// not necessarily the top-level Window that owns the native page actor.
     context: u64,
@@ -197,6 +231,20 @@ impl Drop for LumenWorkerHandle {
         // HTML §10.2.4 "terminate a worker": cancellation is host control
         // flow, so author catch/finally cannot observe or suppress it.
         self.interrupt.cancel();
+        // Cancel an in-flight script/module/fetch independently of the page,
+        // and wake an idle agent without waiting for it on the owner's thread.
+        self.tasks.cancel();
+        let _ = self.ctl.sender.send(LumenWorkerCtl::Terminate);
+    }
+}
+
+/// Release outstanding I/O on self.close(), startup failure, and unwinding too,
+/// without waiting for the owner to dispatch WorkerExited.
+struct LumenWorkerTaskLifetime(Arc<crate::http::PageTaskScope>);
+
+impl Drop for LumenWorkerTaskLifetime {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -8639,9 +8687,6 @@ fn lumen_potentially_trustworthy(url: &url::Url) -> bool {
 /// HTML §10.2.6 `Worker()` construction: URL parsing is synchronous in the shared prelude; the
 /// worker realm, script fetch, and evaluation start in parallel on a dedicated agent thread.
 fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    const MAX_LUMEN_WORKERS: usize = 16;
-    const LUMEN_WORKER_STACK: usize = 64 * 1024 * 1024;
-
     let target = host_arg_string(ctx, args, 0);
     let kind = if host_arg_string(ctx, args, 1) == "module" {
         LumenWorkerKind::Module
@@ -8656,90 +8701,111 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let context = ctx.host_job_context();
     let owner_page = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
-
-    let agent_cluster = ctx
+    let script_url = owner_page
+        .join(&target)
+        .map_err(|_| ctx.make_error("SyntaxError", "invalid worker script URL"))?;
+    let secure_context = lumen_potentially_trustworthy(&owner_page)
+        && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
+    let Some(state) = ctx
         .host_mut::<HostState>()
-        .map_or(0, |state| state.agent_cluster);
-    let port_registry = ctx
-        .host_mut::<HostState>()
-        .unwrap()
-        .message_ports
-        .registry
-        .clone();
-    let (ctl, ctl_rx) = std::sync::mpsc::sync_channel(64);
-    let ctl = Arc::new(ctl);
-    let port_wake = message_port_host::Wake::Worker(Arc::downgrade(&ctl));
-    let Some((id, launch, handle, tasks, events)) = ctx
-        .host_mut::<HostState>()
-        .and_then(|state| state.workers.as_mut())
-        .and_then(|workers| {
-            if workers.workers.len() >= MAX_LUMEN_WORKERS {
-                return None;
-            }
-            let script_url = owner_page.join(&target).ok()?;
-            let secure_context = lumen_potentially_trustworthy(&owner_page)
-                && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
-            let id = workers.next_id;
-            workers.next_id += 1;
-            Some((
-                id,
-                LumenWorkerLaunch {
-                    id,
-                    owner_page: owner_page.clone(),
-                    cookie_context: cookie_context.clone(),
-                    script_url,
-                    kind,
-                    name,
-                    script_body,
-                    secure_context,
-                    agent_cluster,
-                    port_registry,
-                    port_wake,
-                },
-                workers.handle.clone(),
-                workers.tasks.clone(),
-                workers.events.clone(),
-            ))
-        })
+        .filter(|state| state.workers.is_some())
     else {
-        return Ok(Value::Num(-1.0));
+        return Err(ctx.make_error("InvalidStateError", "worker host is unavailable"));
     };
+    let workers = state.workers.as_mut().unwrap();
+    if let Err(error) = workers.workers.try_reserve(1) {
+        return Err(ctx.make_error(
+            "QuotaExceededError",
+            format!("worker allocation failed: {error}"),
+        ));
+    }
+    let id = workers.next_id;
+    workers.next_id += 1;
+    let (ctl, ctl_rx) = LumenWorkerInbox::new();
+    let launch = LumenWorkerLaunch {
+        id,
+        owner_page,
+        cookie_context,
+        script_url,
+        kind,
+        name,
+        script_body,
+        secure_context,
+        agent_cluster: state.agent_cluster,
+        port_registry: state.message_ports.registry.clone(),
+        port_wake: message_port_host::Wake::Worker(Arc::downgrade(&ctl)),
+    };
+    let handle = workers.handle.clone();
+    let tasks = workers.tasks.child();
+    let events = workers.events.clone();
 
     let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
     let worker_interrupt = interrupt.clone();
-    let panic_events = events.clone();
-    let spawned = std::thread::Builder::new()
-        .name(format!("trust-lumen-worker-{id}"))
-        .stack_size(LUMEN_WORKER_STACK)
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_lumen_worker(launch, handle, tasks, events, ctl_rx, worker_interrupt);
-            }));
-            if result.is_err() {
-                let _ = panic_events.send(LumenHostTask::Worker {
-                    id,
-                    event: crate::js::WorkerOut::Error(String::from("Lumen worker engine panic")),
-                });
-            }
-            let _ = panic_events.send(LumenHostTask::WorkerExited { id });
-        });
-    if spawned.is_err() {
-        return Ok(Value::Num(-1.0));
-    }
-    if let Some(workers) = ctx
-        .host_mut::<HostState>()
-        .and_then(|state| state.workers.as_mut())
-    {
-        workers.workers.insert(
+    // Register the outside port before starting the agent, including on failure:
+    // its asynchronous error task must reach the constructor's owning Realm.
+    workers.workers.insert(
+        id,
+        LumenWorkerHandle {
+            ctl,
+            interrupt,
+            tasks: tasks.clone(),
+            context,
+        },
+    );
+    let thread_events = events.clone();
+    let spawned = spawn_lumen_worker_thread(id, move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_lumen_worker(
+                launch,
+                handle,
+                tasks,
+                thread_events.clone(),
+                ctl_rx,
+                worker_interrupt,
+            );
+        }));
+        if result.is_err() {
+            send_lumen_worker_error(&thread_events, id, "Lumen worker engine panic");
+        }
+        let _ = thread_events.send(LumenHostTask::WorkerExited { id });
+    });
+    if let Err(error) = spawned {
+        // HTML #worker-processing-model startup failure is an asynchronous error,
+        // not a successful constructor returning an inert, unregistered Worker.
+        send_lumen_worker_error(
+            &events,
             id,
-            LumenWorkerHandle {
-                ctl,
-                interrupt,
-                context,
-            },
+            format!("worker thread creation failed: {error}"),
         );
+        let _ = events.send(LumenHostTask::WorkerExited { id });
     }
     Ok(Value::Num(id as f64))
+}
+
+#[cfg(test)]
+thread_local! {
+    // Deterministic OS-resource failure coverage without exhausting real threads
+    // or interfering with workers created by tests on other owner threads.
+    static WORKER_SPAWN_FAILURE: std::cell::Cell<Option<std::io::ErrorKind>> = const { std::cell::Cell::new(None) };
+}
+
+fn spawn_lumen_worker_thread(
+    id: usize,
+    task: impl FnOnce() + Send + 'static,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = WORKER_SPAWN_FAILURE.take() {
+        return Err(error.into());
+    }
+    // No worker-count quota or oversized per-worker stack reservation. Use the
+    // platform/Rust thread default; Lumen grows native execution stack segments
+    // only when needed and releases them on return (ECMA-262 #sec-execution-contexts).
+    // Each agent remains independently schedulable and blocks on its inbox when
+    // idle. Thread creation is constrained by actual OS/memory resources.
+    std::thread::Builder::new()
+        .name(format!("trust-lumen-worker-{id}"))
+        .spawn(task)
+        .map(drop)
 }
 
 /// MessagePort post-message steps serialize in the sender's realm before this call; the wire
@@ -8757,7 +8823,8 @@ fn host_worker_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         .is_some_and(|worker| {
             worker
                 .ctl
-                .try_send(LumenWorkerCtl::Message(message))
+                .sender
+                .send(LumenWorkerCtl::Message(message))
                 .is_ok()
         });
     Ok(Value::Bool(sent))
@@ -8770,13 +8837,12 @@ fn host_worker_terminate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         .first()
         .and_then(Value::as_num_opt)
         .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
-    if let Some(worker) = ctx
+    if let Some(workers) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.workers.as_mut())
-        .and_then(|workers| id.and_then(|id| workers.workers.remove(&id)))
+        && let Some(id) = id
     {
-        worker.interrupt.cancel();
-        let _ = worker.ctl.try_send(LumenWorkerCtl::Terminate);
+        workers.workers.remove(&id);
     }
     Ok(Value::Undefined)
 }
@@ -9231,6 +9297,7 @@ fn run_lumen_worker(
     ctl_rx: std::sync::mpsc::Receiver<LumenWorkerCtl>,
     interrupt: Arc<lumen::RuntimeInterrupt>,
 ) {
+    let _task_lifetime = LumenWorkerTaskLifetime(tasks.clone());
     let cache = Arc::new(crate::http::PageCache::with_task_scope(tasks));
     let clock = Rc::new(RealmClock::new());
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
@@ -9421,7 +9488,10 @@ fn run_lumen_worker(
         let _ = lumen_worker_internal_call(&mut engine, "advanceClock", &[Value::Num(now)]);
         let task_result = match task {
             WorkerTask::Command(LumenWorkerCtl::Terminate) => break,
-            WorkerTask::Command(LumenWorkerCtl::PortReady) => Ok(Value::Undefined),
+            WorkerTask::Command(LumenWorkerCtl::PortReady(pending)) => {
+                pending.store(false, std::sync::atomic::Ordering::Release);
+                Ok(Value::Undefined)
+            }
             WorkerTask::Command(LumenWorkerCtl::Message(message)) => {
                 lumen_worker_internal_call(&mut engine, "message", &[Value::from_string(message)])
             }
@@ -10345,49 +10415,14 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             dispatch_websocket_task(engine, id, event)?;
         }
         LumenHostTask::Worker { id, event } => {
-            let context = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .and_then(|state| state.workers.as_ref())
-                .and_then(|workers| workers.workers.get(&id))
-                .map(|worker| worker.context);
-            let Some(context) = context else {
-                return Ok(());
-            };
             let (name, payload) = match event {
                 crate::js::WorkerOut::Message(message) => ("workerMessage", message),
                 crate::js::WorkerOut::Error(message) => ("workerError", message),
             };
-            let run = move |engine: &mut lumen::Engine| {
-                host_call_trust(
-                    engine.ctx(),
-                    name,
-                    &[Value::Num(id as f64), Value::from_string(payload)],
-                )
-                .map(|_| ())
-                .map_err(|error| {
-                    engine
-                        .ctx()
-                        .coerce_string(&error)
-                        .map(|message| format!("Worker task: {message}"))
-                        .unwrap_or_else(|_| String::from("Worker task failed"))
-                })
-            };
-            if context == engine.ctx().host_job_context() {
-                run(engine)?;
-            } else {
-                let realm = engine
-                    .ctx()
-                    .host_mut::<HostState>()
-                    .and_then(|state| state.window_realms.get(&context).cloned());
-                let Some(realm) = realm else { return Ok(()) };
-                match engine.with_embed_realm(&realm, run) {
-                    Ok(result) => result?,
-                    Err(_) => return Err(String::from("Worker task Realm is unavailable")),
-                }
-            }
+            dispatch_lumen_worker_task(engine, id, name, Value::from_string(payload))?;
         }
         LumenHostTask::WorkerExited { id } => {
+            let result = dispatch_lumen_worker_task(engine, id, "workerExited", Value::Undefined);
             if let Some(workers) = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -10395,9 +10430,50 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             {
                 workers.workers.remove(&id);
             }
+            result?;
         }
     }
     Ok(())
+}
+
+fn dispatch_lumen_worker_task(
+    engine: &mut lumen::Engine,
+    id: usize,
+    name: &str,
+    payload: Value,
+) -> Result<(), String> {
+    let context = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.workers.as_ref())
+        .and_then(|workers| workers.workers.get(&id))
+        .map(|worker| worker.context);
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let run = move |engine: &mut lumen::Engine| {
+        host_call_trust(engine.ctx(), name, &[Value::Num(id as f64), payload])
+            .map(|_| ())
+            .map_err(|error| {
+                engine
+                    .ctx()
+                    .coerce_string(&error)
+                    .map(|message| format!("Worker task: {message}"))
+                    .unwrap_or_else(|_| String::from("Worker task failed"))
+            })
+    };
+    if context == engine.ctx().host_job_context() {
+        run(engine)
+    } else {
+        let realm = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .and_then(|state| state.window_realms.get(&context).cloned());
+        let Some(realm) = realm else { return Ok(()) };
+        engine
+            .with_embed_realm(&realm, run)
+            .map_err(|_| String::from("Worker task Realm is unavailable"))?
+    }
 }
 
 fn host_create_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -18637,6 +18713,380 @@ mod tests {
             run_microtask_checkpoint(&mut engine);
         }
         eval(&mut engine, "portWorker.terminate()", "Worker cleanup").unwrap();
+    }
+
+    #[test]
+    fn worker_inbox_preserves_bursts_and_coalesces_only_port_wakes() {
+        let (inbox, receiver) = LumenWorkerInbox::new();
+        for index in 0..1024 {
+            inbox
+                .sender
+                .send(LumenWorkerCtl::Message(index.to_string()))
+                .unwrap();
+            inbox.wake_ports();
+        }
+        let mut messages = 0;
+        let mut wakes = 0;
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                LumenWorkerCtl::Message(message) => {
+                    assert_eq!(message, messages.to_string());
+                    messages += 1;
+                }
+                LumenWorkerCtl::PortReady(pending) => {
+                    pending.store(false, std::sync::atomic::Ordering::Release);
+                    wakes += 1;
+                }
+                LumenWorkerCtl::Terminate => panic!("unexpected termination"),
+            }
+        }
+        assert_eq!(messages, 1024);
+        assert_eq!(wakes, 1);
+        inbox.wake_ports();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(LumenWorkerCtl::PortReady(_))
+        ));
+        drop(inbox);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    fn worker_test_environment() -> (
+        tokio::runtime::Runtime,
+        lumen::Engine,
+        tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    ) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::new(crate::http::PageCache::default()),
+            task_tx,
+        );
+        (runtime, configured_engine(state, page.as_str()), task_rx)
+    }
+
+    #[test]
+    fn workers_have_no_count_quota_and_release_resources_on_close_and_terminate() {
+        // WHATWG HTML snapshot e5071a20 (2026-09-06), #worker-processing-model:
+        // every constructor creates an independent agent; self.close() and
+        // terminate() retire its realm and queued work. Keep >16 agents live at
+        // once so a lifetime counter or the former simultaneous quota cannot pass.
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.pool = [];
+            globalThis.replies = [];
+            globalThis.workerErrors = [];
+            const url = URL.createObjectURL(new Blob([
+                'onmessage = e => { if (e.data === "close") close(); else postMessage(e.data); };'
+            ], {type:'text/javascript'}));
+            for (let index = 0; index < 32; index++) {
+                const worker = new Worker(url);
+                worker.onmessage = event => replies.push(event.data);
+                worker.onerror = event => workerErrors.push(event.message);
+                pool.push(worker);
+                worker.postMessage(index);
+            }
+            URL.revokeObjectURL(url);
+        "#,
+            "uncapped workers",
+        )
+        .unwrap();
+        let scopes = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .workers
+            .as_ref()
+            .unwrap()
+            .workers
+            .values()
+            .map(|worker| Arc::downgrade(&worker.tasks))
+            .collect::<Vec<_>>();
+        assert_eq!(scopes.len(), 32);
+        for _ in 0..32 {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(30), task_rx.recv()).await
+                })
+                .expect("every worker replies")
+                .unwrap();
+            assert!(matches!(
+                task,
+                LumenHostTask::Worker {
+                    event: crate::js::WorkerOut::Message(_),
+                    ..
+                }
+            ));
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(string_value(&mut engine, "workerErrors.join('|')"), "");
+        assert_eq!(
+            string_value(&mut engine, "replies.sort((a,b) => a-b).join(',')"),
+            (0..32).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        );
+        eval(
+            &mut engine,
+            r#"
+            pool.forEach((worker, index) => {
+                if (index % 2) worker.terminate();
+                else worker.postMessage('close');
+            });
+        "#,
+            "worker cleanup",
+        )
+        .unwrap();
+        for _ in 0..32 {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(15), task_rx.recv()).await
+                })
+                .expect("every worker exits")
+                .unwrap();
+            assert!(matches!(task, LumenHostTask::WorkerExited { .. }));
+            dispatch_host_task(&mut engine, task).unwrap();
+        }
+        assert!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .workers
+                .as_ref()
+                .unwrap()
+                .workers
+                .is_empty()
+        );
+        assert!(scopes.iter().all(|scope| scope.upgrade().is_none()));
+        assert_eq!(
+            string_value(&mut engine, "String(Object.keys(__trust.workers).length)"),
+            "0",
+            "closed agents must not retain their Worker wrappers and listeners"
+        );
+    }
+
+    #[test]
+    fn worker_default_stack_supports_deep_execution_and_startup_errors_are_async() {
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        WORKER_SPAWN_FAILURE.set(Some(std::io::ErrorKind::WouldBlock));
+        eval(&mut engine, r#"
+            globalThis.workerErrors = [];
+            globalThis.broken = new Worker('data:text/javascript,');
+            broken.onerror = event => {
+                event.preventDefault();
+                workerErrors.push([event.isTrusted, event.target === broken,
+                    event instanceof ErrorEvent, event.message.includes('worker thread creation failed')].join('|'));
+            };
+        "#, "OS worker resource exhaustion").unwrap();
+        assert_eq!(string_value(&mut engine, "workerErrors.join(',')"), "");
+        for _ in 0..2 {
+            let task = task_rx
+                .try_recv()
+                .expect("startup failure queues error then exit");
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "workerErrors.join(',')"),
+            "true|true|true|true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "String(Object.keys(__trust.workers).length)"),
+            "0"
+        );
+        assert!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .workers
+                .as_ref()
+                .unwrap()
+                .workers
+                .is_empty()
+        );
+
+        // A subsequent worker still starts. Non-tail recursion needs on-demand
+        // stack segments rather than a 64 MiB reservation on every idle thread.
+        eval(
+            &mut engine,
+            r#"
+            globalThis.deepResult = '';
+            globalThis.deep = new Worker(URL.createObjectURL(new Blob([
+                'function recurse(n) { return n === 0 ? 0 : 1 + recurse(n - 1); }' +
+                'postMessage(recurse(2048)); close();'
+            ], {type:'text/javascript'})));
+            deep.onmessage = event => { deepResult = String(event.data); };
+            deep.onerror = event => { deepResult = event.message; };
+        "#,
+            "on-demand worker execution stack",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(30), task_rx.recv()).await
+                })
+                .expect("deep worker completes")
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(string_value(&mut engine, "deepResult"), "2048");
+    }
+
+    #[test]
+    fn worker_startup_failure_and_exit_cleanup_belong_to_the_constructor_realm() {
+        let (_runtime, mut engine, mut task_rx) = worker_test_environment();
+        WORKER_SPAWN_FAILURE.set(Some(std::io::ErrorKind::OutOfMemory));
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe');
+            frame.srcdoc = '<body>worker owner</body>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            globalThis.ownerWindow = frame.contentWindow;
+            ownerWindow.eval(`
+                globalThis.errorResult = '';
+                globalThis.broken = new Worker('data:text/javascript,');
+                broken.onerror = event => {
+                    event.preventDefault();
+                    errorResult = [event.isTrusted, event.target === broken,
+                        event instanceof ErrorEvent].join('|');
+                };
+            `);
+        "#,
+            "iframe worker resource failure",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "ownerWindow.errorResult"), "");
+        for _ in 0..2 {
+            dispatch_host_task(&mut engine, task_rx.try_recv().unwrap()).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "ownerWindow.errorResult"),
+            "true|true|true"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "ownerWindow.eval('String(Object.keys(__trust.workers).length)')"
+            ),
+            "0"
+        );
+        WORKER_SPAWN_FAILURE.set(Some(std::io::ErrorKind::WouldBlock));
+        eval(
+            &mut engine,
+            r#"
+            ownerWindow.eval(`
+                globalThis.cancelled = new Worker('data:text/javascript,');
+                cancelled.onerror = () => { errorResult = 'unexpected error after termination'; };
+                cancelled.terminate();
+            `);
+        "#,
+            "terminate before startup error dispatch",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            dispatch_host_task(&mut engine, task_rx.try_recv().unwrap()).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "ownerWindow.errorResult"),
+            "true|true|true"
+        );
+    }
+
+    #[test]
+    fn worker_termination_aborts_a_pending_script_fetch_without_cancelling_its_owner() {
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let page = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        // Keep the response pending: termination must release the waiting worker
+        // through its own I/O scope, not a network timeout or page cancellation.
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = runtime.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        state.base = page.clone();
+        state.window_request_urls.insert(0, page.clone());
+        state.window_cookie_contexts.clear();
+        eval(
+            &mut engine,
+            &format!(
+                "globalThis.waiting = new Worker({});",
+                serde_json::to_string(page.join("pending.js").unwrap().as_str()).unwrap()
+            ),
+            "pending worker fetch",
+        )
+        .unwrap();
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(15), accepted_rx).await })
+            .expect("worker requested its script")
+            .unwrap();
+        eval(
+            &mut engine,
+            "waiting.terminate()",
+            "terminate fetching worker",
+        )
+        .unwrap();
+        loop {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), task_rx.recv()).await
+                })
+                .expect("termination interrupts the fetch wait")
+                .unwrap();
+            let exited = matches!(task, LumenHostTask::WorkerExited { .. });
+            dispatch_host_task(&mut engine, task).unwrap();
+            if exited {
+                break;
+            }
+        }
+        let tasks = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .workers
+            .as_ref()
+            .unwrap()
+            .tasks
+            .clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        tasks.spawn(runtime.handle(), async move {
+            let _ = sent.send(());
+        });
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), received).await })
+            .expect("owner can still schedule work")
+            .unwrap();
+        server.abort();
     }
 
     #[test]
