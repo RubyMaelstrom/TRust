@@ -252,11 +252,23 @@ ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
 # Assertions may disappear in release builds; runtime mutations must not.
 debug_assert_with_mut_call = "deny"
 
-# Optimized release binaries with ThinLTO to keep rebuilds practical.
-# Symbols are stripped; panic messages still print, without a backtrace.
+# Fast optimized binaries for development, acceptance testing, and local
+# installs. Keep release semantics while allowing parallel, incremental codegen.
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = false
+codegen-units = 64
+incremental = true
+strip = "none"
+
+# Public, numbered releases only. This deliberately pays the expensive final
+# optimization/link cost; routine local promotions continue to use `--release`.
+[profile.numbered-release]
+inherits = "release"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+incremental = false
 strip = "symbols"
 
 # Release optimizations + debug symbols, for profiling the JS engine
@@ -266,15 +278,3 @@ strip = "symbols"
 inherits = "release"
 debug = true
 strip = false
-
-# Fast browser-workload gate: retain optimized/release semantics without paying the production
-# release-profile link on every Lumen iteration. Incremental object reuse and broad
-# codegen parallelism make subsequent engine edits cheap; `cargo build --release` remains the only
-# acceptance/promotion artifact.
-[profile.browser-check]
-inherits = "release"
-opt-level = 2
-lto = false
-codegen-units = 64
-incremental = true
-strip = "none"

@@ -89,6 +89,55 @@ fn relative_image_tiles_preserve_sizing_offsets_and_overflow_crop() {
 }
 
 #[test]
+fn wide_carousel_calc_translation_keeps_dimmed_neighbor_out_of_focus_slot() {
+    // Steam enables this pattern only above its wide-screen breakpoint. The
+    // neighboring slide is intentionally translucent, but its nested calc()
+    // transform must move it beside the opaque focused slide rather than
+    // compositing a ghost image over that slide.
+    let html = r#"<style>
+        body { margin:0; background:white }
+        #carousel { position:relative; height:120px; overflow:hidden }
+        .slide { position:absolute; left:400px; top:10px; width:756px; height:100px }
+        #focus { background:blue }
+        #prev { background:red; opacity:0 }
+        @media screen and (min-width:1400px) {
+            #prev { opacity:.5; transform:translateX(calc(-756px - 40px)) }
+        }
+        </style><div id=carousel><div id=focus class=slide></div><div id=prev class=slide></div></div>"#;
+    let render = |width: f32| {
+        let mut dom = Dom::parse_document(html);
+        dom.set_viewport_px(width, 120.);
+        let layout = lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            Viewport::new(width, 120.),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        headless::render_paint(&layout.paint, CssSize::new(width, 120.)).unwrap()
+    };
+    let narrow = render(1000.);
+    let wide = render(1600.);
+    let rgb = |frame: &crate::render::vello_cpu::OwnedRgbaFrame, x: usize, y: usize| {
+        let offset = (y * frame.size.width as usize + x) * 4;
+        [
+            frame.pixels[offset],
+            frame.pixels[offset + 1],
+            frame.pixels[offset + 2],
+        ]
+    };
+    assert_eq!(rgb(&narrow, 100, 50), [255, 255, 255]);
+    assert_eq!(rgb(&narrow, 500, 50), [0, 0, 255]);
+    assert_eq!(rgb(&wide, 100, 50), [255, 127, 127]);
+    assert_eq!(
+        rgb(&wide, 500, 50),
+        [0, 0, 255],
+        "the dimmed previous slide must not overlap the focus slot"
+    );
+}
+
+#[test]
 fn carousel_inline_paint_and_hits_survive_retained_scroll_and_hover() {
     // CSS Overflow 3 #scrolling and CSS Transforms 1 #transform-rendering:
     // scrolling moves contents through a stationary scrollport. A card's

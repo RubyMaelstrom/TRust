@@ -373,9 +373,9 @@ and do not use keyboard focus as a substitute for window visibility.
 Focused gates:
 
 ```sh
-cargo test --profile browser-check --lib core:: -- --test-threads=1
-cargo test --profile browser-check --bin trust-desktop -- --test-threads=1
-cargo test --profile browser-check --lib render:: -- --test-threads=1 --nocapture
+cargo test --release --lib core:: -- --test-threads=1
+cargo test --release --bin trust-desktop -- --test-threads=1
+cargo test --release --lib render:: -- --test-threads=1 --nocapture
 ```
 
 The queue tests include 10,000 updates with a paused consumer, snapshot release,
