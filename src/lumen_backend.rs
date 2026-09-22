@@ -164,7 +164,7 @@ struct LumenDynamicModuleLoader {
     context: u64,
     page: url::Url,
     cookie_context: crate::http::CookieContext,
-    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    events: LumenTaskSender,
     network: Option<LumenDynamicModuleNetwork>,
     import_map: crate::import_maps::Handle,
 }
@@ -180,8 +180,32 @@ struct LumenWebSockets {
 
 enum LumenWorkerCtl {
     Message(String),
+    HostTask(Box<LumenHostTask>),
     PortReady(Arc<std::sync::atomic::AtomicBool>),
     Terminate,
+}
+
+/// Fetch's task destination is the initiating global, including a worker.
+/// Wake its existing blocking inbox directly: no polling or forwarding task
+/// (and no extra thread) is needed for each idle worker.
+#[derive(Clone)]
+enum LumenTaskSender {
+    Page(tokio::sync::mpsc::UnboundedSender<LumenHostTask>),
+    Worker(std::sync::Weak<LumenWorkerInbox>),
+}
+
+impl LumenTaskSender {
+    fn send(&self, task: LumenHostTask) -> Result<(), ()> {
+        match self {
+            Self::Page(sender) => sender.send(task).map_err(|_| ()),
+            Self::Worker(inbox) => inbox
+                .upgrade()
+                .ok_or(())?
+                .sender
+                .send(LumenWorkerCtl::HostTask(Box::new(task)))
+                .map_err(|_| ()),
+        }
+    }
 }
 
 /// A dynamically allocated FIFO: HTML #message-port-post-message-steps queues
@@ -261,6 +285,9 @@ struct LumenWorkerSelf {
     id: usize,
     events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     closed: bool,
+    /// HTML #set-up-a-worker-environment-settings-object: origin is inherited
+    /// from the creator, whereas the API base URL remains the script URL.
+    origin: url::Url,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -281,6 +308,7 @@ struct LumenWorkerLaunch {
     agent_cluster: u64,
     port_registry: Arc<std::sync::Mutex<message_port_host::Registry>>,
     port_wake: message_port_host::Wake,
+    task_sender: LumenTaskSender,
 }
 
 struct HostState {
@@ -295,7 +323,7 @@ struct HostState {
     screen_position: Cell<(i32, i32)>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
-    task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
+    task_events: Option<LumenTaskSender>,
     pending_resources: usize,
     pending_module_evaluations: usize,
     modules_skipped: usize,
@@ -428,7 +456,7 @@ impl HostState {
             }
         });
         self.base = page;
-        self.task_events = Some(events.clone());
+        self.task_events = Some(LumenTaskSender::Page(events.clone()));
         self.websockets = Some(LumenWebSockets {
             handle: handle.clone(),
             page: self.base.clone(),
@@ -845,7 +873,13 @@ impl RetainedMemory for HostState {
             }
         }
 
-        if worker_self.is_some() {
+        if let Some(worker) = worker_self {
+            let origin_bytes = url_requested_bytes(&worker.origin, visitor);
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.worker-origin",
+                worker.origin.as_str().as_ptr() as usize,
+                origin_bytes,
+            ));
             // The sender retains a Tokio queue whose storage is intentionally an opaque lower
             // bound. Its inline handle and scalar worker id/state are already in HostState.
             visitor.opaque_storage();
@@ -1566,6 +1600,7 @@ mod desktop {
             node: None,
             x: 0.0,
             y: 0.0,
+            metadata: crate::js::PointerMetadata::default(),
         });
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
         let actor_interrupt = interrupt.clone();
@@ -1953,6 +1988,7 @@ mod desktop {
                             node: hover.node,
                             x: hover.x,
                             y: hover.y,
+                            metadata: hover.metadata,
                         },
                         &events,
                         &interrupt,
@@ -2245,7 +2281,7 @@ mod desktop {
         state.screen_position.set(env.screen_position);
         // Inline and data-backed module scripts use the HTML task queue even when this document
         // has no network runtime. Keep that local task source independent of `enable_network`.
-        state.task_events = Some(host_tasks.clone());
+        state.task_events = Some(LumenTaskSender::Page(host_tasks.clone()));
         if let Some(handle) = env.net.clone() {
             state.enable_network(
                 response_url.clone(),
@@ -3264,6 +3300,20 @@ mod desktop {
                 checkpoint(page, method);
                 finish_task_with_ack(page, events, false)
             }
+            PageCmd::InputModifiers(modifiers) => {
+                prepare_interaction(page, interrupt);
+                let metadata = crate::js::PointerMetadata {
+                    modifiers,
+                    ..Default::default()
+                };
+                let _ = call_trust(
+                    page,
+                    "pointerModifiers",
+                    &[Value::Num(f64::from(metadata.modifier_bits()))],
+                    "pointer modifiers",
+                );
+                true
+            }
             PageCmd::LockedPointerButton { button, pressed } => {
                 prepare_interaction(page, interrupt);
                 let _ = call_trust(
@@ -3307,6 +3357,8 @@ mod desktop {
                 pressed,
                 x,
                 y,
+                button,
+                metadata,
             } => {
                 prepare_interaction(page, interrupt);
                 let _ = call_trust(
@@ -3317,6 +3369,10 @@ mod desktop {
                         Value::Bool(pressed),
                         Value::Num(finite_or_zero(x)),
                         Value::Num(finite_or_zero(y)),
+                        Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                        Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                        Value::Num(f64::from(button)),
+                        Value::Num(f64::from(metadata.modifier_bits())),
                     ],
                     "pointer button",
                 );
@@ -3507,7 +3563,12 @@ mod desktop {
                 checkpoint(page, "scroll");
                 finish_task(page, events)
             }
-            PageCmd::Hover { node, x, y } => {
+            PageCmd::Hover {
+                node,
+                x,
+                y,
+                metadata,
+            } => {
                 prepare_interaction(page, interrupt);
                 let node = node
                     .filter(|node| page.dom.borrow().is_valid(*node))
@@ -3519,6 +3580,9 @@ mod desktop {
                         node,
                         Value::Num(finite_or_zero(x)),
                         Value::Num(finite_or_zero(y)),
+                        Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                        Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                        Value::Num(f64::from(metadata.modifier_bits())),
                     ],
                     "hover",
                 );
@@ -7179,15 +7243,21 @@ fn prepare_client_request(
     crate::http::Request,
 )> {
     let resolved = page.join(target).ok()?;
+    // Fetch #populate-request-from-client uses the settings ORIGIN, not the
+    // scheme/host of the API base URL (notably blob: dedicated workers).
+    let origin = state
+        .worker_self
+        .as_ref()
+        .map_or(page, |worker| &worker.origin);
     let network = state.network.as_mut()?;
     if !matches!(resolved.scheme(), "http" | "https" | "file")
-        || !crate::http::subresource_allowed(page, &resolved)
+        || !crate::http::subresource_allowed(origin, &resolved)
     {
         return None;
     }
     if fetch_policy.as_ref().is_some_and(|(mode, _)| {
         *mode == crate::http::RequestMode::SameOrigin
-            && !crate::http::same_origin_for_host(page, &resolved)
+            && !crate::http::same_origin_for_host(origin, &resolved)
     }) {
         return None;
     }
@@ -7205,13 +7275,13 @@ fn prepare_client_request(
         cookie_context: None,
         timing_client: None,
         fetch_policy: fetch_policy.map(|(mode, credentials)| crate::http::FetchPolicy {
-            origin: page.clone(),
+            origin: origin.clone(),
             mode,
             credentials,
         }),
     };
     let mode = fetch_policy.map_or(crate::http::RequestMode::NoCors, |(mode, _)| mode);
-    crate::http::set_fetch_metadata(&mut request, page, "empty", mode.as_str());
+    crate::http::set_fetch_metadata(&mut request, origin, "empty", mode.as_str());
     crate::http::set_referrer(&mut request, page);
     if let Some(context) = request.cookie_context.as_mut() {
         context.cross_site_ancestor = state
@@ -8734,6 +8804,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         agent_cluster: state.agent_cluster,
         port_registry: state.message_ports.registry.clone(),
         port_wake: message_port_host::Wake::Worker(Arc::downgrade(&ctl)),
+        task_sender: LumenTaskSender::Worker(Arc::downgrade(&ctl)),
     };
     let handle = workers.handle.clone();
     let tasks = workers.tasks.child();
@@ -8888,6 +8959,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__url_parse", 2, host_url_parse as NativeFn),
         ("__url_set", 3, host_url_set as NativeFn),
         ("__http_fetch", 5, host_http_fetch as NativeFn),
+        ("__http_fetch_async", 5, host_http_fetch_async as NativeFn),
         ("__worker_self_post", 1, host_worker_self_post as NativeFn),
         ("__worker_self_close", 0, host_worker_self_close as NativeFn),
         ("__blob_mirror", 3, host_blob_mirror as NativeFn),
@@ -9302,6 +9374,7 @@ fn run_lumen_worker(
     let clock = Rc::new(RealmClock::new());
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
     state.base = launch.script_url.clone();
+    state.task_events = Some(launch.task_sender.clone());
     state.window_cookie_contexts.insert(
         0,
         (
@@ -9324,6 +9397,11 @@ fn run_lumen_worker(
         id: launch.id,
         events: events.clone(),
         closed: false,
+        origin: if launch.script_url.scheme() == "data" {
+            launch.script_url.clone()
+        } else {
+            launch.owner_page.clone()
+        },
     });
 
     let mut engine = lumen::Engine::new_with_interrupt(interrupt);
@@ -9494,6 +9572,12 @@ fn run_lumen_worker(
             }
             WorkerTask::Command(LumenWorkerCtl::Message(message)) => {
                 lumen_worker_internal_call(&mut engine, "message", &[Value::from_string(message)])
+            }
+            WorkerTask::Command(LumenWorkerCtl::HostTask(task)) => {
+                if let Err(error) = dispatch_host_task(&mut engine, *task) {
+                    send_lumen_worker_error(&events, launch.id, error);
+                }
+                Ok(Value::Undefined)
             }
             WorkerTask::Port => lumen_worker_internal_call(&mut engine, "runPortTask", &[]),
             WorkerTask::Bitmap => lumen_worker_internal_call(&mut engine, "runBitmapTask", &[]),
@@ -18530,6 +18614,120 @@ mod tests {
     }
 
     #[test]
+    fn worker_fetch_is_nonblocking_and_blob_workers_inherit_origin() {
+        // Fetch #fetch-method/#concept-main-fetch and HTML worker settings:
+        // timers, messages and microtasks progress while the network is held;
+        // an HTTP error status is a Response, not a network error.
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut bytes).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let head = String::from_utf8_lossy(&request);
+                let status = if index == 0 {
+                    assert!(head.starts_with("GET /slow "), "{head}");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("worker tasks must run before fetch finishes");
+                    200
+                } else {
+                    assert!(head.starts_with("GET /unauthorized "), "{head}");
+                    401
+                };
+                write!(stream, "HTTP/1.1 {status} Result\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody").unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        let script = format!(
+            r#"
+            const origin = {};
+            onmessage = () => postMessage('ping');
+            postMessage('before');
+            setTimeout(() => postMessage('timer'), 0);
+            const response = fetch(origin + '/slow');
+            postMessage('after');
+            Promise.resolve().then(() => postMessage('microtask'));
+            response.then(async r => {{
+                const unauthorized = await fetch(origin + '/unauthorized', {{mode:'same-origin'}});
+                let relativeRejected = false;
+                try {{ await fetch('/relative'); }} catch (e) {{ relativeRejected = e instanceof TypeError; }}
+                postMessage('result:' + [r.status,unauthorized.status,unauthorized.ok,
+                    await unauthorized.text(),relativeRejected,location.protocol].join('|'));
+            }}).catch(e => postMessage('ERROR:' + e));
+        "#,
+            serde_json::to_string(&page.origin().ascii_serialization()).unwrap()
+        );
+        eval(&mut engine, &format!(r#"
+            globalThis.fetchEvents = [];
+            globalThis.fetchWorker = new Worker(URL.createObjectURL(new Blob([{}], {{type:'text/javascript'}})));
+            fetchWorker.onmessage = e => fetchEvents.push(e.data);
+            fetchWorker.onerror = e => fetchEvents.push('ERROR:' + e.message);
+            fetchWorker.postMessage('ping');
+        "#, serde_json::to_string(&script).unwrap()), "nonblocking blob worker fetch").unwrap();
+        let mut released = false;
+        loop {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(15), task_rx.recv()).await
+                })
+                .unwrap()
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+            let events = string_value(&mut engine, "fetchEvents.join(',')");
+            assert!(!events.contains("ERROR:"), "{events}");
+            if !released
+                && string_value(
+                    &mut engine,
+                    "['after','microtask','timer','ping'].every(s=>fetchEvents.includes(s))",
+                ) == "true"
+            {
+                release_tx.send(()).unwrap();
+                released = true;
+            }
+            if events.contains("result:") {
+                assert!(released);
+                assert!(events.starts_with("before,after,microtask,"), "{events}");
+                assert!(
+                    events.ends_with("result:200|401|false|body|true|blob:"),
+                    "{events}"
+                );
+                break;
+            }
+        }
+        eval(&mut engine, "fetchWorker.terminate()", "cleanup").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn worker_fetch_preserves_binary_bodies_headers_and_consumption() {
         // Fetch §5.3 consume body / arrayBuffer(), §5.4 RequestInit headers.
         // A real native binary response omits the optional text slot.
@@ -18738,6 +18936,7 @@ mod tests {
                     wakes += 1;
                 }
                 LumenWorkerCtl::Terminate => panic!("unexpected termination"),
+                LumenWorkerCtl::HostTask(_) => panic!("unexpected host task"),
             }
         }
         assert_eq!(messages, 1024);
@@ -24268,6 +24467,47 @@ mod tests {
                 string_value(&mut engine, include_str!("fixtures/mouse_coordinates.mjs")),
                 "mouse-coordinates-ok",
                 "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_input_capture_modifiers_clicks_and_offsets() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/pointer_input.mjs")),
+                "pointer-input-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_activation_tracks_real_input_and_window_lifetime() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/user_activation.mjs")),
+                "user-activation-ok",
+                "{tier:?}"
+            );
+            eval(
+                &mut engine,
+                "__trust.tickTo(performance.now()+5001)",
+                "activation expiry",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "navigator.userActivation.isActive+':'+navigator.userActivation.hasBeenActive"
+                ),
+                "false:true"
             );
         }
     }

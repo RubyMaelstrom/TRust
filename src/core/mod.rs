@@ -220,6 +220,7 @@ pub enum UserAction {
         error: Option<String>,
     },
     ReleasePointerLock,
+    InputModifiers(Modifiers),
     PointerMotion {
         dx: f64,
         dy: f64,
@@ -261,11 +262,14 @@ pub enum UserAction {
     PageHover {
         actor: Option<usize>,
         position: CssPoint,
+        metadata: crate::js::PointerMetadata,
     },
     PagePointerButton {
         actor: Option<usize>,
         position: CssPoint,
         pressed: bool,
+        button: i16,
+        metadata: crate::js::PointerMetadata,
     },
     /// Move native page focus, including clicking non-interactive content.
     /// This is distinct from the window's system-focus notification above.
@@ -1016,6 +1020,10 @@ impl BrowserController {
                 }
                 false
             }
+            UserAction::InputModifiers(modifiers) => {
+                self.send_user(crate::js::PageCmd::InputModifiers(modifiers));
+                false
+            }
             UserAction::LockedPointerButton { button, pressed } => {
                 self.send_user(crate::js::PageCmd::LockedPointerButton { button, pressed });
                 false
@@ -1096,12 +1104,16 @@ impl BrowserController {
                 actor,
                 position,
                 pressed,
+                button,
+                metadata,
             } => {
                 self.send_user(crate::js::PageCmd::PointerButton {
                     node: actor,
                     pressed,
                     x: f64::from(position.x),
                     y: f64::from(position.y),
+                    button,
+                    metadata,
                 });
                 false
             }
@@ -1141,9 +1153,18 @@ impl BrowserController {
             // Interaction stays renderer/window-system neutral: a desktop hit
             // resolves to a semantic link or actor before crossing this API.
             UserAction::Activate(link) => self.activate(link),
-            UserAction::PageHover { actor, position } => {
+            UserAction::PageHover {
+                actor,
+                position,
+                metadata,
+            } => {
                 if let Some(handle) = &self.live_page {
-                    handle.send_hover(actor, f64::from(position.x), f64::from(position.y));
+                    handle.send_hover_with_metadata(
+                        actor,
+                        f64::from(position.x),
+                        f64::from(position.y),
+                        metadata,
+                    );
                 }
                 false
             }
@@ -4545,6 +4566,48 @@ mod tests {
         let target = url::Url::parse("https://cdn.example.test/video.mp4").unwrap();
         browser.handle_action(UserAction::Activate(Link::Media(target.clone())));
         assert_eq!(browser.take_external_media(), Some((target, None)));
+    }
+
+    #[tokio::test]
+    async fn native_pointer_metadata_survives_controller_delivery() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let metadata = crate::js::PointerMetadata {
+            screen: Some((-120.5, 233.25)),
+            modifiers: Modifiers {
+                shift: true,
+                control: true,
+                alt: false,
+                meta: true,
+            },
+        };
+        browser.handle_action(UserAction::PageHover {
+            actor: Some(42),
+            position: CssPoint::new(10.5, 20.25),
+            metadata,
+        });
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::js::PageCmd::Hover { node:Some(42), x:10.5, y:20.25, metadata:m } if m==metadata)
+        );
+        for pressed in [true, false] {
+            browser.handle_action(UserAction::PagePointerButton {
+                actor: Some(42),
+                position: CssPoint::new(10.5, 20.25),
+                pressed,
+                button: 2,
+                metadata,
+            });
+            assert!(
+                matches!(rx.try_recv().unwrap(), crate::js::PageCmd::PointerButton { node:Some(42), x:10.5, y:20.25, pressed:p, button:2, metadata:m } if p==pressed && m==metadata)
+            );
+        }
+        browser.handle_action(UserAction::InputModifiers(metadata.modifiers));
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::js::PageCmd::InputModifiers(m) if m==metadata.modifiers)
+        );
+        assert_eq!(metadata.modifier_bits(), 11);
     }
 
     #[tokio::test]

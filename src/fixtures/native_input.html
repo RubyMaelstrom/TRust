@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>TRust native input diagnostics</title>
+<style>
+body { font:16px sans-serif; margin:24px; background:#eef2f6; color:#162334 }
+#drag { background:#d2e7ff; border:3px solid #366697; padding:20px; width:300px; margin:18px 0 }
+iframe { width:360px; height:110px; border:3px solid #366697 }
+pre { white-space:pre-wrap; font:12px monospace; background:white; padding:12px }
+</style>
+<h1>Native input diagnostics</h1>
+<p>Click and double-click, hold Shift/Ctrl/Alt/Meta, or use the secondary/middle buttons.
+Drag the blue box across the frame or outside the page, then release.</p>
+<label><input type="checkbox" id="check"> Native checkbox activation</label>
+<div id="drag">Pointer capture: drag from here</div>
+<iframe id="frame" srcdoc="<!doctype html><style>body{font:16px sans-serif}</style><label><input type=checkbox id=inner>Iframe checkbox</label>"></iframe>
+<pre id="out">Waiting for native input. This page never synthesizes a click.</pre>
+<script>
+const output=document.getElementById('out'), records=[], watched=new WeakSet();
+function watch(doc,scope) {
+    if(!doc || watched.has(doc))return; watched.add(doc);
+    for(const type of ['pointerdown','mousedown','pointerup','mouseup','click','dblclick',
+        'auxclick','contextmenu','gotpointercapture','lostpointercapture','pointercancel']) {
+        doc.addEventListener(type,event=>{
+            const activation=doc.defaultView.navigator.userActivation;
+            const record={scope,type,target:event.target.id||event.target.nodeName,
+                trusted:event.isTrusted,detail:event.detail,button:event.button,buttons:event.buttons,
+                pointerId:event.pointerId,pointerType:event.pointerType,
+                client:[event.clientX,event.clientY],screen:[event.screenX,event.screenY],
+                offset:[event.offsetX,event.offsetY],modifiers:['Shift','Control','Alt','Meta'].map(k=>event.getModifierState(k)),
+                active:activation.isActive,sticky:activation.hasBeenActive};
+            records.push(record); if(records.length>40)records.shift();
+            output.textContent=records.map(r=>JSON.stringify(r)).join('\n');
+            console.log('NATIVE_INPUT '+JSON.stringify(record));
+        },true);
+    }
+}
+watch(document,'top');
+const frame=document.getElementById('frame');
+frame.onload=()=>watch(frame.contentDocument,'frame');
+watch(frame.contentDocument,'frame');
+document.getElementById('drag').onpointerdown=event=>event.currentTarget.setPointerCapture(event.pointerId);
+</script>

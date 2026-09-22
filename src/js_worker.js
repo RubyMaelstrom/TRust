@@ -531,7 +531,8 @@
         }
     };
 
-    // --- fetch (sync-backed in v1: blocks the worker thread, never the page) ---
+    // Fetch #fetch-method returns before network I/O. The host queues response
+    // processing on this worker's event loop; importScripts remains synchronous.
     // Fetch #concept-body-consume-body / #dom-body-arraybuffer. The native
     // response tuple stores bytes independently of its optional decoded text.
     // Binary responses intentionally have no text field; never reconstruct
@@ -576,7 +577,9 @@
                 if (!be) return Promise.reject(new TypeError("Failed to fetch: " + url));
                 return Promise.resolve(makeResponse(200, be.type || null, be.bytes, url));
             }
-            var rp = __url_parse(url, g.location.href); if (rp) url = rp[0];
+            var rp = __url_parse(url, g.location.href);
+            if (!rp) throw new TypeError("Invalid fetch URL: " + url);
+            url = rp[0];
             var method = String(init.method || (input && input.method) || "GET").toUpperCase();
             // Use the same header and native BufferSource boundary as Window fetch.
             const headers = new g.Headers(init.headers !== undefined ? init.headers : input && input.headers);
@@ -597,12 +600,13 @@
             const credentials = init.credentials || (input && input.credentials) || 'same-origin';
             if (!['cors','no-cors','same-origin'].includes(mode) || !['omit','same-origin','include'].includes(credentials))
                 throw new TypeError('Invalid fetch mode or credentials');
-            var r = __http_fetch(url, method, body, ctype, headerWire, mode, credentials, 'fetch');
-            if (!r) return Promise.reject(new TypeError("Failed to fetch: " + url));
-            const responseHeaders = new g.Headers();
-            const lines = String(r[4] || '').split('\n');
-            for (let i = 0; i + 1 < lines.length; i += 2) responseHeaders.append(lines[i], lines[i + 1]);
-            return Promise.resolve(makeResponse(r[0], r[1], r[3], url, responseHeaders));
+            return __http_fetch_async(url, method, body, ctype, headerWire, mode, credentials, 'fetch').then(r => {
+                if (!r) throw new TypeError("Failed to fetch: " + url);
+                const responseHeaders = new g.Headers();
+                const lines = String(r[4] || '').split('\n');
+                for (let i = 0; i + 1 < lines.length; i += 2) responseHeaders.append(lines[i], lines[i + 1]);
+                return makeResponse(r[0], r[1], r[3], url, responseHeaders);
+            });
         } catch (error) { return Promise.reject(error); }
     };
 })();

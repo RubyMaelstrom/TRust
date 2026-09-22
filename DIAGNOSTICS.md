@@ -28,6 +28,33 @@ comment/example in the same change.
 
 ## Quick-start commands
 
+### Native input and worker fetch
+
+`src/fixtures/native_input.html` records actual mouse/keyboard modifier state,
+screen/client/target-relative coordinates, user activation, capture transitions,
+and click counts, including a same-origin iframe. It does not synthesize input:
+
+```sh
+TRUST_LUMEN_TRACE=1 target/release/trust-desktop src/fixtures/native_input.html
+cargo test --release --lib pointer_
+cargo test --release --lib user_activation
+cargo test --release --lib worker_fetch
+```
+
+The pointer and activation fixtures run in interpreter, bytecode, and JIT tiers.
+The worker fetch regression holds a loopback response until worker timers,
+messages, and microtasks make progress; it also checks blob-worker origin
+inheritance, HTTP error responses, and rejection of unresolved relative URLs.
+These are general conformance checks, not a claim that a challenge service will
+accept the browser. They follow the local 2026-09-06 snapshots of HTML's
+[user activation](https://html.spec.whatwg.org/multipage/interaction.html#tracking-user-activation)
+and [worker settings](https://html.spec.whatwg.org/multipage/workers.html),
+[Pointer Events](https://www.w3.org/TR/pointerevents4/),
+[CSSOM View mouse coordinates](https://drafts.csswg.org/cssom-view-1/#extensions-to-the-mouseevent-interface),
+and [Fetch](https://fetch.spec.whatwg.org/#fetch-method).
+
+### WebAssembly
+
 Compare native WebAssembly execution against the interpreter with the same
 release artifact: `TRUST_WASM_NATIVE_JIT=0` (or `false`) disables the optional
 native compiler. It is enabled by default on little-endian AArch64 and x86-64;

@@ -48,6 +48,9 @@
     __trust.pointerButton(inner.__id, false, x, y);
     __trust.click(inner.__id);
     assert(nestedClick && nestedClick.join() === '12,16,true', 'nested native coordinates: ' + nestedClick);
+    // Pointer Events firing now establishes boundary state on button events
+    // too. Start the next observed sequence outside the child viewport.
+    __trust.hover(null, x, y);
     const pointerEvents = [];
     for (const type of ['pointerover', 'mouseover', 'pointerenter', 'mouseenter', 'pointermove', 'mousemove',
         'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'pointerout', 'mouseout', 'pointerleave', 'mouseleave']) {
@@ -72,7 +75,7 @@
     __trust.pointerButton(inner.__id, true, x, y, 0, -20);
     __trust.pointerButton(inner.__id, false, x, y, 0, -20);
     __trust.click(inner.__id);
-    assert(pointerEvents.length === 5 && pointerEvents.every(event => event.screenX === 0 && event.screenY === -20),
+    assert(pointerEvents.length === 9 && pointerEvents.every(event => event.screenX === 0 && event.screenY === -20),
         'explicit zero and negative screen coordinates are not replaced by client coordinates');
     // Borrowing another realm's getter must still use the target's Document.
     const getter = Element.prototype.getBoundingClientRect;

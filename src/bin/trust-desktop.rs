@@ -1410,6 +1410,8 @@ struct DesktopApp {
     custom_cursors: HashMap<(ImageHandle, u16, u16), CustomCursor>,
     cursor_hotspots: HashMap<ImageHandle, (u16, u16)>,
     modifiers: ModifiersState,
+    screen_origin: (i32, i32),
+    page_pointer_buttons: u16,
     focus: FocusTarget,
     /// The command-line URL starts only after the native window reports its
     /// real CSS viewport and device scale. Responsive scripts must not observe
@@ -1761,6 +1763,8 @@ impl DesktopApp {
             custom_cursors: HashMap::new(),
             cursor_hotspots: HashMap::new(),
             modifiers: ModifiersState::empty(),
+            screen_origin: (0, 0),
+            page_pointer_buttons: 0,
             focus: FocusTarget::for_startup(initial_navigation.as_deref()),
             initial_navigation,
             find: TextEditor::new("", &style, 500.0, false),
@@ -2529,7 +2533,20 @@ impl DesktopApp {
                 })
             })
             .unwrap_or((0, 0));
+        self.screen_origin = position;
         self.dispatch(UserAction::ScreenPosition(position.0, position.1));
+    }
+
+    fn pointer_metadata(&self) -> trust::js::PointerMetadata {
+        // CursorMoved and the cached client-window origin are already in CSS
+        // pixels. Keep chrome in screen coordinates, but not page client ones.
+        trust::js::PointerMetadata {
+            screen: Some((
+                f64::from(self.screen_origin.0) + f64::from(self.pointer.x),
+                f64::from(self.screen_origin.1) + f64::from(self.pointer.y),
+            )),
+            modifiers: translate_modifiers(self.modifiers),
+        }
     }
 
     fn browser_viewport(&self) -> CssSize {
@@ -6352,6 +6369,7 @@ impl DesktopApp {
             self.dispatch(UserAction::PageHover {
                 actor,
                 position: viewport,
+                metadata: self.pointer_metadata(),
             });
         }
         if let Some(cache) = &mut self.protocol_page
@@ -6498,14 +6516,32 @@ impl DesktopApp {
             }
         }
         let button = translate_button(button);
+        let button_id = match button {
+            PointerButton::Primary => 0,
+            PointerButton::Auxiliary => 1,
+            PointerButton::Secondary => 2,
+            PointerButton::Back => 3,
+            PointerButton::Forward => 4,
+            PointerButton::Other(n) => n as i16,
+        };
+        let button_mask = 1_u16.checked_shl(button_id as u32).unwrap_or(0);
         let chrome_owned = self.heart_drag.is_some()
             || self
                 .scene
                 .as_ref()
                 .and_then(|scene| scene.control_at(self.pointer))
                 .is_some();
-        if !chrome_owned {
-            if button == PointerButton::Primary {
+        // A page-owned drag must receive its release even over browser chrome.
+        // The actor resolves DOM pointer capture against its canonical tree.
+        if !chrome_owned
+            || (state == ElementState::Released && self.page_pointer_buttons & button_mask != 0)
+        {
+            if state == ElementState::Pressed {
+                self.page_pointer_buttons |= button_mask;
+            } else {
+                self.page_pointer_buttons &= !button_mask;
+            }
+            {
                 let actor = self
                     .scene
                     .as_ref()
@@ -6521,6 +6557,8 @@ impl DesktopApp {
                     actor,
                     position,
                     pressed: state == ElementState::Pressed,
+                    button: button_id,
+                    metadata: self.pointer_metadata(),
                 });
             }
             self.dispatch(UserAction::PointerButton {
@@ -6565,6 +6603,7 @@ impl DesktopApp {
                             self.pressed_hit
                         );
                     }
+                    let actor_fallback = self.pressed_hit.as_ref().and_then(|hit| hit.actor);
                     let click_target =
                         self.pressed_hit
                             .take()
@@ -6577,10 +6616,19 @@ impl DesktopApp {
                     if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                         eprintln!("desktop: primary click target={click_target:?}");
                     }
-                    if let Some(target) = click_target
-                        && !self.step_number_from_pointer(&target)
+                    if let Some(target) = click_target {
+                        if !self.step_number_from_pointer(&target) {
+                            self.activate_page_hit(target);
+                        }
+                    } else if self.browser.page_is_live()
+                        && let Some(node) = actor_fallback
                     {
-                        self.activate_page_hit(target);
+                        // The actor's up target may be captured even though the
+                        // release has no presentation hit (e.g. over chrome).
+                        self.dispatch(UserAction::Activate(Link::JsClick {
+                            node,
+                            href: String::new(),
+                        }));
                     }
                 }
                 _ => {}
@@ -7402,6 +7450,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.window_focused = focused;
                 if !focused {
                     self.release_native_pointer_lock(true);
+                    self.page_pointer_buttons = 0;
                     self.composing = false;
                     self.selecting = false;
                     if let Some(terminal) = &mut self.terminal {
@@ -7414,7 +7463,12 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.request_redraw();
                 self.dispatch(UserAction::Focus(focused));
             }
-            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+                self.dispatch(UserAction::InputModifiers(translate_modifiers(
+                    self.modifiers,
+                )));
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
@@ -7449,6 +7503,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.dispatch(UserAction::PageHover {
                     actor: None,
                     position: CssPoint::default(),
+                    metadata: self.pointer_metadata(),
                 });
                 self.request_redraw();
             }

@@ -284,7 +284,10 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         let agent = &state.message_ports;
         let wake = state.task_events.as_ref().map_or_else(
             || agent.wake.clone(),
-            |sender| Wake::Page(sender.downgrade()),
+            |sender| match sender {
+                super::LumenTaskSender::Page(sender) => Wake::Page(sender.downgrade()),
+                super::LumenTaskSender::Worker(inbox) => Wake::Worker(inbox.clone()),
+            },
         );
         agent.registry.lock().unwrap().operation(
             Owner {
