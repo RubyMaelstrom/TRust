@@ -497,6 +497,7 @@ impl SelectorDependencies {
             slotted,
             pseudo: _,
             pseudos: _,
+            relative_anchor: _,
         } = compound;
         if id.is_some() {
             self.add("id", impact);

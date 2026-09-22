@@ -2,7 +2,7 @@
 
 You'll need Rust, a C compiler, and the matching [Lumen checkout](https://github.com/RubyMaelstrom/Lumen)
 next to TRust at `../Lumen`. Use Lumen revision
-`328b4bbd1de1e93547cc74bebe08b98d97088eaa`.
+`451e439089675645283c4e4ead0203f2bc7d09ea`.
 
 From the TRust directory:
 
