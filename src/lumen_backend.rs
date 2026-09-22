@@ -1842,6 +1842,12 @@ mod desktop {
                 })
             });
 
+            // Remember whether this turn started inside the bounded background-service
+            // window. A completed rendering opportunity may start that window, but it must
+            // not renew an already-expired window indefinitely. Otherwise a continuous
+            // requestAnimationFrame stream can keep an interaction queued in the HTML task
+            // scheduler forever.
+            let background_service_was_active = background_service.is_some();
             let _interaction = match &wake {
                 Wake::Interaction(Some(_)) | Wake::Hover(Some(_)) => {
                     task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
@@ -2039,7 +2045,10 @@ mod desktop {
                     if animation_frame {
                         last_render_opportunity = Instant::now();
                         render_deadline = None;
-                        background_service = Some((Instant::now(), 0));
+                        rearm_background_service_after_render(
+                            &mut background_service,
+                            background_service_was_active,
+                        );
                     }
                     if !animation_frame {
                         prefer_timer = false;
@@ -2084,7 +2093,10 @@ mod desktop {
                     last_render_opportunity = Instant::now();
                     // Rendering must leave time for the other task sources,
                     // including multiple already-ready short callbacks.
-                    background_service = Some((Instant::now(), 0));
+                    rearm_background_service_after_render(
+                        &mut background_service,
+                        background_service_was_active,
+                    );
                     prefer_command = true;
                 }
             }
@@ -2103,6 +2115,19 @@ mod desktop {
         match wait {
             Some(wait) => tokio::time::sleep(wait).await,
             None => std::future::pending::<()>().await,
+        }
+    }
+
+    fn rearm_background_service_after_render(
+        background_service: &mut Option<(Instant, usize)>,
+        was_active: bool,
+    ) {
+        // The scheduler clears an exhausted budget before dispatching the overdue frame. That
+        // frame is allowed to finish, but it must not create a fresh budget and make the next
+        // frame win over an already queued interaction. A frame that was not inside an active
+        // budget starts the next bounded background-service window normally.
+        if !was_active && background_service.is_none() {
+            *background_service = Some((Instant::now(), 0));
         }
     }
 
@@ -4267,6 +4292,69 @@ mod desktop {
             })
             .await
             .expect("native keyboard delivery timed out");
+        }
+
+        #[tokio::test]
+        async fn continuous_rendering_does_not_starve_native_page_keys() {
+            // HTML #event-loop-processing-model permits bounded task-source preference, but a
+            // rendering task must not keep renewing that preference after its budget expires.
+            // This models pages with a continuously scheduled, non-trivial rAF callback.
+            let html = r#"<body><script>
+                let frames = 0;
+                function frame() {
+                    const end = performance.now() + 20;
+                    while (performance.now() < end) {}
+                    document.body.dataset.frame = String(++frames);
+                    requestAnimationFrame(frame);
+                }
+                requestAnimationFrame(frame);
+            </script></body>"#;
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if html.contains("data-frame=") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("rendering page: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before a rendering frame"),
+                    }
+                }
+                handle
+                    .try_send_user(PageCmd::Key {
+                        node: None,
+                        input: crate::core::KeyInput {
+                            key: crate::core::Key::PageDown,
+                            code: "PageDown".into(),
+                            location: 0,
+                            state: crate::core::KeyState::Pressed,
+                            modifiers: Default::default(),
+                            repeat: false,
+                            composing: false,
+                        },
+                    })
+                    .unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::KeyDefault { prevented }) => {
+                            assert!(!prevented, "page unexpectedly canceled PageDown");
+                            break;
+                        }
+                        Some(PageEvt::Updated { outcome, .. }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("native key: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before native key acknowledgement"),
+                    }
+                }
+            })
+            .await
+            .expect("continuous rendering starved a native page key");
         }
 
         #[tokio::test]
