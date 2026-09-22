@@ -75,9 +75,11 @@ The project favors:
   selection, input, scrolling, live-page messages, and image pipelines.
 - `src/doc.rs`: protocol-neutral presentation model. Small-net and plain-text
   documents use styled lines; HTML uses positioned layout rows and items.
-- `src/http.rs`: hand-built HTTP/1.1 client, WebPKI HTTPS, redirects,
-  keep-alive pool, cookies, page/subresource caching, HTML parsing, form
-  extraction, and full/incremental layout entry points.
+- `src/http.rs`: shared HTTP policy and hand-built HTTP/1.1 client, WebPKI
+  HTTPS, redirects, connection pools, cookies, page/subresource caching, HTML
+  parsing, form extraction, and full/incremental layout entry points.
+  `src/http/http2.rs` integrates the Rust `h2` framing/HPACK engine with ALPN,
+  multiplexed sessions, bounded streaming, cancellation, and safe retries.
 - `src/dom.rs`: html5ever-backed arena DOM, mutations, selectors, CSS parsing,
   cascade, computed values, serialization, and live geometry state.
 - `src/js.rs`: JavaScript/browser contract and engine-neutral
@@ -262,6 +264,13 @@ current behavior and limits; consult the governing standards before changing it.
 
 ### Desktop and web APIs
 
+- HTTPS prefers HTTP/2 via ALPN and retains HTTP/1.1 fallback. Cleartext HTTP
+  and RFC 6455 WebSockets remain HTTP/1.1; HTTP/3, cross-origin connection
+  coalescing, and WebSockets over extended CONNECT are not implemented.
+  HTTP/2 server push is disabled. Networking policy is shared by both HTTP
+  transports; connections are keyed by origin, available top-level schemeful
+  site, credentials, and owning runtime. Canceling HTTP/2 work resets only its
+  stream. Never blindly replay a possibly processed POST after network failure.
 - `--renderer=auto` selects Hybrid only after surface, adapter, device, and
   capability initialization succeed; recoverable later failures fall back to
   Vello CPU. `--renderer=cpu` forces the reference renderer, while

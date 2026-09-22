@@ -1,9 +1,12 @@
-//! A deliberately small HTTP/1.1 client for the text web.
+//! Shared HTTP/1.1 and HTTP/2 client and browser networking policy.
 //!
 //! Persistent connections (a RAM-only keep-alive pool — measured
 //! 2026-06-12: serial fresh-TLS-per-request was 85% of a page load),
-//! responses delimited precisely (Content-Length / chunked / EOF), no
-//! compression (`Accept-Encoding: gzip, deflate`), redirects followed here.
+//! HTTP/1.1 responses delimited precisely (Content-Length / chunked / EOF),
+//! bounded gzip/deflate content decoding, and redirects followed here.
+//! HTTPS negotiates HTTP/2 through ALPN, with HTTP/1.1 fallback. `http2`
+//! owns multiplexed sessions; cookies, Fetch policy and response handling stay
+//! here, shared by all frontends and both wire protocols.
 //! HTTPS uses standard WebPKI validation (`tls::webpki_connector`),
 //! not TOFU. HTML renders through our own arena DOM (`dom.rs`) laid out
 //! into positioned rows by `layout2`; forms are extracted from that same
@@ -22,6 +25,8 @@ use url::{Host, Url};
 use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
 pub use crate::performance::{FetchTiming, NavigationType};
 use crate::tls;
+
+pub(crate) mod http2;
 
 // Per-response memory guard, shared by HTTP framing and content decoding.
 // Fetch/XHR bodies include binary application assets (archives, disk images,
@@ -1418,9 +1423,17 @@ pub(crate) async fn fetch_with_timing(
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(r) => eprintln!(
-            "net: @{at:>6}ms +{ms:>5}ms {} {}B {}",
+            "net: @{at:>6}ms +{ms:>5}ms {} {}B protocol={} reused={} {}",
             r.response.status,
             r.response.body.len(),
+            r.response
+                .timing
+                .as_ref()
+                .map_or("unknown", |t| t.next_hop_protocol),
+            r.response
+                .timing
+                .as_ref()
+                .is_some_and(|t| t.connection_reused),
             request.url
         ),
         Err(e) => eprintln!(
@@ -2147,7 +2160,36 @@ impl AsyncWrite for Conn {
     }
 }
 
-type PoolKey = (String, String, u16); // (scheme, host, port)
+/// Fetch #connections / #network-partition-keys (394d20d, 2026-09-06):
+/// never share a transport across top-level sites or credential modes. Tokio
+/// runtimes are also isolated: a socket/driver cannot outlive its reactor.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PoolKey {
+    scheme: String,
+    host: String,
+    port: u16,
+    top_level_site: Option<String>,
+    credentials: bool,
+    runtime: tokio::runtime::Id,
+}
+
+impl PoolKey {
+    fn for_request(request: &Request) -> Result<Self, String> {
+        let url = &request.url;
+        Ok(Self {
+            scheme: url.scheme().into(),
+            host: url.host_str().ok_or("URL has no host")?.into(),
+            port: url.port_or_known_default().unwrap_or(80),
+            top_level_site: request
+                .cookie_context
+                .as_ref()
+                .and_then(|context| context.top_level_site.clone())
+                .or_else(|| cookie_site(url)),
+            credentials: credentials_included(request),
+            runtime: tokio::runtime::Handle::current().id(),
+        })
+    }
+}
 
 struct IdleConn {
     io: Option<BufReader<Conn>>,
@@ -2264,6 +2306,7 @@ pub(crate) fn prune_idle_connections() {
     if let Ok(mut pool) = POOL.lock() {
         pool.prune(Instant::now());
     }
+    http2::prune_idle();
 }
 
 fn pool_get(key: &PoolKey) -> Option<BufReader<Conn>> {
@@ -3615,6 +3658,16 @@ async fn dial_with_timing(
     scheme: &str,
     host: &str,
     port: u16,
+    timing: Option<&mut crate::performance::FetchTiming>,
+) -> Result<BufReader<Conn>, String> {
+    dial_with_connector(scheme, host, port, &tls::webpki_connector(), timing).await
+}
+
+async fn dial_with_connector(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    connector: &tokio_rustls::TlsConnector,
     mut timing: Option<&mut crate::performance::FetchTiming>,
 ) -> Result<BufReader<Conn>, String> {
     // Same resolver and address-order fallback as TcpStream::connect(host),
@@ -3641,7 +3694,7 @@ async fn dial_with_timing(
         if let Some(timing) = timing.as_deref_mut() {
             timing.secure_connection_start = crate::performance::now_ms();
         }
-        let stream = tls::webpki_connector()
+        let stream = connector
             .connect(name, stream)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
@@ -3651,19 +3704,49 @@ async fn dial_with_timing(
     };
     if let Some(timing) = timing {
         timing.connect_end = crate::performance::now_ms();
-        // This transport implements HTTP/1.1 even when no ALPN negotiation
-        // occurs; Fetch permits the protocol's descriptive registered ID.
-        timing.next_hop_protocol = "http/1.1";
+        timing.next_hop_protocol = match &conn {
+            Conn::Tls(stream) if stream.get_ref().1.alpn_protocol() == Some(b"h2") => "h2",
+            _ => "http/1.1",
+        };
     }
     Ok(BufReader::new(conn))
 }
 
-/// Fresh connection for the bounded streaming download path. Downloads never
-/// enter the keep-alive pool because their body is written directly to disk.
-pub(crate) async fn download_connection(url: &Url) -> Result<BufReader<Conn>, String> {
-    let host = url.host_str().ok_or("download URL has no host")?;
-    let port = url.port_or_known_default().unwrap_or(80);
-    dial(url.scheme(), host, port).await
+pub(crate) enum DownloadConnection {
+    Http1(BufReader<Conn>),
+    Http2(http2::DownloadResponse),
+}
+
+/// Downloads share HTTP/2 sessions with page requests, applying disk
+/// backpressure to their own stream. The HTTP/1.1 path stays unpooled.
+pub(crate) async fn download_connection(
+    request: &Request,
+    limit: usize,
+) -> Result<DownloadConnection, String> {
+    let key = PoolKey::for_request(request)?;
+    let mut timing = FetchTiming::new();
+    for attempt in 0..2 {
+        match http2::acquire(&key, &mut timing).await? {
+            http2::Transport::Http1(io) => return Ok(DownloadConnection::Http1(io)),
+            http2::Transport::Http2(lease) => {
+                match http2::download(&lease, request, limit, &mut timing).await {
+                    Ok(response) => return Ok(DownloadConnection::Http2(response)),
+                    Err(error) => {
+                        if error.requires_http1() {
+                            lease.require_http1().await;
+                        } else if error.retire_connection() {
+                            lease.retire().await;
+                        }
+                        if attempt == 0 && (error.retry_safe() || error.requires_http1()) {
+                            continue;
+                        }
+                        return Err(error.to_string());
+                    }
+                }
+            }
+        }
+    }
+    unreachable!("the final attempt returns its result")
 }
 
 pub(crate) fn download_referrer(source: &Url, target: &Url) -> Option<String> {
@@ -3744,7 +3827,7 @@ async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response,
     let mut timing = crate::performance::FetchTiming::new();
     let host = url.host_str().ok_or("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(80);
-    let key: PoolKey = (url.scheme().to_string(), host.clone(), port);
+    let key = PoolKey::for_request(request)?;
 
     // Reuse an idle connection for GETs only: a pooled connection can
     // be stale (server closed it while idle), and the silent re-send
@@ -3767,9 +3850,58 @@ async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response,
     // to the successful retry. Preserve this hop's fetch start, not its errors.
     timing.first_interim_response_start = 0.0;
     timing.final_response_start = 0.0;
-    let mut io = dial_with_timing(url.scheme(), &host, port, Some(&mut timing)).await?;
-    let parts = exchange(&mut io, request, &host, port, origin, &mut timing).await?;
-    finish_response(request, parts, io, key, timing)
+    for attempt in 0..2 {
+        if attempt != 0 {
+            timing.response_end = 0.0;
+            timing.encoded_body_size = 0;
+            timing.decoded_body_size = 0;
+        }
+        match http2::acquire(&key, &mut timing).await? {
+            http2::Transport::Http1(mut io) => {
+                let parts = exchange(&mut io, request, &host, port, origin, &mut timing).await?;
+                return finish_response(request, parts, io, key, timing);
+            }
+            http2::Transport::Http2(lease) => {
+                match http2::exchange(&lease, request, origin, &mut timing).await {
+                    Ok(parts) => {
+                        // Fetch #http-network-or-cache-fetch: 421 is retried
+                        // once on a new connection. Our bodies are replayable
+                        // byte sources, not non-rewindable upload streams.
+                        if parts.0 == 421 && attempt == 0 {
+                            for cookie in &parts.3 {
+                                response_cookie(request, cookie);
+                            }
+                            lease.retire().await;
+                            timing.first_interim_response_start = 0.0;
+                            timing.final_response_start = 0.0;
+                            continue;
+                        }
+                        return finish_response_parts(request, parts, timing);
+                    }
+                    Err(error) => {
+                        let fallback = error.requires_http1()
+                            && (error.retry_safe()
+                                || matches!(
+                                    request.method.as_str(),
+                                    "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+                                ));
+                        if error.requires_http1() {
+                            lease.require_http1().await;
+                        } else if error.retire_connection() {
+                            lease.retire().await;
+                        }
+                        if attempt == 0 && (error.retry_safe() || fallback) {
+                            timing.first_interim_response_start = 0.0;
+                            timing.final_response_start = 0.0;
+                            continue;
+                        }
+                        return Err(error.to_string());
+                    }
+                }
+            }
+        }
+    }
+    unreachable!("the final attempt returns its result")
 }
 
 /// Build the Response and return a still-healthy connection to the
@@ -3803,14 +3935,24 @@ fn finish_response(
     (status, headers, body, reusable, set_cookies): (u16, Headers, Vec<u8>, bool, Vec<String>),
     io: BufReader<Conn>,
     key: PoolKey,
+    timing: crate::performance::FetchTiming,
+) -> Result<Response, String> {
+    if reusable {
+        pool_put(key, io);
+    }
+    finish_response_parts(request, (status, headers, body, set_cookies), timing)
+}
+
+type ResponseParts = (u16, Headers, Vec<u8>, Vec<String>);
+
+fn finish_response_parts(
+    request: &Request,
+    (status, headers, body, set_cookies): ResponseParts,
     mut timing: crate::performance::FetchTiming,
 ) -> Result<Response, String> {
     timing.response_status = status;
     timing.content_type = headers.get("content-type").cloned().unwrap_or_default();
     timing.content_encoding = headers.get("content-encoding").cloned().unwrap_or_default();
-    if reusable {
-        pool_put(key, io);
-    }
     let url = &request.url;
     if cookie_trace_enabled() {
         trace_cookie_counts(
@@ -3881,28 +4023,11 @@ fn finish_response(
 
 type Headers = HashMap<String, String>;
 
-/// Write the request, read exactly one response. The bool says the
-/// connection is positioned at the next message boundary — safe to
-/// pool. A truncated length-delimited response is a network error and is
-/// never exposed as a partial body or returned to the pool.
-async fn exchange(
-    io: &mut BufReader<Conn>,
-    request: &Request,
-    host: &str,
-    port: u16,
-    origin: Option<&str>,
-    timing: &mut crate::performance::FetchTiming,
-) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+/// Protocol-independent browser-owned headers. HTTP/1.1 adds Host and
+/// Connection; HTTP/2 derives pseudo-headers from the URL and never emits
+/// connection-specific fields (RFC 9113 §§8.2.2, 8.3.1).
+fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, String)> {
     let url = &request.url;
-    let mut path = url.path().to_string();
-    if let Some(query) = url.query() {
-        path.push('?');
-        path.push_str(query);
-    }
-    let host_header = match (url.scheme(), port) {
-        ("http", 80) | ("https", 443) => host.to_string(),
-        _ => format!("{host}:{port}"),
-    };
     // Headers we manage ourselves — a page-supplied copy is ignored so we
     // never emit a duplicate or let a page spoof transport/identity headers.
     // `accept` and `accept-language` are the exceptions: Fetch supplies the
@@ -3913,6 +4038,11 @@ async fn exchange(
         "user-agent",
         "content-length",
         "connection",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "upgrade",
+        "te",
         "cookie",
         "accept-encoding",
         "accept-language",
@@ -3935,26 +4065,27 @@ async fn exchange(
         .find(|(k, _)| k.eq_ignore_ascii_case("accept-language"))
         .filter(|(_, v)| !v.contains(['\r', '\n']))
         .map(|(_, v)| v.as_str());
-    let mut head = format!(
-        "{} {} HTTP/1.1\r\n\
-         Host: {}\r\n\
-         User-Agent: {}\r\n\
-         Accept: {}\r\n\
-         Accept-Language: {}\r\n\
-         Accept-Encoding: gzip, deflate\r\n\
-         Connection: keep-alive\r\n",
-        request.method,
-        path,
-        host_header,
-        USER_AGENT,
-        page_accept.unwrap_or_else(|| request.default_accept()),
-        page_accept_language.unwrap_or(crate::locale::ACCEPT_LANGUAGE),
-    );
+    let mut headers = vec![
+        ("User-Agent".into(), USER_AGENT.into()),
+        (
+            "Accept".into(),
+            page_accept
+                .unwrap_or_else(|| request.default_accept())
+                .into(),
+        ),
+        (
+            "Accept-Language".into(),
+            page_accept_language
+                .unwrap_or(crate::locale::ACCEPT_LANGUAGE)
+                .into(),
+        ),
+        ("Accept-Encoding".into(), "gzip, deflate".into()),
+    ];
     if GLOBAL_PRIVACY_CONTROL {
         // GPC §3.3: the field value is exactly the single character `1`.
         // It is user-agent-owned, so a page-supplied Sec-GPC is filtered by
         // MANAGED below and can neither override nor duplicate this field.
-        head.push_str("Sec-GPC: 1\r\n");
+        headers.push(("Sec-GPC".into(), "1".into()));
     }
     // Fetch Metadata request headers are user-agent-owned. They describe a
     // real navigation context and are therefore not accepted from the page's
@@ -3969,18 +4100,17 @@ async fn exchange(
             FetchSite::SameSite => "same-site",
             FetchSite::CrossSite => "cross-site",
         };
-        head.push_str(&format!(
-            "Sec-Fetch-Dest: {}\r\nSec-Fetch-Mode: {}\r\nSec-Fetch-Site: {site}\r\n",
-            metadata.destination, metadata.mode,
-        ));
+        headers.push(("Sec-Fetch-Dest".into(), metadata.destination.into()));
+        headers.push(("Sec-Fetch-Mode".into(), metadata.mode.into()));
+        headers.push(("Sec-Fetch-Site".into(), site.into()));
         if metadata.mode == "navigate" && metadata.user_activation {
-            head.push_str("Sec-Fetch-User: ?1\r\n");
+            headers.push(("Sec-Fetch-User".into(), "?1".into()));
         }
         // UIR §3.2.1: advertise support for secure navigations. TRust does
         // not yet maintain an HSTS preload list, so this applies to every
         // trustworthy top-level navigation.
         if metadata.mode == "navigate" {
-            head.push_str("Upgrade-Insecure-Requests: 1\r\n");
+            headers.push(("Upgrade-Insecure-Requests".into(), "1".into()));
         }
     }
     let cookie = request_cookies(request);
@@ -4015,16 +4145,16 @@ async fn exchange(
     }
     if !cookie.is_empty() {
         trace_cookie_wire(url, &cookie);
-        head.push_str(&format!("Cookie: {cookie}\r\n"));
+        headers.push(("Cookie".into(), cookie));
     }
     if let Some(origin) = origin {
-        head.push_str(&format!("Origin: {origin}\r\n"));
+        headers.push(("Origin".into(), origin.into()));
     }
     if let Some(content_type) = request.content_type() {
-        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        headers.push(("Content-Type".into(), content_type.into()));
     }
     if let Some((_, payload)) = &request.body {
-        head.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+        headers.push(("Content-Length".into(), payload.len().to_string()));
     } else if request.method.eq_ignore_ascii_case("POST")
         || request.method.eq_ignore_ascii_case("PUT")
     {
@@ -4032,7 +4162,7 @@ async fn exchange(
         // Content-Length value of 0. This is semantically distinct from
         // omitting framing for a GET/HEAD (RFC 9110 §8.6), and some HTTP/1.1
         // gateways correctly answer an unframed POST with 411 Length Required.
-        head.push_str("Content-Length: 0\r\n");
+        headers.push(("Content-Length".into(), "0".into()));
     }
     // Page-supplied headers (X-Requested-With — which servers read as
     // `$request->ajax()` — Authorization, X-CSRF-TOKEN, …), minus the managed
@@ -4052,7 +4182,36 @@ async fn exchange(
         {
             continue;
         }
-        head.push_str(&format!("{k}: {v}\r\n"));
+        headers.push((k.clone(), v.clone()));
+    }
+    headers
+}
+
+/// Write one HTTP/1.1 request and read its complete, bounded response. The
+/// boolean indicates whether the connection is at a reusable message boundary.
+async fn exchange(
+    io: &mut BufReader<Conn>,
+    request: &Request,
+    host: &str,
+    port: u16,
+    origin: Option<&str>,
+    timing: &mut crate::performance::FetchTiming,
+) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    let url = &request.url;
+    let path = &url[url::Position::BeforePath..url::Position::AfterQuery];
+    let host_header = match (url.scheme(), port) {
+        ("http", 80) | ("https", 443) => host.to_string(),
+        _ => format!("{host}:{port}"),
+    };
+    let mut head = format!(
+        "{} {path} HTTP/1.1\r\nHost: {host_header}\r\n",
+        request.method
+    );
+    for (name, value) in request_headers(request, origin) {
+        head.push_str(&format!("{name}: {value}\r\n"));
+        if name == "Accept-Encoding" {
+            head.push_str("Connection: keep-alive\r\n");
+        }
     }
     head.push_str("\r\n");
 
@@ -7725,14 +7884,25 @@ mod tests {
         );
     }
 
+    fn pool_test_key(scheme: &str, host: impl Into<String>, port: u16) -> PoolKey {
+        PoolKey {
+            scheme: scheme.into(),
+            host: host.into(),
+            port,
+            top_level_site: None,
+            credentials: true,
+            runtime: tokio::runtime::Handle::current().id(),
+        }
+    }
+
     #[tokio::test]
     async fn idle_connection_pool_prunes_unvisited_origins_at_the_expiry_boundary() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut pool = ConnectionPool::default();
         let now = Instant::now();
-        let expired = ("http".into(), "old.example".into(), 80);
-        let recent = ("http".into(), "recent.example".into(), 80);
+        let expired = pool_test_key("http", "old.example", 80);
+        let recent = pool_test_key("http", "recent.example", 80);
         let (old_io, mut old_peer) = idle_connection_pair().await;
         let (recent_io, mut recent_peer) = idle_connection_pair().await;
         pool.put(expired.clone(), old_io, now - POOL_IDLE_TTL);
@@ -7762,7 +7932,7 @@ mod tests {
         for index in 0..=POOL_MAX_IDLE {
             let (io, peer) = idle_connection_pair().await;
             pool.put(
-                ("http".into(), format!("host-{index}.example"), 80),
+                pool_test_key("http", format!("host-{index}.example"), 80),
                 io,
                 now + Duration::from_millis(index as u64),
             );
@@ -7772,11 +7942,11 @@ mod tests {
         assert!(
             !pool
                 .idle
-                .contains_key(&("http".into(), "host-0.example".into(), 80))
+                .contains_key(&pool_test_key("http", "host-0.example", 80))
         );
         assert_idle_peer_closed(&mut peers[0]).await;
 
-        let key = ("https".into(), "one.example".into(), 443);
+        let key = pool_test_key("https", "one.example", 443);
         let mut same_origin_peers = Vec::new();
         for index in 0..=POOL_MAX_IDLE_PER_KEY {
             let (io, peer) = idle_connection_pair().await;
@@ -7802,8 +7972,8 @@ mod tests {
     async fn idle_connection_pool_access_sweeps_other_origins() {
         let mut pool = ConnectionPool::default();
         let now = Instant::now();
-        let old_key = ("http".into(), "old.example".into(), 80);
-        let missing_key = ("http".into(), "new.example".into(), 80);
+        let old_key = pool_test_key("http", "old.example", 80);
+        let missing_key = pool_test_key("http", "new.example", 80);
         let (io, mut peer) = idle_connection_pair().await;
         pool.put(old_key.clone(), io, now - POOL_IDLE_TTL);
         assert!(pool.get(&missing_key, now).is_none());
@@ -7820,9 +7990,9 @@ mod tests {
     #[tokio::test]
     async fn idle_connection_pool_is_swept_by_navigation_without_an_http_fetch() {
         let (io, mut peer) = idle_connection_pair().await;
-        let key = (
-            "http".into(),
-            "navigation-pool-test.invalid".into(),
+        let key = pool_test_key(
+            "http",
+            "navigation-pool-test.invalid",
             peer.local_addr().unwrap().port(),
         );
         POOL.lock()
@@ -7878,7 +8048,7 @@ mod tests {
             let mut pool = ConnectionPool::default();
             let now = Instant::now();
             pool.put(
-                ("https".into(), "localhost".into(), 443),
+                pool_test_key("https", "localhost", 443),
                 BufReader::new(Conn::Tls(Box::new(client.unwrap()))),
                 now - POOL_IDLE_TTL,
             );

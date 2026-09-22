@@ -800,7 +800,6 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
         }
         let host = current.host_str().ok_or("download URL has no host")?;
         let port = current.port_or_known_default().unwrap_or(80);
-        let mut io = http::download_connection(&current).await?;
         let mut path = current.path().to_string();
         if let Some(query) = current.query() {
             path.push('?');
@@ -815,6 +814,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             http::USER_AGENT
         );
         cookie_request.url = current.clone();
+        cookie_request.headers.clear();
         let cookies = http::request_cookies(&cookie_request);
         if !cookies.is_empty() {
             request.push_str(&format!("Cookie: {cookies}\r\n"));
@@ -823,34 +823,45 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             referrer.and_then(|source| http::download_referrer(source, &current))
         {
             request.push_str(&format!("Referer: {referrer}\r\n"));
+            cookie_request.headers.push(("Referer".into(), referrer));
         }
         request.push_str("\r\n");
-        io.write_all(request.as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        io.flush().await.map_err(|error| error.to_string())?;
+        let mut connection =
+            http::download_connection(&cookie_request, MAX_DOWNLOAD_BYTES as usize).await?;
+        let (status, headers) = match &mut connection {
+            http::DownloadConnection::Http2(response) => {
+                (response.status, std::mem::take(&mut response.headers))
+            }
+            http::DownloadConnection::Http1(io) => {
+                io.write_all(request.as_bytes())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                io.flush().await.map_err(|error| error.to_string())?;
 
-        let status_line = download_line(&mut io).await?;
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|status| status.parse().ok())
-            .ok_or_else(|| format!("malformed download response: {status_line:?}"))?;
-        let mut headers = std::collections::HashMap::new();
-        loop {
-            let line = download_line(&mut io).await?;
-            if line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                let name = name.trim().to_ascii_lowercase();
-                let value = value.trim().to_string();
-                if name == "set-cookie" {
-                    http::response_cookie(&cookie_request, &value);
+                let status_line = download_line(io).await?;
+                let status: u16 = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|status| status.parse().ok())
+                    .ok_or_else(|| format!("malformed download response: {status_line:?}"))?;
+                let mut headers = std::collections::HashMap::new();
+                loop {
+                    let line = download_line(io).await?;
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        let name = name.trim().to_ascii_lowercase();
+                        let value = value.trim().to_string();
+                        if name == "set-cookie" {
+                            http::response_cookie(&cookie_request, &value);
+                        }
+                        headers.insert(name, value);
+                    }
                 }
-                headers.insert(name, value);
+                (status, headers)
             }
-        }
+        };
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let location = headers
                 .get("location")
@@ -878,21 +889,26 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             .open(partial)
             .await
             .map_err(|error| error.to_string())?;
-        let bytes = if headers
-            .get("transfer-encoding")
-            .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-        {
-            stream_chunked(&mut io, &mut file).await?
-        } else if let Some(length) = headers
-            .get("content-length")
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            if length > MAX_DOWNLOAD_BYTES {
-                return Err(String::from("download exceeds 2 GiB limit"));
+        let bytes = match &mut connection {
+            http::DownloadConnection::Http2(response) => response.write_to(&mut file).await?,
+            http::DownloadConnection::Http1(io) => {
+                if headers
+                    .get("transfer-encoding")
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+                {
+                    stream_chunked(io, &mut file).await?
+                } else if let Some(length) = headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    if length > MAX_DOWNLOAD_BYTES {
+                        return Err(String::from("download exceeds 2 GiB limit"));
+                    }
+                    stream_exact(io, &mut file, length).await?
+                } else {
+                    stream_eof(io, &mut file).await?
+                }
             }
-            stream_exact(&mut io, &mut file, length).await?
-        } else {
-            stream_eof(&mut io, &mut file).await?
         };
         file.flush().await.map_err(|error| error.to_string())?;
         file.sync_all().await.map_err(|error| error.to_string())?;

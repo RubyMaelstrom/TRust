@@ -70,6 +70,10 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 # back to large interpreted JavaScript codecs.
 flate2 = "1"
 futures = "0.3.34"
+# HTTP/2 framing, HPACK and stream state; TRust owns connections and all
+# browser policy. This is not a second general-purpose HTTP client.
+h2 = "0.4.15"
+http_wire = { package = "http", version = "1.5.0" }
 # WebGL uses Rust validation and bindings to the installed EGL/GLES driver.
 # No ANGLE or bundled native shader compiler is linked into the browser.
 glow = "0.17.0"
