@@ -829,10 +829,15 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
         let mut connection =
             http::download_connection(&cookie_request, MAX_DOWNLOAD_BYTES as usize).await?;
         let (status, headers) = match &mut connection {
+            http::DownloadConnection::Http3(response) => {
+                (response.status, std::mem::take(&mut response.headers))
+            }
             http::DownloadConnection::Http2(response) => {
                 (response.status, std::mem::take(&mut response.headers))
             }
             http::DownloadConnection::Http1(io) => {
+                let mut timing = crate::performance::FetchTiming::new();
+                timing.request_start = crate::performance::now_ms();
                 io.write_all(request.as_bytes())
                     .await
                     .map_err(|error| error.to_string())?;
@@ -859,6 +864,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
                         headers.insert(name, value);
                     }
                 }
+                http::http3::remember(&cookie_request, status, &headers, &timing);
                 (status, headers)
             }
         };
@@ -890,6 +896,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             .await
             .map_err(|error| error.to_string())?;
         let bytes = match &mut connection {
+            http::DownloadConnection::Http3(response) => response.write_to(&mut file).await?,
             http::DownloadConnection::Http2(response) => response.write_to(&mut file).await?,
             http::DownloadConnection::Http1(io) => {
                 if headers

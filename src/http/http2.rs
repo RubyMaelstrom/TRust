@@ -16,14 +16,13 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use h2::{Reason, RecvStream, SendStream, client};
-use http_wire::{HeaderMap, HeaderName, HeaderValue, Version};
+use http_wire::{HeaderMap, Version};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{Conn, FetchTiming, Headers, PoolKey, Request, ResponseParts};
 
-const HEADER_BYTES: u32 = 256 * 1024;
-const HEADER_FIELDS: usize = 256;
+use super::wire::HEADER_BYTES;
 const STREAM_WINDOW: u32 = 1024 * 1024;
 const CONNECTION_WINDOW: u32 = 8 * 1024 * 1024;
 const UPLOAD_CHUNK: usize = 64 * 1024;
@@ -223,6 +222,28 @@ pub(super) fn prune_idle() {
     }
 }
 
+/// Also used for a peer's HTTP/3 H3_VERSION_FALLBACK signal (RFC 9114 §8.1).
+pub(super) async fn require_http1(key: &PoolKey) {
+    let origin = POOL.lock().unwrap().origin(key, Instant::now());
+    origin.http1_required.store(true, Ordering::Release);
+    *origin.session.lock().await = None;
+}
+
+#[cfg(test)]
+pub(super) fn install_test_connector(request: &Request, connector: tokio_rustls::TlsConnector) {
+    let origin = Arc::new(Origin {
+        connector,
+        http1_required: AtomicBool::new(false),
+        session: AsyncMutex::new(None),
+    });
+    let mut pool = POOL.lock().unwrap();
+    pool.live.insert(
+        PoolKey::for_request(request).unwrap(),
+        Arc::downgrade(&origin),
+    );
+    pool.recent.push_back((Instant::now(), origin));
+}
+
 // Also runs when the owning runtime cancels the driver during shutdown.
 struct DriverClosed(Arc<AtomicBool>);
 impl Drop for DriverClosed {
@@ -389,6 +410,15 @@ impl From<String> for Error {
         }
     }
 }
+impl From<super::wire::Error> for Error {
+    fn from(error: super::wire::Error) -> Self {
+        if error.malformed {
+            error.message.into()
+        } else {
+            Self::limit(&error.message)
+        }
+    }
+}
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.message.fmt(f)
@@ -400,39 +430,7 @@ fn wire_request(
     origin: Option<&str>,
     download: bool,
 ) -> Result<http_wire::Request<()>, Error> {
-    // Strip fragment and userinfo without decoding/re-encoding the path.
-    // h2 derives :method/:scheme/:authority/:path from this HTTP/2 request.
-    let url = &request.url;
-    let uri = format!(
-        "{}://{}{}",
-        url.scheme(),
-        &url[url::Position::BeforeHost..url::Position::AfterPort],
-        &url[url::Position::BeforePath..url::Position::AfterQuery]
-    );
-    let mut wire = http_wire::Request::builder()
-        .method(request.method.as_str())
-        .uri(uri)
-        .version(Version::HTTP_2)
-        .body(())
-        .map_err(|error| Error::from(format!("invalid HTTP/2 request: {error}")))?;
-    for (name, value) in super::request_headers(request, origin) {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| Error::from("invalid HTTP request header name".to_string()))?;
-        let value = if download && name == "accept-encoding" {
-            "identity"
-        } else {
-            value.trim_matches([' ', '\t'])
-        };
-        let mut value = HeaderValue::from_str(value)
-            .map_err(|_| Error::from("invalid HTTP request header value".to_string()))?;
-        // RFC 7541 §7.1.3: sensitive values never enter the HPACK table.
-        value.set_sensitive(matches!(
-            name.as_str(),
-            "cookie" | "authorization" | "proxy-authorization"
-        ));
-        wire.headers_mut().append(name, value);
-    }
-    Ok(wire)
+    super::wire::request(request, origin, download, Version::HTTP_2).map_err(Into::into)
 }
 
 /// Dropping a fetch future (navigation, AbortController, timeout) must reset
@@ -493,48 +491,7 @@ async fn start(
 }
 
 fn response_headers(fields: &HeaderMap) -> Result<(Headers, Vec<String>), Error> {
-    if fields.len() > HEADER_FIELDS {
-        return Err(Error::limit("too many HTTP/2 response headers"));
-    }
-    let mut headers = Headers::new();
-    let mut cookies = Vec::new();
-    let mut bytes = 0usize;
-    for (name, value) in fields {
-        let name = name.as_str();
-        let raw = value.as_bytes();
-        // h2 checks pseudo-headers and frame ordering; enforce field-value
-        // constraints and connection-specific fields at the HTTP boundary.
-        if matches!(
-            name,
-            "connection"
-                | "proxy-connection"
-                | "keep-alive"
-                | "transfer-encoding"
-                | "upgrade"
-                | "te"
-        ) || raw.first().is_some_and(|b| matches!(b, b' ' | b'\t'))
-            || raw.last().is_some_and(|b| matches!(b, b' ' | b'\t'))
-            || raw.iter().any(|b| (*b < 0x20 && *b != b'\t') || *b == 0x7f)
-        {
-            return Err("malformed HTTP/2 response header".to_string().into());
-        }
-        bytes = bytes.saturating_add(name.len() + raw.len() + 32);
-        if bytes > HEADER_BYTES as usize {
-            return Err(Error::limit("HTTP/2 response headers exceed size limit"));
-        }
-        let value = String::from_utf8_lossy(raw);
-        if name == "set-cookie" {
-            cookies.push(value.to_string());
-        }
-        headers
-            .entry(name.to_string())
-            .and_modify(|existing: &mut String| {
-                existing.push_str(", ");
-                existing.push_str(&value);
-            })
-            .or_insert_with(|| value.into_owned());
-    }
-    Ok((headers, cookies))
+    super::wire::response_headers(fields).map_err(Into::into)
 }
 
 async fn response_head(
@@ -797,6 +754,7 @@ pub(super) async fn download(
     for cookie in cookies {
         super::response_cookie(request, &cookie);
     }
+    super::http3::remember(request, status, &headers, timing);
     let no_content = matches!(status, 204 | 205 | 304);
     let incoming =
         Incoming::new(recv, &headers, no_content, limit).inspect_err(|error| reset.fail(error))?;
@@ -812,6 +770,7 @@ pub(super) async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_wire::{HeaderName, HeaderValue};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1686,6 +1645,14 @@ mod tests {
         let mut request = Request::get(url::Url::parse(&url).unwrap());
         super::super::set_navigation_metadata(&mut request, None);
         for _ in 0..2 {
+            // This diagnostic deliberately isolates the TCP transport even
+            // when the preceding response advertises a QUIC alternative.
+            super::super::http3::remember(
+                &request,
+                200,
+                &Headers::from([("alt-svc".into(), "clear".into())]),
+                &FetchTiming::new(),
+            );
             let response = fetch(&request).await.unwrap();
             let timing = response.timing.unwrap();
             eprintln!(

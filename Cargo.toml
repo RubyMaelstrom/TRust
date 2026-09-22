@@ -73,6 +73,12 @@ futures = "0.3.34"
 # HTTP/2 framing, HPACK and stream state; TRust owns connections and all
 # browser policy. This is not a second general-purpose HTTP client.
 h2 = "0.4.15"
+# HTTP/3 framing/QPACK and QUIC transport; browser policy stays in src/http.
+# Our cancellation/size-limiting QUIC adapter needs structured error access;
+# pin the backend API explicitly rather than accepting breaking patch changes.
+h3 = { version = "=0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = "0.0.10"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 http_wire = { package = "http", version = "1.5.0" }
 # WebGL uses Rust validation and bindings to the installed EGL/GLES driver.
 # No ANGLE or bundled native shader compiler is linked into the browser.
@@ -197,6 +203,9 @@ tempfile = "3.27.0"
 wat = "1"
 
 [patch.crates-io]
+# Keep receive streams owned while reads are pending, so STOP_SENDING and
+# stream IDs remain available during cancellation; see PATCHES.md.
+h3-quinn = { path = "vendor/h3-quinn-0.0.10" }
 # HTML enumerated shadowrootmode values match ASCII case-insensitively.
 html5ever = { path = "vendor/html5ever-0.39.0" }
 # Bound eager GLSL macro expansion before intermediate allocations.

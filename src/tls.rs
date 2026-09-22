@@ -255,6 +255,23 @@ pub(crate) fn http_connector() -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
+/// RFC 9001 §§4.2, 4.5, 9.2: TLS 1.3 only, partition-local resumption,
+/// and no replayable 0-RTT application data. QUIC authenticates the URL's
+/// origin, not the hostname in an Alt-Svc advertisement (RFC 7838 §2.1).
+pub(crate) fn http3_config() -> ClientConfig {
+    ensure_provider();
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config =
+        ClientConfig::builder_with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config.enable_early_data = false;
+    config.resumption = tokio_rustls::rustls::client::Resumption::in_memory_sessions(32);
+    config
+}
+
 /// A TLS connector whose TOFU pin is keyed to this `host:port`.
 pub fn connector(host: &str, port: u16) -> TlsConnector {
     let provider = ensure_provider();

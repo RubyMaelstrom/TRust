@@ -80,6 +80,9 @@ The project favors:
   parsing, form extraction, and full/incremental layout entry points.
   `src/http/http2.rs` integrates the Rust `h2` framing/HPACK engine with ALPN,
   multiplexed sessions, bounded streaming, cancellation, and safe retries.
+  `src/http/http3.rs` adds partitioned Alt-Svc discovery and QUIC sessions;
+  `http3_io.rs` bounds encoded metadata and guards stream cancellation.
+  Both multiplexed transports share field semantics in `http/wire.rs`.
 - `src/dom.rs`: html5ever-backed arena DOM, mutations, selectors, CSS parsing,
   cascade, computed values, serialization, and live geometry state.
 - `src/js.rs`: JavaScript/browser contract and engine-neutral
@@ -264,13 +267,22 @@ current behavior and limits; consult the governing standards before changing it.
 
 ### Desktop and web APIs
 
-- HTTPS prefers HTTP/2 via ALPN and retains HTTP/1.1 fallback. Cleartext HTTP
-  and RFC 6455 WebSockets remain HTTP/1.1; HTTP/3, cross-origin connection
-  coalescing, and WebSockets over extended CONNECT are not implemented.
-  HTTP/2 server push is disabled. Networking policy is shared by both HTTP
+- HTTPS learns HTTP/3 endpoints from authenticated Alt-Svc response headers
+  and otherwise prefers HTTP/2 via ALPN, with HTTP/1.1 fallback. QUIC uses
+  TLS 1.3/WebPKI for the original origin, never the alternative hostname.
+  Its 128-entry RAM-only discovery cache is partitioned like connections;
+  blocked UDP incurs one short foreground wait and a failed-path cooldown.
+  Discovery via DNS HTTPS records and HTTP/2 ALTSVC frames is not implemented.
+  Cleartext HTTP and RFC 6455 WebSockets remain HTTP/1.1; cross-origin
+  connection coalescing and WebSockets over extended CONNECT are unimplemented.
+  HTTP/2 and HTTP/3 server push are disabled. HTTP/3 uses stateless QPACK
+  (zero dynamic-table capacity), without 0-RTT or WebTransport/datagrams.
+  Networking policy is shared by all HTTP
   transports; connections are keyed by origin, available top-level schemeful
-  site, credentials, and owning runtime. Canceling HTTP/2 work resets only its
-  stream. Never blindly replay a possibly processed POST after network failure.
+  site, credentials, and owning runtime. Canceling multiplexed work resets
+  only its stream. Never blindly replay a possibly processed POST after
+  network failure. The owned h3-quinn adapter fixes pending-read cancellation
+  without copying receive buffers; keep its focused regression coverage.
 - `--renderer=auto` selects Hybrid only after surface, adapter, device, and
   capability initialization succeed; recoverable later failures fall back to
   Vello CPU. `--renderer=cpu` forces the reference renderer, while

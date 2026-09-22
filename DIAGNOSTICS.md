@@ -119,9 +119,11 @@ Trace a normal Lumen page load and its network requests:
 TRUST_NET_TRACE=1 TRUST_LUMEN_TRACE=1 target/release/trust https://example.test/
 ```
 
-Network trace lines include `protocol=h2` / `http/1.1` and `reused=true/false`.
-HTTPS negotiates HTTP/2 automatically through ALPN; no User-Agent changes or
-site-specific transport rules are involved. HTTP/1.1-only and no-ALPN servers
+Network trace lines include `protocol=h3` / `h2` / `http/1.1` and
+`reused=true/false`. HTTPS discovers HTTP/3 through authenticated `Alt-Svc`
+response headers and otherwise negotiates HTTP/2 through ALPN; no User-Agent
+changes or site-specific transport rules are involved. An initial HTTP/2
+response can advertise QUIC for later requests. HTTP/1.1-only and no-ALPN servers
 retain the existing transport, and WebSocket Upgrade uses a separate
 HTTP/1.1-only connector.
 
@@ -134,7 +136,8 @@ TRUST_NET_DIAG=https://civitai.red/ \
 
 This makes two GETs through the real browser networking layer, reports status,
 negotiated protocol, connection reuse, body size and challenge presence, and
-expects HTTP/2 200 responses without challenge headers. It is a live acceptance
+expects HTTP/2 200 responses without challenge headers (this diagnostic clears
+Alt-Svc between requests to isolate TCP). It is a live acceptance
 check, not a stable offline test or a guarantee that every protected site works.
 The ordinary `cargo test --lib http2` suite uses local TLS servers for ALPN
 fallback, multiplexing, flow control, uploads, disk streaming, cancellation,
@@ -144,6 +147,38 @@ uploads stage at most 64 KiB at a time. Header blocks are bounded to 256 KiB
 and 256 fields, with at most 128 interim responses per request. Page-body and
 download limits remain separate. At most 32 recently used origin entries are
 retained for reuse; active streams keep their own session alive when evicted.
+
+Check HTTP/3 discovery and actual QUIC responses:
+
+```sh
+TRUST_NET_DIAG=https://civitai.red/ \
+  cargo test --release --lib http3_live_transport_probe -- --ignored --nocapture
+```
+
+This makes three GETs and requires at least one actual HTTP/3 response. It
+reports status/challenge presence without requiring a challenge-free response:
+HTTP/3 support does not itself guarantee acceptance by a challenge service.
+Failure can also indicate missing Alt-Svc or blocked UDP. Normal browser
+requests fall back to TCP; they do not require HTTP/3 to succeed. The first
+QUIC probe waits at most 250 ms in the foreground and runs at most three
+seconds in the background. Concurrent requests use TCP until QUIC is ready;
+failed alternatives cool down for 60 seconds. Only handshakes race, not HTTP
+requests; at most 16 speculative handshakes run at once. With `TRUST_NET_TRACE`,
+`h3-ready` and `h3-unavailable` lines report setup outcomes using origin hosts
+and ports, without cookie values or URL paths/queries. Possibly processed
+non-idempotent requests are never blindly retried.
+
+`cargo test --lib http3` exercises local TLS/QUIC endpoints, including origin
+authentication at a different advertised host/port, multiplexing, uploads,
+early responses, stream-local cancellation, downloads, cookies, compression,
+malformed messages, encoded-header bounds, 421, and fallback. Receive credits
+are 1 MiB per stream / 8 MiB per connection; uploads stage 64 KiB. Metadata
+is limited to 256 KiB decoded / 512 KiB encoded and 256 fields. QPACK uses
+static entries/literals and advertises zero dynamic-table capacity. No 0-RTT,
+server push, extended CONNECT, or QUIC datagrams are enabled. Unused sessions
+close after 30 seconds; 128 origin/partition advertisements are retained only
+in memory, for at most seven days or their shorter advertised freshness.
+DNS HTTPS records and HTTP/2 ALTSVC-frame discovery are not implemented.
 
 Trace terminal redraws, page events, layout, and image work:
 

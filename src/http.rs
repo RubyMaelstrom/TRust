@@ -1,12 +1,13 @@
-//! Shared HTTP/1.1 and HTTP/2 client and browser networking policy.
+//! Shared HTTP/1.1, HTTP/2 and HTTP/3 client and browser networking policy.
 //!
 //! Persistent connections (a RAM-only keep-alive pool — measured
 //! 2026-06-12: serial fresh-TLS-per-request was 85% of a page load),
 //! HTTP/1.1 responses delimited precisely (Content-Length / chunked / EOF),
 //! bounded gzip/deflate content decoding, and redirects followed here.
-//! HTTPS negotiates HTTP/2 through ALPN, with HTTP/1.1 fallback. `http2`
-//! owns multiplexed sessions; cookies, Fetch policy and response handling stay
-//! here, shared by all frontends and both wire protocols.
+//! HTTPS discovers HTTP/3 through Alt-Svc and negotiates HTTP/2 through ALPN,
+//! with HTTP/1.1 fallback. `http2` and `http3` own multiplexed sessions;
+//! cookies, Fetch policy and response handling stay here, shared by all
+//! frontends and wire protocols.
 //! HTTPS uses standard WebPKI validation (`tls::webpki_connector`),
 //! not TOFU. HTML renders through our own arena DOM (`dom.rs`) laid out
 //! into positioned rows by `layout2`; forms are extracted from that same
@@ -26,7 +27,11 @@ use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
 pub use crate::performance::{FetchTiming, NavigationType};
 use crate::tls;
 
+mod alt_svc;
 pub(crate) mod http2;
+pub(crate) mod http3;
+mod http3_io;
+mod wire;
 
 // Per-response memory guard, shared by HTTP framing and content decoding.
 // Fetch/XHR bodies include binary application assets (archives, disk images,
@@ -2307,6 +2312,7 @@ pub(crate) fn prune_idle_connections() {
         pool.prune(Instant::now());
     }
     http2::prune_idle();
+    http3::prune_idle();
 }
 
 fn pool_get(key: &PoolKey) -> Option<BufReader<Conn>> {
@@ -3715,9 +3721,10 @@ async fn dial_with_connector(
 pub(crate) enum DownloadConnection {
     Http1(BufReader<Conn>),
     Http2(http2::DownloadResponse),
+    Http3(http3::DownloadResponse),
 }
 
-/// Downloads share HTTP/2 sessions with page requests, applying disk
+/// Downloads share HTTP/2 and HTTP/3 sessions with page requests, applying disk
 /// backpressure to their own stream. The HTTP/1.1 path stays unpooled.
 pub(crate) async fn download_connection(
     request: &Request,
@@ -3725,6 +3732,24 @@ pub(crate) async fn download_connection(
 ) -> Result<DownloadConnection, String> {
     let key = PoolKey::for_request(request)?;
     let mut timing = FetchTiming::new();
+    if let Some(lease) = http3::acquire(&key, &mut timing).await {
+        match http3::download(&lease, request, limit, &mut timing).await {
+            Ok(response) if response.status != 421 => {
+                return Ok(DownloadConnection::Http3(response));
+            }
+            Ok(_) => lease.misdirected(&key),
+            Err(error) => {
+                lease.failed();
+                if error.requires_http1() {
+                    http2::require_http1(&key).await;
+                }
+                if !error.retry_safe(&request.method) {
+                    return Err(error.to_string());
+                }
+            }
+        }
+        timing = FetchTiming::new();
+    }
     for attempt in 0..2 {
         match http2::acquire(&key, &mut timing).await? {
             http2::Transport::Http1(io) => return Ok(DownloadConnection::Http1(io)),
@@ -3828,6 +3853,33 @@ async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response,
     let host = url.host_str().ok_or("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(80);
     let key = PoolKey::for_request(request)?;
+
+    if let Some(lease) = http3::acquire(&key, &mut timing).await {
+        match http3::exchange(&lease, request, origin, &mut timing).await {
+            Ok(parts) if parts.0 != 421 => return finish_response_parts(request, parts, timing),
+            Ok(parts) => {
+                for cookie in &parts.3 {
+                    response_cookie(request, cookie);
+                }
+                // RFC 7838 §6: remove the alternative, ignore its Alt-Svc,
+                // and retry this replayable request at the origin once.
+                lease.misdirected(&key);
+            }
+            Err(error) => {
+                lease.failed();
+                if error.requires_http1() {
+                    http2::require_http1(&key).await;
+                }
+                if !error.retry_safe(&request.method) {
+                    return Err(error.to_string());
+                }
+            }
+        }
+        let start = timing.start_time;
+        timing = FetchTiming::new();
+        timing.start_time = start;
+        timing.fetch_start = start;
+    }
 
     // Reuse an idle connection for GETs only: a pooled connection can
     // be stale (server closed it while idle), and the silent re-send
@@ -3950,6 +4002,7 @@ fn finish_response_parts(
     (status, headers, body, set_cookies): ResponseParts,
     mut timing: crate::performance::FetchTiming,
 ) -> Result<Response, String> {
+    http3::remember(request, status, &headers, &timing);
     timing.response_status = status;
     timing.content_type = headers.get("content-type").cloned().unwrap_or_default();
     timing.content_encoding = headers.get("content-encoding").cloned().unwrap_or_default();
@@ -4024,8 +4077,8 @@ fn finish_response_parts(
 type Headers = HashMap<String, String>;
 
 /// Protocol-independent browser-owned headers. HTTP/1.1 adds Host and
-/// Connection; HTTP/2 derives pseudo-headers from the URL and never emits
-/// connection-specific fields (RFC 9113 §§8.2.2, 8.3.1).
+/// Connection; HTTP/2 and HTTP/3 derive pseudo-headers from the URL and never
+/// emit connection-specific fields (RFC 9113 §8; RFC 9114 §4).
 fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, String)> {
     let url = &request.url;
     // Headers we manage ourselves — a page-supplied copy is ignored so we
@@ -4035,6 +4088,7 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
     // those names, so a page-authored value overrides our defaults.
     const MANAGED: &[&str] = &[
         "host",
+        "alt-used",
         "user-agent",
         "content-length",
         "connection",
