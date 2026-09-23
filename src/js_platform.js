@@ -11453,7 +11453,11 @@
         }
         values.userAgent=values.userAgent===undefined?'TRust/0.1':values.userAgent;
         // HTML #dom-navigator-appVersion, Gecko compatibility mode. This is
-        // derived metadata, never a change to TRust's actual User-Agent.
+        // derived metadata, never a change to TRust's actual User-Agent. With
+        // TRust's own UA the result is the empty string; under the
+        // TRUST_UA_FIREFOX diagnostic this UA starts with "Mozilla/5.0 (" and
+        // the Gecko-mode branch yields e.g. "5.0 (X11)", as the spec's own
+        // example requires.
         const ua=values.userAgent;
         if(!ua.startsWith('Mozilla/5.0 ('))values.appVersion='';
         else {

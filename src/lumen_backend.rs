@@ -2311,7 +2311,10 @@ mod desktop {
         // HTML NavigatorID: navigator.userAgent exposes the environment settings object's default
         // User-Agent value. Keep that identical to the HTTP client and the
         // selected JS realm; the engine implementation is not a distinct
-        // user agent or an observable browser capability.
+        // user agent or an observable browser capability. Both read it from
+        // `crate::http::user_agent()`, so the `TRUST_UA_FIREFOX` diagnostic
+        // (and any future User-Agent choice) reaches the wire and this realm
+        // as the one value.
         // WHATWG HTML §2.4.3 keeps a Document's URL distinct from its
         // document base URL. A <base href> changes relative-URL resolution
         // and Node.baseURI, but it must not rewrite Location or document.URL.
@@ -2319,8 +2322,9 @@ mod desktop {
         // the route from location.pathname, so seeding the realm with `base`
         // collapses every such navigation to the base path.
         let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: 'TRust/0.1', language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {} }};",
+            "globalThis.__trust_cfg = {{ url: {}, ua: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {} }};",
             json_string(response_url.as_str()),
+            json_string(crate::http::user_agent()),
             json_string(crate::locale::LANGUAGE),
             json_string(crate::locale::LANGUAGES[0]),
             json_string(crate::locale::LANGUAGES[1]),
@@ -9451,11 +9455,12 @@ fn run_lumen_worker(
         "classic"
     };
     let config = format!(
-        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {} }};",
+        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {} }};",
         launch.id,
         serde_json::to_string(&launch.name).unwrap_or_else(|_| String::from("\"\"")),
         serde_json::to_string(worker_type).expect("static worker type serializes"),
         serde_json::to_string(launch.script_url.as_str()).expect("URL serializes"),
+        serde_json::to_string(crate::http::user_agent()).expect("static User-Agent serializes"),
         serde_json::to_string(crate::locale::LANGUAGE).expect("locale serializes"),
         serde_json::to_string(crate::locale::LANGUAGES[0]).expect("locale serializes"),
         serde_json::to_string(crate::locale::LANGUAGES[1]).expect("locale serializes"),
@@ -22294,6 +22299,66 @@ mod tests {
         assert!(!storage.contains_key("cache-storage-names"));
         assert!(!storage.contains_key("cache-storage-data"));
         assert!(!storage.contains_key("indexed-database"));
+    }
+
+    #[test]
+    fn navigator_user_agent_and_appversion_follow_the_environment_value() {
+        // WHATWG HTML §"navigator.userAgent" returns the environment settings
+        // object's default `<code>User-Agent</code>` value verbatim, and §
+        // "navigator.appVersion" derives its Gecko-mode result from that same
+        // value; the spec's own example for a Linux UA is "5.0 (X11)". The
+        // TRUST_UA_FIREFOX diagnostic supplies such a value to the HTTP client
+        // and to every realm, worker included, so the two views cannot drift.
+        for worker in [false, true] {
+            for (ua, app_version) in [
+                (crate::http::USER_AGENT, ""),
+                (crate::http::FIREFOX_USER_AGENT, "5.0 (X11)"),
+            ] {
+                let mut engine = configured_engine_before_prelude(
+                    HostState::new(
+                        Rc::new(RefCell::new(Dom::new())),
+                        Rc::new(RealmClock::new()),
+                    ),
+                    DEFAULT_URL,
+                );
+                engine.set_tier(Tier::Interp);
+                let ua_literal = serde_json::to_string(ua).expect("User-Agent serializes");
+                if worker {
+                    eval(
+                        &mut engine,
+                        &format!(
+                            "globalThis.__worker_cfg = {{ id: 1, name: '', type: 'classic', url: {DEFAULT_URL:?}, ua: {ua_literal}, hwc: 4, globalPrivacyControl: true, secureContext: true }};"
+                        ),
+                        "worker User-Agent",
+                    )
+                    .unwrap();
+                    eval(
+                        &mut engine,
+                        crate::js::worker_prelude(),
+                        "worker environment",
+                    )
+                    .unwrap();
+                } else {
+                    eval(
+                        &mut engine,
+                        &format!("globalThis.__trust_cfg.ua = {ua_literal};"),
+                        "page User-Agent",
+                    )
+                    .unwrap();
+                    eval_platform_prelude(&mut engine).unwrap();
+                }
+                assert_eq!(
+                    string_value(&mut engine, "navigator.userAgent"),
+                    ua,
+                    "worker={worker}: HTML #dom-navigator-userAgent"
+                );
+                assert_eq!(
+                    string_value(&mut engine, "navigator.appVersion"),
+                    app_version,
+                    "worker={worker}: HTML #dom-navigator-appVersion"
+                );
+            }
+        }
     }
 
     #[test]

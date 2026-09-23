@@ -811,7 +811,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
         };
         let mut request = format!(
             "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
-            http::USER_AGENT
+            http::user_agent()
         );
         cookie_request.url = current.clone();
         cookie_request.headers.clear();

@@ -350,7 +350,7 @@
     // GPC §3.2–§3.4: WorkerNavigator exposes the same top-level preference.
     var navigatorGpc = cfg.globalPrivacyControl !== false;
     g.navigator = {
-        userAgent: "TRust/0.1", appName: "Netscape", appCodeName: "Mozilla", product: "Gecko", productSub: "20100101",
+        userAgent: cfg.ua || "TRust/0.1", appName: "Netscape", appCodeName: "Mozilla", product: "Gecko", productSub: "20100101",
         platform: "Linux", vendor: "", vendorSub: "", language: cfg.language || navigatorLanguages[0], languages: navigatorLanguages, onLine: true,
         hardwareConcurrency: cfg.hwc || 8, maxTouchPoints: 0
     };

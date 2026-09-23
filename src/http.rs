@@ -49,6 +49,56 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 10;
 pub(crate) const USER_AGENT: &str = "TRust/0.1";
 
+/// Firefox's current User-Agent string for Linux x86_64, read out of the local
+/// Firefox 153 build (`libxul.so` reports the `Firefox/153.0` product token and
+/// the `X11; Linux x86_64` platform fragment; `application.ini` gives the 153
+/// major version). That is Firefox's *reduced* User-Agent, its default since
+/// Firefox 100 and the shape documented in MDN's Firefox User-Agent reference:
+/// `Mozilla/5.0 (platform; rv:geckoversion) Gecko/geckotrail Firefox/firefoxversion`.
+/// Only used by the `TRUST_UA_FIREFOX` diagnostic below.
+pub(crate) const FIREFOX_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0";
+
+/// The `User-Agent` this instance sends (RFC 9110 §10.1.5) and reports as the
+/// environment settings object's default User-Agent value, which WHATWG HTML
+/// §"navigator.userAgent" exposes to scripts verbatim and §"navigator.appVersion"
+/// derives from. Header and script must therefore agree; a site that compared
+/// them would otherwise see a contradiction.
+///
+/// `TRUST_UA_FIREFOX=1` (also `true`/`yes`/`on`) is a diagnostic override that
+/// reports Firefox's current User-Agent instead of TRust's own. It is read once
+/// per process, so every HTTP/1.1, HTTP/2 and HTTP/3 request, script realm,
+/// worker, WebSocket handshake and download agrees, and it says so on stderr
+/// once. Nothing else changes: TRust still sends its own `Accept`,
+/// `Accept-Language`, Fetch Metadata `Sec-*`, and `Sec-GPC` fields, so this is
+/// a User-Agent swap for A/B-testing a site's UA gate, not a Firefox clone.
+pub(crate) fn user_agent() -> &'static str {
+    static SELECTED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    SELECTED.get_or_init(|| {
+        let requested = std::env::var("TRUST_UA_FIREFOX").ok();
+        if firefox_ua_requested(requested.as_deref()) {
+            eprintln!(
+                "TRUST_UA_FIREFOX: diagnostics report Firefox's User-Agent: {FIREFOX_USER_AGENT}"
+            );
+            FIREFOX_USER_AGENT
+        } else {
+            USER_AGENT
+        }
+    })
+}
+
+/// Parses the `TRUST_UA_FIREFOX` value: only an affirmative spelling enables
+/// the diagnostic, so an unset, empty, or unrecognized value (including a
+/// stray `TRUST_UA_FIREFOX=0`) leaves TRust's own User-Agent in place.
+fn firefox_ua_requested(requested: Option<&str>) -> bool {
+    matches!(
+        requested
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Global Privacy Control is enabled for this user agent. The W3C GPC
 /// specification (§3.1–§3.3) requires the opt-out signal to be expressed on
 /// every HTTP request when enabled, while JavaScript observes the same choice
@@ -4120,7 +4170,7 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
         .filter(|(_, v)| !v.contains(['\r', '\n']))
         .map(|(_, v)| v.as_str());
     let mut headers = vec![
-        ("User-Agent".into(), USER_AGENT.into()),
+        ("User-Agent".into(), user_agent().into()),
         (
             "Accept".into(),
             page_accept
@@ -16543,6 +16593,63 @@ customElements.define('lit-counter', LitCounter);
         );
         assert_eq!(head.matches("Accept-Language:").count(), 1);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn firefox_user_agent_diagnostic_is_opt_in() {
+        // The `TRUST_UA_FIREFOX` diagnostic selects Firefox's User-Agent only
+        // for an affirmative value; unset, empty, `0`, `false` or a
+        // hand-written UA string all keep TRust's own User-Agent in place.
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("Mozilla/5.0 (X11)"),
+        ] {
+            assert!(!firefox_ua_requested(value), "{value:?} must not enable it");
+        }
+        for value in [Some("1"), Some(" true "), Some("Yes"), Some("on")] {
+            assert!(firefox_ua_requested(value), "{value:?} enables it");
+        }
+        // The replacement is Firefox's reduced User-Agent, its default shape
+        // since Firefox 100 and the one MDN's Firefox User-Agent reference
+        // documents: platform, `rv:`, Gecko trail, then `Firefox/<major>.
+        assert!(
+            FIREFOX_USER_AGENT.starts_with("Mozilla/5.0 (X11; Linux x86_64; rv:")
+                && FIREFOX_USER_AGENT.ends_with("Gecko/20100101 Firefox/153.0"),
+            "{FIREFOX_USER_AGENT}"
+        );
+        // And the one cached selection is what the whole instance reports.
+        assert_eq!(
+            user_agent(),
+            if firefox_ua_requested(std::env::var("TRUST_UA_FIREFOX").ok().as_deref()) {
+                FIREFOX_USER_AGENT
+            } else {
+                USER_AGENT
+            }
+        );
+    }
+
+    #[test]
+    fn one_user_agent_header_describes_both_wire_and_scripts() {
+        // RFC 9110 §10.1.5 lets exactly one `User-Agent` describe the client,
+        // and WHATWG HTML §"navigator.userAgent" must expose that same
+        // environment-settings default value to scripts. A page cannot pick
+        // either: `user-agent` is a managed header it may not set.
+        let mut request = Request::get(parse_url("https://example.com/").unwrap());
+        request
+            .headers
+            .push(("User-Agent".into(), "Spiteful/1.0".into()));
+        let headers = request_headers(&request, None);
+        let reported: Vec<&String> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(reported.len(), 1, "exactly one User-Agent: {headers:?}");
+        assert_eq!(reported[0], user_agent());
+        assert!(!reported[0].contains("Spiteful"));
     }
 
     #[tokio::test]
