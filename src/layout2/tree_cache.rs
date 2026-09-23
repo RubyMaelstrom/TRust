@@ -138,7 +138,7 @@ fn boxes_bytes(boxes: &[super::tree::SharedBox], capacity: usize) -> usize {
         + boxes.iter().map(|b| box_bytes(b)).sum::<usize>()
 }
 
-fn box_bytes(b: &BoxNode) -> usize {
+pub(super) fn box_bytes(b: &BoxNode) -> usize {
     size_of::<BoxNode>()
         + 2 * size_of::<usize>()
         + super::memo::box_style_bytes(&b.style)

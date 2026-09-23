@@ -693,6 +693,8 @@ TRUST_BROWSER_GATE=https://example.test/ \
 | `TRUST_BROWSER_GATE_FIXTURE` | absolute HTML file path | Replays a captured main response at the requested URL when navigation is rate-limited; referenced subresources still use the requested origin. |
 | `TRUST_BROWSER_GATE_TYPE` | text | Types into a named live text control before the optional click and requires the text to appear in the DOM. |
 | `TRUST_BROWSER_GATE_TYPE_INTO` | accessible-name substring | Selects the text control for `TRUST_BROWSER_GATE_TYPE`. |
+| `TRUST_BROWSER_GATE_DESKTOP` | presence flag | Uses the desktop actor presentation path, omitting terminal adaptation. |
+| `TRUST_BROWSER_GATE_KEY_TIMING` | presence flag | Waits for each typed key acknowledgement and reports its latency and intervening render updates; pair with `TRUST_BROWSER_GATE_DESKTOP` for desktop input diagnosis. |
 | `TRUST_BROWSER_GATE_CLICK` | accessible-name substring | Activates the first exposed activatable control whose accessible name contains this text. |
 | `TRUST_BROWSER_GATE_CLICK_SECONDS` | integer seconds | Deadline after the named click. Default: `20`. |
 | `TRUST_BROWSER_GATE_EXPECT_HTML_CONTAINS` | HTML substring | Required final HTML milestone; for interactive pages it is also the default initial milestone. |
@@ -760,6 +762,13 @@ subtest's PASS/FAIL/TIMEOUT/NOTRUN status. It accepts `TRUST_NET_DIAG`,
 | `TRUST_DESKTOP_TRACE` | presence flag | Prints desktop frame-stage timings, including the live presentation path. |
 | `TRUST_DESKTOP_BENCH` | presence flag | Enables the ignored `desktop_pipeline_bench`; without it the test exits with a usage message. |
 | `TRUST_DESKTOP_BENCH_ITERATIONS` | positive integer | Number of iterations per desktop fixture. Default: `5`; values are clamped to at least `1`. |
+| `TRUST_LAYOUT_PROFILE` | presence flag | Reports layout operation counts and exclusive time per transaction. Includes cache copying/storage, actual box calculations, intrinsic sizing, inline layout, translations and positioning. Clock reads add overhead; use for attribution, then disable for latency measurements. |
+| `TRUST_SELECTOR_PROFILE_FILE` | HTML file path | Optional input for the ignored `selector_workload_profile` test. Without it, uses a general 2,000-rule/220-section workload. Compares subject indexing, ancestor rejection, and bounded matching reuse; reports candidates and median times, asserts identical results, and lists costly universal rules. |
+| `TRUST_SELECTOR_PROFILE_DEEP` | presence flag | Uses 2,000 rules sharing a required ancestor across 100 levels. Ignored when `TRUST_SELECTOR_PROFILE_FILE` is set. Measures repeated ancestor searches that survive rejection. |
+| `TRUST_LAYOUT_BENCH_ITERATIONS` | positive integer | Samples per warm/edit/resize/resource phase of `layout_engine_workload_matrix`. Default: `7`. Cold layout is one sample after process font initialization. |
+| `TRUST_LAYOUT_BENCH_BOXES` | integer | Repeated sibling count in the engine matrix. Default: `220`. Nested cases use depths 4, 8 and 12. |
+| `TRUST_LAYOUT_BENCH_FILTER` | text | Runs only matrix cases whose name contains this text. Default: all cases. |
+| `TRUST_LAYOUT_BENCH_PROFILE` | presence flag | Adds operation accounting to the engine matrix and prints named `ENGINE_OPS` fields. This also adds measurement overhead to its wall times. |
 | `TRUST_LAYOUT2_BENCH` | — | Appears in the `p8_layout_bench` source example but is not read by the test. The Cargo test selector is the actual switch. |
 
 Run the fixture benchmarks with:
@@ -769,7 +778,28 @@ TRUST_DESKTOP_BENCH=1 TRUST_DESKTOP_BENCH_ITERATIONS=5 \
   cargo test --release desktop_pipeline_bench -- --ignored --nocapture
 
 cargo test --release p8_layout_bench -- --ignored --nocapture
+
+cargo test --release --lib layout_engine_workload_matrix -- --ignored --nocapture
+TRUST_LAYOUT_BENCH_PROFILE=1 TRUST_LAYOUT_BENCH_FILTER=nested-grid \
+  cargo test --release --lib layout_engine_workload_matrix -- --ignored --nocapture
+
+cargo test --release --lib selector_workload_profile -- --ignored --nocapture
+TRUST_SELECTOR_PROFILE_DEEP=1 \
+  cargo test --release --lib selector_workload_profile -- --ignored --nocapture
 ```
+
+The engine matrix isolates style/box construction, flow, and retained CSSOM
+geometry from JavaScript and rasterization. It covers block/inline flow,
+flex/grid, tables, floats, positioned descendants, container queries, shadow
+slots, images, vertical text and line clamping. Compare both cold and changing
+inputs; an unchanged-page result alone does not measure editing performance.
+Run timing samples without competing builds. Ordinary tests enforce bounded
+work growth and compare cached geometry, graphical paint/hit testing, and
+terminal rows with a fresh layout; they do not enforce machine-dependent
+wall-time thresholds.
+
+See [Layout performance and reuse](docs/layout-performance.md) for the reuse
+contracts, measurements, standards references, and remaining limits.
 
 ## Terminal-capture diagnostics
 

@@ -27,12 +27,12 @@ use super::flow::{Frag, FragKind, TopFrag};
 /// composed ancestor unions nor unrelated scrolling areas. Multiple boxes,
 /// inline content, and table cells keep the complete measurement path.
 pub(super) fn single_border_box(
-    root: &Frag<'_>,
-    fixed: &[Frag<'_>],
-    top_layer: &[TopFrag<'_>],
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
     node: NodeId,
 ) -> Option<PxRect> {
-    fn visit(frag: &Frag<'_>, node: NodeId, found: &mut Option<PxRect>) -> Option<()> {
+    fn visit(frag: &Frag, node: NodeId, found: &mut Option<PxRect>) -> Option<()> {
         if frag.node == node && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_)) {
             if found.is_some() || !matches!(frag.kind, FragKind::Block) {
                 return None;
@@ -107,7 +107,7 @@ struct Own {
 }
 
 /// Walk a fragment tree, attributing border boxes and inline piece boxes.
-fn walk(dom: &Dom, f: &Frag<'_>, o: &mut Own) {
+fn walk(dom: &Dom, f: &Frag, o: &mut Own) {
     if f.node != NO_NODE {
         o.nodes.insert(f.node);
         if matches!(f.kind, FragKind::Block | FragKind::TableCell(_)) {
@@ -245,9 +245,9 @@ fn select_into(
 #[allow(clippy::type_complexity)]
 pub(super) fn boxes(
     dom: &Dom,
-    root: &Frag<'_>,
-    fixed: &[Frag<'_>],
-    top_layer: &[TopFrag<'_>],
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
 ) -> (
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, PxRect>,

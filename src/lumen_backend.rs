@@ -3222,11 +3222,12 @@ mod desktop {
         if let Some((url, replace)) = take_navigation(page) {
             return send_navigation(events, url, replace);
         }
+        let mut editable_handled = false;
         if !released && !prevented && !input.composing && edit_key.is_none() {
             // Input Events 2 §6: after keydown/keypress and their checkpoint,
             // the native default edits a focused contenteditable host. Text
             // controls use formInsertText below after the same checkpoint.
-            let handled = call_trust(
+            editable_handled = call_trust(
                 page,
                 "editableKeyDefault",
                 &[
@@ -3240,7 +3241,7 @@ mod desktop {
                 "editable key default",
             )
             .is_some_and(|value| page.engine.ctx().to_boolean(&value));
-            if handled {
+            if editable_handled {
                 prevented = true;
                 checkpoint(page, "editable key default");
             }
@@ -3259,7 +3260,11 @@ mod desktop {
             checkpoint(page, "text key default");
         }
         let click_submit = take_click_submit(page);
-        let finished = if edit_key.is_some() {
+        // HTML #event-loop-processing-model / Input Events 2 §6: actor-owned
+        // edits need their input checkpoint, but no frontend editing default
+        // needs a fresh painted snapshot. Present these at the ordinary render
+        // opportunity. Other native form keys retain their presentation barrier.
+        let finished = if edit_key.is_some() || editable_handled {
             finish_internal_task(page, events)
         } else {
             finish_task_with_ack(page, events, click_submit.is_none())
@@ -4895,6 +4900,67 @@ mod desktop {
             })
             .await
             .expect("deferred input collection did not complete");
+        }
+
+        #[tokio::test]
+        async fn typing_contenteditable_preserves_checkpoints_without_per_key_paint() {
+            let html = r#"<div id=editor contenteditable><b>start</b></div><output id=result></output><script>
+                const editor=document.getElementById('editor'); editor.focus();
+                getSelection().collapse(editor.firstChild.firstChild,5);
+                let inputs=0, jobs=0;
+                editor.onkeydown=()=>{if(jobs!==inputs)throw Error('missing previous input checkpoint')};
+                editor.onbeforeinput=e=>{if(e.data==='x')e.preventDefault()};
+                editor.oninput=()=>{inputs++;queueMicrotask(()=>{
+                    jobs++;
+                    if(jobs===7)document.getElementById('result').textContent='TYPING_COMPLETE';
+                })};
+                </script>"#;
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.terminal_presentation = false;
+            let (handle, mut events) = spawn_page(html.into(), env);
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                for key in ['a', 'b', 'x', 'c', 'd', 'e', 'f', 'g'] {
+                    handle
+                        .try_send_user(PageCmd::Key {
+                            node: None,
+                            input: crate::core::KeyInput {
+                                key: crate::core::Key::Character(key.to_string()),
+                                code: String::new(),
+                                location: 0,
+                                state: crate::core::KeyState::Pressed,
+                                modifiers: Default::default(),
+                                repeat: false,
+                                composing: false,
+                            },
+                        })
+                        .unwrap();
+                }
+                let (mut keys, mut renders, mut complete) = (0, 0, false);
+                while keys < 8 || !complete {
+                    match events.recv().await {
+                        Some(PageEvt::KeyDefault { prevented }) => {
+                            assert!(prevented);
+                            keys += 1;
+                        }
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            renders += 1;
+                            if html.contains("<b>startabcdefg</b>")
+                                && html.contains(">TYPING_COMPLETE</output>")
+                            {
+                                complete = true;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed during typing"),
+                    }
+                }
+                assert!(renders < 8, "each character forced a separate paint");
+            })
+            .await
+            .expect("contenteditable burst timed out");
         }
 
         #[tokio::test]
@@ -11632,6 +11698,27 @@ fn host_css_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::from_string(crate::dom::parse_cssom_json(&css)))
 }
 
+/// CSSOM #dom-window-getcomputedstyle / CSS Conditional 5 #container-lengths:
+/// the first observed registered container length may occur on a hidden node,
+/// after an earlier geometry transaction had no reason to collect containers.
+/// Discover that dependency, settle it, and expose the computed value.
+fn read_layout_dependent_style<R>(ctx: &mut Ctx, read: impl Fn(&crate::dom::Dom) -> R) -> R {
+    let dom = host_dom(ctx);
+    if dom.borrow().style_depends_on_layout() {
+        let _ = ensure_host_geom_cache(ctx, "computed-container-query");
+    }
+    let had_units = dom.borrow().has_container_unit_dependencies();
+    let value = read(&dom.borrow());
+    if !had_units && dom.borrow().has_container_unit_dependencies() {
+        if let Some(state) = ctx.host_mut::<HostState>() {
+            state.geom_cache.borrow_mut().epoch = u64::MAX;
+        }
+        let _ = ensure_host_geom_cache(ctx, "computed-container-units");
+        return read(&dom.borrow());
+    }
+    value
+}
+
 fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let op = host_arg_string(ctx, args, 0);
     let text = host_arg_string(ctx, args, 1);
@@ -11652,37 +11739,33 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         return Ok(Value::from_string("null".into()));
     }
     if matches!(op.as_str(), "computed-names" | "computed-pseudo") {
-        if host_dom(ctx).borrow().has_container_queries() {
-            let _ = ensure_host_geom_cache(ctx, "computed-container-query");
-        }
-        let value = if let Ok((id, pseudo)) = serde_json::from_str::<(usize, Option<String>)>(&text)
-        {
-            let dom = host_dom(ctx);
-            let dom = dom.borrow();
-            let which = match pseudo.as_deref() {
-                Some(":before" | "::before") => Some(crate::dom::PseudoEl::Before),
-                Some(":after" | "::after") => Some(crate::dom::PseudoEl::After),
-                _ => None,
-            };
-            if id >= dom.node_count()
-                || !dom.is_connected(id)
-                || pseudo.is_some() && which.is_none()
-            {
-                if op == "computed-names" {
-                    serde_json::json!([])
+        let value = read_layout_dependent_style(ctx, |dom| {
+            if let Ok((id, pseudo)) = serde_json::from_str::<(usize, Option<String>)>(&text) {
+                let which = match pseudo.as_deref() {
+                    Some(":before" | "::before") => Some(crate::dom::PseudoEl::Before),
+                    Some(":after" | "::after") => Some(crate::dom::PseudoEl::After),
+                    _ => None,
+                };
+                if id >= dom.node_count()
+                    || !dom.is_connected(id)
+                    || pseudo.is_some() && which.is_none()
+                {
+                    if op == "computed-names" {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::Value::Null
+                    }
+                } else if op == "computed-names" {
+                    serde_json::json!(dom.cssom_computed_names(id, which))
                 } else {
-                    serde_json::Value::Null
+                    serde_json::json!(
+                        which.and_then(|which| dom.pseudo_layout_value(id, which, &extra))
+                    )
                 }
-            } else if op == "computed-names" {
-                serde_json::json!(dom.cssom_computed_names(id, which))
             } else {
-                serde_json::json!(
-                    which.and_then(|which| dom.pseudo_layout_value(id, which, &extra))
-                )
+                serde_json::Value::Null
             }
-        } else {
-            serde_json::Value::Null
-        };
+        });
         return Ok(Value::from_string(value.to_string()));
     }
     if op == "register-property" {
@@ -12176,12 +12259,6 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
             return Ok(Value::Null);
         }
     }
-    // CSS Conditional 5 §5.4: query results participate in the same style
-    // change event. Even a non-geometric getter (color/display) can depend
-    // on an ancestor's newly changed size, so flush layout before exposing it.
-    if host_dom(ctx).borrow().has_container_queries() {
-        let _ = ensure_host_geom_cache(ctx, "computed-container-query");
-    }
     if (name == "width" || name == "height")
         && let Some(value) = host_resolved_box_size(ctx, args, name == "width")
     {
@@ -12192,25 +12269,19 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     {
         return Ok(Value::from_string(value));
     }
-    let dom = host_dom(ctx);
-    let dom = dom.borrow();
-    Ok(
-        match host_arg_node(&dom, args, 0).and_then(|id| dom.cssom_resolved_value(id, &name)) {
+    Ok(read_layout_dependent_style(
+        ctx,
+        |dom| match host_arg_node(dom, args, 0).and_then(|id| dom.cssom_resolved_value(id, &name)) {
             Some(value) => Value::from_string(value),
             None => Value::Null,
         },
-    )
+    ))
 }
 
 fn host_offset_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if host_dom(ctx).borrow().has_container_queries() {
-        let _ = ensure_host_geom_cache(ctx, "offset-container-query");
-    }
-    let dom = host_dom(ctx);
-    let dom = dom.borrow();
-    Ok(Value::Num(
-        host_arg_node(&dom, args, 0).map_or(0.0, |id| f64::from(dom.cssom_offset_style(id))),
-    ))
+    Ok(Value::Num(read_layout_dependent_style(ctx, |dom| {
+        host_arg_node(dom, args, 0).map_or(0.0, |id| f64::from(dom.cssom_offset_style(id)))
+    })))
 }
 
 /// CSSOM View §4.1: parse and evaluate the media query list against the document environment.
@@ -22183,6 +22254,28 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "resolvedSizeResult"),
             "640px|100px|124|20px|44|100px|100|40px|40|200px|75px|50%"
+        );
+    }
+
+    #[test]
+    fn computed_container_units_discovered_after_geometry_remain_live() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            body.innerHTML='<style>@property --size{syntax:"<length>";inherits:true;initial-value:0px}#box{container-type:inline-size;width:200px}#hidden{display:none;--size:10cqw}</style><div id=box><span id=hidden></span></div>';
+            const box=document.getElementById('box'), hidden=document.getElementById('hidden');
+            box.getBoundingClientRect();
+            const style=getComputedStyle(hidden), result=[style.getPropertyValue('--size')];
+            box.style.width='350px'; result.push(style.getPropertyValue('--size'));
+            box.style.width='120px'; result.push(style.getPropertyValue('--size'));
+            result.join('|')
+        "#
+            ),
+            "20px|35px|12px"
         );
     }
 

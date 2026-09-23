@@ -48,7 +48,7 @@ pub(crate) struct FloatEnv<'f> {
 /// the box inherits (inheritance follows the DOM tree, not the containing
 /// block: an abspos box inside an `<a>` keeps the link).
 pub(crate) struct OofMark<'t> {
-    pub b: &'t BoxNode,
+    pub b: &'t super::tree::SharedBox,
     pub line: usize,
     pub x_px: f32,
     pub ctx: InlineStyle,

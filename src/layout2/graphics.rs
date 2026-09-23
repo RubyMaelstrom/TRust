@@ -41,7 +41,7 @@ enum PaintStyle {
 }
 
 impl PaintStyle {
-    fn of(fragment: &Frag<'_>) -> Option<Self> {
+    fn of(fragment: &Frag) -> Option<Self> {
         fragment
             .paint
             .pseudo
@@ -72,7 +72,7 @@ struct ClipAncestry {
     top_layer: bool,
 }
 
-struct Builder<'a, 't> {
+struct Builder<'a> {
     dom: &'a Dom,
     /// CSS Backgrounds 3 #body-background: canvas propagation is constant
     /// during this immutable paint transaction. Recompute for each paint so
@@ -81,7 +81,7 @@ struct Builder<'a, 't> {
     canvas_background_source: Option<NodeId>,
     base: &'a Url,
     images: &'a ImageSizes,
-    fixed: &'a [Frag<'t>],
+    fixed: &'a [Frag],
     viewport_w: f32,
     viewport_h: f32,
     fixed_depth: usize,
@@ -130,7 +130,7 @@ struct Builder<'a, 't> {
     scroll_nodes: Vec<(NodeId, bool)>,
 }
 
-impl<'a, 't> Builder<'a, 't> {
+impl<'a> Builder<'a> {
     // The paint adapter's inputs are distinct borrowed engine products. A
     // parameter object would only move these references without simplifying
     // ownership or call sites.
@@ -139,9 +139,9 @@ impl<'a, 't> Builder<'a, 't> {
         dom: &'a Dom,
         base: &'a Url,
         images: &'a ImageSizes,
-        root: &Frag<'t>,
-        fixed: &'a [Frag<'t>],
-        top_layer: &[TopFrag<'t>],
+        root: &Frag,
+        fixed: &'a [Frag],
+        top_layer: &[TopFrag],
         flow_bottom: f32,
         viewport_w: f32,
         viewport_h: f32,
@@ -366,7 +366,7 @@ impl<'a, 't> Builder<'a, 't> {
         clip
     }
 
-    fn collect_legacy_clips(&mut self, fragment: &Frag<'_>) {
+    fn collect_legacy_clips(&mut self, fragment: &Frag) {
         if fragment.node != NO_NODE
             && matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_))
         {
@@ -584,7 +584,7 @@ impl<'a, 't> Builder<'a, 't> {
         }
     }
 
-    fn collect_scroll_containers(&mut self, fragment: &Frag<'_>, fixed: bool) {
+    fn collect_scroll_containers(&mut self, fragment: &Frag, fixed: bool) {
         let nested_viewport = fragment.node != NO_NODE
             && matches!(self.dom.tag_name(fragment.node), Some("iframe" | "frame"));
         if fragment.node != NO_NODE
@@ -647,7 +647,7 @@ impl<'a, 't> Builder<'a, 't> {
         }
     }
 
-    fn collect_patch_boundaries(&mut self, fragment: &Frag<'_>) {
+    fn collect_patch_boundaries(&mut self, fragment: &Frag) {
         if fragment.node != NO_NODE
             && !self.dom.is_scroll_container(fragment.node)
             && !self.dom.is_hscroll_container(fragment.node)
@@ -672,11 +672,11 @@ impl<'a, 't> Builder<'a, 't> {
         }
     }
 
-    fn collect_sticky(&mut self, fragment: &Frag<'t>) {
+    fn collect_sticky(&mut self, fragment: &Frag) {
         self.collect_sticky_in(fragment, &mut Vec::new());
     }
 
-    fn collect_sticky_in<'f>(&mut self, fragment: &'f Frag<'t>, ancestors: &mut Vec<&'f Frag<'t>>) {
+    fn collect_sticky_in<'f>(&mut self, fragment: &'f Frag, ancestors: &mut Vec<&'f Frag>) {
         if fragment.node != NO_NODE
             && matches!(
                 self.dom
@@ -805,7 +805,7 @@ impl<'a, 't> Builder<'a, 't> {
         ancestors.pop();
     }
 
-    fn collect_marquees(&mut self, fragment: &Frag<'_>) {
+    fn collect_marquees(&mut self, fragment: &Frag) {
         if fragment.node != NO_NODE && self.dom.tag_name(fragment.node) == Some("marquee") {
             let viewport = padding_box(fragment);
             let content = marquee_content_bounds(fragment).unwrap_or(viewport);
@@ -885,7 +885,7 @@ impl<'a, 't> Builder<'a, 't> {
     }
 }
 
-fn marquee_content_bounds(fragment: &Frag<'_>) -> Option<CssRect> {
+fn marquee_content_bounds(fragment: &Frag) -> Option<CssRect> {
     fn union(a: CssRect, b: CssRect) -> CssRect {
         let left = a.x.min(b.x);
         let top = a.y.min(b.y);
@@ -893,7 +893,7 @@ fn marquee_content_bounds(fragment: &Frag<'_>) -> Option<CssRect> {
         let bottom = (a.y + a.height).max(b.y + b.height);
         CssRect::new(left, top, right - left, bottom - top)
     }
-    fn collect(fragment: &Frag<'_>, bounds: &mut Option<CssRect>) {
+    fn collect(fragment: &Frag, bounds: &mut Option<CssRect>) {
         let rect = CssRect::new(
             fragment.x,
             fragment.y,
@@ -913,13 +913,13 @@ fn marquee_content_bounds(fragment: &Frag<'_>) -> Option<CssRect> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn paint<'t>(
+pub(super) fn paint(
     dom: &Dom,
     base: &Url,
     images: &ImageSizes,
-    root: &Frag<'t>,
-    fixed: &'_ [Frag<'t>],
-    top_layer: &[TopFrag<'t>],
+    root: &Frag,
+    fixed: &'_ [Frag],
+    top_layer: &[TopFrag],
     flow_bottom: f32,
     viewport_w: f32,
     viewport_h: f32,
@@ -1024,7 +1024,7 @@ pub(super) fn paint<'t>(
 /// CSS 2.2 Appendix E order for one real stacking context. Opacity and
 /// transforms wrap the context atomically, as required by CSS Color and CSS
 /// Transforms; children never observe a renderer-specific layer object.
-fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
     let boundary_start = builder.commands.len();
     let boundary_line_start = builder.lines.len();
     let boundary = graphical_boundary(fragment, builder);
@@ -1169,10 +1169,7 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
 /// its delta from that value. Percentages on `top` use the fixed-position
 /// containing block (CSS Positioned Layout 3 §3.5), while transform
 /// percentages use the element's own border box (CSS Transforms 1 §9).
-fn paint_animation_scope(
-    fragment: &Frag<'_>,
-    builder: &Builder<'_, '_>,
-) -> Option<CssAnimationScope> {
+fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAnimationScope> {
     if fragment.node == NO_NODE || fragment.paint.pseudo.is_some() {
         return None;
     }
@@ -1315,12 +1312,12 @@ fn animation_transform_translation(
     Some(result)
 }
 
-enum PositionedChild<'f, 't> {
-    Fragment(&'f Frag<'t>),
+enum PositionedChild<'f> {
+    Fragment(&'f Frag),
     Fixed(usize),
 }
 
-fn positioned_z(child: &PositionedChild<'_, '_>, fixed: &[Frag<'_>]) -> i32 {
+fn positioned_z(child: &PositionedChild<'_>, fixed: &[Frag]) -> i32 {
     match child {
         PositionedChild::Fragment(fragment) => fragment.paint.z.unwrap_or(0),
         PositionedChild::Fixed(index) => fixed
@@ -1330,18 +1327,14 @@ fn positioned_z(child: &PositionedChild<'_, '_>, fixed: &[Frag<'_>]) -> i32 {
     }
 }
 
-fn build_positioned(
-    child: PositionedChild<'_, '_>,
-    builder: &mut Builder<'_, '_>,
-    _real_context: bool,
-) {
+fn build_positioned(child: PositionedChild<'_>, builder: &mut Builder<'_>, _real_context: bool) {
     match child {
         PositionedChild::Fragment(fragment) => build_sc(fragment, builder),
         PositionedChild::Fixed(index) => build_fixed(index, builder),
     }
 }
 
-fn build_fixed(index: usize, builder: &mut Builder<'_, '_>) {
+fn build_fixed(index: usize, builder: &mut Builder<'_>) {
     let Some(fragment) = builder.fixed.get(index) else {
         return;
     };
@@ -1365,10 +1358,7 @@ fn build_fixed(index: usize, builder: &mut Builder<'_, '_>) {
 /// interior layout must not affect outside layout. A real stacking context is
 /// atomic for paint; an independent formatting context provides the layout
 /// boundary. Anything less stays on the full-layout fallback.
-fn graphical_boundary(
-    fragment: &Frag<'_>,
-    builder: &Builder<'_, '_>,
-) -> Option<(usize, NodeId, CssRect)> {
+fn graphical_boundary(fragment: &Frag, builder: &Builder<'_>) -> Option<(usize, NodeId, CssRect)> {
     if fragment.node == NO_NODE
         || !fragment.paint.sc
         || !builder
@@ -1395,14 +1385,14 @@ fn graphical_boundary(
     ))
 }
 
-fn build_pseudo(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn build_pseudo(fragment: &Frag, builder: &mut Builder<'_>) {
     paint_fragment(fragment, builder);
     inflow_backgrounds(fragment, builder);
     paint_floats(fragment, builder);
     inflow_content(fragment, builder);
 }
 
-fn inflow_backgrounds(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn inflow_backgrounds(fragment: &Frag, builder: &mut Builder<'_>) {
     for child in &fragment.children {
         if child.paint.sc || child.paint.positioned || child.paint.float {
             continue;
@@ -1414,7 +1404,7 @@ fn inflow_backgrounds(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
 }
 
-fn inflow_content(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn inflow_content(fragment: &Frag, builder: &mut Builder<'_>) {
     for child in &fragment.children {
         if child.paint.sc || child.paint.positioned || child.paint.float {
             continue;
@@ -1426,7 +1416,7 @@ fn inflow_content(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
 }
 
-fn paint_floats(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn paint_floats(fragment: &Frag, builder: &mut Builder<'_>) {
     for child in &fragment.children {
         if child.paint.sc || child.paint.positioned {
             continue;
@@ -1442,12 +1432,12 @@ fn paint_floats(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     }
 }
 
-fn collect_positioned<'a, 'tree>(
-    fragment: &'a Frag<'tree>,
-    fixed: &[Frag<'tree>],
-    negative: &mut Vec<PositionedChild<'a, 'tree>>,
-    zero: &mut Vec<(PositionedChild<'a, 'tree>, bool)>,
-    positive: &mut Vec<PositionedChild<'a, 'tree>>,
+fn collect_positioned<'a>(
+    fragment: &'a Frag,
+    fixed: &[Frag],
+    negative: &mut Vec<PositionedChild<'a>>,
+    zero: &mut Vec<(PositionedChild<'a>, bool)>,
+    positive: &mut Vec<PositionedChild<'a>>,
 ) {
     for child in &fragment.children {
         if let FragKind::Fixed(index) = child.kind {
@@ -1479,7 +1469,7 @@ fn collect_positioned<'a, 'tree>(
     }
 }
 
-fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
     if fragment.flow.hidden {
         return;
     }
@@ -2088,8 +2078,8 @@ fn intersect_css_rects(existing: Option<CssRect>, rect: CssRect) -> Option<CssRe
 /// normal fragment (CSS UI 4 §7.2 / HTML Rendering §15.5). Reuse the
 /// canonical fragment decorators over a temporary geometry-only fragment.
 fn paint_atomic_control_box(
-    builder: &mut Builder<'_, '_>,
-    parent: &Frag<'_>,
+    builder: &mut Builder<'_>,
+    parent: &Frag,
     node: NodeId,
     rect: CssRect,
     link: Option<crate::doc::Link>,
@@ -2164,11 +2154,7 @@ fn paint_atomic_control_box(
 /// border leaves the authored paint in charge. The graphical frontend needs a
 /// real surface for native text/button widgets because terminal brackets are
 /// intentionally emitted only by the terminal adapter.
-fn paint_native_control_surface(
-    fragment: &Frag<'_>,
-    radii: CornerRadii,
-    builder: &mut Builder<'_, '_>,
-) {
+fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>) {
     let node = fragment.node;
     // WHATWG HTML Rendering §15.5.10 defines checkbox/radio inputs as one
     // inline-block containing a *single* native control. Their atomic glyph
@@ -2257,7 +2243,7 @@ fn paint_native_control_surface(
 /// rendering for `type=number`. Keep the affordance in the graphical display
 /// list (the terminal frontend uses its own character-cell adaptation), and
 /// suppress it when CSS UI requests `appearance:none`.
-fn paint_number_spin_buttons(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn paint_number_spin_buttons(fragment: &Frag, builder: &mut Builder<'_>) {
     let node = fragment.node;
     if node == NO_NODE
         || !builder.dom.input_spin_buttons(node)
@@ -2311,7 +2297,7 @@ fn paint_color_is_light(color: PaintColor) -> bool {
 /// outline's exact stacking is intentionally UA-defined; emitting it at the
 /// end of this fragment's paint keeps it visible over the fragment's own text
 /// while preserving the surrounding Appendix E traversal.
-fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn paint_outline(fragment: &Frag, builder: &mut Builder<'_>) {
     if fragment.flow.hidden {
         return;
     }
@@ -2327,7 +2313,7 @@ fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
 }
 
 fn paint_outline_box(
-    builder: &mut Builder<'_, '_>,
+    builder: &mut Builder<'_>,
     source: PaintStyle,
     border_box: CssRect,
     outline: Outline,
@@ -2429,7 +2415,7 @@ fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     None
 }
 
-fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) -> bool {
+fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
     let Some(style) = PaintStyle::of(fragment) else {
         return false;
     };
@@ -2453,7 +2439,7 @@ fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) -> bool {
     }
 }
 
-fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_, '_>) -> Option<Affine2d> {
+fn paint_transform(fragment: &Frag, builder: &Builder<'_>) -> Option<Affine2d> {
     let style = PaintStyle::of(fragment)?;
     let context = (
         Units::of(builder.dom, style.node()),
@@ -2488,9 +2474,9 @@ fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_, '_>) -> Option<Aff
 }
 
 fn paint_background_images(
-    fragment: &Frag<'_>,
+    fragment: &Frag,
     shape: PaintShape,
-    builder: &mut Builder<'_, '_>,
+    builder: &mut Builder<'_>,
     canvas: Option<CssRect>,
 ) {
     if let Some(style) = PaintStyle::of(fragment) {
@@ -2528,7 +2514,7 @@ fn nested_canvas_background_source(dom: &Dom, node: NodeId) -> Option<NodeId> {
     (document_root == root).then_some(source)
 }
 
-fn paint_nested_document_canvas(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+fn paint_nested_document_canvas(fragment: &Frag, builder: &mut Builder<'_>) {
     let Some((_root, style_node)) = frame_canvas_background(builder.dom, fragment.node) else {
         return;
     };
@@ -2607,10 +2593,10 @@ fn canvas_background_node(dom: &Dom, root: NodeId) -> NodeId {
 }
 
 fn paint_background_images_for_style(
-    fragment: &Frag<'_>,
+    fragment: &Frag,
     style: PaintStyle,
     shape: PaintShape,
-    builder: &mut Builder<'_, '_>,
+    builder: &mut Builder<'_>,
     canvas: Option<CssRect>,
     positioning_override: Option<CssRect>,
 ) {
@@ -2810,7 +2796,7 @@ fn paint_background_images_for_style(
 // A glyph mask can extend beyond the background border; ordinary background
 // box shapes are already bounded and need no extra stateful clip commands.
 fn fill_background(
-    builder: &mut Builder<'_, '_>,
+    builder: &mut Builder<'_>,
     shape: PaintShape,
     brush: PaintBrush,
     border: &PaintShape,
@@ -2831,7 +2817,7 @@ fn fill_background(
 /// clipping includes in-flow and floated descendants, independently of text
 /// color. Positioned out-of-flow descendants do not contribute to the mask.
 fn background_layer_shape(
-    fragment: &Frag<'_>,
+    fragment: &Frag,
     dom: &Dom,
     clip: &str,
     border: &PaintShape,
@@ -2842,7 +2828,7 @@ fn background_layer_shape(
         let content = content_box_with_style(dom, fragment, padding);
         return background_clip_shape(background_box(clip, rect, padding, content), border, rect);
     }
-    fn collect(f: &Frag<'_>, dom: &Dom, path: &mut Vec<crate::render::PathElement>) {
+    fn collect(f: &Frag, dom: &Dom, path: &mut Vec<crate::render::PathElement>) {
         if let FragKind::Line(line) = &f.kind {
             for piece in &line.pieces {
                 let node = piece.item.style_node;
@@ -2935,7 +2921,7 @@ fn background_box(value: &str, border: CssRect, padding: CssRect, content: CssRe
     }
 }
 
-fn padding_box_with_style(fragment: &Frag<'_>) -> CssRect {
+fn padding_box_with_style(fragment: &Frag) -> CssRect {
     let [top, right, bottom, left] = fragment.border;
     CssRect::new(
         fragment.x + left,
@@ -2945,7 +2931,7 @@ fn padding_box_with_style(fragment: &Frag<'_>) -> CssRect {
     )
 }
 
-fn content_box_with_style(dom: &Dom, fragment: &Frag<'_>, padding: CssRect) -> CssRect {
+fn content_box_with_style(dom: &Dom, fragment: &Frag, padding: CssRect) -> CssRect {
     let width_basis = padding.width.max(0.0);
     let style = PaintStyle::of(fragment);
     let pad = ["top", "right", "bottom", "left"].map(|side| {
@@ -3060,7 +3046,7 @@ fn background_clip_shape(clip: CssRect, original: &PaintShape, border: CssRect) 
 
 #[allow(clippy::too_many_arguments)]
 fn paint_spaced_background(
-    builder: &mut Builder<'_, '_>,
+    builder: &mut Builder<'_>,
     clip: CssRect,
     node: NodeId,
     handle: ImageHandle,
@@ -3214,7 +3200,7 @@ fn border_shade(color: PaintColor, light: bool) -> PaintColor {
 /// CSS Backgrounds and Borders §6: background first, then border. Uniform
 /// rounded borders use one true stroked rounded path; non-uniform sides retain
 /// each side's own color/style and CSS-pixel width.
-fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<'_, '_>) {
+fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>) {
     let Some(style) = PaintStyle::of(fragment) else {
         return;
     };
@@ -3350,12 +3336,7 @@ fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<
     }
 }
 
-fn paint_box_shadows(
-    dom: &Dom,
-    style: PaintStyle,
-    shape: &PaintShape,
-    builder: &mut Builder<'_, '_>,
-) {
+fn paint_box_shadows(dom: &Dom, style: PaintStyle, shape: &PaintShape, builder: &mut Builder<'_>) {
     let Some(value) = style.value(dom, "box-shadow") else {
         return;
     };
@@ -3449,7 +3430,7 @@ fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
     stroke
 }
 
-fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag<'_>) -> Option<Clip> {
+fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
     if matches!(
         dom.tag_name(fragment.node),
         Some("html" | "body" | "iframe" | "frame")
@@ -3478,7 +3459,7 @@ fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag<'_>) -> Option<Clip> {
     })
 }
 
-fn rounded_overflow_clip(dom: &Dom, fragment: &Frag<'_>) -> Option<PaintShape> {
+fn rounded_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<PaintShape> {
     if matches!(dom.tag_name(fragment.node), Some("html" | "body")) {
         return None;
     }
@@ -4093,12 +4074,7 @@ fn blend_mode(value: &str) -> BlendMode {
 /// overflow-hidden probes do not turn an unbounded display-list clip into a
 /// huge raster path. The viewport compositor still supplies the final screen
 /// clip; this extent only replaces CSS's conceptual unbounded axis.
-fn paint_extent(
-    root: &Frag<'_>,
-    fixed: &[Frag<'_>],
-    top_layer: &[TopFrag<'_>],
-    flow_bottom: f32,
-) -> CssRect {
+fn paint_extent(root: &Frag, fixed: &[Frag], top_layer: &[TopFrag], flow_bottom: f32) -> CssRect {
     let mut bounds = (
         0.0_f32,
         0.0_f32,
@@ -4106,7 +4082,7 @@ fn paint_extent(
         flow_bottom.max(root.max_bottom()).max(1.0),
     );
 
-    fn visit(fragment: &Frag<'_>, bounds: &mut (f32, f32, f32, f32)) {
+    fn visit(fragment: &Frag, bounds: &mut (f32, f32, f32, f32)) {
         let (mut x0, mut y0, mut x1, mut y1) = (
             fragment.x,
             fragment.y,
@@ -4159,7 +4135,7 @@ fn paint_extent(
     )
 }
 
-fn padding_box(fragment: &Frag<'_>) -> CssRect {
+fn padding_box(fragment: &Frag) -> CssRect {
     let [top, right, bottom, left] = fragment.border;
     CssRect::new(
         fragment.x + left,

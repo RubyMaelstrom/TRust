@@ -135,7 +135,7 @@ impl ClipPath {
         })
     }
 
-    pub(super) fn shape_for(&self, fragment: &super::flow::Frag<'_>) -> Option<PaintShape> {
+    pub(super) fn shape_for(&self, fragment: &super::flow::Frag) -> Option<PaintShape> {
         let reference = match self.reference {
             ReferenceBox::Border => CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
             ReferenceBox::Content => fragment.content_box(),

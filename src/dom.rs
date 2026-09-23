@@ -245,6 +245,7 @@ pub struct Dom {
     parsed_sheets: RefCell<sheet_cache::Cache>,
     /// Layout-provided query-container content sizes, in untransformed CSS px.
     container_sizes: RefCell<FxHashMap<NodeId, [f32; 2]>>,
+    container_dependencies: RefCell<container_queries::Dependencies>,
     /// Memoized inherited `computed_value` results, keyed (node, property).
     /// `style_value_epoch` expires broad changes; dependency invalidation
     /// removes local subjects and their inheriting descendants.
@@ -599,6 +600,7 @@ impl Dom {
             style_cache,
             parsed_sheets,
             container_sizes,
+            container_dependencies,
             computed_cache,
             custom_prop_cache,
             generated_cache,
@@ -765,6 +767,11 @@ impl Dom {
 
         match parsed_sheets.try_borrow() {
             Ok(cache) => bytes = bytes.saturating_add(cache.retained_bytes()),
+            Err(_) => unavailable += 1,
+        }
+
+        match container_dependencies.try_borrow() {
+            Ok(dependencies) => bytes = bytes.saturating_add(dependencies.retained_bytes()),
             Err(_) => unavailable += 1,
         }
 
@@ -1004,6 +1011,7 @@ impl Dom {
             style_cache: RefCell::new(None),
             parsed_sheets: RefCell::new(sheet_cache::Cache::default()),
             container_sizes: RefCell::new(FxHashMap::default()),
+            container_dependencies: RefCell::new(container_queries::Dependencies::default()),
             computed_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
             custom_prop_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
             generated_cache: RefCell::new(None),
@@ -1602,10 +1610,6 @@ impl Dom {
         }
     }
 
-    /// Coalesce repeated geometry invalidations per arena node. This keeps the queue bounded by
-    /// the DOM itself even on a page that mutates forever without reading layout. Attribute
-    /// changes dominate content changes, which dominate paint-only changes, because the strongest
-    /// retained kind is the one the cache must prove isolated before reusing a box.
     fn record_geometry_dirty(&mut self, id: NodeId, kind: DirtyKind) {
         // CSS Lists 3 / Content 3: counters and quote depth can affect later
         // sibling subtrees. Until their dependencies have a narrower proof,
@@ -1620,12 +1624,21 @@ impl Dom {
                 v.contains("counter-") || v.contains("quotes:")
             });
         if generated_dependency {
+            if casc_diag_on() {
+                eprintln!("DIAGINVALID generated node={id} kind={kind:?}");
+            }
             self.layout_cache.get_mut().clear();
             self.box_tree_cache.get_mut().clear();
             self.dirty_attributed = false;
             self.geometry_dirty_attributed = false;
         }
+        self.record_local_geometry_dirty(id, kind);
+    }
 
+    /// Coalesce per-node invalidations after accounting for nonlocal generated
+    /// content dependencies. Attribute changes dominate content, then paint.
+    /// The queue stays bounded by the DOM even without intervening layout.
+    fn record_local_geometry_dirty(&mut self, id: NodeId, kind: DirtyKind) {
         let strength = |kind| match kind {
             DirtyKind::Paint => 0,
             DirtyKind::Content => 1,
@@ -1805,7 +1818,7 @@ impl Dom {
         // A local width change can alter query results in a descendant's
         // subtree; retain the full style/layout interleave until incremental
         // boundaries carry container-query dependencies too.
-        (attributed && !self.has_container_queries()).then_some(nodes)
+        (attributed && !self.style_depends_on_layout()).then_some(nodes)
     }
 
     /// Consume geometry invalidations accumulated since the last full CSSOM View measure pass.
@@ -1818,7 +1831,7 @@ impl Dom {
         let nodes = std::mem::take(&mut self.geometry_dirty_nodes)
             .into_iter()
             .collect();
-        (attributed && !self.has_container_queries()).then_some(nodes)
+        (attributed && !self.style_depends_on_layout()).then_some(nodes)
     }
 
     /// Whether a concrete mutation target can affect rendered boxes or paint.
@@ -2873,7 +2886,12 @@ impl Dom {
         if style_changed {
             self.touch_style_at(parent);
         } else if text_only {
-            self.touch_text(parent, was_empty != self.is_element_empty(parent));
+            self.touch_text(
+                parent,
+                was_empty != self.is_element_empty(parent),
+                true,
+                None,
+            );
         } else {
             self.touch_content(Some(parent));
         }
@@ -5178,6 +5196,9 @@ impl Dom {
             SelectorContext {
                 scope: None,
                 shadow_host: Some(host),
+                memo: None,
+                memo_prefixes: false,
+                ancestors: None,
             },
         )
     }
@@ -6036,9 +6057,13 @@ impl Dom {
         let mut candidate_count = 0u64;
         let index = self.style_index();
         let scope = self.tree_scope(id);
+        let memo = RefCell::new(rule_index::MatchMemo::default());
         let context = SelectorContext {
             scope: None,
             shadow_host: self.shadow_hosts.get(&scope).copied(),
+            memo: Some(&memo),
+            memo_prefixes: false,
+            ancestors: None,
         };
         let cached_selectors = self
             .selector_cache
@@ -6056,11 +6081,20 @@ impl Dom {
                     // alternatives (or repeating a class) tests the rule once.
                     let mut candidates = Vec::new();
                     b.candidates(self, id, &mut candidates);
+                    // Amortize a lazy ancestor index on large candidate sets.
+                    // It is populated only if a descendant combinator needs it.
+                    let ancestors = (candidates.len() >= 32).then(|| {
+                        RefCell::new(rule_index::AncestorMatches::new(id, context.shadow_host))
+                    });
+                    let context = SelectorContext {
+                        ancestors: ancestors.as_ref(),
+                        ..context
+                    };
                     let mut out: Vec<u32> = Vec::new();
                     for ri in candidates {
                         candidate_count += 1;
                         let rule = &rules[ri as usize];
-                        if self.matches_complex_in(id, &rule.selector.0, context) {
+                        if self.matches_complex_uncached(id, &rule.selector.0, context) {
                             out.push(ri);
                         }
                     }
@@ -6975,6 +7009,8 @@ impl Dom {
             // Idempotent writes are free: no dirty, no redraw.
             NodeData::Text(t) if *t == text => (),
             NodeData::Text(t) => {
+                let direction_changed =
+                    text_node_directionality(t) != text_node_directionality(text);
                 *t = text.to_string();
                 // A text node's content changed — its PARENT element is the
                 // relayout target (text styling/flow is an element concern).
@@ -6984,7 +7020,12 @@ impl Dom {
                     self.reset_cssom_sheet(parent);
                     self.touch_style_at(parent); // sheet text changed in place
                 } else if let Some(parent) = parent {
-                    self.touch_text(parent, was_empty != self.is_element_empty(parent));
+                    self.touch_text(
+                        parent,
+                        was_empty != self.is_element_empty(parent),
+                        direction_changed,
+                        Some(id),
+                    );
                 } else {
                     self.touch_content(None);
                 }
@@ -8592,9 +8633,12 @@ impl Dom {
         self.matches_complex_in(id, parts, self.selector_context(id, scope))
     }
 
-    fn selector_context(&self, id: NodeId, scope: Option<NodeId>) -> SelectorContext {
+    fn selector_context(&self, id: NodeId, scope: Option<NodeId>) -> SelectorContext<'_> {
         SelectorContext {
             scope,
+            memo: None,
+            memo_prefixes: false,
+            ancestors: None,
             shadow_host: if self.shadow_hosts.is_empty() {
                 None
             } else {
@@ -8609,7 +8653,24 @@ impl Dom {
         &self,
         id: NodeId,
         parts: &[(Combinator, Compound)],
-        scope: SelectorContext,
+        scope: SelectorContext<'_>,
+    ) -> bool {
+        if let Some(memo) = scope.memo.filter(|_| scope.memo_prefixes) {
+            if let Some(matched) = memo.borrow().get(id, parts, scope) {
+                return matched;
+            }
+            let matched = self.matches_complex_uncached(id, parts, scope);
+            memo.borrow_mut().put(id, parts, scope, matched);
+            return matched;
+        }
+        self.matches_complex_uncached(id, parts, scope)
+    }
+
+    fn matches_complex_uncached(
+        &self,
+        id: NodeId,
+        parts: &[(Combinator, Compound)],
+        mut scope: SelectorContext<'_>,
     ) -> bool {
         let Some(((comb, compound), rest)) = parts.split_last() else {
             return false;
@@ -8623,11 +8684,51 @@ impl Dom {
         if scope.shadow_host == Some(id) {
             return false;
         }
+        // Memoize only once a chain has at least three branching relations.
+        // Short selectors are cheaper to match directly; longer chains can
+        // revisit identical prefixes combinatorially. Descendant and general
+        // sibling combinators branch, while child/adjacent sibling do not.
+        if scope.memo.is_some() && !scope.memo_prefixes && parts.len() > 3 {
+            scope.memo_prefixes = parts
+                .iter()
+                .skip(1)
+                .filter(|(comb, _)| {
+                    matches!(comb, Combinator::Descendant | Combinator::SubsequentSibling)
+                })
+                .take(3)
+                .count()
+                == 3;
+        }
         match comb {
             Combinator::Child => self
                 .selector_parent_in(id, scope)
                 .is_some_and(|p| self.matches_complex_in(p, rest, scope)),
             Combinator::Descendant | Combinator::None => {
+                if let Some(ancestors) = scope.ancestors {
+                    // Selectors 4 #match-against-element: consider every
+                    // possible related element. A required prefix key narrows
+                    // that set without changing scope or the full predicate.
+                    let mut index = 0;
+                    loop {
+                        let candidate = ancestors.borrow_mut().candidate(
+                            self,
+                            id,
+                            &rest.last().unwrap().1,
+                            scope,
+                            index,
+                        );
+                        match candidate {
+                            rule_index::AncestorCandidate::End => return false,
+                            rule_index::AncestorCandidate::Node(node) => {
+                                if self.matches_complex_in(node, rest, scope) {
+                                    return true;
+                                }
+                                index += 1;
+                            }
+                            rule_index::AncestorCandidate::Unavailable => break,
+                        }
+                    }
+                }
                 let mut up = self.selector_parent_in(id, scope);
                 while let Some(a) = up {
                     if self.matches_complex_in(a, rest, scope) {
@@ -8653,7 +8754,7 @@ impl Dom {
         }
     }
 
-    fn selector_parent_in(&self, id: NodeId, context: SelectorContext) -> Option<NodeId> {
+    fn selector_parent_in(&self, id: NodeId, context: SelectorContext<'_>) -> Option<NodeId> {
         if context.shadow_host == Some(id) {
             return None;
         }
@@ -8721,7 +8822,7 @@ impl Dom {
         of_type: bool,
         from_end: bool,
         of: Option<&[Complex]>,
-        scope: SelectorContext,
+        scope: SelectorContext<'_>,
     ) -> Option<i32> {
         let parent = self.nodes[id].parent?;
         let my_tag = self.tag_name(id)?;
@@ -8751,7 +8852,7 @@ impl Dom {
         })
     }
 
-    fn matches_structural(&self, id: NodeId, st: &Structural, scope: SelectorContext) -> bool {
+    fn matches_structural(&self, id: NodeId, st: &Structural, scope: SelectorContext<'_>) -> bool {
         match st {
             Structural::Empty => self.is_element_empty(id),
             Structural::Nth {
@@ -8769,7 +8870,7 @@ impl Dom {
         self.matches_compound_in(id, c, self.selector_context(id, scope))
     }
 
-    fn matches_compound_in(&self, id: NodeId, c: &Compound, scope: SelectorContext) -> bool {
+    fn matches_compound_in(&self, id: NodeId, c: &Compound, scope: SelectorContext<'_>) -> bool {
         if c.never {
             return false;
         }
@@ -9176,7 +9277,7 @@ impl Dom {
     /// early-exits on the first match, and bounded by `HAS_MAX_VISITS` so a
     /// pathological `*:has(*)` on a huge subtree can't blow up (the cap is a
     /// hostile-page backstop far above any real selector's reach).
-    fn matches_has(&self, subject: NodeId, h: &HasArg, mut scope: SelectorContext) -> bool {
+    fn matches_has(&self, subject: NodeId, h: &HasArg, mut scope: SelectorContext<'_>) -> bool {
         scope.scope = Some(subject);
         const HAS_MAX_VISITS: usize = 8192;
         let mut stack: Vec<NodeId> = if h.sibling {
@@ -9216,6 +9317,20 @@ impl Dom {
         }
         false
     }
+}
+
+/// HTML #text-node-directionality: only the first L, R, or AL code point
+/// contributes to any ancestor's contained-text auto directionality. Equal
+/// results prove a CharacterData edit cannot change a :dir() match, even
+/// when preceding text or excluded descendants determine the ancestor's value.
+fn text_node_directionality(text: &str) -> Option<bool> {
+    use unicode_bidi::BidiClass;
+    text.chars()
+        .find_map(|c| match unicode_bidi::bidi_class(c) {
+            BidiClass::L => Some(false),
+            BidiClass::R | BidiClass::AL => Some(true),
+            _ => None,
+        })
 }
 
 fn escape_text(s: &str) -> Cow<'_, str> {
@@ -9464,9 +9579,12 @@ fn find_var_function(value: &str) -> Option<usize> {
 /// Query scoping and the selector's tree context are distinct (CSS Shadow 1
 /// #selectors-data-model). Keep both stable across combinators and :is/:not.
 #[derive(Clone, Copy)]
-struct SelectorContext {
+struct SelectorContext<'a> {
     scope: Option<NodeId>,
     shadow_host: Option<NodeId>,
+    memo: Option<&'a RefCell<rule_index::MatchMemo>>,
+    memo_prefixes: bool,
+    ancestors: Option<&'a RefCell<rule_index::AncestorMatches>>,
 }
 
 #[derive(PartialEq)]
@@ -11163,6 +11281,9 @@ fn ua_display(tag: &str) -> &'static str {
         "caption" => "table-caption",
         "colgroup" => "table-column-group",
         "col" => "table-column",
+        // CSS Shadow 1 #slots-in-shadow-tree: UA contents, overridable by
+        // author display. Projection belongs to children, not display type.
+        "slot" => "contents",
         "button" | "input" | "select" | "textarea" | "meter" | "progress" | "marquee" => {
             "inline-block"
         }
@@ -13148,10 +13269,17 @@ impl RuleBuckets {
             by_id,
             by_class,
             by_tag,
+            by_attribute,
+            ancestors,
             universal,
         } = self;
         let mut bytes = universal.capacity() * std::mem::size_of::<u32>();
-        for map in [by_id, by_class, by_tag] {
+        bytes += ancestors.capacity() * std::mem::size_of::<(u32, Vec<u16>)>()
+            + ancestors
+                .values()
+                .map(|keys| keys.capacity() * std::mem::size_of::<u16>())
+                .sum::<usize>();
+        for map in [by_id, by_class, by_tag, by_attribute] {
             bytes = bytes.saturating_add(
                 map.capacity()
                     .saturating_mul(std::mem::size_of::<(String, Vec<u32>)>()),
@@ -13558,6 +13686,8 @@ struct RuleBuckets {
     by_id: FxHashMap<String, Vec<u32>>,
     by_class: FxHashMap<String, Vec<u32>>,
     by_tag: FxHashMap<String, Vec<u32>>,
+    by_attribute: FxHashMap<String, Vec<u32>>,
+    ancestors: FxHashMap<u32, Vec<u16>>,
     universal: Vec<u32>,
 }
 
@@ -13573,6 +13703,10 @@ impl RuleBuckets {
                 continue;
             }
             let i = i as u32;
+            let ancestors = rule_index::ancestor_requirements(&r.selector);
+            if !ancestors.is_empty() {
+                b.ancestors.insert(i, ancestors);
+            }
             let keys = r
                 .selector
                 .0
@@ -13584,6 +13718,13 @@ impl RuleBuckets {
                         rule_index::Key::Id(text) => (&mut b.by_id, text),
                         rule_index::Key::Class(text) => (&mut b.by_class, text),
                         rule_index::Key::Tag(text) => (&mut b.by_tag, text),
+                        rule_index::Key::Attribute(text) => {
+                            b.by_attribute
+                                .entry(text.to_ascii_lowercase())
+                                .or_default()
+                                .push(i);
+                            continue;
+                        }
                     };
                     map.entry(text.to_string()).or_default().push(i);
                 }
@@ -13613,8 +13754,37 @@ impl RuleBuckets {
         {
             out.extend(indices.iter().copied());
         }
+        if !self.by_attribute.is_empty()
+            && let NodeData::Element { attrs, .. } = &dom.node(id).data
+        {
+            for attribute in attrs {
+                let name = attribute.name.local.as_ref();
+                let indices = self.by_attribute.get(name).or_else(|| {
+                    name.bytes()
+                        .any(|b| b.is_ascii_uppercase())
+                        .then(|| self.by_attribute.get(&name.to_ascii_lowercase()))
+                        .flatten()
+                });
+                if let Some(indices) = indices {
+                    out.extend(indices.iter().copied());
+                }
+            }
+        }
         out.sort_unstable();
         out.dedup();
+        if !self.ancestors.is_empty() && !out.is_empty() {
+            // Only candidates with ancestor requirements need the filter.
+            // An unrelated descendant rule must not make universal/subject
+            // rules repeatedly walk every ancestor of a deeply nested tree.
+            let mut ancestors = None;
+            out.retain(|index| {
+                self.ancestors.get(index).is_none_or(|required| {
+                    ancestors
+                        .get_or_insert_with(|| rule_index::Ancestors::of(dom, id))
+                        .may_match(dom, required)
+                })
+            });
+        }
     }
 }
 
@@ -17134,6 +17304,9 @@ mod tests {
                     SelectorContext {
                         scope: None,
                         shadow_host: Some(host),
+                        memo: None,
+                        memo_prefixes: false,
+                        ancestors: None,
                     }
                 ),
                 matches,

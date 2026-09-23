@@ -42,6 +42,9 @@ mod boundary;
 mod clamp;
 pub(crate) mod clip_path;
 mod contract;
+mod diagnostics;
+#[cfg(test)]
+mod engine_bench;
 pub(crate) mod filter;
 mod flex;
 mod float;
@@ -352,13 +355,13 @@ pub(crate) fn rich_editor_presentation(
     node: NodeId,
 ) -> Option<RichEditorPresentation> {
     use flow::{Frag, FragKind};
-    fn find<'a>(f: &'a Frag<'static>, node: NodeId) -> Option<&'a Frag<'static>> {
+    fn find(f: &Frag, node: NodeId) -> Option<&Frag> {
         if f.node == node {
             return Some(f);
         }
         f.children.iter().find_map(|f| find(f, node))
     }
-    fn first_line<'a>(f: &'a Frag<'static>, parent: NodeId) -> Option<(&'a Frag<'static>, NodeId)> {
+    fn first_line(f: &Frag, parent: NodeId) -> Option<(&Frag, NodeId)> {
         if matches!(f.kind, FragKind::Line(_)) {
             return Some((f, parent));
         }
@@ -627,9 +630,9 @@ fn graphical_paint_boundaries(
 }
 
 fn graphical_paint_cache(
-    root: &flow::Frag<'_>,
-    fixed: &[flow::Frag<'_>],
-    top_layer: &[flow::TopFrag<'_>],
+    root: &flow::Frag,
+    fixed: &[flow::Frag],
+    top_layer: &[flow::TopFrag],
     flow_bottom: f32,
     viewport: Viewport,
     anchors: &[(NodeId, f32)],
@@ -887,8 +890,9 @@ pub fn adapt_terminal(
             .iter()
             .filter_map(|(node, image)| image.data_url().map(|url| (*node, url)))
             .collect();
-        fn attach(fragment: &mut flow::Frag<'_>, canvases: &HashMap<NodeId, String>) {
+        fn attach(fragment: &mut flow::Frag, canvases: &HashMap<NodeId, String>) {
             if let flow::FragKind::Line(line) = &mut fragment.kind {
+                let line = std::sync::Arc::make_mut(line);
                 for piece in &mut line.pieces {
                     if piece.shaped.is_none()
                         && piece.item.text.is_empty()
@@ -958,7 +962,7 @@ pub fn lay_graphical_subtree(
     controls: &ControlMap,
     images: &ImageSizes,
 ) -> Option<GraphicalLayout> {
-    if dom.has_container_queries() {
+    if dom.style_depends_on_layout() {
         return None;
     }
     let vp = Vp {
@@ -1209,17 +1213,18 @@ pub(crate) fn measure_retained_layout_for_box(
                 ..Default::default()
             };
         };
-        let fragments = LayoutFragments::retain(
-            &layout.root,
-            &layout.fixed,
-            &layout.top_layer,
-            layout.flow_bottom,
-            viewport,
-            &layout.anchors,
-        );
-        let single_box = fragments.as_ref().and_then(|fragments| {
-            let node = requested_box?;
-            fragments.single_border_box(node).map(|rect| (node, rect))
+        let single_box = requested_box.and_then(|node| {
+            if !flow::positioned_complete(&layout.root)
+                || !layout.fixed.iter().all(flow::positioned_complete)
+                || !layout
+                    .top_layer
+                    .iter()
+                    .all(|top| flow::positioned_complete(&top.fragment))
+            {
+                return None;
+            }
+            measure::single_border_box(&layout.root, &layout.fixed, &layout.top_layer, node)
+                .map(|rect| (node, rect))
         });
         let (boxes, scrolling_areas, frame_viewports) = match single_box {
             Some((node, rect)) => (
@@ -1247,7 +1252,14 @@ pub(crate) fn measure_retained_layout_for_box(
             tracks: layout.tracks,
             scrolling_areas,
             frame_viewports,
-            fragments,
+            fragments: LayoutFragments::from_owned(
+                layout.root,
+                layout.fixed,
+                layout.top_layer,
+                layout.flow_bottom,
+                viewport,
+                layout.anchors,
+            ),
             work: layout.work,
         }
     })
@@ -10171,6 +10183,61 @@ mod tests {
             )),
             "shadow content must paint through the 100×60px scrollport clip: {active_at_text:?}"
         );
+    }
+
+    #[test]
+    fn slots_project_children_before_display_box_generation() {
+        // CSS Shadow 1 #flattening / #slots-in-shadow-tree; CSS Display 3
+        // #box-generation. Check normative geometry as well as cold parity:
+        // both old paths incorrectly dropped assigned display:contents nodes.
+        let mut dom = Dom::parse_document(
+            "<div id=host><b id=child style='display:block;width:37px;height:11px'>assigned</b></div>",
+        );
+        let host = node_by_id(&dom, "host");
+        let child = node_by_id(&dom, "child");
+        let root = dom.attach_shadow(host);
+        let slot = dom.create_element("slot");
+        dom.append(root, slot);
+        let fallback = dom.create_element("i");
+        dom.set_attr(fallback, "style", "display:block;width:13px;height:7px");
+        dom.append(slot, fallback);
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(320., 240.);
+        let controls = ControlMap::new();
+        let images = ImageSizes::new();
+        for display in [
+            "",
+            "display:contents",
+            "display:block;width:91px",
+            "display:none",
+            "display:contents",
+        ] {
+            dom.set_attr(slot, "style", display);
+            let layout = measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            if display == "display:none" {
+                assert!(layout.boxes.get(&child).is_none_or(|b| b.width == 0.));
+            } else {
+                assert_eq!(layout.boxes[&child].width, 37.);
+                if display.starts_with("display:block") {
+                    assert_eq!(layout.boxes[&slot].width, 91.);
+                }
+            }
+            memo::tests::assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+        }
+        // Fallback becomes visible when assignment changes, then disappears
+        // when the assigned child returns. No stale slot output may survive.
+        for name in ["other", ""] {
+            dom.set_attr(slot, "name", name);
+            let layout = measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            let (visible, width, hidden) = if name.is_empty() {
+                (child, 37., fallback)
+            } else {
+                (fallback, 13., child)
+            };
+            assert_eq!(layout.boxes[&visible].width, width);
+            assert!(layout.boxes.get(&hidden).is_none_or(|b| b.width == 0.));
+            memo::tests::assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+        }
     }
 
     #[test]

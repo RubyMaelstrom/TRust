@@ -37,10 +37,10 @@ use super::tree::{Atom, AtomKind, BoxNode, Content, Inline, SharedBox};
 use super::value::{Len, Vp};
 
 /// One laid-out fragment: a border-box rect in absolute px, plus content.
-/// `'t` is the box tree (out-of-flow placeholders reference their box until
-/// the positioned post-pass replaces them).
+/// Deferred positioned boxes retain immutable box-tree nodes. Layout results
+/// own their dependencies and can outlive the transient tree-building pass.
 #[derive(Clone, Debug)]
-pub(crate) struct Frag<'t> {
+pub(crate) struct Frag {
     pub flow: super::clamp::FlowInfo,
     /// The generating element (`NO_NODE` for anonymous boxes/line boxes).
     pub node: NodeId,
@@ -73,11 +73,11 @@ pub(crate) struct Frag<'t> {
     /// clip, NOT by its static-position tree parent), which is exactly the
     /// chain `resolve_oof` already walks. CSS Overflow L3 §2/§3.
     pub clip: Option<Clip>,
-    pub kind: FragKind<'t>,
-    pub children: Vec<Frag<'t>>,
+    pub kind: FragKind,
+    pub children: Vec<Frag>,
 }
 
-impl Frag<'_> {
+impl Frag {
     pub(super) fn content_box(&self) -> crate::render::CssRect {
         let [width, height] = self.content_size.unwrap_or([0.0; 2]);
         crate::render::CssRect::new(
@@ -93,8 +93,8 @@ impl Frag<'_> {
 /// lays it as a sibling of the root against the initial containing block and
 /// paints top-layer entries after the document in ordered-set order.
 #[derive(Clone, Debug)]
-pub(crate) struct TopFrag<'t> {
-    pub fragment: Frag<'t>,
+pub(crate) struct TopFrag {
+    pub fragment: Frag,
     pub fixed: bool,
     pub order: usize,
 }
@@ -127,19 +127,19 @@ impl Clip {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum FragKind<'t> {
+pub(crate) enum FragKind {
     Block,
     /// A table cell with row/row-group background layers underneath it.
     /// Relative positioning rectangles survive every later fragment offset.
     TableCell(Box<[(NodeId, [f32; 4])]>),
     /// A line box with retained typographic metrics in CSS pixels.
-    Line(LineFrag),
+    Line(std::sync::Arc<LineFrag>),
     /// An out-of-flow box's placeholder, sitting at its STATIC POSITION
     /// (§10.3.7/§10.6.4) in the fragment tree so every later translation
     /// moves it consistently; the positioned post-pass (`resolve_oof`)
     /// replaces it with the laid box. Carries the inline context the box
     /// inherits (by DOM tree, not by containing block).
-    Oof(&'t BoxNode, Box<InlineStyle>),
+    Oof(SharedBox, Box<InlineStyle>),
     /// Marker retained at the original tree position of a viewport-fixed box.
     /// The laid fragment lives in the flow's fixed list; graphical paint
     /// resolves this marker there so fixed positioning remains viewport-pinned
@@ -168,40 +168,17 @@ pub(crate) struct LineFrag {
     pub forced: bool,
 }
 
-/// Strip the transient box-tree references from a completed fragment tree so
-/// graphical paint can be replayed against updated computed styles without
-/// repeating box construction or flow layout. `Oof` placeholders must have
+/// Retain a completed fragment tree so graphical paint can be replayed against
+/// updated computed styles without repeating box construction or flow layout.
+/// Deferred positioned `Oof` placeholders must have
 /// been resolved by the positioned post-pass; encountering one makes retained
 /// repaint unavailable and preserves the ordinary full-layout fallback.
-pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
-    let kind = match &fragment.kind {
-        FragKind::Block => FragKind::Block,
-        FragKind::TableCell(layers) => FragKind::TableCell(layers.clone()),
-        FragKind::Line(line) => FragKind::Line(line.clone()),
-        FragKind::Oof(_, _) => return None,
-        FragKind::Fixed(index) => FragKind::Fixed(*index),
-    };
-    let children = fragment
-        .children
-        .iter()
-        .map(retain_for_paint)
-        .collect::<Option<Vec<_>>>()?;
-    Some(Frag {
-        flow: fragment.flow,
-        node: fragment.node,
-        x: fragment.x,
-        y: fragment.y,
-        w: fragment.w,
-        h: fragment.h,
-        border: fragment.border,
-        css_size: fragment.css_size,
-        content_size: fragment.content_size,
-        content_offset: fragment.content_offset,
-        paint: fragment.paint.clone(),
-        clip: fragment.clip,
-        kind,
-        children,
-    })
+pub(super) fn retain_for_paint(fragment: &Frag) -> Option<Frag> {
+    positioned_complete(fragment).then(|| fragment.clone())
+}
+
+pub(super) fn positioned_complete(fragment: &Frag) -> bool {
+    !matches!(fragment.kind, FragKind::Oof(..)) && fragment.children.iter().all(positioned_complete)
 }
 
 /// The painter-facing summary of a box's stacking/positioning style
@@ -285,8 +262,8 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
     }
 }
 
-impl<'t> Frag<'t> {
-    pub(super) fn empty() -> Frag<'t> {
+impl Frag {
+    pub(super) fn empty() -> Frag {
         Frag {
             flow: Default::default(),
             node: NO_NODE,
@@ -351,7 +328,7 @@ impl ButtonContentBounds {
 /// anonymous box's in-flow size. For a line, use its actual inline boxes (not
 /// the line's full alignment band), so an authored `text-align` offset is not
 /// mistaken for content width and then applied a second time.
-fn button_content_bounds(f: &Frag<'_>) -> Option<ButtonContentBounds> {
+fn button_content_bounds(f: &Frag) -> Option<ButtonContentBounds> {
     if matches!(f.kind, FragKind::Oof(..)) {
         return None;
     }
@@ -402,7 +379,7 @@ struct CbRect {
 
 /// An out-of-flow box's placeholder fragment at its static position
 /// (`content_x + the IFC pen offset`, the line's y).
-fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag<'_> {
+fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag {
     Frag {
         flow: Default::default(),
         node: NO_NODE,
@@ -416,7 +393,7 @@ fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag<'_> {
         content_offset: [0.0; 2],
         paint: PaintFlags::default(),
         clip: None,
-        kind: FragKind::Oof(m.b, Box::new(m.ctx)),
+        kind: FragKind::Oof(m.b.clone(), Box::new(m.ctx)),
         children: Vec::new(),
     }
 }
@@ -509,16 +486,10 @@ impl Flow<'_> {
     /// `position:fixed` boxes (viewport coordinates — the pinned layer,
     /// painted separately), and boxes promoted to the document top layer.
     #[allow(clippy::type_complexity)]
-    pub fn layout<'t>(
+    pub fn layout(
         &self,
-        root: &'t BoxNode,
-    ) -> (
-        Frag<'t>,
-        f32,
-        Vec<(NodeId, f32)>,
-        Vec<Frag<'t>>,
-        Vec<TopFrag<'t>>,
-    ) {
+        root: &BoxNode,
+    ) -> (Frag, f32, Vec<(NodeId, f32)>, Vec<Frag>, Vec<TopFrag>) {
         let mut cur = Cursor::default();
         let inl = InlineStyle::root();
         // §8.3.1: margins of the root element's box do not collapse. Its top
@@ -550,8 +521,8 @@ impl Flow<'_> {
             w: self.vp.w,
             h: self.vp.h.max(0.0),
         };
-        let mut fixed: Vec<Frag<'t>> = Vec::new();
-        let mut top_layer: Vec<TopFrag<'t>> = Vec::new();
+        let mut fixed: Vec<Frag> = Vec::new();
+        let mut top_layer: Vec<TopFrag> = Vec::new();
         self.resolve_oof(
             &mut frag,
             icb,
@@ -569,7 +540,7 @@ impl Flow<'_> {
         // but paints wrong" (clip/cover/paint-order bugs). Pairs with the
         // `layout_dump` harness in http.rs.
         if std::env::var_os("TRUST_FRAG_DIAG").is_some() {
-            fn dump(dom: &Dom, f: &Frag<'_>, depth: usize) {
+            fn dump(dom: &Dom, f: &Frag, depth: usize) {
                 let tag = if f.node == NO_NODE {
                     "·".to_string()
                 } else {
@@ -668,17 +639,78 @@ impl Flow<'_> {
     /// Lay one block-level box. `cb_x`/`cb_w` are the containing block's
     /// content-box left edge and width; `cb_h` its definite content height
     /// when it has one (percentage-height basis, §10.5).
+    /// Cache a normal-flow transaction only when its external float context
+    /// is empty before and after layout. Preserve the complete cursor output,
+    /// including margin flushes used by collapsing ancestors (CSS 2 §8.3.1).
     #[allow(clippy::too_many_arguments)]
-    fn block<'t>(
+    fn block(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         cb_x: f32,
         cb_w: f32,
         cb_h: Option<f32>,
         cur: &mut Cursor,
         parent_inl: &InlineStyle,
         fc: &mut FloatCtx,
-    ) -> Frag<'t> {
+    ) -> Frag {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::Block);
+        let reuse = self.reuse
+            && b.node != NO_NODE
+            && fc.is_empty()
+            && !self.subgrid_rows.borrow().active();
+        let request = super::memo::Request {
+            node: b,
+            parent: parent_inl,
+            constraint: super::memo::Constraint::Block {
+                x: cb_x,
+                width: cb_w,
+                height: cb_h,
+                y: cur.y,
+                positive_margin: cur.pos,
+                negative_margin: cur.neg,
+            },
+        };
+        if reuse && let Some(item) = self.dom.layout_cache.borrow_mut().item(&request) {
+            let block = item.block.expect("block constraint has cursor output");
+            cur.y = block.y;
+            cur.pos = block.positive_margin;
+            cur.neg = block.negative_margin;
+            cur.flush_log.extend(block.flushes);
+            cur.anchors.extend(item.anchors);
+            self.grid_tracks.borrow_mut().extend(item.tracks);
+            return item.fragment;
+        }
+        let (anchor_start, flush_start) = (cur.anchors.len(), cur.flush_log.len());
+        let fragment = self.block_uncached(b, cb_x, cb_w, cb_h, cur, parent_inl, fc);
+        if reuse && fc.is_empty() {
+            self.dom.layout_cache.borrow_mut().store_block(
+                &request,
+                &fragment,
+                &cur.anchors[anchor_start..],
+                &self.grid_tracks.borrow(),
+                super::memo::BlockOutput {
+                    y: cur.y,
+                    positive_margin: cur.pos,
+                    negative_margin: cur.neg,
+                    flushes: cur.flush_log[flush_start..].to_vec(),
+                },
+            );
+        }
+        fragment
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn block_uncached(
+        &self,
+        b: &BoxNode,
+        cb_x: f32,
+        cb_w: f32,
+        cb_h: Option<f32>,
+        cur: &mut Cursor,
+        parent_inl: &InlineStyle,
+        fc: &mut FloatCtx,
+    ) -> Frag {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::BlockCompute);
         let s = &b.style;
         // Anchors recorded inside this box shift with its §9.4.3/transform
         // paint offset.
@@ -971,7 +1003,7 @@ impl Flow<'_> {
                             self.emit_lines(lines, content_x, cur, &mut children);
                             let first = children.len() - n;
                             let end_y = cur.y;
-                            let line_y = |idx: usize, children: &[Frag<'_>]| {
+                            let line_y = |idx: usize, children: &[Frag]| {
                                 if idx < n {
                                     children[first + idx].y
                                 } else {
@@ -1396,18 +1428,18 @@ impl Flow<'_> {
     /// `a0` = the anchor high-water mark at the box's entry, so anchors
     /// recorded inside it ride along.
     #[allow(clippy::too_many_arguments)]
-    fn finish_frag<'t>(
+    fn finish_frag(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         x: f32,
         y: f32,
         h: &H,
         frag_h: f32,
-        children: Vec<Frag<'t>>,
+        children: Vec<Frag>,
         cb: (f32, Option<f32>),
         cur: &mut Cursor,
         a0: usize,
-    ) -> Frag<'t> {
+    ) -> Frag {
         let border_box_width = h.bp_l + h.content_w + h.bp_r;
         let vertical_edges = b.style.border[TOP]
             + self.pad(&b.style, TOP, cb.0)
@@ -1483,14 +1515,7 @@ impl Flow<'_> {
     /// static-position rectangle is the container's content box (css-flexbox
     /// §4.1 / css-grid §9.1; the "as if it were the sole item" alignment
     /// refinement is documented as not done — the origin is used).
-    fn container_oof<'t>(
-        &self,
-        b: &'t BoxNode,
-        inl: &InlineStyle,
-        x: f32,
-        y: f32,
-        out: &mut Vec<Frag<'t>>,
-    ) {
+    fn container_oof(&self, b: &BoxNode, inl: &InlineStyle, x: f32, y: f32, out: &mut Vec<Frag>) {
         for ob in &b.oof {
             out.push(Frag {
                 flow: Default::default(),
@@ -1505,7 +1530,7 @@ impl Flow<'_> {
                 content_offset: [0.0; 2],
                 paint: PaintFlags::default(),
                 clip: None,
-                kind: FragKind::Oof(ob, Box::new(inl.clone())),
+                kind: FragKind::Oof(ob.clone(), Box::new(inl.clone())),
                 children: Vec::new(),
             });
         }
@@ -1592,7 +1617,7 @@ impl Flow<'_> {
         y: f32,
         width: f32,
         right_to_left: bool,
-    ) -> Vec<Frag<'static>> {
+    ) -> Vec<Frag> {
         let mut fragments = Vec::new();
         self.emit_lines(lines, 0., &mut Cursor::default(), &mut fragments);
         for f in &mut fragments {
@@ -1607,6 +1632,7 @@ impl Flow<'_> {
             f.w = thickness;
             f.h = inline;
             if let FragKind::Line(line) = &mut f.kind {
+                let line = std::sync::Arc::make_mut(line);
                 line.sideways = true;
                 line.width = thickness;
                 line.height = inline;
@@ -1615,7 +1641,7 @@ impl Flow<'_> {
         fragments
     }
 
-    fn emit_lines(&self, lines: Vec<LineOut>, x: f32, cur: &mut Cursor, out: &mut Vec<Frag<'_>>) {
+    fn emit_lines(&self, lines: Vec<LineOut>, x: f32, cur: &mut Cursor, out: &mut Vec<Frag>) {
         for line in lines {
             let hpx = line.height;
             let line_frag = LineFrag {
@@ -1646,7 +1672,7 @@ impl Flow<'_> {
                 content_offset: [0.0; 2],
                 paint: PaintFlags::default(),
                 clip: None,
-                kind: FragKind::Line(line_frag),
+                kind: FragKind::Line(line_frag.into()),
                 children: Vec::new(),
             });
             cur.y += hpx;
@@ -1663,11 +1689,11 @@ impl Flow<'_> {
         marker_image: Option<&str>,
         inl: &InlineStyle,
         content_x: f32,
-        children: &[Frag<'_>],
+        children: &[Frag],
         y_border: Option<f32>,
         bt: f32,
-    ) -> Frag<'static> {
-        fn first_line_y(frags: &[Frag<'_>]) -> Option<f32> {
+    ) -> Frag {
+        fn first_line_y(frags: &[Frag]) -> Option<f32> {
             let mut best: Option<f32> = None;
             for f in frags {
                 let y = match &f.kind {
@@ -1783,21 +1809,24 @@ impl Flow<'_> {
                 ..PaintFlags::default()
             },
             clip: None,
-            kind: FragKind::Line(LineFrag {
-                sideways: false,
-                atom_boxes: Vec::new(),
-                band: [0.0, w],
-                alignment_offset: 0.0,
-                justification: 0.0,
-                pieces,
-                contains_atomic_inline: false,
-                width: w,
-                height: h,
-                baseline,
-                ascent: baseline,
-                descent: (h - baseline).max(0.0),
-                forced: false,
-            }),
+            kind: FragKind::Line(
+                LineFrag {
+                    sideways: false,
+                    atom_boxes: Vec::new(),
+                    band: [0.0, w],
+                    alignment_offset: 0.0,
+                    justification: 0.0,
+                    pieces,
+                    contains_atomic_inline: false,
+                    width: w,
+                    height: h,
+                    baseline,
+                    ascent: baseline,
+                    descent: (h - baseline).max(0.0),
+                    forced: false,
+                }
+                .into(),
+            ),
             children: Vec::new(),
         }
     }
@@ -1973,7 +2002,7 @@ struct FItem<'t> {
     def_h: Option<f32>,
     /// The cross-size property is `auto` (stretch eligibility).
     cross_auto: bool,
-    frag: Option<Frag<'t>>,
+    frag: Option<Frag>,
     anchors: Vec<(NodeId, f32)>,
     border_x: f32,
     border_y: f32,
@@ -2031,8 +2060,8 @@ pub(super) fn cross_shift(extra: f32, auto_start: bool, auto_end: bool, align: A
 /// is the baseline set exported by an ordinary flex item for `align-items:
 /// baseline` (CSS Flexbox §8.5/§9.4). A caller supplies the border-edge
 /// fallback for a fragment with no line boxes.
-pub(super) fn first_baseline(fragment: &Frag<'_>) -> Option<f32> {
-    fn absolute(fragment: &Frag<'_>, best: &mut Option<(f32, f32)>) {
+pub(super) fn first_baseline(fragment: &Frag) -> Option<f32> {
+    fn absolute(fragment: &Frag, best: &mut Option<(f32, f32)>) {
         if let FragKind::Line(line) = &fragment.kind {
             let candidate = (fragment.y, fragment.y + line.baseline);
             if best.is_none_or(|current| candidate.0 < current.0) {
@@ -2048,8 +2077,8 @@ pub(super) fn first_baseline(fragment: &Frag<'_>) -> Option<f32> {
     best.map(|(_, baseline)| baseline - fragment.y)
 }
 
-pub(super) fn last_baseline(fragment: &Frag<'_>) -> Option<f32> {
-    fn absolute(fragment: &Frag<'_>, best: &mut Option<(f32, f32)>) {
+pub(super) fn last_baseline(fragment: &Frag) -> Option<f32> {
+    fn absolute(fragment: &Frag, best: &mut Option<(f32, f32)>) {
         if let FragKind::Line(line) = &fragment.kind {
             let candidate = (fragment.y, fragment.y + line.baseline);
             if best.is_none_or(|current| candidate.0 >= current.0) {
@@ -2081,7 +2110,7 @@ impl Flow<'_> {
         cross_clamp: (f32, f32),
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
-    ) -> (Vec<Frag<'t>>, f32) {
+    ) -> (Vec<Frag>, f32) {
         let u = crate::layout2::Units::of(self.dom, b.node);
         let fs = container_style(self.dom, b.node, u, self.vp);
         // Gap percentages resolve against the container's content box in
@@ -2140,10 +2169,10 @@ impl Flow<'_> {
     /// Row-direction flex layout: §9.2 base sizes → §9.3 lines → §9.7
     /// flexing → §9.4 cross sizing → §9.5/§9.6 alignment.
     #[allow(clippy::too_many_arguments)]
-    fn flex_row<'t>(
+    fn flex_row(
         &self,
         fs: &super::flex::FlexStyle,
-        items: &[&'t BoxNode],
+        items: &[&BoxNode],
         gap_main: f32,
         gap_cross: f32,
         content_x: f32,
@@ -2153,7 +2182,7 @@ impl Flow<'_> {
         cross_clamp: (f32, f32),
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
-    ) -> (Vec<Frag<'t>>, f32) {
+    ) -> (Vec<Frag>, f32) {
         // ---- §9.2: flex base size and hypothetical main size ----
         let mut fi: Vec<FItem> = Vec::with_capacity(items.len());
         let mut calcs: Vec<FlexCalc> = Vec::with_capacity(items.len());
@@ -2415,7 +2444,7 @@ impl Flow<'_> {
             (0..lines.len()).collect()
         };
         let mut top = lead_c;
-        let mut frags: Vec<Frag<'t>> = Vec::with_capacity(fi.len());
+        let mut frags: Vec<Frag> = Vec::with_capacity(fi.len());
         for &li in &order {
             let cross = line_cross[li];
             for i in lines[li].clone() {
@@ -2501,10 +2530,10 @@ impl Flow<'_> {
     /// main size takes each line at its content sum (§9.2's "automatic
     /// block size ... is its max-content size" — no free space to flex).
     #[allow(clippy::too_many_arguments)]
-    fn flex_col<'t>(
+    fn flex_col(
         &self,
         fs: &super::flex::FlexStyle,
-        items: &[&'t BoxNode],
+        items: &[&BoxNode],
         gap_main: f32,
         gap_cross: f32,
         content_x: f32,
@@ -2514,7 +2543,7 @@ impl Flow<'_> {
         main_clamp: (f32, f32),
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
-    ) -> (Vec<Frag<'t>>, f32) {
+    ) -> (Vec<Frag>, f32) {
         let mut fi: Vec<FItem> = Vec::with_capacity(items.len());
         let mut calcs: Vec<FlexCalc> = Vec::with_capacity(items.len());
         let mut post_flex_main_definite: Vec<bool> = Vec::with_capacity(items.len());
@@ -2858,7 +2887,7 @@ impl Flow<'_> {
             }
             left += cross + between_c + gap_cross;
         }
-        let mut frags: Vec<Frag<'t>> = Vec::with_capacity(fi.len());
+        let mut frags: Vec<Frag> = Vec::with_capacity(fi.len());
         for it in &mut fi {
             let mut frag = it.frag.take().expect("laid above");
             let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, frag.w, frag.h);
@@ -2882,7 +2911,7 @@ impl Flow<'_> {
     fn center_button_content(
         &self,
         b: &BoxNode,
-        children: &mut [Frag<'_>],
+        children: &mut [Frag],
         content_left: f32,
         content_top: f32,
         content_w: f32,
@@ -2934,14 +2963,14 @@ impl Flow<'_> {
     /// margins belong to the flex algorithm, not this fragment. Returns the
     /// fragment at (0,0) border-box origin plus its local anchor marks —
     /// the caller translates both.
-    pub(super) fn item_frag<'t>(
+    pub(super) fn item_frag(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         content_w: f32,
         pct_basis: f32,
         def_h: Option<f32>,
         parent_inl: &InlineStyle,
-    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+    ) -> (Frag, Vec<(NodeId, f32)>) {
         self.item_frag_inner(b, content_w, pct_basis, def_h, parent_inl, true)
     }
 
@@ -2950,26 +2979,27 @@ impl Flow<'_> {
     /// size. In particular, a percentage height is cyclic during intrinsic
     /// block sizing and behaves as auto; a preferred `aspect-ratio` transfer is
     /// likewise a separate transferred-size suggestion, not content.
-    fn item_frag_for_content_size<'t>(
+    fn item_frag_for_content_size(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         content_w: f32,
         pct_basis: f32,
         parent_inl: &InlineStyle,
-    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+    ) -> (Frag, Vec<(NodeId, f32)>) {
         self.item_frag_inner(b, content_w, pct_basis, None, parent_inl, false)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn item_frag_inner<'t>(
+    fn item_frag_inner(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         content_w: f32,
         pct_basis: f32,
         def_h: Option<f32>,
         parent_inl: &InlineStyle,
         transfer_preferred_ratio: bool,
-    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+    ) -> (Frag, Vec<(NodeId, f32)>) {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::Item);
         let request = super::memo::Request {
             node: b,
             parent: parent_inl,
@@ -3008,15 +3038,16 @@ impl Flow<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn item_frag_uncached<'t>(
+    fn item_frag_uncached(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         content_w: f32,
         pct_basis: f32,
         def_h: Option<f32>,
         parent_inl: &InlineStyle,
         transfer_preferred_ratio: bool,
-    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+    ) -> (Frag, Vec<(NodeId, f32)>) {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::ItemCompute);
         let s = &b.style;
         let inl = if b.node == NO_NODE {
             parent_inl.with_pseudo(self.dom, s.pseudo)
@@ -3056,7 +3087,7 @@ impl Flow<'_> {
         // an independent block formatting context: its floats are contained here
         // and cannot intrude from the ancestor context (§9.4.1).
         let mut own_fc = FloatCtx::new();
-        let mut children: Vec<Frag<'t>> = Vec::new();
+        let mut children: Vec<Frag> = Vec::new();
         match &b.content {
             Content::Blocks(kids) => {
                 for k in kids {
@@ -3113,7 +3144,7 @@ impl Flow<'_> {
                 }
                 let first = children.len() - n;
                 let end_y = cur.y;
-                let line_y = |idx: usize, children: &[Frag<'_>]| {
+                let line_y = |idx: usize, children: &[Frag]| {
                     if n > 0 && idx < n {
                         children[first + idx].y
                     } else {
@@ -3330,7 +3361,7 @@ impl Flow<'_> {
     /// natural height, else the spec's ratio-less 2:1/150px cap; object-fit
     /// maps the pixels into that box.
     #[allow(clippy::too_many_arguments)]
-    fn img_line_at<'t>(
+    fn img_line_at(
         &self,
         node: NodeId,
         dimension_source: NodeId,
@@ -3341,7 +3372,7 @@ impl Flow<'_> {
         inl: &InlineStyle,
         x: f32,
         y: f32,
-    ) -> Frag<'t> {
+    ) -> Frag {
         let natural = crate::responsive_image::density_corrected_size(
             url.and_then(|url| self.images.get(url)),
             density,
@@ -3397,23 +3428,26 @@ impl Flow<'_> {
             content_offset: [0.0; 2],
             paint: PaintFlags::default(),
             clip: None,
-            kind: FragKind::Line(LineFrag {
-                sideways: false,
-                atom_boxes: Vec::new(),
-                band: [0.0, r.box_w],
-                alignment_offset: 0.0,
-                justification: 0.0,
-                pieces: vec![Piece::boxed(
-                    item, r.box_w, r.box_h, r.off_x, r.off_y, r.paint_w, r.paint_h,
-                )],
-                contains_atomic_inline: false,
-                width: r.box_w,
-                height: r.box_h,
-                baseline: r.box_h,
-                ascent: r.box_h,
-                descent: 0.0,
-                forced: false,
-            }),
+            kind: FragKind::Line(
+                LineFrag {
+                    sideways: false,
+                    atom_boxes: Vec::new(),
+                    band: [0.0, r.box_w],
+                    alignment_offset: 0.0,
+                    justification: 0.0,
+                    pieces: vec![Piece::boxed(
+                        item, r.box_w, r.box_h, r.off_x, r.off_y, r.paint_w, r.paint_h,
+                    )],
+                    contains_atomic_inline: false,
+                    width: r.box_w,
+                    height: r.box_h,
+                    baseline: r.box_h,
+                    ascent: r.box_h,
+                    descent: 0.0,
+                    forced: false,
+                }
+                .into(),
+            ),
             children: Vec::new(),
         }
     }
@@ -3468,7 +3502,8 @@ impl Flow<'_> {
         false
     }
 
-    pub(super) fn offset_frag(f: &mut Frag<'_>, dx: f32, dy: f32) {
+    pub(super) fn offset_frag(f: &mut Frag, dx: f32, dy: f32) {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::Offset);
         f.x += dx;
         f.y += dy;
         for c in &mut f.children {
@@ -3531,7 +3566,7 @@ impl Flow<'_> {
     /// padding box on each clipped axis (CSS Overflow L3 §2 — the scrollport
     /// is the padding box), ±∞ on an unclipped axis. `None` when it clips
     /// neither axis.
-    fn clip_box(&self, f: &Frag<'_>) -> Option<Clip> {
+    fn clip_box(&self, f: &Frag) -> Option<Clip> {
         // Anonymous/line frags never clip. (Guarded first: `tag_name` indexes
         // the arena, so it must not see `NO_NODE`.)
         if f.node == NO_NODE {
@@ -3571,19 +3606,20 @@ impl Flow<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn resolve_oof<'t>(
+    fn resolve_oof(
         &self,
-        f: &mut Frag<'t>,
+        f: &mut Frag,
         abs_cb: CbRect,
         fixed_cb: Option<CbRect>,
         icb: CbRect,
         anchors: &mut Vec<(NodeId, f32)>,
-        fixed_out: &mut Vec<Frag<'t>>,
-        top_layer_out: &mut Vec<TopFrag<'t>>,
+        fixed_out: &mut Vec<Frag>,
+        top_layer_out: &mut Vec<TopFrag>,
         own_clip: Option<Clip>,
         abs_clip: Option<Clip>,
         fixed_clip: Option<Clip>,
     ) {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::Positioned);
         if f.flow.clamp_container {
             let content = f.content_box();
             super::clamp::clip_floats(&mut f.children, content.y + content.height);
@@ -3726,7 +3762,7 @@ impl Flow<'_> {
                 } else {
                     child_abs
                 };
-                let (laid, anc) = self.lay_oof(b, cb, (x0 - cb.x, y0 - cb.y), &ctx);
+                let (laid, anc) = self.lay_oof(&b, cb, (x0 - cb.x, y0 - cb.y), &ctx);
                 if top_layer {
                     top_layer_out.push(TopFrag {
                         fragment: laid,
@@ -3809,13 +3845,13 @@ impl Flow<'_> {
     /// replaced), §10.4/§10.7 min/max re-solving, ltr. `stat` is the static
     /// position relative to the CB's padding-box origin. Returns the laid
     /// fragment in ABSOLUTE coordinates plus its (already offset) anchors.
-    fn lay_oof<'t>(
+    fn lay_oof(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         cb: CbRect,
         stat: (f32, f32),
         ctx: &InlineStyle,
-    ) -> (Frag<'t>, Vec<(NodeId, f32)>) {
+    ) -> (Frag, Vec<(NodeId, f32)>) {
         let s = &b.style;
         let (m, mauto) = self.margins_of(s, cb.w);
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb.w);
@@ -4079,13 +4115,13 @@ impl Flow<'_> {
     /// border-box fragment. The block flow owns box laying; the IFC is handed
     /// only the resulting sizes to place. `cb_w`/`cb_h` are the float's
     /// containing block (its parent block's content box).
-    fn lay_float_box<'t>(
+    fn lay_float_box(
         &self,
-        fb: &'t BoxNode,
+        fb: &BoxNode,
         cb_w: f32,
         cb_h: Option<f32>,
         parent_inl: &InlineStyle,
-    ) -> PrelaidFloat<'t> {
+    ) -> PrelaidFloat {
         let s = &fb.style;
         let side = s.float.unwrap_or(Side::Left);
         // §9.5: a float's `auto` margins compute to zero.
@@ -4148,13 +4184,13 @@ impl Flow<'_> {
     /// = an explicit `width` (clamped) else shrink-to-fit (§10.3.9); auto margins
     /// compute to 0 (§10.3.9). Same shape as `lay_float_box`, minus the float
     /// side — the IFC places it in-flow instead of pulling it aside.
-    fn lay_atom_box<'t>(
+    fn lay_atom_box(
         &self,
-        ab: &'t BoxNode,
+        ab: &BoxNode,
         cb_w: f32,
         cb_h: Option<f32>,
         parent_inl: &InlineStyle,
-    ) -> PrelaidAtom<'t> {
+    ) -> PrelaidAtom {
         let s = &ab.style;
         let (m, _auto) = self.margins_of(s, cb_w);
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
@@ -4290,11 +4326,12 @@ impl Flow<'_> {
         inl: &InlineStyle,
         fc: &mut FloatCtx,
     ) -> InlineLaid<'t> {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::Inline);
         // Pre-lay every float in walk order; `boxes[k]` is the k-th one the IFC
         // meets, `prelaid[k]` its laid fragment.
         let mut float_nodes: Vec<(&'t BoxNode, InlineStyle)> = Vec::new();
         collect_floats(self.dom, self.base, inls, inl, &mut float_nodes);
-        let mut prelaid: Vec<Option<PrelaidFloat<'t>>> = Vec::with_capacity(float_nodes.len());
+        let mut prelaid: Vec<Option<PrelaidFloat>> = Vec::with_capacity(float_nodes.len());
         let mut boxes: Vec<FloatBox> = Vec::with_capacity(float_nodes.len());
         for (fb, fctx) in &float_nodes {
             let pf = self.lay_float_box(fb, content_w, cb_h, fctx);
@@ -4311,7 +4348,7 @@ impl Flow<'_> {
         // and reports where it landed, so we splice the content fragment there.
         let mut atom_nodes: Vec<(&'t BoxNode, InlineStyle)> = Vec::new();
         collect_atom_boxes(self.dom, self.base, inls, inl, &mut atom_nodes);
-        let mut prelaid_atoms: Vec<Option<PrelaidAtom<'t>>> = Vec::with_capacity(atom_nodes.len());
+        let mut prelaid_atoms: Vec<Option<PrelaidAtom>> = Vec::with_capacity(atom_nodes.len());
         let mut atom_sizes: Vec<AtomBoxSize> = Vec::with_capacity(atom_nodes.len());
         for (ab, actx) in &atom_nodes {
             let pa = self.lay_atom_box(ab, content_w, cb_h, actx);
@@ -4481,9 +4518,9 @@ impl Flow<'_> {
     /// translated) anchors. `content_top` is the content-box top; column 0 sits
     /// at `content_x`, column k at `content_x + k·(col_w + gap)`.
     #[allow(clippy::too_many_arguments)]
-    fn lay_multicol<'t>(
+    fn lay_multicol(
         &self,
-        b: &'t BoxNode,
+        b: &BoxNode,
         content_x: f32,
         content_top: f32,
         n: usize,
@@ -4491,7 +4528,7 @@ impl Flow<'_> {
         gap_px: f32,
         cb_h: Option<f32>,
         inl: &InlineStyle,
-    ) -> (Vec<Frag<'t>>, f32, Vec<(NodeId, f32)>) {
+    ) -> (Vec<Frag>, f32, Vec<(NodeId, f32)>) {
         // ---- lay the content once, as a single tall column at col_w ----
         // A multicol container establishes an independent formatting context.
         let mut cur = Cursor {
@@ -4499,7 +4536,7 @@ impl Flow<'_> {
             ..Default::default()
         };
         let mut sub_fc = FloatCtx::new();
-        let mut single: Vec<Frag<'t>> = Vec::new();
+        let mut single: Vec<Frag> = Vec::new();
         match &b.content {
             Content::Blocks(kids) => {
                 for k in kids {
@@ -4547,7 +4584,7 @@ impl Flow<'_> {
             let (_, dy) = column_shift(a.1);
             a.1 += dy;
         }
-        let mut out: Vec<Frag<'t>> = Vec::new();
+        let mut out: Vec<Frag> = Vec::new();
         for f in single {
             slice_columns(f, &column_shift, &mut out);
         }
@@ -4558,13 +4595,13 @@ impl Flow<'_> {
 /// A float's box, pre-laid by the block flow and handed to the IFC for
 /// placement: its margin-box size, leading margins, and the laid border-box
 /// fragment (at origin, offset to its placed position once the IFC resolves it).
-struct PrelaidFloat<'t> {
+struct PrelaidFloat {
     side: Side,
     mw: f32,
     mh: f32,
     ml: f32,
     mt: f32,
-    frag: Frag<'t>,
+    frag: Frag,
     anchors: Vec<(NodeId, f32)>,
 }
 
@@ -4572,21 +4609,21 @@ struct PrelaidFloat<'t> {
 /// margins (the border box's offset within the margin box), and the laid
 /// border-box fragment (at origin, offset to its line spot once the IFC resolves
 /// it). `node` matches it to the IFC's `AtomBoxPlace`.
-struct PrelaidAtom<'t> {
+struct PrelaidAtom {
     node: NodeId,
     mw: f32,
     mh: f32,
     ml: f32,
     mt: f32,
     baseline: Option<f32>,
-    frag: Frag<'t>,
+    frag: Frag,
     anchors: Vec<(NodeId, f32)>,
 }
 
 /// Last line in normal-flow tree order. Atomic inline fragments are appended
 /// beside their containing line; that line already incorporates their
 /// alignment, so its baseline takes precedence over descendants' lines.
-fn inline_block_baseline(dom: &Dom, fragment: &Frag<'_>) -> Option<f32> {
+fn inline_block_baseline(dom: &Dom, fragment: &Frag) -> Option<f32> {
     if fragment.paint.float || matches!(fragment.kind, FragKind::Oof(..) | FragKind::Fixed(_))
         // CSS Align 3 preserves CSS 2's exclusion of table baselines here.
         || (fragment.node != NO_NODE && matches!(dom.effective_display(fragment.node).as_deref(), Some("table" | "inline-table")))
@@ -4616,12 +4653,12 @@ struct InlineLaid<'t> {
     lines: Vec<LineOut>,
     marks: Vec<(NodeId, usize)>,
     oofs: Vec<OofMark<'t>>,
-    float_frags: Vec<Frag<'t>>,
+    float_frags: Vec<Frag>,
     float_anchors: Vec<(NodeId, f32)>,
     /// The pre-laid content fragments of the atomic inline boxes, already
     /// positioned in the content frame (absolute, like `float_frags`) — the
     /// caller appends them to its children.
-    atom_frags: Vec<Frag<'t>>,
+    atom_frags: Vec<Frag>,
 }
 
 /// Slice one laid fragment into multi-column position (css-multicol-1): a line
@@ -4630,11 +4667,7 @@ struct InlineLaid<'t> {
 /// sliced individually (v1 — a block straddling a column break is split at line
 /// granularity, and its own background/border isn't re-drawn per slice). `shift`
 /// maps a fragment's absolute top-y to its `(dx, dy)` column offset.
-fn slice_columns<'t, F: Fn(f32) -> (f32, f32)>(
-    mut f: Frag<'t>,
-    shift: &F,
-    out: &mut Vec<Frag<'t>>,
-) {
+fn slice_columns<F: Fn(f32) -> (f32, f32)>(mut f: Frag, shift: &F, out: &mut Vec<Frag>) {
     match &f.kind {
         FragKind::Block | FragKind::TableCell(_) if !f.children.is_empty() => {
             for c in std::mem::take(&mut f.children) {

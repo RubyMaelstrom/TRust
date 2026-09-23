@@ -59,7 +59,7 @@ pub(super) fn boundary_actor(dom: &Dom, node: NodeId) -> Option<usize> {
 /// `mod.rs` then drops any boundary whose rows overlap a region/carousel band.
 pub(super) fn collect(
     dom: &super::terminal::TerminalPaintModel,
-    root: &Frag<'_>,
+    root: &Frag,
     cw: f32,
     ch: f32,
 ) -> Vec<BoundaryBox> {
@@ -72,7 +72,7 @@ pub(super) fn collect(
 
 fn walk(
     dom: &super::terminal::TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     cw: f32,
     ch: f32,
     line_rows: &std::collections::HashMap<usize, super::terminal::TerminalLinePlacement>,
@@ -109,7 +109,7 @@ fn walk(
 }
 
 fn descendant_line_rows(
-    fragment: &Frag<'_>,
+    fragment: &Frag,
     line_rows: &std::collections::HashMap<usize, super::terminal::TerminalLinePlacement>,
     output: &mut Vec<i64>,
 ) {

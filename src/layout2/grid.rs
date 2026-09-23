@@ -1945,7 +1945,7 @@ impl Flow<'_> {
         def_ch: Option<f32>,
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
-    ) -> (Vec<Frag<'t>>, f32) {
+    ) -> (Vec<Frag>, f32) {
         use super::flex::AlignItem;
         let node = b.node;
         let cv = |p: &str| self.dom.computed_value_resolved(node, p);
@@ -1995,7 +1995,7 @@ impl Flow<'_> {
         let align_items = self_align(cv("align-items").as_deref(), AlignItem::Stretch);
         struct GItem<'t> {
             it: &'t BoxNode,
-            frag: Frag<'t>,
+            frag: Frag,
             anchors: Vec<(NodeId, f32)>,
             m: [f32; 4],
             auto: [bool; 4],
@@ -2270,7 +2270,7 @@ impl Flow<'_> {
         }
 
         // ---- finalize: vertical alignment within row areas, translate ----
-        let mut frags: Vec<Frag<'t>> = Vec::with_capacity(gitems.len());
+        let mut frags: Vec<Frag> = Vec::with_capacity(gitems.len());
         for (g, p) in gitems.iter_mut().zip(&placed) {
             let area_y = row_y[p.rows.start];
             let last = p.rows.end - 1;

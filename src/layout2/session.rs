@@ -21,10 +21,10 @@ pub(crate) struct LayoutWork {
     pub tree_builds: usize,
 }
 
-pub(super) struct FragmentLayout<'t> {
-    pub root: flow::Frag<'t>,
-    pub fixed: Vec<flow::Frag<'t>>,
-    pub top_layer: Vec<flow::TopFrag<'t>>,
+pub(super) struct FragmentLayout {
+    pub root: flow::Frag,
+    pub fixed: Vec<flow::Frag>,
+    pub top_layer: Vec<flow::TopFrag>,
     pub flow_bottom: f32,
     pub anchors: Vec<(NodeId, f32)>,
     pub tracks: flow::GridTrackMap,
@@ -36,15 +36,43 @@ pub(super) struct FragmentLayout<'t> {
 /// terminal adapter mutates only its private working copy when windowing it.
 #[derive(Debug)]
 pub(crate) struct LayoutFragments {
-    pub(super) root: flow::Frag<'static>,
-    pub(super) fixed: Vec<flow::Frag<'static>>,
-    pub(super) top_layer: Vec<flow::TopFrag<'static>>,
+    pub(super) root: flow::Frag,
+    pub(super) fixed: Vec<flow::Frag>,
+    pub(super) top_layer: Vec<flow::TopFrag>,
     pub(super) flow_bottom: f32,
     pub(super) viewport: Viewport,
     pub(super) anchors: Vec<(NodeId, f32)>,
 }
 
 impl LayoutFragments {
+    /// The canonical measurement transaction transfers its finished output
+    /// directly to shared ownership. CSSOM and paint consume the same tree;
+    /// retaining a result does not recursively copy it.
+    pub(super) fn from_owned(
+        root: flow::Frag,
+        fixed: Vec<flow::Frag>,
+        top_layer: Vec<flow::TopFrag>,
+        flow_bottom: f32,
+        viewport: Viewport,
+        anchors: Vec<(NodeId, f32)>,
+    ) -> Option<Arc<Self>> {
+        (flow::positioned_complete(&root)
+            && fixed.iter().all(flow::positioned_complete)
+            && top_layer
+                .iter()
+                .all(|top| flow::positioned_complete(&top.fragment)))
+        .then(|| {
+            Arc::new(Self {
+                root,
+                fixed,
+                top_layer,
+                flow_bottom,
+                viewport,
+                anchors,
+            })
+        })
+    }
+
     pub(crate) fn single_border_box(&self, node: NodeId) -> Option<PxRect> {
         measure::single_border_box(&self.root, &self.fixed, &self.top_layer, node)
     }
@@ -62,9 +90,9 @@ impl LayoutFragments {
     }
 
     pub(super) fn retain(
-        root: &flow::Frag<'_>,
-        fixed: &[flow::Frag<'_>],
-        top_layer: &[flow::TopFrag<'_>],
+        root: &flow::Frag,
+        fixed: &[flow::Frag],
+        top_layer: &[flow::TopFrag],
         flow_bottom: f32,
         viewport: Viewport,
         anchors: &[(NodeId, f32)],
@@ -94,10 +122,12 @@ impl LayoutFragments {
     /// Requested-storage lower bound for the host memory inventory. Shaping
     /// and link internals are opaque here, and reported as such by the caller.
     pub(crate) fn retained_bytes(&self) -> usize {
-        fn fragment(frag: &flow::Frag<'_>) -> usize {
-            let mut bytes = frag.children.capacity() * std::mem::size_of::<flow::Frag<'_>>();
+        fn fragment(frag: &flow::Frag) -> usize {
+            let mut bytes = frag.children.capacity() * std::mem::size_of::<flow::Frag>();
             match &frag.kind {
                 flow::FragKind::Line(line) => {
+                    bytes +=
+                        std::mem::size_of::<flow::LineFrag>() + 2 * std::mem::size_of::<usize>();
                     bytes += (line.pieces.capacity() + line.atom_boxes.capacity())
                         * std::mem::size_of::<inline::Piece>();
                     for piece in line.pieces.iter().chain(&line.atom_boxes) {
@@ -119,8 +149,8 @@ impl LayoutFragments {
             bytes + frag.children.iter().map(fragment).sum::<usize>()
         }
         std::mem::size_of::<Self>()
-            + self.fixed.capacity() * std::mem::size_of::<flow::Frag<'_>>()
-            + self.top_layer.capacity() * std::mem::size_of::<flow::TopFrag<'_>>()
+            + self.fixed.capacity() * std::mem::size_of::<flow::Frag>()
+            + self.top_layer.capacity() * std::mem::size_of::<flow::TopFrag>()
             + self.anchors.capacity() * std::mem::size_of::<(NodeId, f32)>()
             + fragment(&self.root)
             + self.fixed.iter().map(fragment).sum::<usize>()
@@ -142,9 +172,8 @@ pub(crate) fn layout_pass_count() -> usize {
     PASSES.with(std::cell::Cell::get)
 }
 
-/// Keep the transient box tree alive until the consumer has finished with its
-/// fragments. Even an unresolved out-of-flow placeholder keeps the original
-/// borrowed full-layout path; inability to retain must never omit content.
+/// Settle style and layout once. Deferred positioned children retain their
+/// immutable input boxes until the containing-block pass resolves them.
 pub(super) fn with_layout<R>(
     dom: &Dom,
     base: &Url,
@@ -152,13 +181,13 @@ pub(super) fn with_layout<R>(
     forms: &[Form],
     controls: &ControlMap,
     images: &ImageSizes,
-    finish: impl FnOnce(Option<FragmentLayout<'_>>) -> R,
+    finish: impl FnOnce(Option<FragmentLayout>) -> R,
 ) -> R {
+    let _profile = diagnostics::Session::start();
     let vp = Vp {
         w: viewport.width,
         h: viewport.height,
     };
-    let queries = dom.has_container_queries();
     let reuse = dom
         .layout_cache
         .borrow_mut()
@@ -197,7 +226,7 @@ pub(super) fn with_layout<R>(
         work.passes += 1;
         #[cfg(test)]
         PASSES.with(|count| count.set(count.get() + 1));
-        if queries && pass < 64 {
+        if dom.style_depends_on_layout() && pass < 64 {
             let mut sizes = rustc_hash::FxHashMap::default();
             collect_container_sizes(dom, &frag, &mut sizes);
             for frag in &fixed {
@@ -230,7 +259,7 @@ pub(super) fn with_layout<R>(
 
 fn collect_container_sizes(
     dom: &Dom,
-    frag: &flow::Frag<'_>,
+    frag: &flow::Frag,
     sizes: &mut rustc_hash::FxHashMap<NodeId, [f32; 2]>,
 ) {
     if let Some(mut size) = frag.content_size {
