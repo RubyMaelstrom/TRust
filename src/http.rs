@@ -7871,6 +7871,10 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
         }
         "textarea" => {
             let value = dom.text_content(id);
+            // HTML §4.10.11.3: the hint belongs to the textarea's placeholder
+            // attribute. Keep it in the presentation field while the value is
+            // empty so the graphical control paints the authored hint.
+            label = dom.attr(id, "placeholder").unwrap_or("").to_string();
             return Some(Field {
                 name,
                 default_value: value.clone(),
@@ -9633,6 +9637,85 @@ mod tests {
                 pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220 && pixel[3] > 0
             })
         );
+    }
+
+    #[test]
+    fn textarea_placeholder_and_focused_paint_keep_the_authored_control() {
+        // HTML §4.10.11.3 presents the textarea hint while its value is empty.
+        // Focusing it must retain its CSS surface and paint edits in that box.
+        let base = Url::parse("https://example.test/chat").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<body><form><textarea id=prompt placeholder="Ask anything"
+                style="background:#242424;color:white;width:300px;height:52px"></textarea></form></body>"#,
+        );
+        let prompt = dom.get_by_id("prompt").unwrap();
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let &(form, field) = rendered.controls.get(&prompt).unwrap();
+        let control = &rendered.forms[form].fields[field];
+        assert_eq!(control.label, "Ask anything");
+        assert_eq!(control.visual_label(), "Ask anything");
+        let presentation = rendered.rich_editors.get(&prompt).unwrap();
+        assert!(presentation.native_input.is_none());
+        let mut paint = rendered.layout.paint.primitives.clone();
+        assert!(paint.iter().any(|command| matches!(command,
+            crate::render::DisplayCommand::GlyphRun { node, shaped, .. }
+            if *node == prompt && shaped.text.contains("Ask anything"))));
+        let bounds = rendered.layout.boxes[&prompt];
+        assert!(crate::render::paint_pending_editor_text(
+            &mut paint,
+            "Hello",
+            crate::render::CssRect::new(
+                bounds.left as f32,
+                bounds.top as f32,
+                bounds.width as f32,
+                bounds.height as f32,
+            ),
+            presentation,
+        ));
+        assert!(paint.iter().any(|command| matches!(command,
+            crate::render::DisplayCommand::GlyphRun { node, shaped, .. }
+            if *node == prompt && shaped.text.contains("Hello"))));
+        assert!(!paint.iter().any(|command| matches!(command,
+            crate::render::DisplayCommand::GlyphRun { node, shaped, .. }
+            if *node == prompt && shaped.text.contains("Ask anything"))));
+
+        // The same authored surface must survive focus when no hint or value
+        // produced a glyph run during layout.
+        let blank = crate::dom::Dom::parse_document(
+            "<body><textarea id=blank style='padding:7px;background:#242424'></textarea></body>",
+        );
+        let id = blank.get_by_id("blank").unwrap();
+        let rendered = render_arena(
+            &blank,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let presentation = rendered.rich_editors.get(&id).unwrap();
+        assert!(presentation.native_input.is_none());
+        assert!(presentation.origin.x >= 7.0);
+        let bounds = rendered.layout.boxes[&id];
+        let mut paint = rendered.layout.paint.primitives.clone();
+        assert!(crate::render::paint_pending_editor_text(
+            &mut paint,
+            "Hello",
+            crate::render::CssRect::new(
+                bounds.left as f32,
+                bounds.top as f32,
+                bounds.width as f32,
+                bounds.height as f32,
+            ),
+            presentation,
+        ));
     }
 
     #[test]
@@ -13347,6 +13430,7 @@ mod tests {
                 .ok()
                 .or_else(|| expected_html.clone());
         let requested_click = std::env::var("TRUST_BROWSER_GATE_CLICK").ok();
+        let requested_type = std::env::var("TRUST_BROWSER_GATE_TYPE").ok();
         let unexpected_html = std::env::var("TRUST_BROWSER_GATE_EXPECT_HTML_NOT_CONTAINS").ok();
         let expect_no_errors = std::env::var_os("TRUST_BROWSER_GATE_EXPECT_NO_ERRORS").is_some();
         let viewport: (u16, u16) = std::env::var("TRUST_DIAG_VP")
@@ -13359,9 +13443,21 @@ mod tests {
             .unwrap_or((200, 50));
         let url = parse_url(&target).expect("browser workload URL is absolute");
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        let response = fetch(&Request::get(url))
+        // A captured HTML response keeps live-site acceptance reproducible
+        // when the origin rate-limits navigation. Subresources still resolve
+        // against the original URL and use the real network policy.
+        let fixture = std::env::var("TRUST_BROWSER_GATE_FIXTURE").ok();
+        let request_url = fixture.as_deref().map_or_else(
+            || url.clone(),
+            |path| Url::from_file_path(path).expect("workload fixture path is absolute"),
+        );
+        let mut response = fetch(&Request::get(request_url))
             .await
             .expect("workload fetch succeeds");
+        if fixture.is_some() {
+            response.url = url;
+            response.content_type = String::from("text/html");
+        }
         let mut response = execute_js(response, viewport, (8, 16), Default::default()).await;
         let mut html = String::from_utf8_lossy(&response.body).into_owned();
         let mut rendered = response.rendered.take().map(|rendered| *rendered);
@@ -13494,6 +13590,82 @@ mod tests {
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
+            }
+
+            if let Some(text) = requested_type.as_deref() {
+                let control_name =
+                    std::env::var("TRUST_BROWSER_GATE_TYPE_INTO").unwrap_or_default();
+                let target = rendered
+                    .as_ref()
+                    .and_then(|page| {
+                        page.semantics.nodes.iter().find(|node| {
+                            node.dom_node.is_some()
+                                && matches!(
+                                    node.role,
+                                    crate::accessibility::Role::TextInput
+                                        | crate::accessibility::Role::Textarea
+                                )
+                                && node.name.contains(&control_name)
+                        })
+                    })
+                    .unwrap_or_else(|| panic!("{host} has no editable {control_name:?}"));
+                let node = target.dom_node.unwrap();
+                eprintln!(
+                    "BROWSER_GATE typing {text:?} into {:?} at node {node}",
+                    target.name
+                );
+                live.handle
+                    .cmds
+                    .send(crate::js::PageCmd::Focus(Some(node)))
+                    .await
+                    .unwrap();
+                for character in text.chars() {
+                    let input = crate::core::KeyInput {
+                        key: crate::core::Key::Character(character.to_string()),
+                        code: format!("Key{}", character.to_ascii_uppercase()),
+                        location: 0,
+                        state: crate::core::KeyState::Pressed,
+                        modifiers: Default::default(),
+                        repeat: false,
+                        composing: false,
+                    };
+                    let command = if target.role == crate::accessibility::Role::Textarea {
+                        crate::js::PageCmd::EditKey {
+                            node,
+                            input,
+                            text: Some(character.to_string()),
+                        }
+                    } else {
+                        crate::js::PageCmd::Key { node: None, input }
+                    };
+                    live.handle.cmds.send(command).await.unwrap();
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while !html.contains(text) && std::time::Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match tokio::time::timeout(remaining, live.events.recv()).await {
+                        Ok(Some(crate::js::PageEvt::Updated {
+                            html: updated,
+                            mut outcome,
+                        })) => {
+                            updates += 1;
+                            html = updated;
+                            if let Some(next) = outcome.rendered.take() {
+                                rendered = Some(*next);
+                            }
+                            errors.extend(outcome.errors);
+                        }
+                        Ok(Some(crate::js::PageEvt::Trouble(mut trouble))) => {
+                            errors.append(&mut trouble);
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                assert!(
+                    html.contains(text),
+                    "{host} did not insert {text:?}; errors={errors:#?}"
+                );
             }
 
             // Drive a named control through the same canonical actor node used by the
@@ -13642,6 +13814,19 @@ mod tests {
         if let Ok(path) = std::env::var("TRUST_BROWSER_GATE_OUT") {
             std::fs::write(&path, html.as_bytes()).expect("write browser gate snapshot");
             eprintln!("BROWSER_GATE snapshot={}B -> {path}", html.len());
+        }
+        if let Ok(path) = std::env::var("TRUST_BROWSER_GATE_PNG") {
+            let page = rendered
+                .as_ref()
+                .expect("browser gate has graphical layout");
+            let viewport = crate::core::CssSize::new(
+                f32::from(viewport.0) * 8.0,
+                f32::from(viewport.1) * 16.0,
+            );
+            let frame = crate::render::headless::render_paint(&page.layout.paint, viewport)
+                .expect("rasterize browser gate paint");
+            crate::render::headless::write_png(&frame, &path).expect("write browser gate PNG");
+            eprintln!("BROWSER_GATE PNG -> {path}");
         }
         if let Some(expected_html) = expected_html {
             assert!(

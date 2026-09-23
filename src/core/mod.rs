@@ -598,6 +598,10 @@ pub struct BrowserController {
     /// Default-action results for keyboard events delivered to the resident
     /// page. Native frontends consume these after the actor runs `keydown`.
     page_key_defaults: VecDeque<bool>,
+    /// Latest focused-area transition from the resident HTML actor. The
+    /// outer Option distinguishes a blur from no new focus event.
+    pending_page_focus: Option<Option<usize>>,
+    page_editable_state: Option<crate::js::EditableState>,
     pending_form_values: std::collections::HashMap<usize, usize>,
     /// Preserve native input FIFO while the actor's bounded channel is full.
     pending_user_input: VecDeque<(crate::js::PageCmd, bool)>,
@@ -637,6 +641,7 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::PointerLock { .. } => "PointerLock",
         crate::js::PageEvt::Trouble(_) => "Trouble",
         crate::js::PageEvt::Settled => "Settled",
+        crate::js::PageEvt::Focused { .. } => "Focused",
         _ => "Other",
     }
 }
@@ -663,6 +668,8 @@ impl BrowserController {
             render_is_final: false,
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
+            pending_page_focus: None,
+            page_editable_state: None,
             pending_form_values: Default::default(),
             pending_user_input: VecDeque::new(),
             user_input_retry: None,
@@ -811,6 +818,16 @@ impl BrowserController {
     /// or Enter in a formless input); `false` allows editing/submission.
     pub fn take_page_key_default(&mut self) -> Option<bool> {
         self.page_key_defaults.pop_front()
+    }
+
+    pub fn take_page_focus(&mut self) -> Option<Option<usize>> {
+        self.pending_page_focus.take()
+    }
+
+    pub fn page_editable_state(&self, node: usize) -> Option<&crate::js::EditableState> {
+        self.page_editable_state
+            .as_ref()
+            .filter(|state| state.node == node)
     }
 
     /// Whether a native value is still ahead of the actor's canonical DOM.
@@ -2525,6 +2542,8 @@ impl BrowserController {
         http::prune_idle_connections();
         self.pending_live_submit = None;
         self.page_key_defaults.clear();
+        self.pending_page_focus = None;
+        self.page_editable_state = None;
         self.pending_form_values.clear();
         if let Some(task) = self.live_task.take() {
             task.abort();
@@ -2754,6 +2773,15 @@ impl BrowserController {
             PageEvt::KeyDefault { prevented } => {
                 self.page_key_defaults.push_back(prevented);
                 false
+            }
+            PageEvt::Focused { node } => {
+                self.pending_page_focus = Some(node);
+                true
+            }
+            PageEvt::EditableState(state) => {
+                let changed = self.page_editable_state != state;
+                self.page_editable_state = state;
+                changed
             }
             PageEvt::FormValueApplied { node } => {
                 let Some(pending) = self.pending_form_values.get_mut(&node) else {
@@ -4061,6 +4089,18 @@ mod tests {
         assert_eq!(browser.take_page_key_default(), Some(true));
         assert_eq!(browser.take_page_key_default(), Some(false));
         assert_eq!(browser.take_page_key_default(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focused_page_event_preserves_blur_distinct_from_no_change() {
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640.0, 480.0));
+        assert_eq!(browser.take_page_focus(), None);
+        browser.handle_page_event(crate::js::PageEvt::Focused { node: Some(42) });
+        assert_eq!(browser.take_page_focus(), Some(Some(42)));
+        assert_eq!(browser.take_page_focus(), None);
+        browser.handle_page_event(crate::js::PageEvt::Focused { node: None });
+        assert_eq!(browser.take_page_focus(), Some(None));
     }
 
     #[tokio::test(flavor = "current_thread")]
