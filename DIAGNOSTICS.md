@@ -411,7 +411,34 @@ Both binaries support `-h`/`--help`.
 | `TRUST_LAYOUT_TRACE` | presence flag | Prints graphical layout stage timing from `layout2::lay_out_graphical`. |
 | `TRUST_FRAG_DIAG` | presence flag | Dumps the resolved graphical fragment tree (tag, position, size, and clip). Used with `layout_dump` for layout/paint discrepancies. |
 | `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
+| `TRUST_UA_FIREFOX` | affirmative value (`1`, `true`, `yes`, `on`) | Replaces TRust's `TRust/0.1` User-Agent with Firefox's current one (`Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0`) for diagnostics. Selection happens once per process, so the header on every HTTP/1.1, HTTP/2 and HTTP/3 request, fetch/XHR, WebSocket handshake and download matches `navigator.userAgent` in the page, every frame and every worker; HTML's `navigator.appVersion` then derives as `5.0 (X11)`. Prints one stderr line naming the active string. Nothing else about the request changes: `Accept`, `Accept-Language`, Fetch Metadata `Sec-*` and `Sec-GPC` keep TRust's own values. Unset, empty or `0` keeps TRust's User-Agent. |
 | `TRUST_TRACE_PAGE_EVENTS` | presence flag | Prints a `[trace-event] <variant>` line to stderr for every page event the shared controller handles (`Updated`, `Static`, `Patched`, `Trouble`, navigation/settle events). Useful for proving which render path a page reached and in what order. |
+
+#### A/B-testing a site's User-Agent gate
+
+Sites sometimes gate features on the `User-Agent` string. Compare TRust's own
+string with Firefox's on the same navigation:
+
+```sh
+target/release/trust https://example.org/                      # TRust/0.1
+TRUST_UA_FIREFOX=1 target/release/trust https://example.org/   # Firefox/153.0
+```
+
+The enabled form prints `TRUST_UA_FIREFOX: diagnostics report Firefox's
+User-Agent: ...` once to stderr, and `navigator.userAgent` in the page agrees
+with the header. The conformance tests for both halves are:
+
+```sh
+cargo test --lib -- firefox_user_agent_diagnostic_is_opt_in one_user_agent_header_describes_both_wire_and_scripts
+cargo test --lib -- navigator_user_agent_and_appversion_follow_the_environment_value
+```
+
+The replacement is the reduced User-Agent Firefox sends by default (Firefox 100
+onward), read from the locally installed Firefox 153 build: its platform
+fragment, `rv:` and product tokens. To imitate a newer Firefox, update the
+`FIREFOX_USER_AGENT` constant in `src/http.rs`; do not extend the diagnostic to
+Firefox's `Accept`, `Sec-*`, or plugin-flavoured metadata, which stays TRust's
+own by design.
 
 ### Lumen diagnostics
 

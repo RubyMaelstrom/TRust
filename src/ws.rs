@@ -383,7 +383,7 @@ async fn handshake(
          User-Agent: {ua}\r\n\
          Accept-Language: {accept_language}\r\n\
          Origin: {origin}\r\n",
-        ua = crate::http::USER_AGENT,
+        ua = crate::http::user_agent(),
         accept_language = crate::locale::ACCEPT_LANGUAGE,
     );
     if crate::http::GLOBAL_PRIVACY_CONTROL {
