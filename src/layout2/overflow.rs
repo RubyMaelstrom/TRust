@@ -86,7 +86,7 @@ impl Edge {
 }
 
 impl ScrollAreas {
-    pub fn new(dom: &Dom, root: &Frag<'_>) -> Self {
+    pub fn new(dom: &Dom, root: &Frag) -> Self {
         let mut result = Self::default();
         let mut escaping = Vec::new();
         let edge = result.walk(
@@ -100,14 +100,14 @@ impl ScrollAreas {
         result
     }
 
-    pub fn extend(&mut self, dom: &Dom, root: &Frag<'_>) {
+    pub fn extend(&mut self, dom: &Dom, root: &Frag) {
         self.walk(dom, root, None, true, &mut Vec::new());
     }
 
     fn walk(
         &mut self,
         dom: &Dom,
-        f: &Frag<'_>,
+        f: &Frag,
         viewport_source: Option<NodeId>,
         root: bool,
         escaping: &mut Vec<(bool, Edge)>,

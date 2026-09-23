@@ -447,9 +447,9 @@ pub(crate) struct PaintOut {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     dom: &TerminalPaintModel,
-    root: &mut Frag<'_>,
-    fixed: &[Frag<'_>],
-    top_layer: &[TopFrag<'_>],
+    root: &mut Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
     flow_bottom: f32,
     anchors: &[(NodeId, f32)],
     viewport: (usize, usize),
@@ -631,7 +631,7 @@ pub(crate) fn paint(
 /// view. Descendants may overflow back into the viewport from any side.
 fn paint_pinned(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     viewport: (usize, usize),
     cell_w: f32,
     cell_h: f32,
@@ -692,7 +692,7 @@ fn paint_pinned(
 
 fn collect_inset_bounds(
     dom: &TerminalPaintModel,
-    fragment: &Frag<'_>,
+    fragment: &Frag,
     out: &mut HashMap<NodeId, Clip>,
 ) {
     if let Some(inset) = dom
@@ -718,7 +718,7 @@ fn collect_inset_bounds(
 
 fn apply_inset_bounds(
     dom: &TerminalPaintModel,
-    fragment: &mut Frag<'_>,
+    fragment: &mut Frag,
     bounds: &HashMap<NodeId, Clip>,
     inherited: Option<Clip>,
     boundary: Option<NodeId>,
@@ -745,7 +745,7 @@ fn apply_inset_bounds(
 /// `z-index:auto/0` box before a later positioned sibling paints below that
 /// sibling; it is not an always-on-top layer merely because its coordinates
 /// are viewport-relative.
-fn fixed_under_document(root: &Frag<'_>, fixed_len: usize) -> Vec<bool> {
+fn fixed_under_document(root: &Frag, fixed_len: usize) -> Vec<bool> {
     let mut under = vec![false; fixed_len];
     let mut negative = Vec::new();
     let mut zero = Vec::new();
@@ -796,7 +796,7 @@ fn fixed_under_document(root: &Frag<'_>, fixed_len: usize) -> Vec<bool> {
 #[allow(clippy::too_many_arguments)]
 fn extract_scrollers(
     dom: &TerminalPaintModel,
-    f: &mut Frag<'_>,
+    f: &mut Frag,
     cw: f32,
     ch: f32,
     ox: f32,
@@ -864,7 +864,7 @@ fn extract_scrollers(
 /// Whether `f` is a horizontal scroll strip: an `overflow-x: auto|scroll`
 /// element (CSS Overflow L3 §2) whose content overflows its padding box to the
 /// right (there is scrollable overflow to window). Not the document root.
-fn is_carousel(dom: &TerminalPaintModel, f: &Frag<'_>, cw: f32) -> bool {
+fn is_carousel(dom: &TerminalPaintModel, f: &Frag, cw: f32) -> bool {
     if f.node == NO_NODE || matches!(dom.tag_name(f.node), Some("html" | "body")) {
         return false;
     }
@@ -884,7 +884,7 @@ fn is_carousel(dom: &TerminalPaintModel, f: &Frag<'_>, cw: f32) -> bool {
 /// `<pre><code>` code block, `white-space:pre` text — a horizontal scroll strip
 /// (CSS Overflow L3 §2 scrollable overflow), not only a row of overflowing
 /// child boxes.
-fn content_right_px(f: &Frag<'_>, _cw: f32) -> f32 {
+fn content_right_px(f: &Frag, _cw: f32) -> f32 {
     f.children
         .iter()
         .map(|c| match &c.kind {
@@ -911,7 +911,7 @@ fn content_right_px(f: &Frag<'_>, _cw: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn paint_carousel(
     dom: &TerminalPaintModel,
-    f: &mut Frag<'_>,
+    f: &mut Frag,
     cw: f32,
     ch: f32,
     ox: f32,
@@ -1009,7 +1009,7 @@ pub(crate) fn region_buffer(
     dom: &Dom,
     base: &url::Url,
     controls: &super::ControlMap,
-    root: &mut Frag<'_>,
+    root: &mut Frag,
     cw: f32,
     ch: f32,
 ) -> RegionBuffer {
@@ -1055,7 +1055,7 @@ pub(crate) fn region_buffer(
 /// descendant — however many, however deep — is its own bounded region,
 /// scrolled independently (hover + wheel), same as a real browser's own
 /// nested scrollports.
-fn is_scroll_region(dom: &TerminalPaintModel, f: &Frag<'_>) -> bool {
+fn is_scroll_region(dom: &TerminalPaintModel, f: &Frag) -> bool {
     if f.node == NO_NODE || matches!(dom.tag_name(f.node), Some("html" | "body")) {
         return false;
     }
@@ -1084,7 +1084,7 @@ fn is_scroll_region(dom: &TerminalPaintModel, f: &Frag<'_>) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn paint_region(
     dom: &TerminalPaintModel,
-    f: &mut Frag<'_>,
+    f: &mut Frag,
     cw: f32,
     ch: f32,
     ox: f32,
@@ -1182,7 +1182,7 @@ fn paint_region(
 }
 
 /// Topmost row each element's fragment reaches, over the whole tree.
-fn collect_node_rows(f: &Frag<'_>, cell_h: f32, out: &mut HashMap<NodeId, usize>) {
+fn collect_node_rows(f: &Frag, cell_h: f32, out: &mut HashMap<NodeId, usize>) {
     if f.node != NO_NODE {
         let row = ((f.y / cell_h).round() as i64).max(0) as usize;
         out.entry(f.node)
@@ -1345,7 +1345,7 @@ enum Op {
 /// visibility, inertness and pointer-events are the remaining eligibility
 /// filters. Opacity deliberately does not participate.
 fn hit_op(
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,
@@ -1398,7 +1398,7 @@ pub(crate) struct TerminalLinePlacement {
 
 pub(crate) fn line_row_map(
     dom: &TerminalPaintModel,
-    root: &Frag<'_>,
+    root: &Frag,
     ox: f32,
     oy: f32,
     cell_w: f32,
@@ -1406,8 +1406,8 @@ pub(crate) fn line_row_map(
     columns: usize,
 ) -> HashMap<usize, TerminalLinePlacement> {
     #[derive(Clone, Copy)]
-    struct LineEntry<'a, 'tree> {
-        line: &'a Frag<'tree>,
+    struct LineEntry<'a> {
+        line: &'a Frag,
         positioned: bool,
         containing_right: Option<f32>,
         horizontal_item: bool,
@@ -1439,11 +1439,11 @@ pub(crate) fn line_row_map(
         reflowed: bool,
     }
 
-    fn collect<'a, 'tree>(
+    fn collect<'a>(
         dom: &TerminalPaintModel,
-        fragment: &'a Frag<'tree>,
+        fragment: &'a Frag,
         state: CollectState,
-        lines: &mut Vec<LineEntry<'a, 'tree>>,
+        lines: &mut Vec<LineEntry<'a>>,
     ) {
         if matches!(fragment.kind, FragKind::Line(_)) {
             lines.push(LineEntry {
@@ -1866,7 +1866,7 @@ fn terminal_text_chunk(text: &str, max_cells: usize) -> (String, String) {
 /// without treating a proportional CSS line-box boundary as a forced break.
 #[allow(clippy::too_many_arguments)]
 fn terminal_line_extent(
-    line: &Frag<'_>,
+    line: &Frag,
     ox: f32,
     cell_w: f32,
     cell_h: f32,
@@ -1967,7 +1967,7 @@ fn terminal_line_extent(
 }
 
 fn terminal_line_span(
-    line: &Frag<'_>,
+    line: &Frag,
     ox: f32,
     cell_w: f32,
     cell_h: f32,
@@ -2103,7 +2103,7 @@ fn terminal_line_span(
 #[allow(clippy::too_many_arguments)]
 fn build_sc(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,
@@ -2118,9 +2118,9 @@ fn build_sc(
     fill_op(dom, f, ops, cw, ch, ox, oy);
     // Gather this SC's positioned/SC descendants (piercing pseudo-stacking
     // contexts — their positioned descendants belong to THIS context).
-    let mut neg: Vec<&Frag<'_>> = Vec::new();
-    let mut zero: Vec<(&Frag<'_>, bool)> = Vec::new(); // (frag, is_real_sc)
-    let mut pos: Vec<&Frag<'_>> = Vec::new();
+    let mut neg: Vec<&Frag> = Vec::new();
+    let mut zero: Vec<(&Frag, bool)> = Vec::new(); // (frag, is_real_sc)
+    let mut pos: Vec<&Frag> = Vec::new();
     collect_positioned(f, &mut neg, &mut zero, &mut pos);
     neg.sort_by_key(|c| c.paint.z.unwrap_or(0)); // stable: tree order within z
     pos.sort_by_key(|c| c.paint.z.unwrap_or(0));
@@ -2167,7 +2167,7 @@ fn build_sc(
 #[allow(clippy::too_many_arguments)]
 fn build_pseudo(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,
@@ -2193,7 +2193,7 @@ fn build_pseudo(
 #[allow(clippy::too_many_arguments)]
 fn build_floats(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,
@@ -2221,11 +2221,11 @@ fn build_floats(
 /// Bucket the positioned/SC descendants of `f` by stack level, descending
 /// through in-flow boxes AND pseudo-stacking-contexts (whose positioned
 /// descendants participate here), never into real SCs (atomic).
-fn collect_positioned<'f, 't>(
-    f: &'f Frag<'t>,
-    neg: &mut Vec<&'f Frag<'t>>,
-    zero: &mut Vec<(&'f Frag<'t>, bool)>,
-    pos: &mut Vec<&'f Frag<'t>>,
+fn collect_positioned<'f>(
+    f: &'f Frag,
+    neg: &mut Vec<&'f Frag>,
+    zero: &mut Vec<(&'f Frag, bool)>,
+    pos: &mut Vec<&'f Frag>,
 ) {
     for c in &f.children {
         if c.paint.sc {
@@ -2251,7 +2251,7 @@ fn collect_positioned<'f, 't>(
 #[allow(clippy::too_many_arguments)]
 fn inflow_bgs(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,
@@ -2277,7 +2277,7 @@ fn inflow_bgs(
 #[allow(clippy::too_many_arguments)]
 fn inflow_content(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,
@@ -2762,7 +2762,7 @@ fn zero_alpha_color(color: &str) -> bool {
 /// The opaque background fill of a fragment's border box, when it has one.
 fn fill_op(
     dom: &TerminalPaintModel,
-    f: &Frag<'_>,
+    f: &Frag,
     ops: &mut Vec<Op>,
     cw: f32,
     ch: f32,

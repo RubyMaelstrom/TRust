@@ -743,6 +743,26 @@ impl Dom {
     }
 
     fn invalidate_layout_ancestors(&mut self, node: NodeId) {
+        if !self.shadow_roots.is_empty() {
+            // CSS Shadow 1 #flattening: a slottable changes the formatting
+            // path through its slot as well as its light-DOM host. Follow both
+            // chains, including nested/forwarding slots, once per ancestor.
+            let mut pending = vec![node];
+            let mut visited = FxHashSet::default();
+            while let Some(id) = pending.pop() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                self.layout_cache.get_mut().invalidate(id);
+                self.box_tree_cache.get_mut().invalidate(id);
+                pending.extend(
+                    [self.parent_composed(id), self.parent_flat(id)]
+                        .into_iter()
+                        .flatten(),
+                );
+            }
+            return;
+        }
         let mut next = Some(node);
         while let Some(id) = next {
             self.layout_cache.get_mut().invalidate(id);
@@ -971,12 +991,22 @@ impl Dom {
     /// Character data / replace-all of text children leaves the element tree
     /// intact. Selectors 4 :empty is relevant only when its truth value changes;
     /// directionality/state and shadow distribution keep the broad fallback.
-    pub(super) fn touch_text(&mut self, parent: NodeId, empty_changed: bool) {
-        let independent = !self.shadow_style_dependencies(parent) && {
+    /// `character_data` identifies an existing Text node, whose slot assignment
+    /// cannot change merely because its data changes (DOM #find-slotables).
+    pub(super) fn touch_text(
+        &mut self,
+        parent: NodeId,
+        empty_changed: bool,
+        direction_changed: bool,
+        character_data: Option<NodeId>,
+    ) {
+        let stable_shadow_text = character_data.is_some() && !empty_changed && !direction_changed;
+        let independent = (!self.shadow_style_dependencies(parent) || stable_shadow_text) && {
             let index = self.style_cache.borrow();
             index.as_ref().is_some_and(|(epoch, index)| {
                 *epoch == self.style_epoch
-                    && !(index.selector_dependencies.text_direction
+                    && !(direction_changed
+                        && index.selector_dependencies.text_direction
                         && self.text_may_change_direction(parent))
                     && !(index.selector_dependencies.text_placeholder
                         && self.tag_name(parent) == Some("textarea"))
@@ -992,10 +1022,16 @@ impl Dom {
             // other SVG instances too, not just this element's ancestors.
             self.invalidate_svg_layout();
         }
-        self.invalidate_layout_ancestors(parent);
+        self.invalidate_layout_ancestors(character_data.unwrap_or(parent));
         self.mark_dom_revision();
         self.dirty_nodes.push((parent, DirtyKind::Content));
-        self.record_geometry_dirty(parent, DirtyKind::Content);
+        // CSS Lists 3 #inheriting-counters / Content 3 #quote-values:
+        // counters and quote depth follow elements and generated content.
+        // This text-only change preserves their tree order and styles, so
+        // unrelated counter/quote subtrees retain their layout. A subsequent
+        // container-query style change still expires layout through the query
+        // update, and the selector-dependent cases above keep the fallback.
+        self.record_local_geometry_dirty(parent, DirtyKind::Content);
     }
 
     /// Selectors 4 #the-dir-pseudo and HTML #contained-text-auto-directionality:
@@ -1637,6 +1673,42 @@ mod tests {
         assert_style_values_match_cold(&mut dom);
         dom.detach(probe);
         assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn typing_preserves_styles_until_direction_or_emptiness_changes() {
+        // HTML #text-node-directionality and Selectors 4 :dir()/:empty:
+        // changing an existing Text node leaves every element selector
+        // unchanged when its first strong direction and emptiness agree.
+        let mut dom = Dom::parse_document(
+            "<style>:dir(rtl){color:red} :dir(ltr){color:green} \
+             body:has(#editor:empty) #dependent{color:blue} \
+             p:nth-child(2 of :not(:empty)){padding:2px}</style> \
+             <div id=editor dir=auto>a</div><aside id=dependent>stable</aside>",
+        );
+        let node = dom.children(dom.get_by_id("editor").unwrap())[0];
+        for (text, unchanged) in [
+            ("ab", true),
+            ("🙂 abc אבג", true),
+            ("123 אבג", false),
+            ("مرحبا xyz", true),
+            ("123", false),
+            ("456", true),
+            ("", false),
+        ] {
+            let before = cached(&dom, "dependent");
+            dom.set_text(node, text);
+            assert_eq!(
+                std::rc::Rc::ptr_eq(&before, &cached(&dom, "dependent")),
+                unchanged,
+                "{text:?}"
+            );
+            assert_matches_full_scan(&dom);
+            assert_style_values_match_cold(&mut dom);
+        }
+        assert_eq!(text_node_directionality("\u{202a}123🙂"), None);
+        assert_eq!(text_node_directionality("\u{202a}123אa"), Some(true));
+        assert_eq!(text_node_directionality("123aא"), Some(false));
     }
 
     #[test]

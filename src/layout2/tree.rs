@@ -416,21 +416,6 @@ impl Builder<'_> {
         if matches!(tag, "iframe" | "frame") {
             return self.frame(id, disp);
         }
-        // A `<slot>` in a shadow tree is TRANSPARENT (HTML §4.8.2): it renders
-        // the host's assigned light nodes in its place, or its own fallback
-        // content when nothing is assigned. Hoisting mirrors the serializer and
-        // completes the flat tree `children` starts (host → shadow root). A bare
-        // `<slot>` outside any shadow tree has no host, so `slot_assigned_nodes`
-        // is empty and it falls back to its own children.
-        if tag == "slot" {
-            let assigned = self.dom.flat_slot_nodes(id);
-            let kids = if assigned.is_empty() {
-                self.children(id)
-            } else {
-                self.build_child_list(&assigned, false)
-            };
-            return Built::Hoist(kids);
-        }
         // Replaced elements are atomic regardless of their content model.
         if tag == "br" {
             return Built::Inline(Inline::Br);
@@ -1026,9 +1011,21 @@ impl Builder<'_> {
     fn children(&mut self, id: NodeId) -> Vec<Built> {
         let closed_details =
             self.dom.tag_name(id) == Some("details") && self.dom.attr(id, "open").is_none();
-        let child_ids = match self.dom.shadow_root(id) {
-            Some(shadow) => self.dom.children(shadow),
-            None => self.dom.children(id),
+        // CSS Shadow 1 #flattening precedes CSS Display 3 #box-generation:
+        // assigned nodes remain children when contents removes a slot's box.
+        // Keep nested slots as nodes so authored display can create a box
+        // (or suppress their subtree). Do not flatten away their styles.
+        let child_ids = if let Some(shadow) = self.dom.shadow_root(id) {
+            self.dom.children(shadow)
+        } else if self.dom.tag_name(id) == Some("slot") {
+            let assigned = self.dom.slot_assigned_nodes(id);
+            if assigned.is_empty() {
+                self.dom.children(id)
+            } else {
+                assigned
+            }
+        } else {
+            self.dom.children(id)
         };
         let mut out = self.build_child_list(&child_ids, closed_details);
         // Living pages used to gain these compact handles as synthetic HTML

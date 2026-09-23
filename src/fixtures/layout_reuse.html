@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Layout reuse acceptance</title>
+<style>
+  body { margin:16px; font:16px sans-serif; color:#172737; background:#f5f7fa }
+  main { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px }
+  section { padding:12px; border:1px solid #8094a6; background:white }
+  h2 { font-size:18px; margin:0 0 12px }
+  #nested { position:relative; min-height:80px }
+  .nest { display:grid; grid-template-columns:minmax(0,1fr) }
+  #badge { position:absolute; right:3px; bottom:5px; width:17px; height:19px; background:#076 }
+  #flow p { margin:9px 0 -3px }
+  .empty { margin:17px 0 -11px }
+  .float { float:left; width:40px; height:48px; margin-right:8px; background:#bed }
+  .clear { clear:both }
+  #query { container-type:inline-size; width:200px; border:2px solid #687 }
+  .query-child { width:20px; height:20px; background:#f93 }
+  @container (width > 250px) { .query-child { width:100px; background:#076 } }
+  @property --unit { syntax:"<length>"; inherits:true; initial-value:0px }
+  #hidden { display:none; --unit:10cqw }
+  table { width:100%; border-collapse:collapse }
+  td { border:1px solid #abc; padding:5px }
+  #result { padding:12px; background:#dfe; white-space:pre-wrap }
+</style>
+<h1>Layout reuse acceptance</h1>
+<main>
+  <section id="nested"><h2>Nested grid and deferred positioning</h2><div id="nest-root"></div></section>
+  <section id="flow"><h2>Blocks, margins and floats</h2><p id="edit" contenteditable="true">Edit this text.</p><div class="empty"></div><p>Independent sibling</p><i class="float"></i><p>Text alongside a float retains its available line width.</p><p class="clear">Cleared content</p></section>
+  <section><h2>Container queries and units</h2><div id="query"><div class="query-child" id="subject"></div><span id="hidden"></span></div></section>
+  <section><h2>Table and shadow slot</h2><table><tr><td>alpha</td><td>beta gamma</td></tr><tr><td colspan="2">spanning cell</td></tr></table><div id="host"><span id="slotted">Assigned shadow content</span></div></section>
+</main>
+<pre id="result">Running checks…</pre>
+<script>
+try {
+  const assert = (ok, message) => { if (!ok) throw Error(message); };
+  const root = document.getElementById('nest-root');
+  root.innerHTML = '<div class="nest">'.repeat(20) + '<span id="leaf">Nested content</span><i id="badge"></i>' + '</div>'.repeat(20);
+  const host = document.getElementById('host');
+  host.attachShadow({mode:'open'}).innerHTML = '<style>:host{display:block}div{display:flex;padding:7px}slot{display:contents}</style><div><slot></slot></div>';
+  const leaf = document.getElementById('leaf'), badge = document.getElementById('badge');
+  const nested = document.getElementById('nested'), edit = document.getElementById('edit');
+  const query = document.getElementById('query'), subject = document.getElementById('subject');
+  const hidden = document.getElementById('hidden');
+  const start = performance.now();
+  for (let i=0; i<20; ++i) {
+    leaf.textContent = 'Nested content ' + i;
+    edit.firstChild.data = 'Edited text ' + i;
+    assert(badge.getBoundingClientRect().width === 17, 'positioned child width');
+    const outer = nested.getBoundingClientRect(), inner = badge.getBoundingClientRect();
+    assert(Math.abs(outer.bottom - inner.bottom - 6) < .1, 'final containing block bottom');
+    query.style.width = i % 2 ? '350px' : '200px';
+    assert(subject.getBoundingClientRect().width === (i % 2 ? 100 : 20), 'query result after resize');
+    assert(parseFloat(getComputedStyle(hidden).getPropertyValue('--unit')) === (i % 2 ? 35 : 20), 'hidden registered container unit');
+  }
+  assert(document.getElementById('slotted').getBoundingClientRect().width > 0, 'slot geometry');
+  document.getElementById('result').textContent = 'LAYOUT_REUSE_OK — 20 mutation/measurement cycles\n' + (performance.now()-start).toFixed(1) + ' ms including JavaScript and synchronous CSSOM calls';
+  console.log(document.getElementById('result').textContent);
+} catch (error) {
+  document.getElementById('result').textContent = 'LAYOUT_REUSE_FAILED: ' + error.message;
+  console.error(error);
+}
+</script>

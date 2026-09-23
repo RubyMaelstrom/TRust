@@ -34,7 +34,7 @@ struct Budget {
 
 /// Returns the shortened content bottom only when a clamp point exists.
 pub(super) fn apply(
-    children: &mut [Frag<'_>],
+    children: &mut [Frag],
     max_lines: usize,
     top: f32,
     dom: &Dom,
@@ -53,7 +53,7 @@ pub(super) fn apply(
     Some(bottom)
 }
 
-fn walk(children: &mut [Frag<'_>], top: f32, budget: &mut Budget) -> f32 {
+fn walk(children: &mut [Frag], top: f32, budget: &mut Budget) -> f32 {
     let mut bottom = top;
     for fragment in children.iter_mut() {
         if matches!(fragment.kind, FragKind::Oof(..) | FragKind::Fixed(_))
@@ -111,7 +111,7 @@ fn walk(children: &mut [Frag<'_>], top: f32, budget: &mut Budget) -> f32 {
     bottom
 }
 
-fn ellipsis(children: &mut [Frag<'_>], dom: &Dom, base: &Url, inl: &InlineStyle) -> bool {
+fn ellipsis(children: &mut [Frag], dom: &Dom, base: &Url, inl: &InlineStyle) -> bool {
     for index in (0..children.len()).rev() {
         let fragment = &mut children[index];
         if fragment.flow.hidden
@@ -123,6 +123,7 @@ fn ellipsis(children: &mut [Frag<'_>], dom: &Dom, base: &Url, inl: &InlineStyle)
             continue;
         }
         if let FragKind::Line(line) = &mut fragment.kind {
+            let line = std::sync::Arc::make_mut(line);
             let old_atoms = line.atom_boxes.clone();
             super::inline::block_ellipsis(line, dom, base, inl);
             fragment.w = line.width;
@@ -151,7 +152,7 @@ fn ellipsis(children: &mut [Frag<'_>], dom: &Dom, base: &Url, inl: &InlineStyle)
     false
 }
 
-pub(super) fn clip_floats(children: &mut [Frag<'_>], bottom: f32) {
+pub(super) fn clip_floats(children: &mut [Frag], bottom: f32) {
     for fragment in children {
         if fragment.paint.float {
             fragment.flow.float_clip_end = Some(bottom - fragment.y);

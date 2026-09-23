@@ -5,9 +5,11 @@
 //! but the parent must still determine constraints, placement and baselines.
 //! DOM invalidation removes changed branches and their ancestors; unknown
 //! dependencies clear this optional cache. No DOM mutation or CSSOM flush is
-//! skipped. Unresolved out-of-flow references are never retained.
+//! skipped. Deferred positioned children own immutable box-tree nodes and are
+//! resolved only after the final containing blocks and static positions exist
+//! (CSS Positioned Layout 3 #def-cb). Never reuse resolved fixed-list indices.
 
-use super::flow::{Frag, FragKind, GridTrackMap, retain_for_paint};
+use super::flow::{Frag, FragKind, GridTrackMap};
 use super::style::{BoxStyle, InlineStyle};
 use super::tree::BoxNode;
 use super::value::{Len, Node, Vp};
@@ -23,6 +25,17 @@ const MAX_VARIANTS: usize = 8;
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Constraint {
     Intrinsic(bool),
+    /// CSS 2 §§8.3.1, 9.4.1: normal flow also depends on its incoming
+    /// collapsed margins and cursor, not just containing-block dimensions.
+    /// Only contexts with no incoming or escaping floats use this key.
+    Block {
+        x: f32,
+        width: f32,
+        height: Option<f32>,
+        y: f32,
+        positive_margin: f32,
+        negative_margin: f32,
+    },
     Item {
         width: f32,
         basis: f32,
@@ -121,9 +134,18 @@ fn len_bytes(len: &Len) -> usize {
 
 #[derive(Clone)]
 pub(super) struct Item {
-    pub fragment: Frag<'static>,
+    pub fragment: Frag,
     pub anchors: Vec<(NodeId, f32)>,
     pub tracks: GridTrackMap,
+    pub block: Option<BlockOutput>,
+}
+
+#[derive(Clone)]
+pub(super) struct BlockOutput {
+    pub y: f32,
+    pub positive_margin: f32,
+    pub negative_margin: f32,
+    pub flushes: Vec<f32>,
 }
 
 enum Value {
@@ -376,6 +398,7 @@ impl LayoutCache {
     }
 
     pub(super) fn item(&mut self, request: &Request<'_>) -> Option<Item> {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::CacheRead);
         let Value::Item(item) = self.find(request)? else {
             return None;
         };
@@ -397,7 +420,19 @@ impl LayoutCache {
             .get(&request.node.node)
             .is_some_and(|entries| entries.len() >= MAX_VARIANTS)
         {
-            self.invalidate(request.node.node);
+            // Preserve the other constraint variants. Flex/grid alternate
+            // measurement and final constraints; deleting the whole bucket
+            // on its ninth variant caused avoidable repeated layout.
+            let entries = self.entries.get_mut(&request.node.node).unwrap();
+            let oldest = entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.used)
+                .unwrap()
+                .0;
+            let removed = entries.swap_remove(oldest);
+            self.bytes -= removed.bytes;
+            self.count -= 1;
         }
         while self.count >= MAX_ENTRIES
             || self.retained_bytes() + bytes + size_of::<Entry>() > MAX_BYTES
@@ -447,22 +482,49 @@ impl LayoutCache {
     pub(super) fn store_item(
         &mut self,
         request: &Request<'_>,
-        fragment: &Frag<'_>,
+        fragment: &Frag,
         anchors: &[(NodeId, f32)],
         tracks: &GridTrackMap,
     ) {
-        fn portable(fragment: &Frag<'_>) -> bool {
-            !matches!(fragment.kind, FragKind::Oof(..) | FragKind::Fixed(_))
-                && fragment.children.iter().all(portable)
+        self.store_fragment(request, fragment, anchors, tracks, None);
+    }
+
+    pub(super) fn store_block(
+        &mut self,
+        request: &Request<'_>,
+        fragment: &Frag,
+        anchors: &[(NodeId, f32)],
+        tracks: &GridTrackMap,
+        block: BlockOutput,
+    ) {
+        self.store_fragment(request, fragment, anchors, tracks, Some(block));
+    }
+
+    fn store_fragment(
+        &mut self,
+        request: &Request<'_>,
+        fragment: &Frag,
+        anchors: &[(NodeId, f32)],
+        tracks: &GridTrackMap,
+        block: Option<BlockOutput>,
+    ) {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::CacheWrite);
+        fn portable(fragment: &Frag) -> bool {
+            !matches!(fragment.kind, FragKind::Fixed(_)) && fragment.children.iter().all(portable)
         }
         if !portable(fragment) {
+            super::diagnostics::uncacheable();
             return;
         }
-        let Some(fragment) = retain_for_paint(fragment) else {
+        // Reject oversized results before allocating a copy. The source's
+        // Vec capacities conservatively cover the retained clone's storage.
+        let fragment_payload = fragment_bytes(fragment);
+        if fragment_payload > MAX_BYTES / 4 {
             return;
-        };
+        }
+        let fragment = fragment.clone();
         let mut retained_tracks = GridTrackMap::new();
-        fn collect(frag: &Frag<'_>, tracks: &GridTrackMap, out: &mut GridTrackMap) {
+        fn collect(frag: &Frag, tracks: &GridTrackMap, out: &mut GridTrackMap) {
             if let Some(track) = tracks.get(&frag.node) {
                 out.insert(frag.node, track.clone());
             }
@@ -475,9 +537,14 @@ impl LayoutCache {
             fragment,
             anchors: anchors.to_vec(),
             tracks: retained_tracks,
+            block,
         };
         let bytes = size_of::<Item>()
-            + fragment_bytes(&item.fragment)
+            + item
+                .block
+                .as_ref()
+                .map_or(0, |block| block.flushes.capacity() * size_of::<f32>())
+            + fragment_payload
             + item.anchors.capacity() * size_of::<(NodeId, f32)>()
             + item.tracks.capacity() * size_of::<(NodeId, (Vec<f32>, Vec<f32>))>()
             + item
@@ -489,11 +556,13 @@ impl LayoutCache {
     }
 }
 
-fn fragment_bytes(fragment: &Frag<'_>) -> usize {
+fn fragment_bytes(fragment: &Frag) -> usize {
     let own = match &fragment.kind {
         FragKind::Line(line) => {
-            (line.pieces.capacity() + line.atom_boxes.capacity())
-                * size_of::<super::inline::Piece>()
+            size_of::<super::flow::LineFrag>()
+                + 2 * size_of::<usize>()
+                + (line.pieces.capacity() + line.atom_boxes.capacity())
+                    * size_of::<super::inline::Piece>()
                 + line
                     .pieces
                     .iter()
@@ -502,14 +571,23 @@ fn fragment_bytes(fragment: &Frag<'_>) -> usize {
                     .sum::<usize>()
         }
         FragKind::TableCell(layers) => std::mem::size_of_val(layers.as_ref()),
+        FragKind::Oof(b, inl) => {
+            // Count every shared dependency conservatively, even when also
+            // reachable from another cache entry or the box-tree cache.
+            super::tree_cache::box_bytes(b)
+                + size_of::<InlineStyle>()
+                + inl.font_family.capacity()
+                + inl.language.as_ref().map_or(0, String::capacity)
+                + inl.link.as_ref().map_or(0, |link| link.retained_memory().0)
+        }
         _ => 0,
     };
-    own + fragment.children.capacity() * size_of::<Frag<'_>>()
+    own + fragment.children.capacity() * size_of::<Frag>()
         + fragment.children.iter().map(fragment_bytes).sum::<usize>()
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::layout2::{
         TerminalViewport, Viewport, adapt_terminal, measure_retained_layout, paint_retained_layout,
@@ -536,7 +614,7 @@ mod tests {
         <div id=ratio></div>
     </main><div id=fixed></div><footer id=below>below</footer>"#;
 
-    fn assert_cold(
+    pub(in crate::layout2) fn assert_cold(
         dom: &mut Dom,
         base: &Url,
         viewport: Viewport,
@@ -589,6 +667,182 @@ mod tests {
     }
 
     #[test]
+    fn deferred_positioned_children_do_not_multiply_nested_grid_work() {
+        use crate::layout2::diagnostics::{Op, measure};
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        for depth in [4, 8, 12, 24, 48] {
+            let mut dom =
+                Dom::parse_document(&crate::layout2::engine_bench::nested(depth, "grid", true));
+            for edit in [false, true] {
+                if edit {
+                    let text = dom.children(dom.get_by_id("edit").unwrap())[0];
+                    dom.set_text(text, "changed content wraps differently");
+                }
+                let (layout, profile) = measure(|| {
+                    measure_retained_layout(
+                        &dom,
+                        &base,
+                        vp,
+                        &[],
+                        &ControlMap::new(),
+                        &ImageSizes::new(),
+                    )
+                });
+                assert!(layout.fragments.is_some());
+                let requests = profile.samples[Op::Item as usize].calls;
+                assert!(
+                    requests <= 8 * depth + 4,
+                    "depth={depth}, edit={edit}, requests={requests}"
+                );
+                assert_eq!(profile.uncacheable, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_positioning_reuses_inputs_and_resolves_current_containing_blocks() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            main { display:grid; grid-template-columns:1fr; width:400px; position:relative; padding:7px }
+            section { display:flex; flex-direction:column; padding:5px }
+            article { display:grid; grid-template-columns:1fr; overflow:hidden }
+            #abs { position:absolute; right:3%; bottom:2px; width:20%; height:40%; padding:2px }
+            #nested { position:absolute; left:10%; top:50%; width:7px; height:11px }
+            #fixed { position:fixed; right:3px; bottom:5px; width:13px; height:17px }
+        </style><main id=cb><section><article><div id=text>alpha beta gamma delta</div>
+        <aside id=abs>positioned<span id=nested></span><b id=fixed></b></aside>
+        </article></section></main>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let controls = ControlMap::new();
+        let images = ImageSizes::new();
+        for (id, style) in [
+            ("cb", "margin:13px; height:90px"),
+            (
+                "cb",
+                "width:250px; height:140px; transform:translate(11px,7px)",
+            ),
+            (
+                "abs",
+                "position:absolute; left:10%; top:20%; font-size:25px",
+            ),
+            ("cb", "height:200px; overflow:hidden; border:9px solid"),
+            ("fixed", "position:absolute; left:3px; top:5px"),
+        ] {
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            dom.set_attr(dom.get_by_id(id).unwrap(), "style", style);
+            assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+        }
+        let text = dom.children(dom.get_by_id("text").unwrap())[0];
+        dom.set_text(
+            text,
+            "a much longer line changes the static position and containing block height",
+        );
+        assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+    }
+
+    #[test]
+    fn block_reuse_preserves_collapsing_margins_floats_and_cursor_outputs() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(480., 320.);
+        let controls = ControlMap::new();
+        let images = ImageSizes::new();
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            body { margin:0 } main { margin-top:13px; width:300px }
+            .empty { margin:17px 0 -11px } p { margin:7px 0 -3px }
+            .island { display:flow-root; padding:3px }
+            .float { float:left; width:70px; height:80px }
+            .clear { clear:both; margin-top:-9px }
+        </style><main><div id=edit>before</div><div class=empty></div>
+        <section id=flow><div class=empty></div><p>collapsed through parent</p>
+        <div class=island><i class=float></i><p>independent floats wrap this text</p></div>
+        <p>last child</p></section><div id=external></div>
+        <p>text beside external float</p><div class=clear>cleared</div>
+        <div class=empty></div><p>after</p></main>"#,
+        );
+        measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+        let text = dom.children(dom.get_by_id("edit").unwrap())[0];
+        for change in 0..6 {
+            match change {
+                0 => dom.set_text(text, "same height"),
+                1 => dom.set_attr(
+                    dom.get_by_id("edit").unwrap(),
+                    "style",
+                    "height:83px;margin-bottom:-19px",
+                ),
+                2 => dom.set_attr(dom.get_by_id("external").unwrap(), "class", "float"),
+                3 => dom.set_attr(
+                    dom.get_by_id("flow").unwrap(),
+                    "style",
+                    "border-top:2px solid;min-height:170px",
+                ),
+                4 => dom.set_attr(
+                    dom.get_by_id("external").unwrap(),
+                    "style",
+                    "float:right;height:200px",
+                ),
+                _ => dom.set_attr(dom.get_by_id("external").unwrap(), "style", "float:none"),
+            }
+            assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+        }
+    }
+
+    #[test]
+    fn local_block_edit_only_recalculates_its_formatting_path() {
+        use crate::layout2::diagnostics::{Op, measure};
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let mut dom = Dom::parse_document(&format!(
+            "<main><p id=edit>alpha</p>{}</main>",
+            "<p>unchanged sibling</p>".repeat(220)
+        ));
+        let layout = |dom: &Dom| {
+            measure_retained_layout(dom, &base, vp, &[], &ControlMap::new(), &ImageSizes::new())
+        };
+        let text = dom.children(dom.get_by_id("edit").unwrap())[0];
+        let mut stable = false;
+        for iteration in 0..16 {
+            // Other parallel tests install fonts/SVG metadata. Those are valid
+            // global invalidations; assert work bounds on a stable-resource run.
+            let resources = (
+                crate::font_system::page_font_epoch(),
+                crate::img::svg_intrinsic_epoch(),
+            );
+            layout(&dom);
+            dom.set_text(text, if iteration % 2 == 0 { "beta" } else { "alpha" });
+            let (_, profile) = measure(|| layout(&dom));
+            if resources
+                != (
+                    crate::font_system::page_font_epoch(),
+                    crate::img::svg_intrinsic_epoch(),
+                )
+            {
+                continue;
+            }
+            assert!(
+                profile.samples[Op::BlockCompute as usize].calls <= 4,
+                "{profile:?}"
+            );
+            assert_eq!(profile.samples[Op::Inline as usize].calls, 1);
+            stable = true;
+            break;
+        }
+        assert!(stable, "resource revisions never settled");
+        assert_cold(
+            &mut dom,
+            &base,
+            vp,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+        );
+    }
+
+    #[test]
     fn text_updates_reuse_independent_items_but_reflow_parent_constraints() {
         let mut dom = Dom::parse_document(HTML);
         let base = Url::parse("https://example.com/").unwrap();
@@ -612,6 +866,43 @@ mod tests {
             );
             let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
             assert!(hits.0 + hits.1 > 0, "test must exercise reuse");
+        }
+    }
+
+    #[test]
+    fn typing_retains_independent_counter_and_quote_layout() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+                body { counter-reset:item; quotes:'[' ']' '(' ')' }
+                main { display:flex; width:550px }
+                #editor { width:120px }
+                aside { display:grid; grid-template-columns:1fr 1fr; width:250px }
+                p { counter-increment:item }
+                p::before { content:counter(item) open-quote }
+                p::after { content:close-quote }
+                body:has(#editor:empty) p { counter-increment:item 3 }
+            </style><main><div id=editor contenteditable dir=auto>a</div>
+            <aside id=island><p>one</p><p>two <q>nested</q></p></aside></main>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let controls = ControlMap::new();
+        let images = ImageSizes::new();
+        let editor = dom.get_by_id("editor").unwrap();
+        let text_node = dom.children(editor)[0];
+        let island = dom.get_by_id("island").unwrap();
+        for text in ["ab", "a much longer draft that wraps", "", "a"] {
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            assert!(dom.layout_cache.borrow().entries.contains_key(&island));
+            let empty_changed = dom.text_content(editor).is_empty() != text.is_empty();
+            dom.set_text(text_node, text);
+            if !empty_changed {
+                assert!(
+                    dom.layout_cache.borrow().entries.contains_key(&island),
+                    "typing must retain unrelated generated content"
+                );
+            }
+            assert_cold(&mut dom, &base, vp, &[], &controls, &images);
         }
     }
 
@@ -845,6 +1136,42 @@ mod tests {
         measure_retained_layout(&dom, &base, vp, &forms, &controls, &images);
         forms[0].fields[0].value = "changed without a DOM attribute write".to_owned();
         assert_cold(&mut dom, &base, vp, &forms, &controls, &images);
+    }
+
+    #[test]
+    fn registered_container_units_settle_without_at_container_rules() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            @property --size { syntax:"<length>"; inherits:true; initial-value:0px }
+            #container { container-type:inline-size; width:200px }
+            #child { --size:10cqw; width:var(--size); height:11px }
+        </style><div id=container><div id=child></div></div>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let child = dom.get_by_id("child").unwrap();
+        let container = dom.get_by_id("container").unwrap();
+        for width in [200, 350, 120] {
+            dom.set_attr(container, "style", &format!("width:{width}px"));
+            let layout = measure_retained_layout(
+                &dom,
+                &base,
+                vp,
+                &[],
+                &ControlMap::new(),
+                &ImageSizes::new(),
+            );
+            assert_eq!(layout.boxes[&child].width, f64::from(width) / 10.);
+            assert!(layout.work.passes <= 3);
+            assert_cold(
+                &mut dom,
+                &base,
+                vp,
+                &[],
+                &ControlMap::new(),
+                &ImageSizes::new(),
+            );
+        }
     }
 
     #[test]

@@ -58,6 +58,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-casefold",
  "unicode-segmentation",
  "unicode-width",

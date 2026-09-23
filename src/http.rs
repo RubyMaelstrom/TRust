@@ -13458,7 +13458,12 @@ mod tests {
             response.url = url;
             response.content_type = String::from("text/html");
         }
-        let mut response = execute_js(response, viewport, (8, 16), Default::default()).await;
+        let mut response = if std::env::var_os("TRUST_BROWSER_GATE_DESKTOP").is_some() {
+            execute_js_for_window(response, viewport, (8, 16), 1.0, (0, 0), Default::default())
+                .await
+        } else {
+            execute_js(response, viewport, (8, 16), Default::default()).await
+        };
         let mut html = String::from_utf8_lossy(&response.body).into_owned();
         let mut rendered = response.rendered.take().map(|rendered| *rendered);
         let mut errors = response
@@ -13610,6 +13615,8 @@ mod tests {
                     })
                     .unwrap_or_else(|| panic!("{host} has no editable {control_name:?}"));
                 let node = target.dom_node.unwrap();
+                let text_control = target.role == crate::accessibility::Role::Textarea;
+                let key_timing = std::env::var_os("TRUST_BROWSER_GATE_KEY_TIMING").is_some();
                 eprintln!(
                     "BROWSER_GATE typing {text:?} into {:?} at node {node}",
                     target.name
@@ -13629,7 +13636,7 @@ mod tests {
                         repeat: false,
                         composing: false,
                     };
-                    let command = if target.role == crate::accessibility::Role::Textarea {
+                    let command = if text_control {
                         crate::js::PageCmd::EditKey {
                             node,
                             input,
@@ -13638,7 +13645,41 @@ mod tests {
                     } else {
                         crate::js::PageCmd::Key { node: None, input }
                     };
+                    let key_started = std::time::Instant::now();
+                    let previous_updates = updates;
                     live.handle.cmds.send(command).await.unwrap();
+                    if key_timing {
+                        tokio::time::timeout(Duration::from_secs(15), async {
+                            loop {
+                                match live.events.recv().await {
+                                    Some(crate::js::PageEvt::KeyDefault { .. }) => break,
+                                    Some(crate::js::PageEvt::Updated {
+                                        html: updated,
+                                        mut outcome,
+                                    }) => {
+                                        updates += 1;
+                                        html = updated;
+                                        if let Some(next) = outcome.rendered.take() {
+                                            rendered = Some(*next);
+                                        }
+                                        errors.extend(outcome.errors);
+                                    }
+                                    Some(crate::js::PageEvt::Trouble(mut trouble)) => {
+                                        errors.append(&mut trouble)
+                                    }
+                                    Some(_) => {}
+                                    None => panic!("actor ended before key acknowledgement"),
+                                }
+                            }
+                        })
+                        .await
+                        .expect("typing acknowledgement timed out");
+                        eprintln!(
+                            "BROWSER_GATE key={character:?} ack_ms={:.2} updates={}",
+                            key_started.elapsed().as_secs_f64() * 1000.0,
+                            updates - previous_updates
+                        );
+                    }
                 }
                 let deadline = std::time::Instant::now() + Duration::from_secs(15);
                 while !html.contains(text) && std::time::Instant::now() < deadline {

@@ -150,9 +150,9 @@ impl Flow<'_> {
     /// (§17.5.3); vertical alignment places each cell in its row band
     /// (§17.5.4).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn table_grid<'t>(
+    pub(super) fn table_grid(
         &self,
-        tb: &'t TableBox,
+        tb: &TableBox,
         table_node: NodeId,
         cols: &TableCols,
         content_x: f32,
@@ -160,7 +160,7 @@ impl Flow<'_> {
         def_ch: Option<f32>,
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
-    ) -> (Vec<Frag<'t>>, f32) {
+    ) -> (Vec<Frag>, f32) {
         let ncols = tb.ncols;
         let nrows = tb.nrows;
         if ncols == 0 || nrows == 0 {
@@ -185,15 +185,15 @@ impl Flow<'_> {
 
         // Lay every cell at its spanned-column width. Each entry:
         // (fragment, its local anchors, horizontal pad, vertical pad).
-        struct Laid<'t> {
-            frag: Frag<'t>,
+        struct Laid {
+            frag: Frag,
             anchors: Vec<(NodeId, f32)>,
             /// The cell's spanned border-box width (px) — its CB for %.
             cell_w: f32,
             ph: f32,
             pv: f32,
         }
-        let mut laid: Vec<Laid<'t>> = Vec::with_capacity(tb.cells.len());
+        let mut laid: Vec<Laid> = Vec::with_capacity(tb.cells.len());
         for cell in &tb.cells {
             let end = (cell.col + cell.colspan).min(ncols);
             let span = end.saturating_sub(cell.col).max(1);
@@ -293,7 +293,7 @@ impl Flow<'_> {
 
         // Place each cell at its column/row origin, vertically aligned in its
         // (possibly taller) row band per `vertical-align`/`valign`.
-        let mut frags: Vec<Frag<'t>> = Vec::with_capacity(laid.len());
+        let mut frags: Vec<Frag> = Vec::with_capacity(laid.len());
         for ((cell, mut l), (row, group)) in tb.cells.iter().zip(laid).zip(cell_rows) {
             let end = (cell.row + cell.rowspan).min(nrows);
             let span_h = row_h[cell.row..end].iter().sum::<f32>()

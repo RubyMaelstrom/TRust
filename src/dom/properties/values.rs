@@ -158,6 +158,9 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
                 let eligible = kind.split_ascii_whitespace().any(|part| {
                     part == "size" || part == "inline-size" && physical == usize::from(vertical)
                 });
+                if eligible {
+                    dom.record_container_read(ctx.id, node, 1 << physical, true);
+                }
                 if eligible && let Some(size) = dom.container_sizes.borrow().get(&node) {
                     return size[physical];
                 }

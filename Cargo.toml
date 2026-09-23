@@ -154,6 +154,8 @@ svgtypes = "0.16.1"
 tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
 tokio-rustls = "0.26.4"
 unicode-width = "0.2"
+# HTML text-node directionality uses the first Unicode L/R/AL character.
+unicode-bidi = "0.3.18"
 # Extended grapheme boundaries complete Parley's shaping-cluster data for
 # logical selection (notably emoji ZWJ sequences split by font fallback).
 unicode-segmentation = "1.13.3"

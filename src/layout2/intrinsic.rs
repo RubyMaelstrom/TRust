@@ -74,6 +74,7 @@ impl Flow<'_> {
     /// per element from the cascade, so element results are context-free
     /// and memoizable; anonymous boxes use the passed context).
     pub(crate) fn intrinsic_w(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::Intrinsic);
         // CSS Containment 2 §3.1/§3.2: content cannot contribute to a size
         // container's inline intrinsic size, otherwise queries form a cycle.
         if b.style.size_container != 0 {
@@ -112,6 +113,7 @@ impl Flow<'_> {
     }
 
     fn intrinsic_w_inner(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
+        let _profile = super::diagnostics::enter(super::diagnostics::Op::IntrinsicCompute);
         let here = if b.node == NO_NODE {
             inl.with_pseudo(self.dom, b.style.pseudo)
         } else {
