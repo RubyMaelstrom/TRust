@@ -28,6 +28,7 @@ mod invalidation;
 mod properties;
 mod rule_index;
 pub(crate) mod shadow;
+mod sheet_cache;
 mod transitions;
 mod xml;
 
@@ -241,6 +242,7 @@ pub struct Dom {
     transitions: transitions::State,
     /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
+    parsed_sheets: RefCell<sheet_cache::Cache>,
     /// Layout-provided query-container content sizes, in untransformed CSS px.
     container_sizes: RefCell<FxHashMap<NodeId, [f32; 2]>>,
     /// Memoized inherited `computed_value` results, keyed (node, property).
@@ -595,6 +597,7 @@ impl Dom {
             properties,
             transitions,
             style_cache,
+            parsed_sheets,
             container_sizes,
             computed_cache,
             custom_prop_cache,
@@ -758,6 +761,11 @@ impl Dom {
                 }
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
+        match parsed_sheets.try_borrow() {
+            Ok(cache) => bytes = bytes.saturating_add(cache.retained_bytes()),
+            Err(_) => unavailable += 1,
         }
 
         match container_sizes.try_borrow() {
@@ -994,6 +1002,7 @@ impl Dom {
             properties: properties::State::default(),
             transitions: transitions::State::default(),
             style_cache: RefCell::new(None),
+            parsed_sheets: RefCell::new(sheet_cache::Cache::default()),
             container_sizes: RefCell::new(FxHashMap::default()),
             computed_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
             custom_prop_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
@@ -4731,12 +4740,19 @@ impl Dom {
         // element assigned to a slot; it does not create a box of its own.
         // The light-DOM element still receives the declaration in its own
         // cascade map, with the shadow-tree encapsulation context preserved.
+        let assigned_slots = index.slotted_assignments(self, id);
         for &(scope, ri) in &index.slotted_rules {
+            if !assigned_slots
+                .iter()
+                .any(|&(slot_scope, _)| slot_scope == scope)
+            {
+                continue;
+            }
             let Some(rules) = index.scopes.get(&scope) else {
                 continue;
             };
             let r = &rules[ri as usize];
-            if !self.slotted_rule_matches(id, scope, r) {
+            if !self.slotted_rule_matches(id, scope, r, &assigned_slots) {
                 continue;
             }
             for (pk, (imp, v)) in &r.decls {
@@ -4994,7 +5010,13 @@ impl Dom {
     /// element. The pseudo-element's originating element is the slot; a
     /// selector prefix (for example `slot::slotted(*)`) therefore matches the
     /// slot, while the argument matches the flattened assigned element.
-    fn slotted_rule_matches(&self, id: NodeId, scope: NodeId, rule: &StyleRule) -> bool {
+    fn slotted_rule_matches(
+        &self,
+        id: NodeId,
+        scope: NodeId,
+        rule: &StyleRule,
+        assigned_slots: &[(NodeId, NodeId)],
+    ) -> bool {
         let parts = &rule.selector.0;
         let Some((_, subject)) = parts.last() else {
             return false;
@@ -5005,9 +5027,8 @@ impl Dom {
         if !self.matches_compound(id, inner, None) {
             return false;
         }
-        self.descendants(scope).any(|slot| {
-            self.tag_name(slot) == Some("slot")
-                && self.flat_assigned_slot_nodes(slot).contains(&id)
+        assigned_slots.iter().any(|&(slot_scope, slot)| {
+            slot_scope == scope
                 && (parts.len() == 1 || self.matches_complex(slot, &parts[..parts.len() - 1], None))
         })
     }
@@ -5700,7 +5721,7 @@ impl Dom {
                 self.property_base(id).cloned()
             };
             let first = index.scopes.get(&scope).map_or(0, Vec::len);
-            parse_sheet(
+            self.parsed_sheets.borrow_mut().append(
                 &css,
                 &mut order,
                 index.scopes.entry(scope).or_default(),
@@ -5711,7 +5732,6 @@ impl Dom {
                 base.as_ref(),
                 media,
                 layer_regs.entry(scope).or_default(),
-                "",
             );
             if let Some(base) = base {
                 let base = std::rc::Rc::new(base);
@@ -5745,7 +5765,7 @@ impl Dom {
                 .unwrap_or_else(|| vec![(0..css.len(), self.property_base(*scope).cloned())]);
             for (range, base) in sources {
                 let first = index.scopes.get(scope).map_or(0, Vec::len);
-                parse_sheet(
+                self.parsed_sheets.borrow_mut().append(
                     &css[range],
                     &mut order,
                     index.scopes.entry(*scope).or_default(),
@@ -5756,7 +5776,6 @@ impl Dom {
                     base.as_ref(),
                     media,
                     layer_regs.entry(*scope).or_default(),
-                    "",
                 );
                 if let Some(base) = base {
                     let base = std::rc::Rc::new(base);
@@ -5769,31 +5788,32 @@ impl Dom {
             }
         }
         self.build_font_sets(font_faces, &mut index.font_sets);
-        index.has_opacity = index
+        let mut seen = FxHashSet::default();
+        let unique = index
             .scopes
             .values()
             .flatten()
+            .filter(|rule| seen.insert(std::rc::Rc::as_ptr(&rule.data)))
+            .collect::<Vec<_>>();
+        index.has_opacity = unique
+            .iter()
+            .copied()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
-        index.has_revert_layer = index.scopes.values().flatten().any(|r| {
+        index.has_revert_layer = unique.iter().copied().any(|r| {
             r.decls
                 .iter()
                 .any(|(_, (_, value))| value.to_ascii_lowercase().contains("revert-layer"))
         });
-        index.has_container_queries = index
-            .scopes
-            .values()
-            .flatten()
-            .any(|r| !r.containers.is_empty());
+        index.has_container_queries = unique.iter().copied().any(|r| !r.containers.is_empty());
         index.selector_dependencies =
-            invalidation::SelectorDependencies::build(index.scopes.values().flatten());
+            invalidation::SelectorDependencies::build(unique.iter().copied());
         // The hover probes: only rules that could change what we paint under a
         // moved hover chain. Graphical paint properties such as `color` are in
         // the tracked registry too; they invalidate retained paint even when
         // terminal-cell geometry happens not to change.
-        index.hover_probes = index
-            .scopes
-            .values()
-            .flatten()
+        index.hover_probes = unique
+            .iter()
+            .copied()
             .filter(|r| rule_affects_render(r))
             .flat_map(hover_probes_of)
             .collect();
@@ -12464,11 +12484,23 @@ fn list_style_shorthand_image(value: &str) -> Option<&str> {
 
 /// One parsed rule, holding its tracked declarations (`(prop, (important,
 /// value))`). Rules mentioning no tracked property are never stored.
+#[derive(Clone)]
 struct StyleRule {
+    /// Source position is assigned afresh when the current sheet list is assembled.
+    order: usize,
+    data: std::rc::Rc<StyleRuleData>,
+}
+
+impl std::ops::Deref for StyleRule {
+    type Target = StyleRuleData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+struct StyleRuleData {
     selector: Complex,
     specificity: (u32, u32, u32),
-    /// Source position across every sheet of the scope.
-    order: usize,
     /// The rule's cascade-layer position (css-cascade-5 §6.4), pre-encoded
     /// for each importance (the layer order REVERSES for `!important`).
     /// See `encode_layer`; unlayered rules carry the implicit-final-layer
@@ -12593,6 +12625,12 @@ impl CascadeWinner {
     }
 }
 
+#[derive(Default)]
+struct SlotAssignments {
+    epoch: Option<u64>,
+    by_element: FxHashMap<NodeId, Vec<(NodeId, NodeId)>>,
+}
+
 /// Rules bucketed by tree scope: DOCUMENT for the light DOM, the shadow
 /// fragment for each shadow tree. Shadow sheets never leak out;
 /// document sheets never reach in.
@@ -12613,6 +12651,8 @@ struct StyleIndex {
     /// rules are consulted while cascading a light-DOM element assigned to a
     /// slot in the corresponding shadow tree.
     slotted_rules: Vec<(NodeId, u32)>,
+    /// DOM-epoch projection of flattened assignment, independent of selector matching.
+    slot_assignments: RefCell<SlotAssignments>,
     /// The last `@keyframes` rule for each case-sensitive name. Animation
     /// declarations do not participate in the ordinary cascade; values are
     /// retained by property and sorted offset so paint can sample supported
@@ -12819,6 +12859,40 @@ impl RuleBuckets {
 }
 
 impl StyleIndex {
+    fn slotted_assignments(&self, dom: &Dom, id: NodeId) -> Vec<(NodeId, NodeId)> {
+        if self.slotted_rules.is_empty() {
+            return Vec::new();
+        }
+        let mut cache = self.slot_assignments.borrow_mut();
+        if cache.epoch != Some(dom.epoch()) {
+            cache.by_element.clear();
+            // CSS Shadow 1 #slotted-pseudo: only flattened assignments to the
+            // originating slot can match. Index them once per DOM revision,
+            // including forwarding slots; no per-element shadow-tree scans.
+            let scopes = self
+                .slotted_rules
+                .iter()
+                .map(|&(scope, _)| scope)
+                .collect::<FxHashSet<_>>();
+            for scope in scopes {
+                for slot in dom
+                    .descendants(scope)
+                    .filter(|&node| dom.tag_name(node) == Some("slot"))
+                {
+                    for assigned in dom.flat_assigned_slot_nodes(slot) {
+                        cache
+                            .by_element
+                            .entry(assigned)
+                            .or_default()
+                            .push((scope, slot));
+                    }
+                }
+            }
+            cache.epoch = Some(dom.epoch());
+        }
+        cache.by_element.get(&id).cloned().unwrap_or_default()
+    }
+
     fn retained_memory(&self) -> (usize, bool) {
         let StyleIndex {
             font_sets,
@@ -12828,6 +12902,7 @@ impl StyleIndex {
             scopes,
             buckets,
             slotted_rules,
+            slot_assignments,
             keyframes,
             counter_styles,
             properties,
@@ -12853,6 +12928,15 @@ impl StyleIndex {
             .map(properties::registry_bytes)
             .sum::<usize>();
         bytes += rule_bases.capacity() * std::mem::size_of::<(usize, std::rc::Rc<url::Url>)>();
+        if let Ok(assignments) = slot_assignments.try_borrow() {
+            bytes += assignments.by_element.capacity()
+                * std::mem::size_of::<(NodeId, Vec<(NodeId, NodeId)>)>();
+            bytes += assignments
+                .by_element
+                .values()
+                .map(|slots| slots.capacity() * std::mem::size_of::<(NodeId, NodeId)>())
+                .sum::<usize>();
+        }
         let mut seen_bases = FxHashSet::default();
         for base in rule_bases.values() {
             if seen_bases.insert(std::rc::Rc::as_ptr(base)) {
@@ -12875,19 +12959,23 @@ impl StyleIndex {
             }
         }
         let mut queries = FxHashSet::default();
+        let mut seen_rules = FxHashSet::default();
         for rules in scopes.values() {
             bytes = bytes.saturating_add(rules.capacity() * std::mem::size_of::<StyleRule>());
             for rule in rules {
-                let StyleRule {
+                if !seen_rules.insert(std::rc::Rc::as_ptr(&rule.data)) {
+                    continue;
+                }
+                bytes += std::mem::size_of::<StyleRuleData>();
+                let StyleRuleData {
                     selector,
                     specificity,
-                    order,
                     layer_normal,
                     layer_important,
                     decls,
                     containers,
-                } = rule;
-                let _ = (specificity, order, layer_normal, layer_important);
+                } = rule.data.as_ref();
+                let _ = (specificity, layer_normal, layer_important);
                 bytes += containers.capacity()
                     * std::mem::size_of::<std::rc::Rc<container_queries::Query>>();
                 for query in containers {
@@ -13611,7 +13699,7 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
 /// per-scope rule vecs). Layers are ordered by FIRST declaration; a dotted
 /// name (`a.b`) nests, so a layer's identity is its per-level
 /// sibling-declaration-index path.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct LayerRegistry {
     /// Fully-qualified dotted name → per-level sibling-index path.
     paths: std::collections::HashMap<String, Vec<u32>>,
@@ -13721,7 +13809,7 @@ fn qualify_layer(prefix: &str, name: &str) -> String {
 /// enclosing layer's qualified name, "" = unlayered); other @-blocks are
 /// skipped whole. Rules whose selectors don't parse are skipped
 /// (fail-open).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct MediaEnvironment {
     viewport: (f32, f32),
     density: f32,
@@ -13984,7 +14072,10 @@ fn parse_sheet(
                     layer,
                 );
                 for rule in &mut out[start..] {
-                    rule.containers.push(query.clone());
+                    std::rc::Rc::get_mut(&mut rule.data)
+                        .expect("freshly parsed rule")
+                        .containers
+                        .push(query.clone());
                 }
                 rest = tail;
                 continue;
@@ -14061,13 +14152,15 @@ fn parse_style_rule(
     {
         for selector in complexes {
             out.push(StyleRule {
-                specificity: selector.specificity(),
-                selector,
                 order: *order,
-                layer_normal: encode_layer(layer, false),
-                layer_important: encode_layer(layer, true),
-                decls: decls.clone(),
-                containers: Vec::new(),
+                data: std::rc::Rc::new(StyleRuleData {
+                    specificity: selector.specificity(),
+                    selector,
+                    layer_normal: encode_layer(layer, false),
+                    layer_important: encode_layer(layer, true),
+                    decls: decls.clone(),
+                    containers: Vec::new(),
+                }),
             });
             *order += 1;
         }
@@ -14098,7 +14191,10 @@ fn parse_style_rule(
                 let start = out.len();
                 parse_style_rule(resolved, nblock, order, out, media, layer);
                 for rule in &mut out[start..] {
-                    rule.containers.push(query.clone());
+                    std::rc::Rc::get_mut(&mut rule.data)
+                        .expect("freshly parsed rule")
+                        .containers
+                        .push(query.clone());
                 }
             }
             continue;
@@ -16689,6 +16785,35 @@ mod tests {
             Some("column")
         );
         assert_eq!(dom.computed_style(outside, "display"), None);
+        let index = dom.style_index();
+        assert_eq!(index.slotted_assignments(&dom, list), [(shadow, slot)]);
+        dom.set_attr(list, "slot", "named");
+        assert_eq!(dom.computed_style(list, "display"), None);
+        assert!(index.slotted_assignments(&dom, list).is_empty());
+        dom.set_attr(slot, "name", "named");
+        assert_eq!(dom.computed_style(list, "height").as_deref(), Some("100%"));
+        dom.detach(list);
+        assert_eq!(dom.computed_style(list, "display"), None);
+        dom.append(host, list);
+        assert_eq!(dom.computed_style(list, "height").as_deref(), Some("100%"));
+        // Forward through another component's default slot. Both originating
+        // slots must be indexed, and moving the forwarding slot removes only
+        // that assignment path from the next revision.
+        let nested = dom.create_element("x-nested");
+        dom.append(shadow, nested);
+        dom.append(nested, slot);
+        let nested_root = dom.attach_shadow(nested);
+        let nested_slot = dom.create_element("slot");
+        dom.append(nested_root, nested_slot);
+        dom.set_adopted_styles(nested_root, "::slotted(ul){width:37px}");
+        assert_eq!(dom.computed_style(list, "width").as_deref(), Some("37px"));
+        assert_eq!(dom.style_index().slotted_assignments(&dom, list).len(), 2);
+        dom.append(shadow, slot);
+        assert_eq!(dom.computed_style(list, "width"), None);
+        assert_eq!(
+            dom.style_index().slotted_assignments(&dom, list),
+            [(shadow, slot)]
+        );
     }
 
     #[test]
