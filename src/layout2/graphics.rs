@@ -3047,6 +3047,12 @@ fn background_position_component(value: &str, area: f32, image: f32, vertical: b
 fn background_clip_shape(clip: CssRect, original: &PaintShape, border: CssRect) -> PaintShape {
     if clip == border {
         original.clone()
+    } else if let PaintShape::RoundedRect { radii, .. } = original {
+        // CSS Backgrounds 3 §3.11/§5.2: the padding and content edges retain
+        // the outer corner curve after subtracting the intervening border
+        // and padding widths. A rectangular clip paints square corners inside
+        // an otherwise rounded button when background-clip is padding-box.
+        rounded_shape(clip, inset_radii(*radii, border, clip))
     } else {
         PaintShape::Rect(clip)
     }
@@ -4450,6 +4456,29 @@ fn alpha_byte(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_clip_preserves_rounded_padding_and_content_edges() {
+        // CSS Backgrounds 3 §3.11/§5.2: a clipped background follows the
+        // inner corner after subtracting border and padding insets.
+        let border = CssRect::new(0.0, 0.0, 120.0, 40.0);
+        let outer = PaintShape::RoundedRect {
+            rect: border,
+            radii: CornerRadii {
+                corners: [(20.0, 20.0); 4],
+            },
+        };
+        for (clip, expected) in [
+            (CssRect::new(1.0, 1.0, 118.0, 38.0), 19.0),
+            (CssRect::new(6.0, 6.0, 108.0, 28.0), 14.0),
+        ] {
+            let PaintShape::RoundedRect { radii, .. } = background_clip_shape(clip, &outer, border)
+            else {
+                panic!("clipped rounded background became rectangular");
+            };
+            assert_eq!(radii.corners, [(expected, expected); 4]);
+        }
+    }
 
     fn render_fixture(html: &str) -> (Dom, crate::layout2::GraphicalLayout) {
         let mut dom = Dom::parse_document(html);

@@ -690,6 +690,9 @@ TRUST_BROWSER_GATE=https://example.test/ \
 |---|---|---|
 | `TRUST_BROWSER_GATE` | absolute URL | Required page under test. |
 | `TRUST_BROWSER_GATE_SECONDS` | integer seconds | Initial/final milestone deadline. Default: `45`. |
+| `TRUST_BROWSER_GATE_FIXTURE` | absolute HTML file path | Replays a captured main response at the requested URL when navigation is rate-limited; referenced subresources still use the requested origin. |
+| `TRUST_BROWSER_GATE_TYPE` | text | Types into a named live text control before the optional click and requires the text to appear in the DOM. |
+| `TRUST_BROWSER_GATE_TYPE_INTO` | accessible-name substring | Selects the text control for `TRUST_BROWSER_GATE_TYPE`. |
 | `TRUST_BROWSER_GATE_CLICK` | accessible-name substring | Activates the first exposed activatable control whose accessible name contains this text. |
 | `TRUST_BROWSER_GATE_CLICK_SECONDS` | integer seconds | Deadline after the named click. Default: `20`. |
 | `TRUST_BROWSER_GATE_EXPECT_HTML_CONTAINS` | HTML substring | Required final HTML milestone; for interactive pages it is also the default initial milestone. |
@@ -699,6 +702,7 @@ TRUST_BROWSER_GATE=https://example.test/ \
 | `TRUST_BROWSER_GATE_EXPECT_NO_ERRORS` | presence flag | Requires zero collected JavaScript errors (otherwise errors are printed but do not automatically fail). |
 | `TRUST_BROWSER_GATE_MIN_NODES` | integer | Minimum DOM node count for non-special hosts; default `1`. YouTube/Twitch/Steam use built-in empty-shell floors. |
 | `TRUST_BROWSER_GATE_OUT` | file path | Saves the final serialized HTML snapshot. |
+| `TRUST_BROWSER_GATE_PNG` | PNG file path | Renders the final release paint list with Vello CPU for visual inspection. |
 | `TRUST_DIAG_VP` | `WIDTHxHEIGHT` | Gate viewport in terminal cells. Default: `200x50`. |
 
 ### `img_box_diag`

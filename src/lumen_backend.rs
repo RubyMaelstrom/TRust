@@ -360,6 +360,7 @@ struct HostState {
     screen_slots: Option<Value>,
     performance_slots: Option<Value>,
     element_slots: Option<Value>,
+    live_range_registry: Option<Value>,
     pointer_event_slots: Option<Value>,
     image_element_slots: Option<Value>,
     window_message_slots: Option<Value>,
@@ -429,6 +430,7 @@ impl HostState {
             screen_slots: None,
             performance_slots: None,
             element_slots: None,
+            live_range_registry: None,
             pointer_event_slots: None,
             image_element_slots: None,
             window_message_slots: None,
@@ -620,6 +622,7 @@ impl RetainedMemory for HostState {
             screen_slots,
             performance_slots,
             element_slots,
+            live_range_registry,
             pointer_event_slots,
             image_element_slots,
             window_message_slots,
@@ -965,6 +968,9 @@ impl RetainedMemory for HostState {
             visitor.value(value);
         }
         if let Some(value) = performance_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = live_range_registry {
             visitor.value(value);
         }
         if let Some(value) = element_slots {
@@ -1528,6 +1534,8 @@ mod desktop {
         outcome: Outcome,
         started: Instant,
         last_render: Option<crate::http::RenderedPage>,
+        last_sent_focus: Option<usize>,
+        last_sent_editable_state: Option<crate::js::EditableState>,
         terminal_presentation: bool,
         #[cfg(test)]
         last_diagnostic_render: Option<String>,
@@ -2369,6 +2377,8 @@ mod desktop {
             outcome,
             started,
             last_render: None,
+            last_sent_focus: None,
+            last_sent_editable_state: None,
             terminal_presentation: env.terminal_presentation,
             #[cfg(test)]
             last_diagnostic_render: None,
@@ -3189,12 +3199,12 @@ mod desktop {
         prepare_interaction(page, interrupt);
         let key = key_name(&input.key);
         let released = input.state == crate::core::KeyState::Released;
-        let prevented = call_trust(
+        let mut prevented = call_trust(
             page,
             "key",
             &[
                 node.map_or(Value::Null, |node| Value::Num(node as f64)),
-                Value::from_string(key),
+                Value::from_string(key.clone()),
                 Value::from_string(input.code),
                 Value::Bool(input.repeat),
                 Value::Bool(input.composing),
@@ -3211,6 +3221,29 @@ mod desktop {
         checkpoint(page, if released { "keyup" } else { "keydown" });
         if let Some((url, replace)) = take_navigation(page) {
             return send_navigation(events, url, replace);
+        }
+        if !released && !prevented && !input.composing && edit_key.is_none() {
+            // Input Events 2 §6: after keydown/keypress and their checkpoint,
+            // the native default edits a focused contenteditable host. Text
+            // controls use formInsertText below after the same checkpoint.
+            let handled = call_trust(
+                page,
+                "editableKeyDefault",
+                &[
+                    node.map_or(Value::Null, |node| Value::Num(node as f64)),
+                    Value::from_string(key),
+                    Value::Bool(input.modifiers.shift),
+                    Value::Bool(input.modifiers.control),
+                    Value::Bool(input.modifiers.alt),
+                    Value::Bool(input.modifiers.meta),
+                ],
+                "editable key default",
+            )
+            .is_some_and(|value| page.engine.ctx().to_boolean(&value));
+            if handled {
+                prevented = true;
+                checkpoint(page, "editable key default");
+            }
         }
         if !released
             && !prevented
@@ -4109,6 +4142,31 @@ mod desktop {
                     return false;
                 }
                 sent_primary = true;
+            }
+        }
+        // The terminal has its own native edit focus and event batching. The
+        // graphical adapter needs the canonical actor's focus to select its
+        // editor even when pointerdown/label activation has no DOM mutation.
+        if !page.terminal_presentation
+            && let Some(value) = call_trust(page, "focusedNode", &[], "focused area")
+        {
+            let node = value.as_num_opt().map(|number| number as usize);
+            if node != page.last_sent_focus {
+                page.last_sent_focus = node;
+                if events.blocking_send(PageEvt::Focused { node }).is_err() {
+                    return false;
+                }
+            }
+        }
+        if !page.terminal_presentation
+            && let Some(value) = call_trust(page, "editableState", &[], "editing selection")
+            && let Some(json) = value_to_string(page, &value)
+            && let Ok(state) = serde_json::from_str::<Option<crate::js::EditableState>>(&json)
+            && state != page.last_sent_editable_state
+        {
+            page.last_sent_editable_state = state.clone();
+            if events.blocking_send(PageEvt::EditableState(state)).is_err() {
+                return false;
             }
         }
         for (node, top, left) in scrolls {
@@ -6633,6 +6691,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__screen_binding", 1, host_screen_binding),
     ("__performance_binding", 1, host_performance_binding),
     ("__element_slots", 1, host_element_slots),
+    ("__live_range_registry", 1, host_live_range_registry),
     ("__pointer_event_slots", 1, host_pointer_event_slots),
     ("__canvas_2d", 4, canvas_host::call),
     ("__webgl", 4, webgl_host::call),
@@ -6891,6 +6950,14 @@ fn host_screen_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 
 /// Web IDL interface conversion uses platform identity, not mutable properties
 /// or a Realm-local prototype chain. Root the private WeakMap, not its keys.
+fn host_live_range_registry(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("Range bindings require HostState");
+    Ok(state.live_range_registry.get_or_insert(value).clone())
+}
+
 fn host_element_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let state = ctx
@@ -14390,6 +14457,474 @@ mod tests {
     }
 
     #[test]
+    fn live_ranges_follow_structural_and_character_data_mutations() {
+        // DOM #concept-cd-replace, #concept-text-split, #concept-live-range,
+        // #dom-range-stringifier. Selection retains its Range by identity.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<div id=host><b>ab</b><i>cd</i></div>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const host = document.getElementById('host');
+            const range = document.createRange();
+            range.setStart(host.firstChild.firstChild, 1);
+            range.setEnd(host.lastChild.firstChild, 1);
+            const partial = range.toString();
+            host.textContent = 'abcd';
+            const removed = range.collapsed && range.startContainer === host && range.startOffset === 0;
+            const text = host.firstChild, selection = getSelection();
+            selection.collapse(text, 3);
+            const selectedRange = selection.getRangeAt(0), tail = text.splitText(2);
+            const split = selection.focusNode === tail && selection.focusOffset === 1
+                && selection.getRangeAt(0) === selectedRange;
+            tail.insertData(0, 'X');
+            const inserted = selection.focusOffset === 2;
+            tail.deleteData(0, 2);
+            const deleted = selection.focusOffset === 0;
+            tail.remove();
+            const detached = selection.focusNode === host && selection.focusOffset === 1;
+            host.insertBefore(document.createElement('hr'), text);
+            const shifted = selection.focusOffset === 2;
+            host.innerHTML = '<b>new</b>';
+            const replaced = selection.focusNode === host && selection.focusOffset === 0;
+            selection.collapse(host.firstChild.firstChild,1);
+            const replacement = document.createElement('i');
+            host.replaceChild(replacement,host.firstChild);
+            const replacedNode = selection.focusNode === host && selection.focusOffset === 0;
+            replacement.textContent = 'abc'; selection.collapse(replacement.firstChild,1);
+            host.replaceChild(replacement,replacement);
+            const selfReplaced = host.firstChild === replacement && selection.focusNode === host && selection.focusOffset === 0;
+            [partial, removed, split, inserted, deleted, detached, shifted, replaced,replacedNode,selfReplaced].join('|');
+        "#
+            ),
+            "bc|true|true|true|true|true|true|true|true|true"
+        );
+    }
+
+    #[test]
+    fn cssom_logical_properties_keep_specified_names_and_mutation_order() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<div id=box></div>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const box = document.getElementById('box'), s = box.style;
+            s.cssText='direction:rtl;border-inline-end-width:1px;border-left-width:2px';
+            const specified = [s.borderInlineEndWidth,s.borderLeftWidth].join(',');
+            s.borderInlineEndWidth='1px';
+            const first = getComputedStyle(box).borderLeftWidth;
+            s.borderLeftWidth='4px';
+            const second = getComputedStyle(box).borderInlineEndWidth;
+            s.cssText='direction:rtl;inset-inline-end:1px;left:2px';
+            s.insetInlineEnd='3px';
+            [specified,first,second,getComputedStyle(box).left].join('|');
+        "#
+            ),
+            "1px,2px|1px|4px|3px"
+        );
+    }
+
+    #[test]
+    fn iframe_focus_and_native_editing_use_child_selection() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const frame = document.createElement('iframe');
+            frame.srcdoc = '<input id=input><div id=editor contenteditable><b>ab</b><i>cd</i></div>';
+            document.body.appendChild(frame); __trust.hydrateFrames();
+            const child = frame.contentDocument, win = frame.contentWindow;
+            const input = child.getElementById('input'), editor = child.getElementById('editor');
+            __trust.focusPage(input.__id);
+            const inputFocused = __trust.focusedNode() === input.__id;
+            __trust.focusPage(editor.__id);
+            __trust.formSet(editor.__id,'abcd',null,null,null,1,1,0);
+            __trust.editableKeyDefault(null,'X',false,false,false,false);
+            const state = JSON.parse(__trust.editableState());
+            const range = win.document.createRange(), text = editor.firstChild.firstChild;
+            range.setStart(text,1); range.setEnd(text,2);
+            text.insertData(0,'!');
+            [inputFocused,__trust.focusedNode() === editor.__id,editor.innerHTML,
+                state.selection.start,range.startOffset,range.endOffset,range.toString()].join('|');
+        "#
+            ),
+            "true|true|<b>!aXb</b><i>cd</i>|2|2|3|X"
+        );
+    }
+
+    #[test]
+    fn contenteditable_structural_editing_regressions() {
+        // Input Events 2 §6 and HTML #contenteditable: edits retain DOM
+        // structure, protect non-editable descendants, and use the live caret.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<div id=editor contenteditable><b>ab</b><i>cd</i></div>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const editor = document.getElementById('editor'), sel = getSelection();
+            const key = (name,shift=false) => __trust.editableKeyDefault(null,name,shift,false,false,false);
+            const state = () => JSON.parse(__trust.editableState());
+            editor.focus();
+            sel.collapse(editor.lastChild.firstChild,0); key('Backspace');
+            const back = editor.innerHTML;
+            sel.collapse(editor.firstChild.firstChild,1); key('Delete');
+            const forward = editor.innerHTML;
+            editor.innerHTML = '<b>ab</b><i>cd</i>';
+            __trust.formSet(editor.__id,'abcd',null,null,null,1,1,0);
+            key('X'); key('ArrowRight');
+            const native = editor.innerHTML + ':' + state().selection.start;
+            editor.innerHTML = '<p><b>abcd</b></p>';
+            sel.collapse(editor.firstChild.firstChild.firstChild,2); key('Enter'); key('X');
+            const paragraph = editor.innerHTML + ':' + state().text;
+            key('Enter',true); key('Y');
+            const line = editor.innerHTML + ':' + state().text;
+            editor.innerHTML = '<p><br></p>'; sel.removeAllRanges(); key('z');
+            const empty = editor.innerHTML;
+            editor.innerHTML = '<p><b>ab</b></p>';
+            sel.collapse(editor.firstChild.firstChild.firstChild,2); key('Enter');
+            const end = state().text; key('Backspace');
+            const joined = state().text;
+            sel.collapse(editor.firstChild.firstChild.firstChild,0); key('Enter');
+            const beginning = state().text;
+            [back,forward,native,paragraph,line,empty,end,joined,beginning].join('|');
+        "#
+            ),
+            "<b>a</b><i>cd</i>|<b>a</b><i>d</i>|<b>aXb</b><i>cd</i>:3|<p><b>ab</b></p><p><b>Xcd</b></p>:ab\nXcd|<p><b>ab</b></p><p><b>X<br>Ycd</b></p>:ab\nX\nYcd|<p>z</p>|ab\n|ab|\nab"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            editor.innerHTML = '<b>ab</b><span contenteditable=false>LOCK</span>';
+            sel.removeAllRanges(); key('X');
+            const appended = editor.innerHTML;
+            sel.collapse(editor.firstChild.firstChild,1);
+            sel.extend(editor.lastChild,1); key('Y');
+            const protectedText = editor.querySelector('span').textContent;
+            editor.innerHTML = '<span contenteditable=false><i id=nested contenteditable>ok</i></span>';
+            const nested = document.getElementById('nested'); nested.focus();
+            sel.collapse(nested.firstChild,1); key('Z');
+            [appended,protectedText,nested.innerHTML].join('|');
+        "#
+            ),
+            "<b>ab</b><span contenteditable=\"false\">LOCK</span>X|LOCK|oZk"
+        );
+    }
+
+    #[test]
+    fn label_caption_pointer_click_focuses_and_activates_associated_input() {
+        // HTML §4.10.4: activating a label caption follows its for= control.
+        // A descendant button keeps its own activation, and cancellation of
+        // the label's click prevents the forwarded control click.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<body><label id=label for=code><span id=caption>Code</span>\
+                     <button id=other type=button>Other</button></label>\
+                     <input id=code autocomplete=one-time-code><output id=result></output></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const caption = document.getElementById('caption');
+                const label = document.getElementById('label');
+                const code = document.getElementById('code');
+                const other = document.getElementById('other');
+                let codeClicks = 0, otherClicks = 0;
+                code.addEventListener('click', () => codeClicks++);
+                other.addEventListener('click', () => otherClicks++);
+                __trust.pointerButton(caption.__id, true, 20, 20);
+                __trust.pointerButton(caption.__id, false, 20, 20);
+                __trust.click(caption.__id);
+                const focused = document.activeElement === code;
+                other.click();
+                label.addEventListener('click', e => e.preventDefault());
+                caption.click();
+                [focused, codeClicks, otherClicks].join('|');
+            "#
+            ),
+            "true|1|1"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_reports_input_focus_after_label_activation() {
+        let html = "<label id=caption for=code>Code</label><input id=code>\
+            <script>document.getElementById('caption').addEventListener('click',()=>{});</script>";
+        let dom = Dom::parse_document(html);
+        let caption = dom.get_by_id("caption").unwrap();
+        let code = dom.get_by_id("code").unwrap();
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !matches!(
+                events.recv().await,
+                Some(crate::js::PageEvt::Updated { .. })
+            ) {}
+            handle
+                .try_send_user(crate::js::PageCmd::Click(caption))
+                .unwrap();
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Focused { node: Some(node) }) => {
+                        assert_eq!(node, code);
+                        break;
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended before reporting focus"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_reports_input_focus_on_pointer_down_before_click() {
+        // HTML focus follows the uncanceled pointer down. Desktop must learn
+        // it even when the later click target changes during page rendering.
+        let html = "<input id=code placeholder=Code><script>\
+            document.getElementById('code').addEventListener('focus',()=>{});</script>";
+        let code = Dom::parse_document(html).get_by_id("code").unwrap();
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !matches!(
+                events.recv().await,
+                Some(crate::js::PageEvt::Updated { .. })
+            ) {}
+            handle
+                .try_send_user(crate::js::PageCmd::PointerButton {
+                    node: Some(code),
+                    pressed: true,
+                    x: 10.0,
+                    y: 10.0,
+                    button: 0,
+                    metadata: Default::default(),
+                })
+                .unwrap();
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Focused { node: Some(node) }) => {
+                        assert_eq!(node, code);
+                        break;
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended before reporting focus"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn contenteditable_key_default_uses_live_selection_and_input_events() {
+        // Selection API §3 and Input Events 2 §6: keydown/keypress precede
+        // beforeinput, the native edit, and input at the focused editing host.
+        let html = r#"<div id=editor contenteditable><p id=line><br></p></div>
+            <output id=events></output><script>
+            const editor = document.getElementById('editor');
+            const seen = [];
+            for (const type of ['keydown','keypress','beforeinput','input'])
+                editor.addEventListener(type, event => {
+                    seen.push(type + ':' + (event.inputType || event.key));
+                    document.getElementById('events').textContent = seen.join(',');
+                });
+            </script>"#;
+        let editor = Dom::parse_document(html).get_by_id("editor").unwrap();
+        let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+        env.terminal_presentation = false;
+        let (handle, mut events) = spawn_page(html.into(), env);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !matches!(
+                events.recv().await,
+                Some(crate::js::PageEvt::Updated { .. })
+            ) {}
+            handle
+                .cmds
+                .send(crate::js::PageCmd::Focus(Some(editor)))
+                .await
+                .unwrap();
+            handle
+                .cmds
+                .send(crate::js::PageCmd::Key {
+                    node: None,
+                    input: crate::core::KeyInput {
+                        key: crate::core::Key::Character(String::from("x")),
+                        code: String::from("KeyX"),
+                        location: 0,
+                        state: crate::core::KeyState::Pressed,
+                        modifiers: Default::default(),
+                        repeat: false,
+                        composing: false,
+                    },
+                })
+                .await
+                .unwrap();
+            let mut rendered = false;
+            let mut caret = false;
+            while !rendered || !caret {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Updated { html, outcome }) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        if html.contains(
+                            "keydown:x,keypress:x,beforeinput:insertText,input:insertText",
+                        ) {
+                            assert!(html.contains(">x<"), "{html}");
+                            rendered = true;
+                        }
+                    }
+                    Some(crate::js::PageEvt::EditableState(Some(state))) if state.text == "x" => {
+                        assert_eq!(state.node, editor);
+                        assert_eq!(state.selection.start, 1);
+                        assert_eq!(state.selection.end, 1);
+                        caret = true;
+                    }
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("editing actor closed before input"),
+                }
+            }
+        })
+        .await
+        .expect("editing host did not receive input");
+    }
+
+    #[test]
+    fn selection_range_keeps_boundary_points_and_deletes_contained_nodes() {
+        // DOM §4.2 and Selection API §3: scripts see the selected Range by
+        // identity, and deletion removes fully contained siblings as well as
+        // the selected parts of endpoint Text nodes.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<div id=host><b>ab</b><em>cd</em><i>ef</i></div>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const host = document.getElementById('host');
+                const selection = getSelection();
+                const range = document.createRange();
+                range.setStart(host.firstChild.firstChild, 1);
+                range.setEnd(host.lastChild.firstChild, 1);
+                selection.addRange(range);
+                const same = selection === document.getSelection() && selection.getRangeAt(0) === range;
+                const containsMiddle = selection.containsNode(host.children[1]);
+                const containsFirst = selection.containsNode(host.children[0]);
+                const partialFirst = selection.containsNode(host.children[0], true);
+                range.deleteContents();
+                [same, containsMiddle, containsFirst, partialFirst, host.innerHTML,
+                    range.collapsed, range.startContainer === host, range.startOffset].join('|');
+                "#,
+            ),
+            "true|true|false|true|<b>a</b><i>f</i>|true|true|1"
+        );
+    }
+
+    #[test]
+    fn contenteditable_default_respects_beforeinput_cancellation_and_caret() {
+        // Input Events 2 §6: cancellation leaves the DOM and selection alone;
+        // a later deletion uses that same caret and dispatches input once.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<div id=editor contenteditable>abc</div>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const editor = document.getElementById('editor');
+                const seen = [];
+                editor.addEventListener('beforeinput', e => {
+                    seen.push('before:' + e.inputType);
+                    if (e.inputType === 'insertText') e.preventDefault();
+                });
+                editor.addEventListener('input', e => seen.push('input:' + e.inputType));
+                __trust.focusPage(editor.__id);
+                const selection = getSelection();
+                selection.collapse(editor.firstChild, 2);
+                const canceled = __trust.editableKeyDefault(null, 'x', false, false, false, false);
+                const unchanged = editor.textContent === 'abc' && selection.anchorOffset === 2;
+                const deleted = __trust.editableKeyDefault(null, 'Backspace', false, false, false, false);
+                const afterDelete = selection.anchorOffset;
+                const moved = __trust.editableKeyDefault(null, 'ArrowRight', false, false, false, false);
+                __trust.editableKeyDefault(null, 'ArrowLeft', true, false, false, false);
+                const selected = selection.toString();
+                __trust.editableKeyDefault(null, 'ArrowRight', false, false, false, false);
+                [canceled, unchanged, deleted, editor.textContent, afterDelete, moved,
+                    selected, selection.anchorOffset,
+                    seen.join(',')].join('|');
+                "#,
+            ),
+            "true|true|true|ac|1|true|c|2|before:insertText,before:deleteContentBackward,input:deleteContentBackward"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const island = document.createElement('span');
+                island.setAttribute('contenteditable', 'FALSE');
+                island.textContent = 'protected';
+                document.getElementById('editor').appendChild(island);
+                [__trust.editableKeyDefault(island.__id, 'x', false, false, false, false),
+                    island.textContent].join('|');
+                "#,
+            ),
+            "false|protected"
+        );
+    }
+
+    #[test]
     fn scroll_snap_accepts_real_node_lists_for_setters_and_methods() {
         let mut engine = configured_engine(
             HostState::new(
@@ -14953,7 +15488,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 169, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 170, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -14964,7 +15499,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 169);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 170);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

@@ -648,6 +648,10 @@ impl FocusTarget {
     }
 }
 
+fn tab_keeps_document_focus(focus: FocusTarget, has_text_editor: bool) -> bool {
+    matches!(focus, FocusTarget::Form { .. }) && has_text_editor
+}
+
 /// A native key awaiting its resident-page acknowledgement. Page script can
 /// cancel keyboard defaults (scrolling, activation, or an editor's Enter).
 #[derive(Clone, Debug)]
@@ -2363,6 +2367,7 @@ impl DesktopApp {
     /// queue along with the old page.
     fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
         let outcome = self.browser.process_async_events();
+        self.sync_actor_focus();
         self.sync_pointer_lock();
         self.launch_external_media_requests();
         if self.browser.download_offer().is_some()
@@ -2395,6 +2400,35 @@ impl DesktopApp {
         }
         self.apply_page_key_defaults();
         outcome
+    }
+
+    fn sync_actor_focus(&mut self) {
+        let Some(node) = self.browser.take_page_focus() else {
+            return;
+        };
+        if !self.browser.page_is_live()
+            || self.terminal.is_some()
+            || matches!(
+                self.focus,
+                FocusTarget::Command | FocusTarget::Find | FocusTarget::Download
+            )
+        {
+            return;
+        }
+        self.ensure_page_layout(self.browser_viewport());
+        let target = node.and_then(|node| {
+            self.page_layout
+                .as_ref()
+                .and_then(|page| page.document.controls.get(&node).copied())
+        });
+        if let Some((form, field)) = target {
+            // HTML focus updates are actor decisions, not a request to commit
+            // the old native draft or send a new focusing command back.
+            self.present_form_focus(form, field);
+        } else if matches!(self.focus, FocusTarget::Form { .. }) {
+            self.form_editor = None;
+            self.set_focus(FocusTarget::Page);
+        }
     }
 
     fn navigate(&mut self, address: String) {
@@ -3734,11 +3768,20 @@ impl DesktopApp {
             }
             return;
         }
-        let selection = control.selection.and(selection);
-        if control.editing_value() == value && control.selection == selection {
+        let editable = control.kind == FieldKind::Textarea && control.selection.is_none();
+        let state = control
+            .live_node
+            .and_then(|node| self.browser.page_editable_state(node));
+        let previous = state.map_or_else(|| control.editing_value(), |state| state.text.as_str());
+        let previous_selection = state.map_or(control.selection, |state| Some(state.selection));
+        let selection = if editable {
+            selection
+        } else {
+            control.selection.and(selection)
+        };
+        if previous == value && previous_selection == selection {
             return;
         }
-        let previous = control.editing_value();
         let mut prefix = 0;
         for (a, b) in previous.chars().zip(value.chars()) {
             if a != b {
@@ -3763,7 +3806,7 @@ impl DesktopApp {
         } else if data.is_some() {
             "insertText"
         } else if selection
-            .zip(control.selection)
+            .zip(previous_selection)
             .is_some_and(|(now, before)| now.start >= before.start)
         {
             "deleteContentForward"
@@ -3777,7 +3820,9 @@ impl DesktopApp {
             composing: self.composing,
         };
         control.set_editing_value(value.clone());
-        control.selection = selection;
+        if !editable {
+            control.selection = selection;
+        }
         let actor = control.live_node;
         let _ = control;
         if let Some(node) = actor {
@@ -3808,8 +3853,14 @@ impl DesktopApp {
                 .is_some_and(|node| self.browser.form_value_pending(node))
             && let Some(editor) = self.form_editor.as_mut()
         {
-            sync_editor_value(editor, control.editing_value());
-            if let Some(selection) = control.selection
+            let state = control
+                .live_node
+                .and_then(|node| self.browser.page_editable_state(node));
+            sync_editor_value(
+                editor,
+                state.map_or_else(|| control.editing_value(), |state| state.text.as_str()),
+            );
+            if let Some(selection) = state.map_or(control.selection, |state| Some(state.selection))
                 && editor.control_selection() != selection
             {
                 editor.set_control_selection(selection);
@@ -4256,23 +4307,21 @@ impl DesktopApp {
         // UI Events §3.5.6.1 routes keydown to the focused element and makes
         // Tab's default action focus transfer. HTML §6.6.5 explicitly allows
         // that transfer to enter UA controls after the document. TRust uses
-        // that UA-control transfer as COMMAND, but an actually focused form or
-        // contenteditable control retains the document's sequential-focus
-        // behavior. COMMAND itself always yields to Tab.
+        // that UA-control transfer as COMMAND. An active text editor retains
+        // the document's sequential-focus behavior; focused links and buttons
+        // still open COMMAND. COMMAND itself always yields to Tab.
         if pressed
             && !remote_focus
             && input.key == Key::Tab
             && !input.modifiers.control
             && !input.modifiers.meta
         {
-            match self.focus {
-                FocusTarget::Command => self.close_command(),
-                FocusTarget::Download => self.open_command(false),
-                FocusTarget::Form { .. } => self.focus_next(input.modifiers.shift),
-                FocusTarget::Page if self.keyboard_target.is_some() => {
-                    self.focus_next(input.modifiers.shift)
-                }
-                _ => self.open_command(false),
+            if self.focus == FocusTarget::Command {
+                self.close_command();
+            } else if tab_keeps_document_focus(self.focus, self.form_editor.is_some()) {
+                self.focus_next(input.modifiers.shift);
+            } else {
+                self.open_command(false);
             }
             return;
         }
@@ -5519,6 +5568,20 @@ impl DesktopApp {
             return;
         }
         self.finish_text_edit();
+        let actor = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .and_then(|control| control.live_node);
+        self.dispatch(UserAction::PageFocus { actor });
+        self.present_form_focus(form, field);
+    }
+
+    fn present_form_focus(&mut self, form: usize, field: usize) {
+        if self.focus == (FocusTarget::Form { form, field }) && self.form_editor.is_some() {
+            return;
+        }
         let Some(control) = self
             .page_layout
             .as_ref()
@@ -5528,9 +5591,6 @@ impl DesktopApp {
         else {
             return;
         };
-        self.dispatch(UserAction::PageFocus {
-            actor: control.live_node,
-        });
         let presentation = self.page_layout.as_ref().and_then(|page| {
             page.document.controls.iter().find_map(|(node, indices)| {
                 (*indices == (form, field))
@@ -5551,6 +5611,7 @@ impl DesktopApp {
         };
         self.form_scroll_x = 0.0;
         self.set_focus(FocusTarget::Form { form, field });
+        self.sync_focused_form();
         self.scroll_control_into_view(form, field);
     }
 
@@ -8248,6 +8309,129 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_opens_command_except_from_an_active_text_editor() {
+        assert!(!tab_keeps_document_focus(FocusTarget::Page, false));
+        assert!(!tab_keeps_document_focus(FocusTarget::Page, true));
+        assert!(!tab_keeps_document_focus(
+            FocusTarget::Form { form: 0, field: 0 },
+            false
+        ));
+        assert!(tab_keeps_document_focus(
+            FocusTarget::Form { form: 0, field: 0 },
+            true
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Wayland for the native event-loop proxy; creates no window"]
+    async fn verification_input_can_take_pointer_focus() {
+        // Pointer Events §4.1.3.2: the visible control's hit targets it.
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        let mut builder = EventLoop::<DesktopEvent>::with_user_event();
+        builder.with_any_thread(true).with_wayland();
+        let event_loop = builder.build().unwrap();
+        let browser = BrowserController::new(Handle::current(), || {}, CssSize::new(558.0, 625.0));
+        let mut app = DesktopApp::new(
+            browser,
+            Handle::current(),
+            event_loop.create_proxy(),
+            RendererPreference::Cpu,
+            None,
+        );
+        app.metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(558, 625), ScaleFactor::new(1.0));
+        let response = trust::http::Response {
+            url: url::Url::parse("https://example.test/email-verification").unwrap(),
+            status: 200,
+            content_type: "text/html".into(),
+            headers: Vec::new(),
+            body: br#"<!doctype html><style>
+                html,body{margin:0;background:#222;color:white;font:16px sans-serif}
+                form{width:340px;margin:65px auto}
+                input{box-sizing:border-box;width:340px;height:52px;margin-top:80px;
+                  border:1px solid #444;border-radius:26px;padding:0 20px;
+                  background:#222;color:white}
+                button{display:block;margin-top:24px;width:340px;height:52px}
+                </style><form><h1>Check your inbox</h1>
+                <input name=code placeholder=Code autocomplete=one-time-code>
+                <button>Continue</button><input name=next></form>"#
+                .to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+            timing: None,
+        };
+        let rendered = trust::http::render_html_for_environment(
+            &response,
+            trust::layout2::Viewport::new(558.0, 625.0),
+            1.0,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        let input = rendered
+            .controls
+            .iter()
+            .find_map(|(node, &(form, field))| {
+                (rendered.forms[form].fields[field].name == "code").then_some(*node)
+            })
+            .unwrap();
+        let bounds = *rendered.layout.boxes.get(&input).unwrap();
+        let (document, layout) = DesktopPageAdapter::from_rendered(response.url, rendered);
+        let mut scene = desktop_chrome(
+            app.metrics,
+            &app.browser.snapshot(),
+            &ChromeModel::default(),
+        );
+        scene.append_page(&layout.paint, CssPoint::default());
+        app.page_layout = Some(PageLayoutCache {
+            generation: 1,
+            revision: 1,
+            rendered_revision: 1,
+            viewport: CssSize::new(558.0, 625.0),
+            device_pixel_ratio: 1.0,
+            frozen: false,
+            document,
+            layout,
+        });
+        app.scene = Some(scene);
+        app.set_focus(FocusTarget::Page);
+        app.pointer = CssPoint::new(
+            bounds.left as f32 + bounds.width as f32 / 2.0,
+            bounds.top as f32 + bounds.height as f32 / 2.0,
+        );
+        app.handle_pointer_button(ElementState::Pressed, MouseButton::Left);
+        app.handle_pointer_button(ElementState::Released, MouseButton::Left);
+        assert!(matches!(app.focus, FocusTarget::Form { .. }));
+        // A script can clear this field and focus the next one while the
+        // native editor still shows its old draft. Presenting actor focus
+        // must never send that stale draft back to the document.
+        let FocusTarget::Form { form, field } = app.focus else {
+            unreachable!()
+        };
+        app.form_editor.as_mut().unwrap().set_text("stale draft");
+        app.page_layout.as_mut().unwrap().document.forms[form].fields[field]
+            .value
+            .clear();
+        let next = app.page_layout.as_ref().unwrap().document.forms[form]
+            .fields
+            .iter()
+            .position(|control| control.name == "next")
+            .unwrap();
+        app.present_form_focus(form, next);
+        assert_eq!(
+            app.page_layout.as_ref().unwrap().document.forms[form].fields[field].value,
+            ""
+        );
+        assert_eq!(app.focus, FocusTarget::Form { form, field: next });
+    }
 
     #[test]
     fn graphical_form_hit_walks_from_border_or_label_to_control() {

@@ -1554,7 +1554,8 @@ impl Dom {
             let scope = self.tree_scope(label);
             return self
                 .descendants(scope)
-                .find(|&node| self.attr(node, "id") == Some(target) && labelable(node));
+                .find(|&node| self.attr(node, "id") == Some(target))
+                .filter(|&node| labelable(node));
         }
         self.descendants(label).find(|&node| labelable(node))
     }
@@ -4063,6 +4064,23 @@ impl Dom {
         })
     }
 
+    fn logical_property(&self, id: NodeId, pseudo: Option<PseudoEl>, name: &str) -> Option<String> {
+        logical_to_physical(name)?;
+        let value = |property| {
+            match pseudo {
+                Some(which) => self.pseudo_layout_value(id, which, property),
+                None => self.computed_value_resolved(id, property),
+            }
+            .unwrap_or_default()
+        };
+        logical_physical_name(
+            name,
+            &value("writing-mode"),
+            &value("direction"),
+            &value("text-orientation"),
+        )
+    }
+
     /// The computed value of a property — the single inheritance authority.
     /// For an inherited property (per the registry) an element that doesn't
     /// set it resolves to the parent's computed value; otherwise this is the
@@ -4078,6 +4096,9 @@ impl Dom {
     /// here, so a property inherits everywhere by being marked `inherited`
     /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
+        if let Some(physical) = self.logical_property(id, None, name) {
+            return self.computed_value(id, &physical);
+        }
         if let Some(value) = self.transitions.value(id, name) {
             return Some(value);
         }
@@ -4264,6 +4285,9 @@ impl Dom {
     /// initial values for the implemented positioning, sizing and interaction
     /// surface so script does not mistake an empty sentinel for a CSS value.
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
+        if let Some(physical) = self.logical_property(id, None, name) {
+            return self.cssom_resolved_value(id, &physical);
+        }
         if name == "display" {
             return self.effective_display(id);
         }
@@ -4643,8 +4667,11 @@ impl Dom {
             });
         // Clone only on first sight or a WIN — a losing declaration costs a
         // lookup and a key compare, never an allocation.
-        let consider_into =
-            |map: &mut Winners, prop: &str, key: CascadeKey, value: &str| match map.get_mut(prop) {
+        let declaration_order = Cell::new(0usize);
+        let consider_into = |map: &mut Winners, prop: &str, mut key: CascadeKey, value: &str| {
+            key.7 = declaration_order.get();
+            declaration_order.set(key.7 + 1);
+            match map.get_mut(prop) {
                 Some(slot) => slot.consider(key, value, preserve_layers),
                 None => {
                     map.insert(
@@ -4652,7 +4679,8 @@ impl Dom {
                         CascadeWinner::One((key, value.to_string())),
                     );
                 }
-            };
+            }
+        };
         let mut elem = Winners::default();
         let mut before = Winners::default();
         let mut after = Winners::default();
@@ -4664,7 +4692,7 @@ impl Dom {
             consider_into(
                 &mut elem,
                 property,
-                (false, false, true, false, 0, (0, 0, 0), 0),
+                (false, false, true, false, 0, (0, 0, 0), 0, 0),
                 &value,
             );
         });
@@ -4698,6 +4726,7 @@ impl Dom {
                             encode_layer(&[], important),
                             (0, 0, 0),
                             usize::MAX,
+                            0,
                         ),
                         &pv,
                     );
@@ -4730,6 +4759,7 @@ impl Dom {
                             r.layer_key(*imp),
                             r.specificity,
                             r.order,
+                            0,
                         ),
                         v,
                     );
@@ -4767,6 +4797,7 @@ impl Dom {
                         r.layer_key(*imp),
                         r.specificity,
                         r.order,
+                        0,
                     ),
                     v,
                 );
@@ -4796,6 +4827,7 @@ impl Dom {
                             r.layer_key(*imp),
                             r.specificity,
                             r.order,
+                            0,
                         ),
                         v,
                     );
@@ -4826,6 +4858,7 @@ impl Dom {
                             false,
                             encode_layer(&[], false),
                             (0, 0, 0),
+                            0,
                             0,
                         ),
                         &value,
@@ -4871,6 +4904,7 @@ impl Dom {
                             r.layer_key(*imp),
                             r.specificity,
                             r.order,
+                            0,
                         ),
                         value,
                     );
@@ -5003,6 +5037,102 @@ impl Dom {
                 }
             }
         }
+        // CSS Logical 1 #box: compute axes before pairing declarations.
+        // Keep every layer candidate, including a physical fallback below a
+        // logical revert-layer. Source order includes declaration order.
+        if [&elem, &before, &after]
+            .iter()
+            .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
+        {
+            self.cascaded_cache.borrow_mut().put(
+                id,
+                self.style_value_epoch,
+                std::rc::Rc::new(maps.clone()),
+            );
+            for (pseudo, winners) in [
+                (None, &mut elem),
+                (Some(PseudoEl::Before), &mut before),
+                (Some(PseudoEl::After), &mut after),
+            ] {
+                let logical: Vec<_> = winners
+                    .keys()
+                    .filter(|key| logical_to_physical(key).is_some())
+                    .cloned()
+                    .collect();
+                let mut physical = Vec::new();
+                for name in logical {
+                    let target = self.logical_property(id, pseudo, &name).unwrap();
+                    let winner = winners.remove(&name).unwrap();
+                    let candidates = match winner {
+                        CascadeWinner::One(one) => vec![one],
+                        CascadeWinner::Layers(many) => many,
+                    };
+                    for (key, mut value) in candidates {
+                        // CSS Logical 1 #box: explicit inheritance follows
+                        // the logical property on the parent, whose axes can
+                        // differ. Resolve that keyword before losing its name.
+                        let raw = pending_shorthand(&value).map_or(value.as_str(), |(_, raw)| raw);
+                        let substituted = match pseudo {
+                            None => self.resolve_vars(id, raw),
+                            Some(which) => self.resolve_pseudo_vars(id, which, raw),
+                        };
+                        if substituted.trim().eq_ignore_ascii_case("inherit") {
+                            value = match pseudo {
+                                None => self
+                                    .style_parent(id)
+                                    .and_then(|parent| self.computed_value_resolved(parent, &name)),
+                                Some(_) => self.computed_value_resolved(id, &name),
+                            }
+                            .unwrap_or_else(|| "initial".into());
+                        }
+                        match winners.get_mut(&target) {
+                            Some(slot) => slot.consider(key, &value, preserve_layers),
+                            None => {
+                                winners.insert(target.clone(), CascadeWinner::One((key, value)));
+                            }
+                        }
+                    }
+                    physical.push(target);
+                    match pseudo {
+                        None => &mut maps.elem,
+                        Some(PseudoEl::Before) => &mut maps.before,
+                        Some(PseudoEl::After) => &mut maps.after,
+                    }
+                    .remove(&name);
+                }
+                for name in physical {
+                    let value = winners[&name]
+                        .resolve(|raw| {
+                            find_var_function(raw).is_some()
+                                && match pseudo {
+                                    None => self.resolve_vars(
+                                        id,
+                                        pending_shorthand(raw).map_or(raw, |(_, v)| v),
+                                    ),
+                                    Some(which) => self.resolve_pseudo_vars(
+                                        id,
+                                        which,
+                                        pending_shorthand(raw).map_or(raw, |(_, v)| v),
+                                    ),
+                                }
+                                .trim()
+                                .eq_ignore_ascii_case("revert-layer")
+                        })
+                        .to_owned();
+                    match pseudo {
+                        None => &mut maps.elem,
+                        Some(PseudoEl::Before) => &mut maps.before,
+                        Some(PseudoEl::After) => &mut maps.after,
+                    }
+                    .insert(name, value);
+                }
+                self.cascaded_cache.borrow_mut().put(
+                    id,
+                    self.style_value_epoch,
+                    std::rc::Rc::new(maps.clone()),
+                );
+            }
+        }
         maps
     }
 
@@ -5114,7 +5244,14 @@ impl Dom {
         let substituted = self.substitute_vars(id, raw, &mut Vec::new())?;
         expand_box_shorthand(shorthand, &substituted)
             .into_iter()
-            .find_map(|(longhand, value)| (longhand == name).then_some(value))
+            .find_map(|(longhand, value)| {
+                (self
+                    .logical_property(id, None, &longhand)
+                    .as_deref()
+                    .unwrap_or(&longhand)
+                    == name)
+                    .then_some(value)
+            })
     }
 
     fn resolve_pseudo_pending_shorthand(
@@ -5133,7 +5270,14 @@ impl Dom {
         }
         expand_box_shorthand(shorthand, &substituted)
             .into_iter()
-            .find_map(|(longhand, value)| (longhand == name).then_some(value))
+            .find_map(|(longhand, value)| {
+                (self
+                    .logical_property(id, Some(which), &longhand)
+                    .as_deref()
+                    .unwrap_or(&longhand)
+                    == name)
+                    .then_some(value)
+            })
     }
 
     /// The computed value of custom property `name` on `id`, with its own
@@ -5298,6 +5442,9 @@ impl Dom {
     /// pseudo-element, or `None` if no matching rule sets it. One hash
     /// lookup into the pseudo's bucket of the element's winner maps.
     pub fn pseudo_style(&self, id: NodeId, which: PseudoEl, prop: &str) -> Option<String> {
+        if let Some(physical) = self.logical_property(id, Some(which), prop) {
+            return self.pseudo_style(id, which, &physical);
+        }
         self.cascaded_maps(id).pseudo(which).get(prop).cloned()
     }
 
@@ -10259,6 +10406,16 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                 // https://drafts.csswg.org/selectors-4/#invalid
                 // https://dom.spec.whatwg.org/#scope-match-a-selectors-string
                 if double_colon && !matches!(name.as_str(), "before" | "after" | "slotted") {
+                    if name == "backdrop" && arg.is_none() {
+                        // CSS Positioned Layout 4 §3.2 defines ::backdrop as a
+                        // valid pseudo-element. It has no ordinary DOM element
+                        // subject, but its presence must not invalidate a
+                        // strict selector list such as the common
+                        // `*,:before,:after,::backdrop` reset rule.
+                        compound.never = true;
+                        compound.inert_pseudo_element = true;
+                        continue;
+                    }
                     if name.starts_with("-webkit-") && arg.is_none() {
                         compound.never = true;
                         compound.inert_pseudo_element = true;
@@ -10630,8 +10787,8 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "line-height",
     "white-space",
     "white-space-collapse",
-    "text-wrap",
     "text-wrap-mode",
+    "text-wrap-style",
     "text-transform",
     "letter-spacing",
     "word-spacing",
@@ -10657,6 +10814,9 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
 const PROPS: &[PropDef] = &[
     //    name                    inherited  baked
     prop("display", false, true),
+    // CSS Anchor Positioning 1 §2: anchor names are case-sensitive, discrete,
+    // non-inherited computed values. Positioned consumers are separately gated.
+    prop("anchor-name", false, true),
     prop("container-type", false, true),
     prop("container-name", false, true),
     prop("visibility", true, true),
@@ -10731,12 +10891,11 @@ const PROPS: &[PropDef] = &[
     prop("font-style", true, true),
     prop("line-height", true, true),
     prop("white-space", true, true),
-    // CSS Text 4 longhands: `white-space` is now the shorthand of
-    // `white-space-collapse` × `text-wrap-mode` (`text-wrap` shorthands the
-    // latter — modern Tailwind emits `text-wrap:nowrap`). All inherited.
+    // CSS Text 4: `white-space` and `text-wrap` expand to these inherited
+    // longhands before the cascade compares declaration order and specificity.
     prop("white-space-collapse", true, true),
-    prop("text-wrap", true, true),
     prop("text-wrap-mode", true, true),
+    prop("text-wrap-style", true, true),
     // CSS Overflow 3 §5.1 — chooses ellipsis vs plain clip at a nowrap
     // truncation. NOT inherited (applies to the clipping block itself).
     prop("text-overflow", false, true),
@@ -10942,6 +11101,9 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         // CSS Transforms 1 #transform-property: non-inherited, initial none.
         "transform" => Some("none"),
         "position" => Some("static"),
+        "anchor-name" => Some("none"),
+        "text-wrap-mode" => Some("wrap"),
+        "text-wrap-style" => Some("auto"),
         "top" | "right" | "bottom" | "left" => Some("auto"),
         "max-width" | "max-height" => Some("none"),
         "box-sizing" => Some("content-box"),
@@ -10968,7 +11130,9 @@ fn is_tracked(name: &str) -> bool {
     // resolve to their defined (cascaded, inherited) value at bake time, not
     // just the fallback. Unlike ordinary CSS property names, custom-property
     // names are case-sensitive (CSS Custom Properties §2).
-    name.starts_with("--") || PROPS.iter().any(|p| p.name == name)
+    name.starts_with("--")
+        || logical_to_physical(name).is_some()
+        || PROPS.iter().any(|p| p.name == name)
 }
 
 /// The HTML user-agent stylesheet's default `display` for a tag — what a
@@ -11200,9 +11364,8 @@ fn parse_alpha(v: &str) -> Option<f32> {
     }
 }
 
-/// CSS Logical Properties → physical equivalents for horizontal-tb LTR.
-/// Orthogonal text layout is supported by layout2, but logical box properties
-/// still need writing-mode-aware cascade mapping instead of this early rewrite.
+/// Identify a logical longhand and its horizontal LTR counterpart for grammar
+/// recognition. Cascade mapping uses the element's computed axes.
 fn logical_to_physical(prop: &str) -> Option<&'static str> {
     Some(match prop {
         "margin-inline-start" => "margin-left",
@@ -11213,6 +11376,18 @@ fn logical_to_physical(prop: &str) -> Option<&'static str> {
         "padding-inline-end" => "padding-right",
         "padding-block-start" => "padding-top",
         "padding-block-end" => "padding-bottom",
+        "border-inline-start-width" => "border-left-width",
+        "border-inline-end-width" => "border-right-width",
+        "border-block-start-width" => "border-top-width",
+        "border-block-end-width" => "border-bottom-width",
+        "border-inline-start-style" => "border-left-style",
+        "border-inline-end-style" => "border-right-style",
+        "border-block-start-style" => "border-top-style",
+        "border-block-end-style" => "border-bottom-style",
+        "border-inline-start-color" => "border-left-color",
+        "border-inline-end-color" => "border-right-color",
+        "border-block-start-color" => "border-top-color",
+        "border-block-end-color" => "border-bottom-color",
         "inset-inline-start" => "left",
         "inset-inline-end" => "right",
         "inset-block-start" => "top",
@@ -11227,16 +11402,95 @@ fn logical_to_physical(prop: &str) -> Option<&'static str> {
     })
 }
 
+fn logical_mapping_group(property: &str) -> Option<(&'static str, bool)> {
+    let mapped = logical_to_physical(property);
+    let group = match mapped.unwrap_or(property) {
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => "margin",
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => "padding",
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
+            "border-width"
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            "border-style"
+        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            "border-color"
+        }
+        "width" | "height" => "size",
+        "min-width" | "min-height" => "min-size",
+        "max-width" | "max-height" => "max-size",
+        "top" | "right" | "bottom" | "left" => "inset",
+        _ => return None,
+    };
+    Some((group, mapped.is_some()))
+}
+
+/// CSS Writing Modes 4 #logical-directions / CSS Logical 1 #box. Parsing
+/// preserves flow-relative longhands; only the computed writing mode selects
+/// which physical declaration participates in the same cascade group.
+fn logical_physical_name(
+    property: &str,
+    writing_mode: &str,
+    direction: &str,
+    orientation: &str,
+) -> Option<String> {
+    let horizontal = !matches!(
+        writing_mode,
+        "vertical-rl" | "vertical-lr" | "sideways-rl" | "sideways-lr"
+    );
+    let rtl = direction == "rtl"
+        && !(orientation == "upright" && matches!(writing_mode, "vertical-rl" | "vertical-lr"));
+    let (block_start, block_end) = if horizontal {
+        ("top", "bottom")
+    } else if matches!(writing_mode, "vertical-rl" | "sideways-rl") {
+        ("right", "left")
+    } else {
+        ("left", "right")
+    };
+    let (mut inline_start, mut inline_end) = if horizontal {
+        ("left", "right")
+    } else if writing_mode == "sideways-lr" {
+        ("bottom", "top")
+    } else {
+        ("top", "bottom")
+    };
+    if rtl {
+        std::mem::swap(&mut inline_start, &mut inline_end);
+    }
+    let default = logical_to_physical(property)?;
+    Some(
+        default
+            .split('-')
+            .map(|part| match part {
+                "left" => inline_start,
+                "right" => inline_end,
+                "top" => block_start,
+                "bottom" => block_end,
+                "width" if !horizontal && property.ends_with("size") => "height",
+                "height" if !horizontal && property.ends_with("size") => "width",
+                _ => part,
+            })
+            .collect::<Vec<_>>()
+            .join("-"),
+    )
+}
+
 /// The two-value logical shorthands (`margin-inline: <start> <end>?`, …) →
-/// their physical (left/right or top/bottom) longhand pair.
+/// their logical start/end longhand pair.
 fn logical_pair(prop: &str) -> Option<(&'static str, &'static str)> {
     Some(match prop {
-        "margin-inline" => ("margin-left", "margin-right"),
-        "margin-block" => ("margin-top", "margin-bottom"),
-        "padding-inline" => ("padding-left", "padding-right"),
-        "padding-block" => ("padding-top", "padding-bottom"),
-        "inset-inline" => ("left", "right"),
-        "inset-block" => ("top", "bottom"),
+        "margin-inline" => ("margin-inline-start", "margin-inline-end"),
+        "margin-block" => ("margin-block-start", "margin-block-end"),
+        "padding-inline" => ("padding-inline-start", "padding-inline-end"),
+        "padding-block" => ("padding-block-start", "padding-block-end"),
+        "border-inline-width" => ("border-inline-start-width", "border-inline-end-width"),
+        "border-block-width" => ("border-block-start-width", "border-block-end-width"),
+        "border-inline-style" => ("border-inline-start-style", "border-inline-end-style"),
+        "border-block-style" => ("border-block-start-style", "border-block-end-style"),
+        "border-inline-color" => ("border-inline-start-color", "border-inline-end-color"),
+        "border-block-color" => ("border-block-start-color", "border-block-end-color"),
+        "inset-inline" => ("inset-inline-start", "inset-inline-end"),
+        "inset-block" => ("inset-block-start", "inset-block-end"),
         _ => return None,
     })
 }
@@ -11351,6 +11605,37 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             },
         );
     }
+    if prop == "text-wrap" {
+        // CSS Text 4 §5.4: each omitted longhand resets to its initial value.
+        // Expanding in declaration order lets a later text-wrap:wrap override
+        // an inherited or earlier text-wrap-mode:nowrap.
+        if wide_keyword(value).is_some() {
+            return ["text-wrap-mode", "text-wrap-style"]
+                .into_iter()
+                .map(|name| (name.to_string(), value.to_string()))
+                .collect();
+        }
+        let mut mode = None;
+        let mut style = None;
+        for token in split_top_level_ws(value) {
+            match token.to_ascii_lowercase().as_str() {
+                "wrap" | "nowrap" if mode.is_none() => mode = Some(token),
+                "auto" | "balance" | "stable" | "pretty" | "avoid-short-last-line"
+                    if style.is_none() =>
+                {
+                    style = Some(token)
+                }
+                _ => return Vec::new(),
+            }
+        }
+        if mode.is_none() && style.is_none() {
+            return Vec::new();
+        }
+        return vec![
+            ("text-wrap-mode".into(), mode.unwrap_or("wrap").into()),
+            ("text-wrap-style".into(), style.unwrap_or("auto").into()),
+        ];
+    }
     if prop == "container" {
         let (name, kind) = value
             .split_once('/')
@@ -11363,10 +11648,9 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ("container-type".into(), kind.into()),
         ];
     }
-    // Logical properties resolve to their physical names first (LTR
-    // horizontal-tb — see `logical_to_physical`).
-    if let Some(phys) = logical_to_physical(prop) {
-        return vec![(phys.to_string(), value.to_string())];
+    // Logical longhands remain distinct until the element's axes are known.
+    if logical_to_physical(prop).is_some() {
+        return vec![(prop.to_string(), value.to_string())];
     }
     // `word-wrap` parses exactly as `overflow-wrap` (CSS Text 3 §5.5 — a
     // legacy alias, not a shorthand).
@@ -11410,6 +11694,30 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             (start.to_string(), a.to_string()),
             (end.to_string(), b.to_string()),
         ];
+    }
+    let logical_sides: &[&str] = match prop {
+        "border-inline-start" => &["inline-start"],
+        "border-inline-end" => &["inline-end"],
+        "border-block-start" => &["block-start"],
+        "border-block-end" => &["block-end"],
+        "border-inline" => &["inline-start", "inline-end"],
+        "border-block" => &["block-start", "block-end"],
+        _ => &[],
+    };
+    if !logical_sides.is_empty() {
+        if wide_keyword(value).is_some() {
+            return border_longhands(logical_sides, Some(value), Some(value), Some(value));
+        }
+        let (width, style, color) = parse_border_shorthand(value);
+        if width.is_none() && style.is_none() && color.is_none() {
+            return Vec::new();
+        }
+        return border_longhands(
+            logical_sides,
+            Some(width.unwrap_or("medium")),
+            Some(style.unwrap_or("none")),
+            Some(color.unwrap_or("currentcolor")),
+        );
     }
     if prop == "margin" || prop == "padding" {
         let Some([t, r, b, l]) = four_sides(value) else {
@@ -12533,7 +12841,7 @@ impl StyleRule {
 /// sorted before element-attached styles, and element-attached styles before
 /// layers (CSS Cascade 5 §6.1), and BEFORE specificity (layers beat
 /// specificity — the point of the feature).
-type CascadeKey = (bool, bool, bool, bool, u64, (u32, u32, u32), usize);
+type CascadeKey = (bool, bool, bool, bool, u64, (u32, u32, u32), usize, usize);
 
 /// CSS Cascade 5 #revert-layer: keep the strongest declaration at each
 /// importance/context/inline/layer level when rollback occurs in the sheet.
@@ -13345,12 +13653,18 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
             (v, false)
         };
     let v = v.trim();
-    let value = if custom
+    let value = if k == "anchor-name" && find_var_function(v).is_none() && wide_keyword(v).is_none()
+    {
+        // CSS Anchor Positioning 1 §2: the dashed-ident list is parsed once
+        // at the declaration boundary, including escaped names and `none`.
+        cssom::anchor_name_value(v)?
+    } else if custom
         || v.starts_with(PENDING_BOX_SHORTHAND)
         || k.starts_with("grid-")
         || matches!(
             k.as_str(),
             "content"
+                | "anchor-name"
                 | "container"
                 | "container-name"
                 | "counter-reset"
@@ -13366,7 +13680,8 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
                 | "negative"
                 | "fallback"
                 | "system"
-        ) {
+        )
+    {
         v.to_string()
     } else {
         normalize_css_value(v)
@@ -13501,6 +13816,12 @@ fn property_rejects_unitless_nonzero_length(property: &str) -> bool {
             | "border-right-width"
             | "border-bottom-width"
             | "border-left-width"
+            | "border-inline-start-width"
+            | "border-inline-end-width"
+            | "border-block-start-width"
+            | "border-block-end-width"
+            | "border-inline-width"
+            | "border-block-width"
             | "border-radius"
             | "border-top-left-radius"
             | "border-top-right-radius"
@@ -14216,13 +14537,13 @@ fn collect_decls(decl_text: &str) -> Vec<(String, (bool, String))> {
             if !is_tracked(&pk) {
                 continue;
             }
-            if let Some(slot) = decls.iter_mut().find(|(n, _)| *n == pk) {
-                if important >= slot.1.0 {
-                    slot.1 = (important, pv);
+            if let Some(index) = decls.iter().position(|(name, _)| *name == pk) {
+                if !important && decls[index].1.0 {
+                    continue;
                 }
-            } else {
-                decls.push((pk, (important, pv)));
+                decls.remove(index);
             }
+            decls.push((pk, (important, pv)));
         }
     }
     decls
@@ -15596,6 +15917,155 @@ mod tests {
         let parsed = SelectorList::parse(":is(.image, #absent::-webkit-unknown)").unwrap();
         assert!(dom.matches(cover, &parsed));
         assert_eq!(parsed.0[0].specificity(), (0, 1, 0));
+    }
+
+    #[test]
+    fn known_backdrop_selector_keeps_strict_reset_list_valid() {
+        // Selectors 4 §3.9 and CSS Positioned Layout 4 §3.2: ::backdrop is
+        // valid syntax, so a strict reset list containing it still applies
+        // its universal selector to ordinary elements.
+        let dom = Dom::parse_document(
+            "<style>@layer base { *,:after,:before,::backdrop { \
+             box-sizing:border-box;border:0 solid;margin:0;padding:0 \
+             } }</style><button id=control>OK</button>",
+        );
+        let button = dom.get_by_id("control").unwrap();
+        assert!(selector_parses("*,:after,:before,::backdrop"));
+        assert_eq!(
+            dom.computed_value_resolved(button, "box-sizing").as_deref(),
+            Some("border-box")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(button, "border-top-width")
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(button, "border-top-style")
+                .as_deref(),
+            Some("solid")
+        );
+        assert!(!selector_parses("*,::unknown-pseudo"));
+    }
+
+    #[test]
+    fn logical_border_side_and_shorthands_reach_physical_border_in_ltr() {
+        // CSS Logical Properties 1 §4.5: border-inline-end is the right
+        // edge in horizontal-tb LTR, with physical/logical declarations
+        // sharing ordinary cascade order.
+        let dom = Dom::parse_document(
+            "<style>@layer base{*,:after,:before,::backdrop{border:0 solid}} \
+             @layer utilities{.border-e{--tw-border-style:solid; \
+             border-inline-end-style:var(--tw-border-style); \
+             border-inline-end-width:1px;border-color:#ffffff1a} \
+             #pair{border-inline-width:2px 3px;border-block-style:dashed dotted} \
+             #shorthand{border-inline:4px dashed red} \
+             #later{border-inline-end-width:1px;border-right-width:5px}}</style> \
+             <div id=edge class=border-e></div><div id=pair></div> \
+             <div id=shorthand></div><div id=later></div>",
+        );
+        let value = |id, name| dom.computed_value_resolved(dom.get_by_id(id).unwrap(), name);
+        assert_eq!(
+            value("edge", "border-right-style").as_deref(),
+            Some("solid")
+        );
+        assert_eq!(value("edge", "border-right-width").as_deref(), Some("1px"));
+        assert_eq!(value("pair", "border-left-width").as_deref(), Some("2px"));
+        assert_eq!(value("pair", "border-right-width").as_deref(), Some("3px"));
+        assert_eq!(value("pair", "border-top-style").as_deref(), Some("dashed"));
+        assert_eq!(
+            value("pair", "border-bottom-style").as_deref(),
+            Some("dotted")
+        );
+        assert_eq!(
+            value("shorthand", "border-left-width").as_deref(),
+            Some("4px")
+        );
+        assert_eq!(
+            value("shorthand", "border-right-style").as_deref(),
+            Some("dashed")
+        );
+        assert_eq!(value("later", "border-right-width").as_deref(), Some("5px"));
+    }
+
+    #[test]
+    fn logical_properties_follow_axes_and_cascade_order() {
+        // CSS Logical 1 #box: determine axes before cascading corresponding
+        // physical/logical declarations. CSS Writing Modes 4 #logical-to-physical.
+        let mut dom = Dom::parse_document(
+            "<style>@layer base,top; \
+             @layer base{div{border-inline-end-width:7px}} \
+             @layer top{#layer{border-left-width:9px;border-inline-end-width:revert-layer}} \
+             #rtl{direction:rtl;border-inline:2px solid red;border-inline-end-width:3px} \
+             #vertical{writing-mode:vertical-rl;direction:rtl;border-inline:4px  solid; \
+                border-inline-end-width:5px;border-block-start-width:6px;inline-size:20px} \
+             #order{direction:rtl;border-inline-end-width:1px;border-left-width:2px;border-inline-end-width:3px} \
+             #variable{direction:rtl;--edge:8px dashed red;border-inline-end:var(--edge)} \
+             #layer{direction:rtl} #dynamic{border-inline-end-width:11px} \
+             #dynamic::before{content:'x';direction:rtl;border-inline-end-width:12px} \
+             #parent{margin-inline-start:13px;margin-inline-end:14px} \
+             #child{direction:rtl;margin-inline-start:inherit}</style> \
+             <div id=rtl></div><div id=vertical></div><div id=order></div> \
+             <div id=variable></div><div id=layer></div><div id=dynamic></div> \
+             <div id=parent><div id=child></div></div>",
+        );
+        for (id, name, expected) in [
+            ("rtl", "border-left-width", "3px"),
+            ("rtl", "border-right-width", "2px"),
+            ("rtl", "border-inline-end-width", "3px"),
+            ("vertical", "border-top-width", "5px"),
+            ("vertical", "border-bottom-width", "4px"),
+            ("vertical", "border-right-width", "6px"),
+            ("vertical", "height", "20px"),
+            ("order", "border-left-width", "3px"),
+            ("variable", "border-left-width", "8px"),
+            ("variable", "border-left-style", "dashed"),
+            ("layer", "border-left-width", "7px"),
+            ("dynamic", "border-right-width", "11px"),
+            ("child", "margin-right", "13px"),
+        ] {
+            assert_eq!(
+                dom.computed_value_resolved(dom.get_by_id(id).unwrap(), name)
+                    .as_deref(),
+                Some(expected),
+                "{id} {name}"
+            );
+        }
+        let dynamic = dom.get_by_id("dynamic").unwrap();
+        assert_eq!(
+            dom.pseudo_style(dynamic, PseudoEl::Before, "border-left-width")
+                .as_deref(),
+            Some("12px")
+        );
+        dom.set_attr(dynamic, "style", "direction:rtl");
+        assert_eq!(
+            dom.computed_value_resolved(dynamic, "border-left-width")
+                .as_deref(),
+            Some("11px")
+        );
+    }
+
+    #[test]
+    fn text_wrap_shorthand_resets_inherited_nowrap_and_respects_later_longhand() {
+        // CSS Text 4 §5.4: a shorthand sets BOTH longhands, and normal
+        // cascade order then decides whether a later longhand overrides it.
+        let dom = Dom::parse_document(
+            "<style>#outer{text-wrap-mode:nowrap} \
+             #wrapped{text-wrap:wrap} \
+             #pretty{text-wrap:pretty} \
+             #later{text-wrap:wrap;text-wrap-mode:nowrap}</style> \
+             <div id=outer><p id=wrapped>one two</p><p id=pretty>one two</p> \
+             <p id=later>one two</p></div>",
+        );
+        let value = |id, name| dom.computed_value_resolved(dom.get_by_id(id).unwrap(), name);
+        assert_eq!(value("wrapped", "text-wrap-mode").as_deref(), Some("wrap"));
+        assert_eq!(value("wrapped", "text-wrap-style").as_deref(), Some("auto"));
+        assert_eq!(value("pretty", "text-wrap-mode").as_deref(), Some("wrap"));
+        assert_eq!(
+            value("pretty", "text-wrap-style").as_deref(),
+            Some("pretty")
+        );
+        assert_eq!(value("later", "text-wrap-mode").as_deref(), Some("nowrap"));
     }
 
     #[test]
@@ -17088,8 +17558,11 @@ mod tests {
         assert_eq!(
             expand_box_shorthand("margin-inline", "calc(2px + 1em) auto"),
             vec![
-                ("margin-left".to_string(), "calc(2px + 1em)".to_string()),
-                ("margin-right".to_string(), "auto".to_string()),
+                (
+                    "margin-inline-start".to_string(),
+                    "calc(2px + 1em)".to_string()
+                ),
+                ("margin-inline-end".to_string(), "auto".to_string()),
             ]
         );
     }
@@ -20870,6 +21343,16 @@ mod tests {
             !dirty.contains(&b),
             "the control is not designated, so its ancestors do not match"
         );
+    }
+
+    #[test]
+    fn label_for_uses_first_matching_id_even_if_it_is_not_labelable() {
+        // HTML §4.10.4: a later input cannot claim the association when an
+        // earlier non-labelable element has the same ID.
+        let dom = Dom::parse_document(
+            "<label id=caption for=code>Code</label><span id=code></span><input id=code>",
+        );
+        assert_eq!(dom.labeled_control(dom.get_by_id("caption").unwrap()), None);
     }
 
     #[test]

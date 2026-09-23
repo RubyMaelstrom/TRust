@@ -241,6 +241,8 @@
     // The host roots this WeakMap without keeping detached elements alive.
     const elementSlots = g.__element_slots(new WeakMap());
     delete g.__element_slots;
+    const liveRanges = g.__live_range_registry(new Set());
+    delete g.__live_range_registry;
     // Bind pristine intrinsics once: no temporary argument arrays or author
     // prototype lookups on each wrapper creation / interface conversion.
     const rememberElement = messageWeakSet.bind(elementSlots);
@@ -723,6 +725,14 @@
             }
         }
         blurElement(focusedArea);
+    };
+    trust.focusedNode = function () {
+        activeElementFor(g.document); // Disconnected-focus fixup.
+        // HTML #currently-focused-area-of-a-top-level-browsing-context:
+        // the native editor follows the innermost focused navigable.
+        if (focusedArea?.__contentRealmWindow)
+            return focusedArea.__contentRealmWindow.__trust.focusedNode();
+        return focusedArea ? elementIdentity(focusedArea) : null;
     };
     function baseHref() {
         if (baseHrefCache !== null) return baseHrefCache;
@@ -1948,7 +1958,7 @@
             if (ev.defaultPrevented) cancelInputActivation(inputActivation);
             else {
                 const handled = finishInputActivation(inputActivation)
-                    ? false : runClickActivation(activationTarget, clickContext);
+                    ? false : runClickActivation(activationTarget, clickContext, target, ev.isTrusted);
                 if (clickContext) clickContext.handled = handled;
             }
         }
@@ -2665,6 +2675,7 @@
         if (!node || node.nodeType !== 1 || node.namespaceURI !== HTML_NS) return false;
         const tag = node.localName;
         if (tag === "input" || tag === "button") return true;
+        if (tag === "label") return true;
         if (tag === "a" || tag === "area") return node.hasAttribute("href");
         if (tag !== "summary") return false;
         const parent = node.parentElement;
@@ -2876,8 +2887,48 @@
             }), false);
         return !allowed || context.handled;
     }
-    function runClickActivation(t, context) {
+    function labelableElement(el) {
+        if (!el || el.nodeType !== 1 || el.namespaceURI !== HTML_NS) return false;
+        const tag = el.localName;
+        return tag === "button" || tag === "meter" || tag === "output"
+            || tag === "progress" || tag === "select" || tag === "textarea"
+            || (tag === "input" && String(el.type || "").toLowerCase() !== "hidden");
+    }
+    function labeledControl(label) {
+        const forId = label.getAttribute("for");
+        if (forId !== null) {
+            // HTML §4.10.4: the FIRST matching ID in the same tree decides
+            // the association, even if that element is not labelable.
+            const root = label.getRootNode();
+            const first = Array.from(root.querySelectorAll("[id]"))
+                .find(el => el.getAttribute("id") === forId);
+            return labelableElement(first) ? first : null;
+        }
+        return Array.from(label.querySelectorAll("*"))
+            .find(labelableElement) || null;
+    }
+    function interactiveLabelDescendant(el) {
+        if (!el || el.nodeType !== 1 || el.namespaceURI !== HTML_NS) return false;
+        const tag = el.localName;
+        if (tag === "a") return el.hasAttribute("href");
+        if (tag === "audio" || tag === "video") return el.hasAttribute("controls");
+        if (tag === "img") return el.hasAttribute("usemap") || el.hasAttribute("controls");
+        if (tag === "input") return String(el.type || "").toLowerCase() !== "hidden";
+        return tag === "button" || tag === "details" || tag === "embed"
+            || tag === "iframe" || tag === "label" || tag === "select" || tag === "textarea";
+    }
+    function runClickActivation(t, context, originalTarget, trusted) {
         if (isActuallyDisabled(t)) return false;
+        if (t.localName === "label") {
+            // HTML §4.10.4: interactive descendants keep their own activation;
+            // clicks on the caption activate its associated control. Using a
+            // nested click preserves cancellation and the control's own events.
+            for (let node = originalTarget; node && node !== t; node = node.parentNode) {
+                if (interactiveLabelDescendant(node)) return false;
+            }
+            const control = labeledControl(t);
+            return control ? activateClick(control, !!(context && context.record), trusted) : false;
+        }
         if (t.localName === "a" || t.localName === "area") {
             if (context && context.record) pendingClickHyperlink = t;
             else {
@@ -3769,11 +3820,287 @@
         const v = (el.getAttribute("contenteditable") || "").trim().toLowerCase();
         return v === "" || v === "true" || v === "plaintext-only";
     }
+    function ceDisabled(el) {
+        return el?.nodeType === 1 &&
+            el.getAttribute("contenteditable")?.toLowerCase() === "false";
+    }
+    function editingHostOf(node) {
+        let host = null;
+        for (let current = node; current && current !== g.document; current = current.parentNode) {
+            if (ceDisabled(current)) return host;
+            if (ceHost(current)) host = current;
+        }
+        return host;
+    }
+    function editableBlock(node) {
+        if (node.nodeType !== 1) return false;
+        const display = g.getComputedStyle(node).display;
+        return /^(block|flow-root|list-item|flex|grid|table)/.test(display) ||
+            (!display && /^(p|div|li|h[1-6]|blockquote|pre)$/.test(node.localName));
+    }
+    // A projection for the native caret only. The DOM and its live Range are
+    // authoritative. UTF-16 positions include authored line/paragraph breaks
+    // and retain protected text, without making that text editable.
+    function editableModel(host) {
+        const segments = [], placeholders = [];
+        let text = "", pending = null;
+        function append(value, before, after, node, kind) {
+            if (!value) return;
+            segments.push({start:text.length, end:text.length + value.length,
+                text:value, before, after, node, kind});
+            text += value;
+        }
+        function flush(point) {
+            if (pending) {
+                append("\n", pending, point, null, "paragraph");
+                pending = null;
+            }
+        }
+        function visit(node) {
+            const parent = node.parentNode, index = parent ? rangeIndex(node) : 0;
+            if (node.nodeType === 3) {
+                if (node.length) { flush([node,0]); append(node.data,[node,0],[node,node.length],node,"text"); }
+                return;
+            }
+            if (node.nodeType !== 1) return;
+            if (node !== host && ceDisabled(node)) {
+                flush([parent,index]);
+                append(node.textContent || "\uFFFC",[parent,index],[parent,index+1],node,"protected");
+                return;
+            }
+            if (node.localName === "br") {
+                // A sole or trailing repeated BR keeps an empty editing line
+                // paintable; it does not add another character to that line.
+                if (!node.nextSibling && (!text || text.endsWith("\n"))) { placeholders.push(node); return; }
+                flush([parent,index]);
+                append("\n",[parent,index],[parent,index+1],node,"break");
+                return;
+            }
+            const block = node !== host && editableBlock(node);
+            if (block) {
+                if (!pending && text && !text.endsWith("\n")) pending = segments[segments.length-1].after;
+                flush([node,0]);
+            }
+            for (const child of node.childNodes) visit(child);
+            if (block) pending = [node,node.childNodes.length];
+        }
+        visit(host);
+        return {host, text, segments, placeholders};
+    }
+    function editableOffset(model, node, offset) {
+        for (const segment of model.segments) {
+            if (segment.kind === "text" && segment.node === node)
+                return segment.start + Math.min(offset, segment.text.length);
+            if (rangeOrder(node,offset,...segment.before) !== 1) return segment.start;
+            if (rangeOrder(node,offset,...segment.after) === -1) return segment.start;
+        }
+        return model.text.length;
+    }
+    function editablePoint(model, offset) {
+        offset = Math.max(0, Math.min(offset, model.text.length));
+        for (const segment of model.segments) {
+            if (offset > segment.end) continue;
+            if (segment.kind === "text") return [segment.node,offset-segment.start];
+            return offset <= segment.start ? segment.before : segment.after;
+        }
+        let empty = model.host;
+        while (empty.firstChild && empty.firstChild.nodeType === 1 &&
+            empty.firstChild.localName !== "br" && !ceDisabled(empty.firstChild)) empty = empty.firstChild;
+        return [empty,0];
+    }
+    function editableSelection(model) {
+        const selection = g.getSelection();
+        if (!selection.rangeCount || !model.host.contains(selection.anchorNode) || !model.host.contains(selection.focusNode))
+            return {start:model.text.length,end:model.text.length,direction:0};
+        const anchor = editableOffset(model,selection.anchorNode,selection.anchorOffset);
+        const focus = editableOffset(model,selection.focusNode,selection.focusOffset);
+        return {start:Math.min(anchor,focus),end:Math.max(anchor,focus),direction:anchor > focus ? -1 : anchor < focus ? 1 : 0};
+    }
+    function setEditableSelection(model, start, end, direction = 0) {
+        const a = editablePoint(model,start), b = editablePoint(model,end);
+        const selection = g.getSelection();
+        if (start === end) selection.collapse(...a);
+        else if (direction < 0) selection.setBaseAndExtent(...b,...a);
+        else selection.setBaseAndExtent(...a,...b);
+    }
+    trust.editableState = function () {
+        activeElementFor(g.document);
+        if (focusedArea?.__contentRealmWindow)
+            return focusedArea.__contentRealmWindow.__trust.editableState();
+        const host = editingHostOf(focusedArea);
+        if (!host || !host.isConnected) return "null";
+        const model = editableModel(host);
+        return JSON.stringify({node:elementIdentity(host),text:model.text,selection:editableSelection(model)});
+    };
+    function editableStep(model, position, direction) {
+        for (const segment of model.segments) {
+            if (segment.kind === "protected" && (direction < 0
+                ? position > segment.start && position <= segment.end
+                : position >= segment.start && position < segment.end))
+                return direction < 0 ? segment.start : segment.end;
+        }
+        const text = model.text;
+        if (direction < 0) {
+            if (!position) return 0;
+            const low = text.charCodeAt(position-1), high = text.charCodeAt(position-2);
+            return position - (low >= 0xDC00 && low <= 0xDFFF && high >= 0xD800 && high <= 0xDBFF ? 2 : 1);
+        }
+        if (position >= text.length) return text.length;
+        return position + (text.codePointAt(position) > 0xFFFF ? 2 : 1);
+    }
+    function editableMove(selection, host, direction, extend) {
+        const model = editableModel(host), state = editableSelection(model);
+        const focus = state.direction < 0 ? state.start : state.end;
+        const anchor = state.direction < 0 ? state.end : state.start;
+        const destination = !extend && state.start !== state.end
+            ? direction < 0 ? state.start : state.end : editableStep(model,focus,direction);
+        setEditableSelection(model, extend ? Math.min(anchor,destination) : destination,
+            extend ? Math.max(anchor,destination) : destination, extend && destination < anchor ? -1 : 1);
+    }
+    function editableAncestorBlock(host, node) {
+        if (node.nodeType !== 1) node = node.parentNode;
+        while (node && node !== host && !editableBlock(node)) node = node.parentNode;
+        return node || host;
+    }
+    function editableDelete(model, start, end) {
+        let changed = false;
+        // Remove only editable parts. A selection may cross a protected island
+        // but must never rewrite its data or remove an ancestor containing it.
+        for (let i = model.segments.length - 1; i >= 0; i--) {
+            const segment = model.segments[i];
+            const a = Math.max(start,segment.start), b = Math.min(end,segment.end);
+            if (a >= b || segment.kind === "protected") continue;
+            if (segment.kind === "text") segment.node.deleteData(a-segment.start,b-a);
+            else if (segment.kind === "break") segment.node.remove();
+            else {
+                const left = editableAncestorBlock(model.host,segment.before[0]);
+                const right = editableAncestorBlock(model.host,segment.after[0]);
+                if (left === right || left === model.host || right === model.host ||
+                    left.contains(right) || right.contains(left)) continue;
+                for (const placeholder of model.placeholders)
+                    if (left.contains(placeholder) || right.contains(placeholder)) placeholder.remove();
+                // The two blocks stay within this editing host. Moving their
+                // children preserves formatting and protected descendants.
+                while (right.firstChild) left.appendChild(right.firstChild);
+                right.remove();
+            }
+            changed = true;
+        }
+        setEditableSelection(editableModel(model.host),start,start);
+        return changed;
+    }
+    function editableInsertBreak(host, paragraph) {
+        const selection = g.getSelection(), range = selection.getRangeAt(0);
+        if (!paragraph || host.getAttribute("contenteditable")?.toLowerCase() === "plaintext-only") {
+            const br = host.ownerDocument.createElement("br");
+            range.insertNode(br);
+            // Keep the empty line after a terminal BR visible to layout.
+            if (!br.nextSibling || br.nextSibling.nodeType === 3 && !br.nextSibling.length)
+                br.parentNode.appendChild(host.ownerDocument.createElement("br"));
+            selection.collapse(br.parentNode,rangeIndex(br)+1);
+            return;
+        }
+        const block = editableAncestorBlock(host,range.startContainer);
+        let parent = range.startContainer, offset = range.startOffset;
+        if (parent.nodeType === 3) {
+            const tail = parent.splitText(offset);
+            parent = tail.parentNode; offset = rangeIndex(tail);
+        }
+        // Split the containing paragraph and its inline ancestors, retaining
+        // their authored formatting on both sides of the insertion point.
+        let right = parent === host ? host.ownerDocument.createElement("div") : parent.cloneNode(false);
+        right.removeAttribute("id");
+        while (parent.childNodes[offset]) right.appendChild(parent.childNodes[offset]);
+        while (parent !== block) {
+            const outer = parent.parentNode;
+            const copy = outer === host ? host.ownerDocument.createElement("div") : outer.cloneNode(false);
+            copy.removeAttribute("id"); copy.appendChild(right);
+            while (parent.nextSibling) copy.appendChild(parent.nextSibling);
+            parent = outer; right = copy;
+        }
+        if (block === host) {
+            const left = host.ownerDocument.createElement("div");
+            while (host.firstChild) left.appendChild(host.firstChild);
+            host.appendChild(left); host.appendChild(right);
+            if (!left.textContent && !left.querySelector('br')) left.appendChild(host.ownerDocument.createElement('br'));
+        } else block.parentNode.insertBefore(right,block.nextSibling);
+        if (!block.textContent && !block.querySelector('br')) block.appendChild(host.ownerDocument.createElement('br'));
+        if (!right.textContent && !right.querySelector('br')) right.appendChild(host.ownerDocument.createElement('br'));
+        // Stay in the new paragraph's first editable inline box.
+        let caret = right;
+        while (caret.firstChild && caret.firstChild.localName !== "br" && !ceDisabled(caret.firstChild)) caret = caret.firstChild;
+        selection.collapse(caret,0);
+    }
+    function editableEdit(host, inputType, data, composing = false, replacement = null) {
+        let model = editableModel(host);
+        let state = replacement || editableSelection(model);
+        const current = g.getSelection();
+        if (replacement || !current.rangeCount || editingHostOf(current.anchorNode) !== host ||
+            editingHostOf(current.focusNode) !== host)
+            setEditableSelection(model,state.start,state.end,state.direction);
+        const init = {bubbles:true,composed:true,view:g,detail:0,inputType,data,isComposing:composing};
+        const before = createTrustedEvent(InputEvent,"beforeinput",{...init,cancelable:!composing});
+        dispatch(host,before,false);
+        if (before.defaultPrevented) return null;
+        // Handlers can change text, structure, selection or editability. Derive
+        // the default from the current live selection after dispatch.
+        if (!host.isConnected || editingHostOf(host) !== host) return false;
+        model = editableModel(host); state = editableSelection(model);
+        let start = state.start, end = state.end;
+        if (start === end) {
+            if (inputType === "deleteContentBackward") start = editableStep(model,start,-1);
+            if (inputType === "deleteContentForward") end = editableStep(model,end,1);
+        }
+        let changed = false;
+        if (start !== end) changed = editableDelete(model,start,end);
+        if (inputType === "insertParagraph" || inputType === "insertLineBreak") {
+            editableInsertBreak(host,inputType === "insertParagraph"); changed = true;
+        } else if (data != null && !inputType.startsWith("delete")) {
+            const selection = g.getSelection();
+            const currentModel = editableModel(host), position = editableSelection(currentModel).start;
+            for (const placeholder of currentModel.placeholders)
+                if (editableOffset(currentModel,placeholder.parentNode,rangeIndex(placeholder)) === position)
+                    placeholder.remove();
+            const range = selection.getRangeAt(0);
+            const node = range.startContainer, offset = range.startOffset;
+            if (node.nodeType === 3) {
+                node.insertData(offset,data); selection.collapse(node,offset+data.length);
+            } else {
+                const text = host.ownerDocument.createTextNode(data);
+                range.insertNode(text); selection.collapse(text,text.length);
+            }
+            changed = true;
+        }
+        if (changed) dispatch(host,createTrustedEvent(InputEvent,"input",init),false);
+        return changed;
+    }
+    // Input Events 2 §6: key handlers precede beforeinput, a structural edit
+    // at the live Selection, and input. Cancellation leaves the DOM intact.
+    trust.editableKeyDefault = function (id, key, shift, ctrl, alt, meta) {
+        if (ctrl || alt || meta) return false;
+        const target = id == null ? focusedArea : wrap(id);
+        if (id == null && target?.__contentRealmWindow)
+            return target.__contentRealmWindow.__trust.editableKeyDefault(null,key,shift,ctrl,alt,meta);
+        const host = editingHostOf(target);
+        if (!host || !host.isConnected) return false;
+        const movement = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
+        if (movement) { editableMove(g.getSelection(),host,movement,shift); return true; }
+        let inputType, data = null;
+        if (Array.from(key).length === 1) { inputType = "insertText"; data = key; }
+        else if (key === "Backspace") inputType = "deleteContentBackward";
+        else if (key === "Delete") inputType = "deleteContentForward";
+        else if (key === "Enter") inputType = shift ? "insertLineBreak" : "insertParagraph";
+        else return false;
+        editableEdit(host,inputType,data);
+        return true;
+    };
     // UI Events #events-keyboard-event-order and HTML #textFieldSelection:
     // derive each native insertion from canonical state after the keyboard
     // handlers/checkpoint. Queued keys must not reuse a frontend's stale value
     // or selection after script changes, cancellation, or a previous input.
     trust.formInsertText = function (id, text) {
+        const frame = nativeInputChildFrame(id);
+        if (frame) return frame.__contentRealmWindow.__trust.formInsertText(id,text);
         const el = wrap(id), selection = el && controlSelection(el, false);
         if (!selection || !__dom_is_connected(id)) return null;
         const value = el.localName === "textarea"
@@ -3784,10 +4111,27 @@
         return trust.formSet(id, next, null, "insertText", text, caret, caret, 0, false);
     };
     trust.formSet = function (id, value, checked, inputType, data, start, end, direction, composing = false) {
+        const frame = nativeInputChildFrame(id);
+        if (frame) return frame.__contentRealmWindow.__trust.formSet(id,value,checked,inputType,data,start,end,direction,composing);
         const el = wrap(id);
         if (!el) return false;
         value = value === null || value === undefined ? "" : String(value);
         const editable = ceHost(el), textControl = isTextControl(el);
+        if (editable) {
+            const model = editableModel(el), previous = model.text;
+            if (previous === value) {
+                if (start != null) setEditableSelection(model,start,end,direction);
+                return false;
+            }
+            let a = 0, b = previous.length, c = value.length;
+            while (a < b && a < c && previous[a] === value[a]) a++;
+            while (b > a && c > a && previous[b-1] === value[c-1]) { b--; c--; }
+            const inserted = value.slice(a,c);
+            const type = inputType || (inserted ? "insertText" : "deleteContentBackward");
+            const changed = editableEdit(el,type,inserted || null,!!composing,{start:a,end:b,direction:0});
+            if (changed !== null && start != null) setEditableSelection(editableModel(el),start,end,direction);
+            return changed;
+        }
         if (editable || textControl) {
             if (textControl && (isActuallyDisabled(el) || el.hasAttribute("readonly"))) return null;
             const previous = editable ? el.textContent : el.value;
@@ -4118,7 +4462,9 @@
         set textContent(v) {
             v = v === null || v === undefined ? "" : String(v);
             const t = this.nodeType;
-            if (t !== 1 && t !== 3 && t !== 8 && t !== 11) return;
+            if (rangeCharacterData(this)) { this.data = v; return; }
+            if (t !== 1 && t !== 11) return;
+            rangesReplaceChildren(this);
             if (!MO.length) {
                 const removedRoots = __dom_children(this.__id);
                 for (let i = 0; i < removedRoots.length; i++)
@@ -4143,13 +4489,7 @@
         }
         get nodeValue() { const t = this.nodeType; return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(this.__id) : null; }
         set nodeValue(v) {
-            const t = this.nodeType;
-            if (t !== 3 && t !== 4 && t !== 7 && t !== 8) return;
-            v = v == null ? "" : String(v);
-            if (!MO.length) { __dom_set_text(this.__id, v); return; }
-            const old = __dom_text(this.__id);
-            __dom_set_text(this.__id, v);
-            moCharData(this, old);
+            if (rangeCharacterData(this)) this.data = v == null ? "" : String(v);
         }
         // NOTE: `data` is deliberately NOT here. Per the DOM spec it is a
         // CharacterData-only IDL attribute (Text/Comment/ProcessingInstruction),
@@ -4189,7 +4529,10 @@
             if (c && c.nodeType === 11 && !c.__host) { for (const k of Array.from(c.childNodes)) this.appendChild(k); return c; }
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
             // (returns false, unmutated) when `c` is an inclusive ancestor.
+            const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
             if (!__dom_append(this.__id, c.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            rangesRemove(c, oldParent, oldIndex);
+            rangesInsert(this, rangeIndex(c));
             syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
@@ -4202,9 +4545,12 @@
         }
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of Array.from(c.childNodes)) this.insertBefore(k, ref); return c; }
+            const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
             const insertion = __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
             if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            rangesRemove(c, oldParent, oldIndex);
+            rangesInsert(this, rangeIndex(c));
             syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
@@ -4218,7 +4564,8 @@
         removeChild(c) {
             // DOM §4.2.3 pre-remove: validate before mutation-observer or custom-element side
             // effects. A node belonging to some other parent is not silently detached.
-            if (!c || c.parentNode !== this) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
+            if (!c || !rangeSame(rangeParent(c),this)) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
+            rangesRemove(c, this, rangeIndex(c));
             if (c.__trustLN === "base") baseHrefCache = null;
             if (MO.length) moChildRemove(this, c);
             if (CE.defs.size) ceDisconnect(c);
@@ -4230,11 +4577,23 @@
         }
         replaceChild(n, old) {
             const prev = old.previousSibling, next = old.nextSibling;
+            const oldParent = rangeParent(n), oldIndex = oldParent ? rangeIndex(n) : 0;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
             // syscall refuses (unmutated) when `n` is an inclusive ancestor.
             const insertion = __dom_insert_before(this.__id, n.__id, old.__id);
             if (insertion === -1) throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            rangesRemove(n, oldParent, oldIndex);
+            const replacementIndex = rangeIndex(n);
+            if (n === old) {
+                rangesInsert(this,replacementIndex);
+                return old;
+            }
+            // DOM #concept-node-replace removes the old child before the
+            // insertion. The arena syscall validates/inserts first, so apply
+            // Range changes in normative order using the pre-insertion index.
+            rangesRemove(old, this, replacementIndex);
+            rangesInsert(this, replacementIndex);
             syncWrapperSubtreeRetention(n.__id);
             if (CE.defs.size) ceDisconnect(old);
             __dom_detach(old.__id);
@@ -4250,7 +4609,7 @@
             else if (n.__trustLN === "iframe" || n.__trustLN === "frame") maybeProcessInsertedFrame(n, this);
             return old;
         }
-        remove() { if (this.__trustLN === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); destroyFrameNavigablesIn(this); syncWrapperSubtreeRetention(this.__id); slotQueueCheck(p); }
+        remove() { const parent = rangeParent(this); if (parent) Node.prototype.removeChild.call(parent,this); }
         append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
         prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
         // The ChildNode mixin: lit's svg templates go through
@@ -4379,6 +4738,15 @@
         state.raw = cssOp("serialize", JSON.stringify(state.pairs));
         state.write(state.raw, state.pairs);
     }
+    function cssLogicalGroup(name) {
+        const edge = /^(margin|padding|border)-(top|right|bottom|left|inline-start|inline-end|block-start|block-end)(-width|-style|-color)?$/.exec(name);
+        if (edge) return [edge[1] + (edge[3] || ""), /inline|block/.test(edge[2])];
+        const size = /^(min-|max-)?(width|height|inline-size|block-size)$/.exec(name);
+        if (size) return [(size[1] || "") + "size", /inline|block/.test(size[2])];
+        if (/^(top|right|bottom|left)$/.test(name)) return ["inset",false];
+        if (/^inset-(inline|block)-(start|end)$/.test(name)) return ["inset",true];
+        return null;
+    }
     // CSSOM #the-cssstyledeclaration-interface. Inline and rule declarations
     // share Rust's grammar and ordered longhands, including priority flags and
     // case-sensitive custom properties. Rule writes invalidate the live sheet.
@@ -4430,7 +4798,14 @@
                 const index = state.pairs.findIndex((p) => p[0] === k);
                 const next = [k, v, !!priority];
                 if (index < 0) { state.pairs.push(next); changed = true; }
-                else if (state.pairs[index][1] !== v || state.pairs[index][2] !== !!priority) {
+                else if (state.pairs.slice(index+1).some(([other]) => {
+                    // CSSOM #set-a-css-declaration: move past declarations
+                    // in the same group with the opposite mapping logic.
+                    const a = cssLogicalGroup(k), b = cssLogicalGroup(other);
+                    return a && b && a[0] === b[0] && a[1] !== b[1];
+                })) {
+                    state.pairs.splice(index,1); state.pairs.push(next); changed = true;
+                } else if (state.pairs[index][1] !== v || state.pairs[index][2] !== !!priority) {
                     state.pairs[index] = next; changed = true;
                 }
             }
@@ -5090,6 +5465,8 @@
         // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
+            v = String(v);
+            rangesReplaceChildren(this);
             const removedRoots = __dom_children(this.__id);
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
             if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
@@ -7711,13 +8088,7 @@
         // `nodeValue`, `appendData`/`insertData`/`deleteData`/`replaceData`, and
         // Node's `textContent` (on a text node) all route here, so the
         // characterData MutationRecord is emitted from this one setter.
-        set data(v) {
-            v = v === null ? "" : String(v);
-            if (!MO.length) { __dom_set_text(this.__id, v); return; }
-            const old = __dom_text(this.__id) || "";
-            __dom_set_text(this.__id, v);
-            moCharData(this, old);
-        }
+        set data(v) { this.replaceData(0, this.length, v === null ? "" : String(v)); }
         get nodeValue() { return this.data; }
         set nodeValue(v) { this.data = v; }
         get length() { return this.data.length; }
@@ -7732,7 +8103,7 @@
         }
         appendData(s) {
             if (arguments.length < 1) throw new TypeError("1 argument required");
-            this.data = this.data + String(s);
+            this.replaceData(this.length, 0, String(s));
         }
         insertData(offset, s) { this.replaceData(offset, 0, s); }
         deleteData(offset, count) { this.replaceData(offset, count, ""); }
@@ -7741,12 +8112,34 @@
             const d = this.data, o = offset >>> 0;
             if (o > d.length) throw new DOMException("offset out of bounds", "IndexSizeError");
             const c = Math.min(count >>> 0, d.length - o);
-            this.data = d.slice(0, o) + String(s) + d.slice(o + c);
+            s = String(s);
+            __dom_set_text(this.__id, d.slice(0, o) + s + d.slice(o + c));
+            rangesReplaceData(this, o, c, s.length);
+            if (MO.length) moCharData(this, d);
         }
     }
     class Text extends CharacterData {
         get nodeType() { return 3; }
         get nodeName() { return "#text"; }
+        splitText(offset) {
+            // DOM §4.10: split at a UTF-16 boundary, retaining the original
+            // node for the prefix and inserting the new node after it.
+            offset = offset >>> 0;
+            if (offset > this.length) throw new DOMException("Offset exceeds text length", "IndexSizeError");
+            const tail = this.ownerDocument.createTextNode(this.data.slice(offset));
+            const parent = this.parentNode;
+            if (parent) {
+                parent.insertBefore(tail, this.nextSibling);
+                const index = rangeIndex(this);
+                updateLiveRanges((node, position) => {
+                    if (rangeSame(node,this) && position > offset) return [tail, position - offset];
+                    if (rangeSame(node,parent) && position === index + 1) return [parent, position + 1];
+                    return [node, position];
+                });
+            }
+            this.deleteData(offset, this.length - offset);
+            return tail;
+        }
         get assignedSlot() {
             const slot = assignedSlotInternal(this);
             if (!slot) return null;
@@ -9257,6 +9650,8 @@
         get activeElement() { return activeElementFor(this); }
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
+            v = String(v);
+            rangesReplaceChildren(this);
             const removedRoots = __dom_children(this.__id);
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
             if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
@@ -11980,53 +12375,287 @@
             document: g.document, opener: g,
         };
     };
-    // DOM Range: feature-detected/instanceof'd at boot, and used for
-    // measurement + HTML-string parsing (createContextualFragment, jQuery's
-    // `$.parseHTML` fallback). We hold endpoints honestly but approximate
-    // geometry with the viewport box like the element rect stubs.
+    // DOM Range §4.2 / Selection API §3: keep live boundary points and one
+    // Selection per Document. Rich editing hosts use the same Range object
+    // that scripts read through getRangeAt(), so native insertion and editor
+    // code agree on the caret. Geometry remains supplied by layout elsewhere.
+    // DOM #concept-live-range: mutations update every surviving Range, not
+    // only the current Selection. Weak references do not retain discarded
+    // ranges or their detached trees for the lifetime of a page.
+    const rangeFinalizer = new FinalizationRegistry(reference => liveRanges.delete(reference));
+    function updateLiveRanges(boundary) {
+        for (const reference of liveRanges) {
+            const range = reference.deref();
+            if (!range) { liveRanges.delete(reference); continue; }
+            const start = boundary(range.startContainer, range.startOffset);
+            const end = boundary(range.endContainer, range.endOffset);
+            if (start[0] === range.startContainer && start[1] === range.startOffset &&
+                end[0] === range.endContainer && end[1] === range.endOffset) continue;
+            [range.startContainer, range.startOffset] = start;
+            [range.endContainer, range.endOffset] = end;
+            range.__upd();
+        }
+    }
+    function rangesReplaceData(node, offset, count, length) {
+        updateLiveRanges((container, position) => [container, !rangeSame(container,node) || position <= offset
+            ? position : position <= offset + count ? offset : position + length - count]);
+    }
+    function rangesRemove(node, parent, index) {
+        if (!parent) return;
+        updateLiveRanges((container, position) => rangeContains(node,container) ? [parent, index]
+            : [container, rangeSame(container,parent) && position > index ? position - 1 : position]);
+    }
+    function rangesInsert(parent, index, count = 1) {
+        updateLiveRanges((container, position) => [container,
+            rangeSame(container,parent) && position > index ? position + count : position]);
+    }
+    function rangesReplaceChildren(parent) {
+        // DOM string/fragment replace-all removes each old child before
+        // inserting the replacement. Every old child boundary becomes zero.
+        updateLiveRanges((container, position) => rangeContains(parent,container)
+            ? [parent, 0] : [container, position]);
+    }
+    function rangeCharacterData(node) { return [3, 4, 7, 8].includes(node.nodeType); }
+    function rangeLength(node) {
+        return rangeCharacterData(node) ? node.data.length : node.childNodes.length;
+    }
+    function rangeSame(a,b) {
+        return a === b || !!(a && b && a.__id === b.__id && a.nodeType === b.nodeType);
+    }
+    function rangeParent(node) {
+        if (node.nodeType === 9) return null;
+        const parent = wrap(__dom_parent(node.__id));
+        return parent && (parent.__trustLN === "iframe" || parent.__trustLN === "frame") &&
+            parent.__contentDoc ? parent.__contentDoc : parent;
+    }
+    function rangeContains(parent,node) {
+        for (; node; node = rangeParent(node)) if (rangeSame(parent,node)) return true;
+        return false;
+    }
+    function rangeIndex(node) {
+        const parent = rangeParent(node);
+        return parent ? __dom_children(parent.__id).indexOf(node.__id) : -1;
+    }
+    function rangeOrder(a, ao, b, bo) {
+        if (a === b) return Math.sign(ao - bo);
+        if (a.getRootNode() !== b.getRootNode()) return null;
+        if (a.contains(b)) {
+            let child = b;
+            while (child.parentNode !== a) child = child.parentNode;
+            return ao <= rangeIndex(child) ? -1 : 1;
+        }
+        if (b.contains(a)) {
+            let child = a;
+            while (child.parentNode !== b) child = child.parentNode;
+            return bo <= rangeIndex(child) ? 1 : -1;
+        }
+        return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    }
+    function rangeBoundary(node, offset) {
+        if (!node || node.nodeType === 10) throw new DOMException("Invalid range boundary", "InvalidNodeTypeError");
+        offset = offset >>> 0;
+        if (offset > rangeLength(node)) throw new DOMException("Offset exceeds node length", "IndexSizeError");
+        return offset;
+    }
     class Range {
         constructor() {
             this.startContainer = g.document; this.endContainer = g.document;
             this.startOffset = 0; this.endOffset = 0; this.collapsed = true;
             this.commonAncestorContainer = g.document;
+            const reference = new WeakRef(this);
+            liveRanges.add(reference);
+            rangeFinalizer.register(this, reference);
         }
-        __upd() { this.collapsed = this.startContainer === this.endContainer && this.startOffset === this.endOffset; this.commonAncestorContainer = this.startContainer; }
-        setStart(node, off) { this.startContainer = node; this.startOffset = off | 0; this.__upd(); }
-        setEnd(node, off) { this.endContainer = node; this.endOffset = off | 0; this.__upd(); }
-        setStartBefore(node) { if (node && node.parentNode) this.setStart(node.parentNode, 0); }
-        setStartAfter(node) { if (node && node.parentNode) this.setStart(node.parentNode, 0); }
-        setEndBefore(node) { if (node && node.parentNode) this.setEnd(node.parentNode, 0); }
-        setEndAfter(node) { if (node && node.parentNode) this.setEnd(node.parentNode, 0); }
-        selectNode(node) { this.startContainer = this.endContainer = this.commonAncestorContainer = node; this.collapsed = false; }
-        selectNodeContents(node) { this.selectNode(node); }
+        __upd() {
+            this.collapsed = this.startContainer === this.endContainer && this.startOffset === this.endOffset;
+            let ancestor = this.startContainer;
+            while (ancestor && !ancestor.contains(this.endContainer)) ancestor = ancestor.parentNode;
+            this.commonAncestorContainer = ancestor || this.startContainer;
+            if (documentSelection._range === this) queueSelectionChange();
+        }
+        setStart(node, off) {
+            off = rangeBoundary(node, off);
+            if (rangeOrder(node, off, this.endContainer, this.endOffset) !== -1) {
+                this.endContainer = node; this.endOffset = off;
+            }
+            this.startContainer = node; this.startOffset = off; this.__upd();
+        }
+        setEnd(node, off) {
+            off = rangeBoundary(node, off);
+            if (rangeOrder(this.startContainer, this.startOffset, node, off) !== -1) {
+                this.startContainer = node; this.startOffset = off;
+            }
+            this.endContainer = node; this.endOffset = off; this.__upd();
+        }
+        setStartBefore(node) { if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError"); this.setStart(node.parentNode, rangeIndex(node)); }
+        setStartAfter(node) { if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError"); this.setStart(node.parentNode, rangeIndex(node) + 1); }
+        setEndBefore(node) { if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError"); this.setEnd(node.parentNode, rangeIndex(node)); }
+        setEndAfter(node) { if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError"); this.setEnd(node.parentNode, rangeIndex(node) + 1); }
+        selectNode(node) {
+            if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError");
+            const parent = node.parentNode, index = rangeIndex(node);
+            this.startContainer = this.endContainer = parent;
+            this.startOffset = index; this.endOffset = index + 1; this.__upd();
+        }
+        selectNodeContents(node) {
+            rangeBoundary(node, 0);
+            this.startContainer = this.endContainer = node;
+            this.startOffset = 0; this.endOffset = rangeLength(node); this.__upd();
+        }
         collapse(toStart) {
             if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
             else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
-            this.collapsed = true;
+            this.__upd();
         }
         cloneRange() { const r = new Range(); r.startContainer = this.startContainer; r.endContainer = this.endContainer; r.startOffset = this.startOffset; r.endOffset = this.endOffset; r.collapsed = this.collapsed; r.commonAncestorContainer = this.commonAncestorContainer; return r; }
         cloneContents() { return g.document.createDocumentFragment(); }
         extractContents() { return g.document.createDocumentFragment(); }
-        deleteContents() {}
-        insertNode(node) { const c = this.startContainer; if (c && c.insertBefore) c.insertBefore(node, (c.childNodes && c.childNodes[this.startOffset]) || null); }
+        deleteContents() {
+            if (this.collapsed) return;
+            const start = this.startContainer, end = this.endContainer;
+            const startOffset = this.startOffset, endOffset = this.endOffset;
+            if (start === end && rangeCharacterData(start)) {
+                start.deleteData(startOffset, endOffset - startOffset);
+                this.collapse(true);
+                return;
+            }
+            // DOM §4.2 deleteContents: collect fully contained top-level nodes
+            // before changing either boundary, then remove the selected tails.
+            const contained = [];
+            function collect(parent) {
+                for (const child of Array.from(parent.childNodes)) {
+                    const afterStart = rangeOrder(start, startOffset, child, 0) === -1;
+                    const beforeEnd = rangeOrder(child, rangeLength(child), end, endOffset) === -1;
+                    if (afterStart && beforeEnd) contained.push(child);
+                    else collect(child);
+                }
+            }
+            collect(this.commonAncestorContainer);
+            let newNode, newOffset;
+            if (start.contains(end)) { newNode = start; newOffset = startOffset; }
+            else {
+                let reference = start;
+                while (reference.parentNode && !reference.parentNode.contains(end))
+                    reference = reference.parentNode;
+                newNode = reference.parentNode;
+                newOffset = rangeIndex(reference) + 1;
+            }
+            this.startContainer = this.endContainer = newNode;
+            this.startOffset = this.endOffset = newOffset;
+            this.__upd();
+            if (rangeCharacterData(start))
+                start.deleteData(startOffset, start.length - startOffset);
+            for (const child of contained) child.remove();
+            if (rangeCharacterData(end)) end.deleteData(0, endOffset);
+        }
+        insertNode(node) {
+            const container = this.startContainer, offset = this.startOffset;
+            const text = container.nodeType === 3;
+            const parent = text ? container.parentNode : container;
+            if (!parent || rangeCharacterData(container) && !text || node === container || node.contains(parent))
+                throw new DOMException("Invalid range insertion", "HierarchyRequestError");
+            let reference = text ? container.splitText(offset) : container.childNodes[offset] || null;
+            if (reference === node) reference = node.nextSibling;
+            if (node.parentNode) node.parentNode.removeChild(node);
+            const newOffset = (reference ? rangeIndex(reference) : parent.childNodes.length)
+                + (node.nodeType === 11 ? node.childNodes.length : 1);
+            parent.insertBefore(node, reference);
+            if (this.collapsed) this.setEnd(parent, newOffset);
+        }
         surroundContents(node) { this.insertNode(node); }
         createContextualFragment(html) { const tpl = g.document.createElement("template"); tpl.innerHTML = String(html); return tpl.content; }
         getBoundingClientRect() { return new DOMRect(0, 0, windowViewportDimension("width"), windowViewportDimension("height")); }
         getClientRects() { return [this.getBoundingClientRect()]; }
         detach() {}
-        toString() { return ""; }
+        toString() {
+            if (this.collapsed) return "";
+            // DOM #dom-range-stringifier: only Text data between the two
+            // boundary points participates; comments and outside text do not.
+            const parts = [], stack = [this.commonAncestorContainer];
+            while (stack.length) {
+                const node = stack.pop();
+                if (node.nodeType === 3 || node.nodeType === 4) {
+                    if (rangeOrder(node, node.length, this.startContainer, this.startOffset) !== 1 ||
+                        rangeOrder(node, 0, this.endContainer, this.endOffset) !== -1) continue;
+                    parts.push(node.data.slice(node === this.startContainer ? this.startOffset : 0,
+                        node === this.endContainer ? this.endOffset : node.length));
+                } else {
+                    const children = node.childNodes;
+                    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+                }
+            }
+            return parts.join("");
+        }
     }
     g.Range = Range;
     class Selection {
-        constructor() { this.rangeCount = 0; this.isCollapsed = true; this.type = "None"; this.anchorNode = null; this.focusNode = null; }
-        toString() { return ""; }
-        getRangeAt() { return new Range(); }
-        addRange() {} removeAllRanges() {} removeRange() {} empty() {}
-        collapse() {} collapseToStart() {} collapseToEnd() {} selectAllChildren() {}
-        setBaseAndExtent() {} extend() {} containsNode() { return false; }
+        constructor() { this._range = null; this._direction = "directionless"; }
+        get rangeCount() { return this._range ? 1 : 0; }
+        get isCollapsed() { return !this._range || this._range.collapsed; }
+        get type() { return !this._range ? "None" : this._range.collapsed ? "Caret" : "Range"; }
+        get direction() { return this._direction; }
+        get anchorNode() { return this._range && (this._direction === "backwards" ? this._range.endContainer : this._range.startContainer); }
+        get anchorOffset() { return this._range ? (this._direction === "backwards" ? this._range.endOffset : this._range.startOffset) : 0; }
+        get focusNode() { return this._range && (this._direction === "backwards" ? this._range.startContainer : this._range.endContainer); }
+        get focusOffset() { return this._range ? (this._direction === "backwards" ? this._range.startOffset : this._range.endOffset) : 0; }
+        toString() { return this._range ? this._range.toString() : ""; }
+        getRangeAt(index) { if (index !== 0 || !this._range) throw new DOMException("No range at index", "IndexSizeError"); return this._range; }
+        addRange(range) { if (!(range instanceof Range)) throw new TypeError("Expected a Range"); if (!this._range) { this._range = range; queueSelectionChange(); } }
+        removeAllRanges() { if (this._range) { this._range = null; queueSelectionChange(); } }
+        removeRange(range) { if (range !== this._range) throw new DOMException("Range is not selected", "NotFoundError"); this.removeAllRanges(); }
+        empty() { this.removeAllRanges(); }
+        collapse(node, offset = 0) {
+            if (node == null) { this.removeAllRanges(); return; }
+            const range = new Range(); range.setStart(node, offset); range.collapse(true);
+            this._range = range; this._direction = "directionless"; queueSelectionChange();
+        }
+        setPosition(node, offset = 0) { this.collapse(node, offset); }
+        collapseToStart() { if (!this._range) throw new DOMException("No range", "InvalidStateError"); this.collapse(this._range.startContainer, this._range.startOffset); }
+        collapseToEnd() { if (!this._range) throw new DOMException("No range", "InvalidStateError"); this.collapse(this._range.endContainer, this._range.endOffset); }
+        selectAllChildren(node) {
+            const range = new Range(); range.selectNodeContents(node);
+            this._range = range; this._direction = "forwards"; queueSelectionChange();
+        }
+        setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+            rangeBoundary(anchorNode, anchorOffset); rangeBoundary(focusNode, focusOffset);
+            const backwards = rangeOrder(anchorNode, anchorOffset, focusNode, focusOffset) === 1;
+            const range = new Range();
+            range.setStart(backwards ? focusNode : anchorNode, backwards ? focusOffset : anchorOffset);
+            range.setEnd(backwards ? anchorNode : focusNode, backwards ? anchorOffset : focusOffset);
+            this._range = range; this._direction = backwards ? "backwards" : "forwards";
+            queueSelectionChange();
+        }
+        extend(node, offset = 0) {
+            if (!this._range) throw new DOMException("No range", "InvalidStateError");
+            this.setBaseAndExtent(this.anchorNode, this.anchorOffset, node, offset);
+        }
+        deleteFromDocument() { if (this._range) { this._range.deleteContents(); queueSelectionChange(); } }
+        containsNode(node, partial = false) {
+            if (!this._range) return false;
+            const start = rangeOrder(this._range.startContainer, this._range.startOffset, node, 0);
+            const end = rangeOrder(node, rangeLength(node), this._range.endContainer, this._range.endOffset);
+            if (start === null || end === null) return false;
+            if (!partial) return start === -1 && end === -1;
+            const nodeEndsAfterStart = rangeOrder(this._range.startContainer, this._range.startOffset,
+                node, rangeLength(node)) === -1;
+            const nodeStartsBeforeEnd = rangeOrder(node, 0,
+                this._range.endContainer, this._range.endOffset) === -1;
+            return nodeEndsAfterStart && nodeStartsBeforeEnd;
+        }
+        modify() {}
     }
     g.Selection = Selection;
-    g.getSelection = () => new Selection();
+    let selectionChangeQueued = false;
+    function queueSelectionChange() {
+        if (selectionChangeQueued) return;
+        selectionChangeQueued = true;
+        controlSelectionTasks.push({frame:trust.__activeFrame || null, fn() {
+            selectionChangeQueued = false;
+            dispatch(g.document, createTrustedEvent(Event, "selectionchange", {bubbles:false}), false);
+        }});
+    }
+    const documentSelection = new Selection();
+    g.getSelection = () => documentSelection;
     // --- MutationObserver (real) ---------------------------------------
     // A pure-JS DOM-mutation observer, delivered as a microtask exactly like
     // the spec's "mutation observer microtask". Records are emitted ONLY by the
@@ -19517,7 +20146,7 @@
     // Keep native activation, editing, and their default-action bookkeeping in
     // the same Realm as the target. HTMLElement.click() remains synthetic and
     // never enters this host-only routing layer.
-    for (const name of ["click", "key", "numberStep", "formInsertText", "formSet", "formCommit", "formSubmit", "formSubmission", "followAnchorDefault"]) {
+    for (const name of ["click", "key", "editableKeyDefault", "numberStep", "formInsertText", "formSet", "formCommit", "formSubmit", "formSubmission", "followAnchorDefault"]) {
         const local = trust[name];
         trust[name] = function (...args) {
             const frame = nativeInputChildFrame(args[0]);

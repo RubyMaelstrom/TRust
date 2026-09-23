@@ -277,6 +277,15 @@ pub struct TextEdit {
     pub composing: bool,
 }
 
+/// Native presentation of the focused editing host. Text offsets are UTF-16;
+/// the resident DOM Selection remains the authority for structural endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct EditableState {
+    pub node: usize,
+    pub text: String,
+    pub selection: crate::doc::ControlSelection,
+}
+
 #[derive(Debug)]
 pub enum PageCmd {
     Click(usize),
@@ -501,6 +510,12 @@ pub enum PageEvt {
     KeyDefault {
         prevented: bool,
     },
+    /// The canonical HTML focused area changed. The desktop editor follows
+    /// this actor decision, including focus from label activation and script.
+    Focused {
+        node: Option<usize>,
+    },
+    EditableState(Option<EditableState>),
     /// The edit and its input-event microtask checkpoint have completed. This
     /// follows any resulting render, so a native editor can accept script
     /// changes without overwriting newer edits still queued in the actor.

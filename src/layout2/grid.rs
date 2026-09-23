@@ -679,6 +679,41 @@ type AreaMap = std::collections::HashMap<String, (Range<usize>, Range<usize>)>;
 /// Parse `grid-template-areas` (§7.3) into the area map plus the template's
 /// row/column counts. Non-rectangular or ragged definitions invalidate the
 /// whole declaration.
+fn area_ident_code_point(ch: char) -> bool {
+    // CSS Syntax 3 #ident-code-point. Area names are sequences of these code
+    // points, even when they would not be valid CSS identifiers on their own.
+    matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-')
+        || matches!(ch as u32,
+            0x00B7 | 0x00C0..=0x00D6 | 0x00D8..=0x00F6 | 0x00F8..=0x037D
+                | 0x037F..=0x1FFF | 0x200C..=0x200D | 0x203F..=0x2040
+                | 0x2070..=0x218F | 0x2C00..=0x2FEF | 0x3001..=0xD7FF
+                | 0xF900..=0xFDCF | 0xFDF0..=0xFFFD | 0x10000..=0x10FFFF)
+}
+
+fn tokenize_area_row(row: &str) -> Option<Vec<String>> {
+    // CSS Grid 2 #grid-template-areas-property: use longest-match tokens,
+    // not whitespace-separated words. `".footer."` is three cells.
+    let mut chars = row.chars().peekable();
+    let mut cells = Vec::new();
+    while let Some(ch) = chars.peek().copied() {
+        if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0c') {
+            chars.next();
+        } else if ch == '.' {
+            while chars.next_if_eq(&'.').is_some() {}
+            cells.push(".".to_string());
+        } else if area_ident_code_point(ch) {
+            let mut name = String::new();
+            while let Some(next) = chars.next_if(|next| area_ident_code_point(*next)) {
+                name.push(next);
+            }
+            cells.push(name);
+        } else {
+            return None; // trash token invalidates the declaration
+        }
+    }
+    (!cells.is_empty()).then_some(cells)
+}
+
 fn parse_areas(value: &str) -> Option<(AreaMap, usize, usize)> {
     let v = value.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
@@ -691,13 +726,7 @@ fn parse_areas(value: &str) -> Option<(AreaMap, usize, usize)> {
         let quote = rest.as_bytes()[q] as char;
         let tail = &rest[q + 1..];
         let end = tail.find(quote)?;
-        let row: Vec<String> = tail[..end]
-            .split_whitespace()
-            .map(|t| t.to_string())
-            .collect();
-        if !row.is_empty() {
-            rows.push(row);
-        }
+        rows.push(tokenize_area_row(&tail[..end])?);
         rest = &tail[end + 1..];
     }
     if rows.is_empty() {
@@ -2847,6 +2876,24 @@ mod tests {
         assert_eq!(map["head"], (0..1, 0..2));
         assert_eq!(map["nav"], (1..2, 0..1));
         assert_eq!(map["main"], (1..2, 1..2));
+        let (map, rows, cols) =
+            parse_areas(r#""header header header""leading primary trailing"".footer.""#)
+                .expect("adjacent null and named cells are valid");
+        assert_eq!((rows, cols), (3, 3));
+        assert_eq!(map["leading"], (1..2, 0..1));
+        assert_eq!(map["primary"], (1..2, 1..2));
+        assert_eq!(map["trailing"], (1..2, 2..3));
+        assert_eq!(map["footer"], (2..3, 1..2));
+        assert_eq!(
+            tokenize_area_row("..1st·x."),
+            Some(
+                vec![".", "1st·x", "."]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
+        assert!(parse_areas(r#""a $ b""#).is_none());
         // Non-rectangular → invalid.
         assert!(parse_areas(r#""a a" "a b""#).is_none());
         // Ragged → invalid.

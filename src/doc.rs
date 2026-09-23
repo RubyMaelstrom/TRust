@@ -194,7 +194,7 @@ impl NumberConstraints {
 /// One control in an HTML form, in document order.
 /// HTML text-control selection, in UTF-16 code units. Negative direction is
 /// backward, positive is forward, and zero is the platform's "none" direction.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ControlSelection {
     pub start: u32,
     pub end: u32,

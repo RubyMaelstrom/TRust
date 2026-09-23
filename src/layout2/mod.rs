@@ -410,6 +410,81 @@ pub(crate) fn rich_editor_presentation(
             }),
         });
     }
+    if dom.tag_name(node) == Some("textarea") {
+        // A textarea is a native multiline editing host. The existing CSS
+        // paint supplies its background, border, text, and placeholder; focus
+        // adds a caret and any pending user edit in that same box. Replacing it
+        // with desktop chrome loses the author's appearance and geometry.
+        let bounds = layout.boxes.get(&node)?;
+        let painted = layout.paint.primitives.iter().find_map(|command| {
+            if let crate::render::DisplayCommand::GlyphRun {
+                node: id,
+                origin,
+                clip,
+                ..
+            } = command
+                && *id == node
+            {
+                Some((*origin, *clip))
+            } else {
+                None
+            }
+        });
+        let (origin, clip) = painted.unwrap_or_else(|| {
+            // An empty textarea without a placeholder has no glyph run. Its
+            // insertion point still starts at the used content-box edge.
+            let viewport = layout.paint_cache.as_ref().map_or(
+                Viewport::new(layout.paint.width, layout.paint.height),
+                |cache| cache.viewport,
+            );
+            let vp = value::Vp {
+                w: viewport.width,
+                h: viewport.height,
+            };
+            let box_style = style::BoxStyle::of(dom, node, vp);
+            let basis = dom
+                .parent_flat(node)
+                .and_then(|parent| layout.boxes.get(&parent))
+                .map_or(bounds.width as f32, |parent| parent.width as f32);
+            let inset = |side: usize| {
+                box_style.border[side] + box_style.padding[side].resolve(Some(basis)).unwrap_or(0.0)
+            };
+            let x = bounds.left as f32 + inset(style::LEFT);
+            let y = bounds.top as f32 + inset(style::TOP);
+            let width = (bounds.width as f32 - inset(style::LEFT) - inset(style::RIGHT)).max(0.0);
+            let height = (bounds.height as f32 - inset(style::TOP) - inset(style::BOTTOM)).max(0.0);
+            let clip = crate::render::CssRect::new(x, y, width, height);
+            (crate::core::CssPoint::new(x, y), Some(clip))
+        });
+        let style =
+            style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), base).text_style();
+        let color = dom
+            .computed_value_resolved(node, "color")
+            .as_deref()
+            .and_then(crate::render::PaintColor::parse_css)
+            .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+        let caret_color = dom
+            .computed_value_resolved(node, "caret-color")
+            .filter(|value| !matches!(value.trim(), "auto" | "currentcolor" | "currentColor"))
+            .as_deref()
+            .and_then(crate::render::PaintColor::parse_css)
+            .unwrap_or(color);
+        return Some(RichEditorPresentation {
+            style,
+            caret_color,
+            origin: crate::core::CssPoint::new(
+                origin.x - bounds.left as f32,
+                origin.y - bounds.top as f32,
+            ),
+            width: clip.map_or(bounds.width as f32, |clip| clip.width),
+            pending_text: Some(PendingEditorText {
+                text: dom.text_content(node),
+                nodes: vec![node],
+                color,
+            }),
+            native_input: None,
+        });
+    }
     if !dom.is_contenteditable_host(node) {
         return None;
     }
@@ -6524,6 +6599,39 @@ mod tests {
         );
         let (_, side) = find(&out, "side");
         assert_eq!(side.col, 20, "first track capped at 160px");
+    }
+
+    #[test]
+    fn adjacent_null_grid_cells_keep_composer_columns_separate() {
+        // CSS Grid 2 §7.3: `".footer."` is three cells. If it is rejected as
+        // one cell, all named areas disappear and the text field can overlap
+        // controls in an auto / 1fr / auto composer grid.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form style='display:grid;width:640px;grid-template-columns:auto 1fr auto;grid-template-areas:"header header header" "leading primary trailing" ".footer."'>
+                <div id=header style="grid-area:header"></div>
+                <button id=leading style="grid-area:leading;width:36px">+</button>
+                <textarea id=primary style="grid-area:primary;width:100%;box-sizing:border-box;min-width:0"></textarea>
+                <button id=trailing style="grid-area:trailing;width:80px">voice</button>
+                <div id=footer style="grid-area:footer"></div>
+               </form></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let rect = |id| *layout.boxes.get(&dom.get_by_id(id).unwrap()).unwrap();
+        let leading = rect("leading");
+        let primary = rect("primary");
+        let trailing = rect("trailing");
+        assert!((leading.left - 0.0).abs() < 0.1, "{leading:?}");
+        assert!((primary.left - 36.0).abs() < 0.1, "{primary:?}");
+        assert!((trailing.left - 560.0).abs() < 0.1, "{trailing:?}");
+        assert!(primary.left + primary.width <= trailing.left + 0.1);
     }
 
     #[test]

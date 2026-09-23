@@ -1467,23 +1467,18 @@ impl InlineStyle {
     }
 }
 
-/// The CSS Text 4 wrap longhand (`text-wrap-mode`, or its `text-wrap`
-/// shorthand) as a nowrap override for `WhiteSpace::with_longhands`.
+/// The CSS Text 4 wrap longhand as a nowrap override for
+/// `WhiteSpace::with_longhands`. The cascade expands `text-wrap` first.
 fn nowrap_longhand(dom: &Dom, id: NodeId) -> Option<bool> {
-    for prop in ["text-wrap-mode", "text-wrap"] {
-        match dom
-            .computed_value_resolved(id, prop)
-            .as_deref()
-            .map(str::trim)
-        {
-            Some("nowrap") => return Some(true),
-            Some("wrap") | Some("balance") | Some("pretty") | Some("stable") => {
-                return Some(false);
-            }
-            _ => {}
-        }
+    match dom
+        .computed_value_resolved(id, "text-wrap-mode")
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("nowrap") => Some(true),
+        Some("wrap") => Some(false),
+        _ => None,
     }
-    None
 }
 
 pub(crate) fn heading_level(tag: &str) -> Option<u8> {

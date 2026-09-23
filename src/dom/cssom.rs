@@ -327,6 +327,37 @@ pub(super) fn supports(property: &str, value: &str) -> bool {
     !expanded(&property.to_ascii_lowercase(), value).is_empty()
 }
 
+/// CSS Anchor Positioning 1 §2: serialize `none | <dashed-ident>#` after CSS
+/// Syntax has decoded identifier escapes. Names retain their case.
+pub(super) fn anchor_name_value(value: &str) -> Option<String> {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let names: Vec<String> = parser
+        .parse_comma_separated(|parser| {
+            Ok::<_, cssparser::ParseError<'_, ()>>(parser.expect_ident_cloned()?.to_string())
+        })
+        .ok()?;
+    if !parser.is_exhausted() {
+        return None;
+    }
+    if names.len() == 1 && names[0].eq_ignore_ascii_case("none") {
+        return Some(String::from("none"));
+    }
+    if names
+        .iter()
+        .any(|name| !name.starts_with("--") || name.len() <= 2)
+    {
+        return None;
+    }
+    Some(
+        names
+            .iter()
+            .map(|name| properties::identifier_text(name))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 /// Parse the complete Conditional Rules grammar before evaluating it.
 /// Invalid syntax is distinct from an unknown, false feature, so negation
 /// cannot turn a malformed condition into a matching rule.
@@ -398,6 +429,10 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
     if !is_tracked(property) || value.is_empty() {
         return false;
     }
+    let property = logical_to_physical(property).unwrap_or(property);
+    if property == "anchor-name" {
+        return anchor_name_value(value).is_some();
+    }
     let lower = value.to_ascii_lowercase();
     let value = lower.as_str();
     let one_of = |values: &str| values.split_ascii_whitespace().any(|v| v == value);
@@ -424,6 +459,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "overflow-wrap" => one_of("normal break-word anywhere"),
         "word-break" => one_of("normal break-all keep-all break-word"),
         "text-wrap-mode" => one_of("wrap nowrap"),
+        "text-wrap-style" => one_of("auto balance stable pretty avoid-short-last-line"),
         "white-space" => crate::layout2::WhiteSpace::components(value).is_some(),
         "white-space-collapse" => {
             one_of("collapse preserve preserve-breaks preserve-spaces break-spaces")
@@ -566,13 +602,13 @@ fn parse(text: &str) -> Vec<(String, String, bool)> {
             continue;
         };
         for (name, value, _) in expanded(&property, &value) {
-            if let Some(existing) = result.iter_mut().find(|(key, _, _)| *key == name) {
-                if important || !existing.2 {
-                    *existing = (name, value, important);
+            if let Some(index) = result.iter().position(|(key, _, _)| *key == name) {
+                if !important && result[index].2 {
+                    continue;
                 }
-            } else {
-                result.push((name, value, important));
+                result.remove(index);
             }
+            result.push((name, value, important));
         }
     }
     result
@@ -641,6 +677,12 @@ fn get(property: &str, declarations: &[(String, String, bool)]) -> String {
             ["preserve", "wrap"] => "pre-wrap".into(),
             ["preserve-breaks", "wrap"] => "pre-line".into(),
             [collapse, "wrap"] => (*collapse).into(),
+            _ => v.join(" "),
+        },
+        "text-wrap" => match v.as_slice() {
+            ["wrap", "auto"] => "wrap".into(),
+            ["nowrap", "auto"] => "nowrap".into(),
+            ["wrap", style] => (*style).into(),
             _ => v.join(" "),
         },
         "margin" | "padding" | "inset" | "border-width" | "border-style" | "border-color" => {
@@ -785,6 +827,27 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
                 if value.is_empty() {
                     continue;
                 }
+                // CSSOM #serialize-a-css-declaration-block: combining
+                // longhands across an opposite logical mapping changes which
+                // declaration wins when cssText is parsed again.
+                let indices: Vec<_> = declarations
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (name, _, _))| names.contains(name).then_some(i))
+                    .collect();
+                if let (Some(first), Some(last)) = (indices.first(), indices.last())
+                    && declarations[*first..=*last].iter().any(|(name, _, _)| {
+                        logical_mapping_group(name).is_some_and(|(group, logical)| {
+                            names.iter().any(|longhand| {
+                                logical_mapping_group(longhand).is_some_and(|(other, mapping)| {
+                                    group == other && logical != mapping
+                                })
+                            })
+                        })
+                    })
+                {
+                    continue;
+                }
                 done.extend(names);
                 serialized = Some((shorthand.to_string(), value));
                 break;
@@ -862,6 +925,69 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_declaration_parse_and_serialization_preserve_cascade_order() {
+        let source = "direction:rtl;border-left-width:1px;border-inline-end-width:5px;\
+            border-top-width:2px;border-right-width:3px;border-bottom-width:4px";
+        let serialized = serialize(&parse(source), false);
+        assert!(!serialized.contains("border-width:"), "{serialized}");
+        let mut dom = Dom::parse_document("<div id=box></div>");
+        let node = dom.get_by_id("box").unwrap();
+        dom.set_cssom_inline(node, parse(&serialized));
+        assert_eq!(
+            dom.computed_value_resolved(node, "border-left-width")
+                .as_deref(),
+            Some("5px")
+        );
+        dom.set_cssom_inline(
+            node,
+            parse("direction:rtl;margin-inline-start:1px;margin-right:2px;margin-inline-start:3px"),
+        );
+        assert_eq!(
+            dom.computed_value_resolved(node, "margin-right").as_deref(),
+            Some("3px")
+        );
+    }
+
+    #[test]
+    fn anchor_name_dashed_ident_list_is_supported_and_cascades() {
+        // CSS Anchor Positioning 1 §2: anchor-name is non-inherited and uses
+        // a case-sensitive comma-separated list of dashed identifiers.
+        for value in ["none", "NoNe", "--a", "--Card, --menu"] {
+            assert!(supports("anchor-name", value), "{value}");
+        }
+        assert_eq!(anchor_name_value(r"n\6f ne").as_deref(), Some("none"));
+        assert_eq!(anchor_name_value(r"--\43 ard").as_deref(), Some("--Card"));
+        for value in ["--", "card", "--a --b", "--a,", "none, --a", "--a 1"] {
+            assert!(!supports("anchor-name", value), "{value}");
+        }
+        assert!(!supports("position-area", "top center"));
+        assert!(!supports("top", "anchor(bottom)"));
+
+        let dom = crate::dom::Dom::parse_document(
+            "<style>.anchor{anchor-name:--Card, --menu}</style>\
+             <div id=anchor class=anchor><span id=child></span></div>\
+             <div id=invalid style='anchor-name:card'></div>",
+        );
+        let anchor = dom.get_by_id("anchor").unwrap();
+        let child = dom.get_by_id("child").unwrap();
+        let invalid = dom.get_by_id("invalid").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(anchor, "anchor-name")
+                .as_deref(),
+            Some("--Card, --menu")
+        );
+        assert_eq!(
+            dom.cssom_resolved_value(child, "anchor-name").as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            dom.cssom_resolved_value(invalid, "anchor-name").as_deref(),
+            Some("none")
+        );
+        assert_eq!(expanded("anchor-name", "NoNe")[0].1, "none");
+    }
 
     #[test]
     fn transition_shorthand_preserves_lists_and_rejects_unrepresentable_values() {
