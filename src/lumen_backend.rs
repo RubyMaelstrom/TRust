@@ -14214,6 +14214,99 @@ mod tests {
     }
 
     #[test]
+    fn focus_requires_rendering_but_allows_contents_transparency_and_offscreen_boxes() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    r#"<body><input id=anchor>
+                    <section id=hidden style='display:none'><button id=button>hidden</button></section>
+                    <button id=invisible style='visibility:hidden'>invisible</button>
+                    <div style='visibility:hidden'><button id=visible style='visibility:visible'>visible</button></div>
+                    <div id=contents tabindex=0 style='display:contents'><span>text</span></div>
+                    <button id=transparent style='opacity:0'>transparent</button>
+                    <button id=offscreen style='position:absolute;left:-10000px'>offscreen</button>
+                </body>"#,
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const anchor = document.getElementById('anchor');
+            anchor.focus({preventScroll:true});
+            const result = [];
+            for (const id of ['button','invisible']) {
+                document.getElementById(id).focus();
+                result.push(document.activeElement === anchor);
+            }
+            for (const id of ['visible','contents','transparent','offscreen']) {
+                const node = document.getElementById(id);
+                node.focus({preventScroll:true});
+                result.push(document.activeElement === node);
+            }
+            document.getElementById('hidden').style.display='block';
+            document.getElementById('button').focus({preventScroll:true});
+            result.push(document.activeElement.id === 'button');
+            result.join('|');
+        "#
+            ),
+            "true|true|true|true|true|true|true"
+        );
+    }
+
+    #[test]
+    fn hidden_popovers_and_inert_shadow_scopes_cannot_take_focus_or_scroll() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<body><input id=anchor></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const anchor = document.getElementById('anchor');
+            anchor.focus({preventScroll:true});
+            const popover = document.createElement('section');
+            popover.popover = 'manual'; document.body.appendChild(popover);
+            const host = document.createElement('x-menu'); popover.appendChild(host);
+            const root = host.attachShadow({mode:'closed'});
+            root.innerHTML = '<slot inert></slot><button>inside</button>';
+            const inside = root.querySelector('button');
+            const slotted = document.createElement('button'); host.appendChild(slotted);
+            let events = 0, scrolls = 0;
+            for (const button of [inside, slotted]) {
+                button.onfocus = () => events++;
+                button.scrollIntoView = () => scrolls++;
+            }
+            inside.focus(); slotted.focus();
+            const hidden = document.activeElement === anchor && events === 0 && scrolls === 0;
+            popover.showPopover();
+            slotted.focus();
+            const inertSlot = document.activeElement === anchor;
+            inside.focus();
+            const shown = document.activeElement === host && root.activeElement === inside && events === 1 && scrolls === 1;
+            anchor.focus({preventScroll:true});
+            host.inert = true; host.setAttribute('inert','');
+            inside.focus();
+            const inertHost = document.activeElement === anchor;
+            host.removeAttribute('inert'); popover.hidePopover();
+            inside.focus();
+            [hidden, inertSlot, shown, inertHost, document.activeElement === anchor, events, scrolls].join('|');
+        "#
+            ),
+            "true|true|true|true|true|1|1"
+        );
+    }
+
+    #[test]
     fn native_page_focus_blurs_to_viewport_without_losing_text_or_touching_selection() {
         let mut engine = configured_engine(
             HostState::new(

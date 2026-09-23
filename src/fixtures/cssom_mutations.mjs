@@ -126,5 +126,28 @@
     backgroundRule.style.backgroundImage = 'none';
     check(backgroundRule.style.background === '', 'partially overwritten pending background is not a shorthand');
     check(getComputedStyle(nav).backgroundColor === getComputedStyle(reference).backgroundColor, 'partial background mutation preserves color');
+    // CSSOM live rule changes must invalidate the reusable sheet text for
+    // every adopter, including roots that adopt only after the mutation.
+    const shared = new CSSStyleSheet();
+    shared.replaceSync('@media all { div { width:21px } }');
+    const adopters = [];
+    function adoptShared() {
+        const host = document.createElement('x-shared'); body.appendChild(host);
+        const root = host.attachShadow({mode:'open'});
+        root.innerHTML = '<div></div>';
+        root.adoptedStyleSheets = [shared];
+        adopters.push(root.firstElementChild);
+    }
+    adoptShared(); adoptShared();
+    function widths(expected) {
+        check(adopters.every(node => getComputedStyle(node).width === expected), 'shared sheet width ' + expected);
+    }
+    widths('21px');
+    shared.cssRules[0].cssRules[0].style.width = '32px';
+    adoptShared(); widths('32px');
+    shared.insertRule('div {width:43px}', 1); widths('43px');
+    shared.deleteRule(1); widths('32px');
+    shared.replaceSync('div {width:54px}'); widths('54px');
+    adoptShared(); widths('54px');
     return 'cssom-mutations-ok';
 })()

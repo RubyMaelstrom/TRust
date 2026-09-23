@@ -631,21 +631,43 @@
     }
     function elementCanFocus(el) {
         if (!el || !el.isConnected || isActuallyDisabled(el)) return false;
-        for (let p = el; p && p.nodeType === 1; p = p.parentElement) {
+        // HTML #table-fa / #the-popover-attribute: hidden popover contents
+        // are not rendered and cannot take focus. Walk through shadow roots
+        // and slot assignment, which also carry inherited inertness.
+        for (let p = el; p; p = assignedSlotInternal(p) || p.parentNode || p.host) {
+            if (p.nodeType !== 1) continue;
             if (p.hasAttribute("inert")) return false;
+            if (p.hasAttribute("popover") && !p.matches(":popover-open")
+                && !(p.localName === "dialog" && p.hasAttribute("open"))) return false;
         }
-        if (el === g.document.documentElement) return true;
-        if (parsedTabIndex(el) !== null) return true;
         const tag = el.localName;
-        if (tag === "a" || tag === "area") return el.hasAttribute("href");
-        if (tag === "input") return String(el.type || "").toLowerCase() !== "hidden";
-        if (tag === "audio" || tag === "video") return el.hasAttribute("controls");
-        return tag === "button" || tag === "select" || tag === "textarea"
-            || tag === "iframe" || tag === "summary"
-            || ceHost(el);
+        const candidate = el === g.document.documentElement || parsedTabIndex(el) !== null
+            || ((tag === "a" || tag === "area") && el.hasAttribute("href"))
+            || (tag === "input" && String(el.type || "").toLowerCase() !== "hidden")
+            || ((tag === "audio" || tag === "video") && el.hasAttribute("controls"))
+            || tag === "button" || tag === "select" || tag === "textarea"
+            || tag === "iframe" || tag === "summary" || ceHost(el);
+        if (!candidate) return false;
+        // HTML #table-fa and CSS Display #invisible: focus needs rendered
+        // content, not merely a connected node with a tabindex. Checking the
+        // current fragments also observes synchronous style/container changes.
+        const rects = el.getClientRects();
+        const style = g.getComputedStyle(el);
+        if (style.visibility === "hidden" || style.visibility === "collapse") return false;
+        if (rects.length) return true;
+        // HTML also admits display:contents and relevant canvas fallback.
+        // Neither off-screen placement nor opacity:0 removes focusability.
+        const contents = style.display === "contents";
+        for (let p = assignedSlotInternal(el) || el.parentNode; p; p = assignedSlotInternal(p) || p.parentNode || p.host) {
+            if (p.nodeType !== 1) continue;
+            if (p.localName === "canvas" && p.getClientRects().length) return true;
+            if (contents && p.getClientRects().length) return true;
+            if (contents && g.getComputedStyle(p).display !== "contents") return false;
+        }
+        return false;
     }
     function focusElement(el, options) {
-        if (!elementCanFocus(el) || focusedArea === el) return;
+        if (focusedArea === el || !elementCanFocus(el)) return;
         const old = focusedArea;
         // HTML §6.6.4's focus update steps remove focus before firing blur;
         // UI Events §3.3.2 orders blur, focusout, focus, then focusin. A handler
@@ -9896,7 +9918,14 @@
             return this.__disabled;
         }
         set disabled(v) { this.__disabled = !!v; this.__changed(); }
-        get __text() { return this.__children.map((r) => r.__serialize(true)).join("\n"); }
+        get __text() {
+            // CSSOM rule mutations call __changed, including nested rules. Sharing
+            // one constructed sheet among shadow roots must not serialize its
+            // entire rule tree again on every adoption.
+            if (this.__serializedText === undefined)
+                this.__serializedText = this.__children.map((r) => r.__serialize(true)).join("\n");
+            return this.__serializedText;
+        }
         get __appliedText() { return this.disabled ? "" : this.media.mediaText ? "@media " + this.media.mediaText + " { " + this.__text + " }" : this.__text; }
         __check() { if (!this.__clean) throw new DOMException("Cross-origin stylesheet", "SecurityError"); }
         get cssRules() { this.__check(); return this.__list; }
@@ -9932,6 +9961,7 @@
         addRule(selector = "undefined", style = "undefined", index = this.__children.length) { this.insertRule(domString(selector) + " { " + domString(style) + " }", index); return -1; }
         removeRule(index = 0) { this.deleteRule(index); }
         __changed() {
+            this.__serializedText = undefined;
             if (this.ownerNode) {
                 const owner=this.ownerNode;
                 if (owner.sheet===this) __css_sheet(owner.__id, JSON.stringify([this.__text, this.media.mediaText, this.disabled]));
