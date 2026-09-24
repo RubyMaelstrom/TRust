@@ -3907,7 +3907,8 @@ impl Dom {
             }
             return Some(d);
         }
-        Some(ua_display(self.tag_name(id)?).to_string())
+        self.tag_name(id)?;
+        self.ua_default(id, "display")
     }
 
     pub(crate) fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
@@ -4309,6 +4310,22 @@ impl Dom {
         if name == "display" {
             return self.effective_display(id);
         }
+        if name == "text-decoration" {
+            // CSSOM #dom-cssstyledeclaration-getpropertyvalue: reconstruct
+            // the shorthand from its current longhands after cascade, rather
+            // than exposing the now-absent authored shorthand declaration.
+            return Some(
+                [
+                    "text-decoration-line",
+                    "text-decoration-style",
+                    "text-decoration-color",
+                ]
+                .into_iter()
+                .filter_map(|property| self.cssom_resolved_value(id, property))
+                .collect::<Vec<_>>()
+                .join(" "),
+            );
+        }
         // CSS Fonts 4 §2.5 defines the computed value of `font-size` as an
         // absolute length. Do not expose the authored percentage/relative
         // token (or the internal `None` used for initial `medium`) through
@@ -4493,14 +4510,9 @@ impl Dom {
         cache.1.insert((id, idx), v);
     }
 
-    /// The user-agent default stylesheet, for the inherited properties the
-    /// layout used to apply as hardcoded tag behavior: `<b>/<strong>` bold,
-    /// `<i>/<em>` italic, `<pre>` pre white-space, and the list marker style
-    /// (`<ul>` disc/circle/square by nesting depth, `<ol>` decimal or its
-    /// `type` attribute). Non-inherited tag defaults stay where they belong:
-    /// block/inline display (the layout's tag tables), `<a>` linking, heading
-    /// sizing, and `<u>/<s>` decoration (`text_decoration`, which accumulates
-    /// rather than inherits).
+    /// The user-agent stylesheet defaults, below the author cascade and
+    /// before inheritance. Decoration lines are established here and then
+    /// accumulated by `text_decoration`; font sizing also uses `ua_font_scale`.
     fn ua_default(&self, id: NodeId, name: &str) -> Option<String> {
         let tag = self.tag_name(id)?;
         let v = match name {
@@ -4515,8 +4527,26 @@ impl Dom {
             {
                 "#0000ee"
             }
-            "font-weight" if matches!(tag, "b" | "strong") => "bold",
+            // HTML Rendering #sections-and-headings: heading weight belongs
+            // to the UA cascade, so author font-weight still overrides it.
+            "font-weight"
+                if matches!(
+                    tag,
+                    "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                ) =>
+            {
+                "bold"
+            }
             "font-style" if matches!(tag, "i" | "em") => "italic",
+            // HTML Rendering #phrasing-content-3, at the UA origin so
+            // explicit none/initial can suppress an element's own decoration.
+            "text-decoration-line" if matches!(tag, "u" | "ins") => "underline",
+            "text-decoration-line" if matches!(tag, "s" | "strike" | "del") => "line-through",
+            "text-decoration-line"
+                if matches!(tag, "a" | "area") && self.attr(id, "href").is_some() =>
+            {
+                "underline"
+            }
             "white-space" if tag == "pre" => "pre",
             "list-style-type" if tag == "ul" => self.ul_marker_default(id),
             "list-style-type" if tag == "ol" => match self.attr(id, "type") {
@@ -4526,6 +4556,18 @@ impl Dom {
                 Some("I") => "upper-roman",
                 _ => "decimal",
             },
+            // HTML Rendering #the-details-and-summary-elements: only the
+            // first summary child is the disclosure's list-item caption.
+            "display" if self.is_details_summary(id) => "list-item",
+            "list-style-position" if self.is_details_summary(id) => "inside",
+            "counter-increment" if self.is_details_summary(id) => "list-item 0",
+            "list-style-type" if self.is_details_summary(id) => {
+                if self.attr(self.nodes[id].parent.unwrap(), "open").is_some() {
+                    "disclosure-open"
+                } else {
+                    "disclosure-closed"
+                }
+            }
             "display" => ua_display(tag),
             // WHATWG HTML Rendering §15.3.10: these widgets use border-box
             // sizing in the UA origin. An authored 30px button therefore
@@ -4565,6 +4607,19 @@ impl Dom {
         }
     }
 
+    /// HTML #summary-for-its-parent-details (light-tree child order).
+    pub(crate) fn is_details_summary(&self, id: NodeId) -> bool {
+        self.tag_name(id) == Some("summary")
+            && self.nodes[id].parent.is_some_and(|parent| {
+                self.tag_name(parent) == Some("details")
+                    && self
+                        .children(parent)
+                        .into_iter()
+                        .find(|&child| self.tag_name(child) == Some("summary"))
+                        == Some(id)
+            })
+    }
+
     /// The accumulated `(underline, line-through)` for an element's text.
     ///
     /// CSS Text Decoration 3 §2.1 says line decorations are not inherited:
@@ -4589,22 +4644,13 @@ impl Dom {
         // An author declaration on the same element outranks the HTML UA
         // decoration for <u>/<s> and friends. `none` therefore suppresses that
         // element's UA line while leaving the parent's propagated lines alone.
-        if let Some(value) = self
-            .cascaded(id, "text-decoration-line")
-            .or_else(|| self.cascaded(id, "text-decoration"))
+        if let Some(value) = self.computed_value_resolved(id, "text-decoration-line")
+            && !value.split_whitespace().any(|token| token == "none")
         {
-            if !value.split_whitespace().any(|token| token == "none") {
-                underline |= value.split_whitespace().any(|token| token == "underline");
-                strike |= value
-                    .split_whitespace()
-                    .any(|token| token == "line-through");
-            }
-        } else {
-            match self.tag_name(id) {
-                Some("u" | "ins") => underline = true,
-                Some("s" | "strike" | "del") => strike = true,
-                _ => {}
-            }
+            underline |= value.split_whitespace().any(|token| token == "underline");
+            strike |= value
+                .split_whitespace()
+                .any(|token| token == "line-through");
         }
 
         let result = (underline, strike);
@@ -11206,6 +11252,9 @@ const PROPS: &[PropDef] = &[
 /// the additional visibility/pointer/transform clauses are cited below.
 fn cssom_initial_value(name: &str) -> Option<&'static str> {
     match name {
+        "text-decoration-line" => Some("none"),
+        "text-decoration-style" => Some("solid"),
+        "text-decoration-color" => Some("currentcolor"),
         "-webkit-text-fill-color" | "-webkit-text-stroke-color" => Some("currentcolor"),
         "-webkit-text-stroke-width" => Some("0px"),
         "writing-mode" => Some("horizontal-tb"),
@@ -11633,6 +11682,65 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .map(|(name, _)| (name, pending.clone()))
                 .collect();
         }
+    }
+    if prop == "text-decoration" {
+        // CSS Text Decoration 3 #text-decoration-property: unordered line,
+        // style and color; every omitted component resets to its initial value.
+        let names = [
+            "text-decoration-line",
+            "text-decoration-style",
+            "text-decoration-color",
+        ];
+        if wide_keyword(value).is_some() {
+            return names
+                .into_iter()
+                .map(|name| (name.into(), value.into()))
+                .collect();
+        }
+        let mut lines = Vec::new();
+        let (mut style, mut color) = (None, None);
+        for token in split_top_level_ws(value) {
+            let lower = token.to_ascii_lowercase();
+            match lower.as_str() {
+                "none" | "underline" | "overline" | "line-through" | "blink" => {
+                    if lines.contains(&lower)
+                        || (!lines.is_empty() && lower == "none")
+                        || lines.iter().any(|line| line == "none")
+                    {
+                        return Vec::new();
+                    }
+                    lines.push(lower);
+                }
+                "solid" | "double" | "dotted" | "dashed" | "wavy" if style.is_none() => {
+                    style = Some(lower);
+                }
+                _ if color.is_none()
+                    && wide_keyword(token).is_none()
+                    && supports_color_value(token) =>
+                {
+                    color = Some(token.to_string());
+                }
+                _ => return Vec::new(),
+            }
+        }
+        if lines.is_empty() && style.is_none() && color.is_none() {
+            return Vec::new();
+        }
+        return vec![
+            (
+                names[0].into(),
+                if lines.is_empty() {
+                    "none".into()
+                } else {
+                    lines.join(" ")
+                },
+            ),
+            (names[1].into(), style.unwrap_or_else(|| "solid".into())),
+            (
+                names[2].into(),
+                color.unwrap_or_else(|| "currentcolor".into()),
+            ),
+        ];
     }
     if prop == "-webkit-text-stroke" {
         // WHATWG Compatibility #the-webkit-text-stroke: <line-width> ||
@@ -17875,6 +17983,134 @@ mod tests {
             dom.computed_value(n, "font-weight").as_deref(),
             Some("normal"),
             "own value beats inherited UA default"
+        );
+    }
+
+    #[test]
+    fn decoration_shorthand_cascades_color_style_and_lines() {
+        let dom = Dom::parse_document(
+            r#"<style>
+            #color { text-decoration: rgb(161, 47, 255) underline }
+            #reset { text-decoration-color:red; text-decoration-style:wavy; text-decoration:underline }
+            #order { text-decoration:underline red; text-decoration-color:blue }
+            #invalid { text-decoration:underline green; text-decoration:none underline red !important }
+            #variable { --dec: rgb(161, 47, 255) dashed underline line-through; text-decoration:var(--dec) }
+            </style><p id=color></p><p id=reset></p><p id=order></p><p id=invalid></p><p id=variable></p>
+            <u id=initial style='text-decoration:initial'>plain</u>"#,
+        );
+        let value = |id, prop| dom.computed_value_resolved(dom.get_by_id(id).unwrap(), prop);
+        for id in ["color", "variable"] {
+            assert_eq!(
+                value(id, "text-decoration-color").as_deref(),
+                Some("rgb(161, 47, 255)")
+            );
+        }
+        assert_eq!(
+            value("reset", "text-decoration-color").as_deref(),
+            Some("currentcolor")
+        );
+        assert_eq!(
+            value("reset", "text-decoration-style").as_deref(),
+            Some("solid")
+        );
+        assert_eq!(
+            value("order", "text-decoration-color").as_deref(),
+            Some("blue")
+        );
+        assert_eq!(
+            dom.cssom_resolved_value(dom.get_by_id("order").unwrap(), "text-decoration")
+                .as_deref(),
+            Some("underline solid blue")
+        );
+        assert_eq!(
+            value("invalid", "text-decoration-color").as_deref(),
+            Some("green")
+        );
+        assert_eq!(
+            value("variable", "text-decoration-style").as_deref(),
+            Some("dashed")
+        );
+        assert_eq!(
+            dom.text_decoration(dom.get_by_id("variable").unwrap()),
+            (true, true)
+        );
+        assert_eq!(
+            dom.text_decoration(dom.get_by_id("initial").unwrap()),
+            (false, false)
+        );
+        for invalid in [
+            "underline underline",
+            "solid dashed",
+            "red blue",
+            "inherit underline",
+            "",
+        ] {
+            assert!(
+                expand_box_shorthand("text-decoration", invalid).is_empty(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_ua_weight_inherits_and_author_styles_override() {
+        let dom = Dom::parse_document(
+            r#"<body style='font-weight:400'>
+            <h1 id=h1>one <span id=child>child</span></h1><h2 id=h2>two</h2><h3 id=h3>three</h3>
+            <h4 id=h4>four</h4><h5 id=h5>five</h5><h6 id=h6>six</h6>
+            <h2 id=normal style='font-weight:normal'>plain</h2>
+            <h2 id=revert style='font-weight:revert'>bold</h2>
+            <strong id=strong style='font-size:1.2rem'>winner</strong></body>"#,
+        );
+        for id in [
+            "h1", "h2", "h3", "h4", "h5", "h6", "child", "revert", "strong",
+        ] {
+            assert_eq!(
+                dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "font-weight")
+                    .as_deref(),
+                Some("700"),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            dom.cssom_resolved_value(dom.get_by_id("normal").unwrap(), "font-weight")
+                .as_deref(),
+            Some("400")
+        );
+    }
+
+    #[test]
+    fn details_summary_ua_styles_follow_first_child_and_open_state() {
+        let mut dom = Dom::parse_document(
+            r#"<details id=d><p>before</p><summary id=first>caption</summary>
+            <summary id=second>ordinary</summary></details><summary id=orphan>ordinary</summary>"#,
+        );
+        let first = dom.get_by_id("first").unwrap();
+        assert_eq!(dom.effective_display(first).as_deref(), Some("list-item"));
+        assert_eq!(
+            dom.computed_value(first, "list-style-position").as_deref(),
+            Some("inside")
+        );
+        assert_eq!(
+            dom.computed_value(first, "list-style-type").as_deref(),
+            Some("disclosure-closed")
+        );
+        for id in ["second", "orphan"] {
+            assert_eq!(
+                dom.effective_display(dom.get_by_id(id).unwrap()).as_deref(),
+                Some("block")
+            );
+        }
+        dom.set_attr(dom.get_by_id("d").unwrap(), "open", "false");
+        assert_eq!(
+            dom.computed_value(first, "list-style-type").as_deref(),
+            Some("disclosure-open")
+        );
+        dom.set_attr(first, "style", "display:block;list-style:none");
+        assert_eq!(dom.effective_display(first).as_deref(), Some("block"));
+        assert_eq!(
+            dom.computed_value(first, "list-style-type").as_deref(),
+            Some("none")
         );
     }
 

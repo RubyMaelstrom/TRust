@@ -3815,6 +3815,164 @@ mod tests {
     }
 
     #[test]
+    fn graphical_decoration_shorthand_paints_separate_color_and_bold_headings() {
+        let html = r#"<style>h2 { font-family:monospace; font-size:20px;
+            color:black; text-decoration:rgb(161, 47, 255) underline }</style>
+            <h2>Heading</h2><p><strong>Winner</strong></p>"#;
+        let layout = lay_graphical(html, 640., &HashMap::new());
+        let (shaped, color, decoration) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun {
+                    shaped,
+                    color,
+                    decoration,
+                    ..
+                } if shaped.text == "Heading" => Some((shaped, color, decoration)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(shaped.underline);
+        assert_eq!(*color, crate::render::PaintColor::Rgba(0, 0, 0, 255));
+        assert_eq!(
+            decoration.color,
+            crate::render::PaintColor::Rgba(161, 47, 255, 255)
+        );
+        let expected = crate::text::shape(
+            "Heading",
+            &crate::text::TextStyle {
+                family: "monospace".into(),
+                size: 20.,
+                weight: 700.,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            shaped.runs, expected.runs,
+            "heading must use the bold font face"
+        );
+        let terminal = lay(html, 80);
+        assert!(find(&terminal, "Heading").1.emph.bold);
+        assert!(find(&terminal, "Winner").1.emph.bold);
+    }
+
+    #[test]
+    fn graphical_propagated_decoration_retains_originating_color() {
+        for (color, decoration, expected) in [
+            (
+                "color:rgb(161, 47, 255);",
+                "underline rgb(161, 47, 255)",
+                crate::render::PaintColor::Rgba(161, 47, 255, 255),
+            ),
+            (
+                "color:rgb(161, 47, 255);",
+                "underline",
+                crate::render::PaintColor::Rgba(161, 47, 255, 255),
+            ),
+            (
+                "",
+                "underline",
+                crate::render::PaintColor::Rgba(20, 20, 20, 255),
+            ),
+        ] {
+            let layout = lay_graphical(
+                &format!(
+                    r#"<div style='{color}text-decoration:{decoration}'>
+                <span style='color:green;text-decoration-color:red'>Nested</span></div>"#
+                ),
+                640.,
+                &HashMap::new(),
+            );
+            let paint = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun {
+                        shaped, decoration, ..
+                    } if shaped.text == "Nested" => Some(decoration),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(paint.color, expected);
+        }
+    }
+
+    #[test]
+    fn graphical_native_disclosure_keeps_text_color_and_click_target() {
+        let mut dom = Dom::parse_document(
+            "<p>Plain</p><details><summary id=s><span>Caption</span></summary></details><a href='/next'>Link</a>",
+        );
+        let summary = dom.get_by_id("s").unwrap();
+        dom.set_render_clickables(std::collections::HashSet::from([summary]), true);
+        let base = Url::parse("https://example.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(640., 480.),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let run = |text| {
+            layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun {
+                        shaped,
+                        color,
+                        link,
+                        ..
+                    } if shaped.text == text => Some((color, link)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(run("Caption").0, run("Plain").0);
+        assert!(
+            matches!(run("Caption").1, Some(crate::doc::Link::JsClick { node, .. }) if *node == summary)
+        );
+        assert_eq!(
+            *run("Link").0,
+            crate::render::PaintColor::Rgba(0, 0, 238, 255)
+        );
+    }
+
+    #[test]
+    fn details_summary_marker_tracks_open_in_both_renderers() {
+        for (open, marker, visible) in [("", "▸", false), ("open", "▾", true)] {
+            let html = format!("<details {open}><summary>Caption</summary><p>Secret</p></details>");
+            let graphical = lay_graphical(&html, 640., &HashMap::new());
+            let text: String = graphical
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                        Some(shaped.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains(marker), "{text}");
+            assert_eq!(text.contains("Secret"), visible);
+            let terminal = lay(&html, 80);
+            let text: String = terminal
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .map(|item| item.text.as_str())
+                .collect();
+            assert!(text.contains(marker), "{text}");
+            assert_eq!(text.contains("Secret"), visible);
+        }
+    }
+
+    #[test]
     fn details_closed_shows_only_summary() {
         let out = lay(
             r#"<body style="margin:0"><details><summary>more</summary><p>secret</p></details></body>"#,

@@ -2255,7 +2255,7 @@ mod desktop {
             .into_iter()
             .map(|(_, _, _, node)| node)
             .collect();
-        if scripts.is_empty() && !dom.borrow().hover_css_affects_rendering() {
+        if scripts.is_empty() && !crate::js::needs_live_dom(&dom.borrow()) {
             return Err(outcome);
         }
 
