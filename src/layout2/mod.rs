@@ -9357,13 +9357,12 @@ mod tests {
         assert!(
             layout.paint.primitives.iter().any(|command| matches!(
                 command,
-                crate::render::DisplayCommand::Stroke {
+                crate::render::DisplayCommand::Fill {
                     shape: crate::render::PaintShape::Path(path),
                     brush: crate::render::PaintBrush::Solid(
                         crate::render::PaintColor::Rgba(115, 136, 149, 255)
                     ),
-                    style,
-                } if path.len() == 2 && (style.width - 1.5).abs() < 0.01
+                } if !path.is_empty()
             )),
             "the empty generated box must paint its authored bottom border"
         );

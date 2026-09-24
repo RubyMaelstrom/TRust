@@ -144,7 +144,8 @@ pub(super) fn box_bytes(b: &BoxNode) -> usize {
         + super::memo::box_style_bytes(&b.style)
         + b.marker.as_ref().map_or(0, String::capacity)
         + b.marker_image.as_ref().map_or(0, String::capacity)
-        + boxes_bytes(&b.oof, b.oof.capacity())
+        + b.oof.capacity() * std::mem::size_of::<(usize, super::tree::SharedBox)>()
+        + b.oof.iter().map(|(_, b)| box_bytes(b)).sum::<usize>()
         + match &b.content {
             Content::Blocks(bs) | Content::Flex(bs) | Content::Grid(bs) => {
                 boxes_bytes(bs, bs.capacity())

@@ -497,6 +497,11 @@ pub enum PageEvt {
         delta: i32,
     },
     ScrollToFragment(String),
+    /// Script-requested viewport offset, in CSS pixels (CSSOM View scroll()).
+    ViewportScrolled {
+        x: f64,
+        y: f64,
+    },
     PointerLock {
         request: u64,
         node: Option<usize>,

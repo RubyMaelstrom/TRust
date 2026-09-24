@@ -122,7 +122,7 @@ pub(crate) struct BoxNode {
     /// position is the container's content-box origin). Block containers
     /// carry their out-of-flow children inside the content lists instead
     /// (`Inline::OutOfFlow`), which records the inline static position.
-    pub oof: Vec<SharedBox>,
+    pub oof: Vec<(usize, SharedBox)>,
 }
 
 /// What a block container holds (§9.2: all block-level, or an IFC).
@@ -831,9 +831,9 @@ impl Builder<'_> {
     /// inline content); each contiguous run of text becomes an anonymous
     /// item; a run of only collapsible white space generates nothing.
     /// Out-of-flow children don't participate (§4.1) — returned separately.
-    fn itemize(&mut self, kids: Vec<Built>) -> (Vec<SharedBox>, Vec<SharedBox>) {
+    fn itemize(&mut self, kids: Vec<Built>) -> (Vec<SharedBox>, Vec<(usize, SharedBox)>) {
         let mut items: Vec<SharedBox> = Vec::new();
-        let mut oof: Vec<SharedBox> = Vec::new();
+        let mut oof = Vec::new();
         let mut run: Vec<Inline> = Vec::new();
         let flush = |run: &mut Vec<Inline>, items: &mut Vec<SharedBox>| {
             if run.iter().any(inline_has_content) {
@@ -856,7 +856,10 @@ impl Builder<'_> {
                     flush(&mut run, &mut items);
                     items.push(b);
                 }
-                Built::Inline(Inline::OutOfFlow(b)) => oof.push(b),
+                Built::Inline(Inline::OutOfFlow(b)) => {
+                    flush(&mut run, &mut items);
+                    oof.push((items.len(), b));
+                }
                 // css-flexbox §4.1 / css-grid §6: `float` is ignored on a
                 // flex/grid item — the blockified box becomes an ordinary item.
                 Built::Inline(Inline::Float(b)) => {
