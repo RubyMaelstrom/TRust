@@ -792,6 +792,13 @@ fn phase(label: &str) {
     }
 }
 
+/// HTML activation behavior is independent of author scripts. Both initial
+/// loading paths must retain the canonical page actor for native controls.
+pub(crate) fn needs_live_dom(dom: &Dom) -> bool {
+    dom.hover_css_affects_rendering()
+        || clickable_set_for_dom(dom, &std::collections::HashSet::new()).1
+}
+
 pub(crate) fn clickable_set_for_dom(
     dom: &Dom,
     listeners: &std::collections::HashSet<usize>,
@@ -803,7 +810,8 @@ pub(crate) fn clickable_set_for_dom(
         .iter()
         .copied()
         .filter(|&node| {
-            matches!(dom.tag_name(node), Some("button" | "summary"))
+            dom.tag_name(node) == Some("button")
+                || dom.is_details_summary(node)
                 || dom.attr(node, "onclick").is_some()
                 || dom.attr(node, "role") == Some("button")
         })

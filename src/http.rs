@@ -5144,22 +5144,18 @@ async fn execute_js_with_presentation(
     if response.declarative_refresh.is_none() {
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
-    // Keep the cheap CSS-only path for inert documents, but do not classify a
-    // script-less document that uses `:hover` as inert. Selectors 4 §9.1
-    // requires that user-action pseudo-class to track the pointing device even
-    // when there is no author script. The resident page actor already owns the
-    // canonical DOM and its incremental hover invalidation; the old shortcut
-    // dropped that actor before desktop/terminal hit testing could dispatch a
-    // hover, leaving links permanently at their rest color.
+    // Keep the CSS-only path for inert documents. HTML native activation
+    // (#the-summary-element, form controls) and Selectors 4 §9.1 hover state
+    // need the canonical live DOM even when there are no author scripts.
     let mut prefetched_sheets = None;
     if !html.to_ascii_lowercase().contains("<script") {
         let sheets = fetch_page_sheets(&html, &response.url).await;
-        let has_rendering_hover = {
+        let needs_live_dom = {
             let mut probe = crate::js::css_prepare(&html, viewport, cell_px);
             probe.attach_external_sheets(&sheets);
-            probe.hover_css_affects_rendering()
+            crate::js::needs_live_dom(&probe)
         };
-        if !has_rendering_hover {
+        if !needs_live_dom {
             return css_only_with_sheets(response, viewport, cell_px, device_pixel_ratio, sheets)
                 .await;
         }
@@ -5167,7 +5163,7 @@ async fn execute_js_with_presentation(
         // add latency precisely on a first-paint interaction path. Leave the
         // original HTML untouched (the actor's DOM/frame lifecycle remains the
         // source of truth); script-less iframe loading retains its established
-        // CSS-only behavior when no hover state is present.
+        // CSS-only behavior when no live interaction is present.
         prefetched_sheets = Some(sheets);
     }
     // Stylesheets still establish the initial cascade before layout. Scripts
@@ -10680,6 +10676,81 @@ mod tests {
             "deep frame was truncated: {body}"
         );
         assert!(!body.contains("<iframe"), "iframe element survived: {body}");
+    }
+
+    #[tokio::test]
+    async fn scriptless_details_keeps_actor_and_toggles_open_and_closed() {
+        let html = r#"<style>details{background:black}summary{padding:10px;background:white}
+            details p{color:white}</style><details id=disclosure><summary id=caption>Reveal</summary>
+            <p><strong>Winner</strong></p></details>"#;
+        let target = crate::dom::Dom::parse_document(html)
+            .get_by_id("caption")
+            .unwrap();
+        for terminal in [true, false] {
+            let response = Response {
+                url: parse_url("https://example.test/disclosure").unwrap(),
+                status: 200,
+                content_type: "text/html".into(),
+                headers: Vec::new(),
+                body: html.as_bytes().to_vec(),
+                rendered: None,
+                js: None,
+                blobs: None,
+                live: None,
+                declarative_refresh: None,
+                challenge: None,
+                from_post: false,
+                timing: None,
+            };
+            let mut response = execute_js_with_presentation(
+                response,
+                (80, 24),
+                (8, 16),
+                1.,
+                (0, 0),
+                Default::default(),
+                terminal,
+            )
+            .await;
+            assert!(
+                response.live.is_some(),
+                "scriptless disclosure lost its actor"
+            );
+            let rendered = response.rendered.as_ref().unwrap();
+            assert!(rendered.direct_actor_nodes);
+            assert!(
+                rendered.focus_order.contains(&target),
+                "caption is keyboard focusable"
+            );
+            let mut live = response.live.take().unwrap();
+            for open in [true, false] {
+                live.handle
+                    .try_send_user(crate::js::PageCmd::Click(target))
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let html = match live.events.recv().await {
+                            Some(crate::js::PageEvt::Updated { html, .. }) => html,
+                            Some(crate::js::PageEvt::Patched { patches, .. }) => patches
+                                .into_iter()
+                                .map(|patch| patch.html)
+                                .collect::<String>(),
+                            Some(crate::js::PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                            Some(_) => continue,
+                            None => panic!("disclosure actor retired"),
+                        };
+                        let dom = crate::dom::Dom::parse_document(&html);
+                        if let Some(details) = dom.get_by_id("disclosure")
+                            && dom.attr(details, "open").is_some() == open
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("disclosure did not repaint after activation");
+            }
+        }
     }
 
     #[tokio::test]

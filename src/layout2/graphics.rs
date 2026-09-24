@@ -1806,11 +1806,9 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                         PaintStyle::Pseudo(node, pseudo)
                     });
                 let current_color = match piece.item.pseudo {
-                    Some((node, pseudo)) => text_color_for_style(
-                        builder.dom,
-                        PaintStyle::Pseudo(node, pseudo),
-                        piece.item.link.is_some(),
-                    ),
+                    Some((node, pseudo)) => {
+                        text_color_for_style(builder.dom, PaintStyle::Pseudo(node, pseudo))
+                    }
                     None => text_color(builder.dom, style_node, piece.item.link.is_some()),
                 };
                 let color = paint_style
@@ -2337,12 +2335,12 @@ fn paint_outline_box(
         .value(builder.dom, "outline-color")
         .and_then(|value| {
             if value.trim().eq_ignore_ascii_case("currentcolor") {
-                Some(text_color_for_style(builder.dom, source, false))
+                Some(text_color_for_style(builder.dom, source))
             } else {
                 PaintColor::parse_css(&value)
             }
         })
-        .unwrap_or_else(|| text_color_for_style(builder.dom, source, false));
+        .unwrap_or_else(|| text_color_for_style(builder.dom, source));
     builder.commands.push(DisplayCommand::Stroke {
         shape: rounded_shape(rect, radii),
         brush: PaintBrush::Solid(color),
@@ -3215,7 +3213,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     });
     let colors = ["top", "right", "bottom", "left"].map(|side| {
         border_color(builder.dom, style, side)
-            .unwrap_or_else(|| text_color_for_style(builder.dom, style, false))
+            .unwrap_or_else(|| text_color_for_style(builder.dom, style))
     });
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     // #line-style permits UA-chosen band thickness and shading, but double
@@ -3984,7 +3982,7 @@ fn background_color_for_style(dom: &Dom, style: PaintStyle) -> Option<PaintColor
 
 fn text_color(dom: &Dom, node: NodeId, link: bool) -> PaintColor {
     if node != NO_NODE {
-        return text_color_for_style(dom, PaintStyle::Element(node), link);
+        return text_color_for_style(dom, PaintStyle::Element(node));
     }
     if link {
         PaintColor::Rgba(0, 70, 190, 255)
@@ -3993,7 +3991,7 @@ fn text_color(dom: &Dom, node: NodeId, link: bool) -> PaintColor {
     }
 }
 
-fn text_color_for_style(dom: &Dom, style: PaintStyle, link: bool) -> PaintColor {
+fn text_color_for_style(dom: &Dom, style: PaintStyle) -> PaintColor {
     if let Some(color) = style
         .value(dom, "color")
         .as_deref()
@@ -4001,11 +3999,10 @@ fn text_color_for_style(dom: &Dom, style: PaintStyle, link: bool) -> PaintColor 
     {
         return color;
     }
-    if link {
-        PaintColor::Rgba(0, 70, 190, 255)
-    } else {
-        PaintColor::Rgba(20, 20, 20, 255)
-    }
+    // HTML #phrasing-content-3 supplies hyperlink color in the UA cascade.
+    // An activation target (summary, button, onclick host) is not a hyperlink
+    // and must not acquire link styling from its frontend action descriptor.
+    PaintColor::Rgba(20, 20, 20, 255)
 }
 
 fn resolve_color(dom: &Dom, node: NodeId, value: &str) -> Option<PaintColor> {
@@ -4031,18 +4028,20 @@ fn border_color(dom: &Dom, style: PaintStyle, side: &str) -> Option<PaintColor> 
 }
 
 fn decoration_color(dom: &Dom, node: NodeId) -> Option<PaintColor> {
-    if node == NO_NODE {
-        return None;
+    let node = decoration_origin(dom, node)?;
+    let value = dom.computed_value_resolved(node, "text-decoration-color");
+    let value = value.as_deref().unwrap_or("currentcolor");
+    if value.eq_ignore_ascii_case("currentcolor") {
+        Some(text_color_for_style(dom, PaintStyle::Element(node)))
+    } else {
+        resolve_color(dom, node, value)
     }
-    dom.computed_value_resolved(node, "text-decoration-color")
-        .as_deref()
-        .and_then(|value| resolve_color(dom, node, value))
 }
 
 fn decoration_style(dom: &Dom, node: NodeId) -> DecorationStyle {
-    if node == NO_NODE {
+    let Some(node) = decoration_origin(dom, node) else {
         return DecorationStyle::Solid;
-    }
+    };
     match dom
         .computed_value_resolved(node, "text-decoration-style")
         .as_deref()
@@ -4054,6 +4053,30 @@ fn decoration_style(dom: &Dom, node: NodeId) -> DecorationStyle {
         Some("wavy") => DecorationStyle::Wavy,
         _ => DecorationStyle::Solid,
     }
+}
+
+fn decoration_origin(dom: &Dom, mut node: NodeId) -> Option<NodeId> {
+    // CSS Text Decoration 3 #text-decoration-color-property: a propagated
+    // decoration keeps its originating element's color, including currentcolor.
+    // Descendant color/style declarations alone do not establish a new line.
+    // Most text is undecorated; its memoized line flags avoid an ancestry
+    // walk on every glyph run during painting.
+    if node == NO_NODE || dom.text_decoration(node) == (false, false) {
+        return None;
+    }
+    while node != NO_NODE {
+        if dom
+            .computed_value_resolved(node, "text-decoration-line")
+            .is_some_and(|line| {
+                line.split_whitespace()
+                    .any(|part| matches!(part, "underline" | "line-through" | "overline"))
+            })
+        {
+            return Some(node);
+        }
+        node = dom.parent_composed(node)?;
+    }
+    None
 }
 
 fn blend_mode(value: &str) -> BlendMode {
