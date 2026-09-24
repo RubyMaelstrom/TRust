@@ -860,8 +860,22 @@ impl TextSystem {
 
     fn shape_uncached(&mut self, text: &str, style: &TextStyle, quantize: bool) -> ShapedText {
         if text.is_empty() || style.size <= 0.0 {
+            // CSS2 #leading / #strut: a zero-size font has zero ascent and
+            // descent, but an absolute line-height still contributes its
+            // full leading, split equally above and below the baseline.
+            let line_height = if !text.is_empty() {
+                match style.line_height {
+                    CssLineHeight::Length(px) => px.max(0.0),
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            };
             return ShapedText {
                 text: text.to_string(),
+                line_height,
+                leading: line_height,
+                baseline: line_height / 2.0,
                 ..ShapedText::default()
             };
         }
@@ -1302,6 +1316,30 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_font_size_retains_absolute_line_height_and_half_leading() {
+        for (line_height, expected) in [
+            (CssLineHeight::Length(34.), 34.),
+            (CssLineHeight::Length(0.), 0.),
+            (CssLineHeight::Number(2.), 0.),
+            (CssLineHeight::Normal, 0.),
+        ] {
+            let shaped = shape(
+                " ",
+                &TextStyle {
+                    size: 0.,
+                    line_height,
+                    ..TextStyle::default()
+                },
+            );
+            assert_eq!(shaped.line_height, expected);
+            assert_eq!(shaped.baseline, expected / 2.);
+            assert_eq!(shaped.leading, expected);
+            assert_eq!(shaped.advance, 0.);
+            assert!(shaped.runs.is_empty());
+        }
+    }
 
     #[test]
     fn retained_installed_fonts_survive_environment_switches() {

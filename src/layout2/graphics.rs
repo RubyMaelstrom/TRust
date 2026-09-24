@@ -3003,6 +3003,15 @@ fn background_position(value: &str, area: CssRect, image: (f32, f32)) -> (f32, f
         [] => ("0%", "0%"),
         [one] if matches!(one.to_ascii_lowercase().as_str(), "top" | "bottom") => ("50%", *one),
         [one] => (*one, "50%"),
+        // CSS Backgrounds 3 #background-position: two keywords can occur
+        // in either order. A vertical first keyword (or horizontal second
+        // keyword) assigns the axes before resolving percentage offsets.
+        [x, y]
+            if matches!(x.to_ascii_lowercase().as_str(), "top" | "bottom")
+                || matches!(y.to_ascii_lowercase().as_str(), "left" | "right") =>
+        {
+            (*y, *x)
+        }
         [x, y, ..] => (*x, *y),
     };
     (
@@ -4773,6 +4782,81 @@ mod tests {
                 "{images}"
             );
         }
+    }
+
+    #[test]
+    fn background_keyword_axes_position_oversized_images_and_sprites() {
+        // CSS Backgrounds 3 #background-position: keyword pairs can be
+        // reordered, and percentages use the area minus the image size.
+        for (width, height, image) in [
+            (960., 620., (1920, 620)),
+            (1920., 620., (1920, 620)),
+            (10., 38., (8, 76)),
+        ] {
+            for (position, fraction) in [
+                ("top center", (0.5, 0.)),
+                ("center top", (0.5, 0.)),
+                ("bottom right", (1., 1.)),
+                ("right bottom", (1., 1.)),
+                ("center left", (0., 0.5)),
+                ("left center", (0., 0.5)),
+                ("BOTTOM LEFT", (0., 1.)),
+                ("center", (0.5, 0.5)),
+                ("top", (0.5, 0.)),
+                ("25% 75%", (0.25, 0.75)),
+            ] {
+                let dom = Dom::parse_document(&format!(
+                    "<body style='margin:0'><div id=bg style='margin-left:13px;margin-top:17px;width:{width}px;height:{height}px;background:url(tile.png) {position} no-repeat'></div>"
+                ));
+                let layout = crate::layout2::lay_out_graphical(
+                    &dom,
+                    &Url::parse("https://example.test/").unwrap(),
+                    crate::layout2::Viewport::new(width + 30., height + 30.),
+                    &[],
+                    &Default::default(),
+                    &[("https://example.test/tile.png".into(), image)].into(),
+                );
+                let node = dom.get_by_id("bg").unwrap();
+                let rect = layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .find_map(|p| match p {
+                        DisplayCommand::Image { node: n, rect, .. } if *n == node => Some(*rect),
+                        _ => None,
+                    })
+                    .expect("background tile");
+                assert_eq!(
+                    rect,
+                    CssRect::new(
+                        13. + (width - image.0 as f32) * fraction.0,
+                        17. + (height - image.1 as f32) * fraction.1,
+                        image.0 as f32,
+                        image.1 as f32,
+                    ),
+                    "{position}, area {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_font_size_keeps_line_height_around_middle_aligned_inline_blocks() {
+        let (dom, layout) = render_fixture(
+            "<style>body{margin:0} #bar{font-size:0;line-height:34px;background:#a47618} #dot{display:inline-block;width:18px;height:18px;vertical-align:middle;background:#56390a}</style><div id=bar><span id=dot></span></div><div id=after>Next</div>",
+        );
+        let get = |id| layout.boxes.get(&dom.get_by_id(id).unwrap()).unwrap();
+        assert_eq!(get("bar").height, 34.);
+        assert_eq!(get("dot").top, 8.);
+        assert_eq!(get("dot").height, 18.);
+        assert_eq!(get("after").top, 34.);
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| &frame.pixels[(y * 800 + x) * 4..(y * 800 + x) * 4 + 3];
+        for y in [0, 7, 26, 33] {
+            assert_eq!(pixel(9, y), [164, 118, 24]);
+        }
+        assert_eq!(pixel(9, 16), [86, 57, 10]);
     }
 
     #[test]
