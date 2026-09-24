@@ -5102,11 +5102,11 @@
         const entries = Array.from(PENDING_ELEMENT_SCROLLS.values());
         PENDING_ELEMENT_SCROLLS.clear();
         for (const pending of entries) {
-            try { runInFrame(pending.frame, () => dispatch(pending.element, new Event("scroll"), false)); }
+            try { runInFrame(pending.frame, () => dispatch(pending.element, createTrustedEvent(Event, "scroll", {bubbles:pending.element.nodeType === 9}), false)); }
             catch (e) { trust.errors.push("element scroll handler: " + ((e && e.message) || e)); }
         }
         for (const pending of entries) {
-            try { runInFrame(pending.frame, () => dispatch(pending.element, new Event("scrollend"), false)); }
+            try { runInFrame(pending.frame, () => dispatch(pending.element, createTrustedEvent(Event, "scrollend", {bubbles:pending.element.nodeType === 9}), false)); }
             catch (e) { trust.errors.push("element scrollend handler: " + ((e && e.message) || e)); }
             for (const done of pending.resolvers) {
                 try { done(); } catch (e) {}
@@ -5825,8 +5825,7 @@
             let left = options.left === undefined ? this.scrollLeft : normalizedScrollNumber(options.left);
             let top = options.top === undefined ? this.scrollTop : normalizedScrollNumber(options.top);
             if (this.localName === "html") {
-                g.scrollTo(left, top);
-                return Promise.resolve();
+                return g.scrollTo(left, top);
             }
             const maxLeft = Math.max(0, this.scrollWidth - this.clientWidth);
             const maxTop = Math.max(0, this.scrollHeight - this.clientHeight);
@@ -5939,7 +5938,7 @@
         // position (CSSOM View): the getter reads the stored value and the setter
         // clamps to `[0, scrollHeight − clientHeight]` and records the write
         // (`__dom_scroll_set` → the app re-windows the region). The root's setter
-        // routes to the window scroll (terminal-owned, so currently inert).
+        // routes to the window scroll and its frontend presentation request.
         get scrollTop() {
             if (this.localName === "html") return g.scrollY || 0;
             return __dom_scroll_get(this.__id, 0) || 0;
@@ -12356,7 +12355,36 @@
     };
     g.CSS = CSS;
     g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
-    g.scroll = g.scrollTo = g.scrollBy = () => {};
+    // CSSOM View #dom-window-scroll / #dom-window-scrollby. The actor owns
+    // the CSS-pixel offset; the frontends receive the latest requested offset.
+    // Scroll events are coalesced at the rendering update, before rAF.
+    let viewportScrollRequest = null;
+    trust.takeViewportScroll = function () {
+        const request = viewportScrollRequest;
+        viewportScrollRequest = null;
+        return request;
+    };
+    function windowScroll(x, y, relative, count) {
+        const options = count < 2 ? (x == null ? {} : x) : {left:x, top:y};
+        if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("ScrollToOptions must be a dictionary");
+        checkedScrollBehavior(options);
+        const left = options.left;
+        const top = options.top;
+        x = (relative ? (g.scrollX || 0) : 0) +
+            (left === undefined ? (relative ? 0 : (g.scrollX || 0)) : normalizedScrollNumber(left));
+        y = (relative ? (g.scrollY || 0) : 0) +
+            (top === undefined ? (relative ? 0 : (g.scrollY || 0)) : normalizedScrollNumber(top));
+        const oldX = g.scrollX || 0, oldY = g.scrollY || 0;
+        trust.setScroll(x, y);
+        if (oldX === g.scrollX && oldY === g.scrollY) return Promise.resolve();
+        const frame = trust.__activeFrame || realmRootFrame;
+        if (frame) __dom_scroll_set(frame.__id, g.scrollY, g.scrollX);
+        else viewportScrollRequest = [g.scrollX, g.scrollY];
+        return new Promise(resolve => queueElementScroll(g.document, resolve));
+    }
+    g.scroll = g.scrollTo = function (x, y) { return windowScroll(x, y, false, arguments.length); };
+    g.scrollBy = function (x, y) { return windowScroll(x, y, true, arguments.length); };
     // window.open: open a new browsing context. A single-view TUI has none, so
     // this is a no-op that returns a minimal stub window (NEVER null — page
     // code routinely chains `window.open(...).focus()`) and never throws. A
@@ -12928,7 +12956,7 @@
     const RO = [];
     let roInitialUpdatePending = false;
     trust.hasRenderingUpdate = function () {
-        if (ioInitialUpdatePending || roInitialUpdatePending || PENDING_ELEMENT_SCROLLS.size > 0) return true;
+        if (ioInitialUpdatePending || roInitialUpdatePending || PENDING_ELEMENT_SCROLLS.size > 0 || viewportScrollRequest !== null) return true;
         for (const child of renderingChildren()) if (child.hasRenderingUpdate()) return true;
         return false;
     };
@@ -13172,13 +13200,7 @@
         }
         if (x === (g.scrollX || 0) && y === (g.scrollY || 0)) return;
         g.scrollX = x; g.scrollY = y; g.pageXOffset = x; g.pageYOffset = y;
-        // Fire `scroll` at the document with forceBubble so window scroll
-        // listeners run too (dispatch pushes window onto the path). scroll itself
-        // doesn't bubble, but both document and window listeners must fire — the
-        // classic `window.addEventListener('scroll', ...)` infinite-scroll idiom
-        // (Steam) depends on it.
-        try { dispatch(g.document, new Event("scroll"), true); }
-        catch (e) { trust.errors.push("scroll handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        queueElementScroll(g.document);
         trust.updateIntersections();
     };
 

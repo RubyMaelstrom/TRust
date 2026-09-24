@@ -6014,6 +6014,7 @@ impl App {
         // render below so it targets the freshly-rendered doc's `anchor_rows`.
         // Newest wins.
         let mut scroll_fragment: Option<String> = None;
+        let mut viewport_scroll = None;
         let mut submit_default = false;
         // A page-triggered native submit carries its form and optional
         // submitter arena nodes (requestSubmit() has no submitter when called
@@ -6076,6 +6077,7 @@ impl App {
                     history_updates.push((url, replace));
                 }
                 Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
+                Some(PageEvt::ViewportScrolled { x: _, y }) => viewport_scroll = Some(y),
                 Some(PageEvt::PointerLock { request, node, .. }) => {
                     if node.is_some()
                         && let Some(page) = &self.live_page
@@ -6122,6 +6124,15 @@ impl App {
         // applied after any content update so it resolves against the new doc.
         if let Some(frag) = scroll_fragment {
             self.scroll_to_fragment(&frag);
+        }
+        if let Some(y) = viewport_scroll {
+            let row = (y / f64::from(self.picker.font_size().height.max(1)))
+                .round()
+                .max(0.) as usize;
+            self.scroll_intent = row;
+            if let Some(browser) = self.browser.as_mut() {
+                browser.scroll = row;
+            }
         }
         for (url, replace) in history_updates {
             self.apply_same_document_history_update(&url, replace);

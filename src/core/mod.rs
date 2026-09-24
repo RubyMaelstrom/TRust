@@ -638,6 +638,7 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::Reload(_) => "Reload",
         crate::js::PageEvt::HistoryUpdate { .. } => "HistoryUpdate",
         crate::js::PageEvt::ScrollToFragment(_) => "ScrollToFragment",
+        crate::js::PageEvt::ViewportScrolled { .. } => "ViewportScrolled",
         crate::js::PageEvt::PointerLock { .. } => "PointerLock",
         crate::js::PageEvt::Trouble(_) => "Trouble",
         crate::js::PageEvt::Settled => "Settled",
@@ -2745,6 +2746,12 @@ impl BrowserController {
                 self.pending_fragment = Some(fragment);
                 true
             }
+            PageEvt::ViewportScrolled { x, y } => {
+                let next = CssPoint::new(x as f32, y as f32);
+                let changed = self.interaction.scroll != next;
+                self.interaction.scroll = next;
+                changed
+            }
             PageEvt::PointerLock {
                 request,
                 node,
@@ -4412,6 +4419,22 @@ mod tests {
             browser.page_render_is_final(),
             "a document that never committed cannot render again"
         );
+    }
+
+    #[test]
+    fn page_requested_viewport_scroll_updates_presentation_without_navigation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let generation = browser.generation;
+        browser.interaction.scroll = CssPoint::new(10., 500.);
+        assert!(browser.handle_page_event(crate::js::PageEvt::ViewportScrolled { x: 10., y: 0. }));
+        assert_eq!(browser.interaction.scroll, CssPoint::new(10., 0.));
+        assert_eq!(browser.generation, generation);
+        assert!(!browser.handle_page_event(crate::js::PageEvt::ViewportScrolled { x: 10., y: 0. }));
     }
 
     #[test]

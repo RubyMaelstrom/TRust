@@ -789,6 +789,11 @@ impl Flow<'_> {
         if s.clear.any() {
             let ct = fc.clear_y(s.clear);
             if ct > cur.preview() {
+                // CSS2 #collapsing-margins / #clearance: clearance separates
+                // this child's top margin from its parent. Seal the preceding
+                // margin strut before moving the child below the floats; the
+                // parent's top must not follow the clearing child's bottom.
+                cur.flush();
                 cur.y = ct;
                 cur.pos = 0.0;
                 cur.neg = 0.0;
@@ -1516,24 +1521,58 @@ impl Flow<'_> {
     /// §4.1 / css-grid §9.1; the "as if it were the sole item" alignment
     /// refinement is documented as not done — the origin is used).
     fn container_oof(&self, b: &BoxNode, inl: &InlineStyle, x: f32, y: f32, out: &mut Vec<Frag>) {
-        for ob in &b.oof {
-            out.push(Frag {
-                flow: Default::default(),
-                node: NO_NODE,
-                x,
-                y,
-                w: 0.0,
-                h: 0.0,
-                border: [0.0; 4],
-                css_size: None,
-                content_size: None,
-                content_offset: [0.0; 2],
-                paint: PaintFlags::default(),
-                clip: None,
-                kind: FragKind::Oof(ob.clone(), Box::new(inl.clone())),
-                children: Vec::new(),
-            });
+        if b.oof.is_empty() {
+            return;
         }
+        let (Content::Flex(items) | Content::Grid(items)) = &b.content else {
+            return;
+        };
+        // CSS Flexbox #abspos-items / CSS2 Appendix E: removing a child
+        // from layout must preserve its place in painting order. In particular
+        // ::before precedes the items, rather than becoming a foreground layer.
+        let mut source_indices =
+            rustc_hash::FxHashMap::<_, std::collections::VecDeque<usize>>::default();
+        for (index, item) in items.iter().enumerate() {
+            source_indices
+                .entry((item.node, item.style.pseudo))
+                .or_default()
+                .push_back(index);
+        }
+        let mut ordered: Vec<_> = out
+            .drain(..)
+            .enumerate()
+            .map(|(fallback, frag)| {
+                let index = source_indices
+                    .get_mut(&(frag.node, frag.paint.pseudo))
+                    .and_then(|indices| indices.pop_front())
+                    .unwrap_or(fallback);
+                (self.order_of(frag.node), index * 2 + 1, frag)
+            })
+            .collect();
+        for (index, ob) in &b.oof {
+            ordered.push((
+                0,
+                index * 2,
+                Frag {
+                    flow: Default::default(),
+                    node: NO_NODE,
+                    x,
+                    y,
+                    w: 0.0,
+                    h: 0.0,
+                    border: [0.0; 4],
+                    css_size: None,
+                    content_size: None,
+                    content_offset: [0.0; 2],
+                    paint: PaintFlags::default(),
+                    clip: None,
+                    kind: FragKind::Oof(ob.clone(), Box::new(inl.clone())),
+                    children: Vec::new(),
+                },
+            ));
+        }
+        ordered.sort_by_key(|(order, index, _)| (*order, *index));
+        out.extend(ordered.into_iter().map(|(_, _, frag)| frag));
     }
 
     /// Turn finished line boxes into Line fragments at `x`, advancing the

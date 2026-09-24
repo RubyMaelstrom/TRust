@@ -4011,6 +4011,15 @@ mod desktop {
             }
         }
         let fragment = take_scroll_fragment(page);
+        let viewport_scroll = call_trust(page, "takeViewportScroll", &[], "viewport scroll")
+            .filter(|v| !value_is_nullish(v))
+            .and_then(|v| {
+                let ctx = page.engine.ctx();
+                Some((
+                    ctx.member_get(&v, "0").ok()?.as_num_opt()?,
+                    ctx.member_get(&v, "1").ok()?.as_num_opt()?,
+                ))
+            });
         if let Some(value) = call_trust(page, "takePointerLockRequest", &[], "pointer lock request")
             && !value_is_nullish(&value)
         {
@@ -4186,6 +4195,15 @@ mod desktop {
         if let Some(fragment) = fragment {
             if events
                 .blocking_send(PageEvt::ScrollToFragment(fragment))
+                .is_err()
+            {
+                return false;
+            }
+            sent_primary = true;
+        }
+        if let Some((x, y)) = viewport_scroll {
+            if events
+                .blocking_send(PageEvt::ViewportScrolled { x, y })
                 .is_err()
             {
                 return false;
@@ -4591,6 +4609,53 @@ mod desktop {
             })
             .await
             .expect("queued native edits timed out");
+        }
+
+        #[tokio::test]
+        async fn click_animation_delivers_viewport_scroll_requests_to_the_frontend() {
+            let html = r#"<!doctype html><body style="height:3000px">
+                <div id=up style="cursor:pointer">Up</div><script>
+                document.addEventListener('click', e=>{
+                    if(e.target.id!=='up')return;
+                    requestAnimationFrame(()=>{document.documentElement.scrollTop=100;
+                        requestAnimationFrame(()=>{document.documentElement.scrollTop=0;});});
+                });</script></body>"#;
+            let node = Dom::parse_document(html).get_by_id("up").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { .. }) => break,
+                        Some(PageEvt::Static { outcome, .. }) => {
+                            panic!("scroll page became static: {:?}", outcome.errors)
+                        }
+                        Some(_) => {}
+                        None => panic!("scroll page closed"),
+                    }
+                }
+                handle
+                    .try_send_user(PageCmd::Scroll { x: 0., y: 500. })
+                    .unwrap();
+                handle.try_send_user(PageCmd::Click(node)).unwrap();
+                let mut seen = Vec::new();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::ViewportScrolled { x, y }) => {
+                            assert_eq!(x, 0.);
+                            seen.push(y);
+                            if y == 0. {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page retired before scroll"),
+                    }
+                }
+                assert_eq!(seen, [100., 0.]);
+            })
+            .await
+            .expect("click scroll animation timed out");
         }
 
         #[tokio::test]
@@ -13748,6 +13813,44 @@ mod tests {
             if(axes(list)!=='visible,visible') return 'inline variables';
             style.removeProperty('overflow');
             if(style.overflowX!==''||style.overflowY!=='') return 'shorthand removal';
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn viewport_scroll_methods_and_root_setters_coalesce_before_animation_frames() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><body style='margin:0;width:2000px;height:3000px'><div id=target></div></body>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const seen=[];
+            document.addEventListener('scroll',e=>seen.push(e.bubbles && e.isTrusted ? 'document' : 'bad-event'));
+            window.addEventListener('scroll',()=>seen.push('window'));
+            window.addEventListener('scrollend',()=>seen.push('end'));
+            scrollTo(25,200); scrollBy({top:50});
+            if(scrollX!==25 || scrollY!==250 || pageYOffset!==250) return 'offset';
+            document.documentElement.scrollTop=0;
+            if(scrollY!==0 || scrollX!==25) return 'root';
+            scrollTo({top:100});
+            if(seen.length) return 'synchronous event';
+            if(JSON.stringify(__trust.takeViewportScroll())!=='[25,100]') return 'request';
+            if(__trust.takeViewportScroll()!==null) return 'duplicate request';
+            requestAnimationFrame(()=>seen.push('raf'));
+            __trust.runRenderingFrame(performance.now());
+            if(seen.join(',')!=='document,window,end,raf') return seen.join(',');
+            scrollTo(Infinity,NaN);
+            if(scrollX!==0 || scrollY!==0) return 'nonfinite';
+            scrollTo(1e9,1e9);
+            if(scrollY!==document.documentElement.scrollHeight-innerHeight) return 'clamp';
+            try { scrollTo({behavior:'bogus'});return 'behavior'; } catch(e) {if(!(e instanceof TypeError)) return 'type';}
             return 'ok';
         })()"#
             ),

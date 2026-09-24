@@ -3326,11 +3326,29 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         {
             continue;
         }
-        builder.commands.push(DisplayCommand::Stroke {
-            shape: PaintShape::Path(vec![PathElement::MoveTo(start), PathElement::LineTo(end)]),
-            brush: PaintBrush::Solid(colors[index]),
-            style: stroke_for_border(width, &styles[index]),
-        });
+        // CSS Backgrounds 3 #corner-transitions: adjoining sides meet
+        // between the outer and inner corners, including transparent sides
+        // and a zero-sized padding box (the usual CSS triangle).
+        let next = (index + 1) % 4;
+        builder
+            .commands
+            .push(DisplayCommand::PushClip(PaintShape::Polygon {
+                points: vec![outside[index], outside[next], inside[next], inside[index]],
+                evenodd: false,
+            }));
+        if styles[index] == "solid" {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: border_ring(rect, radii, fragment.border, 0., 1.),
+                brush: PaintBrush::Solid(colors[index]),
+            });
+        } else {
+            builder.commands.push(DisplayCommand::Stroke {
+                shape: PaintShape::Path(vec![PathElement::MoveTo(start), PathElement::LineTo(end)]),
+                brush: PaintBrush::Solid(colors[index]),
+                style: stroke_for_border(width, &styles[index]),
+            });
+        }
+        builder.commands.push(DisplayCommand::PopClip);
     }
 }
 
@@ -4455,6 +4473,75 @@ fn alpha_byte(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floated_navigation_background_stays_behind_its_contents() {
+        let (_, layout) = render_fixture(
+            r#"<!doctype html><style>
+            body{margin:0} nav{position:relative;min-height:76px;transform:translate3d(0,0,0);background:#123456}
+            .container:before,.container:after{display:table;content:' '}
+            .container:after{clear:both}.left{float:left;height:76px;width:300px}
+            .right{float:right;height:76px;width:100px}
+            </style><nav><div class=container><div class=left>Menu</div><div class=right>Play</div></div></nav>"#,
+        );
+        let rect = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::Fill {
+                    shape: PaintShape::Rect(rect),
+                    brush: PaintBrush::Solid(PaintColor::Rgba(18, 52, 86, 255)),
+                } => Some(rect),
+                _ => None,
+            })
+            .expect("navigation background");
+        assert_eq!((rect.y, rect.height), (0., 76.));
+    }
+
+    #[test]
+    fn flex_before_background_paints_below_positioned_items() {
+        for display in ["flex", "grid"] {
+            for (pseudo, order, expected) in [
+                ("before", 0, [0, 255, 0]),
+                ("after", 0, [0, 0, 0]),
+                ("before", -1, [0, 0, 0]),
+                ("after", 1, [0, 255, 0]),
+            ] {
+                let (_, layout) = render_fixture(&format!(
+                    r#"<!doctype html><style>
+                body{{margin:0;background:white}}.bar{{position:fixed;bottom:0;left:0;width:100%;z-index:20}}
+                .items{{display:{display}}}.items::{pseudo}{{content:'';position:absolute;bottom:0;left:0;right:0;height:29px;background:black}}
+                .item{{position:relative;width:100px;height:58px;background:lime;transform:translateY(0);order:{order}}}
+                </style><div class=bar><div class=items><div class=item></div></div></div>"#
+                ));
+                let pixels =
+                    crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                        .unwrap()
+                        .pixels;
+                assert_eq!(
+                    &pixels[(590 * 800 + 50) * 4..(590 * 800 + 50) * 4 + 3],
+                    expected,
+                    "{display} ::{pseudo} order:{order}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_border_sides_form_a_triangle() {
+        let (_, layout) = render_fixture(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="width:0;height:0;border:20px solid transparent;border-top-color:red"></div></body>"#,
+        );
+        let pixels = crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+            .unwrap()
+            .pixels;
+        let at = |x: usize, y: usize| &pixels[(y * 800 + x) * 4..(y * 800 + x) * 4 + 3];
+        assert_eq!(at(20, 5), [255, 0, 0]);
+        assert_eq!(at(2, 15), [255, 255, 255]);
+        assert_eq!(at(20, 25), [255, 255, 255]);
+    }
 
     #[test]
     fn background_clip_preserves_rounded_padding_and_content_edges() {

@@ -3,11 +3,48 @@
 //!
 //! The canonical style owns the transition, so CSSOM, layout, observers and
 //! both frontends see the same intermediate value. Currently interpolates
-//! box lengths/percentages and opacity; other animation types stay discrete.
+//! box lengths/percentages, opacity, and matching transform primitives.
 use super::*;
 use crate::layout2::value::{Len, Node as Length, Vp};
 
-const PROPERTIES: [&str; 19] = [
+mod transform;
+use transform::Transform;
+
+#[derive(Clone, Debug, PartialEq)]
+enum Animated {
+    Linear(Linear),
+    Transform(Transform),
+}
+impl Animated {
+    fn compatible(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Linear(_), Self::Linear(_)) => true,
+            (Self::Transform(a), Self::Transform(b)) => a.compatible(b),
+            _ => false,
+        }
+    }
+    fn mix(&self, end: &Self, t: f32) -> Self {
+        match (self, end) {
+            (Self::Linear(a), Self::Linear(b)) => Self::Linear(a.mix(*b, t)),
+            (Self::Transform(a), Self::Transform(b)) => Self::Transform(a.mix(b, t)),
+            _ => unreachable!("transition endpoints have matching animation types"),
+        }
+    }
+    fn css(&self, property: usize) -> String {
+        match self {
+            Self::Linear(v) => v.css(property),
+            Self::Transform(v) => v.css(),
+        }
+    }
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Transform(v) => v.retained_bytes(),
+            _ => 0,
+        }
+    }
+}
+
+const PROPERTIES: [&str; 20] = [
     "width",
     "height",
     "min-width",
@@ -27,6 +64,7 @@ const PROPERTIES: [&str; 19] = [
     "padding-bottom",
     "padding-left",
     "opacity",
+    "transform",
 ];
 const LONGHANDS: [&str; 4] = [
     "transition-property",
@@ -34,7 +72,7 @@ const LONGHANDS: [&str; 4] = [
     "transition-timing-function",
     "transition-delay",
 ];
-type Values = [Option<Linear>; PROPERTIES.len()];
+type Values = [Option<Animated>; PROPERTIES.len()];
 type Key = (NodeId, usize);
 pub(crate) type TransitionEvent = (NodeId, &'static str, &'static str, f64);
 
@@ -297,9 +335,9 @@ fn parameters(dom: &Dom, id: NodeId) -> [Option<Parameters>; PROPERTIES.len()] {
 }
 
 struct Running {
-    from: Linear,
-    to: Linear,
-    reversing_from: Linear,
+    from: Animated,
+    to: Animated,
+    reversing_from: Animated,
     factor: f64,
     start: f64,
     duration: f64,
@@ -320,8 +358,8 @@ impl Running {
                 .sample(((now - self.start) / self.duration).clamp(0., 1.) as f32)
         }
     }
-    fn value(&self, now: f64) -> Linear {
-        self.from.mix(self.to, self.progress(now))
+    fn value(&self, now: f64) -> Animated {
+        self.from.mix(&self.to, self.progress(now))
     }
     fn elapsed(&self, now: f64) -> f64 {
         (now - self.start).clamp(0., self.duration)
@@ -344,7 +382,7 @@ pub(super) struct State {
     now: f64,
     before: FxHashMap<NodeId, Values>,
     running: FxHashMap<Key, Running>,
-    completed: FxHashMap<Key, Linear>,
+    completed: FxHashMap<Key, Animated>,
     values: FxHashMap<Key, String>,
     events: Vec<PendingEvent>,
     generation: u64,
@@ -367,10 +405,30 @@ impl State {
         self.invalid.capacity() * std::mem::size_of::<NodeId>()
             + self.before.capacity() * std::mem::size_of::<(NodeId, Values)>()
             + self.running.capacity() * std::mem::size_of::<(Key, Running)>()
-            + self.completed.capacity() * std::mem::size_of::<(Key, Linear)>()
+            + self.completed.capacity() * std::mem::size_of::<(Key, Animated)>()
             + self.values.capacity() * std::mem::size_of::<(Key, String)>()
             + self.values.values().map(String::capacity).sum::<usize>()
             + self.events.capacity() * std::mem::size_of::<PendingEvent>()
+            + self
+                .before
+                .values()
+                .flat_map(|v| v.iter().flatten())
+                .map(Animated::retained_bytes)
+                .sum::<usize>()
+            + self
+                .completed
+                .values()
+                .map(Animated::retained_bytes)
+                .sum::<usize>()
+            + self
+                .running
+                .values()
+                .map(|v| {
+                    v.from.retained_bytes()
+                        + v.to.retained_bytes()
+                        + v.reversing_from.retained_bytes()
+                })
+                .sum::<usize>()
     }
     fn cancel(&mut self, key: Key, now: f64) {
         if let Some(old) = self.running.remove(&key) {
@@ -397,7 +455,7 @@ impl State {
                     track.duration,
                     track.start + track.duration,
                 ));
-                self.completed.insert(key, track.to);
+                self.completed.insert(key, track.to.clone());
                 finished.push(key);
             }
         }
@@ -486,7 +544,7 @@ impl Dom {
                     && !active_nodes.contains(&id)
                     && let Some(values) = state.before.get(&id)
                 {
-                    after.insert(id, *values);
+                    after.insert(id, values.clone());
                     continue;
                 }
                 if self
@@ -508,10 +566,15 @@ impl Dom {
                         .as_deref()
                         .or_else(|| cssom_initial_value(PROPERTIES[i]))?
                         .trim();
+                    if i == 19 {
+                        return Transform::parse(value, self, id, vp).map(Animated::Transform);
+                    }
                     if i == 18 {
-                        return parse_alpha(value).map(|px| Linear {
-                            px: px.clamp(0., 1.),
-                            pct: 0.,
+                        return parse_alpha(value).map(|px| {
+                            Animated::Linear(Linear {
+                                px: px.clamp(0., 1.),
+                                pct: 0.,
+                            })
                         });
                     }
                     if matches!(
@@ -527,24 +590,26 @@ impl Dom {
                         .ok()
                         .filter(|v| v.is_finite())
                     {
-                        return Some(Linear { px, pct: 0. });
+                        return Some(Animated::Linear(Linear { px, pct: 0. }));
                     }
                     if let Some(pct) = value
                         .strip_suffix('%')
                         .and_then(|s| s.parse::<f32>().ok())
                         .filter(|v| v.is_finite())
                     {
-                        return Some(Linear {
+                        return Some(Animated::Linear(Linear {
                             px: 0.,
                             pct: pct / 100.,
-                        });
+                        }));
                     }
                     match Len::parse(value, crate::layout2::Units::of(self, id), vp)? {
-                        Len::Val(Length::Lin { k, b }) => Some(Linear { px: b, pct: k }),
+                        Len::Val(Length::Lin { k, b }) => {
+                            Some(Animated::Linear(Linear { px: b, pct: k }))
+                        }
                         _ => None,
                     }
                 });
-                if let Some(before) = state.before.get(&id).copied() {
+                if let Some(before) = state.before.get(&id).cloned() {
                     if before == values && !active_nodes.contains(&id) {
                         after.insert(id, values);
                         continue;
@@ -552,7 +617,7 @@ impl Dom {
                     let params = parameters(self, id);
                     for i in 0..PROPERTIES.len() {
                         let key = (id, i);
-                        let Some(end) = values[i] else {
+                        let Some(end) = values[i].clone() else {
                             state.cancel(key, now);
                             state.completed.remove(&key);
                             continue;
@@ -569,7 +634,10 @@ impl Dom {
                             continue;
                         }
                         let old = state.running.remove(&key);
-                        let start = old.as_ref().map(|r| r.value(now)).or(before[i]);
+                        let start = old
+                            .as_ref()
+                            .map(|r| r.value(now))
+                            .or_else(|| before[i].clone());
                         if let Some(old) = &old {
                             state.events.push(old.event(
                                 key,
@@ -581,7 +649,8 @@ impl Dom {
                         let Some(start) = start else {
                             continue;
                         };
-                        if start == end
+                        if !start.compatible(&end)
+                            || start == end
                             || p.duration + p.delay <= 0.
                             || state.completed.get(&key) == Some(&end)
                         {
@@ -594,10 +663,10 @@ impl Dom {
                                 (f64::from(old.progress(now)) * old.factor + 1. - old.factor)
                                     .abs()
                                     .clamp(0., 1.),
-                                old.to,
+                                old.to.clone(),
                             )
                         } else {
-                            (1., start)
+                            (1., start.clone())
                         };
                         let delay = if p.delay < 0. {
                             p.delay * factor
@@ -708,6 +777,65 @@ mod tests {
     }
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 0.001, "{a} != {b}");
+    }
+    #[test]
+    fn hover_transform_transitions_pad_none_and_reverse_without_style_mutation() {
+        let mut dom = Dom::parse_document(
+            r#"<!doctype html><style>
+            #menu{width:200px;height:100px;visibility:hidden;transform:scaleY(.75);transform-origin:center top;transition:transform .2s linear}
+            #host:hover #menu{visibility:visible;transform:none}
+            </style><div id=host><div id=menu>Menu</div></div>"#,
+        );
+        dom.set_viewport_px(800., 600.);
+        let host = dom.get_by_id("host").unwrap();
+        let menu = dom.get_by_id("menu").unwrap();
+        dom.update_css_transitions(0.);
+        dom.set_hover_chain(Some(host));
+        dom.update_css_transitions(1.);
+        dom.update_css_transitions(1.1);
+        assert_eq!(
+            dom.computed_value_resolved(menu, "transform").as_deref(),
+            Some("scale(1, 0.875)")
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &url::Url::parse("https://example.test/").unwrap(),
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(layout.paint.primitives.iter().any(|p| matches!(p,crate::render::DisplayCommand::PushTransform(m) if (m.0[3]-0.875).abs()<0.001)));
+        dom.set_hover_chain(None);
+        dom.update_css_transitions(1.1);
+        dom.update_css_transitions(1.15);
+        assert_eq!(
+            dom.computed_value_resolved(menu, "transform").as_deref(),
+            Some("scale(1, 0.8125)")
+        );
+        dom.update_css_transitions(1.21);
+        assert!(!dom.css_transitions_active());
+        assert!(dom.attr(menu, "style").is_none());
+    }
+
+    #[test]
+    fn transform_transition_preserves_percentage_translation_and_rotation_turns() {
+        let (mut dom, id) = setup(
+            "transform:translateY(calc(100% - 58px)) rotate(0deg);transition:transform 1s linear",
+        );
+        dom.set_attr(
+            id,
+            "style",
+            "transform:translate(20px,0px) rotate(720deg) scaleX(2)",
+        );
+        dom.update_css_transitions(1.);
+        dom.update_css_transitions(1.5);
+        assert_eq!(
+            dom.computed_value_resolved(id, "transform").as_deref(),
+            Some("translate(10px, calc(50% + -29px)) rotate(360deg) scale(1.5, 1)")
+        );
+        dom.update_css_transitions(2.);
+        assert!(!dom.css_transitions_active());
     }
     #[test]
     fn transition_box_lengths_change_layout_and_finish_without_dom_mutation() {
