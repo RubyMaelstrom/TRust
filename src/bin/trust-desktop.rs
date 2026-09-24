@@ -964,6 +964,31 @@ impl ImageLoadScheduler {
         self.completed.insert(handle)
     }
 
+    /// SVG 2 #RenderingTree and HTML #update-the-rendering: an inline SVG's
+    /// current geometry is part of this rendering update. Its serialized data
+    /// URL is a presentation detail, not a new external image load per frame.
+    /// Prepare these bounded, self-contained vectors before scene submission.
+    /// Local snapshots: svgwg c403ca46ad04, HTML e5071a20c856 (2026-09-06).
+    fn prepare_svg_data(
+        &mut self,
+        request: &trust::render::ImageRequest,
+        store: &ImageStore,
+        sizes: &mut trust::layout2::ImageSizes,
+    ) -> Option<Result<Vec<ImageHandle>, String>> {
+        trust::img::decode_graphical_svg_data_url(&request.source).map(|result| match result {
+            Ok(image) => {
+                sizes.insert(request.source.clone(), (image.width, image.height));
+                let evicted = store.insert(request.handle, image);
+                self.mark_cached(request.handle);
+                Ok(evicted)
+            }
+            Err(error) => {
+                self.failed.insert(request.handle);
+                Err(error)
+            }
+        })
+    }
+
     fn retry_evicted(&mut self, handle: ImageHandle) {
         self.completed.remove(&handle);
     }
@@ -1492,6 +1517,20 @@ struct DesktopApp {
     force_full_raster: bool,
 }
 
+/// Native page wheel sensitivity is a UA choice (Pointer Events 4
+/// #events-wheelevents, local 49c398264c8d). Use 120 CSS pixels per discrete
+/// wheel unit, preserving fractional units. Touchpad pixel deltas are already
+/// distances and only need device-to-CSS conversion.
+fn page_wheel_delta(delta: MouseScrollDelta, scale: ScaleFactor) -> CssPoint {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => CssPoint::new(-x * 120.0, -y * 120.0),
+        MouseScrollDelta::PixelDelta(position) => CssPoint::new(
+            (-position.x / scale.get()) as f32,
+            (-position.y / scale.get()) as f32,
+        ),
+    }
+}
+
 /// Apply a wheel delta to the deepest scroll container and return the portion
 /// that could not be consumed. CSS Overflow 3 §2.3 allows that residual to
 /// continue to an ancestor scrollport (the default `overscroll-behavior:auto`);
@@ -1860,6 +1899,24 @@ impl DesktopApp {
                         .insert(request.source.clone(), (image.width, image.height));
                     self.decoded_images_pending_layout = true;
                 }
+                continue;
+            }
+            if self.image_loads.failed.contains(&request.handle) {
+                continue;
+            }
+            if let Some(result) =
+                self.image_loads
+                    .prepare_svg_data(request, &self.image_store, &mut self.image_sizes)
+            {
+                match result {
+                    Ok(evicted) => self.handle_decoded_image_evictions(evicted),
+                    Err(error) => {
+                        if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
+                            eprintln!("desktop: inline SVG failed: {error}");
+                        }
+                    }
+                }
+                self.decoded_images_pending_layout = true;
                 continue;
             }
             if self.image_loads.completed.contains(&request.handle) {
@@ -6834,11 +6891,10 @@ impl DesktopApp {
             return;
         }
         self.cancel_heart_glide();
-        let (dx, dy) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (-x * 40.0, -y * 40.0),
+        let dy = match delta {
+            MouseScrollDelta::LineDelta(_, y) => -y * 40.0,
             MouseScrollDelta::PixelDelta(position) => {
-                let scale = self.metrics.scale_factor.get();
-                ((-position.x / scale) as f32, (-position.y / scale) as f32)
+                (-position.y / self.metrics.scale_factor.get()) as f32
             }
         };
         if dy != 0.0 && self.terminal_mouse(trust::terminal::MouseAction::Wheel(dy < 0.0)) {
@@ -6853,7 +6909,7 @@ impl DesktopApp {
             self.request_redraw();
             return;
         }
-        let mut remaining = CssPoint::new(dx, dy);
+        let mut remaining = page_wheel_delta(delta, self.metrics.scale_factor);
         let chain = self
             .scene
             .as_ref()
@@ -9360,6 +9416,28 @@ mod tests {
     }
 
     #[test]
+    fn page_wheel_keeps_fractional_units_and_exact_touchpad_pixels() {
+        for scale in [1., 2.] {
+            assert_eq!(
+                page_wheel_delta(
+                    MouseScrollDelta::LineDelta(-0.25, -1.),
+                    ScaleFactor::new(scale)
+                ),
+                CssPoint::new(30., 120.),
+                "wheel distance is in CSS pixels at every display scale"
+            );
+        }
+        assert_eq!(
+            page_wheel_delta(
+                MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(-1.5, 17.)),
+                ScaleFactor::new(2.)
+            ),
+            CssPoint::new(0.75, -8.5),
+            "touchpad input retains its distance, precision, and direction"
+        );
+    }
+
+    #[test]
     fn http_page_navigation_keys_target_the_retained_viewport_scroll() {
         let viewport = CssSize::new(800.0, 100.0);
         let page = CssSize::new(1_000.0, 500.0);
@@ -10057,6 +10135,91 @@ mod tests {
         assert!(!scheduler.mark_cached(handle));
         scheduler.enqueue(image_request(1));
         assert!(scheduler.take_ready(1).is_empty());
+    }
+
+    #[test]
+    fn inline_svg_animation_is_available_in_each_presented_frame() {
+        let mut scheduler = ImageLoadScheduler::default();
+        let store = ImageStore::default();
+        let mut sizes = trust::layout2::ImageSizes::new();
+        let mut renderer = trust::render::vello_cpu::VelloCpuRenderer::new();
+        for width in [4, 8, 12, 16, 20, 24, 28, 24, 20, 16, 12, 8, 4] {
+            // Model path changes made by rAF: every snapshot gets a distinct
+            // data URL but must paint its geometry immediately, with no
+            // intermediate placeholder or delayed ImageLoaded event.
+            let source = format!(
+                "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><path d='M0 0H{width}V16H0Z' fill='blue'/></svg>"
+            );
+            let handle = ImageHandle::for_source(&source);
+            let request = trust::render::ImageRequest { handle, source };
+            scheduler
+                .prepare_svg_data(&request, &store, &mut sizes)
+                .unwrap()
+                .unwrap();
+            assert!(scheduler.completed.contains(&handle));
+            assert!(scheduler.pending.is_empty());
+            assert!(scheduler.take_ready(1).is_empty());
+            assert_eq!(sizes[&request.source], (32, 16));
+            let scene = Scene {
+                viewport: ViewportMetrics::from_physical(
+                    PhysicalSize::new(32, 16),
+                    ScaleFactor::default(),
+                ),
+                primitives: vec![DisplayCommand::Image {
+                    rect: CssRect::new(0., 0., 32., 16.),
+                    handle,
+                    source_rect: None,
+                    fit: trust::render::ImageFit::Fill,
+                    sampling: trust::render::ImageSampling::Nearest,
+                    clip: None,
+                    node: 0,
+                    link: None,
+                }],
+                controls: Vec::new(),
+                content_viewport: CssRect::new(0., 0., 32., 16.),
+                image_store: store.clone(),
+                canvas_images: Default::default(),
+                page_scroll_containers: Vec::new(),
+                page_size: CssSize::new(32., 16.),
+            };
+            let frame = renderer.render_rgba(&scene).unwrap();
+            for x in 0..32 {
+                let expected = if x < width {
+                    [0, 0, 255, 255]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(
+                    &frame.pixels[(8 * 32 + x) * 4..][..4],
+                    &expected,
+                    "current SVG geometry must be ready before presenting width {width}"
+                );
+            }
+        }
+        let external = image_request(1);
+        assert!(
+            scheduler
+                .prepare_svg_data(&external, &store, &mut sizes)
+                .is_none()
+        );
+        scheduler.enqueue(external);
+        assert_eq!(
+            scheduler.take_ready(1).len(),
+            1,
+            "network images stay asynchronous"
+        );
+        let broken = trust::render::ImageRequest {
+            handle: ImageHandle(123),
+            source: "data:image/svg+xml,<svg>".into(),
+        };
+        assert!(
+            scheduler
+                .prepare_svg_data(&broken, &store, &mut sizes)
+                .unwrap()
+                .is_err()
+        );
+        assert!(scheduler.failed.contains(&broken.handle));
+        assert!(!store.contains(broken.handle));
     }
 
     #[test]

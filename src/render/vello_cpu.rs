@@ -25,6 +25,39 @@ use crate::core::{CssPoint, PhysicalSize};
 
 pub(super) const MAX_REGISTERED_IMAGES: usize = 256;
 
+/// CSS Images 3 §4.2 and SVG 2 §8.3 size each use of an SVG separately.
+/// A frame may reference several sizes of the same resource: replacing its
+/// registration while building that frame invalidates earlier image paints.
+/// Count all variants against the normal cache limit and pin each used entry
+/// until the frame finishes. Translation leaves this identity unchanged.
+/// https://drafts.csswg.org/css-images-3/#object-negotiation
+/// https://www.w3.org/TR/SVG2/coords.html#ViewportSpace
+/// Local snapshots: csswg-drafts 81c27f686901, svgwg c403ca46ad04.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ImageCacheKey {
+    pub handle: ImageHandle,
+    svg: Option<(u64, [u32; 4])>,
+}
+
+impl ImageCacheKey {
+    pub fn new(
+        handle: ImageHandle,
+        revision: u64,
+        size: Option<crate::img::SvgRasterSize>,
+    ) -> Self {
+        Self {
+            handle,
+            svg: size.map(|size| (revision, size.cache_key())),
+        }
+    }
+}
+
+impl From<ImageHandle> for ImageCacheKey {
+    fn from(handle: ImageHandle) -> Self {
+        Self { handle, svg: None }
+    }
+}
+
 // CSS Fonts 4 §2.5 scales the font's em; §5.2 allows raster-size tolerance.
 // Keep CSS geometry fractional, and use slight vertical hinting in both
 // painters. Native TrueType instructions can round 11pt (14.667px) to 15ppem
@@ -35,7 +68,6 @@ pub(super) const MAX_REGISTERED_IMAGES: usize = 256;
 pub(super) const TEXT_HINTING_MODE: glifo::HintingMode = glifo::HintingMode::Light;
 
 struct CachedImage {
-    svg_size: Option<crate::img::SvgRasterSize>,
     upload_width: u32,
     upload_height: u32,
     source: ImageSource,
@@ -52,7 +84,7 @@ pub struct VelloCpuRenderer {
     presented: Vec<u32>,
     rgba: Vec<u8>,
     size: PhysicalSize,
-    images: HashMap<ImageHandle, CachedImage>,
+    images: HashMap<ImageCacheKey, CachedImage>,
     frame_id: u64,
     #[cfg(test)]
     eager_clips: bool,
@@ -125,15 +157,15 @@ impl VelloCpuRenderer {
             .images
             .keys()
             .copied()
-            .filter(|handle| {
-                !live_images.contains(handle) && !is_desktop_heart_image_handle(*handle)
+            .filter(|key| {
+                !live_images.contains(&key.handle) && !is_desktop_heart_image_handle(key.handle)
             })
             .collect();
-        for handle in stale {
+        for key in stale {
             if let Some(CachedImage {
                 source: ImageSource::OpaqueId { id, .. },
                 ..
-            }) = self.images.remove(&handle)
+            }) = self.images.remove(&key)
             {
                 self.resources.destroy_image(id);
             }
@@ -495,36 +527,36 @@ impl VelloCpuRenderer {
         transform: [f64; 6],
     ) -> Result<(), String> {
         let store_revision = scene.image_revision(handle);
-        let changed = self.images.get(&handle).is_some_and(|image| {
-            store_revision.is_some_and(|revision| revision != image.revision)
-                || image.svg_size.is_some_and(|size| {
-                    size != crate::img::SvgRasterSize::new(
-                        image.width,
-                        image.height,
-                        rect,
-                        fit,
-                        transform,
-                    )
-                })
-        });
+        let resource = scene.image(handle);
+        let svg_size = resource
+            .as_ref()
+            .filter(|image| image.svg_source.is_some())
+            .map(|image| {
+                crate::img::SvgRasterSize::new(image.width, image.height, rect, fit, transform)
+            });
+        let key = ImageCacheKey::new(handle, store_revision.unwrap_or(0), svg_size);
+        let changed = self
+            .images
+            .get(&key)
+            .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
         if changed
             && let Some(CachedImage {
                 source: ImageSource::OpaqueId { id, .. },
                 ..
-            }) = self.images.remove(&handle)
+            }) = self.images.remove(&key)
         {
             self.resources.destroy_image(id);
         }
-        if !self.images.contains_key(&handle) && self.images.len() >= MAX_REGISTERED_IMAGES {
+        if !self.images.contains_key(&key) && self.images.len() >= MAX_REGISTERED_IMAGES {
             let victim = self
                 .images
                 .iter()
-                .filter(|(handle, image)| {
-                    !is_desktop_heart_image_handle(**handle)
+                .filter(|(key, image)| {
+                    !is_desktop_heart_image_handle(key.handle)
                         && image.last_used_frame != self.frame_id
                 })
                 .min_by_key(|(_, image)| image.last_used_frame)
-                .map(|(handle, _)| *handle);
+                .map(|(key, _)| *key);
             if let Some(victim) = victim
                 && let Some(CachedImage {
                     source: ImageSource::OpaqueId { id, .. },
@@ -538,14 +570,11 @@ impl VelloCpuRenderer {
                 return Ok(());
             }
         }
-        if !self.images.contains_key(&handle)
+        if !self.images.contains_key(&key)
             && let Some(revision) = store_revision
-            && let Some(image) = scene.image(handle)
+            && let Some(image) = resource
         {
             let natural = (image.width, image.height);
-            let svg_size = image.svg_source.as_ref().map(|_| {
-                crate::img::SvgRasterSize::new(image.width, image.height, rect, fit, transform)
-            });
             let raster = svg_size
                 .zip(image.svg_source.as_ref())
                 .and_then(|(size, source)| size.rasterize(source).ok());
@@ -593,9 +622,8 @@ impl VelloCpuRenderer {
             ));
             let id = self.resources.register_image(pixmap);
             self.images.insert(
-                handle,
+                key,
                 CachedImage {
-                    svg_size,
                     upload_width: image.width,
                     upload_height: image.height,
                     source: ImageSource::opaque_id_with_transparency_hint(id, image.has_alpha),
@@ -606,7 +634,7 @@ impl VelloCpuRenderer {
                 },
             );
         }
-        let Some(image) = self.images.get_mut(&handle) else {
+        let Some(image) = self.images.get_mut(&key) else {
             // Missing resources are represented by a neutral checkerless box;
             // the command remains stable and will paint pixels after wakeup.
             self.context.set_paint(LIGHT_GRAY);
@@ -1192,6 +1220,15 @@ mod tests {
     use crate::core::{BrowserSnapshot, CssSize, ScaleFactor, ViewportMetrics};
     use crate::render::{ImageResource, desktop_shell};
 
+    #[test]
+    fn svg_cache_variants_obey_budget_and_frame_lifetime_cpu() {
+        let mut renderer = VelloCpuRenderer::new();
+        super::super::image_raster_tests::check_svg_cache_budget(|scene| {
+            let frame = renderer.render_rgba(scene).unwrap();
+            (frame, renderer.images.len())
+        });
+    }
+
     fn clip_test_scene(scale: f64) -> Scene {
         Scene {
             viewport: ViewportMetrics::from_physical(
@@ -1361,7 +1398,11 @@ mod tests {
                 "{width} at {scale}x"
             );
             assert_eq!(&frame.pixels[offset - 4..offset], &[255, 255, 255, 255]);
-            let cached = &renderer.images[&handle];
+            let (&key, cached) = renderer
+                .images
+                .iter()
+                .find(|(_, image)| image.last_used_frame == renderer.frame_id)
+                .unwrap();
             assert_eq!((cached.width, cached.height), (300, 150));
             assert_eq!(
                 (cached.upload_width, cached.upload_height),
@@ -1371,7 +1412,7 @@ mod tests {
                 unreachable!()
             };
             renderer.render_rgba(&scene).unwrap();
-            let ImageSource::OpaqueId { id: reused, .. } = renderer.images[&handle].source else {
+            let ImageSource::OpaqueId { id: reused, .. } = renderer.images[&key].source else {
                 unreachable!()
             };
             assert_eq!(reused, uploaded, "unchanged frames reuse their SVG raster");
@@ -1501,15 +1542,15 @@ mod tests {
 
         let mut renderer = VelloCpuRenderer::new();
         renderer.render(&scene).unwrap();
-        let first = renderer.images[&handle].revision;
+        let first = renderer.images[&handle.into()].revision;
         renderer.render(&scene).unwrap();
-        assert_eq!(renderer.images[&handle].revision, first);
+        assert_eq!(renderer.images[&handle.into()].revision, first);
 
         scene.image_store.insert(handle, resource([0, 0, 255, 255]));
         renderer.render(&scene).unwrap();
-        assert_ne!(renderer.images[&handle].revision, first);
+        assert_ne!(renderer.images[&handle.into()].revision, first);
         assert_eq!(
-            renderer.images[&handle].revision,
+            renderer.images[&handle.into()].revision,
             scene.image_store.revision(handle).unwrap()
         );
     }
@@ -1655,12 +1696,12 @@ mod tests {
 
         let mut renderer = VelloCpuRenderer::new();
         renderer.render(&scene).unwrap();
-        assert!(renderer.images.contains_key(&idle));
+        assert!(renderer.images.contains_key(&idle.into()));
         if let Some(DisplayCommand::Image { handle, .. }) = scene.primitives.last_mut() {
             *handle = active;
         }
         renderer.render(&scene).unwrap();
-        assert!(renderer.images.contains_key(&idle));
-        assert!(renderer.images.contains_key(&active));
+        assert!(renderer.images.contains_key(&idle.into()));
+        assert!(renderer.images.contains_key(&active.into()));
     }
 }
