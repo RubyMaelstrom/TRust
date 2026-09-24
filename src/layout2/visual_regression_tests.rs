@@ -457,6 +457,7 @@ fn replaced_image_pixels_clip_to_the_curved_content_edge() {
         store.insert(
             crate::render::ImageHandle::for_source(&source),
             crate::render::ImageResource {
+                svg_source: None,
                 width: 1,
                 height: 1,
                 rgba: std::sync::Arc::from([255, 0, 0, 255]),
@@ -509,6 +510,7 @@ fn rounded_overflow_clips_transformed_descendants_and_their_hits() {
             store.insert(
                 crate::render::ImageHandle::for_source(&source),
                 crate::render::ImageResource {
+                    svg_source: None,
                     width: 1,
                     height: 1,
                     rgba: std::sync::Arc::from([255, 0, 0, 255]),

@@ -509,6 +509,7 @@ mod tests {
 
     fn solid_image(width: u32, height: u32) -> ImageResource {
         ImageResource {
+            svg_source: None,
             width,
             height,
             rgba: vec![255; (width * height * 4) as usize].into(),

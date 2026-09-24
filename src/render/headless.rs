@@ -233,6 +233,7 @@ mod tests {
         store.insert(
             super::super::ImageHandle::for_source(source),
             super::super::ImageResource {
+                svg_source: None,
                 width: 160,
                 height: 40,
                 rgba: std::sync::Arc::from(pixels),
@@ -644,6 +645,7 @@ mod tests {
         store.insert(
             handle,
             super::super::ImageResource {
+                svg_source: None,
                 width: 1,
                 height: 1,
                 rgba: std::sync::Arc::from([255, 0, 128, 255]),
@@ -680,6 +682,7 @@ mod tests {
         store.insert(
             handle,
             super::super::ImageResource {
+                svg_source: None,
                 width: 2,
                 height: 2,
                 rgba: std::sync::Arc::from([
@@ -781,6 +784,7 @@ mod tests {
         let store = ImageStore::default();
         let handle = ImageHandle::for_source("test:stable-animation-handle");
         let image = |rgba| super::super::ImageResource {
+            svg_source: None,
             width: 1,
             height: 1,
             rgba: std::sync::Arc::from(rgba),
@@ -867,6 +871,7 @@ mod tests {
             store.insert(
                 handle,
                 ImageResource {
+                    svg_source: None,
                     width: 1,
                     height: 1,
                     rgba: std::sync::Arc::from(color),
@@ -1232,6 +1237,7 @@ mod tests {
             store.insert(
                 handle,
                 ImageResource {
+                    svg_source: None,
                     width: 32,
                     height: 32,
                     rgba: std::sync::Arc::from([r, g, b, 255].repeat(32 * 32).into_boxed_slice()),

@@ -35,6 +35,9 @@ pub(super) const MAX_REGISTERED_IMAGES: usize = 256;
 pub(super) const TEXT_HINTING_MODE: glifo::HintingMode = glifo::HintingMode::Light;
 
 struct CachedImage {
+    svg_size: Option<crate::img::SvgRasterSize>,
+    upload_width: u32,
+    upload_height: u32,
     source: ImageSource,
     width: u32,
     height: u32,
@@ -399,7 +402,14 @@ impl VelloCpuRenderer {
                     if let Some(clip) = clip {
                         self.context.push_clip_path(&rect_path(*clip));
                     }
-                    self.paint_image(scene, *handle, *rect, *fit, *sampling)?;
+                    self.paint_image(
+                        scene,
+                        *handle,
+                        *rect,
+                        *fit,
+                        *sampling,
+                        transforms.last().unwrap().as_coeffs(),
+                    )?;
                     if clip.is_some() {
                         self.context.pop_clip_path();
                     }
@@ -474,6 +484,7 @@ impl VelloCpuRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_image(
         &mut self,
         scene: &Scene,
@@ -481,12 +492,21 @@ impl VelloCpuRenderer {
         rect: CssRect,
         fit: ImageFit,
         sampling: ImageSampling,
+        transform: [f64; 6],
     ) -> Result<(), String> {
         let store_revision = scene.image_revision(handle);
-        let changed = self
-            .images
-            .get(&handle)
-            .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
+        let changed = self.images.get(&handle).is_some_and(|image| {
+            store_revision.is_some_and(|revision| revision != image.revision)
+                || image.svg_size.is_some_and(|size| {
+                    size != crate::img::SvgRasterSize::new(
+                        image.width,
+                        image.height,
+                        rect,
+                        fit,
+                        transform,
+                    )
+                })
+        });
         if changed
             && let Some(CachedImage {
                 source: ImageSource::OpaqueId { id, .. },
@@ -522,6 +542,14 @@ impl VelloCpuRenderer {
             && let Some(revision) = store_revision
             && let Some(image) = scene.image(handle)
         {
+            let natural = (image.width, image.height);
+            let svg_size = image.svg_source.as_ref().map(|_| {
+                crate::img::SvgRasterSize::new(image.width, image.height, rect, fit, transform)
+            });
+            let raster = svg_size
+                .zip(image.svg_source.as_ref())
+                .and_then(|(size, source)| size.rasterize(source).ok());
+            let image = raster.unwrap_or(image);
             let expected = usize::try_from(image.width)
                 .ok()
                 .and_then(|width| {
@@ -567,9 +595,12 @@ impl VelloCpuRenderer {
             self.images.insert(
                 handle,
                 CachedImage {
+                    svg_size,
+                    upload_width: image.width,
+                    upload_height: image.height,
                     source: ImageSource::opaque_id_with_transparency_hint(id, image.has_alpha),
-                    width: image.width,
-                    height: image.height,
+                    width: natural.0,
+                    height: natural.1,
                     revision,
                     last_used_frame: self.frame_id,
                 },
@@ -609,7 +640,10 @@ impl VelloCpuRenderer {
         });
         self.context.set_paint_transform(
             Affine::translate((f64::from(x), f64::from(y)))
-                * Affine::scale_non_uniform(f64::from(scale_x), f64::from(scale_y)),
+                * Affine::scale_non_uniform(
+                    f64::from(drawn_width / image.upload_width as f32),
+                    f64::from(drawn_height / image.upload_height as f32),
+                ),
         );
         if fit == ImageFit::Cover {
             self.context.push_clip_path(&rect_path(rect));
@@ -1293,6 +1327,58 @@ mod tests {
     }
 
     #[test]
+    fn svg_chart_lines_stay_sharp_after_resize_and_device_scale_changes() {
+        // A one-user-unit line in a 1200-unit chart vanishes when the SVG is
+        // first reduced to the default 300x150 bitmap and then enlarged.
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600"><rect width="1200" height="600" fill="white"/><rect x="600" width="1" height="600" fill="black"/></svg>"#;
+        let image = crate::img::decode_graphical(source).unwrap();
+        assert_eq!((image.width, image.height), (300, 150));
+        let mut scene = clip_test_scene(1.);
+        scene.primitives.clear();
+        let handle = ImageHandle(42);
+        scene.image_store.insert(handle, image);
+        let mut renderer = VelloCpuRenderer::new();
+        for (width, scale) in [(1200., 1.), (600., 2.), (1200., 2.), (1200., 1.)] {
+            let physical = PhysicalSize::new((width * scale) as u32, (width * scale / 2.) as u32);
+            scene.viewport = ViewportMetrics::from_physical(physical, ScaleFactor::new(scale));
+            scene.primitives = vec![DisplayCommand::Image {
+                rect: CssRect::new(0., 0., width as f32, width as f32 / 2.),
+                handle,
+                source_rect: None,
+                fit: ImageFit::Fill,
+                sampling: ImageSampling::Smooth,
+                clip: None,
+                node: 1,
+                link: None,
+            }];
+            let frame = renderer.render_rgba(&scene).unwrap();
+            let x = physical.width as usize / 2;
+            let y = physical.height as usize / 2;
+            let offset = (y * physical.width as usize + x) * 4;
+            assert_eq!(
+                &frame.pixels[offset..offset + 4],
+                &[0, 0, 0, 255],
+                "{width} at {scale}x"
+            );
+            assert_eq!(&frame.pixels[offset - 4..offset], &[255, 255, 255, 255]);
+            let cached = &renderer.images[&handle];
+            assert_eq!((cached.width, cached.height), (300, 150));
+            assert_eq!(
+                (cached.upload_width, cached.upload_height),
+                (physical.width, physical.height)
+            );
+            let ImageSource::OpaqueId { id: uploaded, .. } = cached.source else {
+                unreachable!()
+            };
+            renderer.render_rgba(&scene).unwrap();
+            let ImageSource::OpaqueId { id: reused, .. } = renderer.images[&handle].source else {
+                unreachable!()
+            };
+            assert_eq!(reused, uploaded, "unchanged frames reuse their SVG raster");
+        }
+    }
+
+    #[test]
     fn adapter_rasterizes_and_reuses_then_resizes_its_cpu_context() {
         let snapshot = BrowserSnapshot {
             address: String::from("https://example.com/"),
@@ -1345,6 +1431,7 @@ mod tests {
         scene.image_store.insert(
             handle,
             ImageResource {
+                svg_source: None,
                 width: 2,
                 height: 2,
                 rgba: Arc::from([255u8; 16]),
@@ -1394,6 +1481,7 @@ mod tests {
         );
         let handle = ImageHandle(101);
         let resource = |rgba| ImageResource {
+            svg_source: None,
             width: 1,
             height: 1,
             rgba: Arc::from(rgba),
@@ -1502,6 +1590,7 @@ mod tests {
         scene.image_store.insert(
             handle,
             ImageResource {
+                svg_source: None,
                 width: 8,
                 height: 8,
                 rgba: Arc::from([255, 0, 0, 255]),
@@ -1545,6 +1634,7 @@ mod tests {
             scene.image_store.insert(
                 handle,
                 ImageResource {
+                    svg_source: None,
                     width: 2,
                     height: 2,
                     rgba: Arc::from([255u8; 16]),

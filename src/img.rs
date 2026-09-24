@@ -135,6 +135,7 @@ impl GraphicalAnimationDecoder {
         let has_alpha = rgba.pixels().any(|pixel| pixel[3] < 255);
         Ok(Some(GraphicalAnimationFrame {
             image: crate::render::ImageResource {
+                svg_source: None,
                 width: rgba.width(),
                 height: rgba.height(),
                 rgba: Arc::from(rgba.into_raw()),
@@ -346,13 +347,14 @@ pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
 
 /// Decode an HTML/CSS image into the renderer-neutral resource format. Raster
 /// formats keep their decoded alpha; SVG remains on the existing secure resvg
-/// static-image path and is rasterized at its CSS intrinsic size. No terminal
+/// static-image path, retaining its source for rasterization at paint size. No terminal
 /// tinting, cell sizing, or graphics protocol enters this path.
 pub fn decode_graphical(bytes: &[u8]) -> Result<crate::render::ImageResource, String> {
-    let (image, _) = decode(bytes)?;
+    let (image, mime) = decode(bytes)?;
     let has_alpha = image_has_alpha(&image);
     let rgba = image.to_rgba8();
     Ok(crate::render::ImageResource {
+        svg_source: (mime == SVG_MIME).then(|| Arc::from(bytes)),
         width: rgba.width(),
         height: rgba.height(),
         rgba: Arc::from(rgba.into_raw()),
@@ -722,6 +724,10 @@ struct SvgImage {
 }
 
 fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
+    parse_svg_at_size(bytes, None)
+}
+
+fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgImage, String> {
     let data = bounded_svg_data(bytes)?;
     let text = std::str::from_utf8(&data).map_err(|_| String::from("SVG is not UTF-8"))?;
     let text = svg_without_external_doctype(text)?;
@@ -744,9 +750,56 @@ fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
         .and_then(view_box_ratio)
         .or_else(|| Some(width? / height?));
     let (width, height) = concrete_object_size(width, height, ratio)?;
-    let original_root = &text[root.range()];
+    let (width, height) = viewport.unwrap_or((width, height));
+    let mut original_root = text[root.range()].to_string();
+    if viewport.is_some() {
+        // CSS Images 3 #object-negotiation passes the concrete object size to
+        // SVG. SVG 2 #ViewportSpace / #ComputingAViewportsTransform then apply
+        // viewBox and preserveAspectRatio inside that viewport. Do not stretch
+        // a bitmap rendered at the 300x150 default object size.
+        let mut edits = Vec::new();
+        let name_end = root.range().start
+            + original_root
+                .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+                .unwrap_or(4);
+        for (name, value) in [("width", width), ("height", height)] {
+            if let Some(attr) = root
+                .attributes()
+                .find(|a| a.name() == name && a.namespace().is_none())
+            {
+                edits.push((attr.range(), format!("{name}=\"{value}\"")));
+            } else {
+                edits.push((name_end..name_end, format!(" {name}=\"{value}\"")));
+            }
+        }
+        // usvg honors root CSS over presentation attributes as well.
+        if let Some(attr) = root.attributes().find(|a| a.name() == "style") {
+            let end = attr.range().end - 1;
+            edits.push((
+                end..end,
+                format!(";width:{width}px!important;height:{height}px!important"),
+            ));
+        } else {
+            edits.push((
+                name_end..name_end,
+                format!(r#" style="width:{width}px!important;height:{height}px!important""#),
+            ));
+        }
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        for (range, value) in edits {
+            original_root.replace_range(
+                range.start - root.range().start..range.end - root.range().start,
+                &value,
+            );
+        }
+    }
+    let viewport_style = if viewport.is_some() {
+        format!(r#" style="width:{width}px!important;height:{height}px!important""#)
+    } else {
+        String::new()
+    };
     let wrapped = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">{original_root}</svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"{viewport_style} viewBox="0 0 {width} {height}">{original_root}</svg>"#
     );
     let tree = resvg::usvg::Tree::from_str(&wrapped, &secure_svg_options())
         .map_err(|e| format!("svg parse: {e}"))?;
@@ -1126,6 +1179,85 @@ fn bounded_svg_size(width: u32, height: u32) -> (u32, u32) {
         (width * scale).round().max(1.0) as u32,
         (height * scale).round().max(1.0) as u32,
     )
+}
+
+/// SVG 2 coordinates and CSS Images 3 object negotiation: the CSS viewport
+/// and device raster size are distinct. Translation does not invalidate pixels.
+/// Local snapshots: svgwg c403ca46ad04, csswg-drafts 81c27f686901.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SvgRasterSize {
+    css_width: f32,
+    css_height: f32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SvgRasterSize {
+    pub(crate) fn new(
+        natural_width: u32,
+        natural_height: u32,
+        rect: crate::render::CssRect,
+        fit: crate::render::ImageFit,
+        transform: [f64; 6],
+    ) -> Self {
+        use crate::render::ImageFit;
+        let iw = natural_width.max(1) as f32;
+        let ih = natural_height.max(1) as f32;
+        let sx = rect.width / iw;
+        let sy = rect.height / ih;
+        let scale = match fit {
+            ImageFit::Fill => None,
+            ImageFit::Contain => Some(sx.min(sy)),
+            ImageFit::Cover => Some(sx.max(sy)),
+            ImageFit::None => Some(1.0),
+            ImageFit::ScaleDown => Some(1.0f32.min(sx.min(sy))),
+        };
+        let (css_width, css_height) = scale.map_or((rect.width, rect.height), |s| (iw * s, ih * s));
+        let css_width = if css_width.is_finite() {
+            css_width.max(0.001)
+        } else {
+            1.0
+        };
+        let css_height = if css_height.is_finite() {
+            css_height.max(0.001)
+        } else {
+            1.0
+        };
+        let (width, height) = bounded_svg_size(
+            (f64::from(css_width) * transform[0].hypot(transform[1]))
+                .ceil()
+                .max(1.0) as u32,
+            (f64::from(css_height) * transform[2].hypot(transform[3]))
+                .ceil()
+                .max(1.0) as u32,
+        );
+        Self {
+            css_width,
+            css_height,
+            width,
+            height,
+        }
+    }
+
+    pub(crate) fn rasterize(self, source: &[u8]) -> Result<crate::render::ImageResource, String> {
+        let svg = parse_svg_at_size(source, Some((self.css_width, self.css_height)))?;
+        let mut pixmap = tiny_skia::Pixmap::new(self.width, self.height)
+            .ok_or_else(|| String::from("svg target is too large"))?;
+        let transform = tiny_skia::Transform::from_scale(
+            self.width as f32 / self.css_width,
+            self.height as f32 / self.css_height,
+        );
+        resvg::render(&svg.tree, transform, &mut pixmap.as_mut());
+        let rgba = pixmap.take_demultiplied();
+        let has_alpha = rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255);
+        Ok(crate::render::ImageResource {
+            svg_source: None,
+            width: self.width,
+            height: self.height,
+            rgba: Arc::from(rgba),
+            has_alpha,
+        })
+    }
 }
 
 fn rasterize_svg(
@@ -1695,6 +1827,68 @@ mod tests {
             usize::from(size.height) * usize::from(font.height),
             "the final sixel band immediately before ST must not be discarded"
         );
+    }
+
+    #[test]
+    fn svg_paint_size_preserves_viewbox_alignment_and_percentage_geometry() {
+        use crate::render::{CssRect, ImageFit};
+        let identity = [1., 0., 0., 1., 0., 0.];
+        // The image's concrete viewport, not its default bitmap, determines
+        // SVG preserveAspectRatio and percentage lengths (SVG 2 §8).
+        for (aspect, expected) in [("xMidYMid meet", [0, 0, 0, 0]), ("none", [255, 0, 0, 255])] {
+            let source = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10" preserveAspectRatio="{aspect}" style="width:10px;height:10px"><rect width="10" height="10" fill="red"/></svg>"#
+            );
+            let image = decode_graphical(source.as_bytes()).unwrap();
+            assert_eq!((image.width, image.height), (10, 10));
+            let size = SvgRasterSize::new(
+                image.width,
+                image.height,
+                CssRect::new(0., 0., 80., 40.),
+                ImageFit::Fill,
+                identity,
+            );
+            let raster = size.rasterize(image.svg_source.as_ref().unwrap()).unwrap();
+            assert_eq!(&raster.rgba[(20 * 80 + 5) * 4..][..4], &expected);
+            assert_eq!(&raster.rgba[(20 * 80 + 40) * 4..][..4], &[255, 0, 0, 255]);
+        }
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="50%" height="100%" fill="red"/></svg>"#;
+        let size = SvgRasterSize::new(
+            300,
+            150,
+            CssRect::new(0., 0., 80., 40.),
+            ImageFit::Fill,
+            identity,
+        );
+        let raster = size.rasterize(source).unwrap();
+        assert_eq!(&raster.rgba[(20 * 80 + 30) * 4..][..4], &[255, 0, 0, 255]);
+        assert_eq!(&raster.rgba[(20 * 80 + 50) * 4..][..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn svg_paint_size_obeys_object_fit_device_transforms_and_limits() {
+        use crate::render::{CssRect, ImageFit};
+        let rect = CssRect::new(0., 0., 80., 40.);
+        for (fit, expected) in [
+            (ImageFit::Fill, (160, 120)),
+            (ImageFit::Contain, (80, 120)),
+            (ImageFit::Cover, (160, 240)),
+            (ImageFit::None, (20, 30)),
+            (ImageFit::ScaleDown, (20, 30)),
+        ] {
+            // Rotated, nonuniform device scaling; translation is irrelevant.
+            let size = SvgRasterSize::new(10, 10, rect, fit, [0., 2., -3., 0., 17., 19.]);
+            assert_eq!((size.width, size.height), expected, "{fit:?}");
+        }
+        let huge = SvgRasterSize::new(
+            10,
+            10,
+            CssRect::new(0., 0., 1e20, 1e20),
+            ImageFit::Fill,
+            [100., 0., 0., 100., 0., 0.],
+        );
+        assert!(u64::from(huge.width) * u64::from(huge.height) <= MAX_SVG_PIXELS);
+        assert!(huge.width <= MAX_DIMENSION && huge.height <= MAX_DIMENSION);
     }
 
     #[test]

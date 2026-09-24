@@ -8469,6 +8469,7 @@ mod tests {
     #[test]
     fn native_cursor_clamps_hotspot_to_the_decoded_bitmap() {
         let image = ImageResource {
+            svg_source: None,
             width: 2,
             height: 2,
             rgba: Arc::from(vec![255; 16]),
@@ -9950,6 +9951,7 @@ mod tests {
             images.insert(
                 *handle,
                 ImageResource {
+                    svg_source: None,
                     width: 1,
                     height: 1,
                     rgba: Arc::from([0, 0, 0, 255]),

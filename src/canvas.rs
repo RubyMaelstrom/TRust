@@ -1165,6 +1165,7 @@ impl Canvas {
             self.image_handle,
             self.bitmap_revision,
             crate::render::ImageResource {
+                svg_source: None,
                 width: self.width,
                 height: self.height,
                 has_alpha: rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255),
