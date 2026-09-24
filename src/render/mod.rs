@@ -517,6 +517,9 @@ pub struct ImageRequest {
 
 #[derive(Clone, Debug)]
 pub struct ImageResource {
+    /// Bounded SVG source retained for rasterization at the painted device size.
+    /// `width`/`height` remain layout dimensions, independent of raster density.
+    pub svg_source: Option<Arc<[u8]>>,
     pub width: u32,
     pub height: u32,
     /// Straight-alpha RGBA8 pixels. Conversion to a backend's native storage
@@ -592,6 +595,7 @@ const MAX_IMAGE_RESOURCE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct ImageStoreState {
+    svg_source_bytes: usize,
     entries: HashMap<ImageHandle, StoredImageResource>,
     order: VecDeque<ImageHandle>,
     bytes: usize,
@@ -615,22 +619,33 @@ impl ImageStore {
         let mut store = self.0.write().expect("image store poisoned");
         if let Some(old) = store.entries.remove(&handle) {
             store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
+            store.svg_source_bytes = store
+                .svg_source_bytes
+                .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
             store.order.retain(|candidate| *candidate != handle);
         }
         store.next_revision = store.next_revision.wrapping_add(1).max(1);
         let revision = store.next_revision;
         store.bytes = store.bytes.saturating_add(image.rgba.len());
+        store.svg_source_bytes = store
+            .svg_source_bytes
+            .saturating_add(image.svg_source.as_ref().map_or(0, |s| s.len()));
         store
             .entries
             .insert(handle, StoredImageResource { image, revision });
         store.order.push_back(handle);
         let mut evicted = Vec::new();
-        while store.entries.len() > MAX_IMAGE_RESOURCES || store.bytes > MAX_IMAGE_RESOURCE_BYTES {
+        while store.entries.len() > MAX_IMAGE_RESOURCES
+            || store.bytes.saturating_add(store.svg_source_bytes) > MAX_IMAGE_RESOURCE_BYTES
+        {
             let Some(oldest) = store.order.pop_front() else {
                 break;
             };
             if let Some(old) = store.entries.remove(&oldest) {
                 store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
+                store.svg_source_bytes = store
+                    .svg_source_bytes
+                    .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
                 evicted.push(oldest);
             }
         }
@@ -709,6 +724,9 @@ impl ImageStore {
         let mut store = self.0.write().expect("image store poisoned");
         let old = store.entries.remove(&handle)?;
         store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
+        store.svg_source_bytes = store
+            .svg_source_bytes
+            .saturating_sub(old.image.svg_source.as_ref().map_or(0, |s| s.len()));
         store.order.retain(|candidate| *candidate != handle);
         Some(old.image)
     }
@@ -718,6 +736,7 @@ impl ImageStore {
         store.entries.clear();
         store.order.clear();
         store.bytes = 0;
+        store.svg_source_bytes = 0;
     }
 }
 
@@ -3906,6 +3925,7 @@ mod tests {
             store.insert(
                 handle,
                 ImageResource {
+                    svg_source: None,
                     width: 1,
                     height: 1,
                     rgba: Arc::from([value, value, value, 255]),
@@ -3978,6 +3998,7 @@ mod tests {
             scene.image_store.insert(
                 desktop_heart_image_handle(active),
                 ImageResource {
+                    svg_source: None,
                     width: 30,
                     height: 30,
                     rgba: Arc::from(vec![0; 30 * 30 * 4]),
@@ -4278,9 +4299,39 @@ mod tests {
     }
 
     #[test]
+    fn svg_source_memory_is_bounded_and_released_with_image_entries() {
+        let store = ImageStore::default();
+        let handle = ImageHandle::for_source("test:svg-cache");
+        let mut image = crate::img::decode_graphical(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#,
+        )
+        .unwrap();
+        let source_bytes = image.svg_source.as_ref().unwrap().len();
+        store.insert(handle, image.clone());
+        assert_eq!(store.0.read().unwrap().svg_source_bytes, source_bytes);
+        assert_eq!(store.desktop_page_image_bytes(), 4);
+        store.insert(handle, image.clone());
+        assert_eq!(store.0.read().unwrap().svg_source_bytes, source_bytes);
+        store.remove(handle);
+        assert_eq!(store.0.read().unwrap().svg_source_bytes, 0);
+        // A shared source is conservatively charged for each stored entry.
+        image.svg_source = Some(Arc::from(vec![0; 1024 * 1024]));
+        for n in 0..257 {
+            store.insert(ImageHandle(n), image.clone());
+        }
+        let retained = store.0.read().unwrap();
+        assert!(retained.bytes + retained.svg_source_bytes <= MAX_IMAGE_RESOURCE_BYTES);
+        assert!(retained.entries.len() < 257);
+        drop(retained);
+        store.clear();
+        assert_eq!(store.0.read().unwrap().svg_source_bytes, 0);
+    }
+
+    #[test]
     fn command_image_cache_bytes_follow_pixels_and_exclude_chrome() {
         let store = ImageStore::default();
         let image = |width, height| ImageResource {
+            svg_source: None,
             width,
             height,
             rgba: vec![0; width as usize * height as usize * 4].into(),
@@ -4318,6 +4369,7 @@ mod tests {
             store.insert(
                 ImageHandle(index as u64),
                 ImageResource {
+                    svg_source: None,
                     width: 1,
                     height: 1,
                     rgba: Arc::from([index as u8, 0, 0, 255]),
@@ -4330,6 +4382,7 @@ mod tests {
         store.insert(
             ImageHandle(MAX_IMAGE_RESOURCES as u64),
             ImageResource {
+                svg_source: None,
                 width: 2,
                 height: 1,
                 rgba: Arc::from([0, 0, 0, 255, 0, 0, 0, 255]),
@@ -4351,6 +4404,7 @@ mod tests {
         let store = ImageStore::default();
         let handle = ImageHandle(42);
         let image = |red| ImageResource {
+            svg_source: None,
             width: 1,
             height: 1,
             rgba: Arc::from([red, 0, 0, 255]),
