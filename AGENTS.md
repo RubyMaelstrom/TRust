@@ -169,7 +169,7 @@ benefit both frontends.
 ## Development and Verification
 
 Keep the sibling Lumen checkout at integration revision
-`451e439089675645283c4e4ead0203f2bc7d09ea`. Cargo uses
+`9b6125072f975fc4d241ed408ed6a5e86162b2c3`. Cargo uses
 `../Lumen/crates/lumen` directly; TRust and Lumen are developed together while
 host-boundary work is upstreamed. TRust supplies networking and TLS.
 

@@ -14199,6 +14199,17 @@ mod tests {
     }
 
     #[test]
+    fn static_self_construction_survives_client_initialization() {
+        let (html, outcome) = transform(
+            include_str!("fixtures/class_static_self_construction.html"),
+            &crate::js::PageEnv::bare(DEFAULT_URL),
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!outcome.panicked);
+        assert!(html.contains("Article initialized: ready"), "{html}");
+    }
+
+    #[test]
     fn declarative_shadow_navigation_survives_script_execution_and_live_serialization() {
         let (html, outcome) = transform(
             include_str!("fixtures/declarative_shadow.html"),
