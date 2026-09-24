@@ -516,6 +516,45 @@ write and erased the new image. The fork now encodes Pixmap transfers with
 those clears/copies, following WebGPU's queue/command ordering. No SVG, JS,
 network or memory-limit workaround is involved.
 
+### Repeated SVG sizes / scrolling crash
+
+An SVG used at different concrete object sizes in one frame needs independent
+raster registrations. Both desktop backends cache SVG variants by source,
+revision, CSS viewport, and device pixel dimensions. Every variant counts toward
+the existing 256-entry limit; entries referenced by the current frame cannot be
+evicted. Scrolling translations reuse registrations.
+
+```sh
+cargo test --release --lib repeated_svg_sizes_survive_scrolling -- --test-threads=1 --nocapture
+cargo test --release --lib svg_cache_variants_obey_budget -- --test-threads=1 --nocapture
+cargo test --release --bin trust-desktop inline_svg_animation_is_available -- --nocapture
+RUST_BACKTRACE=1 target/release/trust-desktop https://mouse.dev/blog/muse-runtime-export/
+```
+
+The pixel tests cover A/B/A size ordering, fractional CSS sizes with identical
+integer raster dimensions, device scale changes, scrolling, and cache pressure.
+For native acceptance, rapidly scroll between the article's top and footer,
+including frames showing the shared header/footer SVG logo at different sizes.
+Repeat with `--renderer=cpu`; the normal Hybrid run must stay on Hybrid without
+an image-registry panic or CPU fallback. GPU tests print an explicit notice if
+no adapter is available, which is not a GPU pass.
+
+The animated header also changes its inline SVG path on each animation frame.
+Desktop presentation prepares those self-contained SVG data snapshots before
+submitting the frame; an asynchronous decode would insert a loading rectangle
+between successive shapes. External images keep their asynchronous loader.
+The native scheduler regression checks current path pixels before any worker
+completion, failed SVG handling, and ordinary network request scheduling.
+For animation diagnosis, `TRUST_DUMP_RAW` records the actor's ordered DOM
+snapshots; compare the header's `--p` values with the native paint trace.
+Ordinary page wheel units move 120 CSS pixels; touchpad pixel deltas retain
+their exact device-scaled distances. The wheel amount is a UA preference,
+not an animation-timing requirement. Terminal scrollback keeps its own scale.
+
+Standards basis: CSS Images 3 §4.2 object negotiation and SVG 2 §8.3 initial
+viewport, plus SVG 2's rendering tree and HTML's update-the-rendering order,
+local 2026-09-06 snapshots cited beside `ImageCacheKey` and `prepare_svg_data`.
+
 ### Covered-window presentation / bounded controller handoff
 
 The native controller's actor bridge must not drain bounded actor output into

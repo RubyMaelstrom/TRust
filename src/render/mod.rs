@@ -21,6 +21,8 @@ pub mod vello_cpu;
 pub mod vello_hybrid;
 
 #[cfg(test)]
+mod image_raster_tests;
+#[cfg(test)]
 mod text_raster_tests;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

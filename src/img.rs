@@ -4,8 +4,9 @@
 //! content types) and guards dimensions against decompression bombs.
 //! Encoding goes through ratatui-image's `Picker` — sixel where the
 //! terminal answered the startup query for it (foot does), unicode
-//! half-blocks anywhere else. Both steps are CPU-bound and run on
-//! blocking tasks, never the UI thread.
+//! half-blocks anywhere else. Network images and terminal encodings run on
+//! blocking tasks. Desktop SVG snapshots already embedded in a display list
+//! are prepared with that frame so animated vectors never paint a loading box.
 
 use std::borrow::Cow;
 use std::io::Read as _;
@@ -377,6 +378,30 @@ pub fn decode_graphical_for_source(
     let image = decode_graphical(bytes)?;
     record_svg_intrinsic_metadata(source, bytes);
     Ok(image)
+}
+
+/// Prepare a self-contained SVG snapshot without network or worker scheduling.
+/// Native presentation uses this before drawing a new inline-SVG frame; routing
+/// each changed path through the asynchronous image loader would insert a
+/// loading rectangle between animation frames. Other resource types return
+/// `None` and retain their ordinary asynchronous loading lifecycle.
+pub fn decode_graphical_svg_data_url(
+    source: &str,
+) -> Option<Result<crate::render::ImageResource, String>> {
+    let (metadata, _) = source.strip_prefix("data:")?.split_once(',')?;
+    if !metadata.split(';').next()?.eq_ignore_ascii_case(SVG_MIME) {
+        return None;
+    }
+    // Bound even a fully percent-escaped payload before allocating its decode.
+    // The SVG parser separately enforces the expanded XML and raster limits.
+    if source.len() > MAX_SVG_BYTES * 4 {
+        return Some(Err(String::from("SVG data URL exceeds the source limit")));
+    }
+    Some(
+        decode_data_url(source)
+            .ok_or_else(|| String::from("invalid SVG data URL"))
+            .and_then(|bytes| decode_graphical_for_source(source, &bytes)),
+    )
 }
 
 /// Decode the first presentation frame and retain a restartable source when
@@ -1193,6 +1218,19 @@ pub(crate) struct SvgRasterSize {
 }
 
 impl SvgRasterSize {
+    /// Exact cache identity includes the CSS viewport as well as pixel size:
+    /// fractional CSS sizes can round to the same raster but resolve SVG
+    /// percentages differently. `new` normalizes both floats to finite,
+    /// strictly positive values, so their bits are a canonical key.
+    pub(crate) fn cache_key(self) -> [u32; 4] {
+        [
+            self.css_width.to_bits(),
+            self.css_height.to_bits(),
+            self.width,
+            self.height,
+        ]
+    }
+
     pub(crate) fn new(
         natural_width: u32,
         natural_height: u32,

@@ -29,7 +29,7 @@ use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureVi
 use winit::window::Window;
 
 use super::vello_cpu::{
-    MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, offset_shape, point_bounds,
+    ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, offset_shape, point_bounds,
     rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
     vello_affine, vello_blend, vello_color, vello_color_filter, vello_rect, vello_stops,
     vello_stroke,
@@ -47,7 +47,6 @@ const GPU_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const HYBRID_IMAGE_ATLAS_LIMIT: u32 = 4096;
 
 struct CachedImage {
-    svg_size: Option<crate::img::SvgRasterSize>,
     source: ImageSource,
     upload_width: u32,
     upload_height: u32,
@@ -94,7 +93,7 @@ pub struct VelloHybridRenderer {
     window: Option<Arc<Window>>,
     format: TextureFormat,
     size: PhysicalSize,
-    images: HashMap<ImageHandle, CachedImage>,
+    images: HashMap<ImageCacheKey, CachedImage>,
     frame_id: u64,
     headless: Option<HeadlessTarget>,
     window_target: Option<WindowTarget>,
@@ -716,15 +715,15 @@ impl VelloHybridRenderer {
             .images
             .keys()
             .copied()
-            .filter(|handle| {
-                !live_images.contains(handle) && !is_desktop_heart_image_handle(*handle)
+            .filter(|key| {
+                !live_images.contains(&key.handle) && !is_desktop_heart_image_handle(key.handle)
             })
             .collect();
-        for handle in stale {
+        for key in stale {
             if let Some(CachedImage {
                 source: ImageSource::OpaqueId { id, .. },
                 ..
-            }) = self.images.remove(&handle)
+            }) = self.images.remove(&key)
             {
                 self.renderer
                     .destroy_image(&mut self.resources, encoder, id);
@@ -1002,54 +1001,36 @@ impl VelloHybridRenderer {
         transform: [f64; 6],
     ) -> Result<(), String> {
         let store_revision = scene.image_revision(handle);
-        let changed = self.images.get(&handle).is_some_and(|image| {
-            store_revision.is_some_and(|revision| revision != image.revision)
-                || image.svg_size.is_some_and(|size| {
-                    size != crate::img::SvgRasterSize::new(
-                        image.width,
-                        image.height,
-                        rect,
-                        fit,
-                        transform,
-                    )
-                })
-        });
+        let resource = scene.image(handle);
+        let svg_size = resource
+            .as_ref()
+            .filter(|image| image.svg_source.is_some())
+            .map(|image| {
+                crate::img::SvgRasterSize::new(image.width, image.height, rect, fit, transform)
+            });
+        let key = ImageCacheKey::new(handle, store_revision.unwrap_or(0), svg_size);
+        let changed = self
+            .images
+            .get(&key)
+            .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
         let mut stale = None;
-        let mut prepared_svg = None;
         if changed {
-            let replacement =
-                store_revision
-                    .zip(scene.image(handle))
-                    .and_then(|(revision, image)| {
-                        let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
-                            .min(self.device.limits().max_texture_dimension_2d)
-                            .min(u32::from(u16::MAX));
-                        let natural = (image.width, image.height);
-                        let svg_size = image.svg_source.as_ref().map(|_| {
-                            crate::img::SvgRasterSize::new(
-                                image.width,
-                                image.height,
-                                rect,
-                                fit,
-                                transform,
-                            )
-                        });
-                        let raster = svg_size
-                            .zip(image.svg_source.as_ref())
-                            .and_then(|(size, source)| size.rasterize(source).ok());
-                        let image = raster.unwrap_or(image);
-                        if svg_size.is_some() {
-                            prepared_svg = Some((image.clone(), natural, svg_size));
-                        }
-                        hybrid_image_pixels(&image, upload_limit).map(|(width, height, pixels)| {
-                            (revision, image, natural, svg_size, width, height, pixels)
-                        })
-                    });
+            // SVG revisions/sizes have separate immutable cache entries.
+            // Bitmap animations can update their stable atlas slot in place.
+            let replacement = store_revision
+                .zip(resource.clone())
+                .and_then(|(revision, image)| {
+                    let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
+                        .min(self.device.limits().max_texture_dimension_2d)
+                        .min(u32::from(u16::MAX));
+                    let natural = (image.width, image.height);
+                    hybrid_image_pixels(&image, upload_limit).map(|(width, height, pixels)| {
+                        (revision, image, natural, width, height, pixels)
+                    })
+                });
             let updated_in_place =
-                if let Some((revision, image, natural, svg_size, width, height, pixels)) =
-                    replacement
-                {
-                    let cached_id = self.images.get(&handle).and_then(|cached| {
+                if let Some((revision, image, natural, width, height, pixels)) = replacement {
+                    let cached_id = self.images.get(&key).and_then(|cached| {
                         if (cached.upload_width, cached.upload_height)
                             != (u32::from(width), u32::from(height))
                         {
@@ -1071,10 +1052,9 @@ impl VelloHybridRenderer {
                             id,
                             &pixmap,
                         ) {
-                            let cached = self.images.get_mut(&handle).unwrap();
+                            let cached = self.images.get_mut(&key).unwrap();
                             cached.width = natural.0;
                             cached.height = natural.1;
-                            cached.svg_size = svg_size;
                             cached.source =
                                 ImageSource::opaque_id_with_transparency_hint(id, image.has_alpha);
                             cached.revision = revision;
@@ -1093,19 +1073,19 @@ impl VelloHybridRenderer {
                 // in-place path above; this is the general size-change
                 // fallback. Atlas uploads, copies and clears share the same
                 // encoder order, including when later images reuse this slot.
-                stale = self.images.remove(&handle);
+                stale = self.images.remove(&key);
             }
         }
-        if !self.images.contains_key(&handle) && self.images.len() >= MAX_REGISTERED_IMAGES {
+        if !self.images.contains_key(&key) && self.images.len() >= MAX_REGISTERED_IMAGES {
             let victim = self
                 .images
                 .iter()
-                .filter(|(handle, image)| {
-                    !is_desktop_heart_image_handle(**handle)
+                .filter(|(key, image)| {
+                    !is_desktop_heart_image_handle(key.handle)
                         && image.last_used_frame != self.frame_id
                 })
                 .min_by_key(|(_, image)| image.last_used_frame)
-                .map(|(handle, _)| *handle);
+                .map(|(key, _)| *key);
             if let Some(victim) = victim
                 && let Some(CachedImage {
                     source: ImageSource::OpaqueId { id, .. },
@@ -1120,22 +1100,15 @@ impl VelloHybridRenderer {
                 return Ok(());
             }
         }
-        if !self.images.contains_key(&handle)
+        if !self.images.contains_key(&key)
             && let Some(revision) = store_revision
-            && let Some(image) = scene.image(handle)
+            && let Some(image) = resource
         {
-            // A size change may require a new atlas slot. Reuse the raster
-            // prepared for the in-place attempt rather than drawing it twice.
-            let (image, natural, svg_size) = prepared_svg.take().unwrap_or_else(|| {
-                let natural = (image.width, image.height);
-                let svg_size = image.svg_source.as_ref().map(|_| {
-                    crate::img::SvgRasterSize::new(image.width, image.height, rect, fit, transform)
-                });
-                let raster = svg_size
-                    .zip(image.svg_source.as_ref())
-                    .and_then(|(size, source)| size.rasterize(source).ok());
-                (raster.unwrap_or(image), natural, svg_size)
-            });
+            let natural = (image.width, image.height);
+            let raster = svg_size
+                .zip(image.svg_source.as_ref())
+                .and_then(|(size, source)| size.rasterize(source).ok());
+            let image = raster.unwrap_or(image);
             let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
                 .min(self.device.limits().max_texture_dimension_2d)
                 .min(u32::from(u16::MAX));
@@ -1153,9 +1126,8 @@ impl VelloHybridRenderer {
                 &pixmap,
             );
             self.images.insert(
-                handle,
+                key,
                 CachedImage {
-                    svg_size,
                     source: ImageSource::opaque_id_with_transparency_hint(id, image.has_alpha),
                     upload_width: u32::from(width),
                     upload_height: u32::from(height),
@@ -1174,7 +1146,7 @@ impl VelloHybridRenderer {
             self.renderer
                 .destroy_image(&mut self.resources, encoder, id);
         }
-        let Some(image) = self.images.get_mut(&handle) else {
+        let Some(image) = self.images.get_mut(&key) else {
             target.set_paint(vello_color(PaintColor::Muted));
             target.fill_rect(&vello_rect(rect));
             return Ok(());
@@ -1552,6 +1524,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn svg_cache_variants_obey_budget_and_frame_lifetime_hybrid() {
+        let Ok(mut renderer) = futures::executor::block_on(VelloHybridRenderer::new_headless())
+        else {
+            eprintln!("SVG cache budget regression not exercised: no Hybrid adapter");
+            return;
+        };
+        super::super::image_raster_tests::check_svg_cache_budget(|scene| {
+            let frame = renderer.render_rgba(scene).unwrap();
+            (frame, renderer.images.len())
+        });
+    }
+
+    #[test]
     fn hybrid_bitmap_glyphs_render_without_fallback_or_atlas_growth() {
         use crate::core::{CssSize, ScaleFactor, ViewportMetrics};
         let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless())
@@ -1748,7 +1733,11 @@ mod tests {
                 "{width} at {scale}x"
             );
             assert_eq!(&frame.pixels[offset - 4..offset], &[255, 255, 255, 255]);
-            let cached = &hybrid.images[&handle];
+            let cached = hybrid
+                .images
+                .values()
+                .find(|image| image.last_used_frame == hybrid.frame_id)
+                .unwrap();
             assert_eq!((cached.width, cached.height), (300, 150));
             assert_eq!(
                 (cached.upload_width, cached.upload_height),
