@@ -416,10 +416,11 @@ fn registered_frames_have_separate_registries_and_reset_on_navigation() {
     let child = dom.get_by_id("child").unwrap();
     assert_eq!(dom.custom_prop(frame, "--x").as_deref(), Some("1"));
     assert_eq!(dom.custom_prop(child, "--x").as_deref(), Some("2"));
-    dom.register_property(frame, "--x", "<number>", false, Some("3".into()), None)
+    let document = dom.frame_document(frame).unwrap();
+    dom.register_property(document, "--x", "<number>", false, Some("3".into()), None)
         .unwrap();
     dom.set_adopted_sheets(
-        frame,
+        document,
         vec![(
             "@property --adopted {initial-value:old-document}".into(),
             None,

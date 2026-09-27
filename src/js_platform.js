@@ -32,6 +32,8 @@
     // The viewport belongs to the browsing context, not to the replaceable
     // Window.innerWidth/innerHeight properties exposed to author JavaScript.
     let windowViewportWidth = cfg.width, windowViewportHeight = cfg.height;
+    const setLayoutViewport = g.__dom_set_viewport;
+    delete g.__dom_set_viewport;
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
     const storageOpaque = !!cfg.cookieOpaque;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
@@ -181,68 +183,74 @@
     // Geometry Interfaces Module Level 1 §3. Keep the four internal dimensions
     // out of page-visible properties, expose derived edges for negative sizes,
     // and let DOMRect override only the four mutable coordinates/dimensions.
-    const rectState = new WeakMap();
-    function rectNumber(value) { return value === undefined ? 0 : Number(value); }
+    /*__GEOMETRY_BEGIN__*/
+    function rectNumber(value) { return value === undefined ? 0 : +value; }
     function rectInit(other) {
-        other = other === null || other === undefined ? {} : Object(other);
-        return [rectNumber(other.x), rectNumber(other.y),
-                rectNumber(other.width), rectNumber(other.height)];
+        // Web IDL #js-to-dictionary: reject primitives, then Get/convert each
+        // member in lexicographical order, including inherited properties.
+        if (other === null || other === undefined) return [0, 0, 0, 0];
+        if (typeof other !== "object" && typeof other !== "function")
+            throw new TypeError("DOMRectInit must be an object");
+        const height = rectNumber(other.height), width = rectNumber(other.width);
+        const x = rectNumber(other.x), y = rectNumber(other.y);
+        return [x, y, width, height];
     }
     class DOMRectReadOnly {
-        constructor(x = 0, y = 0, width = 0, height = 0) {
-            rectState.set(this, {
-                x: rectNumber(x), y: rectNumber(y),
-                width: rectNumber(width), height: rectNumber(height),
-            });
-        }
-        static fromRect(other = {}) { return new DOMRectReadOnly(...rectInit(other)); }
-        get x() { return rectState.get(this).x; }
-        get y() { return rectState.get(this).y; }
-        get width() { return rectState.get(this).width; }
-        get height() { return rectState.get(this).height; }
-        get top() { const r = rectState.get(this); return Math.min(r.y, r.y + r.height); }
-        get right() { const r = rectState.get(this); return Math.max(r.x, r.x + r.width); }
-        get bottom() { const r = rectState.get(this); return Math.max(r.y, r.y + r.height); }
-        get left() { const r = rectState.get(this); return Math.min(r.x, r.x + r.width); }
         toJSON() {
-            return { x: this.x, y: this.y, width: this.width, height: this.height,
-                     top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+            // Default toJSON runs IDL getter steps, not author-overridable
+            // JS properties. The object literal creates own data properties.
+            const r = snapshotRect(this);
+            return { x:r[0], y:r[1], width:r[2], height:r[3],
+                top:r[4], right:r[5], bottom:r[6], left:r[7] };
         }
-        get [Symbol.toStringTag]() { return "DOMRectReadOnly"; }
     }
-    class DOMRect extends DOMRectReadOnly {
-        static fromRect(other = {}) { return new DOMRect(...rectInit(other)); }
-        get x() { return super.x; }
-        set x(value) { rectState.get(this).x = Number(value); }
-        get y() { return super.y; }
-        set y(value) { rectState.get(this).y = Number(value); }
-        get width() { return super.width; }
-        set width(value) { rectState.get(this).width = Number(value); }
-        get height() { return super.height; }
-        set height(value) { rectState.get(this).height = Number(value); }
-        get [Symbol.toStringTag]() { return "DOMRect"; }
+    class DOMRect {}
+    Object.setPrototypeOf(DOMRect.prototype, DOMRectReadOnly.prototype);
+    const rectBindings = g.__geometry_bind(DOMRectReadOnly.prototype, DOMRect.prototype);
+    delete g.__geometry_bind;
+    DOMRectReadOnly = rectBindings[0]; DOMRect = rectBindings[1];
+    Object.setPrototypeOf(DOMRect, DOMRectReadOnly);
+    const snapshotRect = rectBindings[2], createDOMRect = rectBindings[3];
+    const createDOMRectReadOnly = rectBindings[5];
+    Object.defineProperty(DOMRect, 'fromRect', {value: {
+        fromRect(other = {}) { const r = rectInit(other); return createDOMRect(r[0], r[1], r[2], r[3]); }
+    }.fromRect, writable:true, enumerable:true, configurable:true});
+    Object.defineProperty(DOMRectReadOnly, 'fromRect', {value: {
+        fromRect(other = {}) { const r = rectInit(other); return createDOMRectReadOnly(r[0], r[1], r[2], r[3]); }
+    }.fromRect, writable:true, enumerable:true, configurable:true});
+    // Bootstrap-only rendezvous: the shared Window/Worker codec captures these
+    // native operations and removes the temporary property before author code.
+    g.__geometry_codec = [rectBindings[4], createDOMRect, rectBindings[5]];
+    for (const [constructor, name] of [[DOMRectReadOnly, "DOMRectReadOnly"], [DOMRect, "DOMRect"]]) {
+        Object.defineProperty(constructor.prototype, Symbol.toStringTag,
+            {value:name, writable:false, enumerable:false, configurable:true});
+        Object.defineProperty(constructor, "fromRect", {enumerable:true});
     }
-    g.DOMRectReadOnly = DOMRectReadOnly;
-    g.DOMRect = DOMRect;
-    g.SVGRect = DOMRect;
+    Object.defineProperty(DOMRectReadOnly.prototype, "toJSON", {enumerable:true});
+    Object.defineProperty(g, 'DOMRectReadOnly', {value:DOMRectReadOnly, writable:true, configurable:true});
+    Object.defineProperty(g, 'DOMRect', {value:DOMRect, writable:true, configurable:true});
+    /*__GEOMETRY_END__*/
+    // LegacyWindowAlias does not expose SVGRect in a Worker.
+    Object.defineProperty(g, 'SVGRect', {value:DOMRect, writable:true, configurable:true});
 
     // --- node wrappers, identity-cached so wrap(id) === wrap(id) ---
     // Web IDL converts an interface value back to the JavaScript object that
     // represents that SAME platform object. This is more than an `===` detail:
     // custom-element state, event-handler properties, expandos, and the
     // Element→ShadowRoot association live on our wrapper today. Consequently a
-    // wrapper in the connected shadow-including tree must stay strong even if
-    // page JS temporarily drops its last reference. Detached transient nodes
-    // remain weak so virtual-DOM churn does not root the entire Rust arena.
+    // wrapper must survive whenever its native node is reachable, including
+    // through a detached descendant or a lazy static NodeList. The joint
+    // native/JavaScript graph retains this state without rooting dead cycles.
     const W = new Map();
-    const CONNECTED_W = new Map();
     // Same-Agent Web IDL Element identity. Register only trusted wrapper
     // creation paths, never a public getter/prototype-based reconstruction.
     // The host roots this WeakMap without keeping detached elements alive.
     const elementSlots = g.__element_slots(new WeakMap());
     delete g.__element_slots;
-    const liveRanges = g.__live_range_registry(new Set());
-    delete g.__live_range_registry;
+    const registerLiveRange = g.__live_range_register;
+    const snapshotLiveRanges = g.__live_range_snapshot;
+    delete g.__live_range_register;
+    delete g.__live_range_snapshot;
     // Bind pristine intrinsics once: no temporary argument arrays or author
     // prototype lookups on each wrapper creation / interface conversion.
     const rememberElement = messageWeakSet.bind(elementSlots);
@@ -254,28 +262,22 @@
     const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
     const XML_NS = "http://www.w3.org/XML/1998/namespace";
     const XMLNS_NS = "http://www.w3.org/2000/xmlns/";
-    // Shadow mode is native element state conceptually. The Rust arena owns
-    // the host→root association; retain the one bit not stored there so a
-    // reconstructed host wrapper never exposes a closed root.
-    const CLOSED_SHADOW_HOSTS = new Set();
     const wrapperFinalizer = typeof g.FinalizationRegistry === "function"
         ? new g.FinalizationRegistry(function (record) {
             if (W.get(record.id) === record.reference) W.delete(record.id);
         })
         : null;
     function cachedWrapper(id, knownConnected) {
-        const connected = CONNECTED_W.get(id);
-        if (connected) return connected;
         const reference = W.get(id);
         if (!reference) return null;
         const wrapper = typeof reference.deref === "function" ? (reference.deref() || null) : reference;
-        if (wrapper && typeof g.WeakRef === "function"
-            && (knownConnected === true
-                || (knownConnected === undefined && __dom_is_connected(id))))
-            CONNECTED_W.set(id, wrapper);
         return wrapper;
     }
     function rememberWrapper(id, wrapper, knownConnected) {
+        // Web IDL #interface-to-js and DOM's tree/ownerDocument links jointly
+        // preserve platform state, including detached ancestors and siblings.
+        // The native handle is internal to the tracing graph, not a GC root.
+        wrapper = __dom_register_wrapper(id, wrapper);
         if (typeof g.WeakRef !== "function") {
             W.set(id, wrapper);
             return wrapper;
@@ -283,9 +285,6 @@
         const reference = new g.WeakRef(wrapper);
         W.set(id, reference);
         if (wrapperFinalizer) wrapperFinalizer.register(wrapper, { id: id, reference: reference });
-        if (knownConnected === true
-            || (knownConnected === undefined && __dom_is_connected(id)))
-            CONNECTED_W.set(id, wrapper);
         return wrapper;
     }
     // Synchronize only wrappers that already exist; never materialize a whole
@@ -295,24 +294,13 @@
         if (typeof g.WeakRef !== "function") return;
         for (let i = 0; i < ids.length; i++) {
             const id = ids[i];
-            if (!connected) {
-                // A connected platform wrapper is already the strong-map
-                // value. Avoid a second weak-map lookup and WeakRef.deref()
-                // while demoting a known-removed subtree; wrappers for an
-                // already-detached target are absent here and its listeners
-                // are already in DETACHED_LS.
-                const wrapper = CONNECTED_W.get(id);
-                CONNECTED_W.delete(id);
-                if (wrapper) detachListenerTarget(wrapper);
-                continue;
-            }
             const reference = W.get(id);
             const wrapper = reference && (typeof reference.deref === "function"
                 ? reference.deref() : reference);
             if (!reference) continue;
             if (wrapper) {
-                CONNECTED_W.set(id, wrapper);
-                attachListenerTarget(wrapper);
+                if (connected) attachListenerTarget(wrapper);
+                else detachListenerTarget(wrapper);
             }
         }
     }
@@ -367,6 +355,9 @@
         let w = cachedWrapper(id, knownConnected);
         if (w) return w;
         const t = __dom_node_type(id);
+        // Queued frontend input can outlive its removed target. Public IDs are
+        // never recycled; do not manufacture a wrapper for a retired ID.
+        if (typeof t !== "number" || t === 0) return null;
         if (t === 1) {
             // DOM chooses an element interface from BOTH its local name and
             // namespace. Fetch all immutable expanded-name parts in one host
@@ -392,10 +383,18 @@
                 w.__clonable = info[4];
                 w.__slotAssignment = info[5] ? "manual" : "named";
                 w.__host.__sr = w;
-                if (info[1]) CLOSED_SHADOW_HOSTS.add(info[0]);
             }
             return w;
         } else {
+            if (t === 9) {
+                const owner = __dom_frame_owner(id);
+                if (owner !== null && owner !== undefined) {
+                    const frame = realmRootFrame && realmRootFrame.__id === owner ? realmRootFrame : wrap(owner);
+                    const current = frame.__contentDoc;
+                    w = current && current.__id === id ? current : new FrameDocument(frame);
+                    return rememberWrapper(id, w, knownConnected);
+                }
+            }
             w = t === 9 ? (__dom_document_content_type(id) === "text/html" ? new Document(id) : new XMLDocument(id, XML_DOCUMENT_TOKEN))
                 : t === 3 ? new Text(id)
                 : t === 4 ? new CDATASection(id)
@@ -433,11 +432,14 @@
     // Diagnostic-only census for focused host GC tests. The public DOM never
     // exposes the cache or its arena ids.
     trust.nodeWrapperCacheState = function () {
-        let live = 0;
-        for (const reference of W.values()) {
-            if (typeof reference.deref !== "function" || reference.deref() !== undefined) live++;
+        let live = 0, connected = 0;
+        for (const [id, reference] of W) {
+            if (typeof reference.deref !== "function" || reference.deref() !== undefined) {
+                live++;
+                if (__dom_is_connected(id)) connected++;
+            }
         }
-        return [W.size, live, CONNECTED_W.size];
+        return [W.size, live, connected];
     };
 
     const TRACE_FRAME = !!(cfg.frameTrace || false);
@@ -450,9 +452,11 @@
     // flag). Classic and module scripts run; a non-JS `type` is left inert. Scripts
     // parsed from innerHTML do NOT execute (spec), so this only fires for
     // genuine element-node insertion through appendChild/insertBefore.
-    const SCRIPTS_STARTED = new Set();
+    // HTML's already-started state belongs to the script object, not a global
+    // forever-growing ID census. The native graph preserves a live wrapper.
+    const SCRIPTS_STARTED = new WeakSet();
     function maybeRunScript(node) {
-        if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node.__id)) return;
+        if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node)) return;
         const ty = (node.getAttribute("type") || "").trim().toLowerCase();
         if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript" && ty !== "module" && ty !== "importmap") return;
         // A classic script carrying `nomodule` is skipped: it exists only for
@@ -465,7 +469,7 @@
         let n = node, connected = false;
         while (n) { if (n.nodeType === 9) { connected = true; break; } n = n.parentNode; }
         if (!connected) return;
-        SCRIPTS_STARTED.add(node.__id);
+        SCRIPTS_STARTED.add(node);
         __dom_run_injected_script(node.__id);
     }
     // A `<link rel=stylesheet href>` inserted into the live document is fetched
@@ -754,7 +758,14 @@
     // tracks whether ANY capture listener exists, so the common no-capture page
     // pays nothing for the capture phase (no ancestor walk on non-bubbling
     // events, no extra pass).
-    const LS = new Map();
+    // DOM #concept-event-listener: the TARGET owns its listener list. A global
+    // strong table roots even a target -> callback -> target cycle forever,
+    // including Documents of destroyed navigables visited by another Realm.
+    // Connectedness affects presentation discovery, never listener lifetime.
+    const LS = new WeakMap();
+    const getListenerMap = messageWeakGet.bind(LS), setListenerMap = messageWeakSet.bind(LS);
+    const deleteListenerMap = WeakMap.prototype.delete.bind(LS);
+    const EMPTY_LISTENERS = Object.freeze([]);
     // DOM #concept-event-listener: presentation discovery depends on the
     // listener lists, not on every value/style/child-list mutation. Retain
     // only arena IDs, so these caches cannot keep detached targets alive.
@@ -765,53 +776,78 @@
         "mouseover", "mouseout", "mouseenter", "mouseleave", "mousemove",
         "pointerover", "pointerout", "pointerenter", "pointerleave", "pointermove",
     ];
-    // These are subsets of LS, with exactly its strong lifetime. Mutating one
-    // suggestion/menu subtree must not rescan every keyboard/network listener
-    // to discover the page's pointer targets at the next rendering update.
+    // The enumerable indexes contain only target-free lifetime records (IDs
+    // and counts), not wrappers or callbacks. ECMA-262
+    // #sec-finalization-registry.prototype.register holds its held value
+    // strongly: putting a listener map or a target in that record would
+    // recreate the very retaining cycle that the WeakMap removes.
+    // Mutating one subtree need not rescan unrelated event-listener lists.
     const clickableTargets = new Set(), hoverTargets = new Set();
-    function discoveryMembership(targets, target, present) {
-        if (targets.has(target) === present) return false;
-        if (present) targets.add(target); else targets.delete(target);
+    // Cleanup is host bookkeeping, not an invocation of author-overridable
+    // Set methods. IDs are never recycled, and records have no target edge.
+    const deleteClickableTarget = clickableTargets.delete.bind(clickableTargets);
+    const deleteHoverTarget = hoverTargets.delete.bind(hoverTargets);
+    function releaseListenerLifetime(record) {
+        captureCount -= record.captures;
+        record.captures = 0;
+        if (deleteClickableTarget(record)) clickableListenerIds = null;
+        if (deleteHoverTarget(record)) hoverListenerIds = null;
+    }
+    const listenerFinalizer = new FinalizationRegistry(releaseListenerLifetime);
+    const registerListenerLifetime = listenerFinalizer.register.bind(listenerFinalizer);
+    const unregisterListenerLifetime = listenerFinalizer.unregister.bind(listenerFinalizer);
+    function discoveryMembership(targets, record, present) {
+        if (targets.has(record) === present) return false;
+        if (present) targets.add(record); else targets.delete(record);
         return true;
     }
     function updateListenerDiscovery(target, type) {
         const click = type === undefined || type === "click";
         const hover = type === undefined || HOVER_TYPES.indexOf(type) >= 0;
         if (!click && !hover) return;
-        const listeners = LS.get(target);
+        const listeners = getListenerMap(target);
+        if (!listeners) return;
+        const record = listeners.lifetime;
+        if (record.id === undefined) {
+            // Native identity works across Realms and does not invoke author
+            // __id/isConnected getters or depend on instanceof Node.
+            record.nodeId = __dom_node_identity(target);
+            record.id = record.nodeId !== null ? record.nodeId
+                : target === topWindowState.listenerTarget
+                    ? (realmRootFrame ? realmRootFrame.__id : 0) : null;
+        }
+        const connected = record.id !== null
+            && (record.nodeId === null || __dom_is_connected(record.nodeId));
         if (click) {
-            const list = listeners && listeners.get("click");
-            if (discoveryMembership(clickableTargets, target, !!(list && list.length)))
+            const list = listeners.get("click");
+            if (discoveryMembership(clickableTargets, record, connected && !!(list && list.length)))
                 clickableListenerIds = null;
         }
         if (hover) {
             let present = false;
-            if (listeners) for (let i = 0; i < HOVER_TYPES.length; i++) {
+            for (let i = 0; i < HOVER_TYPES.length; i++) {
                 const list = listeners.get(HOVER_TYPES[i]);
                 if (list && list.length) { present = true; break; }
             }
-            if (discoveryMembership(hoverTargets, target, present)) hoverListenerIds = null;
+            if (discoveryMembership(hoverTargets, record, connected && present)) hoverListenerIds = null;
         }
     }
-    // Detached Nodes remain fully usable when author code retains them, but a
-    // host side table must not itself keep an otherwise-unreachable detached
-    // document alive. Connected/event-discovery targets stay enumerable in
-    // LS; detached targets retain the same listener map weakly until reinserted.
-    const DETACHED_LS = new WeakMap();
+    // Detaching a Node never erases or moves its event listener list. Only
+    // the presentation indexes change; reattachment uses the same live list.
     function detachListenerTarget(target) {
-        const listeners = target && LS.get(target);
-        if (!listeners || !target || typeof target !== "object") return;
-        LS.delete(target);
-        updateListenerDiscovery(target);
-        DETACHED_LS.set(target, listeners);
+        const listeners = target && getListenerMap(target);
+        if (!listeners) return;
+        const record = listeners.lifetime;
+        if (deleteClickableTarget(record)) clickableListenerIds = null;
+        if (deleteHoverTarget(record)) hoverListenerIds = null;
     }
     function attachListenerTarget(target) {
-        const listeners = target && DETACHED_LS.get(target);
-        if (!listeners) return;
-        DETACHED_LS.delete(target);
-        LS.set(target, listeners);
-        updateListenerDiscovery(target);
+        if (target) updateListenerDiscovery(target);
     }
+    // Diagnostic-only scalar census: no heap walk, wrapper exposure or timer.
+    trust.listenerRegistryState = function () {
+        return [captureCount, clickableTargets.size, hoverTargets.size];
+    };
     // HTML §7.2.3: WindowProxy identity survives navigation, but its
     // [[Window]] normally changes with the active Document. TRust multiplexes
     // those logical Window objects through `g`; retain per-Window listener,
@@ -871,12 +907,11 @@
     }
     function retireWindowState(frame, state) {
         if (!state) return;
-        const listeners = LS.get(state.listenerTarget);
+        const listeners = getListenerMap(state.listenerTarget);
         if (listeners) {
-            for (const list of listeners.values())
-                captureCount -= list.capN || 0;
-            LS.delete(state.listenerTarget);
-            updateListenerDiscovery(state.listenerTarget);
+            releaseListenerLifetime(listeners.lifetime);
+            unregisterListenerLifetime(listeners.lifetime);
+            deleteListenerMap(state.listenerTarget);
         }
         animationFrames.q = animationFrames.q.filter(
             (entry) => entry.windowState !== state
@@ -894,7 +929,16 @@
         discardTasks(intersectionTasks);
         discardTasks(messageTasks);
         for (let i = MO.length - 1; i >= 0; i--) {
-            if (MO[i].__windowState === state) MO.splice(i, 1);
+            const observer = MO[i].deref();
+            if (!observer || observer.__windowState === state) {
+                if (observer) {
+                    observer.__targets = [];
+                    observer.__records = [];
+                    moPending.delete(observer);
+                    __dom_observer_targets(observer, []);
+                }
+                MO.splice(i, 1);
+            }
         }
         for (let i = IO.length - 1; i >= 0; i--) {
             if (IO[i].__windowState === state) IO.splice(i, 1);
@@ -920,7 +964,7 @@
         }
         // Replacing the active Document destroys every child navigable owned
         // by that Document before the old subtree is unlinked.
-        for (const child of frame.childNodes) destroyFrameNavigablesIn(child);
+        if (frame.__contentDoc) destroyFrameNavigablesIn(frame.__contentDoc);
         if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
         const old = frameWindowStates.get(frame);
         retireWindowState(frame, old);
@@ -939,7 +983,7 @@
         frameNavigationURLs.delete(frame);
         frameBlobOrigins.delete(frame);
         let descendants = [];
-        try { descendants = frame.querySelectorAll("iframe, frame"); } catch (e) {}
+        try { descendants = frame.__contentDoc ? frame.__contentDoc.querySelectorAll("iframe, frame") : []; } catch (e) {}
         for (let i = descendants.length - 1; i >= 0; i--)
             destroyFrameNavigable(descendants[i]);
         const pending = frame.__trustPendingNavigationReservations;
@@ -958,6 +1002,11 @@
         frame.__loadedSrcdoc = undefined;
         frame.__frameUrl = undefined;
         trust.detachChildWindow(frame.__contentRealmWindow);
+        if (frame.__contentDoc) frame.__contentDoc.__destroyed = true;
+        // HTML #destroy-a-child-navigable / #discard-a-document severs the browsing-context
+        // association, not the retained Document's own DOM tree. Drop the presentation edge.
+        const documentId = __dom_frame_document(frame.__id);
+        if (documentId !== null) __dom_detach(documentId);
         frame.__contentDoc = undefined;
         frame.__contentWin = undefined;
         frame.__contentRealmWindow = undefined;
@@ -999,18 +1048,23 @@
         return target === g ? activeWindowState().listenerTarget : target;
     }
     let captureCount = 0;
-    function lsFor(target, type) {
+    function lsFor(target, type, create) {
         const registryTarget = listenerRegistryTarget(target);
-        let m = LS.get(registryTarget) || DETACHED_LS.get(registryTarget);
+        let m = getListenerMap(registryTarget);
         if (!m) {
+            if (!create) return EMPTY_LISTENERS;
             m = new Map();
-            if ((registryTarget instanceof Node && !registryTarget.isConnected) || portState(registryTarget))
-                DETACHED_LS.set(registryTarget, m);
-            else
-                LS.set(registryTarget, m);
+            m.lifetime = { id: undefined, nodeId: null, captures: 0 };
+            registerListenerLifetime(registryTarget, m.lifetime, m.lifetime);
+            setListenerMap(registryTarget, m);
         }
         let l = m.get(type);
-        if (!l) { l = []; m.set(type, l); }
+        if (!l) {
+            if (!create) return EMPTY_LISTENERS;
+            l = [];
+            l.lifetime = m.lifetime;
+            m.set(type, l);
+        }
         return l;
     }
     // Flatten the WebIDL options argument (boolean useCapture, or the
@@ -1048,7 +1102,7 @@
         const o = lsOpts(options);
         if (o.signal && o.signal.aborted) return;
         const t = String(type);
-        const l = lsFor(target, t);
+        const l = lsFor(target, t, true);
         if (lsFind(l, fn, o.capture) >= 0) return;
         // Remember the document whose global was current when the
         // listener was registered; dispatch restores that document before
@@ -1059,7 +1113,7 @@
         if (!l.fns) { l.fns = []; l.caps = []; l.capN = 0; }
         l.push(entry); l.fns.push(fn); l.caps.push(o.capture);
         updateListenerDiscovery(listenerRegistryTarget(target), t);
-        if (o.capture) { captureCount++; l.capN++; }
+        if (o.capture) { captureCount++; l.capN++; l.lifetime.captures++; }
         if (o.signal && typeof o.signal.addEventListener === "function") {
             o.signal.addEventListener("abort", function () { removeL(target, t, fn, { capture: o.capture }); }, { once: true });
         }
@@ -1071,9 +1125,19 @@
         const i = lsFind(l, fn, capture);
         if (i < 0) return;
         l[i].removed = true; // in-flight dispatch snapshots skip it (spec)
-        if (l[i].capture) { captureCount--; l.capN--; }
+        if (l[i].capture) { captureCount--; l.capN--; l.lifetime.captures--; }
         l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
-        updateListenerDiscovery(listenerRegistryTarget(target), t);
+        const registryTarget = listenerRegistryTarget(target);
+        updateListenerDiscovery(registryTarget, t);
+        if (!l.length) {
+            const listeners = getListenerMap(registryTarget);
+            listeners.delete(t);
+            if (!listeners.size) {
+                releaseListenerLifetime(listeners.lifetime);
+                unregisterListenerLifetime(listeners.lifetime);
+                deleteListenerMap(registryTarget);
+            }
+        }
     }
     // DOM §2.2 initializes constructed events as untrusted. Events created by
     // the user-agent activation algorithms use the separate "create an event"
@@ -1999,7 +2063,7 @@
     // HTML §4.8.4 exposes that state through `complete`, and the successful
     // request's `load` event is delivered as a later task. Do not announce a
     // network image before its bytes are available.
-    trust.__imgReadyDelivered = new Map();
+    trust.__imgReadyDelivered = new WeakMap();
     trust.scanImageLoadsWhenReady = function () {
         let imgs;
         try { imgs = g.document.querySelectorAll("img"); } catch (e) { return 0; }
@@ -2016,15 +2080,15 @@
             if (!complete) continue;
             const source = String(im.currentSrc || im.getAttribute("src") || "");
             if (!source) continue;
-            const previous = trust.__imgReadyDelivered.get(id);
+            const previous = trust.__imgReadyDelivered.get(im);
             if (previous === source) continue;
-            const m = LS.get(im);
+            const m = getListenerMap(im);
             const listening =
                 (m && m.get("load") && m.get("load").length) || typeof im.onload === "function";
             // Mark the request delivered even when nobody listens. A listener
             // attached after the resource event has run must not receive a
             // second, synthetic notification.
-            trust.__imgReadyDelivered.set(id, source);
+            trust.__imgReadyDelivered.set(im, source);
             if (!listening) continue;
             pending.push(im);
         }
@@ -2226,7 +2290,7 @@
         // HTML's initial about:blank creation copies the creator Document URL.
         frameReferrers.set(frame, frame.ownerDocument.URL);
         frame.__trustReadyState = "complete";
-        const replacedRoots = Array.from(frame.childNodes);
+        const replacedRoots = frame.__contentDoc ? [frame.__contentDoc] : [];
         if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
         frame.__contentDoc = undefined;
         frame.__contentWin = undefined;
@@ -2264,7 +2328,7 @@
         frame.__trustParentWindow = undefined;
         frame.__trustTopWindow = undefined;
         frame.__trustReadyState = "loading";
-        const replacedRoots = Array.from(frame.childNodes);
+        const replacedRoots = frame.__contentDoc ? [frame.__contentDoc] : [];
         if (reuseInitialWindow) {
             for (const root of replacedRoots) destroyFrameNavigablesIn(root);
         }
@@ -2331,7 +2395,7 @@
         // The native parse is atomic, but its parser-blocking scripts still
         // need to execute with readiness "loading". runFrameScripts marks
         // EOF only after those scripts and before deferred/module execution.
-        queueFrameNavigationsIn(frame);
+        queueFrameNavigationsIn(frameDocument(frame));
 
         // HTML §13.2.7: parser-deferred and module scripts run before
         // DOMContentLoaded. HTML then waits for everything delaying load (such
@@ -3031,7 +3095,7 @@
         if (cfg.frameTrace && target) {
             const path = [];
             for (let node = target; node; node = node.parentNode) {
-                const listeners = LS.get(node);
+                const listeners = getListenerMap(node);
                 path.push(node.localName + "#" + (node.id || "") + ":" +
                     (listeners ? Array.from(listeners.keys()).join(",") : ""));
             }
@@ -3148,8 +3212,8 @@
     // Parser and live DOM insertion share HTML's already-started flag.
     trust.prepareParserScript = function (id) {
         const node = wrap(id);
-        if (!node || !node.isConnected || SCRIPTS_STARTED.has(id)) return false;
-        SCRIPTS_STARTED.add(id);
+        if (!node || !node.isConnected || SCRIPTS_STARTED.has(node)) return false;
+        SCRIPTS_STARTED.add(node);
         return true;
     };
     // Fire a load/error event on an injected resource. GlobalEventHandlers
@@ -3166,13 +3230,7 @@
     trust.clickables = function () {
         if (clickableListenerIds === null) {
             clickableListenerIds = [];
-            for (const target of clickableTargets) {
-                if (target instanceof Node && typeof target.__id === "number") {
-                    clickableListenerIds.push(target.__id);
-                } else if (target === g.document || target === topWindowState.listenerTarget) {
-                    clickableListenerIds.push(realmRootFrame ? realmRootFrame.__id : 0);
-                }
-            }
+            for (const record of clickableTargets) clickableListenerIds.push(record.id);
         }
         const out = clickableListenerIds.slice();
         for (const child of childWindowTrusts) out.push(...child.clickables());
@@ -3650,12 +3708,7 @@
     trust.hoverables = function () {
         if (hoverListenerIds === null) {
             hoverListenerIds = [];
-            for (const target of hoverTargets) {
-                const id = target instanceof Node && typeof target.__id === "number" ? target.__id
-                    : target === g.document || target === topWindowState.listenerTarget
-                        ? (realmRootFrame ? realmRootFrame.__id : 0) : null;
-                if (id !== null) hoverListenerIds.push(id);
-            }
+            for (const record of hoverTargets) hoverListenerIds.push(record.id);
         }
         const out = hoverListenerIds.slice();
         for (const child of childWindowTrusts) out.push(...child.hoverables());
@@ -4411,7 +4464,7 @@
                 while (c) {
                     const tag = CE.tags.get(c);
                     if (tag) {
-                        this.__id = __dom_create_element(tag);
+                        this.__id = __dom_create_element(tag, g.document.__id);
                         seedElementName(this, tag, HTML_NS, null);
                         rememberElement(this, this.__id);
                         this.__ceUpgraded = true;
@@ -4436,12 +4489,9 @@
         get baseURI() { return nodeBaseHref(this); }
         get parentNode() {
             if (this.nodeType === 9) return null;
-            const parent = wrap(__dom_parent(this.__id));
-            // DOM §4.4: the content Document, not the embedding element, is
-            // the parent of a child navigable's document element. The native
-            // presentation arena nests frame content for layout only.
-            return parent && (parent.__trustLN === "iframe" || parent.__trustLN === "frame") &&
-                parent.__contentDoc ? parent.__contentDoc : parent;
+            // Real child Documents now form this boundary natively. Ordinary author-created
+            // children of an iframe still have that Element, not its contentDocument, as parent.
+            return wrap(__dom_parent(this.__id));
         }
         get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
         get childNodes() { return childNodeCollection(this); }
@@ -4470,6 +4520,7 @@
                 for (let i = 0; i < removedRoots.length; i++)
                     destroyFrameNavigablesIn(wrap(removedRoots[i]));
                 __dom_set_text(this.__id, v);
+                if (removedRoots.length || v) moEnqueue();
                 for (let i = 0; i < removedRoots.length; i++)
                     syncWrapperSubtreeRetention(removedRoots[i]);
                 slotQueueCheck(this);
@@ -4506,13 +4557,8 @@
         // the live document for every node made cross-document adoption
         // indistinguishable from a no-op.
         get ownerDocument() {
-            // Each iframe content navigable has its own Document even though
-            // TRust stores its nodes in the page actor's shared arena.  The
-            // arena-level owner id is therefore only the fallback for top-level
-            // and detached documents; a node below a realized frame belongs to
-            // that frame's stable Document facade.
-            const frame = frameOwnerForNode(this);
-            return frame ? frameDocument(frame) : wrap(__dom_owner_document(this.__id));
+            const document = __dom_owner_document(this);
+            return document && typeof document === "object" ? document : wrap(document);
         }
         get isConnected() {
             return !!__dom_is_connected(this.__id);
@@ -4535,7 +4581,7 @@
             rangesInsert(this, rangeIndex(c));
             syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
-            if (MO.length) moChildInsert(this, c);
+            moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             maybeLoadStylesheet(c);
@@ -4553,7 +4599,7 @@
             rangesInsert(this, rangeIndex(c));
             syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
-            if (MO.length) moChildInsert(this, c);
+            moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             maybeLoadStylesheet(c);
@@ -4567,7 +4613,7 @@
             if (!c || !rangeSame(rangeParent(c),this)) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
             rangesRemove(c, this, rangeIndex(c));
             if (c.__trustLN === "base") baseHrefCache = null;
-            if (MO.length) moChildRemove(this, c);
+            moChildRemove(this, c);
             if (CE.defs.size) ceDisconnect(c);
             __dom_detach(c.__id);
             destroyFrameNavigablesIn(c);
@@ -4596,12 +4642,14 @@
             rangesInsert(this, replacementIndex);
             syncWrapperSubtreeRetention(n.__id);
             if (CE.defs.size) ceDisconnect(old);
+            if (MO.length) moRetainTransient(this, old);
             __dom_detach(old.__id);
             destroyFrameNavigablesIn(old);
             syncWrapperSubtreeRetention(old.__id);
             slotQueueCheck(this);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
+            else moEnqueue();
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
             maybeLoadStylesheet(n);
@@ -5142,15 +5190,16 @@
         return parent && parent.nodeType === 1 ? parent : null;
     }
     function offsetBoxRect(element) {
-        try { return __dom_rect(element.__id); }
+        try { return __dom_rect(element.__id, 2); }
         catch (_) { return null; }
     }
     function clientBoxRect(element) {
-        const rect = offsetBoxRect(element);
+        let rect;
+        try { rect = __dom_rect(element.__id); } catch (_) { return null; }
         if (!rect) return null;
         const view = element.ownerDocument && element.ownerDocument.defaultView || g;
         const sx = rect[4] ? 0 : (view.scrollX || 0), sy = rect[4] ? 0 : (view.scrollY || 0);
-        return new DOMRect(rect[0] - sx, rect[1] - sy,
+        return createDOMRect(rect[0] - sx, rect[1] - sy,
             rect[2], rect[3]);
     }
     const offsetStyle = g.__dom_offset_style;
@@ -5183,6 +5232,15 @@
         if (!rect || !document || element === document.body) return 0;
         const parent = cssomOffsetParent(element);
         if (!parent) return Math.round(axis === "top" ? rect[1] : rect[0]);
+        // CSSWG resolution 2024-10-30, csswg-drafts#10549: a static BODY
+        // directly under the root remains offsetParent, but its children's
+        // offset origin is the root's BORDER edge. Positioned bodies still
+        // use their own padding edge. Transforms never enter either result.
+        if (parent === document.body && parent.parentNode === document.documentElement &&
+            (offsetStyle(parent.__id) & 3) === 0) {
+            const rootRect = offsetBoxRect(document.documentElement);
+            if (rootRect) return Math.round(axis === "top" ? rect[1] - rootRect[1] : rect[0] - rootRect[0]);
+        }
         const parentRect = offsetBoxRect(parent);
         if (!parentRect) return Math.round(axis === "top" ? rect[1] : rect[0]);
         const border = parseFloat(__dom_computed(parent.__id,
@@ -5318,7 +5376,7 @@
             if (this.__attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, v);
-            if (MO.length) moAttr(this, n, old);
+            moAttr(this, n, old);
             // DOM §4.2.2.4: changing a light child's `slot`, or a slot's
             // `name`, can change the assigned-node lists and must signal the
             // affected slots at the next microtask checkpoint.
@@ -5343,7 +5401,7 @@
             if (this.__attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, null);
-            if (MO.length) moAttr(this, n, old);
+            moAttr(this, n, old);
             if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
             // Removing src/srcdoc re-runs "process the iframe attributes".
             if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
@@ -5472,6 +5530,7 @@
             if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
             if (!MO.length) {
                 __dom_set_inner_html(this.__id, String(v));
+                if (removedRoots.length || __dom_children(this.__id).length) moEnqueue();
                 syncKnownWrapperRetention(removedWrapperIds, false);
                 baseHrefCache = null;
                 if (CE.defs.size) ceScan(this);
@@ -5521,17 +5580,18 @@
                 for (let i = 0; i < removed.length; i++) {
                     if (CE.defs.size) ceDisconnect(removed[i]);
                     destroyFrameNavigablesIn(removed[i]);
+                    if (MO.length) moRetainTransient(sr, removed[i]);
                     if (MO.length && moHasChildList) moNotify({
                         type: "childList", target: sr, removedNodes: [removed[i]],
                         previousSibling: null, nextSibling: removed[i + 1] || null,
                     });
+                    else moEnqueue();
                 }
                 slotQueueCheck(sr);
             }
             return sr;
         }
         get shadowRoot() {
-            if (CLOSED_SHADOW_HOSTS.has(this.__id)) return null;
             const root = this.__sr || wrap(__dom_shadow_root(this.__id));
             return root && root.__mode === "open" ? root : null;
         }
@@ -5827,10 +5887,8 @@
             if (this.localName === "html") {
                 return g.scrollTo(left, top);
             }
-            const maxLeft = Math.max(0, this.scrollWidth - this.clientWidth);
-            const maxTop = Math.max(0, this.scrollHeight - this.clientHeight);
-            left = Math.max(0, Math.min(maxLeft, left));
-            top = Math.max(0, Math.min(maxTop, top));
+            // CSSOM View clamps against the native scrolling area, including
+            // negative RTL/vertical ranges and non-scrollable overflow:clip.
             left = this.__snapInlinePosition(left, direction || 0);
             const changed = __dom_scroll_set(this.__id, top, left);
             if (!changed) return Promise.resolve();
@@ -5882,11 +5940,11 @@
             try { r = __dom_rect(this.__id); } catch (e) { r = null; }
             if (r) {
                 const left = r[0], top = r[1], width = r[2], height = r[3];
-                return new DOMRect(left, top, width, height);
+                return createDOMRect(left, top, width, height);
             }
             // CSSOM View §6: no associated layout box means an empty rectangle,
             // including for hidden/detached embedded and replaced elements.
-            return new DOMRect();
+            return createDOMRect();
         }
         // getBoundingClientRect/getClientRects are VIEWPORT-relative (CSSOM
         // View): the document-origin `__rect()` shifted up/left by the page
@@ -5896,7 +5954,7 @@
         // box move through the viewport, exactly as in a browser. `offset*` stays
         // document/offsetParent-relative (spec) — only the client rect shifts.
         getBoundingClientRect() {
-            return clientBoxRect(this) || new DOMRect();
+            return clientBoxRect(this) || createDOMRect();
         }
         getClientRects() { const r = clientBoxRect(this); return r ? [r] : []; }
         get offsetWidth() { const r = offsetBoxRect(this); return r ? Math.round(r[2]) : 0; }
@@ -5904,34 +5962,22 @@
         get offsetTop() { return cssomOffsetCoordinate(this, "top"); }
         get offsetLeft() { return cssomOffsetCoordinate(this, "left"); }
         get offsetParent() { return cssomOffsetParent(this); }
-        // The root element's client area IS the viewport (CSSOM View): a page
-        // reading `document.documentElement.clientHeight` to size against the
-        // window must get the viewport, not the full document height. Every
-        // other element reports its own laid-out box.
-        // client*/scroll* read the app-measured box geometry (px) when present
-        // (the region geometry round-trip), else fall back to the element rect —
-        // the pre-Phase-3 behaviour, so a non-region element is unchanged. The
-        // root element's client box IS the viewport (CSSOM View); its
-        // scrollHeight is the full document height (its rect, via the fallback).
+        // CSSOM View client* uses untransformed fragment padding/border edges,
+        // or the owning viewport for the standards root / quirks body. It must
+        // not depend on a terminal-cell or desktop-presentation round trip.
         get clientWidth() {
-            if (this.localName === "html") return Math.round(windowViewportDimension("width"));
-            const v = __dom_scroll_get(this.__id, 5);
-            return v !== null ? v : this.__rect().width;
+            return __dom_scroll_get(this.__id, 5);
         }
         get clientHeight() {
-            if (this.localName === "html") return Math.round(windowViewportDimension("height"));
-            const v = __dom_scroll_get(this.__id, 4);
-            return v !== null ? v : this.__rect().height;
+            return __dom_scroll_get(this.__id, 4);
         }
-        get clientTop() { return 0; }
-        get clientLeft() { return 0; }
+        get clientTop() { return __dom_scroll_get(this.__id, 6); }
+        get clientLeft() { return __dom_scroll_get(this.__id, 7); }
         get scrollWidth() {
-            const v = __dom_scroll_get(this.__id, 3);
-            return v !== null ? v : this.__rect().width;
+            return __dom_scroll_get(this.__id, 3);
         }
         get scrollHeight() {
-            const v = __dom_scroll_get(this.__id, 2);
-            return v !== null ? v : this.__rect().height;
+            return __dom_scroll_get(this.__id, 2);
         }
         // The root scroller mirrors the page scroll position (document.scrolling
         // Element === documentElement). Every other element owns a real scroll
@@ -5946,8 +5992,6 @@
         set scrollTop(v) {
             v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(g.scrollX || 0, v); return; }
-            const max = Math.max(0, this.scrollHeight - this.clientHeight);
-            if (v < 0) v = 0; else if (v > max) v = max;
             if (__dom_scroll_set(this.__id, v, this.scrollLeft)) queueElementScroll(this);
         }
         get scrollLeft() {
@@ -5957,8 +6001,6 @@
         set scrollLeft(v) {
             v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(v, g.scrollY || 0); return; }
-            const max = Math.max(0, this.scrollWidth - this.clientWidth);
-            if (v < 0) v = 0; else if (v > max) v = max;
             const direction = v > this.scrollLeft ? 1 : (v < this.scrollLeft ? -1 : 0);
             v = this.__snapInlinePosition(v, direction);
             if (__dom_scroll_set(this.__id, this.scrollTop, v)) queueElementScroll(this);
@@ -8114,7 +8156,7 @@
             s = String(s);
             __dom_set_text(this.__id, d.slice(0, o) + s + d.slice(o + c));
             rangesReplaceData(this, o, c, s.length);
-            if (MO.length) moCharData(this, d);
+            moCharData(this, d);
         }
     }
     class Text extends CharacterData {
@@ -8343,22 +8385,24 @@
             if (!(this instanceof Document)) {
                 throw new TypeError("Illegal invocation");
             }
-            if (!(node instanceof Node)) {
+            const nodeId = __dom_node_identity(node);
+            if (nodeId === null) {
                 throw new TypeError("Failed to execute 'adoptNode': parameter 1 is not of type 'Node'");
             }
-            if (node.nodeType === 9) {
+            if (__dom_node_type(nodeId) === 9) {
                 throw new DOMException("The node is a document", "NotSupportedError");
             }
-            if (node instanceof ShadowRoot) {
+            if (__dom_shadow_info(nodeId)) {
                 throw new DOMException("The node is a shadow root", "HierarchyRequestError");
             }
-            const oldId = __dom_adopt(this.__id, node.__id);
+            const previous = __dom_owner_document(node);
+            const oldDocument = previous && typeof previous === "object" ? previous : wrap(previous);
+            const oldId = __dom_adopt(this.__id, nodeId);
             if (oldId === -3) throw new TypeError("Illegal invocation");
             if (oldId === -4) throw new DOMException("The node is a document", "NotSupportedError");
             if (oldId === -5) throw new DOMException("The node is a shadow root", "HierarchyRequestError");
             if (oldId < 0) throw new TypeError("The node is not valid");
             syncWrapperSubtreeRetention(node.__id);
-            const oldDocument = wrap(oldId);
             if (oldDocument !== this) ceAdopt(node, oldDocument, this);
             return node;
         }
@@ -8395,8 +8439,7 @@
                 throw new DOMException("The tag name is not a valid element local name.", "InvalidCharacterError");
             }
             const namespace = isHTML || this.contentType === "application/xhtml+xml" ? HTML_NS : null;
-            const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName), localName, namespace, null);
-            if (this.__id !== 0 && __dom_node_type(this.__id) === 9) this.adoptNode(el);
+            const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName, this.__id), localName, namespace, null);
             // HTML's script-element creation steps give dynamically created
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
@@ -8415,10 +8458,9 @@
             const extracted = validateAndExtractElementName(namespace, qualifiedName);
             const localName = extracted[2];
             const el = newElementWrapper(
-                __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName),
+                __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName, this.__id),
                 localName, extracted[0], extracted[1]
             );
-            if (this.__id !== 0 && __dom_node_type(this.__id) === 9) this.adoptNode(el);
             if (extracted[0] === HTML_NS && localName === "script") el.__trustForceAsync = true;
             if (extracted[0] === HTML_NS) {
                 const ctor = CE.defs.get(localName);
@@ -8427,12 +8469,10 @@
             return el;
         }
         createTextNode(s) {
-            const node = wrap(__dom_create_text(s === undefined ? "" : String(s)));
-            return this.__id === 0 ? node : this.adoptNode(node);
+            return wrap(__dom_create_text(s === undefined ? "" : String(s), this.__id));
         }
         createComment(s) {
-            const node = wrap(__dom_create_comment(s === undefined ? "" : String(s)));
-            return this.__id === 0 ? node : this.adoptNode(node);
+            return wrap(__dom_create_comment(s === undefined ? "" : String(s), this.__id));
         }
         // A detached Attr (DOM §4.9.2): a plain object matching what the
         // `attributes` NamedNodeMap yields, so setAttributeNode can consume it.
@@ -8465,6 +8505,7 @@
                     throw new DOMException("Unsupported custom element registry", "NotSupportedError");
             }
             const clone = n.cloneNode(subtree);
+            if (__dom_owner_document(clone.__id) !== this.__id) this.adoptNode(clone);
             // `cloneNode` has completed the whole subtree now, matching the
             // clone algorithm's reaction boundary: constructors run in tree
             // order, against the complete clone, but connectedCallback waits
@@ -8491,7 +8532,9 @@
         }
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
-        createDocumentFragment() { return wrap(__dom_create_fragment()); }
+        createDocumentFragment() {
+            return wrap(__dom_create_fragment(this.__id));
+        }
         createRange() { return new Range(); }
         getElementById(i) {
             // `__dom_get_by_id` scans the LIVE tree; a detached parsed document
@@ -8535,52 +8578,61 @@
     // the Document boundary, never at the embedding iframe element.
     class FrameDocument extends Document {
         constructor(frameEl) {
-            super(frameEl.__id);
+            super(__dom_frame_document(frameEl.__id));
             cookieDocuments.set(this, [frameEl.__id, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
             this.__frame = frameEl;
+            const url = frameEl === realmRootFrame ? String(cfg.url) : frameURLFor(frameEl);
+            documentURLs.set(this, url);
+            const inheritedBase = frameEl === realmRootFrame ? cfg.aboutBaseURL : frameAboutBaseURLs.get(frameEl);
+            this.__fallbackBaseURL = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(url) && inheritedBase
+                ? inheritedBase : url;
             documentReferrers.set(this, frameEl === realmRootFrame
                 ? configuredReferrer : frameReferrers.get(frameEl) || "");
             documentContentTypes.set(this, frameEl === realmRootFrame
                 ? cfg.documentContentType || "text/html" : "text/html");
-            // Nested documents share the native arena, so the iframe element
-            // is their subtree root for host scans (custom-element upgrade,
-            // wrapper retention, and similar document-scoped algorithms).
+            // Sharing an arena does not share identity: this native Document is the root for
+            // document-scoped operations, while __frame retains the navigable/viewport owner.
+            return rememberWrapper(this.__id, this);
         }
         // The content navigable's document element, found live in the arena.
-        // `processIframeAttributes` installs real <html> content for src/srcdoc
-        // frames; an unscripted about:blank frame gets an empty skeleton on
-        // first access so `document.write` has a <body> to write into. (Found,
-        // not cached, so it stays correct after a (re)navigation replaces it.)
+        // Initial about:blank and navigations both install a populated native Document.
+        // Lookup remains live for authored removal/replacement of its document element.
         get documentElement() {
             // The iframe Element belongs to the parent Realm. Calling its
             // `childNodes` getter would therefore manufacture every nested
             // node wrapper with the parent's interface prototypes. Resolve
             // native ids here and wrap them in this Document's Realm instead.
-            const kids = __dom_children(this.__frame.__id).map(wrap);
+            const kids = __dom_children(this.__id).map(wrap);
             for (let i = 0; i < kids.length; i++) {
                 const c = kids[i];
                 if (c.nodeType === 1 && c.localName === "html") return c;
             }
-            const rootDocument = wrap(0);
-            const html = rootDocument.createElement("html");
-            html.appendChild(rootDocument.createElement("head"));
-            html.appendChild(rootDocument.createElement("body"));
-            this.__frame.appendChild(html);
-            return html;
+            return null;
         }
-        get head() { return this.documentElement.querySelector("head") || this.documentElement; }
-        get body() { return this.documentElement.querySelector("body") || this.documentElement; }
-        get defaultView() { return trust.__activeFrame === this.__frame ? g : this.__frame.contentWindow; }
+        get head() { return this.documentElement?.querySelector("head") || null; }
+        get body() { return this.documentElement?.querySelector("body, frameset") || null; }
+        get defaultView() {
+            if (this.__destroyed) return null;
+            return trust.__activeFrame === this.__frame ? g : this.__frame.contentWindow;
+        }
         get readyState() { return this.__frame.__trustReadyState || "complete"; }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
-        get location() { return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location; }
-        get URL() { return this.location.href; }
-        get documentURI() { return this.location.href; }
+        get location() {
+            if (__dom_frame_document(this.__frame.__id) !== this.__id || !this.__frame.isConnected) return null;
+            return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location;
+        }
+        get URL() { return documentURLs.get(this); }
+        get documentURI() { return this.URL; }
         get referrer() { return documentReferrers.get(this) || ""; }
         // Parent-side access must use this child document's base rather than
         // the currently active page scope.
-        get baseURI() { return frameBaseURL(this.__frame); }
+        get baseURI() {
+            const base = this.querySelector("base[href]");
+            const fallback = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(this.URL) ? this.__fallbackBaseURL : this.URL;
+            const parsed = base && __url_parse(base.getAttribute("href"), fallback);
+            return parsed ? parsed[0] : fallback;
+        }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
         open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
         get currentScript() {
@@ -8590,20 +8642,18 @@
         write(...text) { documentWrite(this, text, false); }
         writeln(...text) { documentWrite(this, text, true); }
         close() {}
-        // These constructors must route to the canonical top document. While
-        // a child scope is active, the bare `document` binding is THIS
-        // FrameDocument; delegating through it would recurse forever on the
-        // first `document.createElement()` (reCAPTCHA creates its checkbox
-        // subtree this way).
-        createElement(t) { return wrap(0).createElement(t); }
+        // DOM #concept-node-document is established before custom-element constructors run.
+        // Invoke the ordinary Document algorithm with this native child Document, never the
+        // top Document: detached nodes and their shadow roots already belong to this realm.
+        createElement(t) { return Document.prototype.createElement.apply(this, arguments); }
         createElementNS(namespace, qualifiedName) {
             return Document.prototype.createElementNS.call(this, namespace, qualifiedName);
         }
-        createTextNode(s) { return wrap(0).createTextNode(s); }
-        createComment(s) { return wrap(0).createComment(s); }
+        createTextNode(s) { return Document.prototype.createTextNode.apply(this, arguments); }
+        createComment(s) { return Document.prototype.createComment.apply(this, arguments); }
         createAttribute(n) { return wrap(0).createAttribute(n); }
         createAttributeNS(ns, n) { return wrap(0).createAttributeNS(ns, n); }
-        createDocumentFragment() { return wrap(0).createDocumentFragment(); }
+        createDocumentFragment() { return Document.prototype.createDocumentFragment.call(this); }
         // DOM §4.5: clone into this Document, preserving the requested
         // subtree and applying this realm's fallback custom-element registry.
         // The native arena is shared, but the Document operation and reaction
@@ -8771,6 +8821,8 @@
         return fallback;
     }
     function nodeBaseHref(node) {
+        const document = node && __dom_owner_document(node);
+        if (document && typeof document === "object" && document.__frame) return document.baseURI;
         const owner = frameOwnerForNode(node);
         return (owner || null) === (trust.__activeFrame || null)
             ? baseHref() : documentBaseURL(owner);
@@ -9292,7 +9344,7 @@
                 finishLoad();
             }
             function startResource(script, settled) {
-                SCRIPTS_STARTED.add(script.__id);
+                SCRIPTS_STARTED.add(script);
                 pendingResources++;
                 waitForFrameResource(script, function () {
                     __dom_run_injected_script(script.__id);
@@ -9304,7 +9356,7 @@
                 });
             }
             function runInline(script) {
-                SCRIPTS_STARTED.add(script.__id);
+                SCRIPTS_STARTED.add(script);
                 try {
                     // ScriptEvaluation retains the Realm's global lexical
                     // environment across sibling classic script elements.
@@ -9322,7 +9374,7 @@
                 if (!active()) return;
                 for (; index < scripts.length; index++) {
                     const script = scripts[index];
-                    if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id)) continue;
+                    if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script)) continue;
                     const type = (script.getAttribute("type") || "").trim().toLowerCase();
                     if (type === "importmap") {maybeRunScript(script);continue;}
                     const module = type === "module";
@@ -9366,7 +9418,7 @@
             }
             if (!needsResourceTasks) {
                 for (const script of scripts) {
-                    if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id) ||
+                    if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script) ||
                         (script.hasAttribute('nomodule')&&(script.getAttribute('type')||'').trim().toLowerCase()!=='importmap')) continue;
                     const type = (script.getAttribute('type') || '').trim().toLowerCase();
                     if(type==='importmap') {maybeRunScript(script);continue;}
@@ -9921,9 +9973,11 @@
             activeWindowState(), frame === realmRootFrame ? null : frame
         );
     }
-    // Scopes (document / shadow roots) that ever adopted sheets, so a
-    // later replaceSync() re-pushes their joined text to the cascade.
-    const adoptedScopes = [];
+    // A sheet mutation updates live adopting scopes; it must not keep every detached shadow
+    // tree or retired Document alive. Finalization also bounds metadata when sheets never mutate.
+    const adoptedScopes = new Set();
+    const adoptedScopeReferences = new WeakMap();
+    const adoptedScopeFinalizer = new FinalizationRegistry(reference => adoptedScopes.delete(reference));
     // CSSOM adoptedStyleSheets and Web IDL observable-array operations:
     // indexed mutation changes the active sheet list just like assignment.
     function adoptedArray(scope) {
@@ -9980,7 +10034,12 @@
         for (const sheet of sheets) array.push(sheet);
     }
     const adoptedSync = (scope) => {
-        if (!adoptedScopes.includes(scope)) adoptedScopes.push(scope);
+        if (!adoptedScopeReferences.has(scope)) {
+            const reference = new WeakRef(scope);
+            adoptedScopeReferences.set(scope, reference);
+            adoptedScopes.add(reference);
+            adoptedScopeFinalizer.register(scope, reference);
+        }
         const sheets = [];
         for (const s of scope.__adopted || []) {
             if (s) sheets.push([s.__appliedText || "", s.__baseURL || scope.baseURI || g.document.baseURI]);
@@ -9988,7 +10047,9 @@
         cssOp("adopted-sheets", String(scope.__id), JSON.stringify(sheets));
     };
     const sheetSync = (sheet) => {
-        for (const scope of adoptedScopes) {
+        for (const reference of adoptedScopes) {
+            const scope = reference.deref();
+            if (!scope) { adoptedScopes.delete(reference); continue; }
             if ((scope.__adopted || []).includes(sheet)) adoptedSync(scope);
         }
     };
@@ -10293,6 +10354,9 @@
         constructor(options = {}) {
             this.__children = []; this.__list = new CSSRuleList(this.__children);
             this.__constructorDocument = g.document.__id;
+            // CSSOM's constructor document is an associated Document, not merely an arena
+            // number. A surviving sheet keeps this Document across Window reuse/navigation.
+            this.__constructorDocumentObject = g.document;
             this.__baseURL = g.document.baseURI;
             if (options.baseURL != null) {
                 try { this.__baseURL = new URL(domString(options.baseURL), this.__baseURL).href; } catch (_) {}
@@ -11378,6 +11442,7 @@
         // rewrites, but not a pending cross-document Location navigation.
         const cookieSlot = cookieDocuments.get(g.document);
         if (documentChanged && cookieSlot) cookieSlot[3] = p[0];
+        if (documentChanged) documentURLs.set(g.document, p[0]);
         baseHrefCache = null; // the base resolves against location.href
     };
     const withoutHash = (u) => {
@@ -12408,13 +12473,14 @@
     // that scripts read through getRangeAt(), so native insertion and editor
     // code agree on the caret. Geometry remains supplied by layout elsewhere.
     // DOM #concept-live-range: mutations update every surviving Range, not
-    // only the current Selection. Weak references do not retain discarded
-    // ranges or their detached trees for the lifetime of a page.
-    const rangeFinalizer = new FinalizationRegistry(reference => liveRanges.delete(reference));
+    // only the current Selection. Native weak discovery has no Realm-specific
+    // WeakRef.prototype edge, and the temporary snapshot owns its values until
+    // this mutation finishes. Destroying a navigable does not delete a live
+    // retained Range or stop updates to its detached Document.
     function updateLiveRanges(boundary) {
-        for (const reference of liveRanges) {
-            const range = reference.deref();
-            if (!range) { liveRanges.delete(reference); continue; }
+        const ranges = snapshotLiveRanges();
+        if (!ranges) return;
+        for (const range of ranges) {
             const start = boundary(range.startContainer, range.startOffset);
             const end = boundary(range.endContainer, range.endOffset);
             if (start[0] === range.startContainer && start[1] === range.startOffset &&
@@ -12490,9 +12556,7 @@
             this.startContainer = g.document; this.endContainer = g.document;
             this.startOffset = 0; this.endOffset = 0; this.collapsed = true;
             this.commonAncestorContainer = g.document;
-            const reference = new WeakRef(this);
-            liveRanges.add(reference);
-            rangeFinalizer.register(this, reference);
+            registerLiveRange(this);
         }
         __upd() {
             this.collapsed = this.startContainer === this.endContainer && this.startOffset === this.endOffset;
@@ -12702,7 +12766,17 @@
     // (not a JS parent walk — trap #9).
     //
     // MO and each observer's registration list are arrays in registration order.
-    const MO = [];               // live observers (each with a per-observer record queue)
+    // DOM #interface-mutationobserver: node lists are weak; each live node's
+    // registered-observer list owns its observers. The native graph records
+    // that direction, and only the pending-delivery set is an agent root.
+    const MO = [];               // WeakRefs in registration order
+    const moPending = new Set();
+    let moRegistrationSequence = 0;
+    const moFinalizer = new FinalizationRegistry(reference => {
+        const index = MO.indexOf(reference);
+        if (index >= 0) MO.splice(index, 1);
+        moRecomputeKinds();
+    });
     const MO_EMPTY = Object.freeze([]); // shared empty addedNodes/removedNodes (frozen ⇒ safe to share)
     let moHasChildList = false;
     let moHasAttributes = false;
@@ -12725,7 +12799,9 @@
     function moRecomputeKinds() {
         moHasChildList = moHasAttributes = moHasCharacterData = false;
         for (let i = 0; i < MO.length; i++) {
-            const regs = MO[i].__targets;
+            const observer = MO[i].deref();
+            if (!observer) { MO.splice(i--, 1); continue; }
+            const regs = observer.__targets;
             for (let j = 0; j < regs.length; j++) {
                 const r = regs[j];
                 moHasChildList = moHasChildList || r.childList;
@@ -12740,18 +12816,25 @@
         if (moDisabled) return;
         if (++moChain > MO_CHAIN_CAP) {
             moDisabled = true;
-            for (let i = 0; i < MO.length; i++) MO[i].__records = [];
+            for (const observer of moPending) observer.__records = [];
+            moPending.clear();
             trust.errors.push("MutationObserver: delivery exceeded " + MO_CHAIN_CAP +
                 " microtask turns (observer loop?) — disabled for this page");
             return;
         }
-        // Snapshot the observer list: a callback may observe/disconnect mid-loop.
-        const obs = MO.slice();
+        // DOM #notify-mutation-observers snapshots/empties the pending set,
+        // not the registration list; a callback may enqueue another turn.
+        const obs = Array.from(moPending);
+        moPending.clear();
         for (let i = 0; i < obs.length; i++) {
             const o = obs[i];
-            if (!o.__records.length) continue;
             const recs = o.__records;
             o.__records = [];
+            if (o.__targets.some(reg => reg.source)) {
+                o.__targets = o.__targets.filter(reg => !reg.source);
+                moRetainTargets(o);
+            }
+            if (!recs.length) continue;
             try { o.__cb(recs, o); }
             catch (e) { trust.errors.push("MutationObserver callback: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         }
@@ -12770,13 +12853,13 @@
     // "childList" | "attributes" | "characterData"; oldValue is nulled per
     // observer unless one of its matching registrations asked for it (spec).
     function moNotify(rec) {
-        // 1-entry cache for the subtree ancestor test within THIS mutation:
-        // multiple subtree observers commonly share a root (Steam registers 3
-        // separate `#document subtree` observers), and they are scanned
-        // consecutively, so the same `__dom_contains(root, target)` was run
-        // once per observer. Caching the last (rootId -> result) collapses
-        // those identical syscalls to one — no allocation, no semantic change.
-        let cAid = null, cRes = false;
+        // DOM #queue-a-mutation-record visits inclusive ancestors, then each
+        // node's registrations. Creation order of observers is not delivery
+        // order. Snapshot IDs without materializing ancestor wrappers.
+        const ancestors = [rec.target.__id];
+        for (let id = __dom_parent(rec.target.__id); id !== null; id = __dom_parent(id))
+            ancestors.push(id);
+        const interested = [];
         // Deferred sibling capture: an insert/remove passes `__sib` (the node)
         // instead of pre-read `previousSibling`/`nextSibling`. We resolve them
         // ONCE, lazily, at the first matching observer — so a childList mutation
@@ -12790,28 +12873,33 @@
         // and the inner loop is per (observer × registration), so re-comparing
         // the `rec.type` string each iteration was the bulk of its cost.
         const isCL = rec.type === "childList", isAttr = rec.type === "attributes";
-        let matchedAny = false;
         for (let i = 0; i < MO.length; i++) {
-            const o = MO[i], regs = o.__targets;
-            let matched = false, wantOld = false;
+            const o = MO[i].deref();
+            if (!o) { MO.splice(i--, 1); continue; }
+            const regs = o.__targets;
+            let matched = false, wantOld = false, rank = Infinity, order = Infinity;
             for (let j = 0; j < regs.length; j++) {
                 const opts = regs[j];
+                const target = opts.target.deref();
+                if (!target) { regs.splice(j--, 1); continue; }
                 if (isCL ? !opts.childList : isAttr ? !opts.attributes : !opts.characterData) continue;
-                let hit = opts.target === rec.target;
-                if (!hit && opts.subtree) {
-                    const aid = opts.target.__id;
-                    if (aid === cAid) hit = cRes;
-                    else { cRes = moIsAncestor(opts.target, rec.target); cAid = aid; hit = cRes; }
-                }
-                if (!hit) continue;
+                const distance = ancestors.indexOf(opts.id);
+                if (distance < 0 || (distance !== 0 && !opts.subtree)) continue;
                 if (isAttr && opts.attributeFilter &&
                     opts.attributeFilter.indexOf(rec.attributeName) < 0) continue;
                 matched = true;
+                if (distance < rank || (distance === rank && opts.order < order)) {
+                    rank = distance; order = opts.order;
+                }
                 if ((isAttr && opts.attributeOldValue) ||
-                    (!isCL && !isAttr && opts.characterDataOldValue)) { wantOld = true; break; }
+                    (!isCL && !isAttr && opts.characterDataOldValue)) wantOld = true;
             }
             if (!matched) continue;
-            matchedAny = true;
+            interested.push({observer: o, wantOld, rank, order});
+        }
+        interested.sort((a, b) => a.rank - b.rank || a.order - b.order);
+        for (const entry of interested) {
+            const o = entry.observer;
             if (rec.__sib !== undefined && !sibDone) {
                 sibDone = true;
                 const s = rec.__sib;
@@ -12827,20 +12915,20 @@
                 nextSibling: rec.__sib !== undefined ? nextSib : (rec.nextSibling || null),
                 attributeName: rec.attributeName || null,
                 attributeNamespace: null,
-                oldValue: wantOld ? (rec.oldValue === undefined ? null : rec.oldValue) : null,
+                oldValue: entry.wantOld ? (rec.oldValue === undefined ? null : rec.oldValue) : null,
             });
+            moPending.add(o);
         }
-        // DOM Standard §4.3.2 queues the mutation-observer microtask when a
-        // record is actually queued. An observer registry can be non-empty
-        // while every registration filters out this mutation; avoid creating
-        // a needless Promise reaction in that case.
-        if (matchedAny) moEnqueue();
+        // The algorithm queues the shared microtask even if the interested
+        // observer map is empty. A later mutation in this job must retain its
+        // position relative to intervening Promise jobs.
+        moEnqueue();
     }
 
     // Emission helpers used by the mutation wrappers. Each bails on the
     // zero-observer fast path before touching the DOM for siblings/oldValue.
     function moChildInsert(parent, node) {        // call AFTER the insert
-        if (!MO.length || !moHasChildList) return;
+        if (!MO.length || !moHasChildList) { moEnqueue(); return; }
         // `__sib: node` defers prev/next-sibling capture into moNotify (resolved
         // only if some observer matches — see there). Was: eager
         // `previousSibling: node.previousSibling, …`, 2 syscalls + 2 wraps on
@@ -12848,23 +12936,50 @@
         moNotify({ type: "childList", target: parent, addedNodes: [node], __sib: node });
     }
     function moChildRemove(parent, node) {        // call BEFORE the detach
-        if (!MO.length || !moHasChildList) return;
+        if (!MO.length) { moEnqueue(); return; }
+        moRetainTransient(parent, node);
+        if (!moHasChildList) { moEnqueue(); return; }
         moNotify({ type: "childList", target: parent, removedNodes: [node], __sib: node });
     }
     function moChildBulk(target, removed, added) { // innerHTML / textContent / insertAdjacentHTML
-        if (!MO.length || !moHasChildList) return;
+        if (!MO.length) { moEnqueue(); return; }
+        for (const node of removed) moRetainTransient(target, node);
+        if (!moHasChildList) { moEnqueue(); return; }
         if (!removed.length && !added.length) return;
         moNotify({ type: "childList", target, addedNodes: added, removedNodes: removed });
     }
     function moAttr(target, name, oldValue) {
-        if (!MO.length || !moHasAttributes) return;
+        if (!MO.length || !moHasAttributes) { moEnqueue(); return; }
         moNotify({ type: "attributes", target, attributeName: name, oldValue });
     }
     function moCharData(target, oldValue) {
-        if (!MO.length || !moHasCharacterData) return;
+        if (!MO.length || !moHasCharacterData) { moEnqueue(); return; }
         moNotify({ type: "characterData", target, oldValue });
     }
 
+    function moRetainTargets(observer) {
+        observer.__targets = observer.__targets.filter(reg => reg.target.deref() !== undefined);
+        __dom_observer_targets(observer, Array.from(new Set(observer.__targets.map(reg => reg.id))));
+    }
+    function moRetainTransient(parent, removed) {
+        for (let i = 0; i < MO.length; i++) {
+            const observer = MO[i].deref();
+            if (!observer) { MO.splice(i--, 1); continue; }
+            const regs = observer.__targets;
+            const length = regs.length;
+            let added = false;
+            for (let j = 0; j < length; j++) {
+                const source = regs[j], target = source.target.deref();
+                if (!source.subtree || !target || !(target === parent || moIsAncestor(target, parent))) continue;
+                regs.push(Object.assign({}, source, {target: new WeakRef(removed), id: removed.__id,
+                    source, order: ++moRegistrationSequence}));
+                added = true;
+            }
+            if (added) {
+                moRetainTargets(observer);
+            }
+        }
+    }
     g.MutationObserver = class MutationObserver {
         constructor(cb) {
             if (typeof cb !== "function")
@@ -12873,6 +12988,8 @@
             this.__windowState = activeWindowState();
             this.__records = [];
             this.__targets = []; // array of registrations: { target, childList, … }
+            this.__reference = new WeakRef(this);
+            moFinalizer.register(this, this.__reference);
         }
         observe(target, options) {
             if (!target || typeof target.__id !== "number")
@@ -12899,20 +13016,29 @@
                 throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
             // Re-observing the same node REPLACES its options (spec). Records
             // already queued for this observer survive (not the registration).
-            const reg = { target, childList, attributes, characterData, subtree,
+            const reg = { target: new WeakRef(target), id: target.__id, order: ++moRegistrationSequence,
+                childList, attributes, characterData, subtree,
                 attributeOldValue, characterDataOldValue, attributeFilter };
             let replaced = false;
             for (let i = 0; i < this.__targets.length; i++) {
-                if (this.__targets[i].target === target) { this.__targets[i] = reg; replaced = true; break; }
+                if (!this.__targets[i].source && this.__targets[i].target.deref() === target) {
+                    const source = this.__targets[i];
+                    reg.order = source.order;
+                    this.__targets[i] = reg;
+                    this.__targets = this.__targets.filter(entry => entry.source !== source);
+                    replaced = true; break;
+                }
             }
             if (!replaced) this.__targets.push(reg);
-            if (MO.indexOf(this) < 0) MO.push(this);
+            if (MO.indexOf(this.__reference) < 0) MO.push(this.__reference);
+            moRetainTargets(this);
             moRecomputeKinds();
         }
         disconnect() {
             this.__targets = [];
             this.__records = [];
-            const i = MO.indexOf(this);
+            __dom_observer_targets(this, []);
+            const i = MO.indexOf(this.__reference);
             if (i >= 0) MO.splice(i, 1);
             moRecomputeKinds();
         }
@@ -13221,6 +13347,10 @@
         // viewport. Do not retain its former dimensions when it is hidden.
         if (!Number.isFinite(w) || !Number.isFinite(h) || w < 0 || h < 0) return;
         if (w === windowViewportWidth && h === windowViewportHeight) return;
+        // Keep the canonical layout/media viewport and private Window state
+        // in one resize transaction, before author resize listeners run.
+        // Child viewport geometry is owned by its embedding fragment.
+        if (!realmRootFrame && !trust.__activeFrame) setLayoutViewport(w, h);
         windowViewportWidth = w; windowViewportHeight = h;
         try { dispatch(g, new Event("resize"), false); }
         catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
@@ -13248,9 +13378,9 @@
     trust.hasScrollWork = function () {
         if (IO.length) return true;
         if (activeWindowState().hasElementScrollListener) return true;
-        const wm = LS.get(listenerRegistryTarget(g));
+        const wm = getListenerMap(listenerRegistryTarget(g));
         if (wm) { const l = wm.get("scroll"); if (l && l.length) return true; }
-        const dm = LS.get(g.document);
+        const dm = getListenerMap(g.document);
         if (dm) { const l = dm.get("scroll"); if (l && l.length) return true; }
         return typeof g.onscroll === "function";
     };
@@ -17943,6 +18073,10 @@
         const PlatformException = G.DOMException || Error;
         const imageState = value => apply(weakGet, imageSlots, [value]);
         let bitmapCodec;
+        const rectangleCodec = G.__geometry_codec;
+        delete G.__geometry_codec;
+        const rectangleState = rectangleCodec[0], cloneMutableRect = rectangleCodec[1];
+        const cloneReadonlyRect = rectangleCodec[2];
         G.__sc_bitmap_codec = api => { bitmapCodec = api; };
         const messagePortBrand = G.__message_port_brand;
         delete G.__message_port_brand;
@@ -18084,6 +18218,11 @@
             return ["r", idx];
         }
         function encObj(v, heap, seen, forStorage) {
+            const rectangle = rectangleState(v);
+            if (rectangle === undefined) throw dce("A Proxy");
+            if (rectangle) return [rectangle[0] ? "DR" : "DRO",
+                enc(rectangle[1], heap, seen, forStorage), enc(rectangle[2], heap, seen, forStorage),
+                enc(rectangle[3], heap, seen, forStorage), enc(rectangle[4], heap, seen, forStorage)];
             if (messagePortBrand && messagePortBrand(v)) throw dce("An untransferred MessagePort");
             if (wasmClone) {
                 const module = wasmClone.serialize(v, forStorage);
@@ -18170,6 +18309,9 @@
                     if (!wasmClone) throw dce("A WebAssembly.Module");
                     return wasmClone.deserialize(node);
                 case "D": return new Date(node[1]);
+                case "DR": case "DRO":
+                    return (node[0] === "DR" ? cloneMutableRect : cloneReadonlyRect)(
+                        decRef(node[1]), decRef(node[2]), decRef(node[3]), decRef(node[4]));
                 case "R": return new RegExp(node[1], node[2]);
                 case "M": return new Map();
                 case "S": return new Set();

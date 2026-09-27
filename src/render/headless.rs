@@ -38,6 +38,7 @@ pub fn render_paint(page: &super::PagePaint, viewport: CssSize) -> Result<OwnedR
         page_size: CssSize::default(),
     };
     scene.append_page(page, CssPoint::default());
+    scene.append_browser_media(page, CssPoint::default(), 0.);
     VelloCpuRenderer::new().render_rgba(&scene)
 }
 
@@ -119,6 +120,7 @@ pub fn scene_for_dom(
         page_size: CssSize::default(),
     };
     scene.append_page(&layout.paint, CssPoint::default());
+    scene.append_browser_media(&layout.paint, CssPoint::default(), 0.);
     scene
 }
 

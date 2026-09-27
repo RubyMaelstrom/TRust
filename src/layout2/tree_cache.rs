@@ -2,7 +2,7 @@
 //!
 //! A hit shares immutable children, not a deep copy or an old DOM. Parent
 //! reconstruction still performs anonymous-box generation and itemization.
-//! The builder's input/output list state and table nesting are explicit: a
+//! The builder's input/output list state is explicit: a
 //! sibling's counter mutation may change this subtree without restyling it.
 
 use super::tree::{Atom, AtomKind, BoxNode, Built, Content, Inline};
@@ -13,23 +13,24 @@ use std::mem::size_of;
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENTRIES: usize = 8192;
 
+mod ownership;
+
 struct Entry {
     before: Vec<(i64, i64)>,
     after: Vec<(i64, i64)>,
-    depth: usize,
     built: Built,
     bytes: usize,
-    used: u64,
+    payload: ownership::Payload,
 }
 
-/// Account shared ownership conservatively: a subtree reachable from two
-/// entries is counted twice. Thus eviction cannot hide a retained old tree.
-/// This is a bounded requested-storage estimate, not allocator/RSS accounting.
+/// Cache entries and their transitive shared allocations are accounted once.
+/// This bounds requested cache storage, not allocator/RSS or other owners.
 #[derive(Default)]
 pub(crate) struct BoxTreeCache {
     entries: FxHashMap<NodeId, Entry>,
     bytes: usize,
-    clock: u64,
+    ownership: ownership::Ownership,
+    recency: super::cache_order::Recency,
     pub(super) hits: usize,
     pub(super) builds: usize,
 }
@@ -37,31 +38,36 @@ pub(crate) struct BoxTreeCache {
 impl BoxTreeCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.ownership.clear();
+        self.recency.clear();
         self.bytes = 0;
     }
 
     pub(crate) fn invalidate(&mut self, node: NodeId) {
+        self.recency.remove(node);
         if let Some(entry) = self.entries.remove(&node) {
             self.bytes -= entry.bytes;
+            self.ownership.release(entry.payload);
         }
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.bytes + self.entries.capacity() * size_of::<(NodeId, Entry)>()
+        self.bytes
+            + self.ownership.retained_bytes()
+            + self.entries.capacity() * size_of::<(NodeId, Entry)>()
+            + self.recency.retained_bytes()
     }
 
     pub(super) fn get(
         &mut self,
         node: NodeId,
         lists: &[(i64, i64)],
-        depth: usize,
     ) -> Option<(Built, Vec<(i64, i64)>)> {
-        self.clock = self.clock.wrapping_add(1);
         let entry = self.entries.get_mut(&node)?;
-        if entry.depth != depth || entry.before != lists {
+        if entry.before != lists {
             return None;
         }
-        entry.used = self.clock;
+        self.recency.touch(node);
         self.hits += 1;
         Some((entry.built.clone(), entry.after.clone()))
     }
@@ -70,38 +76,39 @@ impl BoxTreeCache {
         &mut self,
         node: NodeId,
         before: Vec<(i64, i64)>,
-        depth: usize,
         after: &[(i64, i64)],
         built: &Built,
     ) {
         self.builds += 1;
         self.invalidate(node);
         let after = after.to_vec();
+        let built = built.clone();
+        let previous_bytes = self.ownership.retained_bytes();
+        let payload = self.ownership.retain(&built);
         let bytes =
-            built_bytes(built) + (before.capacity() + after.capacity()) * size_of::<(i64, i64)>();
-        if bytes > MAX_BYTES / 4 {
+            payload.bytes + (before.capacity() + after.capacity()) * size_of::<(i64, i64)>();
+        // One oversized addition must not flush every unrelated cache entry.
+        // Reject based on actual newly retained storage, not duplicated
+        // descendant size or an arbitrary fraction of the cache budget.
+        if bytes + self.ownership.retained_bytes() - previous_bytes > MAX_BYTES {
+            self.ownership.release(payload);
+            self.ownership.compact();
             return;
         }
-        self.clock = self.clock.wrapping_add(1);
         self.entries.insert(
             node,
             Entry {
                 before,
                 after,
-                depth,
-                built: built.clone(),
+                built,
                 bytes,
-                used: self.clock,
+                payload,
             },
         );
         self.bytes += bytes;
+        self.recency.touch(node);
         while self.retained_bytes() > MAX_BYTES || self.entries.len() > MAX_ENTRIES {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(id, _)| *id)
-            else {
+            let Some(oldest) = self.recency.oldest() else {
                 break;
             };
             self.invalidate(oldest);
@@ -163,17 +170,6 @@ pub(super) fn box_bytes(b: &BoxNode) -> usize {
                     + t.cells.iter().map(|c| box_bytes(&c.b)).sum::<usize>()
             }
         }
-}
-
-fn built_bytes(b: &Built) -> usize {
-    match b {
-        Built::Block(b) => box_bytes(b),
-        Built::Inline(i) => inline_bytes(i),
-        Built::Hoist(bs) => {
-            bs.capacity() * size_of::<Built>() + bs.iter().map(built_bytes).sum::<usize>()
-        }
-        Built::Skip => 0,
-    }
 }
 
 #[cfg(test)]
@@ -323,6 +319,37 @@ mod tests {
       .wide {font-size:25px;padding:9px;color:blue}
     </style><main><section id=changing><article id=list><b id=first>first</b><i id=second>second</i></article><aside id=emptiness>empty state</aside></section>
     <section id=stable><article><a href=/next>linked text</a><span>another item</span></article></section></main>"#;
+
+    #[test]
+    fn state_and_relational_mutations_retain_independent_formatting_subtrees() {
+        for count in [16, 256] {
+            let mut dom = Dom::parse_document(&format!(
+                "<style>body{{margin:0}} input:checked + nav{{height:80px}}\
+                 header:has(input:checked) nav{{padding:5px}} article{{display:flow-root}}\
+                 </style><header><input id=check type=checkbox><nav>menu</nav></header>\
+                 <main id=stable>{}</main>",
+                "<article>independent text</article>".repeat(count)
+            ));
+            let check = dom.get_by_id("check").unwrap();
+            for state in [true, false, true] {
+                measure(&dom);
+                let stable = block(&dom, "stable");
+                if state {
+                    dom.set_attr(check, "checked", "");
+                } else {
+                    dom.remove_attr(check, "checked");
+                }
+                let measured = measure(&dom);
+                assert!(Arc::ptr_eq(&stable, &block(&dom, "stable")));
+                assert!(
+                    measured.work.tree_builds <= 8,
+                    "unrelated tree size {count}: {:?}",
+                    measured.work
+                );
+                equivalent_to_cold(&mut dom);
+            }
+        }
+    }
 
     #[test]
     fn local_class_changes_retain_layout_despite_unrelated_sibling_selectors() {
@@ -484,7 +511,7 @@ mod tests {
         let mut cache = BoxTreeCache::default();
         let value = Built::Inline(Inline::Text("x".repeat(16384)));
         for node in 0..5000 {
-            cache.insert(node, vec![(node as i64, 1)], 0, &[], &value);
+            cache.insert(node, vec![(node as i64, 1)], &[], &value);
             assert!(cache.entries.len() <= MAX_ENTRIES);
             assert!(cache.retained_bytes() <= MAX_BYTES);
         }
@@ -494,7 +521,7 @@ mod tests {
             cache.entries.values().map(|e| e.bytes).sum::<usize>()
         );
         for _ in 0..1000 {
-            cache.insert(4999, vec![], 0, &[], &Built::Skip);
+            cache.insert(4999, vec![], &[], &Built::Skip);
         }
         assert!(cache.retained_bytes() <= MAX_BYTES);
         cache.clear();

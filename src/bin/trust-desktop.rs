@@ -1539,17 +1539,19 @@ fn page_wheel_delta(delta: MouseScrollDelta, scale: ScaleFactor) -> CssPoint {
 fn scroll_container_delta(container: &ScrollContainer, delta: CssPoint) -> (CssPoint, CssPoint) {
     let mut next = container.offset;
     let mut residual = delta;
+    let target = container.clamp_offset(CssPoint::new(
+        container.offset.x + delta.x,
+        container.offset.y + delta.y,
+    ));
     if container.horizontal {
-        let max_x = (container.content.width - container.viewport.width).max(0.0);
-        next.x = (container.offset.x + delta.x).clamp(0.0, max_x);
+        next.x = target.x;
         residual.x = delta.x - (next.x - container.offset.x);
         if container.contain_overscroll[0] {
             residual.x = 0.;
         }
     }
     if container.vertical {
-        let max_y = (container.content.height - container.viewport.height).max(0.0);
-        next.y = (container.offset.y + delta.y).clamp(0.0, max_y);
+        next.y = target.y;
         residual.y = delta.y - (next.y - container.offset.y);
         if container.contain_overscroll[1] {
             residual.y = 0.;
@@ -3316,6 +3318,13 @@ impl DesktopApp {
             }
         }
         self.paint_focused_form(&mut scene);
+        if let Some(page) = &self.page_layout {
+            scene.append_browser_media(
+                &page.layout.paint,
+                self.browser.interaction().scroll,
+                css_animation_elapsed,
+            );
+        }
         self.paint_keyboard_focus(&mut scene);
         chrome.heart = self.heart_visual(&scene, &snapshot);
         paint_desktop_overlay(&mut scene, &snapshot, &chrome);
@@ -3546,6 +3555,7 @@ impl DesktopApp {
         let rect = scene
             .interactive_hits()
             .into_iter()
+            .rev()
             .find(|candidate| same_page_target(candidate, target))
             .map(|candidate| candidate.rect)
             .unwrap_or(target.rect);
@@ -5582,14 +5592,9 @@ impl DesktopApp {
             } else if rect.x + rect.width > container.viewport.x + container.viewport.width {
                 left += rect.x + rect.width - container.viewport.x - container.viewport.width;
             }
-            top = top.clamp(
-                0.0,
-                (container.content.height - container.viewport.height).max(0.0),
-            );
-            left = left.clamp(
-                0.0,
-                (container.content.width - container.viewport.width).max(0.0),
-            );
+            let clamped = container.clamp_offset(CssPoint::new(left, top));
+            top = clamped.y;
+            left = clamped.x;
             if (top - container.offset.y).abs() > f32::EPSILON
                 || (left - container.offset.x).abs() > f32::EPSILON
             {
@@ -7881,6 +7886,11 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
 }
 
 fn same_page_target(left: &PageHit, right: &PageHit) -> bool {
+    if matches!(left.link, Some(Link::Media(_))) && matches!(right.link, Some(Link::Media(_))) {
+        // Native subwidgets retain the media DOM anchor when keyboard focus
+        // supplies its live actor; pointer activation remains a browser action.
+        return left.node == right.node && left.link == right.link;
+    }
     match (left.actor, right.actor) {
         (Some(left), Some(right)) => left == right,
         (Some(_), None) | (None, Some(_)) => false,
@@ -8608,6 +8618,9 @@ mod tests {
                 "the browser's external playback control must retain its media action"
             );
         }
+        let mut native = target.clone();
+        native.actor = None;
+        assert!(same_page_target(&native, &target));
     }
 
     #[test]
@@ -9518,6 +9531,25 @@ mod tests {
         };
         let (_, remaining) = scroll_container_delta(&container, CssPoint::new(40., 120.));
         assert_eq!(remaining, CssPoint::new(40., 0.));
+    }
+
+    #[test]
+    fn reverse_scroll_ranges_retain_negative_offsets_and_chain_only_the_residual() {
+        let container = ScrollContainer {
+            viewport: CssRect::new(0., 0., 100., 80.),
+            content: CssSize::new(400., 500.),
+            offset: CssPoint::new(-35., -50.),
+            reverse: [true; 2],
+            horizontal: true,
+            vertical: true,
+            ..Default::default()
+        };
+        let (next, residual) = scroll_container_delta(&container, CssPoint::new(-500., -500.));
+        assert_eq!(next, CssPoint::new(-300., -420.));
+        assert_eq!(residual, CssPoint::new(-235., -130.));
+        let (next, residual) = scroll_container_delta(&container, CssPoint::new(100., 100.));
+        assert_eq!(next, CssPoint::new(0., 0.));
+        assert_eq!(residual, CssPoint::new(65., 50.));
     }
 
     #[test]

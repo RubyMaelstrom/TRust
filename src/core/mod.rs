@@ -1259,13 +1259,18 @@ impl BrowserController {
             }
             UserAction::SetNestedScroll { actor, top, left } => {
                 if let Some(actor) = actor {
+                    // The retained scroll container clamps to its signed
+                    // geometry range. The controller must not erase valid
+                    // leftward/upward positions on the way to the actor.
+                    let top = if top.is_finite() { top } else { 0. };
+                    let left = if left.is_finite() { left } else { 0. };
                     self.interaction
                         .nested_scroll
-                        .insert(actor, CssPoint::new(left.max(0.0), top.max(0.0)));
+                        .insert(actor, CssPoint::new(left, top));
                     self.send_user(crate::js::PageCmd::SetScroll {
                         node: actor,
-                        top: f64::from(top.max(0.0)),
-                        left: f64::from(left.max(0.0)),
+                        top: f64::from(top),
+                        left: f64::from(left),
                     });
                 }
                 true
@@ -3894,7 +3899,7 @@ mod tests {
         assert_eq!(browser.interaction().scroll, CssPoint::new(0.0, 125.5));
         assert_eq!(
             browser.interaction().nested_scroll.get(&17),
-            Some(&CssPoint::new(0.0, 44.25))
+            Some(&CssPoint::new(-3.0, 44.25))
         );
     }
 

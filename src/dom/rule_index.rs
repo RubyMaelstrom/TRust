@@ -524,7 +524,7 @@ mod tests {
 
     fn assert_candidates_cover_full_scan(dom: &Dom) {
         let index = dom.style_index();
-        for node in 0..dom.node_count() {
+        for node in dom.live_ids() {
             if dom.tag_name(node).is_none() {
                 continue;
             }

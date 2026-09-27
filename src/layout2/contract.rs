@@ -255,6 +255,10 @@ pub enum ItemKind {
     /// lives in `Row::hits`; this item gives the existing selection/navigation
     /// model one stable address without painting a synthetic glyph.
     HitRegion,
+    /// Browser-owned external playback button. Its spatial clip/scroll anchor
+    /// is retained in the row, but it paints and receives pointer input after
+    /// all page layers. It never displaces authored text or poster images.
+    MediaControl,
 }
 
 /// Visible portion of an image, relative to its original terminal-cell box.
@@ -775,7 +779,7 @@ pub fn visual_columns(
         .items
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.kind != ItemKind::HitRegion)
+        .filter(|(_, item)| !matches!(item.kind, ItemKind::HitRegion | ItemKind::MediaControl))
         .filter_map(|(i, item)| {
             let (col, w, cut) = carousel_place(carousels, row_idx, item)?;
             Some((col, i, w, cut))
@@ -822,6 +826,25 @@ pub fn visual_columns(
         }
     }
     out
+}
+
+/// Native controls share page scroll/clip coordinates, but not terminal text
+/// overlap recovery. Both the UI and pointer targeting consume this mapping.
+pub fn media_control_columns<'a>(
+    row: &'a Row,
+    carousels: &'a [Carousel],
+    row_idx: usize,
+) -> impl Iterator<Item = (usize, u16, u16, usize)> + 'a {
+    row.items
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, item)| {
+            if item.kind != ItemKind::MediaControl || item.invisible {
+                return None;
+            }
+            let (col, width, cut) = carousel_place(carousels, row_idx, item)?;
+            Some((index, col, width, cut))
+        })
 }
 
 /// The on-screen horizontal interval of a non-painting hit box after applying

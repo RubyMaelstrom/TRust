@@ -185,6 +185,8 @@ pub(super) fn positioned_complete(fragment: &Frag) -> bool {
 /// (§9.9/Appendix E, css-position-3 §2.2, css-transforms-1 §3).
 #[derive(Clone, Debug)]
 pub(crate) struct PaintFlags {
+    pub position: Pos,
+    pub overflow: [super::overflow::Overflow; 2],
     /// CSS Lists 3: an outside marker follows the list item's border box,
     /// rather than scrolling with that item's own contents.
     pub outside_marker: bool,
@@ -201,6 +203,8 @@ pub(crate) struct PaintFlags {
     /// Exact group opacity retained from the typed box snapshot.
     pub opacity: f32,
     pub color_filters: std::sync::Arc<[[f32; 20]]>,
+    pub transform: Option<std::sync::Arc<super::transform::Transform>>,
+    pub child_viewport: bool,
     /// Paints a background over the border box in display-list order.
     pub bg: bool,
     /// CSS UI 4 §3 outline decoration. Unlike `border`, this is paint-only and
@@ -223,12 +227,16 @@ impl Default for PaintFlags {
     fn default() -> Self {
         Self {
             outside_marker: false,
+            position: Pos::Static,
+            overflow: [super::overflow::Overflow::Visible; 2],
             pseudo: None,
             positioned: false,
             sc: false,
             z: None,
             opacity: 1.0,
             color_filters: Default::default(),
+            transform: None,
+            child_viewport: false,
             bg: false,
             outline: Outline::NONE,
             cb_abs: false,
@@ -244,12 +252,16 @@ impl Default for PaintFlags {
 pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
     PaintFlags {
         outside_marker: false,
+        position: s.position,
+        overflow: s.overflow,
         pseudo: s.pseudo,
         positioned: s.position.positioned(),
         sc: s.stacking_context(item),
         z: s.z_index,
         opacity: s.opacity,
         color_filters: s.color_filters.clone(),
+        transform: s.transform.clone(),
+        child_viewport: s.child_viewport,
         bg: s.bg,
         outline: s.outline,
         cb_abs: s.position.positioned()
@@ -448,7 +460,8 @@ pub(crate) struct Flow<'a> {
     pub reuse: bool,
     /// The intrinsic-size memo: (element, is-min-mode) → content px. Pass-
     /// wide, so nested flex towers query each subtree once per mode.
-    pub imemo: std::cell::RefCell<std::collections::HashMap<(NodeId, bool), f32>>,
+    pub imemo:
+        std::cell::RefCell<std::collections::HashMap<(NodeId, bool), super::memo::Intrinsic>>,
     /// Grid container → its USED track sizes in px `(columns, rows)`, recorded
     /// by `grid_content` as it lays each grid. This is the CSSOM "resolved
     /// value" `getComputedStyle` must report for `grid-template-columns`/`-rows`
@@ -492,16 +505,9 @@ impl Flow<'_> {
     ) -> (Frag, f32, Vec<(NodeId, f32)>, Vec<Frag>, Vec<TopFrag>) {
         let mut cur = Cursor::default();
         let inl = InlineStyle::root();
-        // §8.3.1: margins of the root element's box do not collapse. Its top
-        // margin is a plain offset; its children then collapse among
-        // themselves inside it.
-        let mt = root.style.margin[TOP]
-            .resolve(Some(self.vp.w))
-            .unwrap_or(0.0);
-        let mb = root.style.margin[BOTTOM]
-            .resolve(Some(self.vp.w))
-            .unwrap_or(0.0);
-        cur.y = mt.max(0.0);
+        // The block pass owns both root margins exactly once, including
+        // negative margins. CSS Display #root seals its independent context;
+        // pre-adding margins here both doubled them and failed to seal it.
         let cb_h = (self.vp.h > 0.0).then_some(self.vp.h);
         // The initial containing block establishes the document's block
         // formatting context; the root element's floats live here (§9.4.1).
@@ -509,7 +515,7 @@ impl Flow<'_> {
         let mut frag = self.block(root, 0.0, self.vp.w, cb_h, &mut cur, &inl, &mut root_fc);
         // The document's height includes trailing collapsed-out margins (the
         // scrollable extent a browser gives a body bottom margin).
-        let flow_bottom = cur.flush() + mb.max(0.0);
+        let flow_bottom = cur.flush();
         let mut anchors = std::mem::take(&mut cur.anchors);
         // The positioned post-pass: every out-of-flow placeholder resolves
         // against its containing block's FINAL geometry (§10.1 — all
@@ -681,7 +687,9 @@ impl Flow<'_> {
             return item.fragment;
         }
         let (anchor_start, flush_start) = (cur.anchors.len(), cur.flush_log.len());
+        let inputs = super::memo::ReadScope::new(self.dom, reuse);
         let fragment = self.block_uncached(b, cb_x, cb_w, cb_h, cur, parent_inl, fc);
+        let inputs = inputs.finish();
         if reuse && fc.is_empty() {
             self.dom.layout_cache.borrow_mut().store_block(
                 &request,
@@ -694,6 +702,7 @@ impl Flow<'_> {
                     negative_margin: cur.neg,
                     flushes: cur.flush_log[flush_start..].to_vec(),
                 },
+                inputs,
             );
         }
         fragment
@@ -727,7 +736,13 @@ impl Flow<'_> {
         // (§17.5.2) and repositions within its band (§17.4 auto margins /
         // align) — its used content width and border-box left are known only
         // after the column algorithm runs, inside the `Content::Table` arm.
-        let mut h = self.horizontal(b, cb_w, cb_h, &inl);
+        let cb_rtl = parent_inl.node != NO_NODE
+            && self
+                .dom
+                .computed_value_resolved(parent_inl.node, "direction")
+                .as_deref()
+                == Some("rtl");
+        let mut h = self.horizontal(b, cb_w, cb_h, &inl, cb_rtl);
         // CSS 2.1 §10.3.4 says a block-level replaced element's auto width is
         // resolved by the inline-replaced algorithm (§10.3.2), then its
         // margins are solved with the ordinary block equation. The generic
@@ -748,7 +763,8 @@ impl Flow<'_> {
             }) = &b.content
         {
             let natural = crate::responsive_image::density_corrected_size(
-                url.as_deref().and_then(|url| self.images.get(url)),
+                url.as_deref()
+                    .and_then(|url| super::memo::image_size(self.dom, self.images, url)),
                 *density,
             );
             if let Some(replaced) = super::replaced::size(
@@ -887,7 +903,7 @@ impl Flow<'_> {
         let ifc_cb_h = spec_h.map(|v| v.clamp(min_h, max_h.max(min_h)));
 
         let mut y_border: Option<f32> = None;
-        if bt > 0.0 {
+        if bt > 0.0 || own_bfc {
             let yb = cur.flush();
             y_border = Some(yb);
             cur.y = yb + bt;
@@ -1341,7 +1357,7 @@ impl Flow<'_> {
                 cur.margin(mb);
             }
             None => {
-                if bb > 0.0 {
+                if bb > 0.0 || own_bfc {
                     // Bottom border/padding separate: trailing child margins
                     // resolve inside the box.
                     let content_bottom = cur.flush();
@@ -1501,9 +1517,8 @@ impl Flow<'_> {
         frag
     }
 
-    /// The paint-time offset of a box: §9.4.3 relative positioning plus the
-    /// translation component of its transform (css-transforms-1 — % against
-    /// the box's own border box). Sticky offsets are scroll-driven and
+    /// The layout offset of a box: §9.4.3 relative positioning. CSS transforms
+    /// are retained separately in paint state. Sticky offsets are scroll-driven and
     /// contribute zero at the initial scroll position (css-position-3 §3.4).
     pub(super) fn paint_offset(
         &self,
@@ -1875,7 +1890,14 @@ impl Flow<'_> {
     /// query for the css-sizing-3 keywords (`width: min-content`/
     /// `max-content`/`fit-content`), which name the CONTENT size directly —
     /// box-sizing does not apply to them (§5.2.2).
-    fn horizontal(&self, b: &BoxNode, cb_w: f32, cb_h: Option<f32>, inl: &InlineStyle) -> H {
+    fn horizontal(
+        &self,
+        b: &BoxNode,
+        cb_w: f32,
+        cb_h: Option<f32>,
+        inl: &InlineStyle,
+        cb_rtl: bool,
+    ) -> H {
         let s = &b.style;
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
@@ -1919,13 +1941,20 @@ impl Flow<'_> {
                 }
                 Some(w) => {
                     let free = cb_w - w - bp;
-                    let ml_auto = s.margin[LEFT].is_auto();
-                    let mr_auto = s.margin[RIGHT].is_auto();
+                    // CSS 2.2 #blockwidth: negative free space first makes
+                    // auto margins zero, then the containing block's (not
+                    // the child's) direction selects the discarded margin.
+                    let overfull = free < ml.unwrap_or(0.) + mr.unwrap_or(0.);
+                    let ml_auto = s.margin[LEFT].is_auto() && !overfull;
+                    let mr_auto = s.margin[RIGHT].is_auto() && !overfull;
                     let mut ml = match (ml_auto, mr_auto) {
-                        // Both auto: center (negative free → treated 0/ltr).
-                        (true, true) => (free / 2.0).max(0.0),
+                        (true, true) => free / 2.0,
                         (true, false) => free - mr.unwrap_or(0.0),
-                        // ml known (or over-constrained: mr gives way, ltr).
+                        (false, false)
+                            if cb_rtl && s.float.is_none() && !s.position.out_of_flow() =>
+                        {
+                            free - mr.unwrap_or(0.)
+                        }
                         _ => ml.unwrap_or(0.0),
                     };
                     if !ml_auto && !mr_auto {
@@ -3057,6 +3086,7 @@ impl Flow<'_> {
             self.grid_tracks.borrow_mut().extend(item.tracks);
             return (item.fragment, item.anchors);
         }
+        let inputs = super::memo::ReadScope::new(self.dom, reuse);
         let result = self.item_frag_uncached(
             b,
             content_w,
@@ -3065,12 +3095,14 @@ impl Flow<'_> {
             parent_inl,
             transfer_preferred_ratio,
         );
+        let inputs = inputs.finish();
         if reuse {
             self.dom.layout_cache.borrow_mut().store_item(
                 &request,
                 &result.0,
                 &result.1,
                 &self.grid_tracks.borrow(),
+                inputs,
             );
         }
         result
@@ -3413,7 +3445,7 @@ impl Flow<'_> {
         y: f32,
     ) -> Frag {
         let natural = crate::responsive_image::density_corrected_size(
-            url.and_then(|url| self.images.get(url)),
+            url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
             density,
         );
         let ratio = super::replaced::ratio_of(self.dom, node, dimension_source, natural);
@@ -3915,7 +3947,8 @@ impl Flow<'_> {
                     ..
                 } => {
                     let natural = crate::responsive_image::density_corrected_size(
-                        url.as_deref().and_then(|url| self.images.get(url)),
+                        url.as_deref()
+                            .and_then(|url| super::memo::image_size(self.dom, self.images, url)),
                         *density,
                     );
                     super::replaced::size(
@@ -4126,6 +4159,14 @@ impl Flow<'_> {
         }
         if b.node == NO_NODE {
             return false;
+        }
+        // CSS Display 3 #root / CSS2 #collapsing-margins: every Document's
+        // root establishes an independent context. The marker represents that
+        // same box only in a non-authoritative serialized presentation arena.
+        if self.dom.is_document_element(b.node)
+            || self.dom.attr(b.node, "data-trust-frame-root").is_some()
+        {
+            return true;
         }
         if self.dom.effective_display(b.node).as_deref() == Some("flow-root") {
             return true;

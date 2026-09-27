@@ -7,7 +7,7 @@
 use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
 use lumen::embed::{
-    Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn,
+    Ctx, EvalError, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeFn, NativeGcId,
     RetainedManagedAllocation, RetainedMemory, Value,
 };
 use std::cell::{Cell, RefCell};
@@ -21,10 +21,14 @@ use std::time::{Duration, Instant};
 mod canvas_host;
 #[path = "challenge_message_trace.rs"]
 mod challenge_message_trace;
+#[path = "geometry_host.rs"]
+mod geometry_host;
 #[path = "image_bitmap_host.rs"]
 mod image_bitmap_host;
 #[path = "image_host.rs"]
 mod image_host;
+#[path = "live_range_host.rs"]
+mod live_range_host;
 #[path = "lumen_wasm.rs"]
 mod lumen_wasm;
 #[path = "message_port_host.rs"]
@@ -41,17 +45,20 @@ const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
 struct LumenGeomCache {
     epoch: u64,
     presentation_epoch: u64,
+    svg_sprite_revision: u64,
     paint_epoch: u64,
+    paint_scroll_epoch: u64,
     /// A rectangle-only read may have projected just one element from the
     /// complete current fragment tree. Scroll, frame, paint and observer
     /// consumers finish the projection without repeating layout.
     complete_geometry: bool,
-    viewport_fixed_roots: Vec<crate::dom::NodeId>,
+    viewport_fixed_roots: std::collections::HashSet<crate::dom::NodeId>,
     boxes: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     tracks: std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
     scrolling_areas: std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     frame_viewports: std::collections::HashMap<crate::dom::NodeId, crate::render::CssRect>,
     paint: Option<crate::render::PagePaint>,
+    hit_index: Option<crate::render::PageHitIndex>,
     fragments: Option<std::sync::Arc<crate::layout2::LayoutFragments>>,
     /// The cached boxes belonging to the container Document remain valid. A nested Document may
     /// have advanced the arena-wide epoch without affecting these boxes (HTML §7.3.1.3).
@@ -63,14 +70,17 @@ impl LumenGeomCache {
         Self {
             epoch: u64::MAX,
             presentation_epoch: u64::MAX,
+            svg_sprite_revision: u64::MAX,
             paint_epoch: u64::MAX,
+            paint_scroll_epoch: u64::MAX,
             complete_geometry: false,
-            viewport_fixed_roots: Vec::new(),
+            viewport_fixed_roots: std::collections::HashSet::new(),
             boxes: Default::default(),
             tracks: Default::default(),
             scrolling_areas: Default::default(),
             frame_viewports: Default::default(),
             paint: None,
+            hit_index: None,
             fragments: None,
             top_document_valid: false,
         }
@@ -152,6 +162,8 @@ struct LumenPendingFetch {
     /// networking task and owns the resulting Response/Body objects.
     context: u64,
     resolve: Value,
+    /// HTML image requests retain their element until their networking task finishes.
+    native_lease: Option<DomResourceLease>,
 }
 
 #[derive(Clone)]
@@ -313,9 +325,111 @@ struct LumenWorkerLaunch {
     task_sender: LumenTaskSender,
 }
 
+#[derive(Clone, Copy)]
+enum DomGcOwnerKind {
+    Wrapper,
+    IdArray,
+    Observer,
+}
+
+struct DomGcOwner {
+    value: Value,
+    nodes: Vec<usize>,
+    kind: DomGcOwnerKind,
+}
+
+#[derive(Default)]
+struct DomGcRegistry {
+    owners: HashMap<usize, DomGcOwner>,
+    /// Canonical Document wrappers cross Window realms during adoption. Pointer identities
+    /// borrow the existing owner records; this index adds no strong JavaScript references.
+    documents: HashMap<usize, usize>,
+    /// Every inserted/replaced logical owner since the last successful native collection.
+    young_owners: std::collections::HashSet<usize>,
+    pending_resources: Rc<RefCell<HashMap<usize, usize>>>,
+    traced: Cell<bool>,
+    traced_minor: Cell<bool>,
+}
+
+impl DomGcRegistry {
+    fn node_identity(&self, value: &Value) -> Option<usize> {
+        let Value::Obj(object) = value else {
+            return None;
+        };
+        let entry = self.owners.get(&(Rc::as_ptr(object) as usize))?;
+        matches!(entry.kind, DomGcOwnerKind::Wrapper).then(|| entry.nodes[0])
+    }
+
+    fn forget_document(&mut self, identity: usize) {
+        if let Some(entry) = self.owners.get(&identity) {
+            for node in &entry.nodes {
+                if self.documents.get(node) == Some(&identity) {
+                    self.documents.remove(node);
+                }
+            }
+        }
+    }
+
+    fn retain(&mut self, value: Value, nodes: Vec<usize>, kind: DomGcOwnerKind) {
+        let Value::Obj(object) = &value else {
+            return;
+        };
+        let identity = Rc::as_ptr(object) as usize;
+        if nodes.is_empty() {
+            self.forget_document(identity);
+            self.owners.remove(&identity);
+            self.young_owners.remove(&identity);
+        } else {
+            self.owners
+                .insert(identity, DomGcOwner { value, nodes, kind });
+            self.young_owners.insert(identity);
+        }
+    }
+
+    fn start_resource(&mut self, node: usize) {
+        *self.pending_resources.borrow_mut().entry(node).or_default() += 1;
+    }
+
+    fn finish_resource(&mut self, node: usize) {
+        let mut roots = self.pending_resources.borrow_mut();
+        if let Some(count) = roots.get_mut(&node) {
+            *count -= 1;
+            if *count == 0 {
+                roots.remove(&node);
+            }
+        }
+    }
+
+    fn resource_lease(&self, node: usize) -> DomResourceLease {
+        DomResourceLease {
+            roots: self.pending_resources.clone(),
+            node,
+        }
+    }
+}
+
+/// The selected task still owns its target while it executes author code. Releasing
+/// the async lease at task entry would leave a GC gap before the wrapper is obtained.
+struct DomResourceLease {
+    roots: Rc<RefCell<HashMap<usize, usize>>>,
+    node: usize,
+}
+impl Drop for DomResourceLease {
+    fn drop(&mut self) {
+        let mut roots = self.roots.borrow_mut();
+        if let Some(count) = roots.get_mut(&self.node) {
+            *count -= 1;
+            if *count == 0 {
+                roots.remove(&self.node);
+            }
+        }
+    }
+}
+
 struct HostState {
     message_ports: message_port_host::Agent,
     dom: Rc<RefCell<Dom>>,
+    dom_gc: DomGcRegistry,
     clock: Rc<RealmClock>,
     base: url::Url,
     storage: crate::js::WebStorage,
@@ -360,7 +474,8 @@ struct HostState {
     screen_slots: Option<Value>,
     performance_slots: Option<Value>,
     element_slots: Option<Value>,
-    live_range_registry: Option<Value>,
+    live_ranges: live_range_host::Registry,
+    geometry: geometry_host::Registry,
     pointer_event_slots: Option<Value>,
     image_element_slots: Option<Value>,
     window_message_slots: Option<Value>,
@@ -374,6 +489,7 @@ impl HostState {
         static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (viewport, device_pixel_ratio) = {
             let mut dom = dom.borrow_mut();
+            dom.enable_gc_allocation_leases();
             let (width, height) = dom.viewport_px();
             let viewport = if width == 0.0 && height == 0.0 {
                 dom.set_viewport_px(DEFAULT_VIEWPORT.width, DEFAULT_VIEWPORT.height);
@@ -390,6 +506,7 @@ impl HostState {
         Self {
             message_ports: Default::default(),
             dom,
+            dom_gc: DomGcRegistry::default(),
             clock,
             base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
             storage: Default::default(),
@@ -430,7 +547,8 @@ impl HostState {
             screen_slots: None,
             performance_slots: None,
             element_slots: None,
-            live_range_registry: None,
+            live_ranges: live_range_host::Registry::default(),
+            geometry: geometry_host::Registry::default(),
             pointer_event_slots: None,
             image_element_slots: None,
             window_message_slots: None,
@@ -582,6 +700,7 @@ impl RetainedMemory for HostState {
         let HostState {
             message_ports,
             dom,
+            dom_gc,
             clock,
             base,
             storage,
@@ -622,7 +741,8 @@ impl RetainedMemory for HostState {
             screen_slots,
             performance_slots,
             element_slots,
-            live_range_registry,
+            live_ranges,
+            geometry,
             pointer_event_slots,
             image_element_slots,
             window_message_slots,
@@ -637,6 +757,24 @@ impl RetainedMemory for HostState {
             pending_resources,
             next_window_context,
         );
+
+        visitor.allocation(RetainedManagedAllocation::new(
+            "trust.dom-js-graph",
+            dom_gc as *const _ as usize,
+            dom_gc.owners.capacity() * std::mem::size_of::<(usize, DomGcOwner)>()
+                + dom_gc.documents.capacity() * std::mem::size_of::<(usize, usize)>()
+                + dom_gc.young_owners.capacity() * std::mem::size_of::<usize>()
+                + dom_gc
+                    .owners
+                    .values()
+                    .map(|owner| owner.nodes.capacity() * std::mem::size_of::<usize>())
+                    .sum::<usize>()
+                + dom_gc.pending_resources.borrow().capacity()
+                    * std::mem::size_of::<(usize, usize)>(),
+        ));
+        for owner in dom_gc.owners.values() {
+            visitor.value(&owner.value);
+        }
 
         match dom.try_borrow() {
             Ok(dom_value) => {
@@ -759,6 +897,13 @@ impl RetainedMemory for HostState {
                 let (paint_bytes, paint_opaque) = paint.retained_memory();
                 bytes = bytes.saturating_add(paint_bytes);
                 if paint_opaque {
+                    visitor.opaque_storage();
+                }
+            }
+            if let Some(index) = &cache.hit_index {
+                let (index_bytes, index_opaque) = index.retained_memory();
+                bytes = bytes.saturating_add(index_bytes);
+                if index_opaque {
                     visitor.opaque_storage();
                 }
             }
@@ -970,9 +1115,8 @@ impl RetainedMemory for HostState {
         if let Some(value) = performance_slots {
             visitor.value(value);
         }
-        if let Some(value) = live_range_registry {
-            visitor.value(value);
-        }
+        live_ranges.scan_retained_memory(visitor);
+        geometry.scan_retained_memory(visitor);
         if let Some(value) = element_slots {
             visitor.value(value);
         }
@@ -1031,9 +1175,234 @@ impl lumen::embed::RetainedExternalMemory for HostState {
 impl HostGc for HostState {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         self.wasm.trace_gc(visitor);
+        self.live_ranges.begin_collection(visitor.is_minor());
+        self.geometry.trace(visitor);
+        self.dom_gc.traced.set(false);
+        if !visitor.supports_native() {
+            return;
+        }
+        // Prove sweeping can borrow exclusively BEFORE discounting any JS owner. A successful
+        // shared borrow would still allow an external reader to block the later native sweep,
+        // leaving discounted dead wrappers in a live registry after their JS fields were cleared.
+        let Ok(dom) = self.dom.try_borrow_mut() else {
+            return;
+        };
+        let owner = Rc::as_ptr(&self.dom) as usize;
+        let id = |id| NativeGcId {
+            domain: "trust.dom",
+            owner,
+            id,
+        };
+        let minor = visitor.is_minor()
+            && visitor.native_old_generation("trust.dom", owner, dom.first_young_gc_id());
+        if !minor && std::env::var_os("LUMEN_GC_DUMP").is_some() {
+            let mut roots = std::collections::BTreeMap::<usize, usize>::new();
+            let mut allocations = std::collections::BTreeMap::<usize, usize>::new();
+            let mut resources = std::collections::BTreeMap::<usize, usize>::new();
+            dom.visit_gc_roots(|node| {
+                *roots
+                    .entry(dom.owner_document(node).unwrap_or(node))
+                    .or_default() += 1;
+            });
+            dom.visit_gc_pending_allocations(|node| {
+                *allocations
+                    .entry(dom.owner_document(node).unwrap_or(node))
+                    .or_default() += 1;
+            });
+            for (&node, &count) in self.dom_gc.pending_resources.borrow().iter() {
+                *resources
+                    .entry(dom.owner_document(node).unwrap_or(node))
+                    .or_default() += count;
+            }
+            eprintln!(
+                "[gc-dump-dom] roots_by_document={roots:?} allocations_by_document={allocations:?} resources_by_document={resources:?} window_realms={}",
+                self.window_realms.len()
+            );
+        }
+        if minor {
+            dom.visit_gc_young_edges(|from, to| visitor.native_edge(id(from), id(to)));
+        } else {
+            dom.visit_gc_edges(|from, to| visitor.native_edge(id(from), id(to)));
+        }
+        dom.visit_gc_roots(|node| {
+            if !minor || dom.is_young_gc_node(node) {
+                visitor.native_root(id(node));
+            }
+        });
+        dom.visit_gc_pending_allocations(|node| visitor.native_root(id(node)));
+        for &node in self.dom_gc.pending_resources.borrow().keys() {
+            if !minor || dom.is_young_gc_node(node) {
+                visitor.native_root(id(node));
+            }
+        }
+        let mut trace_entry = |entry: &DomGcOwner| {
+            visitor.internal(&entry.value);
+            for &node in &entry.nodes {
+                if !dom.is_valid(node) {
+                    continue;
+                }
+                match entry.kind {
+                    DomGcOwnerKind::Wrapper => {
+                        visitor.js_to_native(&entry.value, id(node));
+                        visitor.native_to_js(id(node), &entry.value);
+                    }
+                    DomGcOwnerKind::IdArray => visitor.js_to_native(&entry.value, id(node)),
+                    DomGcOwnerKind::Observer => visitor.native_to_js(id(node), &entry.value),
+                }
+            }
+        };
+        if minor {
+            for owner in &self.dom_gc.young_owners {
+                if let Some(entry) = self.dom_gc.owners.get(owner) {
+                    trace_entry(entry);
+                }
+            }
+        } else {
+            for entry in self.dom_gc.owners.values() {
+                trace_entry(entry);
+            }
+        }
+        self.dom_gc.traced_minor.set(minor);
+        self.dom_gc.traced.set(true);
     }
     fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
         self.wasm.sweep_gc(is_live);
+        self.live_ranges.sweep(is_live);
+        self.geometry.sweep(is_live);
+    }
+
+    fn sweep_gc_with_native(
+        &mut self,
+        is_live: &dyn Fn(&Value) -> bool,
+        native_is_live: &dyn Fn(NativeGcId) -> bool,
+    ) {
+        self.wasm.sweep_gc(is_live);
+        self.live_ranges.sweep(is_live);
+        self.geometry.sweep(is_live);
+        if !self.dom_gc.traced.replace(false) {
+            return;
+        }
+        let Ok(mut dom) = self.dom.try_borrow_mut() else {
+            return;
+        };
+        let owner = Rc::as_ptr(&self.dom) as usize;
+        let live = |id| {
+            native_is_live(NativeGcId {
+                domain: "trust.dom",
+                owner,
+                id,
+            })
+        };
+        let minor = self.dom_gc.traced_minor.get();
+        let retain_entry = |entry: &mut DomGcOwner| {
+            if !is_live(&entry.value) {
+                return false;
+            }
+            entry.nodes.retain(|&node| live(node));
+            !entry.nodes.is_empty()
+        };
+        if minor {
+            for identity in &self.dom_gc.young_owners {
+                if self
+                    .dom_gc
+                    .owners
+                    .get_mut(identity)
+                    .is_some_and(|entry| !retain_entry(entry))
+                {
+                    self.dom_gc.owners.remove(identity);
+                }
+            }
+        } else {
+            self.dom_gc.owners.retain(|_, entry| retain_entry(entry));
+            self.dom_gc
+                .documents
+                .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
+        }
+        let removed = if minor {
+            dom.sweep_gc_young_nodes(&live)
+        } else {
+            dom.sweep_gc_nodes(&live)
+        };
+        for node in &removed {
+            self.dom_gc.documents.remove(node);
+        }
+        dom.finish_gc_generation();
+        self.dom_gc.young_owners.clear();
+        if self.dom_gc.documents.capacity() > self.dom_gc.documents.len().saturating_mul(4).max(64)
+        {
+            self.dom_gc
+                .documents
+                .shrink_to(self.dom_gc.documents.len().saturating_mul(2));
+        }
+        if self.dom_gc.young_owners.capacity() > 64 {
+            self.dom_gc.young_owners = Default::default();
+        }
+        if !removed.is_empty() || !minor {
+            if let Ok(mut cache) = self.geom_cache.try_borrow_mut() {
+                if minor {
+                    for node in &removed {
+                        cache.boxes.remove(node);
+                        cache.tracks.remove(node);
+                        cache.scrolling_areas.remove(node);
+                        cache.frame_viewports.remove(node);
+                        cache.viewport_fixed_roots.remove(node);
+                    }
+                } else {
+                    cache.boxes.retain(|&node, _| dom.is_valid(node));
+                    cache.tracks.retain(|&node, _| dom.is_valid(node));
+                    cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
+                    cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
+                    cache
+                        .viewport_fixed_roots
+                        .retain(|&node| dom.is_valid(node));
+                }
+                macro_rules! shrink_cache {
+                    ($cache:expr) => {
+                        if $cache.capacity() > $cache.len().saturating_mul(4).max(64) {
+                            let capacity = $cache.len().saturating_mul(2);
+                            $cache.shrink_to(capacity);
+                        }
+                    };
+                }
+                shrink_cache!(cache.boxes);
+                shrink_cache!(cache.tracks);
+                shrink_cache!(cache.scrolling_areas);
+                shrink_cache!(cache.frame_viewports);
+                shrink_cache!(cache.viewport_fixed_roots);
+            }
+        }
+        // Contexts are removed by HTML navigable destruction, not by collection:
+        // an active Window realm is an explicit root even while its iframe is
+        // detached. Only reclaim spare metadata here; never invalidate settings
+        // belonging to outstanding jobs merely because a cache entry is old.
+        if self.window_request_urls.capacity()
+            > self.window_request_urls.len().saturating_mul(4).max(64)
+        {
+            self.window_request_urls
+                .shrink_to(self.window_request_urls.len().saturating_mul(2));
+        }
+        if self.window_cookie_contexts.capacity()
+            > self.window_cookie_contexts.len().saturating_mul(4).max(64)
+        {
+            self.window_cookie_contexts
+                .shrink_to(self.window_cookie_contexts.len().saturating_mul(2));
+        }
+        let mut pending = self.dom_gc.pending_resources.borrow_mut();
+        if pending.capacity() > pending.len().saturating_mul(4).max(64) {
+            let capacity = pending.len().saturating_mul(2);
+            pending.shrink_to(capacity);
+        }
+        if self.dom_gc.owners.capacity() > self.dom_gc.owners.len().saturating_mul(4).max(64) {
+            self.dom_gc
+                .owners
+                .shrink_to(self.dom_gc.owners.len().saturating_mul(2));
+        }
+    }
+
+    fn end_job(&mut self) {
+        if let Ok(mut dom) = self.dom.try_borrow_mut() {
+            dom.clear_gc_allocation_leases();
+        }
     }
 }
 
@@ -2362,6 +2731,15 @@ mod desktop {
             outcome.errors.push(error);
             return Err(outcome);
         }
+        // Explicit developer instrumentation, once per resident main-page navigation. Keep it
+        // out of platform bootstrap itself: child Window Realms and replay-only engines must
+        // never inherit it. A hook can observe the normal HTML load event after author modules
+        // have initialized (WHATWG HTML "the end", snapshot e5071a20c856).
+        eval_main_page_diagnostic_init(
+            &mut engine,
+            std::env::var("TRUST_LUMEN_DIAGNOSTIC_INIT").ok().as_deref(),
+            &mut outcome.errors,
+        );
 
         // Fetch #fetch-finale: reports from parallel parser/preload requests
         // belong to this Window, and must precede author completion handlers.
@@ -2405,6 +2783,23 @@ mod desktop {
         );
         let mut tasks = ParserTasks::new(host_rx, events, &mut page);
         let mut deferred = Vec::new();
+        // The parser owns its pending script list independently of the live DOM.
+        // An earlier script may detach a later entry while this native list still
+        // needs its identity for the preparation/connectedness checks.
+        let _script_leases: Vec<_> = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| {
+                scripts
+                    .iter()
+                    .map(|&node| {
+                        state.dom_gc.start_resource(node);
+                        state.dom_gc.resource_lease(node)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         for node in scripts {
             // Earlier scripts may change a later element before the parser
             // prepares it. The speculative scanner is never authoritative.
@@ -5743,13 +6138,82 @@ mod desktop {
             assert_eq!(submission.body, "solution=42&token=abc");
         }
 
+        #[test]
+        fn ordinary_task_completion_defers_resize_observers_until_rendering_opportunity() {
+            fn read(page: &mut LumenPage, source: &str) -> String {
+                let value = evaluate_task(page, source, "observe task state")
+                    .expect("task state expression must evaluate");
+                value_string(&mut page.engine, &value)
+            }
+
+            // HTML #update-the-rendering (e5071a20) and Resize Observer
+            // #broadcast-resize-notifications-h (81c27f68): ordinary task
+            // completion is not itself a rendering opportunity. Drive the
+            // production task boundary explicitly, without assuming two JS
+            // tasks take less than the real actor's 16 ms frame interval.
+            let html = r#"<!doctype html><html><body>
+                <div id="box" style="width:10px;height:10px"></div>
+                <output id="result"></output><script>
+                    const box = document.getElementById('box');
+                    const result = document.getElementById('result');
+                    const seen = [], checkpoints = [];
+                    new ResizeObserver(entries => {
+                        seen.push(Math.round(entries[0].contentRect.width));
+                        result.textContent = seen.join(',');
+                    }).observe(box);
+                </script></body></html>"#;
+            let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+            let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut page = load_page(
+                html,
+                PageEnv::bare(DEFAULT_URL),
+                host_tx,
+                &mut host_rx,
+                None,
+                interrupt,
+            )
+            .unwrap_or_else(|outcome| panic!("fixture load failed: {outcome:?}"));
+            let (initial, rendered, _) = render_with_observers(&mut page);
+            assert!(initial.contains(">10</output>"), "{initial}");
+            page.last_render = Some(rendered);
+            let (events, mut receiver) = tokio::sync::mpsc::channel(16);
+            for width in [20, 30] {
+                assert!(evaluate_task(
+                    &mut page,
+                    &format!("box.style.width = '{width}px'; queueMicrotask(() => checkpoints.push(box.style.width));"),
+                    "ordinary task before rendering",
+                ).is_some());
+                checkpoint(&mut page, "ordinary task");
+                assert!(finish_internal_task(&mut page, &events));
+                assert_eq!(
+                    read(&mut page, "result.textContent"),
+                    "10",
+                    "ordinary task completion delivered a resize observation"
+                );
+                while let Ok(event) = receiver.try_recv() {
+                    assert!(
+                        !matches!(event, PageEvt::Updated { .. } | PageEvt::Patched { .. }),
+                        "ordinary task completion published a rendering update: {event:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                read(&mut page, "checkpoints.join(',')"),
+                "20px,30px",
+                "each task still requires its own microtask checkpoint"
+            );
+            let (rendered, _, _) = render_with_observers(&mut page);
+            assert!(rendered.contains(">10,30</output>"), "{rendered}");
+            assert!(page.outcome.errors.is_empty(), "{:?}", page.outcome.errors);
+        }
+
         #[tokio::test]
-        async fn actor_coalesces_ordinary_tasks_before_resize_observer_rendering() {
-            // WHATWG HTML §8.1.7.3 selects rendering from its own task source,
-            // and Resize Observer §3.4 runs inside that rendering update. Two
-            // already-runnable port-message tasks may therefore be coalesced;
-            // the observer must not expose the intermediate box size merely
-            // because one ordinary task completed.
+        async fn actor_port_tasks_preserve_order_and_eventually_render_observed_final_size() {
+            // HTML #rendering-opportunity does not mandate a frame rate or
+            // prohibit a render between ordinary tasks. Debug execution or a
+            // busy host can exhaust the actor's frame budget after the first
+            // message; both 10,30 and 10,20,30 are valid. The deterministic
+            // task-boundary test above separately guards actual coalescing.
             let html = r#"<!doctype html><html><body>
                 <div id="box" style="width:10px;height:10px"></div>
                 <output id="result"></output>
@@ -5771,28 +6235,30 @@ mod desktop {
             </body></html>"#;
             let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
 
-            let mut exposed_intermediate_size = false;
-            let final_render = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    match events.recv().await {
+                    let fragments = match events.recv().await {
                         Some(PageEvt::Updated { html, .. }) => {
-                            exposed_intermediate_size |= html.contains(">10,20</output>");
-                            if html.contains(">10,30</output>") {
-                                break html;
-                            }
+                            vec![html]
+                        }
+                        Some(PageEvt::Patched { patches, .. }) => {
+                            patches.into_iter().map(|patch| patch.html).collect()
                         }
                         Some(PageEvt::Trouble(errors)) => {
                             panic!("rendering-opportunity fixture failed: {errors:?}")
                         }
-                        Some(_) => {}
+                        Some(_) => continue,
                         None => panic!("actor closed before its rendering opportunity"),
+                    };
+                    if fragments.iter().any(|html| {
+                        html.contains(">10,30</output>") || html.contains(">10,20,30</output>")
+                    }) {
+                        break;
                     }
                 }
             })
             .await
-            .expect("coalesced rendering opportunity timed out");
-
-            assert!(!exposed_intermediate_size, "{final_render}");
+            .expect("final observed size was not rendered");
         }
 
         #[tokio::test]
@@ -6820,22 +7286,27 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__pointer_lock_state", 1, host_pointer_lock_state),
     ("__navigator_binding", 1, host_navigator_binding),
     ("__screen_binding", 1, host_screen_binding),
+    ("__dom_set_viewport", 2, host_set_viewport),
     ("__performance_binding", 1, host_performance_binding),
     ("__element_slots", 1, host_element_slots),
-    ("__live_range_registry", 1, host_live_range_registry),
+    ("__dom_register_wrapper", 2, host_register_dom_wrapper),
+    ("__dom_node_identity", 1, host_node_identity),
+    ("__dom_observer_targets", 2, host_dom_observer_targets),
+    ("__live_range_register", 1, host_live_range_register),
+    ("__live_range_snapshot", 0, host_live_range_snapshot),
     ("__pointer_event_slots", 1, host_pointer_event_slots),
     ("__canvas_2d", 4, canvas_host::call),
     ("__webgl", 4, webgl_host::call),
-    ("__dom_create_element", 1, host_create_element),
-    ("__dom_create_element_ns", 3, host_create_element_ns),
-    ("__dom_create_text", 1, host_create_text),
-    ("__dom_create_fragment", 0, host_create_fragment),
+    ("__dom_create_element", 2, host_create_element),
+    ("__dom_create_element_ns", 4, host_create_element_ns),
+    ("__dom_create_text", 2, host_create_text),
+    ("__dom_create_fragment", 1, host_create_fragment),
     ("__dom_parse_document", 2, host_parse_document),
     ("__dom_create_document", 1, host_create_document),
     ("__dom_document_content_type", 1, host_document_content_type),
     ("__dom_document_quirks", 1, host_document_quirks),
     ("__dom_pi_target", 1, host_pi_target),
-    ("__dom_create_comment", 0, host_create_comment),
+    ("__dom_create_comment", 2, host_create_comment),
     ("__dom_append", 2, host_append),
     ("__dom_insert_before", 3, host_insert_before),
     ("__dom_detach", 1, host_detach),
@@ -6847,6 +7318,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_window_named_items", 1, host_window_named_items),
     ("__dom_window_names_epoch", 0, host_window_names_epoch),
     ("__dom_frame_owner", 1, host_frame_owner),
+    ("__dom_frame_document", 1, host_frame_document),
     ("__dom_is_connected", 1, host_is_connected),
     ("__dom_connected_many", 1, host_connected_many),
     ("__dom_epoch", 0, host_dom_epoch),
@@ -6933,6 +7405,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__image_complete", 1, host_image_complete),
     ("__match_media", 3, host_match_media),
     ("__dom_rect", 1, host_rect),
+    ("__geometry_bind", 2, geometry_host::bind),
     ("__dom_elements_from_point", 5, host_elements_from_point),
     ("__dom_scroll_get", 2, host_scroll_get),
     ("__dom_scroll_set", 3, host_scroll_set),
@@ -7025,19 +7498,6 @@ fn host_wasm_module_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(ctx.make_array(vec![slots, cluster]))
 }
 
-struct PlatformOperation(Value);
-
-impl lumen::embed::NativeCallableRetained for PlatformOperation {
-    fn scan_retained_memory(&self, visitor: &mut dyn lumen::embed::NativeRetainedMemoryVisitor) {
-        visitor.value(&self.0);
-        visitor.allocation(lumen::embed::RetainedManagedAllocation::new(
-            "trust.platform-operation",
-            self as *const Self as usize,
-            std::mem::size_of::<Self>(),
-        ));
-    }
-}
-
 /// CSSOM View client-window origin. All Window Realms in this page share the
 /// native window, not the origin of their individual iframe viewport.
 fn host_window_screen_coordinate(
@@ -7079,14 +7539,58 @@ fn host_screen_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(state.screen_slots.get_or_insert(value).clone())
 }
 
-/// Web IDL interface conversion uses platform identity, not mutable properties
-/// or a Realm-local prototype chain. Root the private WeakMap, not its keys.
-fn host_live_range_registry(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let state = ctx
+/// CSSOM View #resizing-viewports: the same browsing-context dimensions
+/// govern layout, media queries and Window getters before resize dispatch.
+/// A child navigable derives its viewport from the embedding content box;
+/// only the top-level controller invokes this private resize operation.
+fn host_set_viewport(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dimensions = [0, 1].map(|index| args.get(index).and_then(Value::as_num_opt));
+    if let [Some(width), Some(height)] = dimensions
+        && [width, height]
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0. && value <= f32::MAX as f64)
+    {
+        let state = ctx
+            .host_mut::<HostState>()
+            .expect("viewport requires HostState");
+        let viewport = crate::layout2::Viewport::new(width as f32, height as f32);
+        state.viewport.set(viewport);
+        state
+            .dom
+            .borrow_mut()
+            .set_viewport_px(viewport.width, viewport.height);
+    }
+    Ok(Value::Undefined)
+}
+
+/// DOM #concept-live-range: discovery spans all this Agent's Window Realms.
+/// Native weak handles have no JavaScript prototype that can root a retired Realm.
+fn host_live_range_register(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(range) = args
+        .first()
+        .and_then(|value| ctx.downgrade_object_value(value))
+    else {
+        return Err(ctx.make_error("TypeError", "Expected a Range object"));
+    };
+    ctx.host_mut::<HostState>()
+        .expect("Range bindings require HostState")
+        .live_ranges
+        .register(range);
+    Ok(Value::Undefined)
+}
+
+fn host_live_range_snapshot(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let ranges = ctx
         .host_mut::<HostState>()
-        .expect("Range bindings require HostState");
-    Ok(state.live_range_registry.get_or_insert(value).clone())
+        .expect("Range bindings require HostState")
+        .live_ranges
+        .snapshot();
+    // The common no-Range DOM mutation does not allocate an empty JS array.
+    Ok(if ranges.is_empty() {
+        Value::Undefined
+    } else {
+        ctx.make_array(ranges)
+    })
 }
 
 fn host_element_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -7204,14 +7708,11 @@ fn host_window_message_binding(
         .window_message_slots
         .get_or_insert(candidate)
         .clone();
-    let operation = Rc::new(PlatformOperation(
-        args.get(1).cloned().unwrap_or(Value::Undefined),
-    ));
-    let retained = operation.clone();
-    let post = ctx.new_native_fn_with_retained_memory(
+    let operation = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let post = ctx.new_native_fn_with_captures(
         "postMessage",
         1,
-        Rc::new(move |ctx, this, args| {
+        |ctx, this, args, captures| {
             let source = ctx.script_caller_global();
             let target = if matches!(this, Value::Null | Value::Undefined) {
                 ctx.global_this()
@@ -7220,12 +7721,12 @@ fn host_window_message_binding(
             };
             let arguments = ctx.make_array(args.to_vec());
             ctx.invoke(
-                operation.0.clone(),
+                captures[0].clone(),
                 Value::Undefined,
                 &[target, source, arguments],
             )
-        }),
-        retained,
+        },
+        vec![operation],
     );
     Ok(ctx.make_array(vec![slots, post]))
 }
@@ -7235,31 +7736,31 @@ fn host_window_message_binding(
 /// must retain the registering script's incumbent, not otherWindow or the native's own Realm.
 /// The operation receives (sourceGlobal, receiver, argumentsArray) privately.
 fn host_callback_api(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let operation = Rc::new(PlatformOperation(
-        args.first().cloned().unwrap_or(Value::Undefined),
-    ));
+    let operation = args.first().cloned().unwrap_or(Value::Undefined);
     let name = host_arg_string(ctx, args, 1);
     let length = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.) as usize;
     let entry_settings = matches!(args.get(3), Some(Value::Bool(true)));
-    let retained = operation.clone();
-    Ok(ctx.new_native_fn_with_retained_memory(
+    // Engine-owned captures participate in cycle collection. Keeping the
+    // self-hosted operation only in an opaque Rust closure would root its
+    // entire Realm after iframe navigation (ECMA-262 #sec-liveness).
+    Ok(ctx.new_native_fn_with_captures(
         &name,
         length,
-        Rc::new(move |ctx, this, args| {
+        |ctx, this, args, captures| {
             let incumbent = ctx.script_caller_global();
-            let source = if entry_settings {
+            let source = if matches!(captures[1], Value::Bool(true)) {
                 ctx.script_entry_global()
             } else {
                 incumbent.clone()
             };
             let arguments = ctx.make_array(args.to_vec());
             ctx.invoke(
-                operation.0.clone(),
+                captures[0].clone(),
                 Value::Undefined,
                 &[source, this, arguments, incumbent],
             )
-        }),
-        retained,
+        },
+        vec![operation, Value::Bool(entry_settings)],
     ))
 }
 
@@ -7306,7 +7807,7 @@ fn host_dom(ctx: &mut Ctx) -> Rc<RefCell<Dom>> {
 fn host_arg_node(dom: &Dom, args: &[Value], index: usize) -> Option<usize> {
     let number = args.get(index)?.as_num_opt()?;
     let id = number as usize;
-    (number >= 0.0 && dom.is_valid(id)).then_some(id)
+    (number.is_finite() && number >= 0.0 && number.fract() == 0.0 && dom.is_valid(id)).then_some(id)
 }
 
 fn host_arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
@@ -7320,8 +7821,84 @@ fn host_id_value(id: Option<usize>) -> Value {
     id.map_or(Value::Null, |id| Value::Num(id as f64))
 }
 
-fn host_ids_array(ctx: &Ctx, ids: Vec<usize>) -> Value {
-    ctx.make_array(ids.into_iter().map(|id| Value::Num(id as f64)).collect())
+fn host_ids_array(ctx: &mut Ctx, ids: Vec<usize>) -> Value {
+    let array = ctx.make_array(ids.iter().map(|&id| Value::Num(id as f64)).collect());
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state
+            .dom_gc
+            .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
+    }
+    array
+}
+
+fn host_register_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(wrapper @ Value::Obj(_)) = args.get(1) else {
+        return Ok(Value::Undefined);
+    };
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let mut dom = state.dom.borrow_mut();
+    if let Some(node) = host_arg_node(&dom, args, 0) {
+        if matches!(dom.node(node).data, NodeData::Document) {
+            if let Some(entry) = state
+                .dom_gc
+                .documents
+                .get(&node)
+                .and_then(|owner| state.dom_gc.owners.get(owner))
+            {
+                return Ok(entry.value.clone());
+            }
+            let Value::Obj(object) = wrapper else {
+                unreachable!()
+            };
+            state
+                .dom_gc
+                .documents
+                .insert(node, Rc::as_ptr(object) as usize);
+        }
+        state
+            .dom_gc
+            .retain(wrapper.clone(), vec![node], DomGcOwnerKind::Wrapper);
+        dom.release_gc_allocation(node);
+    }
+    Ok(wrapper.clone())
+}
+
+fn host_node_identity(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    Ok(host_id_value(
+        args.first()
+            .and_then(|value| state.dom_gc.node_identity(value)),
+    ))
+}
+
+fn host_dom_observer_targets(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let observer = args.first().cloned().unwrap_or(Value::Undefined);
+    let array = args.get(1).cloned().unwrap_or(Value::Undefined);
+    // The private prelude passes distinct node IDs. Read ordinary own numeric
+    // elements only: no accessor/proxy reentrancy while replacing graph edges,
+    // and no attacker-controlled sparse-array length can force an unbounded loop.
+    let limit = ctx
+        .host_mut::<HostState>()
+        .expect("DOM host")
+        .dom
+        .borrow()
+        .node_count();
+    let Some(numbers) = ctx.copy_numeric_array(&array, limit) else {
+        return Err(ctx.make_error("TypeError", "Invalid observer target ID list"));
+    };
+    let mut nodes: Vec<_> = numbers
+        .into_iter()
+        .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+        .map(|number| number as usize)
+        .collect();
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    nodes.retain(|node| state.dom.borrow().is_valid(*node));
+    nodes.sort_unstable();
+    nodes.dedup();
+    state
+        .dom_gc
+        .retain(observer, nodes, DomGcOwnerKind::Observer);
+    Ok(Value::Undefined)
 }
 
 /// Fetch Standard §2.2.1 method normalization plus the byte-string request-body,
@@ -7915,6 +8492,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                     LumenPendingFetch {
                         context,
                         resolve: resolve.clone(),
+                        native_lease: None,
                     },
                 );
                 Some((
@@ -8474,6 +9052,7 @@ fn send_resource_completion(
     let Some((events, pending)) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
         state.pending_resources += 1;
+        state.dom_gc.start_resource(node_id);
         Some((events, state.pending_resources))
     }) else {
         return false;
@@ -8492,6 +9071,7 @@ fn send_resource_completion(
     {
         if let Some(state) = ctx.host_mut::<HostState>() {
             state.pending_resources = pending.saturating_sub(1);
+            state.dom_gc.finish_resource(node_id);
         }
         return false;
     }
@@ -8525,6 +9105,7 @@ fn spawn_resource_fetch(
         let events = state.task_events.clone()?;
         let network = state.network.as_ref()?;
         state.pending_resources += 1;
+        state.dom_gc.start_resource(node_id);
         Some((network.handle.clone(), network.cache.clone(), events))
     }) else {
         return false;
@@ -9175,6 +9756,7 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 }
 
 fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
+    engine.define_global("__geometry_bind", 2, geometry_host::bind);
     engine.define_global("__message_port_binding", 3, message_port_host::call);
     engine.ctx().op_state().register_gc::<HostState>();
     engine.define_global("__image_data_slots", 1, host_image_data_slots);
@@ -10200,6 +10782,7 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
     if let Some(state) = engine.ctx().host_mut::<HostState>() {
         state.pending_resources += 1;
         state.pending_module_evaluations += 1;
+        state.dom_gc.start_resource(node_id);
     } else {
         return false;
     }
@@ -10208,6 +10791,9 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
         "",
         0,
         Rc::new(move |ctx, _this, _args| {
+            let _lease = ctx
+                .host_mut::<HostState>()
+                .map(|state| state.dom_gc.resource_lease(node_id));
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
                 state.pending_module_evaluations =
@@ -10222,6 +10808,9 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
         "",
         1,
         Rc::new(move |ctx, _this, args| {
+            let _lease = ctx
+                .host_mut::<HostState>()
+                .map(|state| state.dom_gc.resource_lease(node_id));
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
                 state.pending_module_evaluations =
@@ -10245,6 +10834,7 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
     if !attached && let Some(state) = engine.ctx().host_mut::<HostState>() {
         state.pending_resources = state.pending_resources.saturating_sub(1);
         state.pending_module_evaluations = state.pending_module_evaluations.saturating_sub(1);
+        state.dom_gc.finish_resource(node_id);
     }
     attached
 }
@@ -10561,7 +11151,9 @@ fn settle_network_task(
         return Ok(());
     };
     let context = pending.context;
+    let native_lease = pending.native_lease;
     let run = move |engine: &mut lumen::Engine| {
+        let _native_lease = native_lease;
         let value = value(engine.ctx());
         engine
             .call_function_interruptible(&pending.resolve, Value::Undefined, &[value])
@@ -10653,6 +11245,10 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             timing,
             external,
         } => {
+            let _lease = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| state.dom_gc.resource_lease(node_id));
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
                 state.pending_resources = state.pending_resources.saturating_sub(1);
             }
@@ -10806,7 +11402,10 @@ fn dispatch_lumen_worker_task(
 fn host_create_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let tag = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
-    let id = dom.borrow_mut().create_element(&tag);
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 1);
+    let id = dom.create_element(&tag);
+    dom.initialize_node_document(id, document);
     Ok(host_id_value(Some(id)))
 }
 
@@ -10815,24 +11414,33 @@ fn host_create_element_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     let prefix = host_arg_string(ctx, args, 1);
     let local_name = host_arg_string(ctx, args, 2);
     let dom = host_dom(ctx);
-    let id = dom.borrow_mut().create_element_ns(
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 3);
+    let id = dom.create_element_ns(
         &namespace,
         (!prefix.is_empty()).then_some(prefix.as_str()),
         &local_name,
     );
+    dom.initialize_node_document(id, document);
     Ok(host_id_value(Some(id)))
 }
 
 fn host_create_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let text = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
-    let id = dom.borrow_mut().create_text(&text);
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 1);
+    let id = dom.create_text(&text);
+    dom.initialize_node_document(id, document);
     Ok(host_id_value(Some(id)))
 }
 
-fn host_create_fragment(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn host_create_fragment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
-    let id = dom.borrow_mut().create_fragment();
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 0);
+    let id = dom.create_fragment();
+    dom.initialize_node_document(id, document);
     Ok(host_id_value(Some(id)))
 }
 
@@ -10889,10 +11497,19 @@ fn host_pi_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Str(target.to_owned().into()))
 }
 
+fn host_creation_document(dom: &Dom, args: &[Value], index: usize) -> usize {
+    host_arg_node(dom, args, index)
+        .filter(|&id| matches!(dom.node(id).data, NodeData::Document))
+        .unwrap_or(DOCUMENT)
+}
+
 fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let text = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
-    let id = dom.borrow_mut().create_comment(&text);
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 1);
+    let id = dom.create_comment(&text);
+    dom.initialize_node_document(id, document);
     Ok(host_id_value(Some(id)))
 }
 
@@ -10940,6 +11557,18 @@ fn host_detach(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
 }
 
 fn host_owner_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(value @ Value::Obj(_)) = args.first() {
+        let state = ctx.host_mut::<HostState>().expect("DOM host");
+        let document = state
+            .dom_gc
+            .node_identity(value)
+            .and_then(|node| state.dom.borrow().owner_document(node));
+        return Ok(document
+            .and_then(|node| state.dom_gc.documents.get(&node))
+            .and_then(|owner| state.dom_gc.owners.get(owner))
+            .map(|entry| entry.value.clone())
+            .unwrap_or_else(|| host_id_value(document)));
+    }
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(host_id_value(
@@ -10971,9 +11600,11 @@ fn host_adopt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
 fn host_parent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    Ok(host_id_value(
-        host_arg_node(&dom, args, 0).and_then(|id| dom.node(id).parent),
-    ))
+    Ok(host_id_value(host_arg_node(&dom, args, 0).and_then(|id| {
+        (!matches!(dom.node(id).data, NodeData::Document))
+            .then(|| dom.node(id).parent)
+            .flatten()
+    })))
 }
 
 fn host_form_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -11035,11 +11666,19 @@ fn host_frame_owner(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     ))
 }
 
+fn host_frame_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(host_id_value(
+        host_arg_node(&dom, args, 0).and_then(|id| dom.frame_document(id)),
+    ))
+}
+
 fn host_is_connected(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(Value::Bool(
-        host_arg_node(&dom, args, 0).is_some_and(|id| dom.is_connected(id)),
+        host_arg_node(&dom, args, 0).is_some_and(|id| dom.is_dom_connected(id)),
     ))
 }
 
@@ -11069,7 +11708,7 @@ fn host_connected_many(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let values = {
         let dom = dom.borrow();
         ids.into_iter()
-            .map(|id| Value::Bool(id.is_some_and(|id| dom.is_valid(id) && dom.is_connected(id))))
+            .map(|id| Value::Bool(id.is_some_and(|id| dom.is_dom_connected(id))))
             .collect()
     };
     Ok(ctx.make_array(values))
@@ -11144,6 +11783,9 @@ fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
             loop {
                 match current {
                     Some(parent) if parent == ancestor => break true,
+                    Some(parent) if matches!(dom.node(parent).data, NodeData::Document) => {
+                        break false;
+                    }
                     Some(parent) => current = dom.node(parent).parent,
                     None => break false,
                 }
@@ -11180,7 +11822,11 @@ fn host_children(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     let ids = {
         let dom = dom.borrow();
         host_arg_node(&dom, args, 0)
-            .map(|id| dom.children(id))
+            .map(|id| {
+                dom.child_iter(id)
+                    .filter(|&child| !matches!(dom.node(child).data, NodeData::Document))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     Ok(host_ids_array(ctx, ids))
@@ -11627,7 +12273,9 @@ fn host_get_by_id(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let target = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    Ok(host_id_value(dom.get_by_id(&target)))
+    Ok(host_id_value(dom.descendants(DOCUMENT).find(|&id| {
+        dom.owner_document(id) == Some(DOCUMENT) && dom.attr(id, "id") == Some(target.as_str())
+    })))
 }
 
 fn host_upgrade_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -11811,9 +12459,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     Some(":after" | "::after") => Some(crate::dom::PseudoEl::After),
                     _ => None,
                 };
-                if id >= dom.node_count()
-                    || !dom.is_connected(id)
-                    || pseudo.is_some() && which.is_none()
+                if !dom.is_valid(id) || !dom.is_connected(id) || pseudo.is_some() && which.is_none()
                 {
                     if op == "computed-names" {
                         serde_json::json!([])
@@ -12081,8 +12727,13 @@ fn ensure_host_geometry(
     let dom = dom_handle.borrow();
     let epoch = dom.epoch();
     let mut cached = cache.borrow_mut();
-    let rebuilt =
-        cached.epoch != epoch || cached.presentation_epoch != dom.layout_presentation_epoch();
+    // Publish this pre-build key. A concurrent resource insertion is observed
+    // as a miss next time; reading the revision again after layout could bless
+    // an earlier negative-use result with the new resource generation.
+    let svg_sprite_revision = crate::dom::svg_sprite_revision();
+    let rebuilt = cached.epoch != epoch
+        || cached.presentation_epoch != dom.layout_presentation_epoch()
+        || cached.svg_sprite_revision != svg_sprite_revision;
     if rebuilt {
         let measure_started = std::env::var_os("TRUST_DIAG_FRAME")
             .is_some()
@@ -12132,15 +12783,17 @@ fn ensure_host_geometry(
             );
         }
         cached.complete_geometry = measured.complete_geometry;
-        cached.viewport_fixed_roots = measured.viewport_fixed_roots;
+        cached.viewport_fixed_roots = measured.viewport_fixed_roots.into_iter().collect();
         cached.boxes = measured.boxes;
         cached.tracks = measured.tracks;
         cached.scrolling_areas = measured.scrolling_areas;
         cached.frame_viewports = measured.frame_viewports;
         cached.fragments = measured.fragments;
         cached.paint = None;
+        cached.hit_index = None;
         cached.epoch = epoch;
         cached.presentation_epoch = dom.layout_presentation_epoch();
+        cached.svg_sprite_revision = svg_sprite_revision;
         cached.top_document_valid = true;
     }
     if !cached.complete_geometry
@@ -12182,8 +12835,19 @@ fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
     };
     let dom = dom.borrow();
     {
-        let cached = cache.borrow();
+        let mut cached = cache.borrow_mut();
         if cached.paint.is_some() && cached.paint_epoch == dom.layout_paint_epoch() {
+            if cached.paint_scroll_epoch != dom.scroll_epoch() {
+                // Re-sample only retained scroll properties. Commands, text
+                // shaping, clips, image handles and layout remain valid.
+                for container in &mut cached.paint.as_mut().unwrap().scroll_containers {
+                    container.offset = crate::core::CssPoint::new(
+                        dom.scroll_metric(container.node, 1).unwrap_or(0.) as f32,
+                        dom.scroll_metric(container.node, 0).unwrap_or(0.) as f32,
+                    );
+                }
+                cached.paint_scroll_epoch = dom.scroll_epoch();
+            }
             drop(cached);
             return cache;
         }
@@ -12200,6 +12864,8 @@ fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
         .3
     });
     cached.paint_epoch = dom.layout_paint_epoch();
+    cached.hit_index = cached.paint.as_ref().map(crate::render::PageHitIndex::new);
+    cached.paint_scroll_epoch = dom.scroll_epoch();
     drop(cached);
     cache
 }
@@ -12225,7 +12891,7 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         .viewport
         .get();
     let cache = ensure_host_hit_test_cache(ctx);
-    let cached = cache.borrow();
+    let mut cached = cache.borrow_mut();
     let Some(paint) = cached.paint.as_ref() else {
         return Ok(ctx.make_array(Vec::new()));
     };
@@ -12243,12 +12909,19 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     } else {
         return Ok(ctx.make_array(Vec::new()));
     };
-    let hits = crate::render::page_element_hits_at(
-        paint,
-        crate::core::CssSize::new(viewport.width, viewport.height),
-        crate::core::CssPoint::new(scroll_x, scroll_y),
-        point,
-    );
+    let LumenGeomCache {
+        paint, hit_index, ..
+    } = &mut *cached;
+    let hits = hit_index
+        .as_mut()
+        .expect("hit index shares paint lifetime")
+        .query(
+            paint.as_ref().unwrap(),
+            crate::core::CssSize::new(viewport.width, viewport.height),
+            crate::core::CssPoint::new(scroll_x, scroll_y),
+            point,
+            0.,
+        );
     drop(cached);
 
     let dom = host_dom(ctx);
@@ -12453,17 +13126,27 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
             requested_box,
         )
     };
-    let (cached_epoch, cached_presentation_epoch, top_document_valid, available) = {
+    let (
+        cached_epoch,
+        cached_presentation_epoch,
+        cached_svg_revision,
+        top_document_valid,
+        available,
+    ) = {
         let cached = cache.borrow();
         (
             cached.epoch,
             cached.presentation_epoch,
+            cached.svg_sprite_revision,
             cached.top_document_valid,
             cached.complete_geometry
                 || requested_box.is_some_and(|id| cached.boxes.contains_key(&id)),
         )
     };
-    let reuse_cached = if cached_presentation_epoch != presentation_epoch || !available {
+    let reuse_cached = if cached_presentation_epoch != presentation_epoch
+        || cached_svg_revision != crate::dom::svg_sprite_revision()
+        || !available
+    {
         false
     } else if cached_epoch == epoch {
         true
@@ -12522,15 +13205,33 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
                 css_width: None,
                 css_height: None,
             }
+        } else if args.get(1).and_then(Value::as_num_opt) == Some(2.) {
+            cached
+                .fragments
+                .as_ref()?
+                .layout_border_box(&dom_handle.borrow(), id)?
         } else {
             *cached.boxes.get(&id)?
         };
+        let dom = dom_handle.borrow();
+        let (scroll_offset, viewport_fixed) = cached
+            .fragments
+            .as_ref()
+            .map_or((crate::core::CssPoint::default(), false), |fragments| {
+                fragments.scroll_placement(&dom, id)
+            });
+        if !matches!(args.get(1), Some(Value::Bool(true)))
+            && args.get(1).and_then(Value::as_num_opt) != Some(2.)
+        {
+            rect.left += f64::from(scroll_offset.x);
+            rect.top += f64::from(scroll_offset.y);
+        }
         // CSSOM View §6 and HTML Rendering #the-page: the flat layout arena
         // stores page-absolute positions, but every nested Document has its
         // own initial containing block at its container's content-box origin.
         // Normalize here, before the owning Window's viewport scroll is applied
         // by getBoundingClientRect. offset* also needs Document-local geometry.
-        if let Some(owner) = dom_handle.borrow().frame_owner(id) {
+        if let Some(owner) = dom.frame_owner(id) {
             let viewport = cached.frame_viewports.get(&owner)?;
             rect.left -= f64::from(viewport.x);
             rect.top -= f64::from(viewport.y);
@@ -12539,20 +13240,6 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         // viewport-fixed fragments already use viewport coordinates. Keep the
         // fragment's actual containing-block choice (including transforms),
         // rather than guessing from this element's own position property.
-        let dom = dom_handle.borrow();
-        let owner = dom.frame_owner(id);
-        let mut current = Some(id);
-        let mut viewport_fixed = false;
-        while let Some(node) = current {
-            if Some(node) == owner {
-                break;
-            }
-            if cached.viewport_fixed_roots.contains(&node) {
-                viewport_fixed = true;
-                break;
-            }
-            current = dom.parent_composed(node);
-        }
         Some((rect, viewport_fixed))
     });
     Ok(match rect {
@@ -12567,10 +13254,52 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     })
 }
 
-/// CSSOM View §6 scroll metrics. Scrolling-area dimensions come from the layout fragment pass;
-/// mutable offsets and client dimensions remain canonical DOM state.
+/// CSSOM View §6: sizes and borders come from untransformed layout fragments;
+/// only mutable scroll offsets come from canonical DOM state.
 fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u8;
+    if (4..=7).contains(&which) {
+        let cache = ensure_host_geom_cache(ctx, "client-metrics");
+        let dom_handle = host_dom(ctx);
+        let dom = dom_handle.borrow();
+        let Some(id) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Num(0.));
+        };
+        let cached = cache.borrow();
+        let Some(metrics) = cached
+            .fragments
+            .as_ref()
+            .and_then(|fragments| fragments.client_metrics(id))
+        else {
+            return Ok(Value::Num(0.));
+        };
+        let value = if which <= 5 && dom.cssom_client_viewport(id) {
+            if let Some(frame) = dom.frame_owner(id) {
+                cached.frame_viewports.get(&frame).map_or(0., |viewport| {
+                    if which == 4 {
+                        viewport.height
+                    } else {
+                        viewport.width
+                    }
+                })
+            } else {
+                let viewport = ctx.host_mut::<HostState>().unwrap().viewport.get();
+                if which == 4 {
+                    viewport.height
+                } else {
+                    viewport.width
+                }
+            }
+        } else {
+            metrics[match which {
+                4 => 3,
+                5 => 2,
+                6 => 1,
+                _ => 0,
+            }]
+        };
+        return Ok(Value::Num(f64::from(value.round())));
+    }
     let scrolling_area = if matches!(which, 2 | 3) {
         let cache = ensure_host_geom_cache(ctx, "scrolling-area");
         let id = {
@@ -12589,8 +13318,8 @@ fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     };
     Ok(match dom.scroll_metric(id, which) {
         Some(value) => Value::Num(value),
-        None if which == 2 => scrolling_area.map_or(Value::Null, |rect| Value::Num(rect.height)),
-        None if which == 3 => scrolling_area.map_or(Value::Null, |rect| Value::Num(rect.width)),
+        None if which == 2 => Value::Num(scrolling_area.map_or(0., |rect| rect.height.round())),
+        None if which == 3 => Value::Num(scrolling_area.map_or(0., |rect| rect.width.round())),
         None => Value::Null,
     })
 }
@@ -12598,12 +13327,45 @@ fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let top = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0);
     let left = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0);
-    let dom = host_dom(ctx);
-    let mut dom = dom.borrow_mut();
+    let cache = ensure_host_geom_cache(ctx, "scroll-position");
+    let dom_handle = host_dom(ctx);
+    let dom = dom_handle.borrow();
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Bool(false));
     };
-    Ok(Value::Bool(dom.set_scroll_pos(id, top, left, true)))
+    let cached = cache.borrow();
+    let axes = cached
+        .fragments
+        .as_ref()
+        .map_or([false; 2], |f| f.scroll_axes(&dom, id));
+    let metrics = cached.fragments.as_ref().and_then(|f| f.client_metrics(id));
+    let area = cached.scrolling_areas.get(&id);
+    let reverse = crate::layout2::scroll_reverse(&dom, id);
+    let clamp = |axis: usize, value: f64| {
+        if !axes[axis] {
+            return 0.;
+        }
+        let viewport = cached
+            .frame_viewports
+            .get(&id)
+            .map(|r| f64::from(if axis == 0 { r.width } else { r.height }))
+            .or_else(|| metrics.map(|m| f64::from(m[axis + 2])))
+            .unwrap_or(0.);
+        let extent = area.map_or(0., |r| if axis == 0 { r.width } else { r.height });
+        let range = (extent - viewport).max(0.);
+        let value = if value.is_finite() { value } else { 0. };
+        if reverse[axis] {
+            value.clamp(-range, 0.)
+        } else {
+            value.clamp(0., range)
+        }
+    };
+    let (top, left) = (clamp(1, top), clamp(0, left));
+    drop(cached);
+    drop(dom);
+    Ok(Value::Bool(
+        dom_handle.borrow_mut().set_scroll_pos(id, top, left, true),
+    ))
 }
 
 /// HTML's iframe processing installs a parsed nested document and resolves its URLs at the frame
@@ -13165,6 +13927,70 @@ fn eval(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<(), Str
     eval_value(engine, source, label).map(|_| ())
 }
 
+fn eval_main_page_diagnostic_init(
+    engine: &mut lumen::Engine,
+    source: Option<&str>,
+    errors: &mut Vec<String>,
+) {
+    let Some(source) = source.filter(|source| !source.trim().is_empty()) else {
+        return;
+    };
+    // The callback exists only as a lexical initializer parameter, never a Window property.
+    // An installed closure can retain it, but ordinary author code acquires no global host API.
+    let reporter = main_page_diagnostic_reporter(engine);
+    let initializer = format!("(function(__trustDiagnosticReport){{\n{source}\n}})");
+    let result =
+        eval_value(engine, &initializer, "TRust main-page diagnostic init").and_then(|function| {
+            engine
+                .call_function_interruptible(&function, Value::Undefined, &[reporter])
+                .map_err(|error| {
+                    describe_eval_error(engine, error, "TRust main-page diagnostic init")
+                })
+        });
+    // A failed diagnostic is reported, but does not skip the document's author scripts.
+    if let Err(error) = result {
+        errors.push(error);
+    }
+}
+
+fn main_page_diagnostic_reporter(engine: &mut lumen::Engine) -> Value {
+    const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
+    let attempted = Cell::new(false);
+    let error_reported = Cell::new(false);
+    engine.ctx().new_native_fn(
+        "diagnosticReport",
+        1,
+        Rc::new(move |ctx, _, args| {
+            let error = |ctx: &mut Ctx, message: &str| {
+                if !error_reported.replace(true) {
+                    eprintln!("lumen: diagnostic error: {message}");
+                }
+                Err(ctx.make_error("TypeError", message))
+            };
+            if attempted.replace(true) {
+                return error(ctx, "diagnostic report may be submitted only once");
+            }
+            let [Value::Str(text)] = args else {
+                return error(ctx, "diagnostic report requires one JSON object string");
+            };
+            if text.len() > MAX_REPORT_BYTES {
+                return error(ctx, "diagnostic report exceeds the 4 MiB limit");
+            }
+            let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(text.as_ref())
+            else {
+                return error(ctx, "diagnostic report is not a valid JSON object");
+            };
+            // Canonical serialization keeps this exactly one line, even if input had whitespace.
+            let encoded = serde_json::to_string(&value).expect("JSON values serialize");
+            if encoded.len() > MAX_REPORT_BYTES {
+                return error(ctx, "diagnostic report exceeds the 4 MiB limit");
+            }
+            eprintln!("lumen: diagnostic: {encoded}");
+            Ok(Value::Undefined)
+        }),
+    )
+}
+
 fn eval_bootstrap_snapshot(
     engine: &mut lumen::Engine,
     snapshot: &[u8],
@@ -13229,6 +14055,89 @@ fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_page_diagnostic_init_is_explicit_once_and_failure_is_contained() {
+        let mut engine = lumen::Engine::new();
+        let mut errors = Vec::new();
+        eval_main_page_diagnostic_init(&mut engine, None, &mut errors);
+        eval_main_page_diagnostic_init(&mut engine, Some("  "), &mut errors);
+        assert_eq!(string_value(&mut engine, "typeof marker"), "undefined");
+        eval_main_page_diagnostic_init(
+            &mut engine,
+            Some("globalThis.marker=(globalThis.marker||0)+1"),
+            &mut errors,
+        );
+        // Subsequent diagnostic drains do not call this initializer; ordinary evaluation and
+        // errors do not replay it or prevent later document code from running.
+        assert_eq!(string_value(&mut engine, "marker"), "1");
+        eval_main_page_diagnostic_init(
+            &mut engine,
+            Some("throw Error('diagnostic failed')"),
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("diagnostic failed"));
+        assert_eq!(string_value(&mut engine, "marker+=2;marker"), "3");
+        assert_eq!(
+            string_value(&mut engine, "typeof __trustDiagnosticReport"),
+            "undefined"
+        );
+        assert_eq!(
+            string_value(&mut lumen::Engine::new(), "typeof marker"),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn main_page_diagnostic_report_is_bounded_one_shot_and_has_no_global_binding() {
+        let mut engine = lumen::Engine::new();
+        let reporter = main_page_diagnostic_reporter(&mut engine);
+        assert!(
+            engine
+                .call_function(
+                    &reporter,
+                    Value::Undefined,
+                    &[Value::from_string("{\n\"complete\": true\n}".to_owned())]
+                )
+                .is_ok()
+        );
+        assert!(
+            engine
+                .call_function(
+                    &reporter,
+                    Value::Undefined,
+                    &[Value::from_string("{}".to_owned())]
+                )
+                .is_err()
+        );
+        for argument in [
+            Value::Num(3.0),
+            Value::from_string("[1]".to_owned()),
+            Value::from_string("{".to_owned()),
+            Value::from_string("x".repeat(4 * 1024 * 1024 + 1)),
+        ] {
+            let reporter = main_page_diagnostic_reporter(&mut engine);
+            assert!(
+                engine
+                    .call_function(&reporter, Value::Undefined, &[argument])
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .call_function(
+                        &reporter,
+                        Value::Undefined,
+                        &[Value::from_string("{}".to_owned())]
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            string_value(&mut engine, "typeof __trustDiagnosticReport"),
+            "undefined"
+        );
+    }
 
     #[test]
     fn child_collections_stay_live_across_detached_moves_and_iteration() {
@@ -13613,6 +14522,259 @@ mod tests {
     }
 
     #[test]
+    fn boxless_cssom_reads_stay_empty_across_display_mutations() {
+        // CSSOM View #dom-element-getclientrects: no box gives an empty list
+        // and an all-zero bounding rectangle, not a descendant union.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>
+                body { margin:0 }
+                #parent { display:contents }
+                #child { width:50px;height:15px }
+            </style><div id=parent><div id=child></div></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const parent = document.getElementById('parent');
+                    const child = document.getElementById('child');
+                    for (const display of ['contents', 'block', 'none', 'contents']) {
+                        parent.style.display = display;
+                        const r = parent.getBoundingClientRect();
+                        if (display === 'block') {
+                            if (r.height !== 15 || parent.getClientRects().length !== 1)
+                                return 'missing block';
+                        } else if (r.x || r.y || r.width || r.height ||
+                            parent.getClientRects().length || parent.offsetWidth || parent.offsetHeight) {
+                            return 'fabricated ' + display + ' box';
+                        }
+                        if (child.getBoundingClientRect().width !== (display === 'none' ? 0 : 50))
+                            return 'child lost';
+                    }
+                    return 'ok';
+                })()"#,
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn transform_geometry_separates_offsets_clients_and_scroll_extent() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let dom = Rc::new(RefCell::new(Dom::parse_document(
+                r#"<!doctype html><style>
+                body{margin:0} #outer{position:relative;left:10px;top:20px;width:100px;height:100px;
+                    transform-origin:0 0;transform:translate(30px,40px) scale(2)}
+                #inner{position:absolute;left:7px;top:11px;width:20px;height:10px}
+                #scroller{width:100px;height:100px;overflow:auto}
+                #overflow{width:100px;height:100px;transform-origin:0 0;transform:translate(50px,60px) scale(2)}
+                </style><div id=outer><div id=inner></div></div><div id=scroller><div id=overflow></div></div>"#,
+            )));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const o=document.getElementById('outer'), i=document.getElementById('inner');
+                const r=o.getBoundingClientRect(), s=i.getBoundingClientRect();
+                const actual=[r.x,r.y,r.width,r.height,s.x,s.y,s.width,s.height,
+                    o.offsetLeft,o.offsetTop,o.offsetWidth,o.offsetHeight,i.offsetLeft,i.offsetTop,i.offsetWidth,i.offsetHeight];
+                const expected=[40,60,200,200,54,82,40,20,10,20,100,100,7,11,20,10];
+                if(actual.join()!==expected.join()) return 'coordinates '+actual;
+                if([o.clientWidth,o.clientHeight,i.clientWidth,i.clientHeight].join()!=='100,100,20,10') return 'scaled client metrics';
+                const p=document.getElementById('scroller'), c=document.getElementById('overflow');
+                if(p.scrollWidth!==250||p.scrollHeight!==260) return 'overflow '+[p.scrollWidth,p.scrollHeight];
+                c.style.transform='scale(.5)';
+                if(p.scrollWidth!==100||p.scrollHeight!==100) return 'shrunken overflow';
+                o.style.transform='none'; o.style.scale='3 2';
+                if(i.offsetParent!==o||i.getBoundingClientRect().width!==60||i.offsetWidth!==20) return 'individual containing block';
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_placement_retains_layout_and_follows_containing_blocks() {
+        // CSSOM View scrolling-area / CSS Overflow 3 scrolling / Position 3
+        // def-cb: these are coordinate-space transitions, never reflows.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let dom = Rc::new(RefCell::new(Dom::parse_document(
+                r#"<!doctype html>
+                <style>html,body{margin:0}.scroll{width:100px;height:80px;overflow:auto}
+                .large{width:400px;height:500px}</style>
+                <div id=outer style='position:relative;margin:20px;width:200px;height:200px'>
+                <div id=scroll class=scroll><div id=abs style='position:absolute;left:7px;top:11px;width:20px;height:10px'></div>
+                <div id=flow class=large><span id=text>hello</span></div></div></div>
+                <div id=hidden class=scroll style='overflow:hidden'><div id=hchild class=large></div></div>
+                <div id=clip class=scroll style='overflow:clip'><div id=cchild class=large></div></div>
+                <div id=rtl class=scroll style='direction:rtl'><div id=rchild class=large style='direction:ltr'></div></div>"#,
+            )));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                globalThis.sc=document.getElementById('scroll');
+                globalThis.fl=document.getElementById('flow');
+                globalThis.ab=document.getElementById('abs');
+                globalThis.before=[fl.getBoundingClientRect(),ab.getBoundingClientRect(),document.getElementById('text').getBoundingClientRect(),fl.offsetLeft,fl.offsetTop];
+                document.elementFromPoint(25,25);
+                return [sc.scrollWidth,sc.scrollHeight].join();
+            })()"#
+                ),
+                "400,500"
+            );
+            let passes = crate::layout2::layout_pass_count();
+            let cache = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .geom_cache
+                .clone();
+            let commands = cache.borrow().paint.as_ref().unwrap().primitives.as_ptr();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                sc.scrollTo(35,50);
+                const r=fl.getBoundingClientRect(), a=ab.getBoundingClientRect(), t=document.getElementById('text').getBoundingClientRect();
+                if(r.x!==before[0].x-35||r.y!==before[0].y-50) return 'flow '+[r.x,r.y];
+                if(a.x!==before[1].x||a.y!==before[1].y) return 'escaping abs';
+                if(t.x!==before[2].x-35||t.y!==before[2].y-50) return 'inline';
+                if(document.elementFromPoint(25,25)!==fl) return 'scrolled hit';
+                if(fl.offsetLeft!==before[3]||fl.offsetTop!==before[4]) return 'scrolled offsets';
+                const hidden=document.getElementById('hidden'), clip=document.getElementById('clip');
+                const hc=document.getElementById('hchild'), cc=document.getElementById('cchild');
+                const h=hc.getBoundingClientRect(), c=cc.getBoundingClientRect();
+                hidden.scrollTo(35,50);clip.scrollTo(35,50);
+                if(hidden.scrollTop!==50||hc.getBoundingClientRect().y!==h.y-50) return 'hidden';
+                if(clip.scrollTop!==0||clip.scrollLeft!==0||cc.getBoundingClientRect().y!==c.y) return 'clip';
+                const rtl=document.getElementById('rtl'), rc=document.getElementById('rchild');
+                if(rtl.scrollWidth!==400||rc.getBoundingClientRect().x!==-300) return 'rtl initial '+[rtl.scrollWidth,rc.getBoundingClientRect().x];
+                rtl.scrollLeft=-35;if(rtl.scrollLeft!==-35||rc.getBoundingClientRect().x!==-265) return 'rtl scroll';
+                rtl.scrollLeft=-Infinity;if(rtl.scrollLeft!==0) return 'nonfinite';
+                rtl.scrollLeft=-10000;if(rtl.scrollLeft!==-300) return 'rtl clamp';
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+            assert_eq!(
+                crate::layout2::layout_pass_count(),
+                passes,
+                "scroll must retain layout: {tier:?}"
+            );
+            assert_eq!(
+                cache.borrow().paint.as_ref().unwrap().primitives.as_ptr(),
+                commands,
+                "scroll must retain display commands: {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_geometry_uses_unscaled_padding_edges_and_owning_viewports() {
+        // CSSOM View §6: client metrics ignore transforms, exclude borders,
+        // exclude non-replaced inline boxes, and use each Document's viewport.
+        for quirks in [false, true] {
+            let source = format!(
+                r#"{}<style>
+                html,body{{margin:0}} #box{{width:40px;height:20px;padding:5px 7px;
+                    border-style:solid;border-width:3px 4px 6px 8px;transform:scale(3)}}
+                #inline{{border:9px solid;padding:12px}} #hidden{{display:none}}
+                </style><div id=box></div><span id=inline>text</span><div id=hidden></div>
+                <iframe id=frame style='width:170px;height:90px;border:5px solid;transform:scale(2)'
+                srcdoc='<!doctype html><style>html,body{{margin:0}} body{{height:400px}}</style><div>frame</div>'></iframe>"#,
+                if quirks { "" } else { "<!doctype html>" }
+            );
+            let dom = Rc::new(RefCell::new(Dom::parse_document(&source)));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const b=document.getElementById('box');
+                function metrics(e) { return [e.clientLeft,e.clientTop,e.clientWidth,e.clientHeight].join(); }
+                if(metrics(b)!=='8,3,54,30') return 'box '+metrics(b);
+                for(const id of ['inline','hidden']) if(metrics(document.getElementById(id))!=='0,0,0,0') return id;
+                const root=document.compatMode==='BackCompat'?document.body:document.documentElement;
+                if(root.clientWidth!==innerWidth||root.clientHeight!==innerHeight) return 'top viewport';
+                __trust.hydrateFrames();
+                const frame=document.getElementById('frame'), child=frame.contentDocument;
+                if(child.documentElement.clientWidth!==170||child.documentElement.clientHeight!==90) return 'child viewport '+metrics(child.documentElement);
+                window.getComputedStyle=()=>{throw Error('author style called');};
+                b.style.padding='11px 13px'; b.style.borderWidth='1px 2px 3px 4px';
+                if(metrics(b)!=='4,1,66,42') return 'live metrics '+metrics(b);
+                b.style.display='inline'; if(metrics(b)!=='0,0,0,0') return 'became inline';
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "quirks={quirks}"
+            );
+        }
+    }
+
+    #[test]
+    fn offset_geometry_static_body_uses_root_border_edge() {
+        // CSSWG resolution 2024-10-30 / csswg-drafts#10549 supplements the
+        // local CSSOM View offsetTop/Left prose for child-of-root static BODY.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let dom = Rc::new(RefCell::new(Dom::parse_document(
+                r#"<!doctype html><style>
+                html{margin:13px 17px;padding:7px;border:5px solid}
+                body{margin:19px 23px;padding:11px;border:3px solid}
+                #box{margin:29px 0 0 31px;width:40px;height:20px}
+                </style><div id=box></div>"#,
+            )));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const b=document.getElementById('box'), body=document.body, root=document.documentElement;
+                const coords=()=>[b.offsetLeft,b.offsetTop].join();
+                if(b.offsetParent!==body||coords()!=='80,74') return 'static '+coords();
+                body.style.transform='translate(100px,200px)';
+                if(coords()!=='80,74') return 'transformed static '+coords();
+                body.style.position='relative';
+                if(coords()!=='42,40') return 'relative '+coords();
+                body.style.cssText='margin:0;padding:0;border:0';
+                root.style.cssText='margin:0;padding:0;border:0';
+                if(coords()!=='31,29') return 'collapsed margin '+coords();
+                const frame=document.createElement('iframe');
+                frame.srcdoc='<!doctype html><style>html{margin:13px 17px;padding:7px;border:5px solid}'+
+                    'body{margin:19px 23px;padding:11px;border:3px solid}div{margin:29px 0 0 31px;width:40px;height:20px}</style><div id=box></div>';
+                body.append(frame); __trust.hydrateFrames();
+                const child=frame.contentDocument.getElementById('box');
+                if([child.offsetLeft,child.offsetTop].join()!=='80,74') return 'frame origin';
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn retained_layout_geometry_hit_testing_and_paint_share_one_transaction() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<style>
@@ -13711,6 +14873,59 @@ mod tests {
             &fragments,
             cache.borrow().fragments.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn intrinsic_image_completion_refreshes_cssom_without_a_dom_mutation() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<style>body{margin:0}img{display:block;width:40px;height:auto}</style><img id=image src='/resource.png'><div>following content</div>",
+        )));
+        let node = dom.borrow().get_by_id("image").unwrap();
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        let source = url::Url::parse(DEFAULT_URL)
+            .unwrap()
+            .join("/resource.png")
+            .unwrap()
+            .to_string();
+        for (size, height) in [
+            (Some((80, 40)), "20"),
+            (Some((80, 120)), "60"),
+            (None, "20"),
+        ] {
+            {
+                let state = engine.ctx().host_mut::<HostState>().unwrap();
+                if let Some(size) = size {
+                    state.images.borrow_mut().insert(source.clone(), size);
+                } else {
+                    state.images.borrow_mut().remove(&source);
+                }
+            }
+            let epoch = dom.borrow().epoch();
+            dom.borrow_mut().image_changed(node);
+            assert_eq!(dom.borrow().epoch(), epoch);
+            // Do not forcibly expire LumenGeomCache here: the resource
+            // notification's presentation revision must make CSSOM current.
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "String(document.getElementById('image').getBoundingClientRect().height)"
+                ),
+                height
+            );
+            let cache = ensure_host_geom_cache(engine.ctx(), "image-completion-test");
+            assert!(
+                cache.borrow().paint.is_none(),
+                "old hit-test geometry survived a resource update"
+            );
+            assert_eq!(
+                string_value(&mut engine, "document.elementFromPoint(5,5).id"),
+                "image"
+            );
+            assert!(cache.borrow().paint.is_some());
+        }
     }
 
     #[test]
@@ -14141,6 +15356,12 @@ mod tests {
             "first"
         );
         let passes = crate::layout2::layout_pass_count();
+        let hit_storage = ensure_host_hit_test_cache(engine.ctx())
+            .borrow()
+            .hit_index
+            .as_ref()
+            .unwrap()
+            .storage_identity();
         let epoch = dom.borrow().epoch();
         let scroller = dom.borrow().get_by_id("scroller").unwrap();
         dom.borrow_mut().set_scroll_pos(scroller, 40., 0., true);
@@ -14153,6 +15374,57 @@ mod tests {
             crate::layout2::layout_pass_count(),
             passes,
             "scroll must refresh hit-test paint, not relayout"
+        );
+        assert_eq!(
+            ensure_host_hit_test_cache(engine.ctx())
+                .borrow()
+                .hit_index
+                .as_ref()
+                .unwrap()
+                .storage_identity(),
+            hit_storage
+        );
+    }
+
+    #[test]
+    fn retained_hit_index_invalidates_style_and_structure_but_not_scroll() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<style>body{margin:0} .box{position:absolute;inset:0;width:100px;height:100px}</style>
+          <div id=a class=box></div><div id=b class=box></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(&mut engine, "document.elementFromPoint(10,10).id"),
+            "b"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('b').style.pointerEvents='none';document.elementFromPoint(10,10).id"
+            ),
+            "a"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('b').style.pointerEvents='auto';document.elementFromPoint(10,10).id"
+            ),
+            "b"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('b').remove();document.elementFromPoint(10,10).id"
+            ),
+            "a"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('a').style.transform='translate(110px,0)';document.elementFromPoint(120,10).id"
+            ),
+            "a"
         );
     }
 
@@ -14692,6 +15964,141 @@ mod tests {
             ),
             "bc|true|true|true|true|true|true|true|true|true"
         );
+    }
+
+    #[test]
+    fn live_range_registry_releases_retired_realms_and_keeps_borrowed_ranges_live() {
+        // DOM #concept-live-range / live range pre-remove steps, and HTML
+        // #discard-a-document: a borrowed Range stays live after destruction,
+        // but the Agent's discovery registry must not own its entire Realm.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let mut retired = Vec::new();
+            for index in 0..4 {
+                eval(
+                    &mut engine,
+                    r#"
+                        var rangeFrame = document.createElement('iframe');
+                        rangeFrame.srcdoc = '<body><p>abcdef</p><script>' +
+                            'window.ownedRange = document.createRange();' +
+                            'ownedRange.setStart(document.querySelector("p").firstChild, 1);' +
+                            'ownedRange.setEnd(document.querySelector("p").firstChild, 4);' +
+                            '<\/script>';
+                        document.body.appendChild(rangeFrame); __trust.hydrateFrames();
+                    "#,
+                    "Range Realm fixture",
+                )
+                .unwrap();
+                if index == 0 {
+                    eval(
+                        &mut engine,
+                        "var borrowedRange = rangeFrame.contentWindow.ownedRange;",
+                        "retain foreign Range",
+                    )
+                    .unwrap();
+                }
+                {
+                    let state = engine.ctx().host_mut::<HostState>().unwrap();
+                    assert_eq!(state.window_realms.len(), 1);
+                    retired.push(Rc::downgrade(
+                        state
+                            .window_realms
+                            .values()
+                            .next()
+                            .unwrap()
+                            .as_obj()
+                            .unwrap(),
+                    ));
+                }
+                eval(
+                    &mut engine,
+                    "rangeFrame.remove(); rangeFrame = null; while (__trust.hasPlatformTask()) __trust.runPlatformTask(); /parent-match/.test('parent-match');",
+                    "destroy Range Realm",
+                )
+                .unwrap();
+            }
+            for _ in 0..3 {
+                run_microtask_checkpoint(&mut engine);
+                engine.collect_garbage_at_idle();
+            }
+            assert!(
+                retired[0].upgrade().is_some(),
+                "{tier:?}: borrowed Range lost its Realm"
+            );
+            for (index, window) in retired.iter().enumerate().skip(1) {
+                assert!(
+                    window.upgrade().is_none(),
+                    "{tier:?}: range registry kept retired Realm {index} alive"
+                );
+            }
+            assert_eq!(
+                engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .live_ranges
+                    .len(),
+                1,
+                "{tier:?}: collection retained dead native Range metadata"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                        // Borrow the parent's mutation implementation; range
+                        // discovery must still include this foreign Range.
+                        Text.prototype.insertData.call(borrowedRange.startContainer, 0, 'Z');
+                        [borrowedRange.startOffset, borrowedRange.endOffset, borrowedRange.toString()].join('|')
+                    "#
+                ),
+                "2|5|bcd",
+                "{tier:?}: live foreign Range missed CharacterData mutation"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                        borrowedRange.startContainer.parentNode.remove();
+                        [borrowedRange.collapsed, borrowedRange.startContainer.localName,
+                            borrowedRange.startOffset, borrowedRange.endOffset].join('|')
+                    "#
+                ),
+                "true|body|0|0",
+                "{tier:?}: live foreign Range missed removal"
+            );
+            eval(
+                &mut engine,
+                "borrowedRange = null; /parent-match/.test('parent-match');",
+                "release borrowed Range",
+            )
+            .unwrap();
+            for _ in 0..3 {
+                run_microtask_checkpoint(&mut engine);
+                engine.collect_garbage_at_idle();
+            }
+            assert!(
+                retired[0].upgrade().is_none(),
+                "{tier:?}: released Range kept its Realm"
+            );
+            assert_eq!(
+                engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .live_ranges
+                    .len(),
+                0
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
     }
 
     #[test]
@@ -15673,7 +17080,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 170, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 177, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -15684,7 +17091,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 170);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 177);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -16117,6 +17524,39 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn nested_window_snapshot_bootstrap_preserves_default_stack() {
+        // HTML run-a-classic-script permits synchronous child-Window bootstrap while earlier
+        // JS contexts are suspended. Keep the ordinary test-thread stack: the engine's codec
+        // must adapt to the remaining headroom rather than require a larger embedder stack.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                    const html = document.createElement('html');
+                    const body = document.createElement('body');
+                    document.appendChild(html); html.appendChild(body);
+                    const outer = document.createElement('iframe');
+                    outer.srcdoc = '<body><script>document.body.appendChild(document.createElement("iframe"));<\/script>';
+                    body.appendChild(outer);
+                    __trust.hydrateFrames();
+                    let budget = 1000;
+                    while (__trust.hasPlatformTask() && budget-- > 0) __trust.runPlatformTask();
+                    if (budget <= 0) throw Error('nested navigation did not drain');
+                    const inner = outer.contentDocument.querySelector('iframe');
+                    inner.contentDocument.defaultView === inner.contentWindow;
+                "#
+                ),
+                "true",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
@@ -19022,6 +20462,8 @@ mod tests {
             // Exercise the same UA Realm-creation boundary as frame navigation,
             // without needing a live external document server in this unit test.
             const context = __dom_allocate_job_context();
+            __dom_load_frame(frame.__id, '<body></body>', 'https://widget.example.com/widget');
+            frame.__contentDoc = undefined;
             globalThis.foreign = __dom_create_window_realm(context, frame.__id,
                 'https://widget.example.com/widget', __trust_cfg, window, window, frame, 0, '');
             foreign.eval("globalThis.result='pending'; fetch('/api',{mode:'same-origin'})" +
@@ -21819,6 +23261,7 @@ mod tests {
             frame.style.width = 0;
             globalThis.cssLengthAssignmentResult = [
                 invalidProperty,
+                document.styleSheets[0].cssRules[0].style.height,
                 getComputedStyle(frame).height,
                 frame.style.width,
                 CSS.supports("height", "518"),
@@ -21830,7 +23273,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             string_value(&mut engine, "cssLengthAssignmentResult"),
-            "|100%|0|false|true"
+            // CSSOM #resolved-values: a zero-width iframe still has a box.
+            // Its auto-containing-block percentage height uses the 150px
+            // default replaced height; the original declaration stays 100%.
+            "|100%|150px|0|false|true"
         );
     }
 
@@ -22541,6 +23987,234 @@ mod tests {
     }
 
     #[test]
+    fn dom_rect_native_bindings_and_clone_conform_in_windows_and_workers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            for worker in [false, true] {
+                let mut engine = if worker {
+                    worker_platform_engine()
+                } else {
+                    platform_engine()
+                };
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(
+                    string_value(&mut engine, include_str!("fixtures/dom_rect.mjs")),
+                    "dom-rect-ok",
+                    "{tier:?}, worker={worker}"
+                );
+                for _ in 0..4 {
+                    run_microtask_checkpoint(&mut engine);
+                    eval(
+                        &mut engine,
+                        if worker {
+                            "if (__wkr.hasPortTask()) __wkr.runPortTask();"
+                        } else {
+                            "if (__trust.hasPlatformTask()) __trust.runPlatformTask();"
+                        },
+                        "rectangle port delivery",
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    string_value(&mut engine, "rectangleMessageResult"),
+                    "ok",
+                    "{tier:?}, worker={worker}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dom_rect_native_cross_realm_brands_and_snapshot_identity() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<body><div id=box style='width:40px;height:20px'></div></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            (() => {
+                function check(v, m) { if (!v) throw new Error(m); }
+                const frame = document.createElement('iframe'); frame.srcdoc = '<body>child';
+                document.body.appendChild(frame); __trust.hydrateFrames();
+                const child = frame.contentWindow;
+                const rect = new child.DOMRect(5, 6, 7, 8);
+                const x = Object.getOwnPropertyDescriptor(DOMRect.prototype, 'x');
+                check(x.get.call(rect) === 5, 'foreign getter brand');
+                x.set.call(rect, 9); check(rect.x === 9, 'foreign setter brand');
+                const json = DOMRectReadOnly.prototype.toJSON.call(rect);
+                check(json.x === 9 && Object.getPrototypeOf(json) === Object.prototype, 'foreign toJSON');
+                const clone = structuredClone(rect);
+                check(Object.getPrototypeOf(clone) === DOMRect.prototype && clone.x === 9, 'foreign clone into parent');
+                const other = child.structuredClone(new DOMRectReadOnly(15));
+                check(Object.getPrototypeOf(other) === child.DOMRectReadOnly.prototype && other.x === 15, 'clone into child');
+                let Target = child.Function(''); Target.prototype = null;
+                for (let i = 0; i < 128; i++) Target = Function.prototype.bind.call(Target, null);
+                const fallback = Reflect.construct(DOMRect, [21], Target);
+                check(Object.getPrototypeOf(fallback) === child.DOMRect.prototype && fallback.x === 21, 'foreign interface fallback through long bound chain');
+                const prototype = child.DOMRect.prototype;
+                child.DOMRect = null;
+                check(Object.getPrototypeOf(Reflect.construct(DOMRect, [], Target)) === prototype, 'intrinsic fallback ignores overwritten constructor');
+                const box = document.getElementById('box');
+                const a = box.getBoundingClientRect(), b = box.getBoundingClientRect();
+                check(a !== b && a.width === 40 && b.width === 40, 'fresh cached geometry objects');
+                a.width = 999; check(b.width === 40 && box.getBoundingClientRect().width === 40, 'independent snapshots');
+                box.style.width = '65px';
+                check(b.width === 40 && box.getBoundingClientRect().width === 65, 'old snapshot survives invalidation');
+                const Ctor = DOMRect;
+                window.DOMRect = function () { throw new Error('author constructor'); };
+                try { check(Object.getPrototypeOf(box.getBoundingClientRect()) === Ctor.prototype, 'layout bypasses author constructor'); }
+                finally { window.DOMRect = Ctor; }
+                return 'cross-realm-ok';
+            })()
+        "#
+            ),
+            "cross-realm-ok"
+        );
+    }
+
+    #[test]
+    fn dom_rect_registry_collects_cycles_and_survives_reentrant_conversions() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.define_global("collectRectGarbage", 0, |ctx, _, _| {
+                ctx.collect_garbage_for_host();
+                Ok(Value::Undefined)
+            });
+            eval(
+                &mut engine,
+                r#"
+                var keepRect = new DOMRect(8, 9, 10, 11);
+                for (let i = 0; i < 1024; i++) { const r = new DOMRect(i); r.self = r; }
+            "#,
+                "rectangle allocation and cycles",
+            )
+            .unwrap();
+            engine.ctx().unstable_collect_young_for_host_tests();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                keepRect.x = {valueOf() { collectRectGarbage(); return 31; }};
+                const r = new DOMRect({valueOf() { collectRectGarbage(); return 12; }});
+                [keepRect.x, r.x].join('|');
+            "#
+                ),
+                "31|12",
+                "{tier:?}: reentrant collection"
+            );
+            // `r` is a lexical root; explicitly exercise a dropped cyclic root
+            // as well as the many anonymous cycles in the first nursery.
+            eval(
+                &mut engine,
+                r#"
+                for (let i = 0; i < 1024; i++) { const r = new DOMRect(i); r.self = r; }
+                keepRect = null;
+            "#,
+                "release rectangle cycles",
+            )
+            .unwrap();
+            for _ in 0..3 {
+                run_microtask_checkpoint(&mut engine);
+                engine.collect_garbage_at_idle();
+            }
+            assert_eq!(
+                engine.ctx().host_mut::<HostState>().unwrap().geometry.len(),
+                1,
+                "{tier:?}: native state must follow JS liveness"
+            );
+            assert_eq!(string_value(&mut engine, "r.x"), "12");
+        }
+    }
+
+    #[test]
+    fn dom_rect_registry_does_not_root_retired_realms() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<body></body>"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        let mut retired = Vec::new();
+        for i in 0..4 {
+            eval(&mut engine, r#"
+                var rectFrame = document.createElement('iframe'); rectFrame.srcdoc = '<body>rectangle';
+                document.body.appendChild(rectFrame); __trust.hydrateFrames();
+                rectFrame.contentWindow.eval('var localRectangle = new DOMRect(12); localRectangle.self = localRectangle;');
+            "#, "rectangle Realm setup").unwrap();
+            if i == 0 {
+                eval(
+                    &mut engine,
+                    "var borrowedRectangle = rectFrame.contentWindow.localRectangle;",
+                    "borrow rectangle",
+                )
+                .unwrap();
+            }
+            retired.push({
+                let state = engine.ctx().host_mut::<HostState>().unwrap();
+                Rc::downgrade(
+                    state
+                        .window_realms
+                        .values()
+                        .next()
+                        .unwrap()
+                        .as_obj()
+                        .unwrap(),
+                )
+            });
+            eval(&mut engine, "rectFrame.remove(); rectFrame = null; while (__trust.hasPlatformTask()) __trust.runPlatformTask(); /parent-match/.test('parent-match');", "retire rectangle Realm").unwrap();
+        }
+        for _ in 0..3 {
+            run_microtask_checkpoint(&mut engine);
+            engine.collect_garbage_at_idle();
+        }
+        assert!(
+            retired[0].upgrade().is_some(),
+            "borrowed rectangle must keep its intrinsic prototype/Realm live"
+        );
+        for realm in &retired[1..] {
+            assert!(
+                realm.upgrade().is_none(),
+                "native registry rooted retired Realm"
+            );
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "DOMRectReadOnly.prototype.toJSON.call(borrowedRectangle).x"
+            ),
+            "12"
+        );
+        eval(
+            &mut engine,
+            "borrowedRectangle = null; /parent-match/.test('parent-match');",
+            "release borrowed rectangle",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            run_microtask_checkpoint(&mut engine);
+            engine.collect_garbage_at_idle();
+        }
+        assert!(
+            retired[0].upgrade().is_none(),
+            "released rectangle rooted its Realm"
+        );
+        assert_eq!(
+            engine.ctx().host_mut::<HostState>().unwrap().geometry.len(),
+            0
+        );
+    }
+
+    #[test]
     fn marquee_interface_reflects_timing_and_controls_render_pause_state() {
         let mut engine = platform_engine();
         eval(
@@ -22604,6 +24278,7 @@ mod tests {
             document.cookie = 'storagePolicy=top; Path=/';
             function createStoragePolicyRealm(url) {
                 const frame = document.createElement('iframe'); body.appendChild(frame);
+                __dom_load_frame(frame.__id, '<body></body>', url);
                 frame.__contentDoc = undefined;
                 return __dom_create_window_realm(__dom_allocate_job_context(), frame.__id, url,
                     __trust_cfg, window, window, frame, 0, '');
@@ -22648,12 +24323,14 @@ mod tests {
             r#"
             const frame = document.createElement('iframe');
             document.appendChild(frame); frame.__contentDoc = undefined;
+            __dom_load_frame(frame.__id, '<body></body>', 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/frame-test');
             const third = __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
                 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/frame-test',
                 __trust_cfg, window, window, frame, 0, '');
             third.eval(`
                 const frame = document.createElement('iframe');
                 document.appendChild(frame); frame.__contentDoc = undefined;
+                __dom_load_frame(frame.__id, '<body></body>', 'https://nested.example.net/');
                 __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
                     'https://nested.example.net/', __trust_cfg, window, top, frame, 0, '');
                 document.cookie = 'cf_chl_script=still-blocked; Secure; SameSite=None';
@@ -22800,6 +24477,7 @@ mod tests {
                 const frame = document.createElement('iframe');
                 if (sandbox !== undefined) frame.setAttribute('sandbox', sandbox);
                 document.appendChild(frame); frame.__contentDoc = undefined;
+                __dom_load_frame(frame.__id, '<body></body>', url);
                 return __dom_create_window_realm(__dom_allocate_job_context(), frame.__id, url,
                     __trust_cfg, window, window, frame, 0, '');
             }
@@ -22807,6 +24485,7 @@ mod tests {
             third.eval(`
                 const frame = document.createElement('iframe');
                 document.appendChild(frame); frame.__contentDoc = undefined;
+                __dom_load_frame(frame.__id, '<body></body>', 'https://cookie-ancestors.example/');
                 const nested = __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
                     'https://cookie-ancestors.example/', __trust_cfg, window, top, frame, 0, '');
                 nested.eval("globalThis.result = document.cookie; try { localStorage; result += 'exposed'; } catch (e) { result += e.name; }");
@@ -22860,6 +24539,7 @@ mod tests {
             document.appendChild(html); html.appendChild(body);
             function storageRealm(url) {
                 const frame = document.createElement('iframe'); body.appendChild(frame);
+                __dom_load_frame(frame.__id, '<body></body>', url);
                 frame.__contentDoc = undefined;
                 const context = __dom_allocate_job_context();
                 return __dom_create_window_realm(context, frame.__id, url,
@@ -22903,6 +24583,7 @@ mod tests {
             const frame = document.createElement('iframe'); body.appendChild(frame);
             // Ordinary navigation clears the old Document before bootstrapping
             // its replacement Realm. Reproduce that UA boundary in this test.
+            __dom_load_frame(frame.__id, '<body></body>', 'https://storage-inherit.example.com/a');
             frame.__contentDoc = undefined;
             const context = __dom_allocate_job_context();
             const child = __dom_create_window_realm(context, frame.__id,
@@ -22925,6 +24606,7 @@ mod tests {
                     nested.contentWindow.sessionStorage.getItem('marker')].join('|');
             `);
             const opaqueFrame = document.createElement('iframe'); body.appendChild(opaqueFrame);
+            __dom_load_frame(opaqueFrame.__id, '<body></body>', 'data:text/html,');
             opaqueFrame.__contentDoc = undefined;
             const opaqueContext = __dom_allocate_job_context();
             const opaque = __dom_create_window_realm(opaqueContext, opaqueFrame.__id,
@@ -22953,6 +24635,7 @@ mod tests {
             const html = document.createElement('html'), body = document.createElement('body');
             document.appendChild(html); html.appendChild(body);
             const frame = document.createElement('iframe'); body.appendChild(frame);
+            __dom_load_frame(frame.__id, '<body></body>', 'https://storage-retained.example.com/a');
             frame.__contentDoc = undefined;
             globalThis.storageContext = __dom_allocate_job_context();
             const child = __dom_create_window_realm(storageContext, frame.__id,
@@ -25125,6 +26808,106 @@ mod tests {
     }
 
     #[test]
+    fn iframe_detached_nodes_and_constructed_sheets_keep_their_document() {
+        // DOM #concept-node-document / #concept-node-adopt, HTML child Document creation,
+        // CSSOM #concept-css-style-sheet-constructor-document and adoptedStyleSheets.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r##"(() => {
+            function check(value, label) { if (!value) throw Error(label); }
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe');
+            frame.srcdoc = '<head><base href="https://old.test/base/"></head><body><p id="old">old</p><script>' +
+                'const sheet = new CSSStyleSheet(); sheet.replaceSync(":host { color: red }");' +
+                'class OwnedElement extends HTMLElement { constructor() { super();' +
+                'this.attachShadow({mode:"open"}).adoptedStyleSheets=[sheet];' +
+                'this.correctOwner = this.ownerDocument === document; }}' +
+                'customElements.define("owned-element", OwnedElement);' +
+                'globalThis.created=document.createElement("owned-element");' +
+                'globalThis.constructed=new OwnedElement();' +
+                'globalThis.text=document.createTextNode("detached");' +
+                'globalThis.fragment=document.createDocumentFragment();' +
+                '<\/script></body>';
+            body.appendChild(frame); __trust.hydrateFrames();
+            const child = frame.contentWindow, oldDocument = frame.contentDocument;
+            const oldBody = oldDocument.body, created = child.created;
+            check(created && created.correctOwner, 'createElement owns Document before constructor');
+            check(child.constructed.correctOwner, 'new custom element owns constructor Document');
+            check(created.shadowRoot.ownerDocument === oldDocument, 'detached shadow owner');
+            check(created.shadowRoot.adoptedStyleSheets.length === 1, 'constructed sheet accepted');
+            check(child.text.ownerDocument === oldDocument, 'detached text owner');
+            check(child.fragment.ownerDocument === oldDocument, 'detached fragment owner');
+            check(frame.childNodes.length === 0, 'presentation Document is not an iframe child');
+            const fallback=document.createElement('span');frame.appendChild(fallback);
+            check(fallback.parentNode===frame && fallback.ownerDocument===document,
+                'authored iframe children remain in the embedding Document');
+            check(document.querySelector('#old') === null, 'parent selectors stay in their Document');
+            oldBody.appendChild(created); created.remove();
+            check(created.ownerDocument === oldDocument, 'removal preserves owner');
+            frame.srcdoc = '<body><p id="new">new</p></body>'; __trust.hydrateFrames();
+            check(frame.contentDocument !== oldDocument, 'navigation replaces Document identity');
+            check(fallback.parentNode===frame && frame.childNodes.length===1,
+                'navigation replaces only the content Document, not authored iframe children');
+            check(oldDocument.body === oldBody && oldBody.querySelector('#old'), 'old Document keeps its tree');
+            check(oldDocument.isConnected && oldBody.isConnected && oldBody.getRootNode()===oldDocument,
+                'inactive Document remains its own connected DOM root');
+            check(!created.isConnected, 'detached node ownership does not imply connectedness');
+            check(created.ownerDocument === oldDocument, 'navigation does not retarget detached nodes');
+            check(oldDocument.baseURI === 'https://old.test/base/' && created.baseURI === oldDocument.baseURI,
+                'retired Document and detached nodes preserve the old base URL');
+            const imported = frame.contentDocument.importNode(created, true);
+            check(imported !== created && imported.ownerDocument === frame.contentDocument,
+                'import clones into the receiving document');
+            frame.contentDocument.adoptNode(created);
+            check(created.ownerDocument === frame.contentDocument, 'explicit cross-document adoption');
+            check(created.shadowRoot.ownerDocument === frame.contentDocument, 'shadow-including adoption');
+            return 'document-provenance-ok';
+        })()"##
+            ),
+            "document-provenance-ok"
+        );
+    }
+
+    #[test]
+    fn iframe_nested_document_provenance_survives_navigation_and_navigable_destruction() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const check=(value,label)=>{if(!value)throw Error(label)};
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.append(html);html.append(body);
+            const outer=document.createElement('iframe');body.append(outer);
+            const outerDoc=outer.contentDocument, inner=outerDoc.createElement('iframe');
+            outerDoc.body.append(inner);
+            const innerDoc=inner.contentDocument;
+            const text=innerDoc.createTextNode('retained');
+            check(text.ownerDocument===innerDoc,'nested detached provenance');
+            check(inner.ownerDocument===outerDoc,'container belongs to parent Document');
+            check(document.querySelectorAll('iframe').length===1,'top query boundary');
+            check(outerDoc.querySelectorAll('iframe').length===1,'nested query boundary');
+            inner.srcdoc='<body><p>next</p></body>';__trust.hydrateFrames();
+            check(inner.contentDocument!==innerDoc,'nested navigation identity');
+            check(text.ownerDocument===innerDoc,'old nested ownership');
+            const current=inner.contentDocument, savedBody=current.body;
+            inner.remove();
+            check(inner.contentDocument===null && current.defaultView===null,'destroyed navigable');
+            check(current.body===savedBody && savedBody.textContent==='next','destroyed Document retains own tree');
+            check(current.isConnected && savedBody.isConnected && current.parentNode===null,
+                'destroyed navigable does not change the retained Document DOM tree');
+            check(text.ownerDocument===innerDoc,'unrelated destroyed navigation cannot retarget old node');
+            return 'nested-documents-ok';
+        })()"#
+            ),
+            "nested-documents-ok"
+        );
+    }
+
+    #[test]
     fn iframe_windows_do_not_share_writable_platform_globals_across_navigation() {
         // HTML §7.5.1 creates a new Realm and Window for an ordinary
         // cross-document navigation. Writable Window properties patched by
@@ -26915,6 +28698,320 @@ mod tests {
     }
 
     #[test]
+    fn native_platform_callback_captures_keep_live_values_without_rooting_dead_cycles() {
+        // ECMA-262 #sec-liveness (e28783d5) preserves an observable captured
+        // value, not an otherwise unreachable cycle. Explicit host collection
+        // below is an engine lifetime test, not a promise of prompt Web GC.
+        // Web IDL #invoke-a-callback-function (8f182624) also requires the native
+        // boundary to preserve the original receiver/argument behavior.
+        let mut engine = lumen::Engine::new();
+        let owner = eval_value(
+            &mut engine,
+            "(() => { const owner = {value: 42}; owner.operation = function(source, receiver, args) { return owner.value + receiver.extra + args[0]; }; return owner; })()",
+            "native callback capture cycle",
+        )
+        .unwrap();
+        let Value::Obj(object) = &owner else {
+            panic!("fixture must produce an object");
+        };
+        let weak_owner = Rc::downgrade(object);
+        let operation = engine
+            .ctx()
+            .member_get(&owner, "operation")
+            .unwrap_or_else(|_| panic!("fixture operation getter must succeed"));
+        let callback = host_callback_api(
+            engine.ctx(),
+            Value::Undefined,
+            &[
+                operation,
+                Value::from_string(String::from("captureTest")),
+                Value::Num(1.),
+            ],
+        )
+        .unwrap_or_else(|_| panic!("native callback creation must succeed"));
+        engine
+            .ctx()
+            .member_set(&owner, "callback", callback.clone())
+            .unwrap_or_else(|_| panic!("fixture callback assignment must succeed"));
+        drop(owner);
+        run_microtask_checkpoint(&mut engine);
+        engine.collect_garbage_at_idle();
+        assert!(
+            weak_owner.upgrade().is_some(),
+            "live native callback lost its capture"
+        );
+        let receiver = eval_value(&mut engine, "({extra: 1})", "callback receiver").unwrap();
+        let result = engine
+            .ctx()
+            .invoke(callback.clone(), receiver, &[Value::Num(7.)])
+            .unwrap_or_else(|_| panic!("live callback invocation must succeed"));
+        assert_eq!(result.as_num_opt(), Some(50.));
+        drop(result);
+        drop(callback);
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "native callback kept an unreachable capture cycle alive"
+        );
+    }
+
+    #[test]
+    fn iframe_native_callback_captures_release_retired_realms_but_keep_borrowed_functions() {
+        // HTML #discard-a-document explicitly allows a destroyed Document to
+        // remain script-accessible. ECMA-262 #sec-liveness preserves a borrowed
+        // function and its Realm until its last observable reference is gone;
+        // navigation must not forcibly clear the callable's captured operation.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+                var captureHtml = document.createElement('html');
+                var captureBody = document.createElement('body');
+                document.appendChild(captureHtml); captureHtml.appendChild(captureBody);
+                var captureFrame = document.createElement('iframe');
+                captureFrame.srcdoc = '<body>first';
+                captureBody.appendChild(captureFrame);
+                __trust.hydrateFrames();
+                var borrowedPost = captureFrame.contentWindow.postMessage;
+                var captureMessages = [];
+                addEventListener('message', e => captureMessages.push(e.data));
+            "#,
+            "native callback iframe lifetime setup",
+        )
+        .unwrap();
+        let mut retired = Vec::new();
+        for navigation in 0..5 {
+            // Native/rendering event delivery can enter the parent's dispatcher
+            // with a child Document. Even an empty listener lookup must not
+            // leave that target in an immortal parent-Realm registry.
+            eval(
+                &mut engine,
+                "EventTarget.prototype.dispatchEvent.call(captureFrame.contentDocument, new Event('retirement-probe'));",
+                "parent dispatcher visits child Document",
+            )
+            .unwrap();
+            {
+                let state = engine.ctx().host_mut::<HostState>().unwrap();
+                assert_eq!(state.window_realms.len(), 1);
+                let Value::Obj(window) = state.window_realms.values().next().unwrap() else {
+                    panic!("Window Realm must have an object global");
+                };
+                retired.push(Rc::downgrade(window));
+            }
+            eval(
+                &mut engine,
+                &format!(
+                    r#"captureFrame.srcdoc = '<body>replacement {navigation}<script>' +
+                        'class Widget {{ constructor(node) {{ this.node = node; node.widget = this; }} read() {{ return this.node; }} }}' +
+                        'window.widget = new Widget(document.body);' +
+                        'for (let i = 0; i < 100; i++) {{ const node = document.createElement("div"); document.body.appendChild(node); new Widget(node); }}' +
+                        '<\/script>'; __trust.hydrateFrames();"#
+                ),
+                "native callback iframe replacement",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+            engine.collect_garbage_at_idle();
+        }
+        // Removal, unlike replacement navigation, does not pass through the
+        // old frame Window's reset hook. Empty dispatch in the parent must
+        // not turn the final child Document into an immortal strong Map key.
+        eval(
+            &mut engine,
+            "EventTarget.prototype.dispatchEvent.call(captureFrame.contentDocument, new Event('retirement-probe'));",
+            "parent dispatcher visits final child Document",
+        )
+        .unwrap();
+        {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let Value::Obj(window) = state.window_realms.values().next().unwrap() else {
+                panic!("Window Realm must have an object global");
+            };
+            retired.push(Rc::downgrade(window));
+        }
+        eval(
+            &mut engine,
+            "captureFrame.remove(); captureFrame = null; while (__trust.hasPlatformTask()) __trust.runPlatformTask(); /parent-match/.test('parent-match');",
+            "native callback iframe removal",
+        )
+        .unwrap();
+        // Replace the engine's single deferred legacy-RegExp match, which
+        // deliberately retains its constructor until another match. This
+        // test isolates target/callback ownership from that bounded cache.
+        for _ in 0..3 {
+            run_microtask_checkpoint(&mut engine);
+            engine.collect_garbage_at_idle();
+        }
+        assert!(
+            retired[0].upgrade().is_some(),
+            "borrowed function lost its Realm"
+        );
+        for window in &retired[1..] {
+            assert!(
+                window.upgrade().is_none(),
+                "unreachable retired Window remained rooted"
+            );
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "borrowedPost.call(window, 'still callable', '*'); while (__trust.hasPlatformTask()) __trust.runPlatformTask(); captureMessages.join('|')"
+            ),
+            "still callable"
+        );
+        eval(
+            &mut engine,
+            "borrowedPost = null",
+            "release borrowed native callback",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            run_microtask_checkpoint(&mut engine);
+            engine.collect_garbage_at_idle();
+        }
+        assert!(
+            retired[0].upgrade().is_none(),
+            "released borrowed function rooted its Realm"
+        );
+        assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+    }
+
+    #[test]
+    fn event_listener_cycles_are_owned_by_the_target_not_the_registry() {
+        let mut engine = platform_engine();
+        let target = eval_value(
+            &mut engine,
+            r#"(() => {
+                const target = new EventTarget();
+                target.calls = 0;
+                const handler = () => { target.calls++; };
+                target.addEventListener('click', handler, true);
+                target.addEventListener('mouseover', handler);
+                return target;
+            })()"#,
+            "unreachable listener target cycle",
+        )
+        .unwrap();
+        let weak = Rc::downgrade(target.as_obj().unwrap());
+        let dispatch = engine
+            .ctx()
+            .member_get(&target, "dispatchEvent")
+            .unwrap_or_else(|_| panic!("missing dispatchEvent"));
+        let event = eval_value(&mut engine, "new Event('click')", "listener cycle event").unwrap();
+        engine
+            .ctx()
+            .invoke(dispatch, target.clone(), &[event])
+            .unwrap_or_else(|_| panic!("dispatchEvent failed"));
+        assert_eq!(
+            engine
+                .ctx()
+                .member_get(&target, "calls")
+                .unwrap_or_else(|_| panic!("missing calls"))
+                .as_num_opt(),
+            Some(1.)
+        );
+        drop(target);
+        for _ in 0..3 {
+            run_microtask_checkpoint(&mut engine);
+            engine.collect_garbage_at_idle();
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "listener/discovery tables retained a dead target cycle"
+        );
+    }
+
+    #[test]
+    fn event_listener_finalization_preserves_live_targets_and_capture_accounting() {
+        // DOM #concept-event-listener ownership and ECMA-262
+        // #sec-cleanup-finalization-registry: cleanup must not retain the
+        // target through its held value, discard a live listener, or subtract
+        // already-removed capture listeners a second time.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                r#"
+                    globalThis.listenerWeakTargets = [];
+                    globalThis.listenerLog = [];
+                    globalThis.listenerLiveTarget = document.createElement('button');
+                    (() => {
+                        const html = document.createElement('html');
+                        const body = document.createElement('body');
+                        document.appendChild(html); html.appendChild(body);
+                        body.appendChild(listenerLiveTarget);
+                    })();
+                    document.body.addEventListener('probe', () => listenerLog.push('capture'), true);
+                    listenerLiveTarget.addEventListener('probe', () => listenerLog.push('target'));
+                    listenerLiveTarget.addEventListener('click', () => listenerLog.push('click'));
+                    listenerLiveTarget.addEventListener('mouseover', () => listenerLog.push('hover'));
+                    globalThis.listenerLiveState = __trust.listenerRegistryState().join(',');
+                    // Live callbacks must not share the lexical environment
+                    // containing the supposedly unreachable test targets.
+                    (() => {
+                        for (let i = 0; i < 32; i++) {
+                            const target = new EventTarget();
+                            const handler = () => target.dispatchEvent(new Event('unused'));
+                            target.addEventListener('click', handler, true);
+                            target.addEventListener('mouseover', handler);
+                            if (i % 2) target.removeEventListener('click', handler, true);
+                            listenerWeakTargets.push(new WeakRef(target));
+                        }
+                        // A disconnected Document is itself a DOM tree root,
+                        // so it enters discovery without a remove-child hook.
+                        // Its callback cycle must not be rooted by that index.
+                        const doc = document.implementation.createHTMLDocument('unreachable');
+                        doc.addEventListener('click', () => doc.title, true);
+                        doc.addEventListener('mouseover', () => doc.title);
+                        listenerWeakTargets.push(new WeakRef(doc));
+                    })();
+                "#,
+                "listener lifetime and capture cleanup setup",
+            )
+            .unwrap();
+            for _ in 0..3 {
+                run_microtask_checkpoint(&mut engine);
+                engine.collect_garbage_at_idle();
+            }
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "listenerWeakTargets.every(reference => reference.deref() === undefined)"
+                ),
+                "true",
+                "{tier:?}: unreachable listener cycle"
+            );
+            assert_eq!(
+                string_value(&mut engine, "__trust.listenerRegistryState().join(',')"),
+                string_value(&mut engine, "listenerLiveState"),
+                "{tier:?}: dead-target bookkeeping or double decrement"
+            );
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                        listenerLiveTarget.dispatchEvent(new Event('probe'));
+                        listenerLiveTarget.remove();
+                        listenerLiveTarget.dispatchEvent(new Event('click'));
+                        listenerLiveTarget.dispatchEvent(new Event('mouseover'));
+                        listenerLog.join(',')
+                    "#
+                ),
+                "capture,target,click,hover",
+                "{tier:?}: live capture path or detached listeners changed"
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
+    }
+
+    #[test]
     fn detached_node_wrapper_cache_does_not_root_unreachable_wrappers() {
         // Web IDL wrapper identity applies while a platform object remains
         // observable. ECMA-262 WeakRef preserves same-job identity without a
@@ -26969,6 +29066,494 @@ mod tests {
                 "String(keptWrapper === keptWrapper && document === document)"
             ),
             "true"
+        );
+    }
+
+    #[test]
+    fn dom_gc_detached_descendants_preserve_ancestor_sibling_state_and_listeners() {
+        // DOM #concept-tree-parent / #concept-tree-sibling and Web IDL
+        // #interface-to-js preserve the same platform objects through any live node.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.peerEvents = 0;
+            (() => {
+                const parent = document.createElement('div');
+                const sibling = document.createElement('i');
+                const child = document.createElement('b');
+                parent.append(sibling, child);
+                parent.expando = {value: 41};
+                sibling.expando = {value: 42};
+                sibling.addEventListener('peer', () => {peerEvents++;});
+                globalThis.keptDescendant = child;
+                globalThis.oldParent = new WeakRef(parent);
+                globalThis.oldSibling = new WeakRef(sibling);
+            })();
+        "#,
+            "detached native graph",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const parent = keptDescendant.parentNode;
+            const sibling = keptDescendant.previousSibling;
+            sibling.dispatchEvent(new Event('peer'));
+            [parent === oldParent.deref(), sibling === oldSibling.deref(),
+                parent.expando.value, sibling.expando.value, peerEvents].join(':');
+        "#
+            ),
+            "true:true:41:42:1"
+        );
+    }
+
+    #[test]
+    fn dom_gc_raw_allocation_and_async_task_leases_bridge_wrapper_publication() {
+        let mut engine = platform_engine();
+        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let newborn = dom.borrow_mut().create_element("span");
+        engine.collect_garbage_at_idle();
+        assert!(
+            dom.borrow().is_valid(newborn),
+            "raw new-node ID lost before publication"
+        );
+        HostGc::end_job(engine.ctx().host_mut::<HostState>().unwrap());
+        engine.collect_garbage_at_idle();
+        assert!(
+            !dom.borrow().is_valid(newborn),
+            "unpublished lease survived the job boundary"
+        );
+
+        let task_node = dom.borrow_mut().create_element("script");
+        let lease = {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            state.dom_gc.start_resource(task_node);
+            HostGc::end_job(state);
+            state.dom_gc.resource_lease(task_node)
+        };
+        engine.collect_garbage_at_idle();
+        assert!(
+            dom.borrow().is_valid(task_node),
+            "selected task lost its raw-ID target"
+        );
+        drop(lease);
+        engine.collect_garbage_at_idle();
+        assert!(
+            !dom.borrow().is_valid(task_node),
+            "completed task leaked its target"
+        );
+    }
+
+    #[test]
+    fn dom_gc_constructed_sheet_keeps_its_document_but_not_dead_adopting_roots() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"(() => {
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.append(html); html.append(body);
+            const frame=document.createElement('iframe'); body.append(frame);
+            const initial=frame.contentDocument;
+            globalThis.constructorDocumentWeak=new WeakRef(initial);
+            globalThis.survivingSheet=new frame.contentWindow.CSSStyleSheet();
+            survivingSheet.replaceSync(':host {color: red}');
+            const host=initial.createElement('section'), root=host.attachShadow({mode:'open'});
+            root.adoptedStyleSheets=[survivingSheet];
+            globalThis.adoptingRootWeak=new WeakRef(root);
+            frame.srcdoc='<body>replacement</body>'; __trust.hydrateFrames();
+        })()"#,
+            "constructed sheet lifetime",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[constructorDocumentWeak.deref()!==undefined,adoptingRootWeak.deref()===undefined].join(':')"
+            ),
+            "true:true"
+        );
+        eval(
+            &mut engine,
+            "survivingSheet=null",
+            "release constructed sheet",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(constructorDocumentWeak.deref()===undefined)"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn dom_gc_nursery_late_wrappers_for_old_nodes_and_young_detached_peers() {
+        let mut engine = platform_engine();
+        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        let old = {
+            let mut dom = dom.borrow_mut();
+            let id = dom.create_element("div");
+            dom.set_attr(id, "id", "native-old");
+            dom.append(crate::dom::DOCUMENT, id);
+            id
+        };
+        run_microtask_checkpoint(&mut engine);
+        engine.collect_garbage_at_idle();
+        assert!(!dom.borrow().is_young_gc_node(old));
+        eval(
+            &mut engine,
+            r#"
+            (() => {
+                const node = document.getElementById('native-old');
+                node.expando = 41;
+                globalThis.lateOldWrapper = new WeakRef(node);
+            })();
+            (() => {
+                const parent = document.createElement('section');
+                const child = document.createTextNode('kept');
+                const peer = document.createElement('i');
+                parent.append(child,peer);
+                parent.expando = 42; peer.expando = 43;
+                globalThis.nurseryChild = child;
+                globalThis.nurseryParent = new WeakRef(parent);
+            })();
+        "#,
+            "native nursery links",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        engine.ctx().unstable_collect_young_for_host_tests();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[lateOldWrapper.deref().expando,nurseryChild.parentNode.expando,nurseryChild.nextSibling.expando,nurseryParent.deref()===nurseryChild.parentNode].join(':')"
+            ),
+            "41:42:43:true"
+        );
+        assert!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .dom_gc
+                .young_owners
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dom_gc_nursery_unreachable_raw_nodes_are_reclaimed_with_borrow_fallback() {
+        let mut engine = platform_engine();
+        let dom = engine.ctx().host_mut::<HostState>().unwrap().dom.clone();
+        engine.collect_garbage_at_idle();
+        let node = dom.borrow_mut().create_element("div");
+        HostGc::end_job(engine.ctx().host_mut::<HostState>().unwrap());
+        let first_young = dom.borrow().first_young_gc_id();
+        {
+            let external_reader = dom.borrow();
+            engine.ctx().unstable_collect_young_for_host_tests();
+            assert!(external_reader.is_valid(node));
+            assert_eq!(
+                external_reader.first_young_gc_id(),
+                first_young,
+                "borrow fallback must not promote or clear the native journal"
+            );
+        }
+        engine.ctx().unstable_collect_young_for_host_tests();
+        assert!(!dom.borrow().is_valid(node));
+        let newborn = dom.borrow_mut().create_text("pending publication");
+        engine.ctx().unstable_collect_young_for_host_tests();
+        assert!(dom.borrow().is_valid(newborn));
+        HostGc::end_job(engine.ctx().host_mut::<HostState>().unwrap());
+        // This survivor is now old: only the next major may reclaim it.
+        engine.ctx().unstable_collect_young_for_host_tests();
+        assert!(dom.borrow().is_valid(newborn));
+        engine.collect_garbage_at_idle();
+        assert!(!dom.borrow().is_valid(newborn));
+    }
+
+    #[test]
+    fn dom_gc_nursery_unchanged_host_registry_emits_no_old_dom_graph() {
+        #[derive(Default)]
+        struct Count {
+            internal: usize,
+            edges: usize,
+            owners: usize,
+        }
+        impl HostGcVisitor for Count {
+            fn supports_native(&self) -> bool {
+                true
+            }
+            fn is_minor(&self) -> bool {
+                true
+            }
+            fn native_old_generation(&mut self, _: &'static str, _: usize, _: usize) -> bool {
+                true
+            }
+            fn internal(&mut self, _: &Value) {
+                self.internal += 1;
+            }
+            fn edge(&mut self, _: &Value, _: &Value) {}
+            fn root(&mut self, _: &Value) {}
+            fn native_edge(&mut self, _: NativeGcId, _: NativeGcId) {
+                self.edges += 1;
+            }
+            fn js_to_native(&mut self, _: &Value, _: NativeGcId) {
+                self.owners += 1;
+            }
+        }
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const tree=document.createElement('main');
+            (document.body||document.documentElement||document).appendChild(tree);
+            for(let i=0;i<1000;++i) tree.appendChild(document.createElement('p'));
+        "#,
+            "old native registry",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        engine.collect_garbage_at_idle();
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        assert!(state.dom_gc.owners.len() >= 1000);
+        assert!(state.dom_gc.young_owners.is_empty());
+        let mut count = Count::default();
+        state.trace_gc(&mut count);
+        assert_eq!(
+            (count.internal, count.edges, count.owners),
+            (0, 0, 0),
+            "an unchanged old native heap must not be enumerated during minor collection"
+        );
+    }
+
+    #[test]
+    fn dom_gc_lazy_static_nodelists_retain_native_nodes_then_release_dead_components() {
+        let mut engine = platform_engine();
+        let before = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .dom
+            .borrow()
+            .node_count();
+        eval(
+            &mut engine,
+            r#"
+            (() => {
+                const parent = document.createElement('section');
+                for (let i=0; i<128; ++i) {
+                    const child = document.createElement('span');
+                    child.expando = i + 7;
+                    parent.append(child);
+                }
+                globalThis.savedNodeList = parent.querySelectorAll('span');
+            })();
+        "#,
+            "lazy static collection roots",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "savedNodeList.length+':'+savedNodeList[127].expando+':'+savedNodeList[0].parentNode.localName"
+            ),
+            "128:134:section"
+        );
+        eval(&mut engine, "savedNodeList=null;", "drop static collection").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        let after = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .dom
+            .borrow()
+            .node_count();
+        assert!(
+            after <= before + 4,
+            "dead native subtree remained: before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn dom_gc_mutation_observers_have_weak_targets_and_node_owned_registrations() {
+        // DOM #interface-mutationobserver: observer.node list is weak;
+        // node.registered observer list owns the observer in the other direction.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.observedCalls = 0;
+            globalThis.keptObserver = new MutationObserver(() => {});
+            // Use an independently created callback: a closure allocated in
+            // the IIFE could retain its whole lexical environment, including
+            // the very target whose weak registration this test measures.
+            globalThis.recordObserved = records => {observedCalls += records.length;};
+            (() => {
+                const temporary = document.createElement('div');
+                keptObserver.observe(temporary, {attributes:true});
+                globalThis.weakObservedTarget = new WeakRef(temporary);
+                globalThis.liveObservedTarget = document.createElement('i');
+                const observer = new MutationObserver(recordObserved);
+                observer.observe(liveObservedTarget, {attributes:true});
+                globalThis.weakNodeOwnedObserver = new WeakRef(observer);
+            })();
+        "#,
+            "weak mutation observer targets",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "(weakObservedTarget.deref()===undefined)+':'+(weakNodeOwnedObserver.deref()!==undefined)"
+            ),
+            "true:true"
+        );
+        eval(
+            &mut engine,
+            "liveObservedTarget.setAttribute('a','1');",
+            "node-owned observer delivery",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(string_value(&mut engine, "String(observedCalls)"), "1");
+    }
+
+    #[test]
+    fn dom_gc_mutation_records_and_transient_subtrees_survive_until_delivery() {
+        let mut engine = platform_engine();
+        eval(&mut engine, r#"
+            globalThis.pendingRecordsResult = '';
+            (() => {
+                const parent=document.createElement('div'), child=document.createElement('i');
+                parent.append(child);
+                const observer=new MutationObserver(records => {
+                    pendingRecordsResult=records.map(record=>record.type+':'+record.target.localName).join(',');
+                    observer.disconnect();
+                });
+                observer.observe(parent,{childList:true,attributes:true,subtree:true});
+                parent.removeChild(child);
+                child.setAttribute('x','1');
+            })();
+        "#, "pending mutation roots").unwrap();
+        engine.collect_garbage_at_idle();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "pendingRecordsResult"),
+            "childList:div,attributes:i"
+        );
+    }
+
+    #[test]
+    fn dom_gc_mutation_observer_delivery_uses_ancestor_and_registration_order() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.observerOrder = [];
+            const outer=document.createElement('div'), inner=document.createElement('i');
+            outer.append(inner);
+            const first=new MutationObserver(()=>observerOrder.push('outer-first'));
+            const second=new MutationObserver(()=>observerOrder.push('inner-second'));
+            const third=new MutationObserver(()=>observerOrder.push('inner-third'));
+            first.observe(outer,{attributes:true,subtree:true});
+            second.observe(inner,{attributes:true});
+            third.observe(inner,{attributes:true});
+            // Updating options preserves the existing per-node registration position.
+            second.observe(inner,{attributes:true,attributeOldValue:true});
+            inner.setAttribute('x','1');
+        "#,
+            "mutation observer order",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "observerOrder.join(',')"),
+            "inner-second,inner-third,outer-first"
+        );
+    }
+
+    #[test]
+    fn dom_gc_filtered_mutations_preserve_pending_microtask_order() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.filteredOrder=[];
+            const node=document.createElement('div');
+            const observer=new MutationObserver(()=>filteredOrder.push('observer'));
+            observer.observe(node,{attributes:true,attributeFilter:['match']});
+            node.setAttribute('filtered','1');
+            Promise.resolve().then(()=>filteredOrder.push('promise'));
+            node.setAttribute('match','1');
+        "#,
+            "filtered mutation checkpoint ordering",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "filteredOrder.join(',')"),
+            "observer,promise"
+        );
+    }
+
+    #[test]
+    fn dom_gc_reobserving_removes_transient_registrations_without_dropping_records() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.transientRecords=[];
+            const parent=document.createElement('div'), child=document.createElement('i');
+            parent.append(child);
+            const observer=new MutationObserver(records=>{
+                transientRecords.push(...records.map(record=>record.type));
+            });
+            observer.observe(parent,{childList:true,attributes:true,subtree:true});
+            parent.removeChild(child);
+            child.setAttribute('before','1');
+            observer.observe(parent,{attributes:true,subtree:true});
+            child.setAttribute('after','1');
+        "#,
+            "transient registration replacement",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "transientRecords.join(',')"),
+            "childList,attributes"
         );
     }
 
@@ -27029,6 +29614,71 @@ mod tests {
             .unwrap();
             assert!(
                 matches!(result, Value::Str(ref s) if s.as_ref() == "computed-style-initial-values-ok"),
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_overflow_menu_is_not_misidentified_as_a_scroll_lock_target() {
+        // CSS Overflow 3 #overflow-control: visible overflow is not a scroll
+        // container, even when its scrolling area exceeds its border box.
+        // CSSOM #resolved-values must expose `visible`, not the engine's
+        // absent-declaration sentinel. Exercise the consumer as well as the
+        // value: falsely locking this zero-height wrapper clips every menu
+        // control and prevents the user from dismissing the document lock.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let dom = Rc::new(RefCell::new(Dom::parse_document(
+                r#"<!doctype html><style>
+                html,body{margin:0}.scroll-lock{overflow:hidden!important}
+                #header{height:40px}#menu{position:sticky;top:0;height:0;z-index:1}
+                #panel{width:300px;height:120px;background:red}
+                #toggle{display:block;width:100px;height:30px}
+                #page{height:1800px}
+                </style><div id=header></div><div id=menu><div id=panel>
+                <button id=toggle>Toggle menu</button></div></div><div id=page></div>"#,
+            )));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                        const menu=document.getElementById('menu'), panel=document.getElementById('panel');
+                        const toggle=document.getElementById('toggle'), root=document.documentElement;
+                        const style=getComputedStyle(menu);
+                        if(menu.getBoundingClientRect().height!==0 || menu.scrollHeight<120)
+                            return 'missing visible overflow geometry';
+                        let locked=[];
+                        toggle.addEventListener('click',()=>{
+                            if(locked.length){for(const e of locked)e.classList.remove('scroll-lock');locked=[];}
+                            else {
+                                locked=[menu,root].filter(e=>e.scrollHeight>e.getBoundingClientRect().height &&
+                                    getComputedStyle(e).overflowY!=='visible');
+                                // The viewport is explicitly locked while the menu is open.
+                                if(!locked.includes(root))locked.push(root);
+                                for(const e of locked)e.classList.add('scroll-lock');
+                            }
+                        });
+                        for(let cycle=0;cycle<3;cycle++){
+                            let target=document.elementFromPoint(10,50);
+                            if(target!==toggle)return 'initial menu target '+target?.id;
+                            target.click();
+                            if(menu.classList.contains('scroll-lock'))return 'visible wrapper incorrectly locked';
+                            if(style.overflowY!=='visible')return 'wrong live overflow';
+                            if(getComputedStyle(root).overflowY!=='hidden')return 'missing viewport lock';
+                            if(document.elementFromPoint(10,100)!==panel)return 'menu content clipped';
+                            target=document.elementFromPoint(10,50);
+                            if(target!==toggle)return 'dismiss control clipped';
+                            target.click();
+                            if(getComputedStyle(root).overflowY!=='visible')return 'viewport lock not released';
+                        }
+                        return 'ok';
+                    })()"#
+                ),
+                "ok",
                 "{tier:?}"
             );
         }

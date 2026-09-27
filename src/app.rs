@@ -5445,6 +5445,39 @@ impl App {
         let Some(g) = self.browser.as_ref() else {
             return hit;
         };
+        // Native playback buttons have the same priority as their overlay
+        // paint pass, including over unrelated authored fixed/top-layer boxes.
+        if self.mouse_in_content_area(col, row) {
+            let x = col - self.last_content_area.x;
+            let y = row - self.last_content_area.y;
+            for (fi, fixed) in g.doc.fixed.iter().enumerate().rev() {
+                if y < fixed.row || x < fixed.col {
+                    continue;
+                }
+                let r = usize::from(y - fixed.row);
+                if let Some(frow) = fixed.rows.get(r) {
+                    for (i, start, width, _) in crate::layout2::media_control_columns(frow, &[], r)
+                    {
+                        if x - fixed.col >= start && x - fixed.col < start.saturating_add(width) {
+                            hit.fixed = Some((fi, r, i));
+                            return hit;
+                        }
+                    }
+                }
+            }
+            let r = g.scroll + usize::from(y);
+            if r < g.doc.rows.len() {
+                let effective = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+                for (i, start, width, _) in
+                    crate::layout2::media_control_columns(&effective, &g.doc.carousels, r)
+                {
+                    if x >= start && x < start.saturating_add(width) {
+                        hit.item = Some((r, i));
+                        return hit;
+                    }
+                }
+            }
+        }
         if let Some((fi, r, i)) = self.fixed_hit_test(col, row) {
             hit.hover = Self::hover_resolve(g, &g.doc.fixed[fi].rows[r].items[i]);
             hit.fixed = Some((fi, r, i));
@@ -11137,6 +11170,61 @@ mod tests {
             Some(crate::doc::Link::Media(url)) if url.as_str() == "https://example.com/watch"
         ));
         assert_eq!(hit.hover, None, "the inline play script is not dispatched");
+    }
+
+    #[test]
+    fn media_control_paints_and_hits_above_authored_fixed_layers() {
+        let mut app = app_browsing(
+            "text/html",
+            r#"<body style="margin:0">
+          <div style="position:relative;width:320px;height:160px">
+            <video src=clip.mp4 style="position:absolute;inset:0;width:100%;height:100%"></video>
+            <div style="position:absolute;inset:0;background:black">Poster</div>
+          </div><a href=/page style="position:fixed;inset:0;z-index:100;background:black">Covered</a>"#,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(82, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let g = app.browser.as_ref().unwrap();
+        let (r, item) = g
+            .doc
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| {
+                row.items
+                    .iter()
+                    .find(|item| item.kind == crate::layout2::ItemKind::MediaControl)
+                    .map(|item| (r, item))
+            })
+            .unwrap();
+        let x = app.last_content_area.x + item.col;
+        let y = app.last_content_area.y + r as u16;
+        assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), "▶");
+        let hit = app.pointer_hit(x, y);
+        let (r, i) = hit.item.expect("native button above page fixed link");
+        assert!(
+            matches!(&g.doc.rows[r].items[i].link, Some(crate::doc::Link::Media(url)) if url.path() == "/clip.mp4")
+        );
+        assert_eq!(hit.hover, None);
+        let node = g.doc.rows[r].items[i].node;
+        let hidden_anchor = g.doc.rows[r]
+            .items
+            .iter()
+            .position(|item| item.node == node && item.kind == crate::layout2::ItemKind::HitRegion)
+            .unwrap();
+        app.browser.as_mut().unwrap().sel_item = Some((r, hidden_anchor));
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert!(
+            terminal.backend().buffer()[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "keyboard selection of the media anchor highlights its native button"
+        );
     }
 
     /// An app showing a page with a fixed-height (96px ≈ 6 rows)

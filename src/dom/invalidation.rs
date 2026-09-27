@@ -2,31 +2,28 @@
 //!
 //! Cache pure selector matches independently from the cascade and container
 //! conditions. Attribute writes invalidate the selector subjects reachable
-//! through the rule's combinators, not every element merely because the DOM
-//! revision changed. Relational/filtered positional selectors, element state
-//! and cross-shadow dependencies deliberately retain a full fallback.
+//! through compiled dependency paths, not every element merely because the
+//! DOM revision changed. Cross-shadow and untracked state associations retain
+//! an explicit full fallback; optional cache budgets never truncate content.
 
 use super::*;
+
+mod attributes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Impact {
     Element,
-    Subtree,
     SiblingSubtrees,
-    All,
 }
 
 #[derive(Default)]
 pub(super) struct SelectorDependencies {
-    attributes: FxHashMap<String, Impact>,
-    class_tokens: FxHashMap<String, Impact>,
-    raw_class_impact: Option<Impact>,
+    attributes: attributes::Dependencies,
     relational: Vec<RelationalDependency>,
     structural: Vec<StructureDependency>,
     empty: bool,
     text_direction: bool,
     text_placeholder: bool,
-    checked: bool,
     structure_global: bool,
 }
 
@@ -264,7 +261,8 @@ impl SelectorDependencies {
     pub(super) fn build<'a>(rules: impl Iterator<Item = &'a StyleRule>) -> Self {
         let mut result = Self::default();
         for rule in rules {
-            result.complex(&rule.selector, Impact::Element);
+            result.attributes.record(&rule.selector);
+            result.complex(&rule.selector);
             result.record_structure(&rule.selector, &[], Impact::Element);
         }
         result
@@ -377,65 +375,8 @@ impl SelectorDependencies {
         (siblings, children)
     }
 
-    fn attribute_change(
-        &self,
-        dom: &Dom,
-        node: NodeId,
-        name: &str,
-        old_class: Option<&str>,
-    ) -> Option<Impact> {
-        let name = name.to_ascii_lowercase();
-        let mut impact = self.attributes.get(name.as_str()).copied();
-        if name == "class"
-            && let Some(old_class) = old_class
-        {
-            // Selectors 4 #class-html / #logical-combination: only changed
-            // membership can affect a .class test, including one in :not().
-            // Raw [class] selectors still observe spelling/order/whitespace.
-            // Fold dependency keys conservatively for quirks-mode matching;
-            // compare the input sets before folding so case changes in a
-            // standards-mode document still invalidate their exact matches.
-            let old: FxHashSet<_> = old_class.split_ascii_whitespace().collect();
-            let new: FxHashSet<_> = dom
-                .attr(node, "class")
-                .unwrap_or("")
-                .split_ascii_whitespace()
-                .collect();
-            impact = self.raw_class_impact;
-            for token in old.symmetric_difference(&new) {
-                impact = impact.max(self.class_tokens.get(&token.to_ascii_lowercase()).copied());
-            }
-        }
-        if impact == Some(Impact::All)
-            || (self.text_direction
-                && ((name == "value" && dom.text_may_change_direction(node))
-                    // HTML's undefined-dir telephone state is LTR even with
-                    // an RTL parent. Type changes need no automatic ancestor.
-                    || (name == "type" && dom.tag_name(node) == Some("input"))))
-            || (self.checked
-                && matches!(
-                    (dom.tag_name(node), name.as_str()),
-                    (Some("input"), "checked" | "type") | (Some("option"), "selected")
-                ))
-            || self.relational.iter().any(|dependency| {
-                dependency.attributes.contains(&name) && dependency.may_affect(dom, node, false)
-            })
-        {
-            Some(Impact::All)
-        } else {
-            impact
-        }
-    }
-
     pub(super) fn retained_bytes(&self) -> usize {
-        self.attributes.capacity() * std::mem::size_of::<(String, Impact)>()
-            + self.attributes.keys().map(String::capacity).sum::<usize>()
-            + self.class_tokens.capacity() * std::mem::size_of::<(String, Impact)>()
-            + self
-                .class_tokens
-                .keys()
-                .map(String::capacity)
-                .sum::<usize>()
+        self.attributes.retained_bytes()
             + self.relational.capacity() * std::mem::size_of::<RelationalDependency>()
             + self
                 .relational
@@ -450,36 +391,19 @@ impl SelectorDependencies {
                 .sum::<usize>()
     }
 
-    fn add(&mut self, name: &str, impact: Impact) {
-        self.attributes
-            .entry(name.to_ascii_lowercase())
-            .and_modify(|prior| *prior = (*prior).max(impact))
-            .or_insert(impact);
-    }
-
-    fn complex(&mut self, selector: &Complex, outer: Impact) {
-        for (index, (_, compound)) in selector.0.iter().enumerate() {
-            let mut impact = outer;
-            for (combinator, _) in &selector.0[index + 1..] {
-                impact = impact.max(match combinator {
-                    Combinator::Descendant | Combinator::Child => Impact::Subtree,
-                    Combinator::NextSibling | Combinator::SubsequentSibling => {
-                        Impact::SiblingSubtrees
-                    }
-                    Combinator::None => Impact::All,
-                });
-            }
-            self.compound(compound, impact);
+    fn complex(&mut self, selector: &Complex) {
+        for (_, compound) in &selector.0 {
+            self.compound(compound);
         }
     }
 
-    fn compound(&mut self, compound: &Compound, impact: Impact) {
+    fn compound(&mut self, compound: &Compound) {
         // Exhaustive so future selector forms require a dependency decision.
         let Compound {
             tag: _,
-            id,
-            classes,
-            attrs,
+            id: _,
+            classes: _,
+            attrs: _,
             nots,
             selects,
             has,
@@ -499,37 +423,19 @@ impl SelectorDependencies {
             pseudos: _,
             relative_anchor: _,
         } = compound;
-        if id.is_some() {
-            self.add("id", impact);
-        }
-        if !classes.is_empty() {
-            self.add("class", impact);
-            for class in classes {
-                self.class_tokens
-                    .entry(class.to_ascii_lowercase())
-                    .and_modify(|old| *old = (*old).max(impact))
-                    .or_insert(impact);
-            }
-        }
-        for attribute in attrs {
-            self.add(&attribute.name, impact);
-            if attribute.name.eq_ignore_ascii_case("class") {
-                self.raw_class_impact = self.raw_class_impact.max(Some(impact));
-            }
-        }
         for selector in nots
             .iter()
             .flatten()
             .chain(selects.iter().flat_map(|(group, _)| group))
         {
-            self.complex(selector, impact);
+            self.complex(selector);
         }
         for argument in has.iter().flatten() {
             if let Some(dependency) = RelationalDependency::new(compound, argument) {
                 self.relational.push(dependency);
             } else {
                 self.structure_global = true;
-                self.complex(&argument.complex, Impact::All);
+                self.complex(&argument.complex);
             }
         }
         for structural in structural {
@@ -543,12 +449,12 @@ impl SelectorDependencies {
                 // Changing membership changes other siblings' ranks and may
                 // feed a selector with additional combinators outside it.
                 for selector in selectors {
-                    self.complex(selector, Impact::All);
+                    self.complex(selector);
                 }
             }
         }
         for inner in [host_inner, slotted].into_iter().flatten() {
-            self.compound(inner, Impact::All);
+            self.compound(inner);
         }
         for state in states {
             // HTML #concept-element-disabled / #concept-fe-disabled:
@@ -571,37 +477,6 @@ impl SelectorDependencies {
             );
             self.text_direction |= matches!(state, StatePseudo::Dir(_));
             self.text_placeholder |= matches!(state, StatePseudo::PlaceholderShown);
-            self.checked |= matches!(state, StatePseudo::Checked);
-            // HTML state can propagate through fieldsets, radio groups,
-            // inherited language/editability, and flat-tree ancestors. Keep
-            // these dependencies broad until separately proven and tested.
-            let attributes: &[&str] = match state {
-                StatePseudo::AnyLink => &["href"],
-                // Filter by element category at mutation time. A script's
-                // type attribute cannot change a control's checkedness.
-                StatePseudo::Checked => &[],
-                StatePseudo::Indeterminate => &["checked", "name", "type", "value", "form", "id"],
-                StatePseudo::Disabled | StatePseudo::Enabled => &["disabled"],
-                StatePseudo::Required | StatePseudo::Optional => &["required", "type"],
-                StatePseudo::ReadWrite | StatePseudo::ReadOnly => {
-                    &["contenteditable", "readonly", "disabled", "type"]
-                }
-                StatePseudo::PlaceholderShown => &["placeholder", "value"],
-                StatePseudo::Lang(_) => &["lang", "xml:lang"],
-                // Value/type only alter directionality where automatic
-                // direction is in use; explicit dir remains conservative.
-                StatePseudo::Dir(_) => &["dir"],
-            };
-            for name in attributes {
-                self.add(
-                    name,
-                    if matches!(state, StatePseudo::AnyLink) {
-                        impact
-                    } else {
-                        Impact::All
-                    },
-                );
-            }
         }
     }
 }
@@ -638,7 +513,7 @@ impl Dom {
         node: NodeId,
         name: &str,
         old_class: Option<&str>,
-    ) -> Impact {
+    ) -> Option<Vec<NodeId>> {
         // DOM §4.2.2: `slot` and a slot's `name` change distribution without
         // a child-list mutation. That is an implicit cross-tree dependency,
         // including for state resolved through the style parent, even when
@@ -648,47 +523,36 @@ impl Dom {
                 || (name.eq_ignore_ascii_case("name") && self.tag_name(node) == Some("slot")))
         {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
-            return Impact::All;
+            return None;
         }
-        let impact = {
+        let subjects = {
             let cache = self.style_cache.borrow();
             match cache.as_ref() {
                 Some((epoch, index)) if *epoch == self.style_epoch => index
                     .selector_dependencies
-                    .attribute_change(self, node, name, old_class),
+                    .attributes
+                    .subjects(self, node, name, old_class),
                 // No current rule index: no proof of independence.
-                _ => Some(Impact::All),
+                _ => None,
             }
         };
-        if impact.is_none() && !self.shadow_style_dependencies(node) {
-            return Impact::Element;
-        }
-        let impact = impact.unwrap_or(Impact::All);
-        if impact == Impact::All || self.shadow_style_dependencies(node) {
+        if subjects.is_none() || self.shadow_style_dependencies(node) {
             if casc_diag_on() {
                 eprintln!(
-                    "DIAGINVALID attribute node={node} tag={:?} id={:?} name={name} impact={impact:?} shadow={}",
+                    "DIAGINVALID attribute node={node} tag={:?} id={:?} name={name} impact=All shadow={}",
                     self.tag_name(node),
                     self.attr(node, "id"),
                     self.shadow_style_dependencies(node)
                 );
             }
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
-            return Impact::All;
+            return None;
         }
-        let root = if impact == Impact::SiblingSubtrees {
-            self.nodes[node].parent.unwrap_or(node)
-        } else {
-            node
-        };
         let mut cache = self.selector_cache.borrow_mut();
-        cache.invalidate(root);
-        if impact != Impact::Element {
-            for descendant in self.descendants(root) {
-                cache.invalidate(descendant);
-            }
+        for &subject in subjects.as_ref().unwrap() {
+            cache.invalidate(subject);
         }
-        impact
+        subjects
     }
 
     #[track_caller]
@@ -702,6 +566,7 @@ impl Dom {
         self.style_value_epoch = self.style_value_epoch.wrapping_add(1);
         self.layout_cache.get_mut().clear();
         self.box_tree_cache.get_mut().clear();
+        self.svg_dependencies.get_mut().clear_proofs();
     }
 
     /// Activation metadata participates in inline inheritance and anonymous
@@ -737,75 +602,33 @@ impl Dom {
     /// block constraints, but cannot change selectors or base declarations.
     pub(super) fn invalidate_transition_layout(&mut self, changed: &[NodeId]) {
         self.invalidate_activation_layout(changed);
-        if changed.iter().any(|&id| self.ancestor_is_svg(id)) {
-            self.invalidate_svg_layout();
-        }
+        let consumers = self.svg_dirty_consumers(changed, false);
+        self.invalidate_layout_paths(consumers);
     }
 
     fn invalidate_layout_ancestors(&mut self, node: NodeId) {
-        if !self.shadow_roots.is_empty() {
-            // CSS Shadow 1 #flattening: a slottable changes the formatting
-            // path through its slot as well as its light-DOM host. Follow both
-            // chains, including nested/forwarding slots, once per ancestor.
-            let mut pending = vec![node];
-            let mut visited = FxHashSet::default();
-            while let Some(id) = pending.pop() {
-                if !visited.insert(id) {
-                    continue;
-                }
-                self.layout_cache.get_mut().invalidate(id);
-                self.box_tree_cache.get_mut().invalidate(id);
-                pending.extend(
-                    [self.parent_composed(id), self.parent_flat(id)]
-                        .into_iter()
-                        .flatten(),
-                );
-            }
-            return;
-        }
-        let mut next = Some(node);
-        while let Some(id) = next {
-            self.layout_cache.get_mut().invalidate(id);
-            self.box_tree_cache.get_mut().invalidate(id);
-            next = self.nodes[id].parent;
-        }
-    }
-
-    /// SVG 2 #UseShadowTree requires referenced subtree changes to reach every
-    /// instance. Rebuild SVG resources and their containing formatting paths;
-    /// independent HTML formatting contexts do not depend on those resources.
-    /// This deliberately includes every SVG until reference dependencies are
-    /// indexed, covering indirect references and shared arena tree scopes.
-    fn invalidate_svg_layout(&mut self) {
-        let roots: Vec<_> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(node, _)| (self.tag_name(node) == Some("svg")).then_some(node))
-            .collect();
-        for root in roots {
-            self.invalidate_layout_ancestors(root);
-        }
+        self.invalidate_layout_paths([node]);
     }
 
     pub(super) fn invalidate_attribute_style_values(
         &mut self,
         node: NodeId,
         name: &str,
-        impact: Impact,
+        subjects: Option<Vec<NodeId>>,
     ) {
-        if impact == Impact::All {
+        let Some(mut roots) = subjects else {
             self.invalidate_all_style_values();
             return;
-        }
-        let root = if impact == Impact::SiblingSubtrees || self.tag_name(node) == Some("source") {
+        };
+        let root = if self.tag_name(node) == Some("source") {
             self.nodes[node].parent.unwrap_or(node)
         } else {
             node
         };
-        // Named associations and SVG use-instance resources can point outside
-        // a selector's subject subtree. Keep broad layout invalidation for
-        // these until an explicit reference-dependency index is available.
+        // HTML form/label/named associations can point outside a selector's
+        // subject subtree and retain their existing broad layout invalidation.
+        // SVG instance resources are tracked separately by svg_dirty_consumers,
+        // including unresolved IDs and sources outside the consumer's subtree.
         if self.is_connected(node)
             && matches!(
                 name.to_ascii_lowercase().as_str(),
@@ -821,35 +644,44 @@ impl Dom {
             self.layout_cache.get_mut().clear();
             self.box_tree_cache.get_mut().clear();
         }
-        self.invalidate_style_subtree(root, false);
+        roots.push(root);
+        self.invalidate_style_subtrees(&roots, false);
     }
 
     /// CSS selectors and inheritance follow the element tree; immutable box
     /// nodes are invalidated in the same operation, plus rebuilt ancestors.
     pub(super) fn invalidate_style_subtree(&mut self, root: NodeId, selectors: bool) {
+        self.invalidate_style_subtrees(&[root], selectors);
+    }
+
+    fn invalidate_style_subtrees(&mut self, roots: &[NodeId], selectors: bool) {
         // Even an own-element selector/inline style can change inherited
         // computed values, custom properties, link context or font metrics.
-        let affected: Vec<_> = std::iter::once(root)
-            .chain(self.descendants(root))
-            .collect();
+        // Coalesce overlapping subjects before visiting descendants. In
+        // particular `:has()` can return an ancestor AND its descendants;
+        // repeatedly walking each subtree would make one mutation quadratic.
+        let mut seen = FxHashSet::default();
+        let mut pending = roots.to_vec();
+        let mut affected = Vec::new();
+        while let Some(node) = pending.pop() {
+            if seen.insert(node) {
+                affected.push(node);
+                pending.extend(self.child_iter(node));
+            }
+        }
+        let mut resource_roots = self.svg_dirty_consumers(&affected, selectors);
         if casc_diag_on() && affected.len() > 256 {
             eprintln!(
-                "DIAGINVALID subtree node={root} tag={:?} id={:?} selectors={selectors} count={}",
-                self.tag_name(root),
-                self.attr(root, "id"),
+                "DIAGINVALID subtrees roots={} selectors={selectors} count={}",
+                roots.len(),
                 affected.len()
             );
         }
-        // Do not scan every cached property in the document for a local
-        // update. Property IDs are dense, so eviction is bounded by the dirty
-        // subtree's size rather than the total cached document.
+        // Ownership is by node. Retirement visits only populated values;
+        // neither the document nor the entire property registry is scanned.
         let computed = &mut self.computed_cache.get_mut().1;
-        if !computed.is_empty() {
-            for &id in &affected {
-                for property in 0..PROPS.len() {
-                    computed.remove(&(id, property));
-                }
-            }
+        for &id in &affected {
+            computed.remove_node(id);
         }
         if affected
             .iter()
@@ -857,10 +689,6 @@ impl Dom {
         {
             self.layout_cache.get_mut().clear();
             self.box_tree_cache.get_mut().clear();
-        } else if self.ancestor_is_svg(root)
-            || affected.iter().any(|&id| self.tag_name(id) == Some("svg"))
-        {
-            self.invalidate_svg_layout();
         }
         for id in affected {
             self.transitions.invalidate(id);
@@ -877,7 +705,8 @@ impl Dom {
             self.layout_cache.get_mut().invalidate(id);
             self.box_tree_cache.get_mut().invalidate(id);
         }
-        self.invalidate_layout_ancestors(root);
+        resource_roots.extend_from_slice(roots);
+        self.invalidate_layout_paths(resource_roots);
     }
 
     pub(super) fn invalidate_structure(&mut self, parent: NodeId) {
@@ -956,10 +785,10 @@ impl Dom {
             if matches!(self.tag_name(parent), Some("meta" | "base")) {
                 self.layout_cache.get_mut().clear();
                 self.box_tree_cache.get_mut().clear();
-            } else if self.ancestor_is_svg(parent) || self.tag_name(parent) == Some("svg") {
-                self.invalidate_svg_layout();
             }
-            self.invalidate_layout_ancestors(parent);
+            let mut roots = self.svg_dirty_consumers(&[parent], true);
+            roots.push(parent);
+            self.invalidate_layout_paths(roots);
         }
     }
 
@@ -1017,12 +846,9 @@ impl Dom {
             self.touch_content(Some(parent));
             return;
         }
-        if self.ancestor_is_svg(parent) || self.tag_name(parent) == Some("svg") {
-            // SVG 2 #UseShadowTree: referenced text changes must propagate to
-            // other SVG instances too, not just this element's ancestors.
-            self.invalidate_svg_layout();
-        }
-        self.invalidate_layout_ancestors(character_data.unwrap_or(parent));
+        let mut roots = self.svg_dirty_consumers(&[parent], false);
+        roots.push(character_data.unwrap_or(parent));
+        self.invalidate_layout_paths(roots);
         self.mark_dom_revision();
         self.dirty_nodes.push((parent, DirtyKind::Content));
         // CSS Lists 3 #inheriting-counters / Content 3 #quote-values:
@@ -1077,7 +903,7 @@ mod tests {
             "display",
         ];
         let values = |dom: &Dom| {
-            (0..dom.node_count())
+            dom.live_ids()
                 .filter(|&id| dom.tag_name(id).is_some())
                 .map(|id| {
                     (
@@ -1447,7 +1273,7 @@ mod tests {
 
     fn assert_matches_full_scan(dom: &Dom) {
         let index = dom.style_index();
-        for node in 0..dom.node_count() {
+        for node in dom.live_ids() {
             if dom.tag_name(node).is_none() {
                 continue;
             }
@@ -1761,6 +1587,150 @@ mod tests {
         assert_matches_full_scan(&dom);
         dom.remove_attr(a, "data-state");
         assert_matches_full_scan(&dom);
+    }
+
+    #[test]
+    fn relational_matching_does_not_discard_candidates_after_a_work_limit() {
+        let dom = Dom::parse_document(&format!(
+            "<main id=anchor><b class=hit></b>{}</main><aside id=after>following</aside>",
+            "<i></i>".repeat(10_000)
+        ));
+        for selector in [
+            "#anchor:has(> .hit)",
+            "#anchor:has(.hit)",
+            "#anchor:not(:has(.missing))",
+        ] {
+            let parsed = SelectorList::parse(selector).unwrap();
+            assert_eq!(
+                dom.query(DOCUMENT, &parsed, false),
+                vec![dom.get_by_id("anchor").unwrap()]
+            );
+        }
+        let parsed = SelectorList::parse("#anchor:has(+ #after)").unwrap();
+        assert_eq!(
+            dom.query(DOCUMENT, &parsed, false),
+            vec![dom.get_by_id("anchor").unwrap()]
+        );
+    }
+
+    #[test]
+    fn attribute_dependency_paths_match_uncached_selectors_in_both_directions() {
+        // Selectors 4 #matches, #negation, #relational and #the-nth-child-pseudo.
+        // Exercise both acquiring and losing a match, including dependencies
+        // outside a :has() argument's forward relative subtree.
+        let selectors = [
+            ".flag > section > span",
+            ".flag + section span",
+            ".flag ~ section > span",
+            "section:is(.flag > section) > span",
+            "section:not(.flag + section) span",
+            "section:where(:not(.flag section)) > span",
+            "section:has(> span.flag) + section span",
+            "section:has(+ section > span.flag) > span",
+            "section:has(~ section .flag) span",
+            "main:has(section:is(.flag > section)) > section > span",
+            "main:has(section:not(.flag + section)) > section > span",
+            "section:not(:has(> .flag)) + section > span",
+            "section:nth-child(2 of .flag) > span",
+            "section:nth-last-child(2 of :not(.flag)) > span",
+            "section:nth-child(2 of .flag > section) + section span",
+            "section:nth-child(2 of :has(> span.flag)) span",
+            "main:has(> section:nth-child(2 of .flag)) > section > span",
+            "section:has(> span:nth-child(2 of .flag)) ~ section span",
+            "section:is(:has(.flag), :not(.flag + section)) > span",
+            "section:is(.flag ~ section, main:not(.flag) > section) span",
+            "[class] + section > span",
+            "[class~=flag] ~ section span",
+        ];
+        for selector in selectors {
+            let mut dom = Dom::parse_document(&format!(
+                "<!doctype html><style>{selector}{{color:red;width:37px;--test:yes}}</style>\
+                 <main id=m><section id=a><span id=a1>one</span><span id=a2>two</span></section>\
+                 <section id=b><span id=b1>three</span><span id=b2>four</span></section>\
+                 <section id=c><span id=c1>five</span></section></main><aside id=stable>stable</aside>"
+            ));
+            for target in ["m", "a", "a1", "a2", "b", "b1", "b2", "c", "c1"] {
+                let node = dom.get_by_id(target).unwrap();
+                for value in [Some("flag"), Some("other flag"), Some("other"), None] {
+                    assert_matches_full_scan(&dom);
+                    assert_style_values_match_cold(&mut dom);
+                    if let Some(value) = value {
+                        dom.set_attr(node, "class", value);
+                    } else {
+                        dom.remove_attr(node, "class");
+                    }
+                    assert_matches_full_scan(&dom);
+                    assert_style_values_match_cold(&mut dom);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relational_and_checked_attribute_paths_retain_independent_styles() {
+        let mut dom = Dom::parse_document(
+            "<style>input:checked + label{color:red} section:has(> input:checked) .badge{width:20px}\
+             section:nth-child(2 of :has(input:checked)) .badge{height:17px}</style>\
+             <main><section><input id=check type=checkbox><label id=label>label</label><b class=badge>badge</b></section>\
+             <section><input type=checkbox checked><b class=badge>badge</b></section></main>\
+             <aside id=stable><span id=stable_child>independent</span></aside>",
+        );
+        let check = dom.get_by_id("check").unwrap();
+        let stable = dom.get_by_id("stable_child").unwrap();
+        for checked in [true, false, true, false] {
+            assert_matches_full_scan(&dom);
+            let matches = cached(&dom, "stable_child");
+            let cascade = dom.cascaded_maps(stable);
+            let epoch = dom.style_value_epoch;
+            if checked {
+                dom.set_attr(check, "checked", "");
+            } else {
+                dom.remove_attr(check, "checked");
+            }
+            assert_eq!(
+                dom.style_value_epoch, epoch,
+                "local state expired the document"
+            );
+            assert!(std::rc::Rc::ptr_eq(&matches, &cached(&dom, "stable_child")));
+            assert!(std::rc::Rc::ptr_eq(&cascade, &dom.cascaded_maps(stable)));
+            assert_eq!(
+                dom.computed_value_resolved(dom.get_by_id("label").unwrap(), "color")
+                    .as_deref()
+                    == Some("red"),
+                checked
+            );
+            assert_matches_full_scan(&dom);
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn inherited_state_paths_include_descendants_but_not_unrelated_branches() {
+        for (attribute, value, selector) in [
+            ("disabled", "", "input:disabled + span"),
+            ("contenteditable", "true", "div:read-write + span"),
+            ("lang", "fr", "div:lang(fr) + span"),
+        ] {
+            let mut dom = Dom::parse_document(&format!(
+                "<style>{selector}{{color:red}}</style><fieldset id=parent><legend><input><span>legend</span></legend>\
+                 <input><span>control</span><div>editable/language</div><span>following</span></fieldset>\
+                 <aside id=stable>unrelated</aside>"
+            ));
+            let parent = dom.get_by_id("parent").unwrap();
+            let stable = dom.get_by_id("stable").unwrap();
+            for set in [true, false] {
+                assert_matches_full_scan(&dom);
+                let before = dom.cascaded_maps(stable);
+                if set {
+                    dom.set_attr(parent, attribute, value);
+                } else {
+                    dom.remove_attr(parent, attribute);
+                }
+                assert!(std::rc::Rc::ptr_eq(&before, &dom.cascaded_maps(stable)));
+                assert_matches_full_scan(&dom);
+                assert_style_values_match_cold(&mut dom);
+            }
+        }
     }
 
     #[test]

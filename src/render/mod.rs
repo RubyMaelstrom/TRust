@@ -16,7 +16,10 @@ use crate::doc::Link;
 mod command_panel;
 pub mod documents;
 pub mod headless;
+mod hit_index;
+mod media_controls;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
+pub(crate) use hit_index::PageHitIndex;
 pub mod vello_cpu;
 pub mod vello_hybrid;
 
@@ -305,6 +308,7 @@ impl PagePaint {
             fixed_primitives,
             fixed_interleaved,
             top_layer,
+            browser_media,
             image_requests,
             canvas_images,
             scroll_containers,
@@ -362,7 +366,13 @@ impl PagePaint {
                     .saturating_mul(std::mem::size_of::<StickyConstraint>()),
             );
         let mut opaque = false;
-        for commands in [primitives, fixed_under_primitives, fixed_primitives] {
+        bytes = bytes.saturating_add(browser_media.capacity() * std::mem::size_of::<Primitive>());
+        for commands in [
+            primitives,
+            fixed_under_primitives,
+            fixed_primitives,
+            browser_media,
+        ] {
             for command in commands {
                 let (retained, command_opaque) = command.retained_memory();
                 bytes = bytes.saturating_add(retained);
@@ -808,6 +818,9 @@ pub struct ScrollContainer {
     pub viewport: CssRect,
     pub content: CssSize,
     pub offset: CssPoint,
+    /// CSSOM View's physical scroll coordinates can be negative when the
+    /// scrolling area's origin is a right or bottom edge.
+    pub reverse: [bool; 2],
     pub horizontal: bool,
     pub vertical: bool,
     /// Attached to the viewport's pinned layer rather than document scroll.
@@ -816,6 +829,32 @@ pub struct ScrollContainer {
     pub ancestors: Vec<usize>,
     /// CSS Overscroll Behavior: suppress chaining on x/y independently.
     pub contain_overscroll: [bool; 2],
+}
+
+impl ScrollContainer {
+    pub fn clamp_offset(&self, offset: CssPoint) -> CssPoint {
+        let axis = |value: f32, extent: f32, reverse: bool| {
+            let extent = extent.max(0.);
+            let value = if value.is_finite() { value } else { 0. };
+            if reverse {
+                value.clamp(-extent, 0.)
+            } else {
+                value.clamp(0., extent)
+            }
+        };
+        CssPoint::new(
+            axis(
+                offset.x,
+                self.content.width - self.viewport.width,
+                self.reverse[0],
+            ),
+            axis(
+                offset.y,
+                self.content.height - self.viewport.height,
+                self.reverse[1],
+            ),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1099,6 +1138,10 @@ pub struct PagePaint {
     /// Absolute entries retain document scrolling; fixed entries are viewport-
     /// pinned. Every entry paints after the root stacking context.
     pub top_layer: Vec<TopLayerEntry>,
+    /// Browser-owned external playback controls. These never participate in
+    /// document painting or CSSOM hit testing. Frontends compose them above
+    /// page content, below browser chrome, with retained spatial scopes.
+    pub browser_media: Vec<Primitive>,
     pub image_requests: Vec<ImageRequest>,
     /// Node-associated canvas snapshots. No URLs, fetches, or intrinsic-size
     /// round trip is needed; retained old paint keeps its own complete pixels.
@@ -1706,13 +1749,20 @@ impl Scene {
         let mut hits = std::collections::HashMap::new();
         for (index, primitive) in self.primitives.iter().enumerate() {
             if let DisplayCommand::HitRegion(region) = primitive {
-                hits.entry(region.node).or_insert_with(|| PageHit {
+                let hit = PageHit {
                     rect: transformed_bounds(region.rect, states[index].transform),
                     node: region.node,
                     actor: region.actor,
                     link: region.link.clone(),
                     cursor: region.cursor.clone(),
-                });
+                };
+                // A native playback subwidget follows its DOM anchor's focus
+                // order, but uses the button's geometry and activation target.
+                if matches!(region.link, Some(Link::Media(_))) {
+                    hits.insert(region.node, hit);
+                } else {
+                    hits.entry(region.node).or_insert(hit);
+                }
             }
         }
         order.iter().filter_map(|node| hits.remove(node)).collect()

@@ -6,7 +6,7 @@
 //! immediately or retain an immutable tree for later consumers of that result.
 
 use super::*;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,6 +42,10 @@ pub(crate) struct LayoutFragments {
     pub(super) flow_bottom: f32,
     pub(super) viewport: Viewport,
     pub(super) anchors: Vec<(NodeId, f32)>,
+    single_boxes: OnceLock<measure::SingleBoxIndex>,
+    layout_boxes: OnceLock<HashMap<NodeId, PxRect>>,
+    client_metrics: OnceLock<rustc_hash::FxHashMap<NodeId, [f32; 4]>>,
+    scroll_tree: OnceLock<spatial::ScrollTree>,
 }
 
 impl LayoutFragments {
@@ -69,12 +73,60 @@ impl LayoutFragments {
                 flow_bottom,
                 viewport,
                 anchors,
+                single_boxes: OnceLock::new(),
+                layout_boxes: OnceLock::new(),
+                client_metrics: OnceLock::new(),
+                scroll_tree: OnceLock::new(),
             })
         })
     }
 
     pub(crate) fn single_border_box(&self, node: NodeId) -> Option<PxRect> {
-        measure::single_border_box(&self.root, &self.fixed, &self.top_layer, node)
+        self.single_boxes
+            .get_or_init(|| measure::SingleBoxIndex::new(&self.root, &self.fixed, &self.top_layer))
+            .get(node)
+    }
+
+    /// CSSOM View offset* ignores transforms on both the element and its
+    /// ancestors. This projection shares the snapshot index; only fragmented
+    /// and inline boxes require the complete composed projection.
+    pub(crate) fn layout_border_box(&self, dom: &Dom, node: NodeId) -> Option<PxRect> {
+        self.single_boxes
+            .get_or_init(|| measure::SingleBoxIndex::new(&self.root, &self.fixed, &self.top_layer))
+            .get_layout(node)
+            .or_else(|| {
+                self.layout_boxes
+                    .get_or_init(|| {
+                        measure::layout_boxes(dom, &self.root, &self.fixed, &self.top_layer)
+                    })
+                    .get(&node)
+                    .copied()
+            })
+    }
+
+    pub(crate) fn client_metrics(&self, node: NodeId) -> Option<[f32; 4]> {
+        self.client_metrics
+            .get_or_init(|| measure::client_metrics(&self.root, &self.fixed, &self.top_layer))
+            .get(&node)
+            .copied()
+    }
+
+    pub(super) fn scroll_tree(&self, dom: &Dom) -> &spatial::ScrollTree {
+        self.scroll_tree
+            .get_or_init(|| spatial::ScrollTree::new(dom, &self.root, &self.fixed, &self.top_layer))
+    }
+
+    pub(crate) fn scroll_placement(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+    ) -> (crate::core::CssPoint, bool) {
+        let tree = self.scroll_tree(dom);
+        (tree.offset(dom, node), tree.viewport_fixed(node))
+    }
+
+    pub(crate) fn scroll_axes(&self, dom: &Dom, node: NodeId) -> [bool; 2] {
+        self.scroll_tree(dom).axes(node)
     }
 
     #[allow(clippy::type_complexity)]
@@ -116,6 +168,10 @@ impl LayoutFragments {
             flow_bottom,
             viewport,
             anchors: anchors.to_vec(),
+            single_boxes: OnceLock::new(),
+            layout_boxes: OnceLock::new(),
+            client_metrics: OnceLock::new(),
+            scroll_tree: OnceLock::new(),
         }))
     }
 
@@ -149,6 +205,20 @@ impl LayoutFragments {
             bytes + frag.children.iter().map(fragment).sum::<usize>()
         }
         std::mem::size_of::<Self>()
+            + self
+                .scroll_tree
+                .get()
+                .map_or(0, spatial::ScrollTree::retained_bytes)
+            + self.client_metrics.get().map_or(0, |metrics| {
+                metrics.capacity() * std::mem::size_of::<(NodeId, [f32; 4])>()
+            })
+            + self.layout_boxes.get().map_or(0, |boxes| {
+                boxes.capacity() * std::mem::size_of::<(NodeId, PxRect)>()
+            })
+            + self
+                .single_boxes
+                .get()
+                .map_or(0, measure::SingleBoxIndex::retained_bytes)
             + self.fixed.capacity() * std::mem::size_of::<flow::Frag>()
             + self.top_layer.capacity() * std::mem::size_of::<flow::TopFrag>()
             + self.anchors.capacity() * std::mem::size_of::<(NodeId, f32)>()
@@ -279,6 +349,89 @@ fn collect_container_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_rectangle_index_is_lazy_linear_and_snapshot_owned() {
+        let mut html = String::from("<style>body{margin:0}div{width:12px;height:1px}</style>");
+        for n in 0..1024 {
+            html.push_str(&format!("<div id='n{n}'></div>"));
+        }
+        let mut dom = Dom::parse_document(&html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let viewport = Viewport::new(640., 480.);
+        let controls = HashMap::new();
+        let images = HashMap::new();
+        let nodes: Vec<_> = (0..1024)
+            .map(|n| dom.get_by_id(&format!("n{n}")).unwrap())
+            .collect();
+        let measured = measure_retained_layout_for_box(
+            &dom,
+            &base,
+            viewport,
+            &[],
+            &controls,
+            &images,
+            Some(nodes[0]),
+        );
+        assert!(!measured.complete_geometry);
+        let fragments = measured.fragments.unwrap();
+        assert!(
+            fragments.single_boxes.get().is_none(),
+            "one rectangle must not eagerly allocate the index"
+        );
+        let bytes_before = fragments.retained_bytes();
+        for _ in 0..3 {
+            for (n, &node) in nodes.iter().enumerate() {
+                let rect = fragments.single_border_box(node).unwrap();
+                assert_eq!(
+                    (rect.left, rect.top, rect.width, rect.height),
+                    (0., n as f64, 12., 1.)
+                );
+            }
+        }
+        let index = fragments.single_boxes.get().unwrap();
+        assert_eq!(
+            index.visited, 1026,
+            "three sweeps must visit each actual fragment only once"
+        );
+        assert_eq!(
+            fragments.retained_bytes() - bytes_before,
+            index.retained_bytes()
+        );
+        let full = fragments.measure_boxes(&dom).0;
+        for &node in &nodes {
+            assert_eq!(fragments.single_border_box(node), full.get(&node).copied());
+        }
+
+        // Old products are immutable even if a consumer still owns them after
+        // a new style/layout transaction. The new result starts with no index.
+        dom.set_attr(nodes[1], "style", "width:37px;height:5px");
+        let changed = measure_retained_layout_for_box(
+            &dom,
+            &base,
+            viewport,
+            &[],
+            &controls,
+            &images,
+            Some(nodes[1]),
+        );
+        assert_eq!(changed.boxes[&nodes[1]].width, 37.);
+        let replacement = changed.fragments.unwrap();
+        assert!(replacement.single_boxes.get().is_none());
+        assert_eq!(replacement.single_border_box(nodes[2]).unwrap().top, 6.);
+        assert_eq!(fragments.single_border_box(nodes[2]).unwrap().top, 2.);
+        assert_eq!(fragments.single_border_box(nodes[1]).unwrap().width, 12.);
+        assert!(!std::ptr::eq(
+            index,
+            replacement.single_boxes.get().unwrap()
+        ));
+        let lifetime = Arc::downgrade(&fragments);
+        drop(fragments);
+        assert!(
+            lifetime.upgrade().is_none(),
+            "index lifetime must not retain an obsolete layout"
+        );
+    }
 
     #[test]
     fn retained_layout_consumes_the_settled_container_query_pass() {

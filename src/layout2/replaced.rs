@@ -223,12 +223,10 @@ pub(crate) fn size(
         }
         _ => (w0.clamp(min_w, max_w), h0.clamp(min_h, max_h)),
     };
-    let minimum = if replacement || dom.canvas_size(node).is_some() {
-        0.0
-    } else {
-        1.0
-    };
-    let (box_w, box_h) = (box_w.max(minimum), box_h.max(minimum));
+    // CSS2 #min-max-width and CSSOM View #dom-element-getclientrects:
+    // zero and fractional used sizes remain zero/fractional CSS pixels.
+    // A one-pixel floor here changed inline flow and fabricated image area.
+    let (box_w, box_h) = (box_w.max(0.0), box_h.max(0.0));
 
     // object-fit (css-images-3 §5.5). Meaningful only with a natural size to
     // map; a reserved-but-undecoded box paints blank regardless. `none` maps
@@ -275,12 +273,10 @@ pub(crate) fn apply_fit(
                     scale
                 };
                 let (pw, ph) = (nw * scale, nh * scale);
-                if pw < box_w - 0.5 || ph < box_h - 0.5 {
-                    out.paint_w = pw.max(1.0);
-                    out.paint_h = ph.max(1.0);
-                    out.off_x = (box_w - out.paint_w) / 2.0;
-                    out.off_y = (box_h - out.paint_h) / 2.0;
-                }
+                out.paint_w = pw.max(0.0);
+                out.paint_h = ph.max(0.0);
+                out.off_x = (box_w - out.paint_w) / 2.0;
+                out.off_y = (box_h - out.paint_h) / 2.0;
             }
             _ => {}
         }

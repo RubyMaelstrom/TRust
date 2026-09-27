@@ -36,6 +36,36 @@
     expect('hidden', 'none', 'stylesheet inheritance');
     parent.className = '';
     expect('visible', 'auto', 'stylesheet invalidation');
+    function overflow(expected, label) {
+        for (const property of ['overflow', 'overflow-x', 'overflow-y']) {
+            check(style.getPropertyValue(property), expected, label + ' ' + property);
+        }
+        check(style.overflowX, expected, label + ' overflowX');
+        check(style.overflowY, expected, label + ' overflowY');
+    }
+    overflow('visible', 'initial overflow');
+    parent.style.overflow = 'hidden';
+    overflow('visible', 'overflow is not inherited by default');
+    child.style.overflow = 'inherit';
+    overflow('hidden', 'explicit overflow inheritance');
+    for (const keyword of ['initial', 'unset', 'revert']) {
+        child.style.overflow = keyword;
+        overflow('visible', 'overflow ' + keyword);
+    }
+    child.style.overflow = 'var(--missing-overflow)';
+    overflow('visible', 'invalid variable uses initial overflow');
+    child.style.overflow = 'var(--overflow, visible)';
+    overflow('visible', 'overflow variable fallback');
+    child.style.setProperty('--overflow', 'hidden');
+    overflow('hidden', 'overflow variable mutation');
+    child.style.removeProperty('--overflow');
+    overflow('visible', 'overflow variable removed');
+    child.style.removeProperty('overflow');
+    sheet.textContent = '.clipped { overflow: hidden; }';
+    child.className = 'clipped';
+    overflow('hidden', 'overflow stylesheet');
+    child.className = '';
+    overflow('visible', 'overflow stylesheet invalidated');
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     body.append(svg);
     check(getComputedStyle(svg).visibility, 'visible', 'SVG visibility');

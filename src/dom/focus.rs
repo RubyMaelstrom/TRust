@@ -15,9 +15,20 @@ fn tabindex(raw: &str) -> Option<i32> {
 }
 
 impl Dom {
+    #[cfg(test)]
     pub(crate) fn sequential_focus_order(
         &self,
         boxes: &std::collections::HashMap<NodeId, crate::layout2::PxRect>,
+    ) -> Vec<NodeId> {
+        self.sequential_focus_order_with_subwidgets(boxes, &Default::default())
+    }
+
+    /// HTML #focusable-area: UA subwidgets use their element as DOM anchor,
+    /// including its tabindex, inert ancestors, and shadow focus scope.
+    pub(crate) fn sequential_focus_order_with_subwidgets(
+        &self,
+        boxes: &std::collections::HashMap<NodeId, crate::layout2::PxRect>,
+        subwidgets: &std::collections::HashSet<NodeId>,
     ) -> Vec<NodeId> {
         let mut owners = FxHashMap::default();
         let mut scopes: FxHashMap<NodeId, Vec<(NodeId, i32, bool)>> = FxHashMap::default();
@@ -70,7 +81,7 @@ impl Dom {
                 }
                 _ => self.is_contenteditable_host(node),
             };
-            let focusable = (index.is_some() || default)
+            let focusable = (index.is_some() || default || subwidgets.contains(&node))
                 && !self.actually_disabled(node, tag)
                 && boxes.contains_key(&node)
                 && !self.visibility_hidden(node)

@@ -651,7 +651,8 @@ pub(crate) fn render_arena_with_layout(
                 .map(|style| (node, style))
         })
         .collect();
-    let focus_order = dom.sequential_focus_order(&layout.boxes);
+    let focus_order = dom
+        .sequential_focus_order_with_subwidgets(&layout.boxes, &layout.paint.browser_media_nodes());
     RenderedPage {
         layout: std::sync::Arc::new(layout),
         viewport,
@@ -14455,7 +14456,7 @@ mod tests {
         {
             let mut probe = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
             probe.rewrite_inline_svgs(Some(&url));
-            for id in 0..probe.node_count() {
+            for id in probe.live_ids() {
                 if probe.tag_name(id) == Some("img")
                     && let Some(src) = probe.attr(id, "src")
                 {
@@ -14518,7 +14519,7 @@ mod tests {
                 &images,
             )
             .0;
-            for id in 0..mdom.node_count() {
+            for id in mdom.live_ids() {
                 let matches = mdom.attr(id, "id").is_some_and(|v| v.contains(&sub))
                     || mdom.attr(id, "class").is_some_and(|v| v.contains(&sub));
                 if matches && let Some(r) = boxes.get(&id) {
@@ -14636,7 +14637,7 @@ mod tests {
         }
         // The synthetic node id (usize::MAX) marks generated items (pseudo
         // content, tooltips) with no backing arena node — skip it.
-        seen_nodes.retain(|&n| n < legend_dom.node_count());
+        seen_nodes.retain(|&n| legend_dom.is_valid(n));
         println!("--- legend ({} nodes) ---", seen_nodes.len());
         for &nid in &seen_nodes {
             let tag = legend_dom.tag_name(nid).unwrap_or("·").to_string();

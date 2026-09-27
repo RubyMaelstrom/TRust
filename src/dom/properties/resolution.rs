@@ -18,10 +18,18 @@ pub(in crate::dom) struct State {
 #[derive(Default)]
 struct Resolving {
     active: Vec<Key>,
-    cyclic: FxHashSet<Key>,
+    cyclic: FxHashMap<NodeId, FxHashSet<Key>>,
     steps: usize,
     stamp: (u64, u64),
     memo: FxHashMap<Key, Option<String>>,
+}
+
+impl Resolving {
+    fn is_cyclic(&self, key: &Key) -> bool {
+        self.cyclic
+            .get(&key.0)
+            .is_some_and(|keys| keys.contains(key))
+    }
 }
 
 pub(in crate::dom) struct Guard<'a> {
@@ -31,7 +39,7 @@ pub(in crate::dom) struct Guard<'a> {
 
 impl Guard<'_> {
     pub fn cyclic(&self) -> bool {
-        self.state.borrow().cyclic.contains(&self.key)
+        self.state.borrow().is_cyclic(&self.key)
     }
 }
 
@@ -50,6 +58,65 @@ impl Drop for Guard<'_> {
 }
 
 impl State {
+    pub(in crate::dom) fn remove_node(&mut self, id: NodeId) {
+        macro_rules! remove {
+            ($($field:ident),+ $(,)?) => {$(
+                self.$field.remove(&id);
+                if self.$field.capacity() > self.$field.len().saturating_mul(4).max(64) {
+                    self.$field.shrink_to(self.$field.len().saturating_mul(2));
+                }
+            )+};
+        }
+        remove!(
+            javascript,
+            document_bases,
+            document_cookie_restrictions,
+            adopted_sources
+        );
+        let resolving = self.resolving.get_mut();
+        debug_assert!(resolving.active.is_empty() && resolving.memo.is_empty());
+        resolving.cyclic.remove(&id);
+        if resolving.cyclic.capacity() > resolving.cyclic.len().saturating_mul(4).max(64) {
+            resolving
+                .cyclic
+                .shrink_to(resolving.cyclic.len().saturating_mul(2));
+        }
+    }
+
+    pub(in crate::dom) fn retain_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) {
+        macro_rules! retain {
+            ($($field:ident),+ $(,)?) => {$(
+                self.$field.retain(|&id, _| live(id));
+                if self.$field.capacity() > self.$field.len().saturating_mul(4).max(64) {
+                    self.$field.shrink_to(self.$field.len().saturating_mul(2));
+                }
+            )+};
+        }
+        retain!(
+            javascript,
+            document_bases,
+            document_cookie_restrictions,
+            adopted_sources
+        );
+        let resolving = self.resolving.get_mut();
+        debug_assert!(
+            resolving.active.is_empty(),
+            "DOM GC cannot run inside style resolution"
+        );
+        resolving.cyclic.retain(|&node, _| live(node));
+        resolving.memo.retain(|key, _| live(key.0));
+        if resolving.cyclic.capacity() > resolving.cyclic.len().saturating_mul(4).max(64) {
+            resolving
+                .cyclic
+                .shrink_to(resolving.cyclic.len().saturating_mul(2));
+        }
+        if resolving.memo.capacity() > resolving.memo.len().saturating_mul(4).max(64) {
+            resolving
+                .memo
+                .shrink_to(resolving.memo.len().saturating_mul(2));
+        }
+    }
+
     pub fn invalidate_values(&self) {
         let mut state = self.resolving.borrow_mut();
         debug_assert!(state.active.is_empty());
@@ -59,7 +126,7 @@ impl State {
     pub fn invalidate(&mut self, id: NodeId) {
         let state = self.resolving.get_mut();
         debug_assert!(state.active.is_empty());
-        state.cyclic.retain(|key| key.0 != id);
+        state.cyclic.remove(&id);
         state.memo.clear();
     }
     pub fn enter(
@@ -71,16 +138,22 @@ impl State {
     ) -> Option<Guard<'_>> {
         let key = (id, pseudo, name.to_owned());
         let mut state = self.resolving.borrow_mut();
-        // Font discovery can advance the shared font revision while shaping
-        // inside this stack. Finish that dependency walk, then expire it on
-        // the next outer read; never discard an active cycle context.
-        if state.stamp != stamp && state.active.is_empty() {
-            state.cyclic.clear();
+        // CSS Properties and Values API #dependency-cycles: dependency edges
+        // arise from declarations/relative units, not installed font faces.
+        // A font revision expires computed numeric values, but must not erase
+        // cycle membership while font-size can still reuse its cached result.
+        // Style changes do expire the graph; never discard an active context.
+        if state.active.is_empty() {
+            if state.stamp.0 != stamp.0 {
+                state.cyclic.clear();
+            }
             state.stamp = stamp;
         }
         if let Some(start) = state.active.iter().position(|k| *k == key) {
             let cycle = state.active[start..].to_vec();
-            state.cyclic.extend(cycle);
+            for key in cycle {
+                state.cyclic.entry(key.0).or_default().insert(key);
+            }
             return None;
         }
         state.steps += 1;
@@ -118,11 +191,16 @@ impl State {
         }
         if let Ok(state) = self.resolving.try_borrow() {
             bytes += state.active.capacity() * std::mem::size_of::<Key>()
-                + state.cyclic.capacity() * std::mem::size_of::<Key>()
+                + state.cyclic.capacity() * std::mem::size_of::<(NodeId, FxHashSet<Key>)>()
+                + state
+                    .cyclic
+                    .values()
+                    .map(|keys| keys.capacity() * std::mem::size_of::<Key>())
+                    .sum::<usize>()
                 + state
                     .active
                     .iter()
-                    .chain(state.cyclic.iter())
+                    .chain(state.cyclic.values().flat_map(|keys| keys.iter()))
                     .map(|k| k.2.capacity())
                     .sum::<usize>();
             bytes += state.memo.capacity() * std::mem::size_of::<(Key, Option<String>)>()
@@ -329,7 +407,7 @@ impl Dom {
         let key = (id, pseudo, name.to_owned());
         if let Some(value) = {
             let state = self.properties.resolving.borrow();
-            (!state.active.is_empty() && !state.cyclic.contains(&key))
+            (!state.active.is_empty() && !state.is_cyclic(&key))
                 .then(|| state.memo.get(&key).cloned())
                 .flatten()
         } {
@@ -622,4 +700,42 @@ pub(in crate::dom) fn substitute(
         0,
     )
     .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_dependency_cycles_survive_font_registry_revisions() {
+        // CSS Properties and Values API #dependency-cycles: these edges
+        // come from property references and units, not from available faces.
+        for unit in ["em", "rem", "lh", "rlh"] {
+            let html = format!(
+                "<style>@property --x {{syntax:'<length>';initial-value:3px;inherits:false}} \
+                 html {{--x:2{unit};font-size:var(--x);line-height:var(--x)}}</style>"
+            );
+            let mut dom = Dom::parse_document(&html);
+            let root = dom.document_element().unwrap();
+            assert_eq!(dom.font_px(root), FONT_SIZE_INITIAL, "{unit}");
+            assert_eq!(dom.custom_prop(root, "--x").as_deref(), Some("3px"));
+
+            // Simulate retained dependencies/values predating a font-registry
+            // update, without changing process-global fonts in parallel tests.
+            let old_font_epoch = crate::font_system::page_font_epoch().wrapping_sub(1);
+            dom.properties.resolving.borrow_mut().stamp.1 = old_font_epoch;
+            dom.custom_prop_cache.borrow_mut().0.1 = old_font_epoch;
+            dom.computed_cache.borrow_mut().0.1 = old_font_epoch;
+            assert_eq!(
+                dom.custom_prop(root, "--x").as_deref(),
+                Some("3px"),
+                "font revision must not hide the {unit} cycle behind cached font-size"
+            );
+            assert_eq!(dom.font_px(root), FONT_SIZE_INITIAL, "{unit}");
+
+            // Real dependency changes still invalidate the retained cycle.
+            dom.set_attr(root, "style", "font-size:10px;line-height:20px;--x:2em");
+            assert_eq!(dom.custom_prop(root, "--x").as_deref(), Some("20px"));
+        }
+    }
 }
