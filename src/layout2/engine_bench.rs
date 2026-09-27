@@ -128,6 +128,7 @@ fn shadow_character_data_invalidates_both_formatting_paths() {
             let resources = (
                 crate::font_system::page_font_epoch(),
                 crate::img::svg_intrinsic_epoch(),
+                crate::dom::svg_sprite_revision(),
             );
             measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
             dom.set_text(changed, data);
@@ -136,6 +137,7 @@ fn shadow_character_data_invalidates_both_formatting_paths() {
                 == (
                     crate::font_system::page_font_epoch(),
                     crate::img::svg_intrinsic_epoch(),
+                    crate::dom::svg_sprite_revision(),
                 )
             {
                 assert!(
@@ -293,6 +295,87 @@ fn incremental_layout_matches_fresh_across_formatting_models() {
             // The shared assertion covers CSSOM boxes/tracks/scroll extents,
             // graphical display lists/hit testing, and terminal rows.
             memo::tests::assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+        }
+    }
+}
+
+/// The control reproduces the old resource policy (expire both layout caches,
+/// retain the style cascade). Both policies run the identical current code,
+/// interleaved with the same resource changes and verified geometry. This is
+/// an architectural isolation experiment, not a full-browser speedup claim.
+#[test]
+#[ignore]
+fn layout_engine_resource_workloads() {
+    let base = Url::parse("https://resource-bench.test/").unwrap();
+    let vp = Viewport::new(960., 640.);
+    let controls = ControlMap::new();
+    let iterations = std::env::var("TRUST_LAYOUT_BENCH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(31)
+        .max(3);
+    for count in [16, 64, 256] {
+        let mut html = String::from(
+            "<style>body{margin:0}main{display:grid;grid-template-columns:repeat(8,100px);grid-auto-rows:90px}article{width:100px;height:90px}img{width:40px;height:auto}</style><main>",
+        );
+        for index in 0..count {
+            html.push_str(&format!(
+                "<article><img src='/{index}.png'><b>caption</b></article>"
+            ));
+        }
+        html.push_str("</main>");
+        for scenario in ["one-image", "unrelated-image"] {
+            let doms = [Dom::parse_document(&html), Dom::parse_document(&html)];
+            let mut images: ImageSizes = (0..count)
+                .map(|index| (format!("https://resource-bench.test/{index}.png"), (80, 40)))
+                .collect();
+            for dom in &doms {
+                measure_retained_layout(dom, &base, vp, &[], &controls, &images);
+            }
+            let mut timings = [Vec::new(), Vec::new()];
+            let mut builds = [Vec::new(), Vec::new()];
+            let source = format!(
+                "https://resource-bench.test/{}.png",
+                if scenario == "one-image" {
+                    count - 1
+                } else {
+                    count
+                }
+            );
+            for index in 0..iterations {
+                images.insert(source.clone(), (80, 40 + (1 - index as u32 % 2) * 80));
+                let mut boxes = None;
+                for policy in if index % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let dom = &doms[policy];
+                    let start = Instant::now();
+                    if policy == 1 {
+                        dom.layout_cache.borrow_mut().clear();
+                        dom.box_tree_cache.borrow_mut().clear();
+                    }
+                    let layout = measure_retained_layout(dom, &base, vp, &[], &controls, &images);
+                    timings[policy].push(start.elapsed().as_secs_f64() * 1e6);
+                    builds[policy].push(layout.work.tree_builds);
+                    if let Some(expected) = &boxes {
+                        assert_eq!(expected, &layout.boxes);
+                    } else {
+                        boxes = Some(layout.boxes);
+                    }
+                }
+            }
+            for values in &mut timings {
+                values.sort_by(f64::total_cmp);
+            }
+            for values in &mut builds {
+                values.sort_unstable();
+            }
+            eprintln!(
+                "RESOURCE_BENCH {scenario} count={count} selective_us={:.1} full_expiration_us={:.1} ratio={:.3} selective_tree_builds={} full_tree_builds={} iterations={iterations}",
+                timings[0][iterations / 2],
+                timings[1][iterations / 2],
+                timings[1][iterations / 2] / timings[0][iterations / 2],
+                builds[0][iterations / 2],
+                builds[1][iterations / 2],
+            );
         }
     }
 }

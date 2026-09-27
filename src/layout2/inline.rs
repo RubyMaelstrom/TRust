@@ -1123,9 +1123,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // CSS 2 #content: unavailable generated images are omitted.
                 // Resource discovery is independent of this zero-size state,
                 // and decoded natural dimensions trigger ordinary relayout.
-                let Some((mut width, mut height)) =
-                    crate::responsive_image::density_corrected_size(self.images.get(url), 1.0)
-                else {
+                let Some((mut width, mut height)) = crate::responsive_image::density_corrected_size(
+                    super::memo::image_size(self.dom, self.images, url),
+                    1.0,
+                ) else {
                     return;
                 };
                 // CSS Images 3 #sizing / CSS 2 #inline-replaced-width:
@@ -1388,7 +1389,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .map(Link::Media)
             .or_else(|| ctx.link.clone());
         let natural = crate::responsive_image::density_corrected_size(
-            url.and_then(|url| self.images.get(url)),
+            url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
             density,
         );
         if let Some(r) = super::replaced::size(
@@ -1537,8 +1538,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             })
             .flatten();
         if let Some(poster) = poster
-            && let Some((iw, ih)) =
-                crate::responsive_image::density_corrected_size(self.images.get(&poster), 1.0)
+            && let Some((iw, ih)) = crate::responsive_image::density_corrected_size(
+                super::memo::image_size(self.dom, self.images, &poster),
+                1.0,
+            )
         {
             // The poster draws at its DECODED box capped to the line — never
             // the video's CSS box, which often carries a `height:0`/padding

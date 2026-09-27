@@ -138,6 +138,9 @@ impl Dom {
         self.sanitize_input_value(id, value.unwrap_or(""))
     }
     pub fn set_input_value(&mut self, id: NodeId, value: &str, user: bool) -> bool {
+        if !self.is_valid(id) {
+            return false;
+        }
         if !Self::input_value_mode(&self.input_type(id)) {
             if self.input_type(id) != "file" {
                 self.set_attr(id, "value", value);

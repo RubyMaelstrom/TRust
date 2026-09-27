@@ -54,7 +54,7 @@ type TerminalPageMedia = (Link, Option<(String, f32, f32)>);
 /// quantize the retained pixel fragments into cells.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TerminalPaintModel {
-    nodes: Vec<TerminalNodePaint>,
+    nodes: crate::dom::arena::DenseIdMap<TerminalNodePaint>,
     fragment_targets: HashMap<String, NodeId>,
     links: HashMap<NodeId, Link>,
     has_editing_hosts: bool,
@@ -126,8 +126,8 @@ impl TerminalPaintModel {
         needed: Option<&std::collections::HashSet<NodeId>>,
     ) -> Self {
         let mut links = HashMap::new();
-        let mut nodes = Vec::with_capacity(dom.node_count());
-        for node in 0..dom.node_count() {
+        let mut nodes = crate::dom::arena::DenseIdMap::with_capacity(dom.node_count());
+        for node in dom.live_ids() {
             // CSS Display 3 §2: descendants of a display:none/otherwise
             // suppressed flat-tree element generate no boxes. Keep their actor
             // state in the canonical DOM, but do not let newly-created hidden
@@ -138,7 +138,6 @@ impl TerminalPaintModel {
                 || !dom.is_connected(node)
                 || dom.omitted_from_flat_box_tree(node)
             {
-                nodes.push(TerminalNodePaint::default());
                 continue;
             }
             let tag = dom.tag_name(node).map(str::to_string);
@@ -221,81 +220,86 @@ impl TerminalPaintModel {
                 .and_then(|parent| dom.computed_value_resolved(parent, "display"))
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            nodes.push(TerminalNodePaint {
-                parent: dom.parent_flat(node),
-                clip_path: dom
-                    .computed_value_resolved(node, "clip-path")
-                    .and_then(|value| {
-                        let (w, h) = dom.viewport_px();
-                        super::clip_path::ClipPath::parse(
-                            &value,
-                            super::Units::of(dom, node),
-                            super::value::Vp { w, h },
-                        )
-                    }),
-                tag,
-                id: dom
-                    .attr(node, "id")
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string),
-                anchor_name: dom
-                    .attr(node, "name")
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string),
-                vertical_scroll: dom.is_scroll_container(node),
-                horizontal_scroll: dom.is_hscroll_container(node),
-                principal_scroll: dom.is_principal_scroller(node),
-                background_covers: terminal_background_covers_dom(dom, node),
-                scrollbar_hidden: matches!(
-                    dom.computed_value_resolved(node, "scrollbar-width")
-                        .as_deref(),
-                    Some("none")
-                ),
-                horizontal_item: matches!(
-                    display.as_str(),
-                    "inline-block" | "inline-flex" | "inline-grid"
-                ) || matches!(
-                    parent_display.as_str(),
-                    "flex" | "inline-flex" | "grid" | "inline-grid"
-                ),
-                independent_band: matches!(
-                    display.as_str(),
-                    "inline-block" | "flex" | "inline-flex" | "grid" | "inline-grid" | "table-cell"
-                ),
-                inline_snap,
-                snap_align: dom
-                    .computed_value_resolved(node, "scroll-snap-align")
-                    .and_then(|value| value.split_whitespace().last().map(str::to_ascii_lowercase)),
-                live_node,
-                boundary_actor: super::boundary::boundary_actor(dom, node),
-                scroll_top: dom
-                    .attr(node, "data-trust-scroll-top")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        dom.render_live()
-                            .then(|| dom.scroll_metric(node, 0).map(|value| value as f32))
-                            .flatten()
-                    }),
-                scroll_left: dom
-                    .attr(node, "data-trust-scroll-left")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        dom.render_live()
-                            .then(|| dom.scroll_metric(node, 1).map(|value| value as f32))
-                            .flatten()
-                    }),
-                outline: outline_of(dom, node, super::Units::of(dom, node)),
-                editing_barrier: dom
-                    .attr(node, "contenteditable")
-                    .is_some_and(|v| v.eq_ignore_ascii_case("false")),
-            });
+            nodes.insert(
+                node,
+                TerminalNodePaint {
+                    parent: dom.parent_flat(node),
+                    clip_path: dom
+                        .computed_value_resolved(node, "clip-path")
+                        .and_then(|value| {
+                            let (w, h) = dom.viewport_px();
+                            super::clip_path::ClipPath::parse(
+                                &value,
+                                super::Units::of(dom, node),
+                                super::value::Vp { w, h },
+                            )
+                        }),
+                    tag,
+                    id: dom
+                        .attr(node, "id")
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string),
+                    anchor_name: dom
+                        .attr(node, "name")
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string),
+                    vertical_scroll: dom.is_scroll_container(node),
+                    horizontal_scroll: dom.is_hscroll_container(node),
+                    principal_scroll: dom.is_principal_scroller(node),
+                    background_covers: terminal_background_covers_dom(dom, node),
+                    scrollbar_hidden: matches!(
+                        dom.computed_value_resolved(node, "scrollbar-width")
+                            .as_deref(),
+                        Some("none")
+                    ),
+                    horizontal_item: matches!(
+                        display.as_str(),
+                        "inline-block" | "inline-flex" | "inline-grid"
+                    ) || matches!(
+                        parent_display.as_str(),
+                        "flex" | "inline-flex" | "grid" | "inline-grid"
+                    ),
+                    independent_band: matches!(
+                        display.as_str(),
+                        "inline-block"
+                            | "flex"
+                            | "inline-flex"
+                            | "grid"
+                            | "inline-grid"
+                            | "table-cell"
+                    ),
+                    inline_snap,
+                    snap_align: dom
+                        .computed_value_resolved(node, "scroll-snap-align")
+                        .and_then(|value| {
+                            value.split_whitespace().last().map(str::to_ascii_lowercase)
+                        }),
+                    live_node,
+                    boundary_actor: super::boundary::boundary_actor(dom, node),
+                    scroll_top: dom
+                        .attr(node, "data-trust-scroll-top")
+                        .and_then(|value| value.parse().ok())
+                        .or_else(|| {
+                            dom.render_live()
+                                .then(|| dom.scroll_metric(node, 0).map(|value| value as f32))
+                                .flatten()
+                        }),
+                    scroll_left: dom
+                        .attr(node, "data-trust-scroll-left")
+                        .and_then(|value| value.parse().ok())
+                        .or_else(|| {
+                            dom.render_live()
+                                .then(|| dom.scroll_metric(node, 1).map(|value| value as f32))
+                                .flatten()
+                        }),
+                    outline: outline_of(dom, node, super::Units::of(dom, node)),
+                    editing_barrier: dom
+                        .attr(node, "contenteditable")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("false")),
+                },
+            );
         }
-        while nodes
-            .last()
-            .is_some_and(|node| *node == TerminalNodePaint::default())
-        {
-            nodes.pop();
-        }
+        nodes.retain(|_, node| *node != TerminalNodePaint::default());
         Self {
             nodes,
             fragment_targets: crate::fragment::targets(dom),
@@ -459,6 +463,33 @@ pub(crate) fn paint(
     // compositor groups only overlaps where an upper image is transparent.
     alpha: &HashMap<String, bool>,
 ) -> PaintOut {
+    // CSS transforms are a visual-space projection, never normal-flow
+    // placement. Only this adapter's disposable copy is projected to its
+    // axis-aligned cell representation; CSSOM and graphical paint retain the
+    // original boxes and typed transforms.
+    let mut transformed_fixed;
+    let mut transformed_top;
+    let transformed = has_transform(root)
+        || fixed.iter().any(has_transform)
+        || top_layer.iter().any(|top| has_transform(&top.fragment));
+    let (fixed, top_layer) = if transformed {
+        project_terminal(root, crate::render::Affine2d::IDENTITY, (None, None));
+        transformed_fixed = fixed.to_vec();
+        for f in &mut transformed_fixed {
+            project_terminal(f, crate::render::Affine2d::IDENTITY, (None, None));
+        }
+        transformed_top = top_layer.to_vec();
+        for top in &mut transformed_top {
+            project_terminal(
+                &mut top.fragment,
+                crate::render::Affine2d::IDENTITY,
+                (None, None),
+            );
+        }
+        (transformed_fixed.as_slice(), transformed_top.as_slice())
+    } else {
+        (fixed, top_layer)
+    };
     // Masking affects paint, not canonical layout/DOM geometry. Apply inset
     // bounds only to this terminal adapter's fragment copy, before extracting
     // independent scroll buffers, so a closed drawer cannot leak via one.
@@ -623,6 +654,80 @@ pub(crate) fn paint(
         carousels,
         composites,
     }
+}
+
+fn has_transform(f: &Frag) -> bool {
+    f.paint.transform.is_some() || f.children.iter().any(has_transform)
+}
+
+/// The terminal backend cannot rotate glyph outlines. It maps the same CSS
+/// geometry to axis-aligned cell extents, retaining the text spelling. This
+/// backend adaptation does not feed measurements or graphical hit testing.
+fn project_terminal(
+    f: &mut Frag,
+    parent: crate::render::Affine2d,
+    inherited: (Option<Clip>, Option<Clip>),
+) {
+    use crate::render::CssRect;
+    let matrix = parent.then(super::transform::matrix(f));
+    let (old_x, old_y) = (f.x, f.y);
+    let rect = super::transform::bounds(matrix, CssRect::new(f.x, f.y, f.w, f.h));
+    let original_clip = f.clip;
+    if original_clip == inherited.0 {
+        // An ancestor clip stays in the ancestor's space, even after entering
+        // several transformed descendants. Projecting the same inherited clip
+        // at each level incorrectly clips a translated-in carousel slide.
+        f.clip = inherited.1;
+    } else if let Some(clip) = &mut f.clip {
+        if [clip.x0, clip.y0, clip.x1, clip.y1]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            let r = super::transform::bounds(
+                parent,
+                CssRect::new(clip.x0, clip.y0, clip.x1 - clip.x0, clip.y1 - clip.y0),
+            );
+            *clip = Clip {
+                x0: r.x,
+                y0: r.y,
+                x1: r.x + r.width,
+                y1: r.y + r.height,
+            };
+        } else if parent.0[..4] == [1., 0., 0., 1.] {
+            clip.x0 += parent.0[4];
+            clip.x1 += parent.0[4];
+            clip.y0 += parent.0[5];
+            clip.y1 += parent.0[5];
+        }
+    }
+    for child in &mut f.children {
+        project_terminal(child, matrix, (original_clip, f.clip));
+    }
+    if let FragKind::Line(line) = &mut f.kind
+        && !matrix.is_identity()
+    {
+        let line = std::sync::Arc::make_mut(line);
+        for piece in line.pieces.iter_mut().chain(&mut line.atom_boxes) {
+            let rect_piece = super::transform::bounds(
+                matrix,
+                CssRect::new(
+                    old_x + piece.x,
+                    old_y + piece.y,
+                    piece.box_width,
+                    piece.box_height,
+                ),
+            );
+            piece.x = rect_piece.x - rect.x;
+            piece.y = rect_piece.y - rect.y;
+            piece.box_width = rect_piece.width;
+            piece.box_height = rect_piece.height;
+        }
+    }
+    f.x = rect.x;
+    f.y = rect.y;
+    f.w = rect.width;
+    f.h = rect.height;
+    f.paint.transform = None;
 }
 
 /// Paint a pinned surface in viewport coordinates before storing its relative
@@ -3195,6 +3300,7 @@ fn composite(
     // left overhang cuts leading cells, the right edge truncates.
     let mut placed: Vec<Option<Placed>> = Vec::with_capacity(ops.len());
     let mut hits: Vec<PlacedHit> = Vec::new();
+    let mut browser_controls = Vec::new();
     // ---- stamping pass (paint order) ----
     for (i, op) in ops.into_iter().enumerate() {
         match op {
@@ -3293,6 +3399,29 @@ fn composite(
                 let top = top as usize;
                 let c0 = colu as u32;
                 let c1 = c0 + u32::from(item.width);
+                // HTML #the-video-element permits a native external-player
+                // representation. Retain the authored paint beneath it: the
+                // terminal UI paints these subwidgets after even fixed layers.
+                if matches!(item.link, Some(Link::Media(_))) && !item.invisible {
+                    let mut control = item.clone();
+                    control.col = colu.min(u16::MAX as usize) as u16;
+                    control.kind = ItemKind::MediaControl;
+                    control.height = 1;
+                    control.image = None;
+                    control.image_clip = None;
+                    control.terminal_band = None;
+                    if control.text.is_empty() {
+                        control.text = truncate_to_width("▶ mpv", item.width as usize);
+                    }
+                    control.width = display_width(&control.text).min(u16::MAX as usize) as u16;
+                    if control.width > 0 {
+                        browser_controls.push((top, control));
+                    }
+                    if item.image.is_none() {
+                        placed.push(None);
+                        continue;
+                    }
+                }
                 // Stamp only rows within the vertical band: a box taller than
                 // the clip claims no cells below it (following content shows
                 // through), while emission stays anchored at the top row.
@@ -3534,6 +3663,16 @@ fn composite(
             item,
             order: hit.order,
         });
+    }
+    for (row, control) in browser_controls {
+        ensure_rows(&mut rows, row + 1);
+        if !rows[row].items.iter().any(|item| {
+            item.kind == ItemKind::MediaControl
+                && item.col == control.col
+                && item.link == control.link
+        }) {
+            rows[row].items.push(control);
+        }
     }
     rows
 }

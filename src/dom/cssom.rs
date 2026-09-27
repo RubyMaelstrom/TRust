@@ -15,6 +15,21 @@ pub(crate) struct Sheet {
 }
 
 impl Dom {
+    /// CSSOM View #dom-element-clientwidth / #dom-element-clientheight.
+    /// Each Document, including child navigables, has its own root and mode.
+    pub(crate) fn cssom_client_viewport(&self, id: NodeId) -> bool {
+        let Some(document) = self.owner_document(id) else {
+            return false;
+        };
+        let root = self.style_scope_root_element(id);
+        let quirks = self.document_mode(document) == QuirksMode::Quirks;
+        if quirks {
+            self.tag_name(id) == Some("body") && self.node(id).parent == root
+        } else {
+            root == Some(id)
+        }
+    }
+
     /// CSSOM View §7 reads computed positioning state, not an author-visible
     /// `getComputedStyle()` call. Keep this small native query allocation-light:
     /// offset walks can inspect the same ancestors thousands of times in a task.
@@ -37,9 +52,16 @@ impl Dom {
         // Transforms 1 §3, Positioned Layout 3 §2.1, Containment 2 §3.2/§3.4,
         // and Will Change §2. Filter Effects 1 §5 excludes each Document root.
         let root = self.style_scope_root_element(id) == Some(id);
-        let fixed_block = ["transform", "perspective", "backdrop-filter"]
-            .into_iter()
-            .any(non_none)
+        let fixed_block = [
+            "transform",
+            "translate",
+            "rotate",
+            "scale",
+            "perspective",
+            "backdrop-filter",
+        ]
+        .into_iter()
+        .any(non_none)
             || (!root && non_none("filter"))
             || value("contain").split_ascii_whitespace().any(|token| {
                 ["layout", "paint", "strict", "content"]
@@ -47,9 +69,17 @@ impl Dom {
                     .any(|keyword| token.eq_ignore_ascii_case(keyword))
             })
             || value("will-change").split(',').any(|token| {
-                ["transform", "perspective", "backdrop-filter", "contain"]
-                    .iter()
-                    .any(|keyword| token.trim().eq_ignore_ascii_case(keyword))
+                [
+                    "transform",
+                    "translate",
+                    "rotate",
+                    "scale",
+                    "perspective",
+                    "backdrop-filter",
+                    "contain",
+                ]
+                .iter()
+                .any(|keyword| token.trim().eq_ignore_ascii_case(keyword))
                     || (!root && token.trim().eq_ignore_ascii_case("filter"))
             });
         if fixed_block {
@@ -59,7 +89,7 @@ impl Dom {
     }
 
     pub(crate) fn set_cssom_inline(&mut self, id: NodeId, declarations: Declarations) {
-        if id >= self.nodes.len() || self.tag_name(id).is_none() {
+        if !self.is_valid(id) || self.tag_name(id).is_none() {
             return;
         }
         let text = serialize(&declarations, false);

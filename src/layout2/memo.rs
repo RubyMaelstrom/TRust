@@ -22,6 +22,31 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENTRIES: usize = 2048;
 const MAX_VARIANTS: usize = 8;
 
+mod inputs;
+pub(super) use inputs::{Inputs, ReadScope};
+
+/// Every retained computation observes the actual lookup, even when the
+/// resource has not arrived yet. Anonymous/pseudo boxes need no invented DOM
+/// identity: the enclosing layout transaction owns their reads.
+pub(super) fn image_size<'a>(
+    dom: &Dom,
+    images: &'a ImageSizes,
+    url: &str,
+) -> Option<&'a (u32, u32)> {
+    let size = images.get(url);
+    dom.layout_cache
+        .borrow_mut()
+        .inputs
+        .observe_image(url, size.copied());
+    size
+}
+
+#[derive(Clone)]
+pub(super) struct Intrinsic {
+    pub(super) value: f32,
+    pub(super) inputs: Inputs,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Constraint {
     Intrinsic(bool),
@@ -110,9 +135,10 @@ pub(super) fn box_style_bytes(s: &super::style::BoxStyle) -> usize {
         .map(len_bytes)
         .sum::<usize>()
         + s.color_filters.len() * size_of::<[f32; 20]>()
+        + s.transform.as_ref().map_or(0, |t| t.retained_bytes())
 }
 
-fn len_bytes(len: &Len) -> usize {
+pub(super) fn len_bytes(len: &Len) -> usize {
     fn node_bytes(node: &Node) -> usize {
         match node {
             Node::Lin { .. } => 0,
@@ -158,6 +184,7 @@ struct Entry {
     value: Value,
     bytes: usize,
     used: u64,
+    inputs: Inputs,
 }
 
 struct Environment {
@@ -171,6 +198,7 @@ struct Environment {
     images: ImageSizes,
     font_epoch: u64,
     image_metadata_epoch: u64,
+    svg_sprite_revision: u64,
 }
 
 impl Environment {
@@ -238,6 +266,8 @@ pub(crate) struct LayoutCache {
     bytes: usize,
     count: usize,
     clock: u64,
+    recency: super::cache_order::Recency,
+    inputs: inputs::Tracker,
     pub(super) item_hits: usize,
     pub(super) intrinsic_hits: usize,
 }
@@ -245,16 +275,22 @@ pub(crate) struct LayoutCache {
 impl LayoutCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.recency.clear();
+        self.inputs.clear_retained();
         self.entry_storage_bytes = 0;
         self.bytes = 0;
         self.count = 0;
     }
 
     pub(crate) fn invalidate(&mut self, node: NodeId) {
+        self.recency.remove(node);
         if let Some(entries) = self.entries.remove(&node) {
             self.entry_storage_bytes -= entries.capacity() * size_of::<Entry>();
             self.bytes -= entries.iter().map(|entry| entry.bytes).sum::<usize>();
             self.count -= entries.len();
+            for entry in &entries {
+                self.inputs.release(&entry.inputs);
+            }
         }
     }
 
@@ -263,6 +299,8 @@ impl LayoutCache {
             + self.entries.capacity() * size_of::<(NodeId, Vec<Entry>)>()
             + self.entry_storage_bytes
             + self.environment_bytes
+            + self.recency.retained_bytes()
+            + self.inputs.retained_bytes()
     }
 
     pub(super) fn prepare(
@@ -284,13 +322,24 @@ impl LayoutCache {
         }
         let font_epoch = crate::font_system::page_font_epoch();
         let image_metadata_epoch = crate::img::svg_intrinsic_epoch();
+        // Capture before constructing output, never after it: an immutable
+        // resource inserted concurrently with this layout must force a miss on
+        // the next transaction, not bless older output with the newer revision.
+        let svg_sprite_revision = crate::dom::svg_sprite_revision();
         let same_global = self.environment.as_ref().is_some_and(|e| {
             e.base == *base
                 && e.vp == vp
-                && e.images == *images
                 && e.font_epoch == font_epoch
                 && e.image_metadata_epoch == image_metadata_epoch
+                && e.svg_sprite_revision == svg_sprite_revision
         });
+        let same_images = self
+            .environment
+            .as_ref()
+            .is_some_and(|e| e.images == *images);
+        if !same_images {
+            self.inputs.changed();
+        }
         let same_forms = self
             .environment
             .as_ref()
@@ -339,7 +388,7 @@ impl LayoutCache {
                 .collect();
             let mut invalid = FxHashSet::default();
             let mut ancestors = Vec::new();
-            for node in changed.into_iter().filter(|&node| node < dom.node_count()) {
+            for node in changed.into_iter().filter(|&node| dom.is_valid(node)) {
                 invalid.extend(dom.descendants(node));
                 ancestors.push(node);
             }
@@ -366,40 +415,83 @@ impl LayoutCache {
                 images: images.clone(),
                 font_epoch,
                 image_metadata_epoch,
+                svg_sprite_revision,
             });
+        } else if !same_images {
+            // Natural dimensions affect only the computations which observed
+            // that resource. They do not change the styled formatting tree.
+            self.environment.as_mut().unwrap().images = images.clone();
+        }
+        if !same_global || !same_forms || !same_images {
             self.environment_bytes = self.environment.as_ref().map_or(0, Environment::bytes);
-            if self.retained_bytes() > MAX_BYTES {
+            if self.environment_bytes > MAX_BYTES {
+                self.clear();
                 self.environment = None;
                 self.environment_bytes = 0;
                 return false;
+            }
+            while self.retained_bytes() > MAX_BYTES {
+                let Some(node) = self.recency.oldest() else {
+                    self.environment = None;
+                    self.environment_bytes = 0;
+                    return false;
+                };
+                self.invalidate(node);
             }
         }
         true
     }
 
-    fn find(&mut self, request: &Request<'_>) -> Option<&Value> {
-        self.clock = self.clock.wrapping_add(1);
-        let entry = self
-            .entries
-            .get_mut(&request.node.node)?
-            .iter_mut()
-            .find(|entry| entry.key.matches(request))?;
-        entry.used = self.clock;
-        Some(&entry.value)
+    pub(super) fn replay_inputs(&mut self, inputs: &Inputs) {
+        self.inputs.replay(inputs);
     }
 
-    pub(super) fn intrinsic(&mut self, request: &Request<'_>) -> Option<f32> {
-        let Value::Intrinsic(value) = self.find(request)? else {
+    fn remove_variant(&mut self, node: NodeId, index: usize) {
+        let entries = self.entries.get_mut(&node).unwrap();
+        let removed = entries.swap_remove(index);
+        self.bytes -= removed.bytes;
+        self.count -= 1;
+        self.inputs.release(&removed.inputs);
+        if entries.is_empty() {
+            self.invalidate(node);
+        }
+    }
+
+    fn find(&mut self, request: &Request<'_>) -> Option<(&Value, &Inputs)> {
+        let entries = self.entries.get(&request.node.node)?;
+        let index = entries
+            .iter()
+            .position(|entry| entry.key.matches(request))?;
+        if !self
+            .inputs
+            .valid(&entries[index].inputs, &self.environment.as_ref()?.images)
+        {
+            self.remove_variant(request.node.node, index);
+            return None;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let entry = &mut self.entries.get_mut(&request.node.node)?[index];
+        entry.used = self.clock;
+        self.recency.touch(request.node.node);
+        self.inputs.replay(&entry.inputs);
+        Some((&entry.value, &entry.inputs))
+    }
+
+    pub(super) fn intrinsic(&mut self, request: &Request<'_>) -> Option<Intrinsic> {
+        let (Value::Intrinsic(value), inputs) = self.find(request)? else {
             return None;
         };
-        let value = *value;
+        let value = Intrinsic {
+            value: *value,
+            inputs: inputs.clone(),
+        };
         self.intrinsic_hits += 1;
         Some(value)
     }
 
     pub(super) fn item(&mut self, request: &Request<'_>) -> Option<Item> {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::CacheRead);
-        let Value::Item(item) = self.find(request)? else {
+        let (Value::Item(item), _) = self.find(request)? else {
             return None;
         };
         let item = (**item).clone();
@@ -407,12 +499,20 @@ impl LayoutCache {
         Some(item)
     }
 
-    fn insert(&mut self, request: &Request<'_>, value: Value, payload: usize) {
+    fn insert(&mut self, request: &Request<'_>, value: Value, payload: usize, inputs: Inputs) {
         let key = Key::new(request);
         let bytes = key.bytes() + payload;
         // Avoid making a deep formatting-context tower quadratic in retained
         // memory. Large results simply use the ordinary layout path.
         if bytes > MAX_BYTES / 4 {
+            return;
+        }
+        let previous_inputs = self.inputs.retained_bytes();
+        self.inputs.retain(&inputs);
+        if bytes + size_of::<Entry>() + self.inputs.retained_bytes() - previous_inputs > MAX_BYTES {
+            // Reject an oversized dependency result without evicting useful
+            // unrelated entries just to discover that it cannot fit.
+            self.inputs.release(&inputs);
             return;
         }
         if self
@@ -430,21 +530,16 @@ impl LayoutCache {
                 .min_by_key(|(_, e)| e.used)
                 .unwrap()
                 .0;
-            let removed = entries.swap_remove(oldest);
-            self.bytes -= removed.bytes;
-            self.count -= 1;
+            self.remove_variant(request.node.node, oldest);
         }
         while self.count >= MAX_ENTRIES
             || self.retained_bytes() + bytes + size_of::<Entry>() > MAX_BYTES
         {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entries)| {
-                    entries.iter().map(|entry| entry.used).max().unwrap_or(0)
-                })
-                .map(|(&node, _)| node);
-            let Some(node) = oldest else { return };
+            let oldest = self.recency.oldest();
+            let Some(node) = oldest else {
+                self.inputs.release(&inputs);
+                return;
+            };
             self.invalidate(node);
         }
         self.clock = self.clock.wrapping_add(1);
@@ -455,28 +550,28 @@ impl LayoutCache {
             value,
             bytes,
             used: self.clock,
+            inputs,
         });
         self.entry_storage_bytes += (entries.capacity() - old_capacity) * size_of::<Entry>();
         self.bytes += bytes;
         self.count += 1;
+        self.recency.touch(request.node.node);
         // Vec/hash-table growth can reserve more than the inserted payload.
         while self.retained_bytes() > MAX_BYTES {
-            let Some(node) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entries)| {
-                    entries.iter().map(|entry| entry.used).max().unwrap_or(0)
-                })
-                .map(|(&node, _)| node)
-            else {
+            let Some(node) = self.recency.oldest() else {
                 break;
             };
             self.invalidate(node);
         }
     }
 
-    pub(super) fn store_intrinsic(&mut self, request: &Request<'_>, value: f32) {
-        self.insert(request, Value::Intrinsic(value), 0);
+    pub(super) fn store_intrinsic(&mut self, request: &Request<'_>, value: &Intrinsic) {
+        self.insert(
+            request,
+            Value::Intrinsic(value.value),
+            0,
+            value.inputs.clone(),
+        );
     }
 
     pub(super) fn store_item(
@@ -485,8 +580,9 @@ impl LayoutCache {
         fragment: &Frag,
         anchors: &[(NodeId, f32)],
         tracks: &GridTrackMap,
+        inputs: Inputs,
     ) {
-        self.store_fragment(request, fragment, anchors, tracks, None);
+        self.store_fragment(request, fragment, anchors, tracks, None, inputs);
     }
 
     pub(super) fn store_block(
@@ -496,8 +592,9 @@ impl LayoutCache {
         anchors: &[(NodeId, f32)],
         tracks: &GridTrackMap,
         block: BlockOutput,
+        inputs: Inputs,
     ) {
-        self.store_fragment(request, fragment, anchors, tracks, Some(block));
+        self.store_fragment(request, fragment, anchors, tracks, Some(block), inputs);
     }
 
     fn store_fragment(
@@ -507,6 +604,7 @@ impl LayoutCache {
         anchors: &[(NodeId, f32)],
         tracks: &GridTrackMap,
         block: Option<BlockOutput>,
+        inputs: Inputs,
     ) {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::CacheWrite);
         fn portable(fragment: &Frag) -> bool {
@@ -552,7 +650,7 @@ impl LayoutCache {
                 .values()
                 .map(|(cols, rows)| (cols.capacity() + rows.capacity()) * size_of::<f32>())
                 .sum::<usize>();
-        self.insert(request, Value::Item(Box::new(item)), bytes);
+        self.insert(request, Value::Item(Box::new(item)), bytes, inputs);
     }
 }
 
@@ -1175,6 +1273,103 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn image_arrival_reuses_the_formatting_tree_and_independent_fragments() {
+        let base = Url::parse("https://image-inputs.test/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let controls = ControlMap::new();
+        let mut html = String::from(
+            "<style>body{margin:0} main{display:grid;grid-template-columns:repeat(8,80px);grid-auto-rows:70px} section{width:80px;height:70px} img{display:block;width:40px;height:auto}</style><main>",
+        );
+        for index in 0..96 {
+            html.push_str(&format!(
+                "<section><img id=i{index} src='/{index}.png'></section>"
+            ));
+        }
+        html.push_str("</main>");
+        for _ in 0..16 {
+            let mut dom = Dom::parse_document(&html);
+            let mut images: ImageSizes = (0..96)
+                .map(|index| (format!("https://image-inputs.test/{index}.png"), (40, 20)))
+                .collect();
+            let revisions = (
+                crate::font_system::page_font_epoch(),
+                crate::img::svg_intrinsic_epoch(),
+                crate::dom::svg_sprite_revision(),
+            );
+            measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            // The image map can change without any DOM mutation. Keep the
+            // exact same formatting allocations and revisit only actual reads.
+            images.insert("https://image-inputs.test/95.png".into(), (40, 60));
+            let epoch = dom.epoch();
+            dom.image_changed(dom.get_by_id("i95").unwrap());
+            assert_eq!(dom.epoch(), epoch, "image completion is not a DOM mutation");
+            let changed = measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            assert_eq!(changed.boxes[&dom.get_by_id("i95").unwrap()].height, 60.);
+            assert_eq!(changed.boxes[&dom.get_by_id("i0").unwrap()].height, 20.);
+            images.insert("https://image-inputs.test/unused.png".into(), (500, 600));
+            let unrelated = measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+            assert_eq!(unrelated.boxes, changed.boxes);
+            let stable = revisions
+                == (
+                    crate::font_system::page_font_epoch(),
+                    crate::img::svg_intrinsic_epoch(),
+                    crate::dom::svg_sprite_revision(),
+                );
+            assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            if stable {
+                assert_eq!(changed.work.tree_builds, 0, "{:?}", changed.work);
+                assert!(changed.work.item_hits >= 95, "{:?}", changed.work);
+                assert_eq!(unrelated.work.tree_builds, 0, "{:?}", unrelated.work);
+                assert!(unrelated.work.item_hits > 0, "{:?}", unrelated.work);
+                return;
+            }
+        }
+        panic!("no resource-stable transaction for selective image work bounds");
+    }
+
+    #[test]
+    fn resource_reads_cover_missing_generated_responsive_and_poster_images() {
+        let base = Url::parse("https://image-inputs.test/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let controls = ControlMap::new();
+        let mut dom = Dom::parse_document(
+            r#"<style>
+                body{margin:0} main{display:grid;grid-template-columns:auto 1fr}
+                #generated::before{content:url('/generated.png')}
+                #nested{display:flex} #nested>div{display:inline-grid}
+                img{width:40px;height:auto}
+            </style><main>
+                <section id=generated>after generated image</section>
+                <section id=nested><div><img src='/inline.png'></div><img style='display:block' src='/block.png'></section>
+                <picture><source srcset='/selected.png 2x'><img src='/fallback.png'></picture>
+                <video poster='/poster.png' src='/video.webm'></video>
+                <div style='position:relative;height:40px'><img style='position:absolute;right:0' src='/positioned.png'></div>
+            </main>"#,
+        );
+        let mut images = ImageSizes::new();
+        for path in [
+            "generated",
+            "inline",
+            "block",
+            "selected",
+            "fallback",
+            "poster",
+            "positioned",
+        ] {
+            let url = format!("https://image-inputs.test/{path}.png");
+            for size in [Some((80, 40)), Some((40, 80)), None, Some((100, 30))] {
+                measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
+                if let Some(size) = size {
+                    images.insert(url.clone(), size);
+                } else {
+                    images.remove(&url);
+                }
+                assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            }
+        }
+    }
+
+    #[test]
     fn container_query_and_empty_selector_changes_match_cold_layout() {
         let html = r#"<style>
             main { display:flex; width:550px }
@@ -1297,7 +1492,13 @@ pub(super) mod tests {
                     ratio: true,
                 },
             };
-            cache.store_intrinsic(&request, width as f32);
+            cache.store_intrinsic(
+                &request,
+                &Intrinsic {
+                    value: width as f32,
+                    inputs: None,
+                },
+            );
             assert!(cache.count <= MAX_VARIANTS);
             assert!(cache.retained_bytes() <= MAX_BYTES);
             check_inventory(&cache);
@@ -1315,7 +1516,13 @@ pub(super) mod tests {
                 parent: &large_parent,
                 constraint: Constraint::Intrinsic(true),
             };
-            cache.store_intrinsic(&request, 10.);
+            cache.store_intrinsic(
+                &request,
+                &Intrinsic {
+                    value: 10.,
+                    inputs: None,
+                },
+            );
             assert!(cache.count <= MAX_ENTRIES);
             assert!(cache.retained_bytes() <= MAX_BYTES);
             if node % 100 == 0 {

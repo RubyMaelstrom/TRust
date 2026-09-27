@@ -81,9 +81,13 @@ impl Flow<'_> {
             return 0.0;
         }
         if b.node != NO_NODE
-            && let Some(&hit) = self.imemo.borrow().get(&(b.node, mode == IMode::Min))
+            && let Some(hit) = self.imemo.borrow().get(&(b.node, mode == IMode::Min))
         {
-            return hit;
+            self.dom
+                .layout_cache
+                .borrow_mut()
+                .replay_inputs(&hit.inputs);
+            return hit.value;
         }
         let request = super::memo::Request {
             node: b,
@@ -92,22 +96,28 @@ impl Flow<'_> {
         };
         let reuse = self.reuse && b.node != NO_NODE;
         if reuse && let Some(value) = self.dom.layout_cache.borrow_mut().intrinsic(&request) {
+            let width = value.value;
             self.imemo
                 .borrow_mut()
                 .insert((b.node, mode == IMode::Min), value);
-            return value;
+            return width;
         }
+        let inputs = super::memo::ReadScope::new(self.dom, reuse);
         let v = self.intrinsic_w_inner(b, mode, inl);
+        let value = super::memo::Intrinsic {
+            value: v,
+            inputs: inputs.finish(),
+        };
         if reuse {
             self.dom
                 .layout_cache
                 .borrow_mut()
-                .store_intrinsic(&request, v);
+                .store_intrinsic(&request, &value);
         }
         if b.node != NO_NODE {
             self.imemo
                 .borrow_mut()
-                .insert((b.node, mode == IMode::Min), v);
+                .insert((b.node, mode == IMode::Min), value);
         }
         v
     }
@@ -289,10 +299,11 @@ impl Flow<'_> {
     /// applies the special cyclic-percentage constraints around this content.
     fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode, inl: &InlineStyle) -> f32 {
         match &atom.kind {
-            AtomKind::GeneratedImage { url } => {
-                crate::responsive_image::density_corrected_size(self.images.get(url), 1.0)
-                    .map_or(0.0, |(w, _)| w)
-            }
+            AtomKind::GeneratedImage { url } => crate::responsive_image::density_corrected_size(
+                super::memo::image_size(self.dom, self.images, url),
+                1.0,
+            )
+            .map_or(0.0, |(w, _)| w),
             AtomKind::Img {
                 url,
                 density,
@@ -300,7 +311,8 @@ impl Flow<'_> {
                 alt,
             } => {
                 let natural = crate::responsive_image::density_corrected_size(
-                    url.as_deref().and_then(|url| self.images.get(url)),
+                    url.as_deref()
+                        .and_then(|url| super::memo::image_size(self.dom, self.images, url)),
                     *density,
                 );
                 match super::replaced::size(
@@ -342,7 +354,10 @@ impl Flow<'_> {
                         _ => None,
                     })
                     .and_then(|p| {
-                        crate::responsive_image::density_corrected_size(self.images.get(&p), 1.0)
+                        crate::responsive_image::density_corrected_size(
+                            super::memo::image_size(self.dom, self.images, &p),
+                            1.0,
+                        )
                     });
                 if let Some((w, _)) = poster {
                     return w;

@@ -11,6 +11,8 @@ use super::*;
 pub(super) struct Dependencies {
     epoch: u64,
     readers: FxHashMap<NodeId, FxHashMap<NodeId, u8>>,
+    /// Reverse edges make retiring a nursery subject proportional to its own dependencies.
+    subjects: FxHashMap<NodeId, FxHashSet<NodeId>>,
     edges: usize,
     broad: bool,
     units: bool,
@@ -18,6 +20,65 @@ pub(super) struct Dependencies {
 
 impl Dependencies {
     const MAX_EDGES: usize = 65_536;
+
+    pub(super) fn retain_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) {
+        self.edges = 0;
+        self.readers.retain(|&container, readers| {
+            if !live(container) {
+                return false;
+            }
+            readers.retain(|&subject, _| live(subject));
+            if readers.capacity() > readers.len().saturating_mul(4).max(64) {
+                readers.shrink_to(readers.len().saturating_mul(2));
+            }
+            self.edges += readers.len();
+            !readers.is_empty()
+        });
+        if self.readers.capacity() > self.readers.len().saturating_mul(4).max(64) {
+            self.readers.shrink_to(self.readers.len().saturating_mul(2));
+        }
+        self.subjects = FxHashMap::default();
+        for (&container, readers) in &self.readers {
+            for &subject in readers.keys() {
+                self.subjects.entry(subject).or_default().insert(container);
+            }
+        }
+    }
+
+    pub(super) fn remove_node(&mut self, id: NodeId) {
+        if let Some(readers) = self.readers.remove(&id) {
+            self.edges -= readers.len();
+            for subject in readers.keys() {
+                if let Some(containers) = self.subjects.get_mut(subject) {
+                    containers.remove(&id);
+                    if containers.is_empty() {
+                        self.subjects.remove(subject);
+                    } else if containers.capacity() > containers.len().saturating_mul(4).max(64) {
+                        containers.shrink_to(containers.len().saturating_mul(2));
+                    }
+                }
+            }
+        }
+        if let Some(containers) = self.subjects.remove(&id) {
+            for container in containers {
+                if let Some(readers) = self.readers.get_mut(&container) {
+                    self.edges -= usize::from(readers.remove(&id).is_some());
+                    if readers.is_empty() {
+                        self.readers.remove(&container);
+                    } else if readers.capacity() > readers.len().saturating_mul(4).max(64) {
+                        readers.shrink_to(readers.len().saturating_mul(2));
+                    }
+                }
+            }
+        }
+        if self.readers.capacity() > self.readers.len().saturating_mul(4).max(64) {
+            self.readers.shrink_to(self.readers.len().saturating_mul(2));
+        }
+        if self.subjects.capacity() > self.subjects.len().saturating_mul(4).max(64) {
+            self.subjects
+                .shrink_to(self.subjects.len().saturating_mul(2));
+        }
+    }
 
     fn read(&mut self, epoch: u64, subject: NodeId, container: NodeId, axes: u8) {
         if self.epoch != epoch {
@@ -34,11 +95,13 @@ impl Dependencies {
             std::collections::hash_map::Entry::Occupied(mut entry) => *entry.get_mut() |= axes,
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(axes);
+                self.subjects.entry(subject).or_default().insert(container);
                 self.edges += 1;
             }
         }
         if self.edges > Self::MAX_EDGES {
             self.readers = FxHashMap::default();
+            self.subjects = FxHashMap::default();
             self.edges = 0;
             self.broad = true;
         }
@@ -46,6 +109,12 @@ impl Dependencies {
 
     pub(super) fn retained_bytes(&self) -> usize {
         self.readers.capacity() * std::mem::size_of::<(NodeId, FxHashMap<NodeId, u8>)>()
+            + self.subjects.capacity() * std::mem::size_of::<(NodeId, FxHashSet<NodeId>)>()
+            + self
+                .subjects
+                .values()
+                .map(|s| s.capacity() * std::mem::size_of::<NodeId>())
+                .sum::<usize>()
             + self
                 .readers
                 .values()
@@ -429,9 +498,8 @@ impl Dom {
             let mut font_units = self.font_units_cache.borrow_mut();
             let mut decorations = self.decoration_cache.borrow_mut();
             for &node in &affected {
-                for property in 0..PROPS.len() {
-                    computed.1.remove(&(node, property));
-                }
+                self.transitions.invalidate(node);
+                computed.1.remove_node(node);
                 custom.1.remove(&node);
                 matched.invalidate(node);
                 cascaded.invalidate(node);
@@ -480,6 +548,7 @@ impl Dom {
         };
         // A style/layout interleave is not a DOM mutation. Preserve the parsed
         // rule index and invalidate only values which depend on query results.
+        self.transitions.invalidate_all();
         *self.matched_cache.borrow_mut() = NodeCache::default();
         *self.cascaded_cache.borrow_mut() = NodeCache::default();
         self.computed_cache.borrow_mut().1.clear();
@@ -500,6 +569,34 @@ impl Dom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nursery_dependency_retirement_repairs_both_indexes_without_other_reads() {
+        let mut dependencies = Dependencies::default();
+        dependencies.read(1, 10, 20, 1);
+        dependencies.read(1, 10, 20, 2);
+        dependencies.read(1, 10, 21, 1);
+        dependencies.read(1, 11, 20, 1);
+        dependencies.read(1, 20, 21, 1);
+        assert_eq!(dependencies.edges, 4);
+        assert_eq!(dependencies.readers[&20][&10], 3);
+        dependencies.remove_node(20);
+        assert_eq!(dependencies.edges, 1);
+        assert_eq!(dependencies.readers.len(), 1);
+        assert_eq!(dependencies.readers[&21].len(), 1);
+        assert_eq!(dependencies.subjects[&10], [21].into_iter().collect());
+        assert!(!dependencies.subjects.contains_key(&11));
+        dependencies.remove_node(10);
+        assert_eq!(dependencies.edges, 0);
+        assert!(dependencies.readers.is_empty());
+        assert!(dependencies.subjects.is_empty());
+        dependencies.read(1, 30, 40, 1);
+        dependencies.read(1, 31, 41, 1);
+        dependencies.retain_nodes(&|id| id != 31);
+        dependencies.remove_node(40);
+        assert_eq!(dependencies.edges, 0);
+        assert!(dependencies.subjects.is_empty());
+    }
 
     #[test]
     fn size_changes_invalidate_readers_including_false_queries_and_units() {
@@ -565,6 +662,32 @@ mod tests {
         dependencies.read(2, 1, 2, 2);
         assert!(!dependencies.broad);
         assert_eq!(dependencies.edges, 1);
+    }
+
+    #[test]
+    fn query_changes_expire_both_box_generation_consumers_without_dom_mutation() {
+        let dom = Dom::parse_document(
+            r#"<style>
+                #container { container-type:size }
+                #child { display:contents }
+                @container (width > 100px) { #child { display:block } }
+                @container (width > 200px) { #child { display:none } }
+            </style><div id=container><div id=child>text</div></div>"#,
+        );
+        let container = dom.get_by_id("container").unwrap();
+        let child = dom.get_by_id("child").unwrap();
+        let epoch = dom.epoch;
+        for (width, principal, hidden) in [
+            (50., false, false),
+            (150., true, false),
+            (250., false, true),
+            (50., false, false),
+        ] {
+            dom.update_container_sizes([(container, [width, 100.])].into_iter().collect());
+            assert_eq!(dom.epoch, epoch);
+            assert_eq!(dom.generates_principal_box(child), principal);
+            assert_eq!(dom.is_hidden(child), hidden);
+        }
     }
 
     #[test]

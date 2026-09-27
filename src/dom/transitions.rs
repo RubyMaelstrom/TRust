@@ -378,7 +378,8 @@ impl Running {
 pub(super) struct State {
     epoch: Option<u64>,
     style_stamp: (u64, u64),
-    invalid: FxHashSet<NodeId>,
+    invalid: RefCell<FxHashSet<NodeId>>,
+    all_invalid: Cell<bool>,
     now: f64,
     before: FxHashMap<NodeId, Values>,
     running: FxHashMap<Key, Running>,
@@ -386,10 +387,70 @@ pub(super) struct State {
     values: FxHashMap<Key, String>,
     events: Vec<PendingEvent>,
     generation: u64,
+    #[cfg(test)]
+    last_recomputed: usize,
 }
 impl State {
-    pub(super) fn invalidate(&mut self, id: NodeId) {
-        self.invalid.insert(id);
+    pub(super) fn remove_node(&mut self, node: NodeId) {
+        self.invalid.get_mut().remove(&node);
+        self.before.remove(&node);
+        for property in 0..PROPERTIES.len() {
+            // Running and pending transition targets are native roots. Completed/value caches
+            // do not root nodes and can be removed directly without scanning old transitions.
+            debug_assert!(!self.running.contains_key(&(node, property)));
+            self.completed.remove(&(node, property));
+            self.values.remove(&(node, property));
+        }
+        macro_rules! shrink {
+            ($($field:ident),+ $(,)?) => {$(
+                if self.$field.capacity() > self.$field.len().saturating_mul(4).max(64) {
+                    self.$field.shrink_to(self.$field.len().saturating_mul(2));
+                }
+            )+};
+        }
+        shrink!(before, completed, values);
+        let invalid = self.invalid.get_mut();
+        if invalid.capacity() > invalid.len().saturating_mul(4).max(64) {
+            invalid.shrink_to(invalid.len().saturating_mul(2));
+        }
+    }
+
+    pub(super) fn visit_gc_roots(&self, visit: &mut dyn FnMut(NodeId)) {
+        for &(node, _) in self.running.keys() {
+            visit(node);
+        }
+        for event in &self.events {
+            visit(event.event.0);
+        }
+    }
+
+    pub(super) fn retain_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) {
+        self.invalid.get_mut().retain(|&id| live(id));
+        self.before.retain(|&id, _| live(id));
+        self.running.retain(|(id, _), _| live(*id));
+        self.completed.retain(|(id, _), _| live(*id));
+        self.values.retain(|(id, _), _| live(*id));
+        self.events.retain(|event| live(event.event.0));
+        macro_rules! shrink {
+            ($($field:ident),+ $(,)?) => {$(
+                if self.$field.capacity() > self.$field.len().saturating_mul(4).max(64) {
+                    self.$field.shrink_to(self.$field.len().saturating_mul(2));
+                }
+            )+};
+        }
+        shrink!(before, running, completed, values, events);
+        let invalid = self.invalid.get_mut();
+        if invalid.capacity() > invalid.len().saturating_mul(4).max(64) {
+            invalid.shrink_to(invalid.len().saturating_mul(2));
+        }
+    }
+
+    pub(super) fn invalidate(&self, id: NodeId) {
+        self.invalid.borrow_mut().insert(id);
+    }
+    pub(super) fn invalidate_all(&self) {
+        self.all_invalid.set(true);
+        self.invalid.borrow_mut().clear();
     }
     pub(super) fn affects_computation(&self, name: &str) -> bool {
         !self.values.is_empty() && PROPERTIES.contains(&name)
@@ -402,7 +463,7 @@ impl State {
         self.values.get(&(id, property)).cloned()
     }
     pub(super) fn retained_bytes(&self) -> usize {
-        self.invalid.capacity() * std::mem::size_of::<NodeId>()
+        self.invalid.borrow().capacity() * std::mem::size_of::<NodeId>()
             + self.before.capacity() * std::mem::size_of::<(NodeId, Values)>()
             + self.running.capacity() * std::mem::size_of::<(Key, Running)>()
             + self.completed.capacity() * std::mem::size_of::<(Key, Animated)>()
@@ -465,6 +526,37 @@ impl State {
     }
 }
 
+/// Resolve participation only along paths whose styles/tree membership changed.
+/// CSS Transitions 1 #starting: detached or non-rendered elements have no
+/// before/after pair. Memoizing common ancestors keeps a large dirty subtree
+/// linear without traversing unrelated branches or relying on dirty-set order.
+fn participates(dom: &Dom, node: NodeId, memo: &mut FxHashMap<NodeId, bool>) -> bool {
+    let mut path = Vec::new();
+    let mut cursor = Some(node);
+    let result = loop {
+        let Some(id) = cursor else { break false };
+        if id == DOCUMENT {
+            break true;
+        }
+        if let Some(&result) = memo.get(&id) {
+            break result;
+        }
+        path.push(id);
+        if !dom.is_valid(id)
+            || (dom.tag_name(id).is_some()
+                && (dom.computed_display(id).as_deref() == Some("none")
+                    || dom.subtree_omitted_from_box_tree(id)))
+        {
+            break false;
+        }
+        cursor = dom.parent_composed(id);
+    };
+    for id in path {
+        memo.insert(id, result);
+    }
+    result
+}
+
 impl Dom {
     pub(crate) fn css_transitions_active(&self) -> bool {
         !self.transitions.running.is_empty()
@@ -512,49 +604,58 @@ impl Dom {
             self.style_value_epoch,
             crate::font_system::page_font_epoch(),
         );
-        if state.epoch != Some(self.epoch) || state.style_stamp != stamp {
+        let explicitly_invalid = state.all_invalid.replace(false);
+        let full = state.epoch.is_none() || state.style_stamp != stamp || explicitly_invalid;
+        let invalid = std::mem::take(state.invalid.get_mut());
+        #[cfg(test)]
+        {
+            state.last_recomputed = 0;
+        }
+        if full || !invalid.is_empty() || state.epoch != Some(self.epoch) {
             state.generation = state.generation.wrapping_add(1);
             let active_nodes = state
                 .running
                 .keys()
                 .map(|(id, _)| *id)
                 .collect::<FxHashSet<_>>();
-            let mut after = FxHashMap::default();
-            let mut excluded = FxHashSet::default();
+            // CSS Transitions 1 #starting defines observable before/after
+            // styles, not a compulsory document walk. The cascade already
+            // invalidates every changed selector subject and inherited
+            // descendant. Retain other endpoints in place: copying all 20
+            // properties after every local mutation made detection O(document).
+            let candidates = if full {
+                let mut candidates = self
+                    .composed_descendants(DOCUMENT)
+                    .into_iter()
+                    .collect::<FxHashSet<_>>();
+                // Include formerly rendered nodes to retire detached values
+                // and cancel their transitions even after broad invalidation.
+                candidates.extend(state.before.keys().copied());
+                candidates
+            } else {
+                invalid
+            };
+            let mut participation = FxHashMap::default();
+            let mut tree_order: Option<FxHashMap<NodeId, usize>> = None;
             let vp = Vp {
                 w: self.viewport_px.0,
                 h: self.viewport_px.1,
             };
-            for (tree_order, id) in self.composed_descendants(DOCUMENT).into_iter().enumerate() {
+            for id in candidates {
                 if self.tag_name(id).is_none() {
                     continue;
                 }
-                if self
-                    .parent_composed(id)
-                    .is_some_and(|p| excluded.contains(&p))
-                {
-                    excluded.insert(id);
+                if !participates(self, id, &mut participation) {
+                    state.before.remove(&id);
+                    for property in 0..PROPERTIES.len() {
+                        state.cancel((id, property), now);
+                        state.completed.remove(&(id, property));
+                    }
                     continue;
                 }
-                // Share the cascade's dependency invalidation. A text edit or
-                // resource callback does not require resolving every box
-                // property of every unchanged element for transition detection.
-                if state.style_stamp == stamp
-                    && !state.invalid.contains(&id)
-                    && !active_nodes.contains(&id)
-                    && let Some(values) = state.before.get(&id)
+                #[cfg(test)]
                 {
-                    after.insert(id, values.clone());
-                    continue;
-                }
-                if self
-                    .parent_composed(id)
-                    .is_some_and(|p| excluded.contains(&p))
-                    || self.computed_display(id).as_deref() == Some("none")
-                    || self.subtree_omitted_from_box_tree(id)
-                {
-                    excluded.insert(id);
-                    continue;
+                    state.last_recomputed += 1;
                 }
                 let values = std::array::from_fn(|i| {
                     // Transition endpoints are computed values, not CSSOM's
@@ -610,8 +711,10 @@ impl Dom {
                     }
                 });
                 if let Some(before) = state.before.get(&id).cloned() {
-                    if before == values && !active_nodes.contains(&id) {
-                        after.insert(id, values);
+                    if before == values
+                        && !active_nodes.contains(&id)
+                        && !(0..PROPERTIES.len()).any(|i| state.completed.contains_key(&(id, i)))
+                    {
                         continue;
                     }
                     let params = parameters(self, id);
@@ -675,6 +778,19 @@ impl Dom {
                         };
                         let duration = p.duration * factor;
                         state.completed.remove(&key);
+                        // Event ordering is observable, but only actual new
+                        // transitions need a tree-order snapshot. Ordinary
+                        // local style transactions never build this map.
+                        let tree_order = *tree_order
+                            .get_or_insert_with(|| {
+                                self.composed_descendants(DOCUMENT)
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(order, node)| (node, order))
+                                    .collect()
+                            })
+                            .get(&id)
+                            .expect("participating transition target is connected");
                         state.running.insert(
                             key,
                             Running {
@@ -699,22 +815,10 @@ impl Dom {
                         ));
                     }
                 }
-                after.insert(id, values);
+                state.before.insert(id, values);
             }
-            let removed = state
-                .running
-                .keys()
-                .filter(|(id, _)| !after.contains_key(id))
-                .copied()
-                .collect::<Vec<_>>();
-            for key in removed {
-                state.cancel(key, now);
-            }
-            state.completed.retain(|(id, _), _| after.contains_key(id));
-            state.before = after;
             state.epoch = Some(self.epoch);
             state.style_stamp = stamp;
-            state.invalid.clear();
         }
         state.advance(now);
         let values: FxHashMap<Key, String> = state
@@ -777,6 +881,149 @@ mod tests {
     }
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 0.001, "{a} != {b}");
+    }
+
+    #[test]
+    fn local_transition_detection_does_not_visit_independent_endpoints() {
+        for siblings in [16, 1024] {
+            let mut checked = false;
+            for _ in 0..16 {
+                // Parallel font tests can legitimately invalidate every
+                // endpoint. Always check semantic results, and require a
+                // complete stable-font transaction for the locality bounds.
+                let fonts = crate::font_system::page_font_epoch();
+                let mut dom = Dom::parse_document(&format!(
+                    "<style>div{{width:10px;transition:width 1s linear}}.wide{{width:30px}}</style><main>{}</main>",
+                    (0..siblings)
+                        .map(|i| format!("<div id=n{i}>text</div>"))
+                        .collect::<String>()
+                ));
+                let changed = dom.get_by_id("n0").unwrap();
+                let stable = dom.get_by_id("n1").unwrap();
+                dom.update_css_transitions(0.);
+                assert!(dom.transitions.last_recomputed >= siblings);
+                let before = dom.transitions.before.get(&stable).unwrap() as *const Values;
+                dom.set_attr(changed, "class", "wide");
+                dom.update_css_transitions(1.);
+                let changed_work = dom.transitions.last_recomputed;
+                let retained = std::ptr::eq(before, dom.transitions.before.get(&stable).unwrap());
+                dom.update_css_transitions(1.5);
+                let sampled_work = dom.transitions.last_recomputed;
+                close(px(&dom, changed, "width"), 20.);
+                close(px(&dom, stable, "width"), 10.);
+                dom.set_attr(stable, "data-unrelated", "value");
+                dom.update_css_transitions(1.5);
+                let unrelated_work = dom.transitions.last_recomputed;
+                close(px(&dom, changed, "width"), 20.);
+                dom.update_css_transitions(2.);
+                assert!(!dom.css_transitions_active());
+                if fonts != crate::font_system::page_font_epoch() {
+                    continue;
+                }
+                assert_eq!((changed_work, sampled_work, unrelated_work), (1, 0, 1));
+                assert!(retained, "independent endpoint allocation was replaced");
+                checked = true;
+                break;
+            }
+            assert!(
+                checked,
+                "font revisions never settled for the locality check"
+            );
+        }
+    }
+
+    #[test]
+    fn selective_transition_endpoints_match_full_style_change_transactions() {
+        let html = r#"<style>
+            main { width:10px } div { width:inherit; transition:width 1s linear }
+            main.wide { width:30px } .hidden { display:none }
+        </style><main id=parent><div id=a></div><div id=b></div></main><aside id=other></aside>"#;
+        let mut selective = Dom::parse_document(html);
+        let mut full = Dom::parse_document(html);
+        let a_id = selective.get_by_id("a").unwrap();
+        assert_eq!(full.get_by_id("a"), Some(a_id));
+        for dom in [&mut selective, &mut full] {
+            dom.update_css_transitions(0.);
+        }
+        for step in 0..10 {
+            for dom in [&mut selective, &mut full] {
+                let parent = dom.get_by_id("parent").unwrap();
+                let a = a_id;
+                let b = dom.get_by_id("b").unwrap();
+                match step {
+                    0 => dom.set_attr(parent, "class", "wide"),
+                    1 => dom.set_attr(b, "style", "transition:none"),
+                    2 => dom.set_attr(parent, "class", "hidden"),
+                    3 => dom.set_attr(parent, "class", "wide"),
+                    4 => dom.set_attr(a, "style", "width:50px"),
+                    5 => dom.detach(a),
+                    6 => dom.append(parent, a),
+                    7 => dom.set_attr(a, "style", "width:70px;transition:width .5s linear"),
+                    8 => dom.set_attr(a, "style", "width:90px;transition:none"),
+                    _ => dom.set_attr(parent, "class", ""),
+                }
+            }
+            full.transitions.invalidate_all();
+            for t in [step as f64 + 1., step as f64 + 1.25] {
+                selective.update_css_transitions(t);
+                full.update_css_transitions(t);
+                for id in ["parent", "a", "b", "other"] {
+                    let a = if id == "a" {
+                        a_id
+                    } else {
+                        selective.get_by_id(id).unwrap()
+                    };
+                    let b = if id == "a" {
+                        a_id
+                    } else {
+                        full.get_by_id(id).unwrap()
+                    };
+                    assert_eq!(
+                        selective.transitions.before.get(&a),
+                        full.transitions.before.get(&b),
+                        "step {step}, {id}"
+                    );
+                    assert_eq!(
+                        selective.computed_value_resolved(a, "width"),
+                        full.computed_value_resolved(b, "width"),
+                        "step {step}, {id}"
+                    );
+                }
+                assert_eq!(
+                    selective.take_css_transition_events(),
+                    full.take_css_transition_events(),
+                    "step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn container_query_changes_are_transition_style_events_without_dom_mutations() {
+        // CSS Conditional 5 #animated-containers: query and container-unit
+        // changes participate in style change events even without DOM edits.
+        let mut dom = Dom::parse_document(
+            r#"<style>
+                main { container-type:inline-size }
+                #child { width:10px;transition:width 1s linear }
+                @container (width > 150px) { #child { width:20px } }
+            </style><main id=parent><div id=child></div></main>"#,
+        );
+        let parent = dom.get_by_id("parent").unwrap();
+        let child = dom.get_by_id("child").unwrap();
+        dom.update_container_sizes([(parent, [100., 50.])].into_iter().collect());
+        dom.update_css_transitions(0.);
+        let epoch = dom.epoch();
+        assert!(dom.update_container_sizes([(parent, [200., 50.])].into_iter().collect()));
+        assert_eq!(dom.epoch(), epoch);
+        dom.update_css_transitions(1.);
+        assert_eq!(dom.transitions.last_recomputed, 1);
+        dom.update_css_transitions(1.5);
+        close(px(&dom, child, "width"), 15.);
+        assert!(dom.update_container_sizes([(parent, [100., 50.])].into_iter().collect()));
+        dom.update_css_transitions(1.5);
+        dom.update_css_transitions(1.75);
+        close(px(&dom, child, "width"), 12.5);
     }
     #[test]
     fn hover_transform_transitions_pad_none_and_reverse_without_style_mutation() {
@@ -960,7 +1207,10 @@ mod tests {
         close(px(&dom, parent, "height"), 5.);
         close(px(&dom, child, "height"), 5.);
         dom.update_css_transitions(2.);
-        assert!(dom.is_hidden(parent));
+        assert!(
+            !dom.is_hidden(parent),
+            "a fully clipped box is still generated"
+        );
         close(px(&dom, child, "height"), 0.);
         dom.set_attr(parent, "style", "height:40px");
         dom.update_css_transitions(3.);

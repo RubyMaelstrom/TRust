@@ -25,10 +25,8 @@ use super::ImageSizes;
 use super::NO_NODE;
 use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
-use super::overflow::{
-    ScrollAreas, overflow_axes, viewport_overflow_disabled, viewport_overflow_source,
-};
-use super::style::{Outline, OutlineStyle, Pos, outline_of};
+use super::overflow::{ScrollAreas, overflow_axes, viewport_overflow_disabled};
+use super::style::{Outline, OutlineStyle, outline_of};
 use super::value::{Len, Vp};
 
 /// Computed-style source used by graphical box decoration. Generated boxes
@@ -62,14 +60,6 @@ impl PaintStyle {
             Self::Pseudo(node, pseudo) => dom.pseudo_layout_value(node, pseudo, property),
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct ClipAncestry {
-    position: Pos,
-    absolute_cb: bool,
-    fixed_cb: bool,
-    top_layer: bool,
 }
 
 struct Builder<'a> {
@@ -107,6 +97,7 @@ struct Builder<'a> {
     /// Blockified replaced elements have a principal border box separate
     /// from their anonymous content line. Keep its used geometry for radii.
     replaced_border_boxes: HashMap<NodeId, CssRect>,
+    has_media_controls: bool,
     /// Overflow clips round the padding edge, independently of whether the
     /// box exposes a user scrolling mechanism (hidden/clip do not).
     rounded_overflow_clips: HashMap<NodeId, PaintShape>,
@@ -114,7 +105,7 @@ struct Builder<'a> {
     /// A flattened fragment clip loses which side of a scroll transform each
     /// edge belongs on, especially at a child document's viewport boundary.
     overflow_clips: HashMap<NodeId, Clip>,
-    clip_ancestry: HashMap<NodeId, ClipAncestry>,
+    scroll_tree: std::borrow::Cow<'a, super::spatial::ScrollTree>,
     patch_boundaries: Vec<super::GraphicalPatchBoundary>,
     boundaries: Vec<super::GraphicalBoundary>,
     /// Absolute overflow clips already active in the display list. A clip
@@ -145,6 +136,7 @@ impl<'a> Builder<'a> {
         flow_bottom: f32,
         viewport_w: f32,
         viewport_h: f32,
+        scroll_tree: Option<&'a super::spatial::ScrollTree>,
     ) -> Self {
         let document_root = dom.document_element();
         let mut this = Self {
@@ -169,9 +161,17 @@ impl<'a> Builder<'a> {
             marquee_scopes: HashMap::new(),
             legacy_clips: HashMap::new(),
             replaced_border_boxes: HashMap::new(),
+            has_media_controls: false,
             rounded_overflow_clips: HashMap::new(),
             overflow_clips: HashMap::new(),
-            clip_ancestry: HashMap::new(),
+            scroll_tree: scroll_tree.map_or_else(
+                || {
+                    std::borrow::Cow::Owned(super::spatial::ScrollTree::new(
+                        dom, root, fixed, top_layer,
+                    ))
+                },
+                std::borrow::Cow::Borrowed,
+            ),
             patch_boundaries: Vec::new(),
             boundaries: Vec::new(),
             hard_clips: Vec::new(),
@@ -224,34 +224,11 @@ impl<'a> Builder<'a> {
     }
 
     fn scroll_ancestor_nodes(&self, node: NodeId) -> Vec<NodeId> {
-        let mut result = Vec::new();
-        let mut current = Some(node);
-        let mut waiting = None;
-        while let Some(id) = current {
-            let context = self.clip_ancestry.get(&id);
-            if context.is_some_and(|c| match waiting {
-                Some(Pos::Absolute) => c.absolute_cb,
-                Some(Pos::Fixed) => c.fixed_cb,
-                _ => false,
-            }) {
-                waiting = None;
-            }
-            if waiting.is_none() {
-                if id != node && self.scroll_containers.iter().any(|c| c.node == id) {
-                    result.push(id);
-                }
-                if let Some(context) = context {
-                    if context.top_layer {
-                        break;
-                    }
-                    if matches!(context.position, Pos::Absolute | Pos::Fixed) {
-                        waiting = Some(context.position);
-                    }
-                }
-            }
-            current = self.dom.parent_flat(id);
-        }
-        result
+        self.scroll_tree
+            .chain(node, false)
+            .filter(|link| link.axes.iter().any(|axis| *axis))
+            .map(|link| link.node)
+            .collect()
     }
 
     /// Emit one descendant paint command inside its nearest marquee's fixed
@@ -371,22 +348,6 @@ impl<'a> Builder<'a> {
             && matches!(fragment.kind, FragKind::Block | FragKind::TableCell(_))
         {
             let node = fragment.node;
-            let nested_viewport = matches!(self.dom.tag_name(node), Some("iframe" | "frame"));
-            if fragment.paint.cb_abs
-                || fragment.paint.cb_fixed
-                || nested_viewport
-                || self.dom.is_popover_showing(node)
-            {
-                self.clip_ancestry.insert(
-                    node,
-                    ClipAncestry {
-                        position: Pos::of(self.dom, node),
-                        absolute_cb: fragment.paint.cb_abs || nested_viewport,
-                        fixed_cb: fragment.paint.cb_fixed,
-                        top_layer: self.dom.is_popover_showing(node),
-                    },
-                );
-            }
             if let Some(shape) = rounded_overflow_clip(self.dom, fragment) {
                 self.rounded_overflow_clips.insert(node, shape);
             }
@@ -475,81 +436,41 @@ impl<'a> Builder<'a> {
             return 0;
         }
         let mut chain = Vec::new();
-        let mut waiting_for_cb = if include_node {
-            None
-        } else {
-            self.clip_ancestry
-                .get(&node)
-                .and_then(|context| match context.position {
-                    Pos::Absolute | Pos::Fixed => Some(context.position),
-                    _ => None,
-                })
-        };
-        if self
-            .clip_ancestry
-            .get(&node)
-            .is_some_and(|context| context.top_layer)
-            && !include_node
-        {
-            return 0;
-        }
         // CSS Overflow 3 §2.3 clips the contents of a scroll container to
         // its scrollport.  A shadow tree is attached to the light tree through
         // its host (DOM §4.2.2), so paint ancestry must cross that boundary:
         // otherwise a custom element's host box is clipped but the image/text
         // painted by its shadow tree escapes the same scrollport.
-        let mut current = if include_node {
-            Some(node)
-        } else {
-            self.dom.parent_flat(node)
-        };
-        while let Some(id) = current {
-            let context = self.clip_ancestry.get(&id);
-            if context.is_some_and(|context| match waiting_for_cb {
-                Some(Pos::Absolute) => context.absolute_cb,
-                Some(Pos::Fixed) => context.fixed_cb,
-                _ => false,
-            }) {
-                waiting_for_cb = None;
+        for link in self.scroll_tree.chain(node, include_node) {
+            let id = link.node;
+            let container = self
+                .scroll_containers
+                .iter()
+                .find(|container| container.node == id);
+            let shape = self
+                .rounded_overflow_clips
+                .get(&id)
+                .cloned()
+                .or_else(|| container.map(|container| PaintShape::Rect(container.viewport)))
+                .or_else(|| {
+                    self.overflow_clips
+                        .get(&id)
+                        .map(|clip| PaintShape::Rect(self.clip_rect(*clip)))
+                });
+            if let Some(shape) = shape {
+                chain.push((
+                    id,
+                    shape,
+                    container.is_some() && link.axes.iter().any(|axis| *axis),
+                ));
             }
-            if waiting_for_cb.is_none() && !matches!(self.dom.tag_name(id), Some("html" | "body")) {
-                let container = self
-                    .scroll_containers
-                    .iter()
-                    .find(|container| container.node == id);
-                let shape = self
-                    .rounded_overflow_clips
-                    .get(&id)
-                    .cloned()
-                    .or_else(|| container.map(|container| PaintShape::Rect(container.viewport)))
-                    .or_else(|| {
-                        self.overflow_clips
-                            .get(&id)
-                            .map(|clip| PaintShape::Rect(self.clip_rect(*clip)))
-                    });
-                if let Some(shape) = shape {
-                    chain.push((id, shape, container.is_some()));
-                }
-                // CSS Overflow 3 §2 and Position 3 §2.1: clipping follows
-                // the containing-block chain. A positioned descendant skips
-                // intervening boxes that do not establish its containing block.
-                if let Some(context) = context {
-                    if context.top_layer {
-                        break;
-                    }
-                    if matches!(context.position, Pos::Absolute | Pos::Fixed) {
-                        waiting_for_cb = Some(context.position);
-                    }
-                }
-            }
-            current = self.dom.parent_flat(id);
         }
         chain.reverse();
         let common = self
             .scroll_nodes
             .iter()
             .zip(&chain)
-            .take_while(|(active, requested)| active.0 == requested.0)
+            .take_while(|(active, requested)| active.0 == requested.0 && active.1 == requested.2)
             .count();
         // Paint traversal is properly nested: a caller can only request the
         // active ancestor chain or extend it. If a future paint path violates
@@ -588,11 +509,11 @@ impl<'a> Builder<'a> {
         let nested_viewport = fragment.node != NO_NODE
             && matches!(self.dom.tag_name(fragment.node), Some("iframe" | "frame"));
         if fragment.node != NO_NODE
-            && Some(fragment.node) != viewport_overflow_source(self.dom)
-            && self.dom.document_element() != Some(fragment.node)
-            && (self.dom.is_scroll_container(fragment.node)
-                || self.dom.is_hscroll_container(fragment.node)
-                || nested_viewport)
+            && self
+                .scroll_tree
+                .axes(fragment.node)
+                .iter()
+                .any(|axis| *axis)
         {
             let viewport = if nested_viewport {
                 fragment.content_box()
@@ -619,6 +540,7 @@ impl<'a> Builder<'a> {
                 },
                 viewport,
                 content,
+                reverse: super::overflow::scroll_reverse(self.dom, fragment.node),
                 offset: CssPoint::new(
                     self.dom.scroll_metric(fragment.node, 1).unwrap_or(0.0) as f32,
                     self.dom.scroll_metric(fragment.node, 0).unwrap_or(0.0) as f32,
@@ -627,9 +549,9 @@ impl<'a> Builder<'a> {
                 // scrolling behavior supplies scroll mechanisms only on axes
                 // whose child document overflows that viewport; authored CSS
                 // scroll containers retain their explicit axis eligibility.
-                horizontal: self.dom.is_hscroll_container(fragment.node)
+                horizontal: fragment.paint.overflow[0].user_scrollable()
                     || (nested_viewport && content.width > viewport.width),
-                vertical: self.dom.is_scroll_container(fragment.node)
+                vertical: fragment.paint.overflow[1].user_scrollable()
                     || (nested_viewport && content.height > viewport.height),
                 ancestors: Vec::new(),
                 fixed,
@@ -918,11 +840,66 @@ pub(super) fn paint(
     base: &Url,
     images: &ImageSizes,
     root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+    flow_bottom: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> (
+    PagePaint,
+    Vec<super::GraphicalPatchBoundary>,
+    Vec<super::GraphicalBoundary>,
+) {
+    paint_in_spaces(
+        dom,
+        base,
+        images,
+        root,
+        fixed,
+        top_layer,
+        flow_bottom,
+        viewport_w,
+        viewport_h,
+        None,
+    )
+}
+
+pub(super) fn paint_retained(
+    dom: &Dom,
+    base: &Url,
+    images: &ImageSizes,
+    fragments: &super::LayoutFragments,
+) -> (
+    PagePaint,
+    Vec<super::GraphicalPatchBoundary>,
+    Vec<super::GraphicalBoundary>,
+) {
+    paint_in_spaces(
+        dom,
+        base,
+        images,
+        &fragments.root,
+        &fragments.fixed,
+        &fragments.top_layer,
+        fragments.flow_bottom,
+        fragments.viewport.width,
+        fragments.viewport.height,
+        Some(fragments.scroll_tree(dom)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_in_spaces(
+    dom: &Dom,
+    base: &Url,
+    images: &ImageSizes,
+    root: &Frag,
     fixed: &'_ [Frag],
     top_layer: &[TopFrag],
     flow_bottom: f32,
     viewport_w: f32,
     viewport_h: f32,
+    scroll_tree: Option<&super::spatial::ScrollTree>,
 ) -> (
     PagePaint,
     Vec<super::GraphicalPatchBoundary>,
@@ -938,6 +915,7 @@ pub(super) fn paint(
         flow_bottom,
         viewport_w,
         viewport_h,
+        scroll_tree,
     );
     // CSS Backgrounds 3 §§2.11.1–2: the root background becomes the canvas
     // background. For HTML, when the root has its initial transparent/none
@@ -999,7 +977,7 @@ pub(super) fn paint(
     let width = width.max(viewport_w).max(0.);
     let height = height.max(flow_bottom).max(viewport_h).max(0.);
     let locked = viewport_overflow_disabled(dom);
-    let paint = PagePaint {
+    let mut paint = PagePaint {
         width,
         height,
         user_scroll_size: Some(CssSize::new(
@@ -1013,11 +991,26 @@ pub(super) fn paint(
         fixed_primitives,
         fixed_interleaved: true,
         top_layer: top_layer_entries,
+        browser_media: Vec::new(),
         image_requests: builder.image_requests,
         canvas_images: builder.canvas_images,
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
     };
+    if builder.has_media_controls {
+        paint.collect_browser_media(|node, fallback| {
+            (matches!(dom.tag_name(node), Some("video" | "audio"))
+                && !dom.paint_suppressed(node)
+                && !dom.visibility_hidden(node))
+            .then(|| {
+                builder
+                    .replaced_border_boxes
+                    .get(&node)
+                    .copied()
+                    .unwrap_or(fallback)
+            })
+        });
+    }
     (paint, patch_boundaries, boundaries)
 }
 
@@ -1886,6 +1879,8 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     }
                 }
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    builder.has_media_controls |=
+                        matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
                     builder.push_marquee_content(
                         node,
                         DisplayCommand::HitRegion(HitRegion {
@@ -1979,6 +1974,8 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     );
                 }
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    builder.has_media_controls |=
+                        matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
                     builder.push_marquee_content(
                         node,
                         DisplayCommand::HitRegion(HitRegion {
@@ -2437,38 +2434,9 @@ fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
     }
 }
 
-fn paint_transform(fragment: &Frag, builder: &Builder<'_>) -> Option<Affine2d> {
-    let style = PaintStyle::of(fragment)?;
-    let context = (
-        Units::of(builder.dom, style.node()),
-        Vp {
-            w: builder.viewport_w,
-            h: builder.viewport_h,
-        },
-    );
-    let (matrix, layout_translation) = element_transform(
-        builder.dom,
-        style,
-        fragment.w,
-        fragment.h,
-        fragment.x,
-        fragment.y,
-        context,
-    )?;
-    // Phase 2 retained translated fragment coordinates for terminal output.
-    // Undo that already-applied translation inside the graphical transform so
-    // the desktop path sees CSS's complete matrix exactly once.
-    let corrected = if fragment.paint.pseudo.is_some() {
-        // Generated-box transforms are wholly paint-time; their anonymous
-        // fragment geometry was not pre-translated by `BoxStyle::of`.
-        matrix
-    } else {
-        matrix.then(Affine2d::translate(
-            -layout_translation.x,
-            -layout_translation.y,
-        ))
-    };
-    (!corrected.is_identity()).then_some(corrected)
+fn paint_transform(fragment: &Frag, _builder: &Builder<'_>) -> Option<Affine2d> {
+    let matrix = super::transform::matrix(fragment);
+    (!matrix.is_identity()).then_some(matrix)
 }
 
 fn paint_background_images(
@@ -2490,7 +2458,7 @@ fn frame_canvas_background(dom: &Dom, frame: NodeId) -> Option<(NodeId, NodeId)>
         return None;
     }
     let root = dom
-        .children(frame)
+        .children(dom.frame_document(frame)?)
         .into_iter()
         .find(|&child| dom.tag_name(child) == Some("html"))?;
     Some((root, canvas_background_node(dom, root)))
@@ -2507,7 +2475,7 @@ fn nested_canvas_background_source(dom: &Dom, node: NodeId) -> Option<NodeId> {
     if dom.tag_name(root) != Some("html") {
         return None;
     }
-    let frame = dom.parent_flat(root)?;
+    let frame = dom.frame_owner(root)?;
     let (document_root, source) = frame_canvas_background(dom, frame)?;
     (document_root == root).then_some(source)
 }
@@ -3456,10 +3424,7 @@ fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
 }
 
 fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
-    if matches!(
-        dom.tag_name(fragment.node),
-        Some("html" | "body" | "iframe" | "frame")
-    ) {
+    if matches!(dom.tag_name(fragment.node), Some("iframe" | "frame")) {
         return None;
     }
     let [x, y] =
@@ -3485,9 +3450,6 @@ fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
 }
 
 fn rounded_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<PaintShape> {
-    if matches!(dom.tag_name(fragment.node), Some("html" | "body")) {
-        return None;
-    }
     let style = PaintStyle::Element(fragment.node);
     let shorthand = style.value(dom, "overflow").unwrap_or_default();
     let mut parts = shorthand.split_whitespace();
@@ -3766,141 +3728,6 @@ fn gradient_direction(value: &str) -> Option<f32> {
     })
 }
 
-fn element_transform(
-    dom: &Dom,
-    style: PaintStyle,
-    width: f32,
-    height: f32,
-    x: f32,
-    y: f32,
-    context: (Units, Vp),
-) -> Option<(Affine2d, CssPoint)> {
-    let (units, viewport) = context;
-    let transform = style
-        .value(dom, "transform")
-        .unwrap_or_else(|| "none".into());
-    let translate = style
-        .value(dom, "translate")
-        .unwrap_or_else(|| "none".into());
-    if transform.trim().eq_ignore_ascii_case("none")
-        && translate.trim().eq_ignore_ascii_case("none")
-    {
-        return None;
-    }
-    let mut matrix = Affine2d::IDENTITY;
-    let mut layout_translation = CssPoint::default();
-    if !translate.trim().eq_ignore_ascii_case("none") {
-        let parts = split_ws(&translate);
-        let tx = transform_length_in(
-            parts.first().copied().unwrap_or("0"),
-            width,
-            units,
-            viewport,
-        )?;
-        let ty = transform_length_in(
-            parts.get(1).copied().unwrap_or("0"),
-            height,
-            units,
-            viewport,
-        )?;
-        matrix = matrix.then(Affine2d::translate(tx, ty));
-        layout_translation.x += tx;
-        layout_translation.y += ty;
-    }
-    if !transform.trim().eq_ignore_ascii_case("none") {
-        for (name, args) in transform_functions(&transform)? {
-            let next = match name.as_str() {
-                "matrix" if args.len() == 6 => {
-                    let values: Vec<f32> = args
-                        .iter()
-                        .map(|value| value.parse::<f32>().ok())
-                        .collect::<Option<_>>()?;
-                    layout_translation.x += values[4];
-                    layout_translation.y += values[5];
-                    Affine2d(values.try_into().ok()?)
-                }
-                "translate" => {
-                    let tx = transform_length_in(args.first()?, width, units, viewport)?;
-                    let ty = transform_length_in(
-                        args.get(1).map_or("0", String::as_str),
-                        height,
-                        units,
-                        viewport,
-                    )?;
-                    layout_translation.x += tx;
-                    layout_translation.y += ty;
-                    Affine2d::translate(tx, ty)
-                }
-                "translatex" => {
-                    let tx = transform_length_in(args.first()?, width, units, viewport)?;
-                    layout_translation.x += tx;
-                    Affine2d::translate(tx, 0.0)
-                }
-                "translatey" => {
-                    let ty = transform_length_in(args.first()?, height, units, viewport)?;
-                    layout_translation.y += ty;
-                    Affine2d::translate(0.0, ty)
-                }
-                "translate3d" => {
-                    let tx = transform_length_in(args.first()?, width, units, viewport)?;
-                    let ty = transform_length_in(args.get(1)?, height, units, viewport)?;
-                    layout_translation.x += tx;
-                    layout_translation.y += ty;
-                    Affine2d::translate(tx, ty)
-                }
-                "scale" => {
-                    let sx = args.first()?.parse::<f32>().ok()?;
-                    let sy = args.get(1).map_or(Some(sx), |v| v.parse().ok())?;
-                    Affine2d::scale(sx, sy)
-                }
-                "scalex" => Affine2d::scale(args.first()?.parse().ok()?, 1.0),
-                "scaley" => Affine2d::scale(1.0, args.first()?.parse().ok()?),
-                "scale3d" => {
-                    Affine2d::scale(args.first()?.parse().ok()?, args.get(1)?.parse().ok()?)
-                }
-                "rotate" => rotate(angle(args.first()?)?),
-                "rotatez" => rotate(angle(args.first()?)?),
-                "skewx" => Affine2d([1.0, 0.0, angle(args.first()?)?.tan(), 1.0, 0.0, 0.0]),
-                "skewy" => Affine2d([1.0, angle(args.first()?)?.tan(), 0.0, 1.0, 0.0, 0.0]),
-                "skew" => Affine2d([
-                    1.0,
-                    args.get(1).and_then(|v| angle(v)).unwrap_or(0.0).tan(),
-                    angle(args.first()?)?.tan(),
-                    1.0,
-                    0.0,
-                    0.0,
-                ]),
-                // 3D transforms are retained in style but cannot be projected
-                // by this 2D display-list phase without inventing semantics.
-                _ => continue,
-            };
-            matrix = matrix.then(next);
-        }
-    }
-    let origin = style
-        .value(dom, "transform-origin")
-        .unwrap_or_else(|| "50% 50%".into());
-    let parts = split_ws(&origin);
-    let ox = x - layout_translation.x
-        + transform_origin(
-            parts.first().copied().unwrap_or("50%"),
-            width,
-            units,
-            viewport,
-        );
-    let oy = y - layout_translation.y
-        + transform_origin(
-            parts.get(1).copied().unwrap_or("50%"),
-            height,
-            units,
-            viewport,
-        );
-    let around = Affine2d::translate(ox, oy)
-        .then(matrix)
-        .then(Affine2d::translate(-ox, -oy));
-    Some((around, layout_translation))
-}
-
 fn transform_functions(value: &str) -> Option<Vec<(String, Vec<String>)>> {
     let mut result = Vec::new();
     let mut rest = value.trim();
@@ -3936,6 +3763,7 @@ fn transform_functions(value: &str) -> Option<Vec<(String, Vec<String>)>> {
     Some(result)
 }
 
+#[cfg(test)]
 fn rotate(radians: f32) -> Affine2d {
     let (sin, cos) = radians.sin_cos();
     Affine2d([cos, sin, -sin, cos, 0.0, 0.0])
@@ -3969,15 +3797,6 @@ fn transform_length(value: &str, basis: f32) -> Option<f32> {
 /// and resolve percentages against the transform reference box.
 fn transform_length_in(value: &str, basis: f32, units: Units, viewport: Vp) -> Option<f32> {
     Len::parse(value, units, viewport)?.resolve(Some(basis))
-}
-
-fn transform_origin(value: &str, basis: f32, units: Units, viewport: Vp) -> f32 {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "left" | "top" => 0.0,
-        "center" => basis / 2.0,
-        "right" | "bottom" => basis,
-        other => transform_length_in(other, basis, units, viewport).unwrap_or(basis / 2.0),
-    }
 }
 
 fn resolve_image_source(base: &Url, source: &str) -> String {

@@ -1,0 +1,523 @@
+# Layout2 lifecycle and conformance audit
+
+This is an implementation/verification ledger, not a claim of complete CSS
+conformance. A faster warm layout is acceptable only if its geometry, scrolling,
+painting, hit testing and synchronous DOM observations remain correct. An
+optimization budget may discard optional cached results; it must not discard
+content or silently change selector truth.
+
+## Standards provenance
+
+Normative sources consulted locally, not represented as current upstream checks:
+
+- CSSWG snapshot `81c27f68690138345b2b3b6af8ccc42dad3dca1d`: Selectors 4
+  [logical combinations](https://drafts.csswg.org/selectors-4/#logical-combination),
+  [relational selectors](https://drafts.csswg.org/selectors-4/#relational),
+  [filtered child indices](https://drafts.csswg.org/selectors-4/#the-nth-child-pseudo),
+  combinators and matching; Cascade 5 computed values/inheritance;
+  CSSOM View client rectangles; Tables 3 grid construction/track merging.
+- DOM `a2331a45360129e8645ef7e0a04740241b6e3726`: tree relations and identity.
+- HTML `e5071a20c8569d8a3ec02ed27dd01b948773f850`: selector states, form disabledness,
+  checkedness, table formation and non-negative integer parsing.
+- Geometry 1 in the CSSWG snapshot above: DOMRect private numeric dimensions,
+  NaN-safe edges and structured serialization. Web IDL
+  `8f182624f632a0ce485e236edbc1df18ca385b1d`: interface-object construction,
+  dictionary conversion, attribute brands/descriptors and default toJSON.
+  ECMA-262 `e28783d5fc9dc12b3de905961e2c71410b38a202`: BuiltinCallOrConstruct
+  and GetFunctionRealm for native host-constructor integration.
+- CSS Display 3 #root; CSS2 #collapsing-margins and #root-height; HTML
+  Rendering #the-page: every child navigable retains its own root formatting
+  box, independent of its embedding viewport. CSSOM View offset/client
+  algorithms and #resizing-viewports; Transforms 1/2 matrix composition and
+  reference boxes; Overflow 3 before/after-transform overflow bounds.
+  The CSSOM View snapshot has a known unresolved prose gap for static BODY
+  offsets. The official CSSWG 2024-10-30 resolution was consulted online:
+  https://www.w3.org/2024/10/30-css-minutes.html and
+  https://github.com/w3c/csswg-drafts/issues/10549. This is a WG resolution,
+  not a claim that the local draft already incorporates its edits.
+
+## Contract ledger
+
+| Boundary | Required contract | Audit / implementation state |
+| --- | --- | --- |
+| Attribute → selector subject | Follow combinators and logical dependencies; preserve former matches on removal | Compiled forward/inverse dependency paths; `:has()` anchors and filtered sibling ranks; differential and retention tests added |
+| Selector subject → computed values | Explicit inheritance and custom properties can propagate through descendants | Coalesced subtree retirement; still conservative for unchanged computed outcomes |
+| Computed-value storage | Missing differs from cached absence; node retirement is local; font epochs remain valid | Node-owned sparse value rows with indexed property lookup; GC and container-query invalidation integrated |
+| Child-list → selectors | Adjacency, positions, emptiness, reparenting, relational predicates | Existing dependency guards retained; complex relational/state structures still have broad fallback |
+| Shadow scopes / slot distribution | Selector scoping and flat-tree inheritance are distinct relations | Existing correct conservative fallback retained; scope-bearing selective paths remain open |
+| Stateful controls | CSS state, IDL state, reset/default state and radio associations agree | Checked selector invalidation localized; dirty checkedness/selectedness native-state contract remains open |
+| Style / rule changes | Source order, media, layers, inheritance and registrations remain authoritative | Global stylesheet epochs retained; full interaction audit not yet complete |
+| Transitions | Before/after styles, endpoint invalidation and sampled presentation stay coherent | Dirty-target endpoint transactions retain independent values in place; container queries/units now invalidate endpoints without a DOM mutation; incremental/full comparison and 16/1,024-sibling work-bound tests |
+| Container queries / units | Observe even false queries; settle before geometry escapes | Existing axis-aware read graph retained; node-owned value retirement integrated; cycle/fallback review open |
+| Formatting tree | Anonymous boxes, lists, generated content and inherited inline context survive reuse | Immutable sharing and counter input/output keys retained; broader conformance gaps remain |
+| Fragment constraints | Parent makes placement decisions; margins, floats, dimensions and positioned descendants are inputs | Existing complete-key checks and cold equivalence suite retained; no new assumption of independent layout |
+| Resource inputs | Fonts, intrinsic image metadata and SVG resources invalidate all actual consumers | Per-result shared read sets for image-size inputs, including missing reads, nested cache-hit replay and bounded unique allocation accounting; resource completion preserves DOM/style/formatting-tree state. Negative/arrival/resize/removal, CSSOM and paint tests pass. Global font/SVG metadata expiration and whole-map comparison remain open |
+| Optional cache retention | Bounded metadata and payload, predictable victim selection, no stale references | Constant-time expected recency bookkeeping; formatting cache now accounts shared allocations with first-retain/final-release ownership edges; fragment-cache accounting remains conservative |
+| Synchronous geometry | CSSOM reads see current layout; rendering may consume the same immutable fragments | Actor-owned retained measurement remains authoritative; display:contents no longer receives fabricated descendant rectangles. Lazy snapshot-owned border-box index eliminates repeated whole-fragment scans, preserves multi-fragment/table fallbacks and accounts storage; fragmented inline client-rectangle projection remains incomplete |
+| Coordinate spaces | Client rectangles apply accumulated transforms; offset/client metrics ignore transforms; scrolling overflow includes before/after bounds | Typed retained 2D transforms now serve graphics, client geometry, overflow and the terminal projection; normal-flow positions stay untransformed. Nine core independent coordinate cases pass with matched scrollbar policy. Projective 3D, inline fragment identities and live scroll/sticky projection remain open |
+| Document roots and nested viewports | Every Document retains its root box and independent formatting context; root margins never collapse | Root margin pre-addition removed; context boundaries seal child margins at both ends. Child HTML boxes preserved in canonical and serialized layouts, with root display blockification and native viewport resize synchronization. Focused canonical/snapshot/client/offset coverage added; broad verification ongoing |
+| Graphical / terminal output | Shared CSS-pixel geometry, one terminal quantization, matching hit tests | Cold comparison covers boxes, tracks, scroll extents, painting and terminal rows; broad independent-browser differential coverage remains open |
+| Relational matching | No arbitrary visit cutoff may produce a false match result | Removed the 8,192-candidate truth-changing cutoff; >10,000-candidate regression added |
+| Table structure | Correct groups, spans, nesting and anonymous fixup without area-proportional storage | Removed depth fallback/span-product clamp; row-group zero spans, numeric parsing, first-header/footer ordering and ghost-track merging implemented; focused tests and Chromium differential pass |
+| Box generation versus paint | Clipping, opacity, zero area and offscreen placement do not remove boxes | Removed clipped/screen-reader-only/zero-size suppression and media-wrapper sibling deletion; geometry, clipping and authored-poster ordering regressions pass; UA display/content-visibility and other hard-coded tree omissions still require review |
+| Other formatting / fragmentation | Flex, grid, floats, inline/bidi, writing modes, overflow, replaced content, positioning | Existing tests are a baseline, not evidence of exhaustive standards coverage; full audit remains open |
+| Scheduling / presentation | No idle spin; no repeated authoritative DOM/layout copies | Existing shared actor/frontend contracts retained; desktop acceptance must be measured separately |
+
+## Verification record
+
+Artifacts: `target/layout2-contract-audit-20260927-WM7EoT/`.
+
+- Frozen pre-change release library tests: 508 layout tests passed, four ignored.
+- Frozen pre-change matrix: `baseline-matrix.log`; binaries and hashes retained.
+- Dependency-path tests: 30 passed after correcting an over-invalidation caught
+  by the existing relational-anchor retention test.
+- Pass 2 full release library: 2,097 passed, zero failed, 31 ignored; normal
+  release binaries built successfully. Pass 3 affected layout: 517 passed,
+  zero failed, four ignored; transition regressions: 11 passed.
+- Pass 4 full debug: 2,105 library, 52 desktop, 14 headless and one replay
+  tests passed (34 ignored across targets). The release run found a work-bound
+  test racing a parallel font installation; its semantic assertions passed in
+  isolation. The test now requires a complete stable-font transaction for its
+  locality assertions without skipping semantic checks. The release rerun
+  passes all 2,172 tests, with 34 ignored across targets.
+- Pass 4 normal release binaries built successfully. Clippy all-targets
+  succeeds with five pre-existing collapsible-if warnings (three in the
+  production library and two additional test-only warnings).
+- Pass 5 final full debug and release: 2,114 library, 52 desktop, 14 headless
+  and one replay tests passed (2,181 total; 35 ignored, zero failed). Clippy
+  all-targets, formatting, diff whitespace checks and the normal release build
+  succeed; the same five pre-existing Clippy warnings remain. Frozen pass-5
+  binaries and source, hashes and all command logs are retained.
+- Pass 6 full debug and release: 2,116 library, 52 desktop, 14 headless and one
+  replay tests passed (2,183 total; 35 ignored, zero failed). Clippy all-targets,
+  formatting, diff whitespace checks and the normal release build succeed,
+  with only the same five pre-existing warnings. The release layout module
+  has 526 passing tests, five ignored. Snapshot/index regressions verify
+  unique versus ambiguous/table boxes, fractional/zero-area geometry, fixed
+  and top-layer forests, lazy allocation, one traversal for repeated sweeps,
+  old/new result independence and allocation lifetime/accounting.
+- Pinned official CSS WPT subset (revision
+  `7c3bae55cab5840dc333e99ffd56d5422811ce2c`): baseline and pass 2 have identical
+  statuses for all 208 checks: 170 pass, 38 fail, zero incomplete. Pass 4 also
+  preserves every individual baseline status. Failures
+  remain recorded in full; they are existing conformance gaps, not waived.
+- Pass 5 pinned CSS WPT: 170 pass, 38 fail, zero incomplete; all nine targeted
+  Chromium geometry cases pass. The extended failures listed below remain open.
+- Pass 6 again passes all nine targeted Chromium cases and preserves every
+  individual status in the 208-check WPT subset relative to the baseline,
+  pass 4 and pass 5. The existing 38 failures are retained, not waived.
+- Independent Chromium geometry: six of seven initial scenarios passed;
+  display:contents failed and prompted the geometry fix. Pass 4 passes all nine
+  targeted scenarios: relational state, filtered ranks, three table scenarios,
+  flex/grid inheritance, display:contents, clipped/zero/fractional boxes and
+  authored media-overlay ordering. The first clipping comparison differed by
+  0.375px in a following block's position because of UA-defined line-height:
+  normal; the isolated replaced-geometry fixture has a zero-font strut. Both
+  original and isolated results are retained, not tolerance-adjusted.
+- Extended independent audit reproduces still-open defects in hidden author
+  overrides/until-found, author-displayed metadata, inline rectangle fragments,
+  and loaded-image aspect-ratio handling. These are not claimed fixed.
+- Seven interleaved pairs, 21 inner iterations, pinned CPU 5: pass 1 cache
+  lookup regressed common warm/edit phases 4–9%. Direct-index correction in
+  pass 2 removes most of that regression; container-query warm/edit remains
+  about 3% slower. Full measurements and confidence intervals are retained.
+- Pass 4 paired matrix: common cold layouts improve roughly 5–12%; warm
+  inline layout regresses about 7.5% and container queries about 5.4%.
+  These regressions are not accepted as a completed optimization. Pass 5
+  shares typed box-generation memoization between formatting and geometry
+  instead of repeating string-valued cascade reads for each inline fallback.
+- Pass 5 seven paired matrix runs (21 inner iterations, CPU 5): cold layouts
+  generally improve 5–12%; warm inline ratio 0.9755 [0.9631, 0.9881], query
+  ratio 0.9550 [0.9497, 0.9604], image-edit ratio 0.9582 [0.9465, 0.9700]
+  relative to the baseline (larger is faster). These residual regressions
+  remain open. The existing all-images resource workload improves 1.2566x
+  [1.2342, 1.2794]. Results and per-case intervals: paired-matrix-pass5/.
+- Pass 5 resource-policy experiment, seven fresh processes, CPU 5, alternating
+  selective/forced-both-cache-expiration order, 51 iterations per process:
+  changing one image in 16/64/256 independent panels is 4.65x/5.59x/5.78x faster
+  than forced expiration; changing an unused image is 10.84–11.09x faster.
+  Every paired geometry result is equal. This isolates the cache policy within
+  the same build, not a before/after whole-browser speedup. Individual samples
+  and paired-log 95% intervals: resource-policy-pass5-results.json.
+- Settled-layout geometry-read diagnostic (shared workstation, CPU 5, six
+  measured repetitions after warm-up): pass 5 needs a median 496.8 ms for
+  8,191 distinct getBoundingClientRect reads and 111.35 ms to repeat those
+  already-cached reads. Chromium 150 reference: 9.95 ms / 9.85 ms. All geometry
+  checksums agree. This unpaired diagnostic isolates a repeated full-fragment
+  scan and a separate remaining binding cost; it is NOT a full-browser 50x
+  claim. Artifacts: geometry-queries-pass5-cached/ and geometry-queries-reference/.
+- Pass 6 geometry scaling: seven interleaved pass-5/pass-6 fresh-process pairs,
+  CPU 5, six samples per size after warm-up, no concurrent compiler/tests.
+  At 8,191 distinct queries, 492.6–497.7 ms becomes 119.3–120.5 ms:
+  4.1347x [4.1173, 4.1523] paired-log 95% Student-t interval. At 2,047 queries,
+  the ratio is 1.7886x [1.7791, 1.7980]; at 511 it is 1.2090x [1.1998, 1.2183].
+  Already-cached 8,191-query sweeps remain about 110 ms (ratio 1.0047x), so
+  their separate binding/runtime cost has not been fixed by the index. Every
+  geometry checksum agrees. Results: geometry-paired-pass6/.
+- Pass 6 native CPU profile of already-cached rectangle reads (instrumented,
+  not a timing sample): 792,576 queries with equal checksums. The native
+  layout/geometry entry accounts for 6.96% inclusive CPU; JavaScript dispatch,
+  property access, construction and allocation dominate the remaining work.
+  Inclusive categories overlap and must not be added. Valid CPU percentages
+  are in geometry-profile-pass6/functions-cpu.txt; the first functions.txt
+  used an unsuitable default metric configuration and is not timing evidence.
+- First complete official Speedometer comparison, baseline versus frozen
+  pass 6, CPU 5, three iterations per fresh headless process: 20/20 suites,
+  174/174 measured steps, both completion records valid. Scores 0.268 ->
+  0.3204 (1.1955x); measurement walls 448.480 -> 316.326 seconds. Sampled peak
+  RSS 1,240,224 -> 1,208,628 KiB. This single pair is exploratory, not a
+  confidence interval, desktop acceptance, or a V8 comparison. Full raw
+  progress/iteration records are retained in full-speedometer-baseline-p0/
+  and full-speedometer-pass6-p0/. No compiler/tests ran during these timings.
+- Pass 7 in progress: native Agent-wide numeric DOMRect state and native
+  accessors/constructors/factories, with weak identity and Realm-owned
+  prototype tracing, replace separate JS WeakMap-backed state objects. The
+  shared codec now preserves primary interface and all four unrestricted
+  doubles across structured clone. Focused Window/Worker, tier, coercion,
+  cross-Realm, snapshot and GC verification is underway; no performance or
+  broad-suite acceptance is claimed for these unfinalized changes.
+- Pass 7 first full debug run: 2,118 passed, two failed, 32 ignored in the
+  library. One failure caught enumeration of old geometry Realm metadata in
+  nursery collections; the registry now journals newly bound Realms and only
+  traces those on minor GC, preserving full-collection ownership edges. The
+  unchanged-old-heap work-bound test passes after correction. The other failure
+  was the explicit canonical/native binding counts after adding __geometry_bind;
+  both count assertions now include that binding. Broader rerun is pending.
+- Lumen native-constructor integration: full debug and release both pass
+  1,572 library tests plus one integration test. All-tier coverage checks
+  reentrant NewTarget restoration and >64 bound/proxy GetFunctionRealm chains;
+  the former arbitrary realm-lookup cutoff has been removed.
+- First pass-7 release: all nine targeted layout comparisons pass and all 208
+  individual pinned CSS WPT statuses equal pass 6 (170 pass, 38 fail, zero
+  incomplete). Native rectangle regression fixture passes in both release
+  Window and actual dedicated Worker, including MessageChannel delivery.
+  Independent Chromium 150 execution records differences in NewTarget lookup
+  ordering, derived signed-zero ties, and the SVGRect legacy alias. No
+  differences are suppressed. Local Web IDL specifies conversions before
+  interface allocation; local Geometry IDL requires the Window-only alias.
+  Geometry's NaN-safe minimum/maximum prose has no explicit signed-zero
+  tie-break rule; TRust retains its former Math.min/Math.max convention.
+  The related editor discussion is recorded at
+  https://github.com/w3c/fxtf-drafts/issues/272#issuecomment-438271146 (checked
+  online because the local normative text did not settle the zero convention).
+  These are not claimed as full cross-browser agreement. Raw results:
+  dom-rect-differential-pass7b/; earlier stop-at-first-failure results retained.
+- Extended coordinate-space audit: four additional independent cases fail
+  (scale 2 differences, nested transforms 12, individual transforms 2,
+  transform-box:content-box 4). Raw coordinates: coordinate-spaces-pass7/.
+  These expose pre-existing layout/paint/CSSOM coordinate-contract gaps, not
+  native DOMRect storage failures. They remain open.
+- Corrected pass 7b: full browser debug and release each pass 2,120 library,
+  52 desktop, 14 headless and one replay test (35 existing ignored tests).
+  Clippy succeeds with five existing warnings outside geometry_host; release
+  build, format check and diff check succeed. Nine independent layout cases
+  pass again. The Window/Worker rectangle fixture passes in TRust; the same
+  three recorded Chromium/spec differences remain, without suppression.
+- Pass 7b native-rectangle measurement: seven interleaved fresh-process pairs
+  against pass 6, CPU 5, no compiler/tests. For 8,191 distinct reads the ratio
+  is 2.3540x [2.3354, 2.3728]; already-cached reads are 2.6620x [2.6419, 2.6823]
+  (roughly 109–110 ms -> 41 ms). All checksums match. This is a binding-path
+  result, NOT a whole-browser/Speedometer gain. Raw: geometry-paired-pass7b/.
+  The follow-up native profile completes 1,414,144 reads with valid checksums;
+  host_rect is now ~16% inclusive CPU, exposing remaining wrapper/property/
+  host-state lookup costs. Instrumented profiles are not timing samples.
+- Pass 8 in progress: retained typed transform values are separated from
+  untransformed layout positions. Graphics, client geometry, local overflow
+  and the terminal projection consume the same matrix; offset* has a separate
+  untransformed projection. The desktop translation-compensation path is
+  removed. New tests cover transform order, individual properties, reference
+  boxes, non-linear lengths after resize, overflow and all three JS tiers.
+  Genuine projective 3D, inline fragment identity and live scroll projections
+  are still open contracts; this is NOT a completed transform/layout engine.
+  A broad run caught a terminal inherited-clip projection regression in a
+  carousel. The fix preserves ancestor clip space instead of transforming the
+  same inherited clip repeatedly. Broad verification is in progress.
+- Pass 8j: 532 layout tests pass, five existing ignores. Root regression
+  coverage exposed missing child HTML boxes and root-margin collapse/double
+  application; the general formatting fixes pass canonical and serialized
+  geometry comparisons. Static BODY offset coordinates follow the CSSWG
+  resolution above while positioned parents retain the draft's padding-edge
+  rule. No screenshot or site-specific coordinate adjustment is involved.
+- Pass 8j independent coordinate audit: 12 cases; the nine original core
+  cases and nested-root viewport case pass with scrollbar-width:none applied
+  identically to both engines. Original UA-default results remain in
+  coordinate-spaces-pass8j/; their 15px gutter differences are expected from
+  permitted classic/overlay scrollbar policies, not waived geometry failures.
+  The matched-policy run, coordinate-spaces-pass8j-no-gutters/, still records
+  16 inline-border-box differences and two positioned-BODY offset differences
+  (Chromium includes the body border, unlike the current padding-edge prose).
+  Those investigations remain open and the differential exits nonzero.
+- Pass 8j full debug: 2,125 pass, four failures, 32 existing ignores. It caught
+  hidden child HEAD content leaking through the new serializer, an old test
+  assuming the omitted root, and Window private resize dimensions diverging
+  from native client metrics. Serialization now honors the child's display;
+  the structural assertion checks the retained root; private resize updates
+  native layout/media state before author resize listeners. Full rerun underway.
+- Seven additional independent live-scroll scenarios all expose open gaps:
+  nested/rotated scroll displacement, containing-block ancestry, hidden versus
+  clip scrollability and negative RTL ranges. Baseline preserved under
+  scroll-spaces-pass8j/. Correct scroll updates must project existing fragments,
+  not invalidate or rebuild layout merely because an offset changed.
+- Pass 8k full verification: debug and release each pass 2,129 library,
+  52 desktop, 14 headless and one replay test; 35 existing ignored tests.
+  Clippy, release build, format and diff checks succeed. Clippy reported six
+  library-test warnings (including one new needless borrow, corrected in the
+  following source checkpoint); it was not a warning-free run. Frozen binary
+  hashes and source copies are candidate-pass8k-* in the audit directory.
+- Pass 8k paired geometry versus 7b: seven interleaved fresh-process pairs,
+  CPU 5, checksums valid. 8,191 distinct queries: 1.02636x [1.01637,1.03644].
+  Repeated queries: 0.98193x [0.97234,0.99163], a small measured regression.
+  Raw: geometry-paired-pass8k/. These are binding/geometry measurements, not
+  whole-browser gains. The 96-workload, seven-pair matrix versus the original
+  baseline also retains regressions: queries/warm 0.920x [0.911,0.928],
+  floats/edit 0.922x [0.919,0.925], images/edit 0.938x [0.932,0.944].
+  Full individual results: paired-matrix-pass8k/. No failing or slower workload
+  is excluded from the stored results.
+- Independent second-reference BODY check: LibreWolf 153.0.4-1 (Gecko) agrees
+  with the normative positioned-BODY padding-edge result (42,40), whereas
+  Chromium 150 reports (45,43). Gecko differs on static/transformed-static
+  BODY and uses a 400px-high viewport in this headless configuration. Raw
+  body-offset-gecko-pass8j/ keeps every difference, including viewport-policy
+  differences; this is not evidence that either browser implements every
+  branch of the consulted draft/WG resolution identically.
+- Pass 9 under development: a retained containing-block scroll/clip tree
+  feeds native client rectangles and graphical clipping/hit testing. Typed
+  overflow eligibility distinguishes hidden, clip and user-scrollable axes.
+  Initial regressions cover retained-layout identity through scroll changes,
+  escaping positioned descendants, inline descendants and negative RTL ranges.
+- Pass 9g verification: debug and release each pass 2,132 library, 53 desktop,
+  14 headless and one replay test (2,200 total; 35 existing ignored tests).
+  Clippy succeeds with the five existing warnings; release build, format and
+  diff checks succeed. Frozen sources and binaries: candidate-pass9g-*.
+  These suites did not detect the subsequently reported Steam regression;
+  the investigation and new interaction coverage are recorded below.
+- Pass 9g versus 8k: seven interleaved fresh-process pairs, CPU 5, no concurrent
+  compiler/tests. At 8,192 elements, 64 scroll-change/hit-test operations improve
+  10.12574x [10.04444, 10.20771]; unchanged hit tests are 0.99865x
+  [0.98869, 1.00871]. All checksums match. Raw: scroll-hit-paired-pass9g/.
+  Distinct geometry reads are 1.00338x [0.99816, 1.00863]; cached reads are
+  1.01155x [1.00008, 1.02315]. Raw: geometry-paired-pass9g/.
+  These are specific host-path workloads, NOT a whole-browser/Speedometer gain.
+- One preliminary paired official Speedometer NewsSite-Next/NewsSite-Nuxt run
+  (three iterations each): geometric-mean score 0.03750 -> 0.10700 (2.85x).
+  Both completion records valid, all 18 steps completed. This is a subset,
+  not a full Speedometer result, and needs repeated independent pairs.
+  Sampled peak RSS increased from 1,170,264 to 1,305,300 KiB in this pair.
+- Pass 4 repeated official NewsSite-Next/NewsSite-Nuxt runs: five interleaved
+  fresh-process pairs, three iterations each, CPU 5, no concurrent compiler.
+  All ten runs valid (18/18 steps each). Paired geometric-mean score ratio
+  3.0207x, 95% paired-log Student-t interval [2.9830, 3.0589]. Sampled peak-RSS
+  ratio 1.0665 [0.9788, 1.1620]. This is a headless subset on a shared
+  workstation, not a full Speedometer score or a V8 comparison. Raw logs,
+  completion records, binaries, hashes and calculation are retained under
+  `news-paired-pass4/`.
+- Final debug/release suites, Clippy, independent differential, release-site
+  acceptance and repeated timing results remain to be recorded. No installed
+  binaries were changed, and no release promotion is implied.
+
+## Steam menu regression (2026-09-27)
+
+Artifacts: `target/steam-menu-regression-20260927-IPziFXF4/`.
+
+- Reproduced the reported disappearance and unreleased scroll lock with the
+  actual release desktop browser, native pointer events and private Wayland
+  sessions. The installed desktop and pass 7b open Special Sections correctly;
+  passes 8k and 9g clip away the entire menu. User sessions were untouched.
+- Cause: corrected scrolling-area geometry exposes overflowing descendants of
+  a zero-height sticky wrapper. CSSOM incorrectly returned an empty string for
+  its unspecified overflow-y. The author's scroll-lock predicate consequently
+  treated that visible-overflow wrapper as a scroll container and applied
+  overflow:hidden to it as well as the viewport. Clipping the dismissal controls
+  then left the viewport lock unreleased. This is a TRust contract defect, not
+  a website-specific exception or a reason to suppress valid overflow geometry.
+- Causal control: overriding only missing computed overflow values to `visible`
+  in the unchanged failing release restores the menu. The production correction
+  supplies the normative initial values at the CSSOM boundary; it contains no
+  site identifiers, selector exceptions or author-script modifications.
+- Governing local CSSWG snapshot is the one recorded above (fetched 2026-09-06):
+  css-overflow-3/Overview.bs:350, #overflow-control (initial visible, not inherited);
+  cssom-1/Overview.bs:3380, #dom-window-getcomputedstyle and #resolved-values;
+  css-cascade-5/Overview.bs:1781, #defaulting / #initial-values / #inheriting.
+  Official clauses: https://drafts.csswg.org/css-overflow-3/#overflow-control,
+  https://drafts.csswg.org/cssom-1/#resolved-values and
+  https://drafts.csswg.org/css-cascade-5/#defaulting. This is not an upstream
+  freshness check.
+- A reduced, network-independent menu/scroll-lock regression fails before the
+  correction and passes afterward in interpreter, bytecode and JIT tiers.
+  It preserves nonzero overflow geometry, verifies unclipped hit targets and
+  cycles the viewport lock three times. Extended live computed-style checks
+  cover default/non-inheritance, CSS-wide values, variables and stylesheet edits.
+- Initial fixed release native acceptance: Special Sections opens, switching to
+  Ways to Play preserves the panel, both dismissal paths work, and native wheel
+  scrolling works after dismissal and reopening. Ways to Play's empty body in
+  this captured page is identical in the installed reference; it is not counted
+  as newly passing content coverage. Screenshots and browser logs are retained.
+- The initial full debug suite passes all 2,201 tests (35 ignored). The release
+  suite exposed one intermittent registered-property cycle failure; its original
+  output is retained in release-all.log, not replaced by the isolated passing
+  rerun. A deterministic font-revision test reproduces it (32px instead of 3px)
+  in font-revision-before-fix-complete.log. Font updates expired custom values
+  and dependency-cycle membership while retaining cached font-size, preventing
+  rediscovery of the cycle. Retain cycle membership until a real style change;
+  numeric-value caches still honor font revisions. The test expires per-DOM
+  cache stamps instead of mutating process-global fonts, then verifies that a
+  declaration change still breaks the cycle correctly.
+- The font fix follows CSS Properties and Values API #dependency-cycles,
+  local css-houdini-drafts revision 954df531741a9d2da94aec82b073b3f9b5af5573,
+  css-properties-values-api/Overview.bs:407, fetched 2026-09-06:
+  https://drafts.css-houdini.org/css-properties-values-api-1/#dependency-cycles.
+  These edges arise from references and relative units, not font availability.
+  CSS Values 5 #substitution and CSS Variables 1 replacement/cyclic contexts
+  were read in the CSSWG snapshot above. The deterministic regression now passes
+  in debug and release, as do all 15 registered-property module tests.
+- Final debug and release suites each pass 2,134 library, 53 desktop, 14 headless
+  and one replay test (2,202 total; 35 existing ignored tests). Clippy all-targets
+  succeeds with the same five pre-existing collapsible-if warnings. Formatting,
+  diff checks and the ordinary release build succeed.
+- Final release native acceptance (final-auto-acceptance/): all five navigation
+  panels open without disappearing when switched. Toggle and backdrop dismissal,
+  scrolling afterward, return-to-top and reopening are visually verified with
+  native input and no diagnostic JavaScript. Auto renderer selection falls back
+  to Vello CPU in the private headless compositor; this is not a claim of a
+  separate Hybrid live-site acceptance run. The empty Ways to Play content noted
+  above remains identical to the installed comparison, not claimed repaired.
+- Final pinned CSS WPT subset: 170 pass, 38 fail, zero incomplete. Every one of
+  the 208 individual statuses matches pass 6; all failure details are retained
+  in css-wpt-final/. The runner correctly exits nonzero for the existing failures.
+- Final release SHA-256: trust
+  b2f5114b984a3b0ba1f843e48e9acf2c4d82f32be0f37eede9f53ccbfde9fc84;
+  trust-desktop 419e8713ddc469c079c03656a9676a2ef118482cd75a9e2cae1571efc791cd54;
+  trust-headless 565ab683008696c8dc6556f5149cde607af0c0cb93ca17cfebe53142c40968d3.
+  Desktop/headless copies are retained as final-trust-* in the artifact directory.
+  Installed binary hashes are unchanged. No release promotion is implied, and
+  the broader open layout contracts listed above are not claimed complete.
+
+## Native external-playback controls and retained point-hit index (2026-09-27)
+
+Artifacts: `target/mpv-overlay-20260927-tH01iCpZ/`. README and installed
+executables remain unchanged; this is a development release, not a promotion.
+
+- The earlier removal of media-wrapper sibling deletion was correct for CSS
+  box generation but exposed a presentation regression: opaque authored posters
+  covered the external-playback affordance. Do not reinstate sibling deletion
+  or assign a huge author z-index. HTML #the-video-element explicitly permits
+  representation by an external playback utility, and #focusable-area gives
+  UA subwidgets a media-element DOM anchor (local HTML snapshot e5071a20c856).
+  Sources: /big/web-standards/repositories/whatwg/html/source:37347 and :86020,
+  https://html.spec.whatwg.org/multipage/media.html#the-video-element and
+  https://html.spec.whatwg.org/multipage/interaction.html#focusable-area.
+  The snapshot was fetched 2026-09-06, not refreshed against upstream here.
+- Graphical paint now retains a separate browser-media spatial program. The
+  desktop/headless browser UI composes it after all page layers and before
+  browser chrome; CSSOM never includes it. Native activation wins over authored
+  overlays, while scrollports, visibility, inertness, transforms, and source
+  changes remain effective. Focus order includes the eligible native subwidget
+  at its DOM anchor, honoring tabindex and shadow scopes. This does not change
+  TRust's existing Tab/COMMAND shortcut policy.
+- Terminal controls have an explicit item kind, separate from author text
+  collision recovery. They paint after inline images and fixed layers and use
+  the same scroll/carousel mapping for input. Selecting the underlying media
+  hit box highlights the visible button. Poster pixels and authored siblings
+  remain; controls add no layout row or geometry change.
+- The new fixture `src/fixtures/media_overlay.html` covers an opaque poster,
+  transformed nested scroller, source-less video, and a full-page fixed cover.
+  Native release input verifies exact direct/page fallback URLs and originating
+  referrers through a private test-only mpv argument recorder. No real playback
+  capability is claimed. Final screenshots show both controls above the opaque
+  cover. Private sessions were closed without touching the user's desktop.
+- Steam's Special Sections and Ways to Play panels remain visible. Toggle and
+  backdrop dismissal allow native scrolling and reopening. Auto selection uses
+  CPU in the private compositor; this is not Hybrid site acceptance. The
+  scripted Recommendations click retained Browse content in both the pre-index
+  and final comparison; do not count it as an independently passed menu switch.
+- CSSOM point queries previously constructed and cloned an entire Scene, then
+  copied the active clip stack for every region on every call. `PageHitIndex`
+  compiles one immutable paint transaction into shared dynamic coordinate
+  spaces, clip-parent nodes, and median-partitioned local-space BVHs. Queries
+  sample current scroll/sticky/animation properties, search local bounds, check
+  exact shapes/transforms, and return unique elements in reverse paint order.
+  Static boxes and indexes survive scrolling; actual paint/geometry invalidation
+  replaces them. The geometry cache accounts for retained index allocations.
+- Local normative sources: CSSWG snapshot 81c27f686901, CSSOM View §5
+  #dom-document-elementsfrompoint, CSS Transforms 1 #transform-rendering,
+  CSS Overflow 3 #scrolling, CSS Position 3 #stickypos-insets. Independent clip
+  and transform stacks are preserved, including a clip outliving its transform.
+  Under /big/web-standards/repositories/w3c/csswg-drafts/, the consulted source
+  locations include cssom-view-1/Overview.bs:1104,
+  css-transforms-1/Overview.bs:180, css-overflow-3/Overview.bs:228 and
+  css-position-3/Overview.bs:617. Official clauses:
+  https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint,
+  https://drafts.csswg.org/css-transforms-1/#transform-rendering,
+  https://drafts.csswg.org/css-overflow-3/#scrolling and
+  https://drafts.csswg.org/css-position-3/#stickypos-insets.
+- Regression coverage includes 900 mixed-space sampled comparisons against the
+  original compositor, animated/marquee timeline samples, singular transforms,
+  negative/positive scroll offsets, fixed and top-layer order, covered nodes,
+  native-UI exclusion, and synchronous style/tree invalidation. A 32,768-box
+  work-bound test visits at most 16 candidates per query and retains index
+  identity across scroll changes. Existing live-frame/geometry tests also pass.
+- Final debug and release suites pass 2,145 library, 53 desktop, 14 headless,
+  and one replay test: 2,213 passed, 35 existing ignored. Clippy all-targets
+  retains only the same five pre-existing warnings; formatting, diff checks,
+  and the ordinary release build pass. The combined verification shell was
+  terminated after all release test targets reported success; an independent
+  release rerun (`release-verified.log`) exits successfully. Two interrupted
+  acceptance collectors required explicit PID/start-verified descendant cleanup;
+  their cleanup records confirm no remaining processes.
+- Pinned CSS WPT remains 170 pass, 38 fail, zero incomplete. All 208 individual
+  statuses match the previous release. Complete failure records are retained.
+- Retained-index measurements (`hit-index-paired-final/`): seven interleaved
+  fresh-process baseline/candidate pairs, CPU 5, six measured samples per size
+  after warm-up. No concurrent compiler, test suite or private desktop session.
+  Baseline already contains the native-media correction. All expected point-hit
+  checksums agree. Paired-log Student-t 95% intervals (df=6), larger is faster:
+
+      boxes     scroll + hit queries       unchanged hit queries
+         32     1.448x [1.432,1.465]        1.577x [1.554,1.600]
+        128     2.582x [2.553,2.611]        2.929x [2.914,2.943]
+        512     7.699x [7.643,7.756]        9.543x [9.437,9.651]
+      2,048    30.184x [29.443,30.943]     40.912x [40.468,41.360]
+      8,192   128.565x [126.797,130.358]  202.366x [199.499,205.275]
+
+  At 8,192 boxes, batches of 64 scroll-and-hit operations fall from about
+  323ms to 2.5ms; unchanged-query batches fall from about 323ms to 1.6ms.
+  First-query construction improves 1.069x [1.059,1.079], roughly 57ms to
+  53ms. The fixture settles layout before that first-query timing, so it does
+  not claim to measure layout construction. These are specific CSSOM host-path
+  gains on a shared workstation, NOT overall Speedometer/browser speedups.
+  The earlier `hit-index-paired/` pilot is preserved but excluded because a
+  format check briefly overlapped its first baseline startup; the clean full
+  repetition above is the reported result.
+- Independent diagnostic only (`hit-index-chromium/`): Chromium 150.0.7871.47
+  in Electron 43.1.0, V8 15.0.245.13-electron.0, same fixture and CPU. One
+  fresh process, six post-warm-up samples, not seven paired comparisons. At
+  8,192 boxes its medians are 16.6ms for 64 scroll-and-hit queries, 0.1ms for
+  unchanged queries and 3.5ms for first-query construction. The unchanged
+  samples are near clock granularity (0-0.2ms). This is useful evidence of
+  remaining cold-path and repeated-query overhead, not a precise cross-engine
+  speedup estimate or a whole-browser/V8 parity claim.
+- Full official Speedometer 3.1 (`speedometer-comparison.json`): one sequential
+  fresh-process baseline/candidate pair, three iterations each, CPU 5, same
+  pinned fixture 1386415be8fef2f6b6bbdbe1828872471c5d802a and collector settings.
+  Both runs complete all 20 suites and 174 steps, with valid completion records
+  and no remaining processes. Rounded score 0.316 -> 0.315; geometric-mean raw
+  score 0.316331 -> 0.314716 (0.994897x). Completion wall time 322.250s ->
+  322.440s; sampled peak RSS 1,160,512 -> 1,161,500 KiB. All suite results,
+  including slower ones, remain in the comparison. With only one independent
+  pair this is exploratory, not a statistically established regression or gain.
+  It shows NO meaningful overall Speedometer improvement from this index:
+  point-hit queries are not its dominant cost. Headless timing is not the user's
+  desktop score, a V8 comparison, or evidence that the broad performance goal
+  has been reached. No compiler, test suite, or private desktop session ran
+  concurrently; the user's existing desktop session was left untouched.
+- Final release SHA-256: trust
+  0c9870fda3034533bc68e23b8a6148ba797608a3346d6898466a3fadaf40831b;
+  trust-desktop 5fc4c867cfb723753e3bb30ad6648ba8f9884770aaa788474399c10b80a19574;
+  trust-headless 862e837bcf0df3df01af93fe7e064578946804b903c276418cbca08fd0ade673.
+  Frozen desktop/headless copies are `candidate-trust-*` in the artifact
+  directory; pre-index media-only copies are `media-trust-*`.
+- Remaining boundary: this index accelerates JavaScript CSSOM point queries.
+  Native Scene pointer/text hit tests still use their existing interpretation
+  path. Paint-only changes currently conservatively replace the index; finer
+  hit-property invalidation remains future work. No claim of complete layout
+  conformance or a 60x whole-browser improvement is made.

@@ -76,9 +76,10 @@ impl EmbeddedDocument {
         if dom.node_count() > limits.nodes {
             return Err("This document contains too many elements to display");
         }
-        let mut depths = vec![0usize; dom.node_count()];
+        let mut depths = crate::dom::arena::DenseIdMap::with_capacity(dom.node_count());
+        depths.insert(crate::dom::DOCUMENT, 0usize);
         for node in dom.descendants(crate::dom::DOCUMENT) {
-            depths[node] = dom.node(node).parent.map_or(0, |p| depths[p] + 1);
+            depths.insert(node, dom.node(node).parent.map_or(0, |p| depths[p] + 1));
             if depths[node] > limits.depth {
                 return Err("This document is nested too deeply to display");
             }
@@ -321,7 +322,8 @@ impl EmbeddedDocument {
     /// The document and its Rc-based style/fragment caches stay on their owner
     /// thread. Native callers send mutations back using these stable node IDs.
     pub fn snapshot(&self, semantics: bool) -> EmbeddedSnapshot {
-        let mut nodes = vec![SnapshotNode::default(); self.dom.node_count()];
+        let mut nodes = crate::dom::arena::DenseIdMap::with_capacity(self.dom.node_count());
+        nodes.insert(crate::dom::DOCUMENT, SnapshotNode::default());
         for id in self.dom.flat_descendants(crate::dom::DOCUMENT) {
             let attrs = match &self.dom.node(id).data {
                 crate::dom::NodeData::Element { attrs, .. } => attrs
@@ -330,17 +332,20 @@ impl EmbeddedDocument {
                     .collect(),
                 _ => Vec::new(),
             };
-            nodes[id] = SnapshotNode {
-                parent: self.dom.parent_flat(id),
-                children: self.dom.flat_children(id),
-                tag: self.dom.tag_name(id).map(str::to_owned),
-                attrs,
-                opacity: self
-                    .dom
-                    .computed_value(id, "opacity")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1.0),
-            };
+            nodes.insert(
+                id,
+                SnapshotNode {
+                    parent: self.dom.parent_flat(id),
+                    children: self.dom.flat_children(id),
+                    tag: self.dom.tag_name(id).map(str::to_owned),
+                    attrs,
+                    opacity: self
+                        .dom
+                        .computed_value(id, "opacity")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1.0),
+                },
+            );
         }
         nodes[crate::dom::DOCUMENT].children = self.dom.flat_children(crate::dom::DOCUMENT);
         EmbeddedSnapshot {
@@ -375,12 +380,12 @@ pub struct SnapshotNode {
 
 #[derive(Clone, Debug)]
 pub struct SnapshotDom {
-    nodes: Vec<SnapshotNode>,
+    nodes: crate::dom::arena::DenseIdMap<SnapshotNode>,
 }
 
 impl SnapshotDom {
     pub fn is_valid(&self, node: NodeId) -> bool {
-        node < self.nodes.len()
+        self.nodes.get(node).is_some()
     }
     pub fn node(&self, node: NodeId) -> &SnapshotNode {
         &self.nodes[node]

@@ -39,6 +39,7 @@
 //! always-correct full-relayout path.
 
 mod boundary;
+mod cache_order;
 mod clamp;
 pub(crate) mod clip_path;
 mod contract;
@@ -59,8 +60,11 @@ mod memo;
 mod overflow;
 mod replaced;
 mod session;
+mod spatial;
+pub(crate) use overflow::scroll_reverse;
 mod style;
 mod table;
+mod transform;
 // The legacy Row/Item output is now explicitly a terminal compatibility
 // adapter. Its source filename is retained to keep this refactor reviewable.
 #[path = "paint.rs"]
@@ -788,17 +792,8 @@ pub(crate) fn paint_retained_layout(
     terminal_presentation: bool,
 ) -> GraphicalLayout {
     let started = std::env::var_os("TRUST_DIAG_FRAME").map(|_| std::time::Instant::now());
-    let (paint, patch_boundaries, boundaries) = graphics::paint(
-        dom,
-        base,
-        images,
-        &fragments.root,
-        &fragments.fixed,
-        &fragments.top_layer,
-        fragments.flow_bottom,
-        fragments.viewport.width,
-        fragments.viewport.height,
-    );
+    let (paint, patch_boundaries, boundaries) =
+        graphics::paint_retained(dom, base, images, &fragments);
     let painted = started.map(|started| started.elapsed());
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
     let terminal = terminal_presentation.then(|| {
@@ -836,18 +831,7 @@ pub(crate) fn paint_retained_hit_test(
     images: &ImageSizes,
     fragments: &LayoutFragments,
 ) -> crate::render::PagePaint {
-    graphics::paint(
-        dom,
-        base,
-        images,
-        &fragments.root,
-        &fragments.fixed,
-        &fragments.top_layer,
-        fragments.flow_bottom,
-        fragments.viewport.width,
-        fragments.viewport.height,
-    )
-    .0
+    graphics::paint_retained(dom, base, images, fragments).0
 }
 
 /// Quantize one already-laid CSS-pixel page into the terminal compatibility
@@ -1572,19 +1556,25 @@ mod tests {
     }
 
     fn graphical_text<'a>(layout: &'a GraphicalLayout, needle: &str) -> (f32, f32, &'a str) {
-        layout
-            .paint
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
+        let mut transforms = vec![crate::render::Affine2d::IDENTITY];
+        for primitive in &layout.paint.primitives {
+            match primitive {
+                crate::render::Primitive::PushTransform(transform) => {
+                    transforms.push(transforms.last().unwrap().then(*transform));
+                }
+                crate::render::Primitive::PopTransform => {
+                    transforms.pop();
+                }
                 crate::render::Primitive::GlyphRun { origin, shaped, .. }
                     if shaped.text.contains(needle) =>
                 {
-                    Some((origin.x, origin.y, shaped.text.as_str()))
+                    let origin = transforms.last().unwrap().map_point(*origin);
+                    return (origin.x, origin.y, shaped.text.as_str());
                 }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("graphical glyph run containing {needle:?} not found"))
+                _ => {}
+            }
+        }
+        panic!("graphical glyph run containing {needle:?} not found")
     }
 
     fn terminal_text(out: &Output) -> String {
@@ -4625,6 +4615,81 @@ mod tests {
     }
 
     #[test]
+    fn document_root_seals_child_margins_and_applies_its_own_once() {
+        // CSS Display #root, CSS2 #collapsing-margins and #root-height.
+        for margin in [13., 0., -13.] {
+            let html = format!(
+                r#"<!doctype html><html id=root style="margin:{margin}px 0">
+                <body style="margin:0"><div id=child style="margin:29px 0 31px;height:20px"></div></body></html>"#
+            );
+            let (dom, boxes) = measure(&html, 80, 24);
+            let root = rect(&dom, &boxes, "root");
+            let child = rect(&dom, &boxes, "child");
+            assert_eq!(root.top, margin, "root margin is not doubled or clamped");
+            assert_eq!(child.top, margin + 29., "child margin stays inside root");
+            assert_eq!(root.height, 80., "both child margins stay inside root");
+        }
+        for context in ["display:flow-root", "overflow:hidden"] {
+            let (dom, boxes) = measure(
+                &format!(
+                    r#"<body style="margin:0"><div id=context style="{context}">
+                <div style="height:20px;margin:10px 0 30px"></div></div><div id=after style="height:5px"></div>"#
+                ),
+                80,
+                24,
+            );
+            assert_eq!(rect(&dom, &boxes, "context").height, 60.);
+            assert_eq!(rect(&dom, &boxes, "after").top, 60.);
+        }
+    }
+
+    #[test]
+    fn nested_document_retains_root_box_in_canonical_and_serialized_layout() {
+        let mut resident = Dom::parse_document(
+            r#"<!doctype html><body style="margin:0"><iframe id=f
+            style="display:block;width:300px;height:150px;border:0"></iframe>"#,
+        );
+        let frame = resident.get_by_id("f").unwrap();
+        resident
+            .install_frame_document(
+                frame,
+                r#"<!doctype html><html style="margin:13px 17px;padding:7px;border:5px solid">
+            <body style="margin:19px 23px;padding:11px;border:3px solid"><div id=child
+            style="width:40px;height:20px;margin:29px 0 0 31px"></div></body></html>"#,
+                "https://child.test/",
+            )
+            .unwrap();
+        let static_snapshot = Dom::parse_document(&resident.serialize(crate::dom::DOCUMENT));
+        let live_snapshot = Dom::parse_document(
+            &resident.serialize_live(crate::dom::DOCUMENT, &Default::default()),
+        );
+        for dom in [&resident, &static_snapshot, &live_snapshot] {
+            let layout = lay_out_graphical(
+                dom,
+                &Url::parse("https://parent.test/").unwrap(),
+                Viewport::new(800., 600.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let root = dom
+                .frame_root(frame)
+                .or_else(|| {
+                    dom.descendants(crate::dom::DOCUMENT)
+                        .find(|&id| dom.attr(id, "data-trust-frame-root").is_some())
+                })
+                .unwrap();
+            let root = layout.boxes[&root];
+            let child = layout.boxes[&dom.get_by_id("child").unwrap()];
+            assert_eq!((root.left, root.top), (17., 13.));
+            assert_eq!(
+                (child.left, child.top, child.width, child.height),
+                (97., 87., 40., 20.)
+            );
+        }
+    }
+
+    #[test]
     fn canonical_frame_keeps_child_body_flex_formatting_context() {
         // This exercises Tree::frame directly, before the resident DOM is
         // serialized for another presentation arena. CSS Display 3 §2 makes
@@ -5181,12 +5246,12 @@ mod tests {
         assert!(
             matches!(&img.link, Some(crate::doc::Link::Media(u)) if u.as_str().ends_with("clip.mp4"))
         );
-        assert!(
-            !out.rows
-                .iter()
-                .flat_map(|r| &r.items)
-                .any(|i| i.text.contains('▶')),
-            "the drawn preview IS the affordance — no text line under it"
+        let (control_row, control) = find(&out, "▶");
+        assert_eq!(control.kind, ItemKind::MediaControl);
+        assert_eq!(
+            control_row,
+            first_image(&out).0,
+            "the button overlays the poster; no extra layout row"
         );
     }
 
@@ -5204,41 +5269,32 @@ mod tests {
     }
 
     #[test]
-    fn a_videojs_transformed_player_still_renders_its_caption() {
-        // erome.com's real shape after video.js initialises: the aspect-ratio
-        // hack (`height:0;padding-top:NN%`) wrapper holds the out-of-flow
-        // `<video>` tech PLUS an out-of-flow poster-overlay chrome div with
-        // its own opaque `background-color`. In our paint model a declared
-        // background is an opaque fill (§Appendix E — needed for the modal/
-        // card-stack cases), and the poster overlay sits LATER in the tree
-        // than the tech, so it legally painted over our synthesized "▶ Video"
-        // mpv-link text, leaving the whole player area blank. The player-
-        // wrapper chrome skip must drop the poster/chrome siblings from the
-        // box tree entirely so they can never clobber the media
-        // representation.
-        let out = lay(
-            r#"<body style="margin:0"><div class="player video-js" style="height:0;padding-top:56.25%;position:relative;background-color:#000">
-                 <video class="vjs-tech" src="clip_720p.mp4" style="position:absolute;width:100%;height:100%;top:0;left:0"></video>
-                 <div class="vjs-poster" style="position:absolute;top:0;left:0;width:100%;height:100%;background-color:#000"></div>
-               </div></body>"#,
-            60,
+    fn media_wrapper_preserves_authored_siblings_and_paint_order() {
+        // CSS Display 3 #box-tree and CSS2 Appendix E: a zero-content-height
+        // aspect-ratio wrapper does not authorize deleting author overlays.
+        // The poster retains its paint/geometry; native UI is independent.
+        let html = r#"<body style="margin:0"><div style="height:0;padding-top:56.25%;position:relative;background-color:#000">
+            <video id=media src="clip.mp4" style="position:absolute;width:100%;height:100%;top:0;left:0"></video>
+            <div id=poster style="position:absolute;top:0;left:0;width:100%;height:100%;background-color:#000">Poster</div>
+            </div></body>"#;
+        let out = lay(html, 60);
+        find(&out, "Poster");
+        let (_, control) = find(&out, "▶ Video");
+        assert_eq!(control.kind, ItemKind::MediaControl);
+        assert!(matches!(control.link, Some(crate::doc::Link::Media(_))));
+        let (dom, boxes) = measure(html, 60, 24);
+        let media = rect(&dom, &boxes, "media");
+        let poster = rect(&dom, &boxes, "poster");
+        assert_eq!(
+            (media.left, media.top, media.width, media.height),
+            (poster.left, poster.top, poster.width, poster.height)
         );
-        let (_, it) = find(&out, "▶ Video");
-        assert!(
-            matches!(&it.link, Some(crate::doc::Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")),
-            "the caption still links mpv to the source"
-        );
+        assert!(media.width > 0. && media.height > 0.);
     }
 
     #[test]
-    fn player_wrapper_skip_is_gated_on_the_aspect_ratio_hack() {
-        // The player-wrapper chrome skip must NOT fire on a generic
-        // in-flow container (no `height:0`) that happens to hold real
-        // content beside an unrelated out-of-flow video — only the
-        // aspect-ratio-hack shape (which video.js/Plyr/JW always use, since
-        // every real child must escape the zero-height content box) opts
-        // in. A plain `<div>` here keeps its normal auto height, so its
-        // `<p>` sibling must render untouched.
+    fn media_siblings_preserve_their_in_flow_content() {
+        // Replaced out-of-flow media does not alter its siblings' box generation.
         let out = lay(
             r#"<body style="margin:0"><div style="position:relative">
                  <p style="margin:0">cap</p>
@@ -8751,8 +8807,8 @@ mod tests {
 
     #[test]
     fn deeply_nested_tables_still_render_the_innermost_content() {
-        // Past MAX_TABLE_DEPTH a table degrades to block-stacked content; the
-        // descent terminates and the innermost cell content still renders.
+        // Deep nesting retains table formatting, including the adjacent cell
+        // at every level. Optional memo limits may not change display types.
         let mut html = String::from("DEEPEST");
         for i in 0..40 {
             html = format!("<table><tr><td>L{i} {html}</td><td>x</td></tr></table>");
@@ -8760,7 +8816,7 @@ mod tests {
         let out = lay(&format!("<body>{html}</body>"), 80);
         assert!(
             !absent(&out, "DEEPEST"),
-            "the innermost content renders past the depth lid"
+            "the innermost content renders without a table-depth fallback"
         );
     }
 
@@ -9110,6 +9166,91 @@ mod tests {
     }
 
     #[test]
+    fn boxless_elements_do_not_borrow_descendant_geometry() {
+        // CSSOM View #dom-element-getclientrects and CSS Display 3 #box-tree:
+        // display:contents preserves descendant layout, not a principal box.
+        let mut dom = Dom::parse_document(
+            r#"<style>
+                body { margin:0 }
+                #scroller { width:30px; height:10px; overflow:auto }
+                #contents, #nested { display:contents }
+                #child { width:50px; height:15px }
+                #hidden { display:none }
+            </style><div id=scroller><div id=contents><div id=nested>
+                <div id=child></div>
+            </div></div></div><div id=hidden><div id=hidden-child>hidden</div></div>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        for display in ["contents", "block", "none", "contents"] {
+            let contents = node_by_id(&dom, "contents");
+            dom.set_attr(contents, "style", &format!("display:{display}"));
+            let (boxes, _, scrolling_areas) = measure_boxes_css(
+                &dom,
+                &base,
+                Viewport::new(320.0, 200.0),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            assert_eq!(boxes.contains_key(&contents), display == "block");
+            for id in ["nested", "hidden", "hidden-child"] {
+                assert!(
+                    !boxes.contains_key(&node_by_id(&dom, id)),
+                    "{display}: {id}"
+                );
+            }
+            let child = node_by_id(&dom, "child");
+            if display == "none" {
+                assert!(!boxes.contains_key(&child));
+            } else {
+                assert_eq!((boxes[&child].width, boxes[&child].height), (50.0, 15.0));
+                let scroller = node_by_id(&dom, "scroller");
+                assert_eq!(scrolling_areas[&scroller].width, 50.0);
+                assert_eq!(scrolling_areas[&scroller].height, 15.0);
+            }
+        }
+    }
+
+    #[test]
+    fn clipping_and_zero_sizes_keep_cssom_boxes_without_leaking_terminal_paint() {
+        // CSS Overflow 3 #overflow-properties and CSSOM View #dom-element-getclientrects.
+        let html = r#"<style>body{margin:0}</style><body>
+            <div id=zero style='width:40px;height:0;overflow:hidden'>
+                <div id=inside style='width:80px;height:30px'>clipped</div>
+            </div>
+            <div id=sr style='position:absolute;left:7px;top:9px;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)'>secret</div>
+            <img id=empty src=empty.png style='display:block;width:0;height:0'>
+            <img id=inline-empty src=empty.png style='width:0;height:0'>
+            <img id=fractional src=empty.png style='width:.25px;height:.5px'>
+            <img id=border src=border.png style='display:block;width:0;height:20px;border:2px solid red'>
+            <p style='margin:0'>visible</p>
+        </body>"#;
+        let (dom, boxes) = measure(html, 40, 24);
+        for (id, w, h) in [
+            ("zero", 40., 0.),
+            ("inside", 80., 30.),
+            ("sr", 1., 1.),
+            ("empty", 0., 0.),
+            ("inline-empty", 0., 0.),
+            ("fractional", 0.25, 0.5),
+            ("border", 4., 24.),
+        ] {
+            let r = rect(&dom, &boxes, id);
+            assert_eq!((r.width, r.height), (w, h), "{id}: {r:?}");
+        }
+        let sr = rect(&dom, &boxes, "sr");
+        assert_eq!((sr.left, sr.top), (7., 9.));
+        let out = lay(html, 40);
+        for hidden in ["clipped", "secret", "empty.png", "border.png"] {
+            assert!(
+                absent(&out, hidden),
+                "paint escaped clip/zero content box: {hidden}"
+            );
+        }
+        find(&out, "visible");
+    }
+
+    #[test]
     fn variable_display_hides_closed_popover_from_layout() {
         // CSS Variables L1 §3 + CSS Display: substitution must happen before
         // display is interpreted, so a custom-property-backed tooltip remains
@@ -9272,7 +9413,17 @@ mod tests {
                 &controls,
                 &HashMap::new(),
             );
-            let control = rect(&dom, &layout.boxes, "control");
+            let control = layout
+                .paint_cache
+                .as_ref()
+                .unwrap()
+                .fragments
+                .layout_border_box(&dom, node_by_id(&dom, "control"))
+                .unwrap();
+            assert_eq!(
+                rect(&dom, &layout.boxes, "control").width,
+                control.width / 2.
+            );
             let icon = rect(&dom, &layout.boxes, "icon");
             let offset = icon.top - control.top;
             assert!(
@@ -9311,20 +9462,37 @@ mod tests {
         let image = rect(&dom, &layout.boxes, "image");
         assert_eq!(
             (control.left, control.top, control.width, control.height),
-            (5., 0., 40., 40.)
+            (15., 10., 20., 20.)
         );
         assert_eq!(
             (image.left, image.top, image.width, image.height),
-            (55., 0., 40., 40.)
+            (65., 10., 20., 20.)
         );
         assert_eq!(rect(&dom, &layout.boxes, "after").left, 100.);
         for (name, rect) in [("control", control), ("image", image)] {
             let node = node_by_id(&dom, name);
+            let untransformed = layout
+                .paint_cache
+                .as_ref()
+                .unwrap()
+                .fragments
+                .layout_border_box(&dom, node)
+                .unwrap();
+            assert_eq!(
+                (
+                    untransformed.left,
+                    untransformed.top,
+                    untransformed.width,
+                    untransformed.height
+                ),
+                (rect.left - 10., 0., 40., 40.),
+                "{name}: offset geometry ignores the transform"
+            );
             let hits = crate::render::page_element_hits_at(
                 &layout.paint,
                 CssSize::new(640., 480.),
                 CssPoint::default(),
-                CssPoint::new(rect.left as f32 + 28., 28.),
+                CssPoint::new(rect.left as f32 + 18., 28.),
             );
             let hit = hits
                 .iter()
@@ -9333,7 +9501,7 @@ mod tests {
                 .unwrap();
             assert_eq!(hit.rect.width, 20., "{name}");
             assert_eq!(hit.rect.height, 20., "{name}");
-            assert_eq!(hit.rect.x, rect.left as f32 + 10., "{name}");
+            assert_eq!(hit.rect.x, rect.left as f32, "{name}");
             assert_eq!(hit.rect.y, 10., "{name}");
         }
     }
@@ -9739,7 +9907,30 @@ mod tests {
             })
             .expect("photo paint command");
         assert_eq!((image.width, image.height), (320.0, 180.0));
-        assert_eq!(clip.map(|rect| rect.height), Some(180.0));
+        // Hidden overflow is a programmatic scrollport. Its clip surrounds
+        // BeginScroll instead of being repeated inside the moving image.
+        assert!(clip.is_none());
+        let mut clips = Vec::new();
+        let mut found = false;
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::PushClip(shape) => clips.push(shape),
+                crate::render::DisplayCommand::PopClip => {
+                    clips.pop();
+                }
+                crate::render::DisplayCommand::Image { node, .. }
+                    if *node == node_by_id(&dom, "photo") =>
+                {
+                    found = clips.iter().any(|shape| matches!(shape,
+                        crate::render::PaintShape::Rect(rect) if *rect == crate::render::CssRect::new(0., 0., 320., 180.)));
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            found,
+            "the image must retain the stationary 320x180 scrollport clip"
+        );
     }
 
     #[test]

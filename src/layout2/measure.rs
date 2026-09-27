@@ -21,6 +21,106 @@ use crate::dom::{DOCUMENT, Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind, TopFrag};
+use crate::render::{Affine2d, CssRect};
+
+fn border_rect(frag: &Frag, transform: Affine2d) -> PxRect {
+    let rect = super::transform::bounds(transform, CssRect::new(frag.x, frag.y, frag.w, frag.h));
+    PxRect {
+        left: f64::from(rect.x),
+        top: f64::from(rect.y),
+        // Keep the same edge arithmetic as the complete measurement path.
+        width: f64::from((rect.x + rect.width) - rect.x),
+        height: f64::from((rect.y + rect.height) - rect.y),
+        css_width: frag.css_size.map(|size| f64::from(size[0])),
+        css_height: frag.css_size.map(|size| f64::from(size[1])),
+    }
+}
+
+/// Rectangle-only projection for an immutable layout result. CSSOM View
+/// #dom-element-getboundingclientrect permits the single-border-box case to
+/// avoid a composed-tree/scrolling-area projection, but not to substitute one
+/// fragment for several. `None` marks a node needing complete measurement.
+///
+/// Build once on the second distinct rectangle query, not once per element:
+/// N geometry reads after one layout must not perform N fragment-tree walks.
+/// The owner is the completed layout, never the mutable DOM or a global epoch.
+#[derive(Debug, Default)]
+pub(super) struct SingleBoxIndex {
+    boxes: rustc_hash::FxHashMap<NodeId, Option<PxRect>>,
+    /// Most pages have few transformed boxes. Only those boxes need a second
+    /// rectangle; don't double retained geometry for every ordinary element.
+    untransformed: rustc_hash::FxHashMap<NodeId, PxRect>,
+    #[cfg(test)]
+    pub(super) visited: usize,
+}
+
+impl SingleBoxIndex {
+    pub(super) fn new(root: &Frag, fixed: &[Frag], top_layer: &[TopFrag]) -> Self {
+        let mut index = Self::default();
+        for root in std::iter::once(root)
+            .chain(fixed)
+            .chain(top_layer.iter().map(|top| &top.fragment))
+        {
+            // Iterators bound the temporary traversal stack by depth, not by
+            // sibling count. No fragment or inline shaping payload is copied.
+            let mut pending = vec![(std::slice::from_ref(root).iter(), Affine2d::IDENTITY)];
+            while let Some((children, parent)) = pending.last_mut() {
+                let Some(frag) = children.next() else {
+                    pending.pop();
+                    continue;
+                };
+                let transform = parent.then(super::transform::matrix(frag));
+                #[cfg(test)]
+                {
+                    index.visited += 1;
+                }
+                if frag.node != NO_NODE
+                    && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_))
+                {
+                    index
+                        .boxes
+                        .entry(frag.node)
+                        .and_modify(|rect| *rect = None)
+                        .or_insert_with(|| {
+                            matches!(frag.kind, FragKind::Block)
+                                .then(|| border_rect(frag, transform))
+                        });
+                    if !transform.is_identity() {
+                        index
+                            .untransformed
+                            .insert(frag.node, border_rect(frag, Affine2d::IDENTITY));
+                    }
+                }
+                if !frag.children.is_empty() {
+                    pending.push((
+                        frag.children.iter(),
+                        if frag.paint.child_viewport {
+                            Affine2d::IDENTITY
+                        } else {
+                            transform
+                        },
+                    ));
+                }
+            }
+        }
+        index
+    }
+
+    pub(super) fn get(&self, node: NodeId) -> Option<PxRect> {
+        self.boxes.get(&node).copied().flatten()
+    }
+
+    pub(super) fn get_layout(&self, node: NodeId) -> Option<PxRect> {
+        let visual = self.get(node)?;
+        Some(self.untransformed.get(&node).copied().unwrap_or(visual))
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        // Requested-storage lower bound, matching the host inventory contract.
+        self.boxes.capacity() * std::mem::size_of::<(NodeId, Option<PxRect>)>()
+            + self.untransformed.capacity() * std::mem::size_of::<(NodeId, PxRect)>()
+    }
+}
 
 /// CSSOM View #dom-element-getboundingclientrect: a single generated border
 /// box already is its element's bounding box. This projection needs neither
@@ -32,33 +132,40 @@ pub(super) fn single_border_box(
     top_layer: &[TopFrag],
     node: NodeId,
 ) -> Option<PxRect> {
-    fn visit(frag: &Frag, node: NodeId, found: &mut Option<PxRect>) -> Option<()> {
+    fn visit(
+        frag: &Frag,
+        node: NodeId,
+        found: &mut Option<PxRect>,
+        parent: Affine2d,
+    ) -> Option<()> {
+        let transform = parent.then(super::transform::matrix(frag));
         if frag.node == node && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_)) {
             if found.is_some() || !matches!(frag.kind, FragKind::Block) {
                 return None;
             }
-            *found = Some(PxRect {
-                left: f64::from(frag.x),
-                top: f64::from(frag.y),
-                // Match the fragment edge arithmetic used by `boxes`.
-                width: f64::from((frag.x + frag.w) - frag.x),
-                height: f64::from((frag.y + frag.h) - frag.y),
-                css_width: frag.css_size.map(|size| f64::from(size[0])),
-                css_height: frag.css_size.map(|size| f64::from(size[1])),
-            });
+            *found = Some(border_rect(frag, transform));
         }
         for child in &frag.children {
-            visit(child, node, found)?;
+            visit(
+                child,
+                node,
+                found,
+                if frag.paint.child_viewport {
+                    Affine2d::IDENTITY
+                } else {
+                    transform
+                },
+            )?;
         }
         Some(())
     }
     let mut found = None;
-    visit(root, node, &mut found)?;
+    visit(root, node, &mut found, Affine2d::IDENTITY)?;
     for frag in fixed {
-        visit(frag, node, &mut found)?;
+        visit(frag, node, &mut found, Affine2d::IDENTITY)?;
     }
     for top in top_layer {
-        visit(&top.fragment, node, &mut found)?;
+        visit(&top.fragment, node, &mut found, Affine2d::IDENTITY)?;
     }
     found
 }
@@ -74,6 +181,18 @@ struct Rect {
 }
 
 impl Rect {
+    fn transformed(self, transform: Affine2d) -> Self {
+        let r = super::transform::bounds(
+            transform,
+            CssRect::new(self.x0, self.y0, self.x1 - self.x0, self.y1 - self.y0),
+        );
+        Self {
+            x0: r.x,
+            y0: r.y,
+            x1: r.x + r.width,
+            y1: r.y + r.height,
+        }
+    }
     fn union(a: Rect, b: Rect) -> Rect {
         Rect {
             x0: a.x0.min(b.x0),
@@ -107,7 +226,12 @@ struct Own {
 }
 
 /// Walk a fragment tree, attributing border boxes and inline piece boxes.
-fn walk(dom: &Dom, f: &Frag, o: &mut Own) {
+fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
+    let transform = if visual {
+        parent.then(super::transform::matrix(f))
+    } else {
+        Affine2d::IDENTITY
+    };
     if f.node != NO_NODE {
         o.nodes.insert(f.node);
         if matches!(f.kind, FragKind::Block | FragKind::TableCell(_)) {
@@ -117,8 +241,8 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own) {
                 x1: f.x + f.w,
                 y1: f.y + f.h,
             };
-            add(&mut o.block, f.node, r);
-            add(&mut o.own, f.node, r);
+            add(&mut o.block, f.node, r.transformed(transform));
+            add(&mut o.own, f.node, r.transformed(transform));
             if let Some(size) = f.css_size {
                 o.css_size.insert(f.node, size);
             }
@@ -150,11 +274,18 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own) {
                 }
             };
             o.nodes.insert(p.item.node);
-            add(&mut o.own, p.item.node, r);
+            add(&mut o.own, p.item.node, r.transformed(transform));
         }
     }
     for c in &f.children {
-        walk(dom, c, o);
+        // Each nested Document has its own viewport. It does not inherit the
+        // embedding element's transforms in its CSSOM coordinate space.
+        let parent = if f.paint.child_viewport {
+            Affine2d::IDENTITY
+        } else {
+            transform
+        };
+        walk(dom, c, o, parent, visual);
     }
 }
 
@@ -207,6 +338,15 @@ fn select_into(
     scroll: &mut HashMap<NodeId, PxRect>,
 ) {
     for (&node, &cbox) in content {
+        // CSS Display 3 #box-tree and CSSOM View #dom-element-getclientrects:
+        // a composed descendant extent does not establish an associated box.
+        // Keep that extent in `content` so a box-generating ancestor includes
+        // the children, but never expose it as the box of display:contents.
+        // Actual block fragments need no style lookup; only the composed
+        // inline fallback needs this box-generation check.
+        if !block.contains_key(&node) && !dom.generates_principal_box(node) {
+            continue;
+        }
         // Non-block elements (inline wrappers and shadow hosts without their
         // own generated block) use the union of their generated pieces.
         let c = block.get(&node).copied().unwrap_or(cbox);
@@ -253,21 +393,82 @@ pub(super) fn boxes(
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, crate::render::CssRect>,
 ) {
+    project(dom, root, fixed, top_layer, true)
+}
+
+pub(super) fn layout_boxes(
+    dom: &Dom,
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+) -> HashMap<NodeId, PxRect> {
+    project(dom, root, fixed, top_layer, false).0
+}
+
+/// CSSOM View client* consumes unscaled padding/border edges, not a visual
+/// bounding rectangle or frontend-reported, quantized scroll-region size.
+/// Non-replaced inline boxes deliberately have no entry.
+pub(super) fn client_metrics(
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+) -> rustc_hash::FxHashMap<NodeId, [f32; 4]> {
+    let mut result = rustc_hash::FxHashMap::default();
+    for root in std::iter::once(root)
+        .chain(fixed)
+        .chain(top_layer.iter().map(|top| &top.fragment))
+    {
+        let mut pending = vec![std::slice::from_ref(root).iter()];
+        while let Some(children) = pending.last_mut() {
+            let Some(frag) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            if frag.node != NO_NODE && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_))
+            {
+                let [top, right, bottom, left] = frag.border;
+                result.entry(frag.node).or_insert([
+                    left,
+                    top,
+                    (frag.w - left - right).max(0.),
+                    (frag.h - top - bottom).max(0.),
+                ]);
+            }
+            if !frag.children.is_empty() {
+                pending.push(frag.children.iter());
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::type_complexity)]
+fn project(
+    dom: &Dom,
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+    visual: bool,
+) -> (
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, crate::render::CssRect>,
+) {
     // In-flow tree: its own boxes never include the fixed layer.
     let mut flow = Own::default();
-    walk(dom, root, &mut flow);
+    walk(dom, root, &mut flow, Affine2d::IDENTITY, visual);
 
     // The pinned fixed layer: measured separately so a fixed header never
     // inflates the document's scrollable height (a fixed box is viewport-
     // relative, contributing no scroll overflow — CSS Overflow L3).
     let mut fx = Own::default();
     for f in fixed {
-        walk(dom, f, &mut fx);
+        walk(dom, f, &mut fx, Affine2d::IDENTITY, visual);
     }
     // Top-layer boxes do not inflate the document scroll area, but CSSOM View
     // still reports their actual ICB-relative border boxes.
     for top in top_layer {
-        walk(dom, &top.fragment, &mut fx);
+        walk(dom, &top.fragment, &mut fx, Affine2d::IDENTITY, visual);
     }
 
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
@@ -295,6 +496,9 @@ pub(super) fn boxes(
     }
     // Scroll overflow follows containing blocks and local overflow clipping;
     // the composed union above remains solely the inline border-box fallback.
+    if !visual {
+        return (out, HashMap::new(), flow.frame_viewports);
+    }
     let mut areas = super::overflow::ScrollAreas::new(dom, root);
     for f in fixed {
         areas.extend(dom, f);
@@ -303,10 +507,98 @@ pub(super) fn boxes(
         areas.extend(dom, &top.fragment);
     }
     for (node, rect) in areas.nodes {
-        if scroll.contains_key(&node) {
-            scroll.insert(node, rect);
-        }
+        scroll.insert(node, rect);
     }
     flow.frame_viewports.extend(fx.frame_viewports);
     (out, scroll, flow.frame_viewports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fragment(node: NodeId, kind: FragKind, children: Vec<Frag>) -> Frag {
+        Frag {
+            flow: Default::default(),
+            node,
+            x: 13.375,
+            y: -2.25,
+            w: 0.125,
+            h: 0.0,
+            border: [0.0; 4],
+            css_size: Some([0.125, 0.0]),
+            content_size: Some([0.125, 0.0]),
+            content_offset: [0.0; 2],
+            paint: Default::default(),
+            clip: None,
+            kind,
+            children,
+        }
+    }
+
+    #[test]
+    fn single_box_index_preserves_fragment_eligibility_and_edge_arithmetic() {
+        let root = fragment(
+            NO_NODE,
+            FragKind::Block,
+            vec![
+                fragment(
+                    1,
+                    FragKind::Block,
+                    vec![fragment(2, FragKind::Block, vec![])],
+                ),
+                fragment(3, FragKind::Block, vec![]),
+                fragment(3, FragKind::Block, vec![]),
+                fragment(4, FragKind::TableCell(Box::new([])), vec![]),
+                fragment(5, FragKind::Block, vec![]),
+                fragment(6, FragKind::Fixed(0), vec![]),
+                fragment(7, FragKind::Block, vec![]),
+                fragment(8, FragKind::Block, vec![]),
+                fragment(8, FragKind::TableCell(Box::new([])), vec![]),
+            ],
+        );
+        let fixed = vec![
+            fragment(5, FragKind::Block, vec![]),
+            fragment(6, FragKind::Block, vec![]),
+        ];
+        let top_layer = vec![
+            TopFrag {
+                fragment: fragment(7, FragKind::Block, vec![]),
+                fixed: true,
+                order: 0,
+            },
+            TopFrag {
+                fragment: fragment(9, FragKind::Block, vec![]),
+                fixed: false,
+                order: 1,
+            },
+        ];
+        let index = SingleBoxIndex::new(&root, &fixed, &top_layer);
+        for node in 0..=12 {
+            assert_eq!(
+                index.get(node),
+                single_border_box(&root, &fixed, &top_layer, node),
+                "node {node}"
+            );
+        }
+        assert_eq!(index.visited, 15);
+        assert!(
+            index.get(NO_NODE).is_none(),
+            "anonymous/generated boxes are not DOM elements"
+        );
+        for node in [3, 4, 5, 7, 8] {
+            assert!(index.get(node).is_none(), "ambiguous/table node {node}");
+        }
+        let rect = index.get(2).unwrap();
+        assert_eq!(rect.width, 0.125);
+        assert_eq!(rect.height, 0.0, "zero-area generated boxes must survive");
+        assert_eq!(rect.top, -2.25);
+        assert_eq!(rect.css_width, Some(0.125));
+        assert_eq!(
+            index.get(6),
+            Some(rect),
+            "fixed markers must not duplicate the fixed fragment"
+        );
+        assert_eq!(index.get(9), Some(rect));
+    }
 }

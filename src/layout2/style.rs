@@ -14,7 +14,7 @@ use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::layout2::{Emphasis, NO_NODE};
 use crate::layout2::{ItemKind, TextTransform, Units, WhiteSpace, css_is_italic, css_length_px};
 
-use super::value::{Len, Node, Vp};
+use super::value::{Len, Vp};
 
 /// Sides index order used throughout: Top, Right, Bottom, Left.
 pub(crate) const TOP: usize = 0;
@@ -167,6 +167,7 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
 /// honored and retained at fractional CSS-pixel precision.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BoxStyle {
+    pub overflow: [super::overflow::Overflow; 2],
     /// CSS Overflow 4 #webkit-line-clamp, active only for a vertical legacy box.
     pub line_clamp: Option<usize>,
     /// CSS Writing Modes 4: vertical inline progression, with columns ordered
@@ -203,12 +204,10 @@ pub(crate) struct BoxStyle {
     pub inset: [Len; 4],
     /// `z-index`: the integer stack level; `auto` → `None` (§9.9.1).
     pub z_index: Option<i32>,
-    /// The accumulated TRANSLATION of `transform` + the individual
-    /// `translate` property, per axis as `(pct-of-own-border-box, px)` —
-    /// the transform subset currently represented by the fragment tree
-    /// (css-transforms-1; affine scale/rotate/skew are handled by graphics paint).
-    pub tx: (f32, f32),
-    pub ty: (f32, f32),
+    /// Visual transform values; never folded into normal-flow coordinates.
+    pub transform: Option<std::sync::Arc<super::transform::Transform>>,
+    /// Child navigables start a new CSSOM viewport coordinate space.
+    pub child_viewport: bool,
     /// Any non-none `transform`/`translate`: a stacking-context AND
     /// containing-block former for out-of-flow descendants (transforms-1 §3)
     /// even when the translation component is zero.
@@ -234,9 +233,15 @@ pub(crate) struct BoxStyle {
 }
 
 impl BoxStyle {
-    /// CSS 2.2 §9.4.3 relative positioning, followed by the translation
-    /// component of CSS Transforms. The caller preserves normal-flow size.
-    pub(super) fn paint_offset(&self, cb_w: f32, cb_h: Option<f32>, w: f32, h: f32) -> (f32, f32) {
+    /// CSS 2.2 §9.4.3 relative positioning. Transforms are separate visual
+    /// coordinates and cannot be baked into the boxes used by offset*.
+    pub(super) fn paint_offset(
+        &self,
+        cb_w: f32,
+        cb_h: Option<f32>,
+        _w: f32,
+        _h: f32,
+    ) -> (f32, f32) {
         let (mut dx, mut dy) = (0.0, 0.0);
         if self.position == Pos::Relative {
             dx = self.inset[LEFT]
@@ -248,10 +253,6 @@ impl BoxStyle {
                 .or_else(|| self.inset[BOTTOM].resolve(cb_h).map(|v| -v))
                 .unwrap_or(0.0);
         }
-        if self.has_transform {
-            dx += self.tx.0 * w + self.tx.1;
-            dy += self.ty.0 * h + self.ty.1;
-        }
         (dx, dy)
     }
 
@@ -259,6 +260,7 @@ impl BoxStyle {
     /// the initial value for every non-inherited property).
     pub fn anonymous() -> BoxStyle {
         BoxStyle {
+            overflow: [super::overflow::Overflow::Visible; 2],
             line_clamp: None,
             vertical: None,
             sideways_text: Some(false),
@@ -279,8 +281,8 @@ impl BoxStyle {
             position: Pos::Static,
             inset: [Len::Auto, Len::Auto, Len::Auto, Len::Auto],
             z_index: None,
-            tx: (0.0, 0.0),
-            ty: (0.0, 0.0),
+            transform: None,
+            child_viewport: false,
             has_transform: false,
             has_clip_path: false,
             color_filters: Default::default(),
@@ -297,7 +299,12 @@ impl BoxStyle {
         let u = Units::of(dom, id);
         let tag = dom.tag_name(id).unwrap_or("");
         let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
-        let (mut has_transform, tx, ty) = transform_translation(dom, id, u, vp);
+        let transform = super::transform::Transform::parse(
+            |property| dom.computed_value_resolved(id, property),
+            u,
+            vp,
+        );
+        let mut has_transform = transform.is_some();
         // CSS Animations 1 §4 gives a transform animation the same stacking-
         // context behavior as a non-none computed transform even when the
         // underlying value is `none`. This also keeps the animated element's
@@ -330,6 +337,7 @@ impl BoxStyle {
         };
         BoxStyle {
             line_clamp: dom.legacy_line_clamp(id),
+            overflow: super::overflow::Overflow::axes(cv),
             vertical: vertical_mode(cv("writing-mode").as_deref()),
             sideways_text: sideways_text(
                 cv("writing-mode").as_deref(),
@@ -374,8 +382,8 @@ impl BoxStyle {
                 Len::parse_or(cv("left").as_deref(), u, vp, Len::Auto),
             ],
             z_index: cv("z-index").and_then(|v| v.trim().parse::<i32>().ok()),
-            tx,
-            ty,
+            transform,
+            child_viewport: matches!(tag, "iframe" | "frame"),
             has_transform,
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             color_filters: cv("filter")
@@ -383,7 +391,7 @@ impl BoxStyle {
                 .and_then(super::filter::color_filters)
                 .unwrap_or_default()
                 .into(),
-            filter_containing_block: dom.document_element() != Some(id),
+            filter_containing_block: !dom.is_document_element(id),
             opacity: dom.effective_opacity(id),
             bg: declares_background(dom, id),
             // §9.7: an out-of-flow box computes `float:none` (positioning wins).
@@ -480,6 +488,7 @@ impl BoxStyle {
         };
         BoxStyle {
             line_clamp: None,
+            overflow: super::overflow::Overflow::axes(cv),
             vertical: vertical_mode(cv("writing-mode").as_deref()),
             sideways_text: sideways_text(
                 cv("writing-mode").as_deref(),
@@ -524,14 +533,11 @@ impl BoxStyle {
                 len("left", Len::Auto),
             ],
             z_index: cv("z-index").and_then(|value| value.trim().parse().ok()),
-            // Translation of generated boxes is a paint-only extension of the
-            // same model; keep the geometry standards-correct at the declared
-            // box position until pseudo transforms join the compositor.
-            tx: (0.0, 0.0),
-            ty: (0.0, 0.0),
-            has_transform: cv("transform")
-                .as_deref()
-                .is_some_and(|value| !matches!(value.trim(), "" | "none")),
+            transform: super::transform::Transform::parse(cv, u, vp),
+            child_viewport: false,
+            has_transform: ["transform", "translate", "rotate", "scale"]
+                .iter()
+                .any(|prop| cv(prop).is_some_and(|value| !matches!(value.trim(), "" | "none"))),
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             color_filters: cv("filter")
                 .as_deref()
@@ -642,169 +648,6 @@ fn zero_alpha_color(t: &str) -> bool {
     };
     let args = args.trim_end_matches(')');
     color_args_alpha(args).is_some_and(|v| v == 0.0)
-}
-
-/// The translation component of `transform` + the `translate` property:
-/// `(has_any_transform, tx, ty)` with each axis as a linear
-/// `(pct-of-own-border-box, px)` pair, summed across the function list
-/// (exact when the list is translation-only; a translation mixed with
-/// rotate/scale sums components — the documented quantization). An invalid
-/// transform list is dropped whole, per CSS parse rules.
-fn transform_translation(
-    dom: &Dom,
-    id: NodeId,
-    u: Units,
-    vp: Vp,
-) -> (bool, (f32, f32), (f32, f32)) {
-    let mut has = false;
-    let mut tx = (0.0f32, 0.0f32);
-    let mut ty = (0.0f32, 0.0f32);
-    let add = |acc: &mut (f32, f32), v: &str| {
-        if let Some(Len::Val(node)) = Len::parse(v, u, vp) {
-            match node {
-                Node::Lin { k, b } => {
-                    acc.0 += k;
-                    acc.1 += b;
-                }
-                // A min()/max() tree isn't linear in the box size; take its
-                // basis-free resolution (px-only args), else contribute 0.
-                n => acc.1 += n.resolve(None).unwrap_or(0.0),
-            }
-        }
-    };
-    if let Some(t) = dom.computed_value_resolved(id, "transform") {
-        let t = t.trim();
-        if !t.is_empty()
-            && !t.eq_ignore_ascii_case("none")
-            && let Some(fns) = parse_transform_list(t)
-        {
-            has = true;
-            for (name, args) in fns {
-                match name.as_str() {
-                    "translate" => {
-                        if let Some(x) = args.first() {
-                            add(&mut tx, x);
-                        }
-                        if let Some(y) = args.get(1) {
-                            add(&mut ty, y);
-                        }
-                    }
-                    "translatex" => {
-                        if let Some(x) = args.first() {
-                            add(&mut tx, x);
-                        }
-                    }
-                    "translatey" => {
-                        if let Some(y) = args.first() {
-                            add(&mut ty, y);
-                        }
-                    }
-                    "translate3d" => {
-                        if let Some(x) = args.first() {
-                            add(&mut tx, x);
-                        }
-                        if let Some(y) = args.get(1) {
-                            add(&mut ty, y);
-                        }
-                    }
-                    // matrix(a,b,c,d,e,f): e/f are the px translation.
-                    "matrix" => {
-                        if let (Some(e), Some(f)) = (args.get(4), args.get(5)) {
-                            tx.1 += e.trim().parse::<f32>().unwrap_or(0.0);
-                            ty.1 += f.trim().parse::<f32>().unwrap_or(0.0);
-                        }
-                    }
-                    // matrix3d(...m41,m42,m43,m44): m41/m42 translate.
-                    "matrix3d" => {
-                        if let (Some(e), Some(f)) = (args.get(12), args.get(13)) {
-                            tx.1 += e.trim().parse::<f32>().unwrap_or(0.0);
-                            ty.1 += f.trim().parse::<f32>().unwrap_or(0.0);
-                        }
-                    }
-                    _ => {} // scale/rotate/skew/perspective: SC+CB, no offset
-                }
-            }
-        }
-    }
-    // The individual `translate: x y?` property (css-transforms-2).
-    if let Some(t) = dom.computed_value_resolved(id, "translate") {
-        let t = t.trim();
-        if !t.is_empty() && !t.eq_ignore_ascii_case("none") {
-            has = true;
-            let mut parts = t.split_whitespace();
-            if let Some(x) = parts.next() {
-                add(&mut tx, x);
-            }
-            if let Some(y) = parts.next() {
-                add(&mut ty, y);
-            }
-        }
-    }
-    (has, tx, ty)
-}
-
-/// Parse a `transform` function list into lowercased `(name, args)` pairs.
-/// `None` when any function is unrecognized/malformed — CSS drops the whole
-/// declaration, so an invalid list must not form a stacking context.
-fn parse_transform_list(t: &str) -> Option<Vec<(String, Vec<String>)>> {
-    const KNOWN: &[&str] = &[
-        "matrix",
-        "translate",
-        "translatex",
-        "translatey",
-        "scale",
-        "scalex",
-        "scaley",
-        "rotate",
-        "skew",
-        "skewx",
-        "skewy",
-        "matrix3d",
-        "translate3d",
-        "translatez",
-        "scale3d",
-        "scalez",
-        "rotate3d",
-        "rotatex",
-        "rotatey",
-        "rotatez",
-        "perspective",
-    ];
-    let mut out = Vec::new();
-    let mut rest = t.trim();
-    while !rest.is_empty() {
-        let open = rest.find('(')?;
-        let name = rest[..open].trim().to_ascii_lowercase();
-        if !KNOWN.contains(&name.as_str()) {
-            return None;
-        }
-        // Transform arguments are component values and may themselves be
-        // functions. CSS Values 4 #component-values / #calc-func permits
-        // e.g. `translateX(calc(1200px + 40px))`; the first `)` closes the
-        // nested math function, not the transform function. Keep the whole
-        // declaration valid until the matching outer parenthesis.
-        let mut depth = 0i32;
-        let close = rest[open..].char_indices().find_map(|(offset, ch)| {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(open + offset);
-                    }
-                }
-                _ => {}
-            }
-            None
-        })?;
-        let args = super::value::split_args(&rest[open + 1..close])
-            .into_iter()
-            .map(|a| a.trim().to_string())
-            .collect();
-        out.push((name, args));
-        rest = rest[close + 1..].trim_start();
-    }
-    Some(out)
 }
 
 /// One side's used border width in px: 0 when the side's `border-style` is

@@ -3,9 +3,9 @@
 //! out by `layout2` or serialized back to HTML for the app to re-parse.
 //!
 //! Deliberately NOT rcdom: a mutable DOM can't live with rcdom's
-//! Node::drop force-clearing children, and an arena of indices gives JS a flat,
-//! GC-free handle type — wrappers hold a `NodeId`, and the whole arena drops
-//! with the page.
+//! Node::drop force-clearing children. Stable numeric identities are independent
+//! of compactable physical storage; the resident host jointly traces native
+//! relationships and JavaScript wrappers before reclaiming detached islands.
 
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell};
@@ -16,19 +16,27 @@ use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
 
+pub(crate) mod arena;
 mod class_tokens;
+mod computed_cache;
 mod container_queries;
 mod counter_styles;
 pub(crate) mod cssom;
 mod focus;
+mod gc;
 mod generated;
 mod html_hints;
 mod input;
 mod invalidation;
 mod properties;
+
+pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
+    properties::transform_number(text, angle, percentage)
+}
 mod rule_index;
 pub(crate) mod shadow;
 mod sheet_cache;
+mod svg_dependencies;
 mod transitions;
 mod xml;
 
@@ -174,7 +182,12 @@ pub fn last_mutation_ms() -> u128 {
 }
 
 pub struct Dom {
-    nodes: Vec<Node>,
+    nodes: arena::DenseIdMap<Node>,
+    /// Numeric IDs may briefly be held by binding code before its JS owner registers them.
+    /// Keep new allocations until that handoff or the host's end-of-job boundary.
+    pending_allocations: FxHashSet<NodeId>,
+    /// Static/parser-only arenas cannot be collected by the JS host and need no leases.
+    gc_allocation_leases: bool,
     /// Only detached non-HTML documents need an entry. Kept in the arena so
     /// wrapper collection/recreation cannot change a node's document type.
     document_content_types: FxHashMap<NodeId, String>,
@@ -206,6 +219,8 @@ pub struct Dom {
     pub(crate) layout_cache: RefCell<crate::layout2::LayoutCache>,
     /// Immutable formatting subtrees, separately bounded from laid fragments.
     pub(crate) box_tree_cache: RefCell<crate::layout2::BoxTreeCache>,
+    /// SVG resource dependency proofs and reusable mutation-path work storage.
+    svg_dependencies: RefCell<svg_dependencies::State>,
     /// Geometry invalidations retained independently of the frontend's incremental-render
     /// queue. TRust stores nested Documents in one arena, but HTML §7.3.1.3 gives each child
     /// navigable its own active Document: a mutation inside that Document cannot change the
@@ -281,11 +296,10 @@ pub struct Dom {
     /// Pure memoization (identical results), so it never affects the
     /// cascade outcome.
     cascaded_cache: RefCell<NodeCache<std::rc::Rc<CascadedMaps>>>,
-    /// Memoized `is_hidden` results for the current epoch. `is_hidden` reads ~15
-    /// cascaded properties and runs once per `flow_element` visit (and the same
-    /// node is re-visited by every measurement pass that re-descends through it),
-    /// so without this the visibility test is the layout's most-repeated work.
-    hidden_cache: RefCell<NodeCache<bool>>,
+    /// Memoized box participation, shared by formatting-tree construction and
+    /// geometry projection. Clipping, opacity, visibility and zero sizes must
+    /// never be mistaken for `display:none` here.
+    hidden_cache: RefCell<NodeCache<BoxGeneration>>,
     /// Memoized computed `font-size` in CSS px for the current epoch (see
     /// `font_px`): every `em`/`rem` length resolution consults it, and the
     /// numeric composition walks ancestors, so it's cached like the other
@@ -379,9 +393,12 @@ pub struct Dom {
     /// retained inline actions. It is not a DOM/style mutation, but is an
     /// independent input to a reusable box/fragment tree.
     layout_presentation_epoch: u64,
-    /// Scroll offsets and hit-test markers change paint inputs without
-    /// changing style, intrinsic sizes, or the fragment geometry transaction.
+    /// Hit-test markers change display-list inputs without changing style,
+    /// intrinsic sizes, or the fragment geometry transaction.
     layout_paint_epoch: u64,
+    /// Scroll positions are sampled properties, not display-list contents.
+    /// Updating them must preserve both layout and the retained paint list.
+    scroll_epoch: u64,
     /// The live `:hover` chain: the committed hover target + its composed
     /// ancestors (empty at rest / no pointer). Consulted by selector matching
     /// (`Compound.hover`); moved by `set_hover_chain`, which bumps the epoch
@@ -442,7 +459,7 @@ struct ScrollBox {
 /// are arena-internal, so SipHash's DoS resistance buys nothing.
 // Numeric computed lengths (notably inherited line-height:ch/ex) also depend
 // on the installed font metrics, independently of DOM/style invalidation.
-type ComputedCache = ((u64, u64), FxHashMap<(NodeId, usize), Option<String>>);
+type ComputedCache = ((u64, u64), computed_cache::Values);
 
 /// Per-epoch memo for inherited custom-property source values. Custom
 /// properties form an open-ended, case-sensitive name space, so keep a small
@@ -455,19 +472,34 @@ type CustomPropCache = (
     FxHashMap<NodeId, FxHashMap<String, Option<String>>>,
 );
 
-/// A node-indexed, epoch-STAMPED slot cache for the per-epoch memos keyed
-/// by bare `NodeId`. NodeIds are dense arena indices, so a Vec slot
-/// replaces hashing entirely, and the stamp compare replaces the per-epoch
-/// clear: advancing the epoch invalidates every slot at once, for free.
-/// A stale value lingers in its slot until overwritten — bounded by the
-/// arena, the same steady-state the old cleared-and-refilled maps had.
+#[derive(Clone, Copy)]
+struct BoxGeneration {
+    /// Existing HTML-state / author-display subtree suppression. UA metadata
+    /// suppression is also applied by the formatting-tree builder.
+    hidden: bool,
+    /// Whether this element's display generates its own principal box; this
+    /// says nothing about its ancestors or whether that box has been laid out.
+    principal: bool,
+}
+
+impl BoxGeneration {
+    const HIDDEN: Self = Self {
+        hidden: true,
+        principal: false,
+    };
+}
+
+/// Epoch-stamped cache slots carry the full stable NodeId. Collection can compact them
+/// independently of the DOM; retired identities never alias a new cached value.
 struct NodeCache<T> {
-    slots: Vec<(u64, Option<T>)>,
+    slots: arena::DenseIdMap<(u64, Option<T>)>,
 }
 
 impl<T> Default for NodeCache<T> {
     fn default() -> Self {
-        NodeCache { slots: Vec::new() }
+        NodeCache {
+            slots: arena::DenseIdMap::default(),
+        }
     }
 }
 
@@ -483,10 +515,7 @@ impl<T> NodeCache<T> {
     }
 
     fn put(&mut self, id: NodeId, epoch: u64, v: T) {
-        if self.slots.len() <= id {
-            self.slots.resize_with(id + 1, || (0, None));
-        }
-        self.slots[id] = (epoch, Some(v));
+        self.slots.insert_dense(id, (epoch, Some(v)), || (0, None));
     }
 
     fn invalidate(&mut self, id: NodeId) {
@@ -573,6 +602,8 @@ impl Dom {
         // classified before the crate builds.
         let Dom {
             nodes,
+            pending_allocations,
+            gc_allocation_leases,
             document_content_types,
             document_modes,
             input_values,
@@ -587,6 +618,7 @@ impl Dom {
             style_value_epoch,
             layout_cache,
             box_tree_cache,
+            svg_dependencies,
             geometry_dirty_nodes,
             geometry_dirty_attributed,
             style_epoch,
@@ -630,11 +662,13 @@ impl Dom {
             render_live,
             layout_presentation_epoch,
             layout_paint_epoch,
+            scroll_epoch,
             hover_chain,
             popover_open,
             popover_order,
         } = self;
         let _ = (
+            gc_allocation_leases,
             dirty,
             epoch,
             window_names_epoch,
@@ -649,12 +683,22 @@ impl Dom {
             render_live,
             layout_presentation_epoch,
             layout_paint_epoch,
+            scroll_epoch,
         );
 
-        let mut bytes = nodes.capacity().saturating_mul(std::mem::size_of::<Node>());
-        let mut opaque = false;
+        let mut bytes = nodes.storage_bytes();
+        bytes =
+            bytes.saturating_add(pending_allocations.capacity() * std::mem::size_of::<NodeId>());
+        let mut opaque = pending_allocations.capacity() != 0 || nodes.has_sparse_storage();
         let mut unavailable = 0usize;
-        for node in nodes {
+        match svg_dependencies.try_borrow() {
+            Ok(state) => {
+                bytes = bytes.saturating_add(state.retained_bytes());
+                opaque |= state.retained_bytes() != 0;
+            }
+            Err(_) => unavailable += 1,
+        }
+        for node in nodes.iter() {
             match &node.data {
                 NodeData::Comment(text) | NodeData::Text(text) | NodeData::CData(text) => {
                     bytes = bytes.saturating_add(text.capacity());
@@ -785,10 +829,7 @@ impl Dom {
         match computed_cache.try_borrow() {
             Ok(cache) => {
                 let (_epoch, cache) = &*cache;
-                fixed_map!(cache, ((NodeId, usize), Option<String>));
-                for value in cache.values().flatten() {
-                    bytes = bytes.saturating_add(value.capacity());
-                }
+                bytes = bytes.saturating_add(cache.retained_bytes());
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
         }
@@ -832,10 +873,9 @@ impl Dom {
 
         match class_cache.try_borrow() {
             Ok(cache) => {
-                bytes = bytes.saturating_add(cache.slots.capacity().saturating_mul(
-                    std::mem::size_of::<(u64, Option<class_tokens::ClassTokens>)>(),
-                ));
-                for (_, tokens) in &cache.slots {
+                bytes = bytes.saturating_add(cache.slots.storage_bytes());
+                opaque |= cache.slots.has_sparse_storage();
+                for (_, tokens) in cache.slots.iter() {
                     if let Some(tokens) = tokens {
                         fixed_set!(tokens, Box<str>);
                         for token in tokens {
@@ -851,10 +891,9 @@ impl Dom {
         for cache in [matched_cache, selector_cache] {
             match cache.try_borrow() {
                 Ok(cache) => {
-                    bytes = bytes.saturating_add(cache.slots.capacity().saturating_mul(
-                        std::mem::size_of::<(u64, Option<std::rc::Rc<Vec<u32>>>)>(),
-                    ));
-                    for (_stamp, value) in &cache.slots {
+                    bytes = bytes.saturating_add(cache.slots.storage_bytes());
+                    opaque |= cache.slots.has_sparse_storage();
+                    for (_stamp, value) in cache.slots.iter() {
                         if let Some(value) = value {
                             let identity = std::rc::Rc::as_ptr(value) as usize;
                             if rc_vectors.insert(identity) {
@@ -874,10 +913,9 @@ impl Dom {
         let mut cascaded_maps = std::collections::HashSet::new();
         match cascaded_cache.try_borrow() {
             Ok(cache) => {
-                bytes = bytes.saturating_add(cache.slots.capacity().saturating_mul(
-                    std::mem::size_of::<(u64, Option<std::rc::Rc<CascadedMaps>>)>(),
-                ));
-                for (_stamp, value) in &cache.slots {
+                bytes = bytes.saturating_add(cache.slots.storage_bytes());
+                opaque |= cache.slots.has_sparse_storage();
+                for (_stamp, value) in cache.slots.iter() {
                     let Some(value) = value else { continue };
                     let identity = std::rc::Rc::as_ptr(value) as usize;
                     if !cascaded_maps.insert(identity) {
@@ -909,18 +947,14 @@ impl Dom {
             ($cache:expr, $value:ty) => {
                 match $cache.try_borrow() {
                     Ok(cache) => {
-                        bytes = bytes.saturating_add(
-                            cache
-                                .slots
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<(u64, Option<$value>)>()),
-                        );
+                        bytes = bytes.saturating_add(cache.slots.storage_bytes());
+                        opaque |= cache.slots.has_sparse_storage();
                     }
                     Err(_) => unavailable = unavailable.saturating_add(1),
                 }
             };
         }
-        node_cache!(hidden_cache, bool);
+        node_cache!(hidden_cache, BoxGeneration);
         node_cache!(font_cache, f32);
         node_cache!(font_units_cache, (u64, crate::layout2::Units));
         node_cache!(decoration_cache, (bool, bool));
@@ -983,7 +1017,9 @@ impl Dom {
 
     pub fn new() -> Self {
         let mut dom = Dom {
-            nodes: Vec::new(),
+            nodes: arena::DenseIdMap::default(),
+            pending_allocations: FxHashSet::default(),
+            gc_allocation_leases: false,
             document_content_types: FxHashMap::default(),
             document_modes: FxHashMap::default(),
             input_values: FxHashMap::default(),
@@ -998,6 +1034,7 @@ impl Dom {
             style_value_epoch: 0,
             layout_cache: RefCell::new(crate::layout2::LayoutCache::default()),
             box_tree_cache: RefCell::new(crate::layout2::BoxTreeCache::default()),
+            svg_dependencies: RefCell::new(svg_dependencies::State::default()),
             geometry_dirty_nodes: FxHashMap::default(),
             geometry_dirty_attributed: true,
             style_epoch: 0,
@@ -1012,7 +1049,7 @@ impl Dom {
             parsed_sheets: RefCell::new(sheet_cache::Cache::default()),
             container_sizes: RefCell::new(FxHashMap::default()),
             container_dependencies: RefCell::new(container_queries::Dependencies::default()),
-            computed_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
+            computed_cache: RefCell::new(((u64::MAX, u64::MAX), computed_cache::Values::default())),
             custom_prop_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
             generated_cache: RefCell::new(None),
             matched_cache: RefCell::new(NodeCache::default()),
@@ -1041,6 +1078,7 @@ impl Dom {
             render_live: false,
             layout_presentation_epoch: 0,
             layout_paint_epoch: 0,
+            scroll_epoch: 0,
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
             popover_order: Vec::new(),
@@ -1119,6 +1157,10 @@ impl Dom {
 
     pub(crate) fn layout_paint_epoch(&self) -> u64 {
         self.layout_paint_epoch
+    }
+
+    pub(crate) fn scroll_epoch(&self) -> u64 {
+        self.scroll_epoch
     }
 
     pub fn render_clickable(&self, id: NodeId) -> bool {
@@ -1511,7 +1553,7 @@ impl Dom {
         if let Some(slot) = self.assigned_slot(id) {
             return Some(slot);
         }
-        let parent = self.nodes[id].parent?;
+        let parent = self.nodes.get(id)?.parent?;
         self.shadow_hosts.get(&parent).copied().or(Some(parent))
     }
 
@@ -1534,7 +1576,7 @@ impl Dom {
     /// event dispatcher uses this as Node's `get the parent` algorithm; the
     /// public `assignedSlot` IDL getter additionally hides closed-tree slots.
     pub fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
-        let host = self.nodes[id].parent?;
+        let host = self.nodes.get(id)?.parent?;
         let shadow = self.shadow_root(host)?;
         if self
             .shadow_data
@@ -1573,9 +1615,15 @@ impl Dom {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Total arena slots (diagnostic): the tree size the layout walks.
+    /// Number of live native nodes, not an identity upper bound.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Live identities in physical storage order. DOM tree order is supplied by descendants()
+    /// and child_iter(), never by the arena's compaction-dependent storage order.
+    pub fn live_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.ids()
     }
 
     /// The monotonic mutation counter. Anything memoized against the DOM's
@@ -1600,6 +1648,7 @@ impl Dom {
     }
 
     fn mark_dom_revision(&mut self) {
+        self.invalidate_untracked_svg_resources();
         self.dirty = true;
         self.epoch = self.epoch.wrapping_add(1);
         // Diagnostic: record WHEN the DOM last changed, so we can size the
@@ -1670,6 +1719,10 @@ impl Dom {
     }
 
     fn touch_attr_with_old_class(&mut self, id: NodeId, name: &str, old_class: Option<&str>) {
+        if name.eq_ignore_ascii_case("id") {
+            let consumers = self.svg_dirty_consumers(&[id], true);
+            self.invalidate_layout_paths(consumers);
+        }
         if name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name") {
             self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
         }
@@ -2232,6 +2285,7 @@ impl Dom {
         });
         if self.fragment_target != target {
             self.fragment_target = target;
+            self.nodes.remember(DOCUMENT);
             self.touch_style();
         }
         target
@@ -2245,6 +2299,9 @@ impl Dom {
     /// their fresh scrolling-area extents from the same fragment pass that
     /// supplies the border box, never from lagging frontend state.
     pub fn scroll_metric(&self, id: NodeId, which: u8) -> Option<f64> {
+        if !self.is_valid(id) {
+            return None;
+        }
         let sb = self.scroll_state.get(&id);
         match which {
             0 => Some(sb.map_or(0.0, |s| s.top)),
@@ -2266,12 +2323,15 @@ impl Dom {
     /// (baked) and the `Scrolled` channel. Returns whether the position changed,
     /// which the CSSOM View binding uses to queue `scroll`/`scrollend`.
     pub fn set_scroll_pos(&mut self, id: NodeId, top: f64, left: f64, record: bool) -> bool {
+        if !self.is_valid(id) {
+            return false;
+        }
         let sb = self.scroll_state.entry(id).or_default();
         let changed = sb.top != top || sb.left != left;
         sb.top = top;
         sb.left = left;
         if changed {
-            self.layout_paint_epoch = self.layout_paint_epoch.wrapping_add(1);
+            self.scroll_epoch = self.scroll_epoch.wrapping_add(1);
         }
         if record && changed {
             self.scroll_changes.push((id, top, left));
@@ -2284,6 +2344,9 @@ impl Dom {
     /// measurement backing: no dirty, no scroll record. The scrolling-area
     /// dimensions remain actor-owned fragment geometry; see `ScrollBox`.)
     pub fn set_scroll_geom(&mut self, id: NodeId, client_h: f64, client_w: f64) {
+        if !self.is_valid(id) {
+            return;
+        }
         let sb = self.scroll_state.entry(id).or_default();
         sb.client_h = Some(client_h);
         sb.client_w = Some(client_w);
@@ -2473,7 +2536,7 @@ impl Dom {
     }
 
     fn new_node(&mut self, data: NodeData) -> NodeId {
-        self.nodes.push(Node {
+        let id = self.nodes.allocate(Node {
             parent: None,
             first_child: None,
             last_child: None,
@@ -2482,7 +2545,10 @@ impl Dom {
             owner_document: DOCUMENT,
             data,
         });
-        self.nodes.len() - 1
+        if self.gc_allocation_leases {
+            self.pending_allocations.insert(id);
+        }
+        id
     }
 
     pub fn node(&self, id: NodeId) -> &Node {
@@ -2498,6 +2564,11 @@ impl Dom {
         }
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
+            // HTML child navigables share the presentation arena, not their node document.
+            // A Document is always its own node document and adoption cannot cross it.
+            if matches!(self.nodes[id].data, NodeData::Document) {
+                continue;
+            }
             self.nodes[id].owner_document = document;
             stack.extend(self.child_iter(id));
             let template_contents = match &self.nodes[id].data {
@@ -2518,7 +2589,15 @@ impl Dom {
 
     /// The document that owns `id` (DOM §4.5's *node document*).
     pub fn owner_document(&self, id: NodeId) -> Option<NodeId> {
-        self.is_valid(id).then_some(self.nodes[id].owner_document)
+        self.nodes.get(id).map(|node| node.owner_document)
+    }
+
+    /// DOM creation establishes provenance before publishing a wrapper or invoking a custom
+    /// constructor. Unlike adoption, a fresh node cannot invalidate any existing tree/style.
+    pub(crate) fn initialize_node_document(&mut self, id: NodeId, document: NodeId) {
+        debug_assert!(self.nodes[id].parent.is_none());
+        debug_assert!(matches!(self.nodes[document].data, NodeData::Document));
+        self.set_owner_document_subtree(id, document);
     }
 
     pub(crate) fn set_frame_cookie_restriction(&mut self, frame: NodeId, restricted: bool) {
@@ -2549,7 +2628,7 @@ impl Dom {
     }
 
     pub fn is_valid(&self, id: NodeId) -> bool {
-        id < self.nodes.len()
+        self.nodes.get(id).is_some()
     }
 
     pub fn create_element(&mut self, tag: &str) -> NodeId {
@@ -2623,9 +2702,8 @@ impl Dom {
             .unwrap_or(QuirksMode::NoQuirks)
     }
 
-    /// Unlink a node from its parent and siblings (the node and its
-    /// subtree stay in the arena; arenas only ever grow — page-lifetime
-    /// memory is the deal).
+    /// Unlink a node from its parent and siblings. Detachment itself never destroys nodes;
+    /// the joint native/JavaScript collector reclaims a subtree only after proving it unreachable.
     pub fn detach(&mut self, id: NodeId) {
         let (parent, prev, next) = {
             let n = &self.nodes[id];
@@ -2990,7 +3068,7 @@ impl Dom {
 
     pub fn children(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
-        let mut next = self.nodes[id].first_child;
+        let mut next = self.nodes.get(id).and_then(|node| node.first_child);
         while let Some(c) = next {
             out.push(c);
             next = self.nodes[c].next_sibling;
@@ -3002,9 +3080,10 @@ impl Dom {
     /// walks (the serializers, queries, text extraction). Use `children()`
     /// (materialized) when the tree is mutated mid-iteration.
     pub fn child_iter(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        std::iter::successors(self.nodes[id].first_child, move |&c| {
-            self.nodes[c].next_sibling
-        })
+        std::iter::successors(
+            self.nodes.get(id).and_then(|node| node.first_child),
+            move |&c| self.nodes[c].next_sibling,
+        )
     }
 
     /// The subtree under `root` in document (pre-)order, excluding `root`,
@@ -3018,12 +3097,12 @@ impl Dom {
         Descendants {
             dom: self,
             root,
-            next: self.nodes[root].first_child,
+            next: self.nodes.get(root).and_then(|node| node.first_child),
         }
     }
 
     pub fn tag_name(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes[id].data {
+        match &self.nodes.get(id)?.data {
             NodeData::Element { name, .. } => Some(&name.local),
             _ => None,
         }
@@ -3036,7 +3115,7 @@ impl Dom {
     /// hydration reads `el.namespaceURI.includes("svg")`, so a missing value
     /// throws on every SSR Vue/Nuxt page.
     pub fn namespace_uri(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes[id].data {
+        match &self.nodes.get(id)?.data {
             NodeData::Element { name, .. } => {
                 let ns = &*name.ns;
                 (!ns.is_empty()).then_some(ns)
@@ -3047,7 +3126,7 @@ impl Dom {
 
     /// DOM `Element.prefix`, retained as part of the element's qualified name.
     pub fn namespace_prefix(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes[id].data {
+        match &self.nodes.get(id)?.data {
             NodeData::Element { name, .. } => name.prefix.as_deref(),
             _ => None,
         }
@@ -3069,6 +3148,9 @@ impl Dom {
         let folded = qualified.to_ascii_lowercase();
         self.descendants(root)
             .filter(|&id| {
+                if self.nodes[id].owner_document != self.nodes[root].owner_document {
+                    return false;
+                }
                 let NodeData::Element { name, .. } = &self.nodes[id].data else {
                     return false;
                 };
@@ -3120,7 +3202,7 @@ impl Dom {
         } else {
             self.frame_owner(root)
         };
-        let document = frame.unwrap_or(self.nodes[root].owner_document);
+        let document = self.nodes[root].owner_document;
         let quirks = self.document_mode(document) == QuirksMode::Quirks;
         self.descendants(root)
             .filter(|&id| {
@@ -3140,7 +3222,7 @@ impl Dom {
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
-        match &self.nodes[id].data {
+        match &self.nodes.get(id)?.data {
             NodeData::Element { attrs, .. } => attrs
                 .iter()
                 .find(|a| str::eq_ignore_ascii_case(&a.name.local, name))
@@ -3153,7 +3235,7 @@ impl Dom {
     /// elements in HTML documents. `attr` remains the renderer's historical
     /// case-insensitive lookup and is not the web-facing DOM operation.
     pub fn get_attribute(&self, id: NodeId, qualified: &str) -> Option<&str> {
-        let NodeData::Element { name, attrs, .. } = &self.nodes[id].data else {
+        let NodeData::Element { name, attrs, .. } = &self.nodes.get(id)?.data else {
             return None;
         };
         let folded;
@@ -3190,6 +3272,9 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        if !self.is_valid(id) {
+            return;
+        }
         let old_class = name
             .eq_ignore_ascii_case("class")
             .then(|| self.attr(id, "class").unwrap_or("").to_owned());
@@ -3254,6 +3339,9 @@ impl Dom {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        if !self.is_valid(id) {
+            return;
+        }
         let old_class = name
             .eq_ignore_ascii_case("class")
             .then(|| self.attr(id, "class").unwrap_or("").to_owned());
@@ -3344,7 +3432,17 @@ impl Dom {
     /// attribute mutation. Detached image loads must not invalidate the page.
     pub(crate) fn image_changed(&mut self, id: NodeId) {
         if self.is_connected(id) {
-            self.touch_content(Some(id));
+            // HTML #updating-the-image-data / CSS Images 3 #default-sizing:
+            // decoded dimensions change a replaced box's inputs, not the DOM
+            // child list, selector truth, inherited style, or counter state.
+            // Layout's observed resource reads invalidate the computations
+            // which consumed the changed image. Keep the formatting tree.
+            self.dirty = true;
+            self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+            // The element's OWN box may resize, so use the outer-box scope
+            // rather than Content's potentially self-contained patch boundary.
+            self.dirty_nodes.push((id, DirtyKind::Attr));
+            self.record_local_geometry_dirty(id, DirtyKind::Attr);
         }
     }
 
@@ -3393,20 +3491,33 @@ impl Dom {
     }
 
     pub fn is_hidden(&self, id: NodeId) -> bool {
-        // Per-epoch memo: `is_hidden` reads ~15 cascaded properties and runs once
-        // per `flow_element` visit, with the same node re-tested by every
-        // measurement re-descent through it — the layout's most-repeated check.
+        self.box_generation(id).hidden
+    }
+
+    /// CSS Display 3 #box-tree: `none` and `contents` have no principal box.
+    /// A descendant's overflow extent does not give its boxless ancestor one.
+    /// Share the typed result with the formatting pass so projecting retained
+    /// fragments does not re-enter the string-valued cascade for every inline.
+    pub(crate) fn generates_principal_box(&self, id: NodeId) -> bool {
+        self.box_generation(id).principal
+    }
+
+    fn box_generation(&self, id: NodeId) -> BoxGeneration {
+        // Box-generation state, not an estimate of painted visibility. A
+        // clipped or zero-area box remains observable through CSSOM View.
         if let Some(&hit) = self.hidden_cache.borrow().get(id, self.epoch) {
             return hit;
         }
-        let hidden = self.is_hidden_inner(id);
-        self.hidden_cache.borrow_mut().put(id, self.epoch, hidden);
-        hidden
+        let generation = self.box_generation_inner(id);
+        self.hidden_cache
+            .borrow_mut()
+            .put(id, self.epoch, generation);
+        generation
     }
 
-    fn is_hidden_inner(&self, id: NodeId) -> bool {
+    fn box_generation_inner(&self, id: NodeId) -> BoxGeneration {
         if self.attr(id, "hidden").is_some() {
-            return true;
+            return BoxGeneration::HIDDEN;
         }
         // UA default `dialog:not([open]) { display:none }`: a closed dialog
         // is a modal that hasn't been shown — never render its content (its
@@ -3416,7 +3527,7 @@ impl Dom {
             && self.attr(id, "open").is_none()
             && self.cascaded(id, "display").is_none()
         {
-            return true;
+            return BoxGeneration::HIDDEN;
         }
         // HTML Popover: hidePopover removes the element from the top layer AND
         // applies display:none. This is visibility state, not an ordinary UA
@@ -3424,7 +3535,7 @@ impl Dom {
         // libraries commonly retain that inline display while hidden; allowing
         // it to win resurrects every closed menu in the presentation snapshot.
         if !self.is_popover_showing(id) && self.attr(id, "popover").is_some() {
-            return true;
+            return BoxGeneration::HIDDEN;
         }
         // `display:none` generates NO box (the element and subtree occupy no
         // space). `visibility:hidden` is NOT here — like `opacity:0` it is
@@ -3437,99 +3548,23 @@ impl Dom {
         // Stack Exchange's `display:var(--_po-d)` therefore has to participate
         // in the display:none check after substitution, not as the literal
         // token stream returned by the cascade.
-        if self.computed_display(id).as_deref() == Some("none") {
-            return true;
+        let display = self.computed_display(id);
+        if display.as_deref() == Some("none") {
+            return BoxGeneration::HIDDEN;
         }
-        // Visually-hidden / "sr-only" accessibility text: the universal idiom
-        // for screen-reader-only content is a 1px, clipped, absolutely
-        // positioned box (Bootstrap `.visually-hidden`, Tailwind / HTML5BP
-        // `.sr-only`, archive.org's `aria-describedby` targets, …). It carries
-        // text meant to be invisible to sighted users — render nothing, as a
-        // browser does, instead of leaking it into the page (it's also often
-        // wider than its sibling content, distorting flex/grid sizing).
-        // `position` is checked first so the hot path short-circuits for the
-        // overwhelming majority of nodes that aren't absolutely positioned.
-        if self.cascaded(id, "position").as_deref() == Some("absolute")
-            && self.computed_value_resolved(id, "overflow-x").as_deref() == Some("hidden")
-            && self.computed_value_resolved(id, "overflow-y").as_deref() == Some("hidden")
-            && self
-                .cascaded(id, "width")
-                .as_deref()
-                .is_some_and(css_len_at_most_1px)
-        {
-            return true;
+        // CSS Overflow 3 #overflow-properties clips paint, not box generation;
+        // CSSOM View #dom-element-getclientrects includes zero-area fragments.
+        // Keep clipped, offscreen, zero-sized, transparent and invisible boxes
+        // (and their descendants). The paint boundary applies actual clips.
+        BoxGeneration {
+            hidden: false,
+            principal: !matches!(
+                display
+                    .as_deref()
+                    .or_else(|| self.tag_name(id).map(ua_display)),
+                Some("none" | "contents")
+            ),
         }
-        // CSS Position 3 #insets allows off-screen coordinates without
-        // suppressing box generation. CSSOM View #dom-htmlelement-offsetwidth
-        // and #dom-htmlelement-offsetheight still measure those boxes (font
-        // measurement probes depend on this), and descendants can extend back
-        // into view. Viewport clipping belongs to painting, not this check.
-        // A box collapsed to ZERO on an axis, with `overflow:hidden`/`clip` on
-        // that axis, clips ALL its content to nothing — the standard "keep it
-        // in the DOM but show nothing" idiom (a preloaded hero copy, a closed
-        // `max-height:0` drawer/accordion, a `height:0` mega-menu). A browser
-        // paints none of it; we used to render it (Steam's
-        // `.menu_takeover_background{height:0;overflow:hidden}` preload copy of
-        // the banner drew a full-width 1-row sliver). EXCEPTION: a `height:0`
-        // box whose PADDING reserves the height is the responsive-image
-        // "intrinsic ratio" box (`padding-bottom:56.25%` → a 16:9 thumbnail
-        // whose absolutely-positioned child fills the padding box, Humble
-        // Bundle's tiles) — its content box is zero but the padding box isn't,
-        // so it is NOT empty; spare it (`intrinsic_ratio_container_rows` sizes
-        // the child off exactly this).
-        let clips = |v: Option<String>| {
-            v.as_deref().is_some_and(|s| {
-                let mut toks = s.split_whitespace().peekable();
-                toks.peek().is_some() && toks.all(|t| matches!(t, "hidden" | "clip"))
-            })
-        };
-        let overflow = self.computed_value_resolved(id, "overflow");
-        let zero = |prop| {
-            self.computed_value_resolved(id, prop)
-                .as_deref()
-                .is_some_and(css_len_is_zero)
-        };
-        let oy = clips(self.cascaded(id, "overflow-y")) || clips(overflow.clone());
-        let ox = clips(self.cascaded(id, "overflow-x")) || clips(overflow);
-        let h_zero = zero("height") || zero("max-height");
-        let w_zero = zero("width") || zero("max-width");
-        if (oy && h_zero && !self.has_axis_padding(id, true))
-            || (ox && w_zero && !self.has_axis_padding(id, false))
-        {
-            return true;
-        }
-        // A REPLACED element (img/svg/video/canvas/…) sized to a definite zero on
-        // EITHER axis paints nothing: its raster scales into a zero content box,
-        // so — unlike a normal block, whose overflow can still show — there is
-        // nothing to overflow, and `overflow` is irrelevant (hence no `ox`/`oy`
-        // gate here). This is the OTHER half of the copyable-but-unseen idiom:
-        // `font-size:0` hides sibling TEXT (which never affects a replaced box),
-        // while images are collapsed by a separate zero-size rule (Mastodon's
-        // `.invisible img{width:0!important;height:0!important}`). Without this
-        // our image box clamps to a 1-cell sliver instead of vanishing.
-        if (w_zero || h_zero)
-            && matches!(
-                self.tag_name(id),
-                Some(
-                    "img" | "svg" | "video" | "canvas" | "picture" | "iframe" | "embed" | "object"
-                )
-            )
-        {
-            return true;
-        }
-        // `opacity:0` is NOT hidden — CSS separates box generation (`display`)
-        // from painting. `opacity` (like `visibility`) suppresses only the
-        // PAINT: an `opacity:0` element is fully laid out and occupies its
-        // normal space (`getBoundingClientRect`/`scrollHeight` report its real
-        // box), it is merely painted fully transparent. Collapsing it here (no
-        // box) is what broke React virtualized lists — Mastodon's off-screen
-        // placeholders are `opacity:0` PRECISELY so they keep their measured
-        // height. Paint suppression rides `paint_suppressed`/`Ctx.invisible`
-        // instead (laid out, painted blank); the slideshow that used to lean on
-        // this branch still resolves to its active slide (an inactive slide is
-        // out-of-flow → reserves no space, and paints blank → can't cover the
-        // active one). See `paint_suppressed`.
-        false
     }
 
     /// Whether an authored CSS/HTML state omits this element and all descendants
@@ -3628,24 +3663,6 @@ impl Dom {
             cur = self.parent_composed(node);
         }
         true
-    }
-
-    /// Whether an element reserves height (`vertical`) or width via positive
-    /// padding on that axis — the responsive-image "intrinsic ratio" idiom
-    /// (`padding-bottom:56.25%` on a `height:0` box). A non-zero/`auto`/unknown
-    /// value counts (we only treat a provably-zero box as empty), so this
-    /// returns `true` to SPARE a box from the zero-axis hide above.
-    fn has_axis_padding(&self, id: NodeId, vertical: bool) -> bool {
-        let props: [&str; 2] = if vertical {
-            ["padding-top", "padding-bottom"]
-        } else {
-            ["padding-left", "padding-right"]
-        };
-        props.iter().any(|p| {
-            self.cascaded(id, p)
-                .as_deref()
-                .is_some_and(|v| !css_len_is_zero(v))
-        })
     }
 
     /// The element's effective opacity for visibility: its cascaded `opacity`
@@ -3882,6 +3899,25 @@ impl Dom {
     /// never `None` for a known element, so the layout can route the CSS table
     /// formatting context off a bare HTML `<table>` with no CSS at all.
     pub fn effective_display(&self, id: NodeId) -> Option<String> {
+        let display = self.effective_display_before_blockification(id)?;
+        // CSS Display 3 #root: this applies to every Document root, including
+        // a child navigable, not to every element named `html`.
+        if self.is_document_element(id) {
+            return Some(match display.as_str() {
+                "contents" | "inline" | "table-cell" | "table-row" | "table-row-group"
+                | "table-header-group" | "table-footer-group" | "table-column"
+                | "table-column-group" | "table-caption" => "block".into(),
+                "inline-block" => "flow-root".into(),
+                "inline-flex" => "flex".into(),
+                "inline-grid" => "grid".into(),
+                "inline-table" => "table".into(),
+                _ => display,
+            });
+        }
+        Some(display)
+    }
+
+    fn effective_display_before_blockification(&self, id: NodeId) -> Option<String> {
         if let Some(d) = self.computed_display(id) {
             // CSS Overflow 4 #continue: the legacy vertical line-clamp
             // combination computes to an independent block formatting context.
@@ -4115,6 +4151,9 @@ impl Dom {
     /// here, so a property inherits everywhere by being marked `inherited`
     /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
+        if name == "display" {
+            return self.effective_display(id);
+        }
         if let Some(physical) = self.logical_property(id, None, name) {
             return self.computed_value(id, &physical);
         }
@@ -4400,7 +4439,7 @@ impl Dom {
         }
         let units = compute();
         // Anonymous/synthetic layout ids must never grow a node-indexed cache.
-        if id < self.nodes.len() {
+        if self.is_valid(id) {
             self.font_units_cache
                 .borrow_mut()
                 .put(id, self.style_value_epoch, (font_epoch, units));
@@ -4424,6 +4463,19 @@ impl Dom {
     pub(crate) fn document_element(&self) -> Option<NodeId> {
         self.child_iter(DOCUMENT)
             .find(|&c| self.tag_name(c).is_some())
+    }
+
+    /// DOM document-element identity, without crossing a child navigable or
+    /// treating a shadow root / arbitrary `html` element as a Document root.
+    pub(crate) fn is_document_element(&self, id: NodeId) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            node.parent == Some(node.owner_document)
+                && self.tag_name(id).is_some()
+                && self
+                    .child_iter(node.owner_document)
+                    .find(|&child| self.tag_name(child).is_some())
+                    == Some(id)
+        })
     }
 
     /// The root element's computed `font-size` in CSS px — the `rem` basis.
@@ -5638,13 +5690,11 @@ impl Dom {
     /// either — ancestor walks stop at fragment roots).
     fn tree_scope(&self, id: NodeId) -> NodeId {
         let mut cur = id;
+        if matches!(self.nodes[cur].data, NodeData::Document) {
+            return cur;
+        }
         while let Some(p) = self.nodes[cur].parent {
-            // A nested navigable's active document is a distinct tree scope.
-            // TRust retains it below the iframe owner in one arena, so use the
-            // owner as the scope key without making the owner itself part of
-            // the child document's author cascade.
-            if matches!(self.tag_name(p), Some("iframe" | "frame")) && self.frame_body(p).is_some()
-            {
+            if matches!(self.nodes[p].data, NodeData::Document) {
                 return p;
             }
             cur = p;
@@ -5663,7 +5713,7 @@ impl Dom {
         let scope = self.tree_scope(id);
         if self.tag_name(id) != Some("img")
             && let Some(name) = self.attr(id, "form")
-            && self.is_connected(id)
+            && self.is_dom_connected(id)
         {
             if name.is_empty() {
                 return None;
@@ -5675,9 +5725,9 @@ impl Dom {
         }
         let mut parent = self.nodes[id].parent;
         while let Some(node) = parent {
-            // An iframe is only an arena parent, not a DOM ancestor of its
-            // content Document. Detached form roots still count as ancestors.
-            if node == scope && matches!(self.tag_name(node), Some("iframe" | "frame")) {
+            // The child Document is the DOM root even though its presentation arena parent is
+            // an iframe. Detached form roots still count as ordinary ancestors.
+            if matches!(self.nodes[node].data, NodeData::Document) {
                 break;
             }
             if is_form(node) {
@@ -5831,7 +5881,8 @@ impl Dom {
                     .shadow_hosts
                     .get(&scope)
                     .and_then(|host| sets.get(&self.tree_scope(*host)));
-                let child_document = matches!(self.tag_name(scope), Some("iframe" | "frame"));
+                let child_document =
+                    scope != DOCUMENT && matches!(self.nodes[scope].data, NodeData::Document);
                 if !fonts.is_empty() || child_document || parent.is_some() {
                     let foreground =
                         !child_document && self.registration_document(scope) == DOCUMENT;
@@ -5847,8 +5898,8 @@ impl Dom {
     /// and crosses to its host; separate Document trees do not inherit.
     fn style_parent(&self, id: NodeId) -> Option<NodeId> {
         let parent = self.parent_flat(id)?;
-        if matches!(self.tag_name(parent), Some("iframe" | "frame"))
-            && self.frame_body(parent).is_some()
+        if matches!(self.nodes[id].data, NodeData::Document)
+            || matches!(self.nodes[parent].data, NodeData::Document)
         {
             None
         } else {
@@ -5898,9 +5949,7 @@ impl Dom {
         let mut layer_regs: std::collections::HashMap<NodeId, LayerRegistry> =
             std::collections::HashMap::new();
         for id in self.composed_descendants(DOCUMENT) {
-            if matches!(self.tag_name(id), Some("iframe" | "frame"))
-                && self.frame_body(id).is_some()
-            {
+            if id != DOCUMENT && matches!(self.nodes[id].data, NodeData::Document) {
                 // Each content Document has an independent font environment,
                 // including when it declares no downloadable fonts at all.
                 font_faces.entry(id).or_default();
@@ -6339,6 +6388,7 @@ impl Dom {
         let owner_document = self.nodes[host].owner_document;
         self.set_owner_document_subtree(root, owner_document);
         self.shadow_roots.insert(host, root);
+        self.nodes.remember(host);
         self.shadow_hosts.insert(root, host);
         self.shadow_data
             .insert(root, shadow::ShadowRootData::default());
@@ -6353,7 +6403,8 @@ impl Dom {
     /// Parent in the COMPOSED tree: shadow roots hand off to their host
     /// (event paths and ancestor checks cross shadow boundaries).
     pub fn parent_composed(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes[id]
+        self.nodes
+            .get(id)?
             .parent
             .or_else(|| self.shadow_hosts.get(&id).copied())
     }
@@ -6370,6 +6421,22 @@ impl Dom {
                 return true;
             }
             cur = self.parent_composed(c);
+        }
+        false
+    }
+
+    /// DOM #connected: any Document is a shadow-including root, including inactive Documents.
+    /// Keep this distinct from `is_connected`, the top-level presentation/invalidation predicate.
+    pub(crate) fn is_dom_connected(&self, id: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(id) = current {
+            let Some(node) = self.nodes.get(id) else {
+                return false;
+            };
+            if matches!(node.data, NodeData::Document) {
+                return true;
+            }
+            current = self.parent_composed(id);
         }
         false
     }
@@ -6625,6 +6692,9 @@ impl Dom {
         }
         let mut stack: Vec<NodeId> = vec![root];
         while let Some(id) = stack.pop() {
+            if id != root && matches!(self.nodes[id].data, NodeData::Document) {
+                continue;
+            }
             if self.tag_name(id) == Some(name) {
                 out.push(id);
             }
@@ -6646,6 +6716,9 @@ impl Dom {
         }
         let mut stack: Vec<NodeId> = vec![root];
         while let Some(id) = stack.pop() {
+            if id != root && matches!(self.nodes[id].data, NodeData::Document) {
+                continue;
+            }
             if self.tag_name(id).is_some_and(|t| t.contains('-')) {
                 out.push(id);
             }
@@ -6694,11 +6767,21 @@ impl Dom {
     /// an `<iframe>`, whose children the HTML parser treats as RAWTEXT. `None`
     /// for an unrealized or cross-origin frame.
     pub fn frame_body(&self, id: NodeId) -> Option<NodeId> {
-        let html = self
-            .child_iter(id)
-            .find(|&c| self.tag_name(c) == Some("html"))?;
+        let html = self.frame_root(id)?;
         self.child_iter(html)
             .find(|&c| self.tag_name(c) == Some("body"))
+    }
+
+    pub(crate) fn frame_root(&self, frame: NodeId) -> Option<NodeId> {
+        self.child_iter(self.frame_document(frame)?)
+            .find(|&child| self.tag_name(child).is_some())
+    }
+
+    /// HTML #creating-a-new-browsing-context: each navigation creates a real, distinct
+    /// Document. Its arena parent is a presentation-only edge to the navigable container.
+    pub(crate) fn frame_document(&self, frame: NodeId) -> Option<NodeId> {
+        self.child_iter(frame)
+            .find(|&id| matches!(self.nodes[id].data, NodeData::Document))
     }
 
     /// The nearest iframe/frame whose active nested document contains `id`.
@@ -6709,6 +6792,14 @@ impl Dom {
     /// Walking the composed parent chain also keeps shadow-tree descendants in
     /// their containing document without exposing a deeper nested document.
     pub fn frame_owner(&self, id: NodeId) -> Option<NodeId> {
+        // Ownership does not depend on being inserted. A detached node created in a child
+        // Window keeps that Document until adoption, including shadow descendants.
+        let document = self.nodes.get(id)?.owner_document;
+        if let Some(parent) = self.nodes.get(document)?.parent {
+            if matches!(self.tag_name(parent), Some("iframe" | "frame")) {
+                return Some(parent);
+            }
+        }
         let mut current = Some(id);
         while let Some(node) = current {
             let parent = self.parent_composed(node)?;
@@ -6817,6 +6908,17 @@ impl Dom {
         out.push('>');
     }
 
+    fn write_serialized_frame_root_open(&self, root: NodeId, out: &mut String) {
+        // HTML elements cannot be nested in serialized HTML. Preserve the
+        // child Document's root as a presentation-only box with its computed
+        // styles; layout recognizes its independent formatting boundary.
+        out.push_str("<div data-trust-frame-root=\"\" style=\"");
+        let mut style = self.attr(root, "style").unwrap_or("").to_string();
+        append_style(&mut style, &self.baked_element_style(root, true));
+        out.push_str(&escape_attr(&style));
+        out.push_str("\">");
+    }
+
     /// Load `html` as an iframe's nested document (the HTML "navigate an
     /// `iframe` or `frame`" step, for src + srcdoc). The fetched bytes are
     /// parsed as a FULL HTML document and installed as the frame's content
@@ -6857,21 +6959,24 @@ impl Dom {
             .children(DOCUMENT)
             .into_iter()
             .find(|&c| doc.tag_name(c) == Some("html"))?;
-        // Discard the previous content navigable (arenas only grow; the old
-        // subtree is just unlinked).
+        // Retained old Documents keep their old trees. Joint GC, not navigation, decides
+        // when unreachable prior documents and their detached nodes can be reclaimed.
         for c in self.children(frame) {
-            self.detach(c);
+            if matches!(self.nodes[c].data, NodeData::Document) {
+                self.detach(c);
+            }
         }
+        let document = self.create_document(doc.document_content_type(DOCUMENT));
         let new_html = self.transplant(doc, src_html);
-        self.append(frame, new_html);
+        self.append(document, new_html);
+        self.append(frame, document);
         self.document_modes
-            .insert(frame, doc.document_mode(DOCUMENT));
-        self.properties.javascript.remove(&frame);
-        self.properties.document_bases.remove(&frame);
-        self.adopted_styles.remove(&frame);
-        self.properties.adopted_sources.remove(&frame);
+            .insert(document, doc.document_mode(DOCUMENT));
         if let Ok(base_url) = url::Url::parse(base) {
             self.absolutize_subtree_urls(new_html, &base_url);
+            self.properties
+                .document_bases
+                .insert(document, base_url.clone());
             self.properties.document_bases.insert(frame, base_url);
         }
         self.frame_body(frame)
@@ -7152,6 +7257,10 @@ impl Dom {
         }
         if deep {
             for c in self.children(id) {
+                // A child navigable's Document is a presentation child, not a DOM child.
+                if matches!(self.nodes[c].data, NodeData::Document) {
+                    continue;
+                }
                 let cc = self.clone_subtree(c, true);
                 self.append(copy, cc);
             }
@@ -7469,6 +7578,11 @@ impl Dom {
     /// that SVG's `<defs>` so the authored `<use>` resolves without changing
     /// the canonical DOM.
     fn svg_render_markup(&self, id: NodeId, base: Option<&url::Url>) -> Option<String> {
+        let local_target = self.local_svg_use_target(id);
+        let proof = self.svg_input_dependencies(id, local_target, true);
+        // Publish negative/unresolved lookups too: a parent box may cache the
+        // absence of an image until a later ID insertion makes it renderable.
+        self.svg_dependencies.borrow_mut().publish(id, proof);
         let external = self.svg_sprite_ref(id);
         let mut svg = if let Some((file, frag)) = &external {
             // Keep the authored outer SVG and <use> boxes/paint/transforms.
@@ -7478,7 +7592,7 @@ impl Dom {
                 return None;
             }
             self.serialize_svg_for_image(id)
-        } else if let Some(target) = self.local_svg_use_target(id) {
+        } else if let Some(target) = local_target {
             let mut outer = self.serialize(id);
             if !self.descendants(id).any(|node| node == target) {
                 let open = outer.find('>')? + 1;
@@ -7717,7 +7831,12 @@ impl Dom {
                 .and_then(|b| b.join(&file).ok())
                 .is_some_and(|abs| sprite_has_symbol(abs.as_str(), &frag));
         }
-        self.local_svg_use_target(id).is_some() || self.svg_is_renderable(id)
+        let target = self.local_svg_use_target(id);
+        let proof = self.svg_input_dependencies(id, target, false);
+        self.svg_dependencies
+            .borrow_mut()
+            .publish_candidate(id, proof);
+        target.is_some() || self.svg_is_renderable(id)
     }
 
     /// Whether the subtree under `id` (inclusive) will PAINT an icon in the
@@ -8035,10 +8154,21 @@ impl Dom {
                     out.push_str("<div data-trust-frame=\"\" style=\"");
                     out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
                     out.push_str("\">");
-                    if let Some(body) = self.frame_body(id) {
-                        self.write_serialized_frame_body_open(body, out);
-                        for c in self.child_iter(body) {
-                            self.serialize_node_inner(c, None, js_serialization, out);
+                    if let Some(root) = self.frame_root(id) {
+                        self.write_serialized_frame_root_open(root, out);
+                        for child in self.child_iter(root) {
+                            if self.effective_display(child).as_deref() == Some("none") {
+                                continue;
+                            }
+                            if self.tag_name(child) == Some("body") {
+                                self.write_serialized_frame_body_open(child, out);
+                                for c in self.child_iter(child) {
+                                    self.serialize_node_inner(c, None, js_serialization, out);
+                                }
+                                out.push_str("</div>");
+                            } else {
+                                self.serialize_node_inner(child, None, js_serialization, out);
+                            }
                         }
                         out.push_str("</div>");
                     }
@@ -8140,13 +8270,23 @@ impl Dom {
             out.push_str("<div data-trust-frame=\"\" style=\"");
             out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
             out.push_str("\">");
-            if let Some(body) = self.frame_body(id) {
-                self.write_serialized_frame_body_open(body, out);
-                for c in self.child_iter(body) {
-                    // A child navigable starts a new document/tree scope. It
-                    // cannot inherit a shadow host or anchor context from the
-                    // element that embeds it in the parent document.
-                    self.serialize_live_node(c, None, clickable, false, out);
+            if let Some(root) = self.frame_root(id) {
+                self.write_serialized_frame_root_open(root, out);
+                for child in self.child_iter(root) {
+                    if self.effective_display(child).as_deref() == Some("none") {
+                        continue;
+                    }
+                    if self.tag_name(child) == Some("body") {
+                        self.write_serialized_frame_body_open(child, out);
+                        for c in self.child_iter(child) {
+                            // A child navigable starts a new document/tree
+                            // scope, independent of its owner's shadow/anchor.
+                            self.serialize_live_node(c, None, clickable, false, out);
+                        }
+                        out.push_str("</div>");
+                    } else {
+                        self.serialize_live_node(child, None, clickable, false, out);
+                    }
                 }
                 out.push_str("</div>");
             }
@@ -8636,6 +8776,9 @@ impl Dom {
     pub fn query(&self, root: NodeId, selectors: &SelectorList, first_only: bool) -> Vec<NodeId> {
         let mut out = Vec::new();
         for d in self.descendants(root) {
+            if self.nodes[d].owner_document != self.nodes[root].owner_document {
+                continue;
+            }
             // ParentNode queries only return elements. Avoid entering the full
             // selector matcher for text/comments in mixed-content trees.
             let Some(tag) = self.tag_name(d) else {
@@ -9320,12 +9463,11 @@ impl Dom {
     /// SUBTREE (descendant/child leading combinator) or the following-sibling
     /// forest (`+`/`~`), testing each candidate against the `:scope`-anchored
     /// relative complex with `scope = subject`. Iterative (no deep recursion),
-    /// early-exits on the first match, and bounded by `HAS_MAX_VISITS` so a
-    /// pathological `*:has(*)` on a huge subtree can't blow up (the cap is a
-    /// hostile-page backstop far above any real selector's reach).
+    /// early-exits on the first match. Selectors 4 #relational requires the
+    /// complete finite candidate set: a cache/work budget must never silently
+    /// turn a late match into false. Nested :has() is rejected by the parser.
     fn matches_has(&self, subject: NodeId, h: &HasArg, mut scope: SelectorContext<'_>) -> bool {
         scope.scope = Some(subject);
-        const HAS_MAX_VISITS: usize = 8192;
         let mut stack: Vec<NodeId> = if h.sibling {
             if scope.shadow_host == Some(subject) {
                 return false;
@@ -9346,12 +9488,7 @@ impl Dom {
             .filter(|&c| self.tag_name(c).is_some())
             .collect()
         };
-        let mut budget = HAS_MAX_VISITS;
         while let Some(node) = stack.pop() {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
             if self.matches_complex_in(node, &h.complex.0, scope) {
                 return true;
             }
@@ -10216,6 +10353,14 @@ type SpriteTable = std::sync::Arc<FxHashMap<String, String>>;
 static SPRITE_SHEETS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, SpriteTable>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// Availability changes must invalidate cached negative use results, including
+// parent boxes and CSSOM geometry. At most MAX_SPRITE_SHEETS immutable insertions
+// advance this counter; there is no wrapping-generation ambiguity.
+static SVG_SPRITE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn svg_sprite_revision() -> u64 {
+    SVG_SPRITE_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Cap on cached sprite sheets — a hostile-page lid, not a real limit (a design
 /// system ships one or two sheets). Sheets can be ~600KB each.
@@ -10242,8 +10387,9 @@ pub fn prime_sprite_sheet(abs_url: &str, text: &str) {
     }
     let table = build_sprite_symbols(text);
     let mut sheets = SPRITE_SHEETS.lock().unwrap();
-    if sheets.len() < MAX_SPRITE_SHEETS {
+    if sheets.len() < MAX_SPRITE_SHEETS && !sheets.contains_key(abs_url) {
         sheets.insert(abs_url.to_string(), std::sync::Arc::new(table));
+        SVG_SPRITE_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -11149,16 +11295,17 @@ const PROPS: &[PropDef] = &[
     prop("background-clip", false, true),
     prop("background-attachment", false, true),
     prop("position", false, true),
-    // CSS Transforms 1: only the TRANSLATE functions are consumed (a paint
-    // offset on out-of-flow composited boxes — `layout::translate_offset`);
-    // scale/rotate/matrix stay unapplied (visual-only deviation). Baked so
-    // the live-page re-parse keeps a JS-set slide-in offset.
+    // CSS Transforms 1/2: visual-space values are retained separately from
+    // normal-flow positions and survive live-page presentation snapshots.
     prop("transform", false, true),
     prop("transform-origin", false, true),
+    prop("transform-box", false, true),
     // CSS Transforms 2 individual transform property (the modern
     // `translate: x y`); like `transform`, any non-none value forms a
     // stacking context and a containing block for out-of-flow descendants.
     prop("translate", false, true),
+    prop("rotate", false, true),
+    prop("scale", false, true),
     prop("mix-blend-mode", false, true),
     prop("isolation", false, true),
     prop("filter", false, true),
@@ -11261,12 +11408,19 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "text-orientation" => Some("mixed"),
         // CSS Display 4 #visibility: inherited, initial visible.
         "visibility" => Some("visible"),
+        // CSS Overflow 3 #overflow-control and CSSOM #resolved-values:
+        // the lack of an authored overflow value is `visible`, not an empty
+        // string. A non-clipping box can have a large scrolling area; scripts
+        // must be able to distinguish it from an actual scroll container.
+        "overflow" | "overflow-x" | "overflow-y" => Some("visible"),
         // CSS UI 4 #pointer-events-control / SVG 2 #PointerEventsProp:
         // inherited, initial auto (also for SVG's extended value grammar).
         "pointer-events" => Some("auto"),
         "overscroll-behavior-x" | "overscroll-behavior-y" => Some("auto"),
         // CSS Transforms 1 #transform-property: non-inherited, initial none.
-        "transform" => Some("none"),
+        "transform" | "translate" | "rotate" | "scale" => Some("none"),
+        "transform-origin" => Some("50% 50%"),
+        "transform-box" => Some("view-box"),
         "position" => Some("static"),
         "anchor-name" => Some("none"),
         "text-wrap-mode" => Some("wrap"),
@@ -11340,27 +11494,6 @@ fn ua_display(tag: &str) -> &'static str {
         | "template" | "source" | "track" | "datalist" => "none",
         _ => "inline",
     }
-}
-
-/// Whether a CSS length is ≤ 1px — the box size of the "sr-only" visually
-/// hidden clip idiom. Only unitless `0`/`1` and `px` lengths qualify; `em`,
-/// `%`, `auto`, etc. are not the pattern and return `false`.
-fn css_len_at_most_1px(v: &str) -> bool {
-    let v = v.trim();
-    let n = v.strip_suffix("px").unwrap_or(v).trim();
-    n.parse::<f32>().is_ok_and(|x| x <= 1.0)
-}
-
-/// Whether a CSS length/percentage is exactly zero (`0`, `0px`, `0%`, `0em`,
-/// …) — its leading numeric part parses to 0. `auto`/empty/`calc(…)`/
-/// non-numeric → false (we can't prove those zero, so we never hide on them).
-fn css_len_is_zero(v: &str) -> bool {
-    let num: String = v
-        .trim()
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
-        .collect();
-    !num.is_empty() && num.parse::<f32>().map(|n| n == 0.0).unwrap_or(false)
 }
 
 /// Classify an element's OWN `font-size` declaration for the zero-size
@@ -15859,6 +15992,9 @@ impl TreeSink for Sink {
         if dom.nodes.len() > 1 {
             dom.touch();
         }
+        // Parser handles do not escape this completed parse. Connected trees are native roots;
+        // binding-created nodes acquire their own short-lived leases when allocated later.
+        dom.clear_gc_allocation_leases();
         dom
     }
 
@@ -16664,11 +16800,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_size_replaced_element_hidden_via_rule_and_baked() {
-        // Mastodon collapses images inside `.invisible` with a RULE (a descendant
-        // combinator + !important), not inline — `.invisible img{width:0!important;
-        // height:0!important}`. The cascade must resolve it, is_hidden must hide the
-        // img, and the JS render path must bake the zero so the re-parse hides it too.
+    fn zero_size_replaced_element_preserves_its_box_and_dimensions() {
+        // CSSOM View includes zero-area border boxes. Preserve the node and
+        // cascaded dimensions in both canonical and serialized layout paths.
         let dom = Dom::parse_document(
             "<head><style>.invisible img,.invisible svg\
              {width:0 !important;height:0 !important}</style></head>\
@@ -16681,13 +16815,15 @@ mod tests {
             Some("0"),
             "rule height"
         );
-        assert!(dom.is_hidden(i), "zero-sized img not hidden");
-        // The render path drops a hidden node entirely, so the re-parsed layout
-        // arena never sees the collapsed img (no baked sliver to clamp to 1 cell).
+        assert!(!dom.is_hidden(i), "zero-sized img still generates a box");
         let html = dom.serialize(DOCUMENT);
         assert!(
-            !html.contains("<img"),
-            "zero-sized img leaked into render HTML: {html}"
+            html.contains("<img"),
+            "zero-sized img was discarded: {html}"
+        );
+        assert!(
+            html.contains("width:0") && html.contains("height:0"),
+            "{html}"
         );
     }
 
@@ -18295,11 +18431,13 @@ mod tests {
         let mut dom = Dom::parse_document("<body id=outer></body>");
         let outer = dom.get_by_id("outer").unwrap();
         let frame = dom.create_element("iframe");
+        let child_document = dom.create_document("text/html");
         let html = dom.create_element("html");
         let body = dom.create_element("body");
         let child = dom.create_element("p");
         dom.append(outer, frame);
-        dom.append(frame, html);
+        dom.append(frame, child_document);
+        dom.append(child_document, html);
         dom.append(html, body);
         dom.append(body, child);
         let _ = dom.take_dirty_targets();
@@ -18908,8 +19046,12 @@ mod tests {
             .descendants(DOCUMENT)
             .find(|&id| snapshot.attr(id, "data-trust-frame").is_some())
             .expect("serialized iframe viewport");
-        let body = snapshot
+        let root = snapshot
             .child_iter(outer)
+            .find(|&id| snapshot.attr(id, "data-trust-frame-root").is_some())
+            .expect("serialized child document root box");
+        let body = snapshot
+            .child_iter(root)
             .find(|&id| snapshot.attr(id, "data-trust-frame-body").is_some())
             .expect("serialized child body formatting box");
         assert_eq!(
@@ -19000,7 +19142,7 @@ mod tests {
         let parent = dom.get_by_id("parent").unwrap();
         let child = dom.get_by_id("child").unwrap();
         let child_html = dom
-            .child_iter(frame)
+            .child_iter(dom.frame_document(frame).unwrap())
             .find(|&node| dom.tag_name(node) == Some("html"))
             .unwrap();
 
@@ -19025,6 +19167,46 @@ mod tests {
         assert!(
             !dom.matches(child, &SelectorList::parse("iframe p").unwrap()),
             "selector ancestry stops at the child document element"
+        );
+    }
+
+    #[test]
+    fn iframe_native_documents_preserve_detached_ownership_across_navigation() {
+        let mut dom = Dom::parse_document("<iframe id=f></iframe>");
+        let frame = dom.get_by_id("f").unwrap();
+        let old_body = dom
+            .install_frame_document(frame, "<p id=old>old</p>", "https://old.test/")
+            .unwrap();
+        let old_document = dom.frame_document(frame).unwrap();
+        assert_ne!(old_document, frame);
+        assert!(matches!(dom.node(old_document).data, NodeData::Document));
+        assert_eq!(dom.owner_document(old_body), Some(old_document));
+        let detached = dom.create_element("div");
+        dom.adopt_node(old_document, detached).unwrap();
+        let shadow = dom.attach_shadow(detached);
+        assert_eq!(dom.owner_document(shadow), Some(old_document));
+        assert_eq!(dom.frame_owner(detached), Some(frame));
+        let new_body = dom
+            .install_frame_document(frame, "<p id=new>new</p>", "https://new.test/")
+            .unwrap();
+        let new_document = dom.frame_document(frame).unwrap();
+        assert_ne!(old_document, new_document);
+        assert_eq!(dom.owner_document(old_body), Some(old_document));
+        assert_eq!(dom.owner_document(new_body), Some(new_document));
+        assert!(dom.node(old_document).parent.is_none());
+        assert!(dom.descendants(old_document).any(|id| id == old_body));
+        assert_eq!(dom.owner_document(detached), Some(old_document));
+        dom.adopt_node(new_document, detached).unwrap();
+        assert_eq!(dom.owner_document(shadow), Some(new_document));
+        assert_eq!(dom.frame_owner(detached), Some(frame));
+        assert!(
+            dom.query(DOCUMENT, &SelectorList::parse("p").unwrap(), false)
+                .is_empty()
+        );
+        assert_eq!(
+            dom.query(new_document, &SelectorList::parse("p").unwrap(), false)
+                .len(),
+            1
         );
     }
 
@@ -19759,6 +19941,92 @@ mod tests {
     }
 
     #[test]
+    fn box_generation_memo_distinguishes_contents_and_survives_state_changes() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+                #x { display:var(--display, inline) }
+                #x:hover { display:contents }
+            </style><div id=x></div><slot id=slot></slot>"#,
+        );
+        let x = dom.get_by_id("x").unwrap();
+        let slot = dom.get_by_id("slot").unwrap();
+        assert!(!dom.is_hidden(slot));
+        assert!(!dom.generates_principal_box(slot));
+        for (display, hidden, principal) in [
+            ("contents", false, false),
+            ("none", true, false),
+            ("inline", false, true),
+            ("block", false, true),
+        ] {
+            dom.set_attr(x, "style", &format!("--display:{display}"));
+            // Populate through either consumer, then read through the other.
+            assert_eq!(dom.is_hidden(x), hidden);
+            assert_eq!(dom.generates_principal_box(x), principal);
+            assert_eq!(dom.generates_principal_box(x), principal);
+        }
+        dom.set_hover_chain(Some(x));
+        assert!(!dom.generates_principal_box(x));
+        assert!(!dom.is_hidden(x));
+        dom.set_hover_chain(None);
+        assert!(dom.generates_principal_box(x));
+    }
+
+    #[test]
+    fn image_completion_changes_geometry_not_dom_style_or_selector_state() {
+        let mut dom = Dom::parse_document(
+            "<style>img:empty{color:red}div:has(img){counter-increment:images}div::before{content:counter(images)}</style><div id=panel><img id=image src=one.png></div>",
+        );
+        let image = dom.get_by_id("image").unwrap();
+        let panel = dom.get_by_id("panel").unwrap();
+        let matches = dom.matched_rules(image);
+        let generated = dom.pseudo_content(panel, PseudoEl::Before);
+        assert!(generated.is_some());
+        let (epoch, names, style, selectors, presentation) = (
+            dom.epoch,
+            dom.window_names_epoch,
+            dom.style_value_epoch,
+            dom.selector_epoch,
+            dom.layout_presentation_epoch,
+        );
+        dom.take_dirty();
+        dom.take_dirty_targets();
+        dom.take_geometry_dirty_targets();
+        dom.image_changed(image);
+        assert_eq!(
+            (
+                dom.epoch,
+                dom.window_names_epoch,
+                dom.style_value_epoch,
+                dom.selector_epoch
+            ),
+            (epoch, names, style, selectors)
+        );
+        assert_ne!(dom.layout_presentation_epoch, presentation);
+        assert!(std::rc::Rc::ptr_eq(&matches, &dom.matched_rules(image)));
+        assert_eq!(dom.pseudo_content(panel, PseudoEl::Before), generated);
+        assert!(dom.take_dirty());
+        assert_eq!(
+            dom.take_dirty_targets(),
+            Some(vec![(image, DirtyKind::Attr)])
+        );
+        assert_eq!(
+            dom.take_geometry_dirty_targets(),
+            Some(vec![(image, DirtyKind::Attr)])
+        );
+
+        dom.detach(image);
+        dom.take_dirty();
+        dom.take_dirty_targets();
+        dom.take_geometry_dirty_targets();
+        let detached_presentation = dom.layout_presentation_epoch;
+        dom.image_changed(image);
+        assert_eq!(dom.layout_presentation_epoch, detached_presentation);
+        assert!(!dom.take_dirty());
+        assert_eq!(dom.take_dirty_targets(), Some(Vec::new()));
+        assert_eq!(dom.take_geometry_dirty_targets(), Some(Vec::new()));
+    }
+
+    #[test]
     fn font_units_cache_reuses_metrics_and_invalidates_dom_and_font_revisions() {
         use crate::layout2::Units;
         let mut dom = Dom::parse_document(
@@ -20178,12 +20446,9 @@ mod tests {
     }
 
     #[test]
-    fn visually_hidden_sr_only_is_dropped() {
-        // The universal screen-reader-only idiom (1px clipped absolutely
-        // positioned box) carries text invisible to sighted users — both the
-        // class form (Bootstrap/Tailwind `.sr-only`) and the inline form
-        // (archive.org's `aria-describedby` targets) must be hidden + dropped,
-        // while a normal sibling renders.
+    fn visually_hidden_boxes_are_retained_for_geometry_and_clipping() {
+        // CSS Overflow clips these boxes at paint. Neither accessibility text
+        // nor its CSSOM geometry may be erased from the formatting tree.
         let dom = Dom::parse_document(
             "<body>\
              <span id=a class=sr>screen reader only</span>\
@@ -20195,15 +20460,21 @@ mod tests {
         let a = dom.get_by_id("a").unwrap();
         let b = dom.get_by_id("b").unwrap();
         let c = dom.get_by_id("c").unwrap();
-        assert!(dom.is_hidden(a), "class .sr-only hidden");
-        assert!(dom.is_hidden(b), "inline sr-only hidden");
+        assert!(!dom.is_hidden(a), "clipped class box remains generated");
+        assert!(
+            !dom.is_hidden(b),
+            "clipped inline-style box remains generated"
+        );
         assert!(!dom.is_hidden(c), "normal content visible");
         let html = dom.serialize(DOCUMENT);
         assert!(
-            !html.contains("screen reader only"),
-            "class sr dropped: {html}"
+            html.contains("screen reader only"),
+            "class sr content retained: {html}"
         );
-        assert!(!html.contains("inline hidden"), "inline sr dropped: {html}");
+        assert!(
+            html.contains("inline hidden"),
+            "inline content retained: {html}"
+        );
         assert!(html.contains("visible"), "normal kept: {html}");
         // A wider absolutely-positioned overflow-hidden box is NOT sr-only.
         let dom2 = Dom::parse_document(
@@ -20241,11 +20512,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_axis_overflow_hidden_box_is_hidden_but_padding_ratio_box_renders() {
-        // A box collapsed to zero on an axis with `overflow:hidden` on that
-        // axis clips ALL its content — Steam's `.menu_takeover_background`
-        // preload copy of the banner (`height:0;overflow:hidden`) drew a
-        // full-width 1-row sliver. Hide it (and its image child).
+    fn zero_axis_overflow_boxes_retain_their_content_for_layout() {
+        // CSS Overflow 3 clips the padding box; it never removes descendants
+        // from layout, CSSOM geometry or the programmatic scrolling area.
         let dom = Dom::parse_document(
             "<body>\
              <div id=a style=\"height:0;overflow:hidden\"><img src=banner.jpg></div>\
@@ -20257,12 +20526,9 @@ mod tests {
              </body>",
         );
         let g = |i| dom.get_by_id(i).unwrap();
-        assert!(dom.is_hidden(g("a")), "height:0 + overflow:hidden hidden");
-        assert!(
-            dom.is_hidden(g("b")),
-            "max-height:0 + overflow:hidden hidden"
-        );
-        assert!(dom.is_hidden(g("c")), "width:0 + overflow-x:hidden hidden");
+        assert!(!dom.is_hidden(g("a")), "height:0 is not display:none");
+        assert!(!dom.is_hidden(g("b")), "max-height:0 is not display:none");
+        assert!(!dom.is_hidden(g("c")), "width:0 is not display:none");
         // The responsive-image intrinsic-ratio box (padding reserves height)
         // is NOT empty — its absolutely-positioned child fills the padding box.
         assert!(
@@ -20280,8 +20546,8 @@ mod tests {
         );
         let html = dom.serialize(DOCUMENT);
         assert!(
-            !html.contains("banner.jpg"),
-            "hidden banner dropped: {html}"
+            html.contains("banner.jpg"),
+            "clipped content retained: {html}"
         );
         assert!(html.contains("tile.jpg"), "ratio-box image kept: {html}");
     }

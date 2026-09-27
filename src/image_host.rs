@@ -105,6 +105,15 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     if op != "load" {
         return Ok(Value::Null);
     }
+    // HTML e5071a20 #updating-the-image-data: while this algorithm runs the node document
+    // strongly retains the element. Do not depend on the JS reaction retaining its wrapper:
+    // allocation and Realm entry can collect before the completion reaction is installed.
+    let native_lease = if selected.is_some() {
+        state.dom_gc.start_resource(id);
+        Some(state.dom_gc.resource_lease(id))
+    } else {
+        None
+    };
     let (promise, resolve, _) = ctx.new_promise_with_resolvers();
     let Some(selected) = selected else {
         ctx.invoke(resolve, Value::Undefined, &[Value::Null])?;
@@ -193,9 +202,14 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let network = state.network.as_mut().expect("prepared network");
     let id = network.next_fetch_id;
     network.next_fetch_id += 1;
-    network
-        .pending_fetches
-        .insert(id, LumenPendingFetch { context, resolve });
+    network.pending_fetches.insert(
+        id,
+        LumenPendingFetch {
+            context,
+            resolve,
+            native_lease,
+        },
+    );
     cache.spawn(&handle, async move {
         let (data, timing) = if let Some(cached) = cached {
             match cached.await {

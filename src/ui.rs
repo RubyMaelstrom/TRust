@@ -191,6 +191,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     false,
                 );
             }
+            render_media_controls(frame, g, inner);
             // Scroll-position indicator on the right border, when the document
             // overflows the panel — plus a horizontal bar under each overflowing
             // carousel. Both are clickable/draggable (tracks recorded for the
@@ -513,7 +514,7 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
 fn item_kind_style(kind: crate::layout2::ItemKind) -> Style {
     use crate::layout2::ItemKind;
     match kind {
-        ItemKind::Link => Style::new().fg(theme::NEON_CYAN),
+        ItemKind::Link | ItemKind::MediaControl => Style::new().fg(theme::NEON_CYAN),
         ItemKind::Heading(1) => Style::new()
             .fg(theme::NEON_PINK)
             .add_modifier(Modifier::BOLD),
@@ -706,6 +707,77 @@ pub(crate) fn browser_rows<'a>(
 /// are placed at their box-relative columns; the box is clipped to the panel.
 /// Decoded images inside a rail overlay their reserved box (a fixed avatar/logo)
 /// just like the scrolling document's inline-image pass.
+fn render_media_controls(frame: &mut Frame, g: &BrowserView, inner: Rect) {
+    let mut paint = |row: &crate::layout2::Row,
+                     row_idx: usize,
+                     x: u16,
+                     y: u16,
+                     carousels: &[crate::layout2::Carousel],
+                     selected: Option<usize>| {
+        if y >= inner.height {
+            return;
+        }
+        for (index, col, width, cut) in
+            crate::layout2::media_control_columns(row, carousels, row_idx)
+        {
+            let col = x.saturating_add(col);
+            if col >= inner.width {
+                continue;
+            }
+            let width = width.min(inner.width - col);
+            let text = crate::layout2::slice_display(&row.items[index].text, cut, width as usize);
+            let mut style = Style::new()
+                .fg(theme::NEON_CYAN)
+                .bg(theme::BG)
+                .add_modifier(Modifier::BOLD);
+            if selected == Some(index)
+                || selected.and_then(|i| row.items.get(i)).is_some_and(|item| {
+                    item.node != crate::layout2::NO_NODE && item.node == row.items[index].node
+                })
+            {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            frame.render_widget(
+                Paragraph::new(text).style(style),
+                Rect::new(inner.x + col, inner.y + y, width, 1),
+            );
+        }
+    };
+    for y in 0..inner.height {
+        let row_idx = g.scroll + y as usize;
+        if row_idx >= g.doc.rows.len() {
+            break;
+        }
+        let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, row_idx);
+        paint(
+            &row,
+            row_idx,
+            0,
+            y,
+            &g.doc.carousels,
+            g.sel_item.filter(|(r, _)| *r == row_idx).map(|(_, i)| i),
+        );
+    }
+    for (fi, fixed) in g.doc.fixed.iter().enumerate() {
+        for (r, row) in fixed.rows.iter().enumerate() {
+            let y = fixed.row as usize + r;
+            if y >= inner.height as usize {
+                break;
+            }
+            paint(
+                row,
+                r,
+                fixed.col,
+                y as u16,
+                &[],
+                g.sel_fixed
+                    .filter(|(f, rr, _)| *f == fi && *rr == r)
+                    .map(|(_, _, i)| i),
+            );
+        }
+    }
+}
+
 fn render_fixed_layer(
     frame: &mut Frame,
     g: &BrowserView,
@@ -785,7 +857,12 @@ fn fixed_row_line(
 ) -> Line<'static> {
     // Keep the original index (the hit-test / `sel` addresses `row.items[i]`)
     // while placing left-to-right by column.
-    let mut items: Vec<(usize, &crate::layout2::Item)> = row.items.iter().enumerate().collect();
+    let mut items: Vec<(usize, &crate::layout2::Item)> = row
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.kind != crate::layout2::ItemKind::MediaControl)
+        .collect();
     items.sort_by_key(|(_, it)| it.col);
     let mut spans: Vec<Span> = Vec::new();
     let mut col = 0u16;

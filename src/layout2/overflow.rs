@@ -5,41 +5,83 @@ use super::flow::{Frag, FragKind};
 use super::{Dom, NO_NODE, NodeId, PxRect};
 use std::collections::HashMap;
 
+/// Computed overflow eligibility, independent of whether a frontend offers a
+/// scrollbar. In particular, hidden is programmatically scrollable; clip is
+/// not. CSS Overflow 3 #overflow-control (CSSWG snapshot 81c27f686901).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Overflow {
+    #[default]
+    Visible,
+    Clip,
+    Hidden,
+    Auto,
+    Scroll,
+}
+
+impl Overflow {
+    pub fn scrollable(self) -> bool {
+        matches!(self, Self::Hidden | Self::Auto | Self::Scroll)
+    }
+
+    pub fn user_scrollable(self) -> bool {
+        matches!(self, Self::Auto | Self::Scroll)
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "clip" => Self::Clip,
+            "hidden" => Self::Hidden,
+            "auto" | "overlay" => Self::Auto,
+            "scroll" => Self::Scroll,
+            _ => Self::Visible,
+        }
+    }
+
+    pub fn axes(cv: impl Fn(&str) -> Option<String>) -> [Self; 2] {
+        let shorthand = cv("overflow").unwrap_or_default();
+        let mut tokens = shorthand.split_whitespace();
+        let x = tokens.next().unwrap_or("visible");
+        let y = tokens.next().unwrap_or(x);
+        let mut axes = [
+            Self::parse(cv("overflow-x").as_deref().unwrap_or(x)),
+            Self::parse(cv("overflow-y").as_deref().unwrap_or(y)),
+        ];
+        let scrollable = axes.map(Self::scrollable);
+        for axis in 0..2 {
+            // The consulted draft supports single-axis scroll containers:
+            // visible becomes auto, whereas clip remains non-scrollable.
+            if scrollable[1 - axis] && axes[axis] == Self::Visible {
+                axes[axis] = Self::Auto;
+            }
+        }
+        axes
+    }
+}
+
 pub(super) fn overflow_axes(dom: &Dom, node: NodeId) -> [String; 2] {
     if node == NO_NODE {
         return ["visible".into(), "visible".into()];
     }
-    let shorthand = dom
-        .computed_value_resolved(node, "overflow")
-        .unwrap_or_else(|| "visible".into());
-    let mut tokens = shorthand.split_whitespace();
-    let x = tokens.next().unwrap_or("visible");
-    let y = tokens.next().unwrap_or(x);
-    let mut axes = [
-        dom.computed_value_resolved(node, "overflow-x")
-            .unwrap_or_else(|| x.into()),
-        dom.computed_value_resolved(node, "overflow-y")
-            .unwrap_or_else(|| y.into()),
-    ];
-    // CSS Overflow 3 #overflow-properties: visible/clip compute to
-    // auto/hidden when the other axis is a scrollable overflow value.
-    let scrollable = axes
-        .each_ref()
-        .map(|a| !matches!(a.as_str(), "visible" | "clip"));
-    for axis in 0..2 {
-        if scrollable[1 - axis] {
-            axes[axis] = match axes[axis].as_str() {
-                "visible" => "auto".into(),
-                "clip" => "hidden".into(),
-                _ => axes[axis].clone(),
-            };
+    Overflow::axes(|property| dom.computed_value_resolved(node, property)).map(|v| {
+        match v {
+            Overflow::Visible => "visible",
+            Overflow::Clip => "clip",
+            Overflow::Hidden => "hidden",
+            Overflow::Auto => "auto",
+            Overflow::Scroll => "scroll",
         }
-    }
-    axes
+        .into()
+    })
 }
 
 pub(super) fn viewport_overflow_source(dom: &Dom) -> Option<NodeId> {
-    let root = dom.document_element()?;
+    viewport_overflow_source_for(dom, dom.document_element()?)
+}
+
+pub(super) fn viewport_overflow_source_for(dom: &Dom, root: NodeId) -> Option<NodeId> {
+    if !dom.is_valid(root) {
+        return None;
+    }
     if dom.computed_value_resolved(root, "display").as_deref() == Some("none") {
         return None;
     }
@@ -69,6 +111,37 @@ pub(super) fn viewport_overflow_disabled(dom: &Dom) -> [bool; 2] {
     })
 }
 
+/// CSSOM View #scrolling-area and CSS Overflow 3 #scrolling: the origin is
+/// block-start/inline-start, or main-start/cross-start for a flex container.
+pub(crate) fn scroll_reverse(dom: &Dom, node: NodeId) -> [bool; 2] {
+    let rtl = dom.computed_value_resolved(node, "direction").as_deref() == Some("rtl");
+    let writing = dom
+        .computed_value_resolved(node, "writing-mode")
+        .unwrap_or_default();
+    let vertical = writing.starts_with("vertical-") || writing.starts_with("sideways-");
+    let mut reverse = if vertical {
+        [writing.ends_with("-rl"), rtl ^ (writing == "sideways-lr")]
+    } else {
+        [rtl, false]
+    };
+    if matches!(
+        dom.effective_display(node).as_deref(),
+        Some("flex" | "inline-flex")
+    ) {
+        let direction = dom
+            .computed_value_resolved(node, "flex-direction")
+            .unwrap_or_default();
+        let main = usize::from(vertical ^ direction.starts_with("column"));
+        if direction.ends_with("-reverse") {
+            reverse[main] = !reverse[main];
+        }
+        if dom.computed_value_resolved(node, "flex-wrap").as_deref() == Some("wrap-reverse") {
+            reverse[1 - main] = !reverse[1 - main];
+        }
+    }
+    reverse
+}
+
 #[derive(Default)]
 pub(super) struct ScrollAreas {
     pub nodes: HashMap<NodeId, PxRect>,
@@ -76,12 +149,20 @@ pub(super) struct ScrollAreas {
 }
 
 #[derive(Clone, Copy)]
-struct Edge(f32, f32);
+struct Edge(f32, f32, f32, f32);
 
 impl Edge {
+    fn point(x: f32, y: f32) -> Self {
+        Self(x, y, x, y)
+    }
+    fn rect(x: f32, y: f32, right: f32, bottom: f32) -> Self {
+        Self(right, bottom, x, y)
+    }
     fn union(&mut self, other: Self) {
         self.0 = self.0.max(other.0);
         self.1 = self.1.max(other.1);
+        self.2 = self.2.min(other.2);
+        self.3 = self.3.min(other.3);
     }
 }
 
@@ -113,7 +194,7 @@ impl ScrollAreas {
         escaping: &mut Vec<(bool, Edge)>,
     ) -> Edge {
         if matches!(f.kind, FragKind::Fixed(_) | FragKind::Oof(..)) {
-            return Edge(0., 0.);
+            return Edge::point(0., 0.);
         }
         if f.flow.hidden || f.flow.float_clip_end.is_some() {
             // CSS Overflow 4 #line-clamp-containers: these boxes retain
@@ -123,7 +204,7 @@ impl ScrollAreas {
             for child in &f.children {
                 self.walk(dom, child, viewport_source, false, escaping);
             }
-            return Edge(0., 0.);
+            return Edge::point(0., 0.);
         }
         let frame = f.node != NO_NODE && matches!(dom.tag_name(f.node), Some("iframe" | "frame"));
         let [top, right, bottom, left] = f.border;
@@ -132,28 +213,33 @@ impl ScrollAreas {
             (
                 content.x,
                 content.y,
-                Edge(content.x + content.width, content.y + content.height),
+                Edge::rect(
+                    content.x,
+                    content.y,
+                    content.x + content.width,
+                    content.y + content.height,
+                ),
             )
         } else {
             (
                 f.x + left,
                 f.y + top,
-                Edge(f.x + f.w - right, f.y + f.h - bottom),
+                Edge::rect(f.x + left, f.y + top, f.x + f.w - right, f.y + f.h - bottom),
             )
         };
         let mut area = end;
-        let mut flow_end = Edge(content.x, content.y);
+        let mut flow_end = Edge::point(content.x, content.y);
         let mut pending = Vec::new();
         for child in &f.children {
             let edge = self.walk(dom, child, viewport_source, false, &mut pending);
             area.union(edge);
             if edge.0 != 0. || edge.1 != 0. {
-                flow_end.union(Edge(child.x + child.w, child.y + child.h));
+                flow_end.union(Edge::point(child.x + child.w, child.y + child.h));
             }
         }
         // Preserve end padding after in-flow content at the final scroll
         // position, without adding it to an escaping positioned descendant.
-        area.union(Edge(
+        area.union(Edge::point(
             flow_end.0 + (end.0 - content.x - content.width).max(0.),
             flow_end.1 + (end.1 - content.y - content.height).max(0.),
         ));
@@ -175,11 +261,22 @@ impl ScrollAreas {
             }
         }
         if f.node != NO_NODE {
+            let reverse = scroll_reverse(dom, f.node);
+            let (left, right) = if reverse[0] {
+                (area.2.min(x), end.0)
+            } else {
+                (x, area.0)
+            };
+            let (top, bottom) = if reverse[1] {
+                (area.3.min(y), end.1)
+            } else {
+                (y, area.1)
+            };
             let rect = PxRect {
-                left: x as f64,
-                top: y as f64,
-                width: (area.0 - x).max(0.) as f64,
-                height: (area.1 - y).max(0.) as f64,
+                left: left as f64,
+                top: top as f64,
+                width: (right - left).max(0.) as f64,
+                height: (bottom - top).max(0.) as f64,
                 css_width: None,
                 css_height: None,
             };
@@ -206,23 +303,35 @@ impl ScrollAreas {
                     });
             if frame || paint_containment || axes[0] != "visible" {
                 area.0 = end.0;
+                area.2 = end.2;
             }
             if frame || paint_containment || axes[1] != "visible" {
                 area.1 = end.1;
+                area.3 = end.3;
             }
         }
         // A child's border box also contributes independently of its clipped
         // scrollable overflow. The box's own scrolling area excludes borders.
-        area.union(Edge(f.x + f.w, f.y + f.h));
+        area.union(Edge::rect(f.x, f.y, f.x + f.w, f.y + f.h));
+        // CSS Transforms 1 #transform-rendering: transforms extend, never
+        // shrink, overflow. The box's own scrolling area above is local and
+        // unscaled; its contribution to an ancestor includes both bounds.
+        if f.paint.transform.is_some() {
+            let r = super::transform::bounds(
+                super::transform::matrix(f),
+                crate::render::CssRect::new(area.2, area.3, area.0 - area.2, area.1 - area.3),
+            );
+            area.union(Edge::rect(r.x, r.y, r.x + r.width, r.y + r.height));
+        }
         if !root && f.node != NO_NODE {
             match dom.computed_value_resolved(f.node, "position").as_deref() {
                 Some("absolute") => {
                     escaping.push((false, area));
-                    return Edge(0., 0.);
+                    return Edge::point(0., 0.);
                 }
                 Some("fixed") => {
                     escaping.push((true, area));
-                    return Edge(0., 0.);
+                    return Edge::point(0., 0.);
                 }
                 _ => {}
             }

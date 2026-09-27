@@ -184,19 +184,141 @@ pub(crate) enum ColSpec {
     Pct(f32),
 }
 
-/// How deeply tables may nest before a table degrades to block-stacked
-/// content: past the lid the whole table subtree lays as ordinary blocks.
-/// A hard recursion lid on the box-tree build (and thus on the per-cell
-/// intrinsic/layout descents) so a pathologically deep table tree (some
-/// wikis nest navboxes very deep) can't overflow the stack.
-const MAX_TABLE_DEPTH: usize = 8;
+type CellRows = Vec<Vec<SharedBox>>;
 
-/// Hostile-input lid on one cell's occupancy footprint: `colspan` and
-/// `rowspan` are each clamped to 1000, but their PRODUCT drives the grid
-/// inserts, so the colspan (the visually meaningful axis) is kept and the
-/// rowspan clamped to fit this area (a page of `colspan=1000 rowspan=1000`
-/// cells would otherwise do 10^6 inserts per cell).
-const MAX_CELL_SPAN_AREA: usize = 10_000;
+#[cfg(test)]
+mod table_contract_tests {
+    use super::*;
+
+    fn table(html: &str, check: impl FnOnce(&Dom, &TableBox)) {
+        let dom = Dom::parse_document(&format!("<!doctype html>{html}"));
+        let base = Url::parse("https://tables.invalid/").unwrap();
+        let controls = ControlMap::new();
+        let mut builder = Builder {
+            dom: &dom,
+            base: &base,
+            controls: &controls,
+            forms: &[],
+            vp: Vp { w: 800., h: 600. },
+            lists: Vec::new(),
+            reuse: false,
+        };
+        let root = builder.table(dom.get_by_id("table").unwrap());
+        let Content::Table(table) = &root.content else {
+            panic!("table must remain a table")
+        };
+        check(&dom, table);
+    }
+
+    #[test]
+    fn zero_rowspan_ends_at_its_row_group_and_group_occupancy_resets() {
+        table(
+            "<table id=table><tbody><tr><td id=growing rowspan=0>grow</td><td>A</td></tr><tr><td id=second>B</td></tr><tr><td>C</td></tr></tbody><tbody><tr><td id=next>D</td></tr></tbody></table>",
+            |dom, table| {
+                let cell = |id| {
+                    table
+                        .cells
+                        .iter()
+                        .find(|cell| Some(cell.b.node) == dom.get_by_id(id))
+                        .unwrap()
+                };
+                assert_eq!((cell("growing").rowspan, cell("second").col), (3, 1));
+                assert_eq!((cell("next").row, cell("next").col), (3, 0));
+                assert_eq!((table.nrows, table.ncols), (4, 2));
+            },
+        );
+    }
+
+    #[test]
+    fn span_area_never_limits_content_and_ghost_tracks_merge_by_coverage() {
+        for (style, columns) in [("", 1), ("table-layout:fixed;width:1000px", 1000)] {
+            table(
+                &format!(
+                    "<table id=table style='{style}'><tr><td colspan=1000 rowspan=65534>large span</td></tr></table>"
+                ),
+                |_, table| {
+                    assert_eq!((table.ncols, table.nrows), (columns, 1));
+                    assert_eq!(
+                        (table.cells[0].colspan, table.cells[0].rowspan),
+                        (columns, 1)
+                    );
+                },
+            );
+        }
+        // An explicit column box prevents merging even in auto layout.
+        table(
+            "<table id=table><colgroup span=1000></colgroup><tr><td colspan=1000 rowspan=65534>large span</td></tr></table>",
+            |_, table| {
+                assert_eq!((table.ncols, table.nrows), (1000, 1));
+                assert_eq!(table.cells[0].colspan, 1000);
+            },
+        );
+    }
+
+    #[test]
+    fn spans_use_html_integer_parsing_and_only_apply_to_html_table_elements() {
+        table(
+            "<table id=table style='table-layout:fixed;width:100px'><tr><td colspan=' +2trailing'>A</td><td colspan='-2'>B</td><td colspan='0'>C</td></tr></table>",
+            |_, table| {
+                assert_eq!(
+                    table.cells.iter().map(|c| c.colspan).collect::<Vec<_>>(),
+                    [2, 1, 1]
+                );
+                assert_eq!(table.ncols, 4);
+            },
+        );
+        table(
+            "<div id=table style='display:table;table-layout:fixed;width:100px'><div style='display:table-row'><div style='display:table-cell' colspan=9 rowspan=8>not HTML td</div></div></div>",
+            |_, table| {
+                assert_eq!((table.ncols, table.nrows), (1, 1));
+            },
+        );
+    }
+
+    #[test]
+    fn only_first_header_and_footer_groups_are_reordered() {
+        table(
+            "<div id=table style='display:table'><div style='display:table-footer-group'><div style='display:table-row'><div id=f1 style='display:table-cell'>f1</div></div></div><div style='display:table-row-group'><div style='display:table-row'><div id=b style='display:table-cell'>b</div></div></div><div style='display:table-header-group'><div style='display:table-row'><div id=h1 style='display:table-cell'>h1</div></div></div><div style='display:table-footer-group'><div style='display:table-row'><div id=f2 style='display:table-cell'>f2</div></div></div><div style='display:table-header-group'><div style='display:table-row'><div id=h2 style='display:table-cell'>h2</div></div></div></div>",
+            |dom, table| {
+                assert_eq!(
+                    table
+                        .cells
+                        .iter()
+                        .map(|c| dom.attr(c.b.node, "id").unwrap())
+                        .collect::<Vec<_>>(),
+                    ["h1", "b", "f2", "h2", "f1"]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn nested_tables_keep_their_formatting_context_at_every_depth() {
+        let depth = 40;
+        let mut html = "content".to_owned();
+        for index in 0..depth {
+            html = format!(
+                "<table {}><tr><td>{html}</td><td>adjacent</td></tr></table>",
+                if index == depth - 1 { "id=table" } else { "" }
+            );
+        }
+        table(&html, |_, table| {
+            fn nested(node: &BoxNode) -> usize {
+                match &node.content {
+                    Content::Table(table) => {
+                        1 + table.cells.iter().map(|c| nested(&c.b)).sum::<usize>()
+                    }
+                    Content::Blocks(children) => children.iter().map(|c| nested(c)).sum(),
+                    _ => 0,
+                }
+            }
+            assert_eq!(
+                1 + table.cells.iter().map(|c| nested(&c.b)).sum::<usize>(),
+                depth
+            );
+        });
+    }
+}
 
 /// Build the box tree for a document. `None` when there is no root element
 /// (nothing to render).
@@ -230,7 +352,6 @@ pub(super) fn build_document(
         forms,
         vp,
         lists: Vec::new(),
-        table_depth: 0,
         reuse,
     };
     match b.element(root) {
@@ -268,7 +389,6 @@ pub(crate) fn build_at(
         forms,
         vp,
         lists: Vec::new(),
-        table_depth: 0,
         reuse: false,
     };
     match b.element(boundary) {
@@ -357,27 +477,19 @@ struct Builder<'a> {
     /// Open lists' counters: `(next value, step)` per nesting level (`<ol
     /// reversed>` counts down — HTML §4.4.5, through zero into negatives).
     lists: Vec<(i64, i64)>,
-    /// How many `display:table` wrappers enclose the current box — the
-    /// `MAX_TABLE_DEPTH` recursion lid.
-    table_depth: usize,
     reuse: bool,
 }
 
 impl Builder<'_> {
     fn element(&mut self, id: NodeId) -> Built {
         if self.reuse {
-            let cached =
-                self.dom
-                    .box_tree_cache
-                    .borrow_mut()
-                    .get(id, &self.lists, self.table_depth);
+            let cached = self.dom.box_tree_cache.borrow_mut().get(id, &self.lists);
             if let Some((built, lists)) = cached {
                 self.lists = lists;
                 return built;
             }
         }
         let lists = self.lists.clone();
-        let depth = self.table_depth;
         let built = self.element_uncached(id);
         if self.reuse {
             // A changed counter/context can rebuild a box even when its own
@@ -386,7 +498,7 @@ impl Builder<'_> {
             self.dom
                 .box_tree_cache
                 .borrow_mut()
-                .insert(id, lists, depth, &self.lists, &built);
+                .insert(id, lists, &self.lists, &built);
         }
         built
     }
@@ -497,63 +609,6 @@ impl Builder<'_> {
         if let Replaced::Atom(kind) = rep {
             return self.atom(id, disp, kind);
         }
-        // A media-player WRAPPER: an element directly holding a `position:
-        // absolute`/`fixed` `<video>`/`<audio>` tech (the video.js/Plyr/JW
-        // pattern — the tech fills an aspect-ratio box via out-of-flow
-        // `top:0;left:0;width:100%;height:100%`, surrounded by control chrome:
-        // big-play button, poster overlay, control bar — all `position:
-        // absolute` too, drawn as `background-image`/empty divs we don't
-        // paint). Build the wrapper's OWN box completely normally (its
-        // aspect-ratio hack, background, and — crucially — the tech's OWN
-        // out-of-flow resolution against the wrapper's padding box all stay
-        // untouched), but DROP every sibling except the tech itself from the
-        // children DOM gathers: the chrome never enters the box tree, so it
-        // can't paint an opaque background over the media representation (a
-        // CSS `background-color` is an opaque fill in our paint model —
-        // §Appendix E — and video.js's poster overlay sits later in the tree
-        // than the `<video>` tech, so its black loading backdrop was legally
-        // winning the cells our synthesized "▶ Video" affordance needs).
-        // GATED on the wrapper's own `height:0` (the aspect-ratio-hack box —
-        // `padding-top:NN%` supplies the visual height, so EVERY real child
-        // is necessarily out-of-flow to escape the zero-height content box):
-        // that's the declared-CSS signal a generic container holding real
-        // in-flow content beside an unrelated `<video>` never has (a plain
-        // `<body>` with a paragraph and a stray absolute video flows that
-        // paragraph normally — no chrome to clobber it, nothing to skip).
-        // A wrapper whose subtree holds a visible IN-FLOW `<img>` is the other
-        // idiom (a content image with a video overlaid on hover — Steam's sale
-        // capsules) and flows normally instead: player chrome draws its poster
-        // as a background-image div, never an in-flow `<img>`.
-        if matches!(disp, Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid)
-            && self
-                .dom
-                .computed_value_resolved(id, "height")
-                .as_deref()
-                .map(str::trim)
-                .and_then(|v| css_length_px(v, Units::of(self.dom, id)))
-                .is_some_and(|h| h <= 0.0)
-            && let Some(media) = self.dom.children(id).into_iter().find(|&c| {
-                matches!(self.dom.tag_name(c), Some("video" | "audio"))
-                    && Pos::of(self.dom, c).out_of_flow()
-            })
-        {
-            let has_content_img = self.dom.descendants(id).any(|d| {
-                self.dom.tag_name(d) == Some("img")
-                    && !Pos::of(self.dom, d).out_of_flow()
-                    && !self.dom.is_hidden(d)
-            });
-            if !has_content_img {
-                let kids = self.build_child_list(&[media], false);
-                return Built::Block(Arc::new(self.assemble(
-                    id,
-                    BoxStyle::of(self.dom, id, self.vp),
-                    kids,
-                    None,
-                    None,
-                    false,
-                )));
-            }
-        }
         // ATOMIC INLINE-LEVEL box (`inline-block`/`inline-flex`/`inline-grid` —
         // CSS-Display-3 §2.5): in-flow, not floated, not replaced. Its content
         // lays as its own formatting context (the blockified inner display),
@@ -602,7 +657,7 @@ impl Builder<'_> {
     }
 
     fn frame(&mut self, id: NodeId, disp: Disp) -> Built {
-        let body = self.dom.frame_body(id);
+        let root = self.dom.frame_root(id);
         let mut style = BoxStyle::of(self.dom, id, self.vp);
         let dimension = |name: &str, fallback: f32| {
             // Iframe dimension attributes already participate in the cascade.
@@ -624,41 +679,27 @@ impl Builder<'_> {
         if matches!(style.height, super::value::Len::Auto) {
             style.height = super::value::Len::px(dimension("height", 150.0));
         }
-        // HTML Rendering §15.3.2 sizes the child document to the iframe's
-        // content box. The BODY remains that document's formatting box: CSS
-        // Display 3 §2 requires its authored inner display type to select the
-        // descendants' block/flex/grid/table formatting context. Hard-coding
-        // block here made the canonical desktop path disagree with the
-        // serialized terminal adapter for flex-centered iframe documents.
-        let body = body.and_then(|body| match display_of(self.dom, body) {
-            Disp::Table => Some(self.table(body)),
-            display @ (Disp::Flex | Disp::Grid | Disp::Block | Disp::ListItem) => {
-                Some(self.container(body, display))
-            }
-            // BODY's HTML UA display is block. If an author explicitly picks
-            // an inline-level value, blockify it because it is the root
-            // formatting box of the child document viewport.
-            Disp::Inline => Some(self.container(body, Disp::Block)),
-            // `display:contents` removes BODY's principal box; preserving its
-            // child flow in an anonymous block is the closest tree-level
-            // representation supported by this iframe viewport container.
-            Disp::Contents => {
-                let children = self.children(body);
-                Some(self.assemble(
-                    crate::layout2::NO_NODE,
-                    BoxStyle::anonymous(),
-                    children,
-                    None,
-                    None,
-                    false,
-                ))
-            }
-            Disp::None => None,
+        // HTML Rendering #the-page and CSS Display #root: the content box
+        // contains a whole Document, including its independent root box.
+        // Skipping HTML loses its margins, borders, transforms, display type
+        // and CSSOM geometry. BODY is an ordinary child formatting box.
+        let root = root.and_then(|root| match self.element(root) {
+            Built::Block(root) => Some(root),
+            Built::Inline(inline) => Some(Arc::new(BoxNode {
+                node: crate::layout2::NO_NODE,
+                style: BoxStyle::anonymous(),
+                content: Content::Inlines(vec![inline]),
+                marker: None,
+                marker_image: None,
+                marker_inside: false,
+                oof: Vec::new(),
+            })),
+            Built::Hoist(_) | Built::Skip => None,
         });
         let frame = BoxNode {
             node: id,
             style,
-            content: Content::Blocks(body.into_iter().map(Arc::new).collect()),
+            content: Content::Blocks(root.into_iter().collect()),
             marker: None,
             marker_image: None,
             marker_inside: false,
@@ -1237,15 +1278,10 @@ impl Builder<'_> {
         }
     }
 
-    /// Build a `display:table` element's box (CSS 2.1 §17). Past the
-    /// `MAX_TABLE_DEPTH` recursion lid the whole subtree degrades to
-    /// block-stacked content (its rows/cells flow as ordinary blocks — the
-    /// innermost content still renders, and the descent terminates).
+    /// Build a `display:table` element's box (CSS 2.1 §17). Nesting does not
+    /// change the element's display type. Intrinsic memoization bounds repeated
+    /// probes; optional cache limits must not replace a table with block flow.
     fn table(&mut self, id: NodeId) -> BoxNode {
-        if self.table_depth >= MAX_TABLE_DEPTH {
-            return self.container(id, Disp::Block);
-        }
-        self.table_depth += 1;
         let mut style = BoxStyle::of(self.dom, id, self.vp);
         // CSS Tables 3 #collapsed-style-overrides: table-root padding has
         // zero used value in the collapsed border model. Cell padding still
@@ -1290,7 +1326,8 @@ impl Builder<'_> {
         // Rows in visual order (§17.2.1: header group → body/implicit rows →
         // footer group), placed on the grid with `colspan`/`rowspan`.
         let rows = self.table_cell_rows(id);
-        let (placed, ncols, nrows) = self.build_grid(&rows);
+        let col_specs = self.table_col_specs(id);
+        let (placed, ncols, nrows) = self.build_grid(&rows, col_specs.len(), fixed_layout);
         let cells = placed
             .into_iter()
             .map(|(cell, row, col, rowspan, colspan)| TableCell {
@@ -1301,8 +1338,6 @@ impl Builder<'_> {
                 colspan,
             })
             .collect();
-        let col_specs = self.table_col_specs(id);
-        self.table_depth -= 1;
 
         BoxNode {
             node: id,
@@ -1329,10 +1364,11 @@ impl Builder<'_> {
     /// children. In particular, positioned children are zero-size inline
     /// placeholders during fixup: their complete boxes MUST survive for the
     /// positioned post-pass. Filtering only explicit rows/cells lost them.
-    fn table_cell_rows(&mut self, table: NodeId) -> Vec<Vec<SharedBox>> {
+    fn table_cell_rows(&mut self, table: NodeId) -> Vec<CellRows> {
         let mut header = Vec::new();
         let mut body = Vec::new();
         let mut footer = Vec::new();
+        let mut implicit = Vec::new();
         let mut stray = Vec::new();
         for child in self.dom.flat_children(table) {
             let display = self.table_child_display(child);
@@ -1348,18 +1384,34 @@ impl Builder<'_> {
                         | "table-caption"
                 )
             ) {
-                self.flush_anonymous_table_row(&mut stray, &mut body);
+                self.flush_anonymous_table_row(&mut stray, &mut implicit);
+            }
+            if matches!(
+                display.as_deref(),
+                Some("table-header-group" | "table-footer-group" | "table-row-group")
+            ) && !implicit.is_empty()
+            {
+                body.push(std::mem::take(&mut implicit));
             }
             match display.as_deref() {
-                Some("table-header-group") => header.extend(self.group_rows(child)),
-                Some("table-footer-group") => footer.extend(self.group_rows(child)),
-                Some("table-row-group") => body.extend(self.group_rows(child)),
-                Some("table-row") => body.push(self.row_cells(self.dom.flat_children(child))),
+                Some("table-header-group") if header.is_empty() => {
+                    header.push(self.group_rows(child))
+                }
+                Some("table-footer-group") if footer.is_empty() => {
+                    footer.push(self.group_rows(child))
+                }
+                Some("table-header-group" | "table-footer-group" | "table-row-group") => {
+                    body.push(self.group_rows(child))
+                }
+                Some("table-row") => implicit.push(self.row_cells(self.dom.flat_children(child))),
                 Some("table-column" | "table-column-group" | "table-caption" | "none") => {}
                 _ => stray.push(child),
             }
         }
-        self.flush_anonymous_table_row(&mut stray, &mut body);
+        self.flush_anonymous_table_row(&mut stray, &mut implicit);
+        if !implicit.is_empty() {
+            body.push(implicit);
+        }
         header.extend(body);
         header.extend(footer);
         header
@@ -1468,50 +1520,136 @@ impl Builder<'_> {
     #[allow(clippy::type_complexity)]
     fn build_grid(
         &self,
-        rows: &[Vec<SharedBox>],
+        groups: &[CellRows],
+        declared_columns: usize,
+        fixed: bool,
     ) -> (Vec<(SharedBox, usize, usize, usize, usize)>, usize, usize) {
-        let mut cells = Vec::new();
-        let mut ncols = 0usize;
+        let mut cells: Vec<(SharedBox, usize, usize, usize, usize)> = Vec::new();
+        let mut ncols = declared_columns;
         let mut nrows = 0usize;
-        // Slots occupied by a rowspan reaching down from an earlier row.
-        let mut occupied: std::collections::HashSet<(usize, usize)> =
-            std::collections::HashSet::new();
-        for (r, row) in rows.iter().enumerate() {
-            let mut c = 0usize;
-            for cell in row {
-                while occupied.contains(&(r, c)) {
-                    c += 1;
-                }
-                let colspan = self.cell_span(cell.node, "colspan");
-                // Cap the occupancy PRODUCT: keep the colspan, clamp rowspan.
-                let rowspan = self
-                    .cell_span(cell.node, "rowspan")
-                    .min((MAX_CELL_SPAN_AREA / colspan).max(1));
-                for rr in r..r + rowspan {
-                    for cc in c..c + colspan {
-                        occupied.insert((rr, cc));
+        let mut explicit_rows = Vec::new();
+        // HTML #algorithm-for-processing-rows only queries the current row.
+        // Store exclusive occupied end rows per column, not colspan*rowspan
+        // individual slots. max() preserves overlaps (table-model errors).
+        let mut occupied: Vec<usize> = Vec::new();
+        for rows in groups {
+            let start = nrows;
+            let mut growing = Vec::new();
+            occupied.fill(0);
+            for (local_row, row) in rows.iter().enumerate() {
+                let r = start + local_row;
+                explicit_rows.push(r);
+                nrows = nrows.max(r + 1);
+                let mut c = 0usize;
+                for cell in row {
+                    while occupied.get(c).is_some_and(|&end| end > r) {
+                        c += 1;
                     }
+                    let colspan = self.cell_span(cell.node, "colspan");
+                    let span = self.cell_span(cell.node, "rowspan");
+                    let rowspan = span.max(1);
+                    if occupied.len() < c + colspan {
+                        occupied.resize(c + colspan, 0);
+                    }
+                    let end = if span == 0 { usize::MAX } else { r + rowspan };
+                    for occupied in &mut occupied[c..c + colspan] {
+                        *occupied = (*occupied).max(end);
+                    }
+                    if span == 0 {
+                        growing.push(cells.len());
+                    }
+                    cells.push((cell.clone(), r, c, rowspan, colspan));
+                    ncols = ncols.max(c + colspan);
+                    nrows = nrows.max(r + rowspan);
+                    c += colspan;
                 }
-                cells.push((cell.clone(), r, c, rowspan, colspan));
-                ncols = ncols.max(c + colspan);
-                nrows = nrows.max(r + rowspan);
-                c += colspan;
+            }
+            // HTML #algorithm-for-ending-a-row-group: zero spans include rows
+            // introduced by other spans, but cannot leak into the next group.
+            for index in growing {
+                cells[index].3 = nrows - cells[index].1;
             }
         }
-        (cells, ncols, nrows)
+
+        // CSS Tables 3 #dimensioning-the-row-column-grid--step2: tracks with
+        // identical covering cell sets merge unless explicitly defined. Sets
+        // change only at cell start/end boundaries; no dense matrix is needed.
+        let tracks = |length: usize, explicit: Vec<usize>, columns: bool| {
+            let mut kept = explicit;
+            if length > 0 {
+                kept.push(0);
+            }
+            for (_, row, col, rowspan, colspan) in &cells {
+                let (start, span) = if columns {
+                    (*col, *colspan)
+                } else {
+                    (*row, *rowspan)
+                };
+                kept.push(start);
+                if start + span < length {
+                    kept.push(start + span);
+                }
+            }
+            kept.sort_unstable();
+            kept.dedup();
+            kept
+        };
+        let row_tracks = tracks(nrows, explicit_rows, false);
+        let col_tracks = (!fixed).then(|| tracks(ncols, (0..declared_columns).collect(), true));
+        for (_, row, col, rowspan, colspan) in &mut cells {
+            let start = row_tracks.partition_point(|&track| track < *row);
+            *rowspan = row_tracks.partition_point(|&track| track < *row + *rowspan) - start;
+            *row = start;
+            if let Some(tracks) = &col_tracks {
+                let start = tracks.partition_point(|&track| track < *col);
+                *colspan = tracks.partition_point(|&track| track < *col + *colspan) - start;
+                *col = start;
+            }
+        }
+        (
+            cells,
+            col_tracks.map_or(ncols, |tracks| tracks.len()),
+            row_tracks.len(),
+        )
     }
 
-    /// A cell's `colspan`/`rowspan` (HTML attributes), clamped to ≥1 and a
-    /// sane ceiling (a hostile `colspan=100000` can't blow up the grid).
+    /// HTML #rules-for-parsing-non-negative-integers and table span limits.
+    /// CSS Tables 3 uses HTML attributes only on the corresponding HTML type.
     fn cell_span(&self, id: NodeId, attr: &str) -> usize {
-        if id == crate::layout2::NO_NODE {
+        if self.dom.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml")
+            || !matches!(
+                (self.dom.tag_name(id), attr),
+                (Some("td" | "th"), "colspan" | "rowspan") | (Some("col" | "colgroup"), "span")
+            )
+        {
             return 1;
         }
-        self.dom
-            .attr(id, attr)
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 1000)
+        let Some(value) = self.dom.attr(id, attr) else {
+            return 1;
+        };
+        let value = value.trim_start_matches(['\t', '\n', '\x0c', '\r', ' ']);
+        let negative = value.starts_with('-');
+        let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+        if !digits.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            return 1;
+        }
+        let maximum = if attr == "rowspan" {
+            65_534usize
+        } else {
+            1000usize
+        };
+        let mut number = 0;
+        for digit in digits.bytes().take_while(u8::is_ascii_digit) {
+            number = (number * 10 + usize::from(digit - b'0')).min(maximum);
+        }
+        if negative && number != 0 {
+            return 1;
+        }
+        if attr == "rowspan" {
+            number
+        } else {
+            number.max(1)
+        }
     }
 
     /// Per-column width preferences from `<col>`/`<colgroup>` (CSS 2.1

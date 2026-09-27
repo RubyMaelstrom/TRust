@@ -279,7 +279,7 @@ mod tests {
             "<div id=header><template shadowrootmode=open><a>Frame navigation</a></template></div>",
             "https://example.test/",
         );
-        let inner_host = query(&dom, frame, "#header");
+        let inner_host = query(&dom, dom.frame_document(frame).unwrap(), "#header");
         let root = dom.shadow_root(inner_host).unwrap();
         assert!(dom.text_content(root).contains("Frame navigation"));
         assert!(dom.is_connected(root));

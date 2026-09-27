@@ -232,6 +232,34 @@ impl Context<'_> {
     }
 }
 
+/// Reuse CSS Values' typed math evaluator for transform numbers and angles.
+/// Percentage scale values are numbers divided by 100 (Transforms 2
+/// #individual-transforms). Length percentages keep their used-value basis
+/// in layout's retained length expressions instead of being flattened here.
+pub(super) fn transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
+    if angle && text.trim() == "0" {
+        return Some(0.);
+    }
+    let parse = |kind: Kind, suffix: &str| {
+        let mut input = ParserInput::new(text);
+        let mut parser = Parser::new(&mut input);
+        let computed = math::parse(&mut parser, &kind, &Context::validation(), 0).ok()?;
+        parser.expect_exhausted().ok()?;
+        computed
+            .strip_suffix(suffix)?
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+    };
+    if percentage && let Some(value) = parse(Kind::Percentage, "%") {
+        return Some(value / 100.);
+    }
+    parse(
+        if angle { Kind::Angle } else { Kind::Number },
+        if angle { "deg" } else { "" },
+    )
+}
+
 /// Scan component values with the CSS Syntax tokenizer. Strings, escaped
 /// identifiers, URL tokens and nested blocks must not be searched as raw text.
 pub(super) fn valid_tokens(text: &str) -> bool {
