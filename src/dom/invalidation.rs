@@ -588,7 +588,7 @@ impl Dom {
     /// inheritance and slot distribution cannot couple separate shadow-
     /// including trees. A detached feature probe must not make unrelated
     /// detached construction invalidate the live document's style cache.
-    fn shadow_style_dependencies(&self, node: NodeId) -> bool {
+    pub(super) fn shadow_style_dependencies(&self, node: NodeId) -> bool {
         if self.shadow_roots.is_empty() {
             return false;
         }

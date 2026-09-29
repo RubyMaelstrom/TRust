@@ -119,6 +119,7 @@ struct Builder<'a> {
     /// clips rather than wrapping them. Keeping the active prefix lets the
     /// ordinary fragment painter add only newly-entered scrollports.
     scroll_nodes: Vec<(NodeId, bool)>,
+    scroll_indices: HashMap<NodeId, usize>,
 }
 
 impl<'a> Builder<'a> {
@@ -177,6 +178,7 @@ impl<'a> Builder<'a> {
             hard_clips: Vec::new(),
             transformed_clips: Vec::new(),
             scroll_nodes: Vec::new(),
+            scroll_indices: HashMap::new(),
         };
         this.collect_legacy_clips(root);
         this.collect_scroll_containers(root, false);
@@ -444,9 +446,9 @@ impl<'a> Builder<'a> {
         for link in self.scroll_tree.chain(node, include_node) {
             let id = link.node;
             let container = self
-                .scroll_containers
-                .iter()
-                .find(|container| container.node == id);
+                .scroll_indices
+                .get(&id)
+                .map(|&index| &self.scroll_containers[index]);
             let shape = self
                 .rounded_overflow_clips
                 .get(&id)
@@ -529,6 +531,9 @@ impl<'a> Builder<'a> {
                     .map_or(viewport.height, |r| r.height as f32)
                     .max(viewport.height),
             );
+            self.scroll_indices
+                .entry(fragment.node)
+                .or_insert(self.scroll_containers.len());
             self.scroll_containers.push(ScrollContainer {
                 node: fragment.node,
                 actor: if self.dom.render_live() {

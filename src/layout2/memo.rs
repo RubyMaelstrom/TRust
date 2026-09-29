@@ -18,9 +18,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
 use url::Url;
 
-const MAX_BYTES: usize = 32 * 1024 * 1024;
-const MAX_ENTRIES: usize = 2048;
+// One foreground page owns this cache. Large galleries exceed the former
+// 2,048-entry/32 MiB working set during flex measurement alone, repeatedly
+// evicting unchanged card layouts before a search-field edit can reuse them.
+const MAX_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ENTRIES: usize = 8192;
 const MAX_VARIANTS: usize = 8;
+// Whole-page wrapper fragments duplicate the cards retained below them.
+// Limit admission separately from the total budget so a few large wrappers
+// cannot evict the independent contexts needed by the next edit or resize.
+const MAX_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 
 mod inputs;
 pub(super) use inputs::{Inputs, ReadScope};
@@ -504,7 +511,7 @@ impl LayoutCache {
         let bytes = key.bytes() + payload;
         // Avoid making a deep formatting-context tower quadratic in retained
         // memory. Large results simply use the ordinary layout path.
-        if bytes > MAX_BYTES / 4 {
+        if bytes > MAX_ENTRY_BYTES {
             return;
         }
         let previous_inputs = self.inputs.retained_bytes();
@@ -617,7 +624,7 @@ impl LayoutCache {
         // Reject oversized results before allocating a copy. The source's
         // Vec capacities conservatively cover the retained clone's storage.
         let fragment_payload = fragment_bytes(fragment);
-        if fragment_payload > MAX_BYTES / 4 {
+        if fragment_payload > MAX_ENTRY_BYTES {
             return;
         }
         let fragment = fragment.clone();
@@ -1273,6 +1280,53 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn gallery_edit_reuses_independent_cards_with_bounded_storage() {
+        use super::super::diagnostics::{Op, measure};
+        let base = Url::parse("https://gallery.test/").unwrap();
+        let vp = Viewport::new(1280., 720.);
+        let html = format!(
+            "<style>body{{margin:0}}main,.panel{{display:flex;flex-wrap:wrap}}\
+             .card{{display:flex;flex-direction:column;width:240px}}\
+             .thumb{{position:relative}}img{{width:240px;height:auto}}\
+             .badge{{position:absolute;right:0;bottom:0}}</style><input id=search><main>{}</main>",
+            format!("<section class=panel>{}</section>",
+                "<article class=card><div class=thumb><img src=/picture.png><span class=badge>badge</span></div><div><b>Title</b><span> caption</span></div></article>".repeat(24)
+            ).repeat(12)
+        );
+        let images = ImageSizes::from([("https://gallery.test/picture.png".into(), (480, 320))]);
+        for _ in 0..16 {
+            let mut dom = Dom::parse_document(&html);
+            let revision = (
+                crate::font_system::page_font_epoch(),
+                crate::img::svg_intrinsic_epoch(),
+                crate::dom::svg_sprite_revision(),
+            );
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            measure_retained_layout(&dom, &base, vp, &forms, &controls, &images);
+            dom.set_attr(dom.get_by_id("search").unwrap(), "value", "gallery");
+            let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+            let (_, work) =
+                measure(|| measure_retained_layout(&dom, &base, vp, &forms, &controls, &images));
+            assert!(dom.layout_cache.borrow().retained_bytes() <= MAX_BYTES);
+            let stable = revision
+                == (
+                    crate::font_system::page_font_epoch(),
+                    crate::img::svg_intrinsic_epoch(),
+                    crate::dom::svg_sprite_revision(),
+                );
+            assert_cold(&mut dom, &base, vp, &forms, &controls, &images);
+            if stable {
+                assert!(
+                    work.samples[Op::ItemCompute as usize].calls < 100,
+                    "editing one input recomputed gallery cards: {work:?}"
+                );
+                return;
+            }
+        }
+        panic!("no resource-stable gallery transaction");
+    }
+
+    #[test]
     fn image_arrival_reuses_the_formatting_tree_and_independent_fragments() {
         let base = Url::parse("https://image-inputs.test/").unwrap();
         let vp = Viewport::new(640., 480.);
@@ -1509,7 +1563,7 @@ pub(super) mod tests {
         check_inventory(&cache);
         let mut large_parent = parent;
         large_parent.font_family = "x".repeat(20_000);
-        for node in 0..5000 {
+        for node in 0..MAX_ENTRIES {
             root.node = node;
             let request = Request {
                 node: &root,

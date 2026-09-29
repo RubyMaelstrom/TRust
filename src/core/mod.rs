@@ -597,7 +597,8 @@ pub struct BrowserController {
     pending_live_submit: Option<(crate::doc::Form, Option<usize>)>,
     /// Default-action results for keyboard events delivered to the resident
     /// page. Native frontends consume these after the actor runs `keydown`.
-    page_key_defaults: VecDeque<bool>,
+    page_key_defaults: VecDeque<(bool, Option<crate::js::EditableState>)>,
+    page_text_control_state: Option<crate::js::EditableState>,
     /// Latest focused-area transition from the resident HTML actor. The
     /// outer Option distinguishes a blur from no new focus event.
     pending_page_focus: Option<Option<usize>>,
@@ -669,6 +670,7 @@ impl BrowserController {
             render_is_final: false,
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
+            page_text_control_state: None,
             pending_page_focus: None,
             page_editable_state: None,
             pending_form_values: Default::default(),
@@ -818,7 +820,19 @@ impl BrowserController {
     /// the native default (canceled, already applied by the actor, composing,
     /// or Enter in a formless input); `false` allows editing/submission.
     pub fn take_page_key_default(&mut self) -> Option<bool> {
+        self.page_key_defaults
+            .pop_front()
+            .map(|(prevented, _)| prevented)
+    }
+
+    pub fn take_page_key_result(&mut self) -> Option<(bool, Option<crate::js::EditableState>)> {
         self.page_key_defaults.pop_front()
+    }
+
+    pub fn page_text_control_state(&self, node: usize) -> Option<&crate::js::EditableState> {
+        self.page_text_control_state
+            .as_ref()
+            .filter(|state| state.node == node)
     }
 
     pub fn take_page_focus(&mut self) -> Option<Option<usize>> {
@@ -1221,9 +1235,8 @@ impl BrowserController {
                 false
             }
             UserAction::PageEditKey { node, input, text } => {
-                // No optimistic native value is ahead of the DOM here. Each
-                // published presentation may therefore update the editor even
-                // when further actor-owned keystrokes are already queued.
+                // The actor acknowledges canonical value/selection with the
+                // key result, independently of full-page rendering.
                 self.send_user(crate::js::PageCmd::EditKey { node, input, text });
                 false
             }
@@ -1289,23 +1302,27 @@ impl BrowserController {
         }
     }
 
-    /// Drain all async completions currently queued. Returns whether visible
-    /// state changed and therefore a redraw should be requested.
+    /// Service a bounded batch, then yield to native input. HTML's event loop
+    /// permits prioritizing user interaction over other task sources; a page
+    /// which continuously publishes updates must not monopolize the window.
     pub fn process_async_events(&mut self) -> ActionOutcome {
         if let Some(error) = crate::site_storage::take_notice() {
             self.set_status(error);
         }
         let generation_before = self.generation;
         let mut changed = false;
-        while let Some(event) = self.rx.pop() {
+        let started = std::time::Instant::now();
+        for _ in 0..16 {
+            let Some(event) = self.rx.pop() else { break };
             match event {
                 CoreEvent::UserInputReady { generation, permit } => {
                     if generation == self.generation {
                         self.user_input_retry = None;
                         if let (Some(page), Some(permit)) = (&self.live_page, permit) {
-                            if let Some((command, navigation)) = self.pending_user_input.pop_front()
+                            if let Some((command, _navigation)) =
+                                self.pending_user_input.pop_front()
                             {
-                                page.send_reserved_user(permit, command, navigation);
+                                page.send_reserved_user(permit, command);
                             }
                             self.flush_user_input();
                         } else {
@@ -1378,7 +1395,11 @@ impl BrowserController {
                     }
                 }
             }
+            if started.elapsed() >= std::time::Duration::from_millis(2) {
+                break;
+            }
         }
+        self.rx.wake_if_pending();
         ActionOutcome {
             invalidated: changed || self.generation != generation_before,
             loading_retired: self.generation != generation_before,
@@ -2477,6 +2498,22 @@ impl BrowserController {
         if self.live_page.is_none() {
             return false;
         }
+        // CSSOM View scroll notifications coalesce per box. A full actor
+        // channel must retain the latest position, not a history of touchpad
+        // samples. Keys, buttons and different scroll boxes are FIFO barriers.
+        if let Some((previous, _)) = self.pending_user_input.back_mut() {
+            use crate::js::PageCmd;
+            let same_scroll = match (&*previous, &command) {
+                (PageCmd::Scroll { .. }, PageCmd::Scroll { .. }) => true,
+                (PageCmd::SetScroll { node: a, .. }, PageCmd::SetScroll { node: b, .. }) => a == b,
+                _ => false,
+            };
+            if same_scroll {
+                *previous = command;
+                self.flush_user_input();
+                return self.live_page.is_some();
+            }
+        }
         // UI Events keydown/keyup MUST be delivered; HTML #task-queue and
         // #user-interaction-task-source preserve ordering within the source.
         // A full transport must not silently drop releases or reorder focus/click
@@ -2548,6 +2585,7 @@ impl BrowserController {
         http::prune_idle_connections();
         self.pending_live_submit = None;
         self.page_key_defaults.clear();
+        self.page_text_control_state = None;
         self.pending_page_focus = None;
         self.page_editable_state = None;
         self.pending_form_values.clear();
@@ -2655,6 +2693,7 @@ impl BrowserController {
         use crate::js::PageEvt;
         match event {
             PageEvt::Updated { html, mut outcome } => {
+                self.page_text_control_state = None;
                 self.last_js_outcome = Some(outcome.clone());
                 // The native frontends do not pass through `App`, so mirror its
                 // gated live-render diagnostic here. Keeping this at the shared
@@ -2685,6 +2724,7 @@ impl BrowserController {
                 true
             }
             PageEvt::Static { html, mut outcome } => {
+                self.page_text_control_state = None;
                 self.last_js_outcome = Some(outcome.clone());
                 if let Some(page) = &mut self.current {
                     // The actor has classified this document as inert and is
@@ -2715,6 +2755,9 @@ impl BrowserController {
                 patches,
                 mut outcome,
             } => {
+                if outcome.rendered.is_some() {
+                    self.page_text_control_state = None;
+                }
                 self.last_js_outcome = Some(outcome.clone());
                 let _ = patches;
                 if let Some(page) = &mut self.current {
@@ -2782,8 +2825,11 @@ impl BrowserController {
                 self.status = String::from("Ready");
                 changed
             }
-            PageEvt::KeyDefault { prevented } => {
-                self.page_key_defaults.push_back(prevented);
+            PageEvt::KeyDefault { prevented, state } => {
+                if let Some(state) = &state {
+                    self.page_text_control_state = Some(state.clone());
+                }
+                self.page_key_defaults.push_back((prevented, state));
                 false
             }
             PageEvt::Focused { node } => {
@@ -4096,8 +4142,14 @@ mod tests {
             );
             assert!(!browser.form_value_pending(42));
         }
-        browser.handle_page_event(crate::js::PageEvt::KeyDefault { prevented: true });
-        browser.handle_page_event(crate::js::PageEvt::KeyDefault { prevented: false });
+        browser.handle_page_event(crate::js::PageEvt::KeyDefault {
+            prevented: true,
+            state: None,
+        });
+        browser.handle_page_event(crate::js::PageEvt::KeyDefault {
+            prevented: false,
+            state: None,
+        });
         assert_eq!(browser.take_page_key_default(), Some(true));
         assert_eq!(browser.take_page_key_default(), Some(false));
         assert_eq!(browser.take_page_key_default(), None);
@@ -4233,6 +4285,80 @@ mod tests {
         browser.process_async_events();
         assert!(!browser.page_is_live());
         assert!(browser.pending_user_input.is_empty() && browser.user_input_retry.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_scroll_backpressure_preserves_latest_positions_and_click_barriers() {
+        use crate::js::PageCmd;
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.send_user(PageCmd::Focus(None)); // Hold the actor lane full.
+        for y in 0..500 {
+            browser.send_user(PageCmd::Scroll {
+                x: 0.,
+                y: f64::from(y),
+            });
+        }
+        browser.send_user(PageCmd::Click(9));
+        for top in 0..500 {
+            browser.send_user(PageCmd::SetScroll {
+                node: 7,
+                top: f64::from(top),
+                left: 0.,
+            });
+        }
+        browser.send_user(PageCmd::SetScroll {
+            node: 8,
+            top: 3.,
+            left: 0.,
+        });
+        browser.send_user(PageCmd::SetScroll {
+            node: 7,
+            top: 4.,
+            left: 0.,
+        });
+        assert_eq!(browser.pending_user_input.len(), 5);
+        let mut received = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while received.len() < 6 {
+                browser.process_async_events();
+                if let Ok(command) = rx.try_recv() {
+                    received.push(command);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(received[0], PageCmd::Focus(None)));
+        assert!(matches!(received[1], PageCmd::Scroll { y: 499., .. }));
+        assert!(matches!(received[2], PageCmd::Click(9)));
+        assert!(matches!(
+            received[3],
+            PageCmd::SetScroll {
+                node: 7,
+                top: 499.,
+                ..
+            }
+        ));
+        assert!(matches!(
+            received[4],
+            PageCmd::SetScroll {
+                node: 8,
+                top: 3.,
+                ..
+            }
+        ));
+        assert!(matches!(
+            received[5],
+            PageCmd::SetScroll {
+                node: 7,
+                top: 4.,
+                ..
+            }
+        ));
     }
 
     #[test]

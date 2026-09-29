@@ -30,8 +30,8 @@ use trust::render::{
     PaintBrush, PaintColor, PaintShape, RasterBackend, RendererKind, RendererPreference, Scene,
     SceneDamage, ScrollContainer, ScrollbarAxis, StrokeStyle, TextSelection, desktop_chrome,
     desktop_heart_image_handle, horizontal_heart_track, paint_desktop_overlay, paint_text_editor,
-    raster_damage, scene_damage, scrollbar_fraction, scrollbar_position, scrollbar_track_fraction,
-    vertical_heart_track,
+    raster_damage, scene_damage_with_image_changes, scrollbar_fraction, scrollbar_position,
+    scrollbar_track_fraction, vertical_heart_track,
 };
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
@@ -660,6 +660,69 @@ struct PendingPageKey {
     input: KeyInput,
     text: Option<String>,
     actor_default: bool,
+    previewed: bool,
+}
+
+/// UI Events #event-flow-default-cancel permits reversible native feedback.
+/// The DOM still runs keydown → beforeinput → edit → input in its actor. Rebase
+/// only unacknowledged feedback after cancellation or script value/selection
+/// changes; never send the preview back as an additional DOM edit.
+fn reconcile_text_preview<'a>(
+    editor: &mut TextEditor,
+    state: &trust::js::EditableState,
+    pending: impl Iterator<Item = &'a PendingPageKey>,
+    target: (usize, usize),
+) {
+    sync_editor_value(editor, &state.text);
+    editor.set_control_selection(state.selection);
+    replay_text_feedback(editor, pending, target);
+}
+
+fn apply_editor_key(editor: &mut TextEditor, input: &KeyInput, text: Option<&str>) {
+    if !editor.handle_key(input)
+        && let Some(text) = text
+    {
+        editor.replace_selection(text);
+    }
+}
+
+fn replay_text_feedback<'a>(
+    editor: &mut TextEditor,
+    pending: impl Iterator<Item = &'a PendingPageKey>,
+    target: (usize, usize),
+) {
+    for key in pending.filter(|key| key.previewed && key.form == Some(target)) {
+        apply_editor_key(editor, &key.input, key.text.as_deref());
+    }
+}
+
+fn native_text_feedback_key(
+    input: &KeyInput,
+    text: Option<&str>,
+    control: &trust::doc::Field,
+) -> bool {
+    input.state == KeyState::Pressed
+        && !input.composing
+        && !input.modifiers.control
+        && !input.modifiers.meta
+        && !input.modifiers.alt
+        && control.selection.is_some()
+        && matches!(
+            control.kind,
+            FieldKind::Text | FieldKind::Password | FieldKind::Textarea
+        )
+        && (actor_text_key(input, text, control)
+            || matches!(
+                input.key,
+                Key::Backspace
+                    | Key::Delete
+                    | Key::ArrowLeft
+                    | Key::ArrowRight
+                    | Key::Home
+                    | Key::End
+            )
+            || (control.kind == FieldKind::Textarea
+                && matches!(input.key, Key::Enter | Key::ArrowUp | Key::ArrowDown)))
 }
 
 fn actor_text_key(input: &KeyInput, text: Option<&str>, control: &trust::doc::Field) -> bool {
@@ -710,6 +773,7 @@ struct PageLayoutCache {
     frozen: bool,
     document: DesktopPageAdapter,
     layout: std::sync::Arc<trust::layout2::PixelLayout>,
+    scroll_offsets: HashMap<usize, CssPoint>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -994,24 +1058,6 @@ impl ImageLoadScheduler {
     }
 }
 
-fn apply_graphical_scroll_state(
-    layout: &mut std::sync::Arc<trust::layout2::PixelLayout>,
-    interaction: &trust::core::InteractionState,
-) {
-    if interaction.nested_scroll.is_empty() {
-        return;
-    }
-    let layout = std::sync::Arc::make_mut(layout);
-    for container in &mut layout.paint.scroll_containers {
-        if let Some(offset) = container
-            .actor
-            .and_then(|actor| interaction.nested_scroll.get(&actor))
-        {
-            container.offset = *offset;
-        }
-    }
-}
-
 /// Actor ids of graphical boundaries currently represented by retained
 /// geometry. Scroll containers are Tier `Size`, independent formatting
 /// contexts are Tier `WidthStable`, and paint-only hover selector subjects are
@@ -1070,6 +1116,7 @@ fn scheduled_page_images(
     page: &PageLayoutCache,
     scroll: CssPoint,
     viewport: CssSize,
+    scene: Option<&Scene>,
 ) -> (Vec<trust::render::ImageRequest>, HashSet<ImageHandle>) {
     let band = CssRect::new(
         scroll.x - viewport.width,
@@ -1078,7 +1125,19 @@ fn scheduled_page_images(
         viewport.height * 5.0,
     );
     let mut visible = HashSet::new();
-    collect_visible_image_handles(&page.layout.paint.primitives, band, &mut visible);
+    if let Some(scene) = scene {
+        // Lazy fetching follows the same native nested-scroll/fixed transforms
+        // as painting, even before the page actor handles its scroll task.
+        let near_viewport = CssRect::new(
+            scene.content_viewport.x - viewport.width,
+            scene.content_viewport.y - viewport.height * 2.,
+            viewport.width * 3.,
+            viewport.height * 5.,
+        );
+        collect_visible_image_handles(&scene.primitives, near_viewport, &mut visible);
+    } else {
+        collect_visible_image_handles(&page.layout.paint.primitives, band, &mut visible);
+    }
     // Fixed-position image commands are viewport-relative. They are cheap and
     // necessarily near the user whenever their layer is active.
     for command in page
@@ -1493,6 +1552,7 @@ struct DesktopApp {
     gopher_query: Option<trust::gopher::GopherUrl>,
     gemini_input: bool,
     pending_page_keys: VecDeque<PendingPageKey>,
+    browser_events_pending: bool,
     queued_form_keys: VecDeque<PendingPageKey>,
     keyboard_target: Option<PageHit>,
     pressed_hit: Option<PageHit>,
@@ -1508,10 +1568,9 @@ struct DesktopApp {
     /// after a present. Only browser/UI invalidation is allowed to consume CPU
     /// and build a new frame; this latch prevents an idle presentation loop.
     redraw_pending: bool,
-    /// ImageStore is shared by old/new scenes, so retain its scalar generation
-    /// at presentation time to prevent partial raster damage across decoded or
-    /// animated pixel changes.
-    presented_image_generation: u64,
+    /// ImageStore is shared by old/new scenes. Snapshot visible resource
+    /// identities at presentation time to bound decoded/animated pixel damage.
+    presented_image_revisions: HashMap<ImageHandle, Option<u64>>,
     /// Native surface recreation/exposure can require a present even when the
     /// renderer-neutral scene is byte-identical to the last one.
     force_full_raster: bool,
@@ -1855,6 +1914,7 @@ impl DesktopApp {
             gopher_query: None,
             gemini_input: false,
             pending_page_keys: VecDeque::new(),
+            browser_events_pending: false,
             queued_form_keys: VecDeque::new(),
             keyboard_target: None,
             pressed_hit: None,
@@ -1867,7 +1927,7 @@ impl DesktopApp {
             loading_started: None,
             chrome_tick_scheduled: false,
             redraw_pending: false,
-            presented_image_generation: 0,
+            presented_image_revisions: HashMap::new(),
             force_full_raster: true,
         }
     }
@@ -2312,11 +2372,7 @@ impl DesktopApp {
     /// Editing APIs leave editing-host insertion to the user agent;
     /// HTML §4.10.22.2 defines Enter submission for single-line text controls.
     fn apply_page_key_defaults(&mut self) {
-        if matches!(self.focus, FocusTarget::Form { .. }) {
-            self.ensure_page_layout(self.browser_viewport());
-            self.sync_focused_form();
-        }
-        while let Some(prevented) = self.browser.take_page_key_default() {
+        while let Some((prevented, state)) = self.browser.take_page_key_result() {
             let Some(pending) = self.pending_page_keys.pop_front() else {
                 continue;
             };
@@ -2338,6 +2394,28 @@ impl DesktopApp {
                 }
                 continue;
             };
+            if self.focus == (FocusTarget::Form { form, field }) {
+                if !pending.actor_default && pending.input.state == KeyState::Pressed {
+                    // A native glyph default accepts the keyboard handlers'
+                    // canonical selection before replaying later feedback.
+                    self.ensure_page_layout(self.browser_viewport());
+                    self.sync_focused_form();
+                }
+                if let Some(state) = state
+                    && let Some(editor) = &mut self.form_editor
+                {
+                    reconcile_text_preview(
+                        editor,
+                        &state,
+                        self.pending_page_keys
+                            .iter()
+                            .chain(self.queued_form_keys.iter())
+                            .filter(|_| prevented || pending.input.state == KeyState::Released),
+                        (form, field),
+                    );
+                    self.request_redraw();
+                }
+            }
             if prevented
                 || self.focus != (FocusTarget::Form { form, field })
                 || pending.input.state != KeyState::Pressed
@@ -2372,10 +2450,7 @@ impl DesktopApp {
                 }
                 _ => {
                     if let Some(editor) = &mut self.form_editor {
-                        let consumed = editor.handle_key(&pending.input);
-                        if !consumed && let Some(text) = &pending.text {
-                            editor.replace_selection(text);
-                        }
+                        apply_editor_key(editor, &pending.input, pending.text.as_deref());
                         self.finish_text_edit_as(match pending.input.key {
                             Key::Backspace => Some("deleteContentBackward"),
                             Key::Delete => Some("deleteContentForward"),
@@ -2385,6 +2460,17 @@ impl DesktopApp {
                         self.request_redraw();
                     }
                 }
+            }
+            if self.focus == (FocusTarget::Form { form, field })
+                && let Some(editor) = &mut self.form_editor
+            {
+                replay_text_feedback(
+                    editor,
+                    self.pending_page_keys
+                        .iter()
+                        .chain(self.queued_form_keys.iter()),
+                    (form, field),
+                );
             }
         }
         self.dispatch_next_form_key();
@@ -2793,6 +2879,13 @@ impl DesktopApp {
                 cache.frozen,
             )
         {
+            cache.scroll_offsets.extend(
+                self.browser
+                    .interaction()
+                    .nested_scroll
+                    .iter()
+                    .map(|(node, offset)| (*node, *offset)),
+            );
             // WHATWG HTML §7.4 keeps showing the active document while the
             // replacement is fetched and only changes it when the new history
             // entry becomes active. `begin_fetch` deliberately retires the old
@@ -2800,13 +2893,11 @@ impl DesktopApp {
             // presentation during this interval. A viewport change must not
             // rebuild those pixels from the response's pre-script source.
             if navigation_pending || cache.frozen {
-                apply_graphical_scroll_state(&mut cache.layout, self.browser.interaction());
                 return false;
             }
             cache.revision = revision;
             cache.viewport = viewport;
             cache.device_pixel_ratio = device_pixel_ratio;
-            apply_graphical_scroll_state(&mut cache.layout, self.browser.interaction());
             return false;
         }
 
@@ -2845,6 +2936,19 @@ impl DesktopApp {
             }
             Some((response.url.clone(), rendered))
         });
+        let mut scroll_offsets = self
+            .page_layout
+            .as_ref()
+            .filter(|cache| cache.generation == generation)
+            .map(|cache| cache.scroll_offsets.clone())
+            .unwrap_or_default();
+        scroll_offsets.extend(
+            self.browser
+                .interaction()
+                .nested_scroll
+                .iter()
+                .map(|(node, offset)| (*node, *offset)),
+        );
         self.page_layout = typed.map(|(base, rendered)| {
             self.sync_image_document(generation, &base);
             let requests = rendered
@@ -2856,8 +2960,7 @@ impl DesktopApp {
                 })
                 .collect::<Vec<_>>();
             self.request_page_images(generation, &base, &requests, &HashSet::new());
-            let (document, mut layout) = DesktopPageAdapter::from_rendered(base, rendered);
-            apply_graphical_scroll_state(&mut layout, self.browser.interaction());
+            let (document, layout) = DesktopPageAdapter::from_rendered(base, rendered);
             PageLayoutCache {
                 generation,
                 revision,
@@ -2867,6 +2970,7 @@ impl DesktopApp {
                 frozen: false,
                 document,
                 layout,
+                scroll_offsets,
             }
         });
         if page_is_live && let Some(old) = seed.as_deref() {
@@ -3203,32 +3307,6 @@ impl DesktopApp {
         scene.image_store = self.image_store.clone();
 
         let generation = self.browser.document_generation();
-        if let Some(page) = &self.page_layout {
-            let key = ImageScheduleKey {
-                generation,
-                revision: page.revision,
-                scroll: self.browser.interaction().scroll,
-                viewport: page_viewport,
-            };
-            if self.image_schedule_key != Some(key) {
-                let base = page.document.base.clone();
-                let (requests, visible_retries) =
-                    scheduled_page_images(page, key.scroll, page_viewport);
-                self.request_page_images(generation, &base, &requests, &visible_retries);
-                self.animation_sources.touch_visible(&visible_retries);
-                let active_animations = if self.window_focused {
-                    self.animation_sources
-                        .bounded_active_handles(&visible_retries, &self.image_store)
-                } else {
-                    HashSet::new()
-                };
-                self.set_active_animations(active_animations);
-                self.image_schedule_key = Some(key);
-            }
-        } else {
-            self.set_active_animations(HashSet::new());
-            self.image_schedule_key = None;
-        }
         // The actor owns the canonical layout, so decoded native pixels become
         // paintable at the actor's next geometry pass. `BrowserController`
         // deliberately uses a nonblocking send; retry a full command queue on
@@ -3283,13 +3361,33 @@ impl DesktopApp {
                 terminal.line_input.selecting = false;
             }
         } else if let Some(page) = &self.page_layout {
-            scene.append_page_at(
+            scene.append_page_with_scroll_offsets(
                 &page.layout.paint,
                 self.browser.interaction().scroll,
                 css_animation_elapsed,
+                &page.scroll_offsets,
             );
         } else if let Some(page) = &self.protocol_page {
             scene.append_page(&page.layout.paint, self.browser.interaction().scroll);
+        }
+
+        if let Some(page) = &self.page_layout {
+            let key = ImageScheduleKey {
+                generation,
+                revision: page.revision,
+                scroll: self.browser.interaction().scroll,
+                viewport: page_viewport,
+            };
+            if self.image_schedule_key != Some(key) {
+                let base = page.document.base.clone();
+                let (requests, visible_retries) =
+                    scheduled_page_images(page, key.scroll, page_viewport, Some(&scene));
+                self.request_page_images(generation, &base, &requests, &visible_retries);
+                self.image_schedule_key = Some(key);
+            }
+        } else {
+            self.set_active_animations(HashSet::new());
+            self.image_schedule_key = None;
         }
 
         let query = self.find.text();
@@ -3319,10 +3417,11 @@ impl DesktopApp {
         }
         self.paint_focused_form(&mut scene);
         if let Some(page) = &self.page_layout {
-            scene.append_browser_media(
+            scene.append_browser_media_with_scroll_offsets(
                 &page.layout.paint,
                 self.browser.interaction().scroll,
                 css_animation_elapsed,
+                &page.scroll_offsets,
             );
         }
         self.paint_keyboard_focus(&mut scene);
@@ -3377,12 +3476,37 @@ impl DesktopApp {
             );
         }
 
-        let image_generation = self.image_store.generation();
+        // Animation decoding follows actual composed visibility. The lazy
+        // fetch band spans several screens and must not keep all of those
+        // offscreen decoders and redraws running.
+        let image_revisions = scene.visible_image_revisions();
+        let active_animations = if self.window_focused && !self.animation_sources.entries.is_empty()
+        {
+            let visible = image_revisions.keys().copied().collect();
+            self.animation_sources.touch_visible(&visible);
+            self.animation_sources
+                .bounded_active_handles(&visible, &self.image_store)
+        } else {
+            HashSet::new()
+        };
+        self.set_active_animations(active_animations);
+        let changed_images = image_revisions
+            .iter()
+            .filter(|(handle, revision)| {
+                self.presented_image_revisions.get(handle) != Some(revision)
+            })
+            .map(|(handle, _)| *handle)
+            .chain(
+                self.presented_image_revisions
+                    .keys()
+                    .filter(|handle| !image_revisions.contains_key(handle))
+                    .copied(),
+            )
+            .collect();
         let damage = if !self.force_full_raster
-            && image_generation == self.presented_image_generation
             && let Some(previous) = &self.scene
         {
-            scene_damage(previous, &scene)
+            scene_damage_with_image_changes(previous, &scene, &changed_images)
         } else {
             SceneDamage::Full
         };
@@ -3392,7 +3516,7 @@ impl DesktopApp {
             SceneDamage::Full => self.present_scene(&scene, None)?,
         };
         self.force_full_raster = !presented;
-        self.presented_image_generation = image_generation;
+        self.presented_image_revisions = image_revisions;
         if trace {
             let renderer = self
                 .renderer
@@ -3804,6 +3928,17 @@ impl DesktopApp {
     }
 
     fn finish_text_edit(&mut self) {
+        if let FocusTarget::Form { form, field } = self.focus
+            && self
+                .pending_page_keys
+                .iter()
+                .chain(self.queued_form_keys.iter())
+                .any(|key| key.previewed && key.form == Some((form, field)))
+        {
+            // The queued key tasks already own these edits. Blurring must not
+            // submit native feedback as an additional whole-value edit.
+            return;
+        }
         self.finish_text_edit_as(None);
     }
 
@@ -3836,9 +3971,11 @@ impl DesktopApp {
             return;
         }
         let editable = control.kind == FieldKind::Textarea && control.selection.is_none();
-        let state = control
-            .live_node
-            .and_then(|node| self.browser.page_editable_state(node));
+        let state = control.live_node.and_then(|node| {
+            self.browser
+                .page_text_control_state(node)
+                .or_else(|| self.browser.page_editable_state(node))
+        });
         let previous = state.map_or_else(|| control.editing_value(), |state| state.text.as_str());
         let previous_selection = state.map_or(control.selection, |state| Some(state.selection));
         let selection = if editable {
@@ -3906,6 +4043,14 @@ impl DesktopApp {
         let FocusTarget::Form { form, field } = self.focus else {
             return;
         };
+        if self
+            .pending_page_keys
+            .iter()
+            .chain(self.queued_form_keys.iter())
+            .any(|key| key.previewed && key.form == Some((form, field)))
+        {
+            return;
+        }
         let Some(control) = self
             .page_layout
             .as_ref()
@@ -3920,9 +4065,11 @@ impl DesktopApp {
                 .is_some_and(|node| self.browser.form_value_pending(node))
             && let Some(editor) = self.form_editor.as_mut()
         {
-            let state = control
-                .live_node
-                .and_then(|node| self.browser.page_editable_state(node));
+            let state = control.live_node.and_then(|node| {
+                self.browser
+                    .page_text_control_state(node)
+                    .or_else(|| self.browser.page_editable_state(node))
+            });
             sync_editor_value(
                 editor,
                 state.map_or_else(|| control.editing_value(), |state| state.text.as_str()),
@@ -4168,11 +4315,19 @@ impl DesktopApp {
             self.stop_current_page();
             return true;
         }
+        let actor_default = actor_text_key(input, text.as_deref(), &control);
+        let previewed = native_text_feedback_key(input, text.as_deref(), &control)
+            && self.form_editor.is_some();
+        if previewed {
+            apply_editor_key(self.form_editor.as_mut().unwrap(), input, text.as_deref());
+            self.request_redraw();
+        }
         self.queued_form_keys.push_back(PendingPageKey {
             form: Some((form, field)),
             input: input.clone(),
             text,
-            actor_default: false,
+            actor_default,
+            previewed,
         });
         self.dispatch_next_form_key();
         true
@@ -4460,6 +4615,7 @@ impl DesktopApp {
                 input: input.clone(),
                 text: None,
                 actor_default: false,
+                previewed: false,
             });
             self.dispatch(UserAction::Key(input));
             return;
@@ -6919,19 +7075,24 @@ impl DesktopApp {
             .scene
             .as_ref()
             .map_or_else(Vec::new, |scene| scene.scroll_chain_at(self.pointer));
-        for container in chain {
+        for mut container in chain {
+            // Accumulate wheel samples even before their first redraw, including
+            // static documents which have no actor.
+            let key = container.actor.unwrap_or(container.node);
+            if let Some(offset) = self
+                .page_layout
+                .as_ref()
+                .and_then(|cache| cache.scroll_offsets.get(&key))
+            {
+                container.offset = *offset;
+            }
             let (next, residual) = scroll_container_delta(&container, remaining);
             let changed = next != container.offset;
             if changed {
-                if let Some(cache) = &mut self.page_layout
-                    && let Some(scroll) = std::sync::Arc::make_mut(&mut cache.layout)
-                        .paint
-                        .scroll_containers
-                        .iter_mut()
-                        .find(|scroll| scroll.node == container.node)
-                {
-                    scroll.offset = next;
+                if let Some(cache) = &mut self.page_layout {
+                    cache.scroll_offsets.insert(key, next);
                 }
+                self.image_schedule_key = None;
                 self.dispatch(UserAction::SetNestedScroll {
                     actor: container.actor,
                     top: next.y,
@@ -7028,44 +7189,45 @@ impl DesktopApp {
             .map(|scene| scene.content_viewport)
             .unwrap_or(CssRect::new(0.0, 0.0, self.metrics.css.width, 0.0));
         let scroll = self.browser.interaction().scroll;
-        let update = build_accessibility_update(
-            AccessibilityFrame {
-                metrics: self.metrics,
-                page: self.page_layout.as_ref(),
-                focus: self.focus,
-                content_viewport: viewport,
-                scroll,
-                keyboard_node: self.keyboard_target.as_ref().map(|target| target.node),
-                command_prompt: self.browser.gemini_prompt(),
-                command_value: (self.focus == FocusTarget::Command).then(|| {
-                    if self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
-                        "Sensitive Gemini input"
-                    } else {
-                        self.command.raw_text()
-                    }
-                }),
-                find_value: (self.focus == FocusTarget::Find).then(|| self.find.raw_text()),
-                terminal_text: self
-                    .terminal
-                    .as_ref()
-                    .map(|terminal| terminal.view.terminal.visible_text()),
-                terminal_input: self
-                    .terminal
-                    .as_ref()
-                    .filter(|terminal| terminal.connected && !terminal.char_mode())
-                    .map(|terminal| {
-                        (
-                            terminal.line_editor.text(),
-                            terminal.view.terminal.remote_echo(),
-                        )
-                    }),
-            },
-            initial,
-        );
         let Some(adapter) = &mut self.accessibility else {
             return;
         };
-        adapter.update_if_active(|| update);
+        adapter.update_if_active(|| {
+            build_accessibility_update(
+                AccessibilityFrame {
+                    metrics: self.metrics,
+                    page: self.page_layout.as_ref(),
+                    focus: self.focus,
+                    content_viewport: viewport,
+                    scroll,
+                    keyboard_node: self.keyboard_target.as_ref().map(|target| target.node),
+                    command_prompt: self.browser.gemini_prompt(),
+                    command_value: (self.focus == FocusTarget::Command).then(|| {
+                        if self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
+                            "Sensitive Gemini input"
+                        } else {
+                            self.command.raw_text()
+                        }
+                    }),
+                    find_value: (self.focus == FocusTarget::Find).then(|| self.find.raw_text()),
+                    terminal_text: self
+                        .terminal
+                        .as_ref()
+                        .map(|terminal| terminal.view.terminal.visible_text()),
+                    terminal_input: self
+                        .terminal
+                        .as_ref()
+                        .filter(|terminal| terminal.connected && !terminal.char_mode())
+                        .map(|terminal| {
+                            (
+                                terminal.line_editor.text(),
+                                terminal.view.terminal.remote_echo(),
+                            )
+                        }),
+                },
+                initial,
+            )
+        });
     }
 
     fn handle_access_action(&mut self, request: ActionRequest) {
@@ -7153,6 +7315,16 @@ impl DesktopApp {
 }
 
 impl ApplicationHandler<DesktopEvent> for DesktopApp {
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if std::mem::take(&mut self.browser_events_pending) {
+            let outcome = self.process_browser_events();
+            if outcome.invalidated {
+                self.scroll_to_fragment();
+                self.request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.force_full_raster = true;
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -7273,17 +7445,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         match event {
             DesktopEvent::Bookmarks(completion) => self.on_bookmark(completion),
             DesktopEvent::BrowserWake => {
-                let outcome = self.process_browser_events();
-                if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
-                    eprintln!(
-                        "desktop: browser wake changed={} retired={}",
-                        outcome.invalidated, outcome.loading_retired
-                    );
-                }
-                if outcome.invalidated {
-                    self.scroll_to_fragment();
-                    self.request_redraw();
-                }
+                // Native key/pointer events in this turn get first service.
+                // A wake must not drain a continuously refilled page queue
+                // ahead of window input.
+                self.browser_events_pending = true;
             }
             DesktopEvent::ChromeTick => {
                 self.chrome_tick_scheduled = false;
@@ -8375,6 +8540,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trust::render::scene_damage;
 
     #[test]
     fn tab_opens_command_except_from_an_active_text_editor() {
@@ -8388,6 +8554,80 @@ mod tests {
             FocusTarget::Form { form: 0, field: 0 },
             true
         ));
+    }
+
+    #[test]
+    fn text_feedback_rebases_unacknowledged_keys_after_cancellation_and_script_edits() {
+        let mut editor = TextEditor::new("old", &TextStyle::default(), 300., false);
+        editor.set_control_selection(trust::doc::ControlSelection {
+            start: 3,
+            end: 3,
+            direction: 0,
+        });
+        let keys: Vec<_> = ["a", "b", "🦀"]
+            .into_iter()
+            .map(|text| PendingPageKey {
+                form: Some((0, 0)),
+                input: KeyInput {
+                    key: Key::Character(text.into()),
+                    code: String::new(),
+                    location: 0,
+                    state: KeyState::Pressed,
+                    modifiers: Default::default(),
+                    repeat: false,
+                    composing: false,
+                },
+                text: Some(text.into()),
+                actor_default: true,
+                previewed: true,
+            })
+            .collect();
+        // No actor/task/paint acknowledgement is needed to show this burst.
+        for key in &keys {
+            editor.replace_selection(key.text.as_deref().unwrap());
+        }
+        assert_eq!(editor.text(), "oldab🦀");
+        let mut state = trust::js::EditableState {
+            node: 7,
+            text: "Q🙂Z".into(),
+            selection: trust::doc::ControlSelection {
+                start: 1,
+                end: 3,
+                direction: -1,
+            },
+        };
+        // The first key was canceled after script changed the selection.
+        reconcile_text_preview(&mut editor, &state, keys[1..].iter(), (0, 0));
+        assert_eq!(editor.text(), "Qb🦀Z");
+        // The next input handler transformed the value before acknowledging.
+        state.text = "[QBZ]".into();
+        state.selection = trust::doc::ControlSelection {
+            start: 2,
+            end: 2,
+            direction: 0,
+        };
+        reconcile_text_preview(&mut editor, &state, keys[2..].iter(), (0, 0));
+        assert_eq!(editor.text(), "[Q🦀BZ]");
+        assert_eq!(editor.control_selection().start, 4);
+        // The last beforeinput is canceled. Roll back exactly that feedback.
+        reconcile_text_preview(&mut editor, &state, keys[3..].iter(), (0, 0));
+        assert_eq!(editor.text(), "[QBZ]");
+        assert_eq!(editor.control_selection(), state.selection);
+        let mut deletion = keys[0].clone();
+        deletion.input.key = Key::Backspace;
+        deletion.text = None;
+        deletion.actor_default = false;
+        let replacement = [deletion, keys[1].clone()];
+        reconcile_text_preview(&mut editor, &state, replacement.iter(), (0, 0));
+        assert_eq!(
+            editor.text(),
+            "[bBZ]",
+            "typing must stay visible behind a native deletion barrier"
+        );
+        // Canceling the deletion restores the character, while the later b
+        // remains pending and is replayed at the canonical caret.
+        reconcile_text_preview(&mut editor, &state, replacement[1..].iter(), (0, 0));
+        assert_eq!(editor.text(), "[QbBZ]");
     }
 
     #[cfg(target_os = "linux")]
@@ -8466,6 +8706,7 @@ mod tests {
             frozen: false,
             document,
             layout,
+            scroll_offsets: HashMap::new(),
         });
         app.scene = Some(scene);
         app.set_focus(FocusTarget::Page);
@@ -10322,13 +10563,14 @@ mod tests {
             frozen: false,
             document,
             layout,
+            scroll_offsets: HashMap::new(),
         };
         for (scroll, expected) in [
             (0.0, vec!["fixed.jpg", "near.jpg"]),
             (4800.0, vec!["far.jpg", "fixed.jpg"]),
         ] {
             let (requests, visible) =
-                scheduled_page_images(&page, CssPoint::new(0.0, scroll), viewport);
+                scheduled_page_images(&page, CssPoint::new(0.0, scroll), viewport, None);
             let mut sources: Vec<_> = requests
                 .iter()
                 .map(|request| request.source.rsplit('/').next().unwrap())

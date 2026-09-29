@@ -514,6 +514,9 @@ pub enum PageEvt {
     /// (e.g. Enter in a formless input).
     KeyDefault {
         prevented: bool,
+        /// Canonical text-control state after this key's checkpoint. This
+        /// acknowledges native feedback without waiting for page layout.
+        state: Option<EditableState>,
     },
     /// The canonical HTML focused area changed. The desktop editor follows
     /// this actor decision, including focus from label activation and script.
@@ -550,7 +553,6 @@ pub struct PageHandle {
 #[derive(Debug)]
 struct PageHandleState {
     interactions: Option<tokio::sync::mpsc::Sender<PageCmd>>,
-    interaction_running: std::sync::Arc<std::sync::Mutex<bool>>,
     hover: Option<tokio::sync::watch::Sender<PageHover>>,
     cache: std::sync::Arc<crate::http::PageCache>,
     runtime_interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
@@ -560,7 +562,6 @@ impl PageHandle {
     pub(crate) fn from_lumen_parts(
         cmds: tokio::sync::mpsc::Sender<PageCmd>,
         interactions: tokio::sync::mpsc::Sender<PageCmd>,
-        interaction_running: std::sync::Arc<std::sync::Mutex<bool>>,
         hover: tokio::sync::watch::Sender<PageHover>,
         cache: std::sync::Arc<crate::http::PageCache>,
         runtime_interrupt: std::sync::Arc<lumen::RuntimeInterrupt>,
@@ -569,7 +570,6 @@ impl PageHandle {
             cmds,
             state: Box::new(PageHandleState {
                 interactions: Some(interactions),
-                interaction_running,
                 hover: Some(hover),
                 cache,
                 runtime_interrupt,
@@ -581,36 +581,24 @@ impl PageHandle {
         &self,
         command: PageCmd,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<PageCmd>> {
-        self.try_send_user_with_navigation_preemption(command, false)
+        debug_assert!(command.is_user_interaction());
+        self.state
+            .interactions
+            .as_ref()
+            .unwrap_or(&self.cmds)
+            .try_send(command)
     }
 
     pub fn try_send_navigation_click(
         &self,
         node: usize,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<PageCmd>> {
-        self.try_send_user_with_navigation_preemption(PageCmd::Click(node), true)
-    }
-
-    fn try_send_user_with_navigation_preemption(
-        &self,
-        command: PageCmd,
-        preempt_for_navigation: bool,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<PageCmd>> {
-        debug_assert!(command.is_user_interaction());
-        let Some(sender) = &self.state.interactions else {
-            return self.cmds.try_send(command);
-        };
-        let permit = match sender.try_reserve() {
-            Ok(permit) => permit,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-                return Err(tokio::sync::mpsc::error::TrySendError::Full(command));
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
-                return Err(tokio::sync::mpsc::error::TrySendError::Closed(command));
-            }
-        };
-        self.with_user_preemption(preempt_for_navigation, || permit.send(command));
-        Ok(())
+        // HTML #user-interaction-task-source / #event-loop-processing-model:
+        // a link click is a queued task, not a committed navigation. Its
+        // handler may cancel the default and retain this realm. Aborting a
+        // running task here skips finally blocks and can strand its scheduler
+        // or controlled inputs. Actual navigation/Stop still calls retire().
+        self.try_send_user(PageCmd::Click(node))
     }
 
     pub(crate) fn user_input_sender(&self) -> tokio::sync::mpsc::Sender<PageCmd> {
@@ -625,28 +613,8 @@ impl PageHandle {
         &self,
         permit: tokio::sync::mpsc::OwnedPermit<PageCmd>,
         command: PageCmd,
-        preempt_for_navigation: bool,
     ) {
-        self.with_user_preemption(preempt_for_navigation, || {
-            permit.send(command);
-        });
-    }
-
-    fn with_user_preemption(&self, preempt_for_navigation: bool, send: impl FnOnce()) {
-        if preempt_for_navigation {
-            let running = self
-                .state
-                .interaction_running
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if !*running {
-                self.state.runtime_interrupt.request_user_navigation();
-            }
-            send();
-            drop(running);
-        } else {
-            send();
-        }
+        permit.send(command);
     }
 
     pub fn send_hover(&self, node: Option<usize>, x: f64, y: f64) -> bool {
@@ -690,7 +658,6 @@ impl PageHandle {
             cmds,
             state: Box::new(PageHandleState {
                 interactions: None,
-                interaction_running: Default::default(),
                 hover: None,
                 cache: Default::default(),
                 runtime_interrupt: Default::default(),

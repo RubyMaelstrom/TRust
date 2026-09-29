@@ -743,7 +743,11 @@ impl VelloHybridRenderer {
         target.set_transform(device_transform);
         let mut layer_filters = Vec::new();
 
-        for command in &scene.primitives {
+        let mut skip_until = 0;
+        for (index, command) in scene.primitives.iter().enumerate() {
+            if index < skip_until {
+                continue;
+            }
             match command {
                 DisplayCommand::Fill { shape, brush } => {
                     if shape_is_visible(
@@ -805,6 +809,12 @@ impl VelloHybridRenderer {
                     }
                 }
                 DisplayCommand::PushLayer(layer) => {
+                    if (clips.bounds().width <= 0. || clips.bounds().height <= 0.)
+                        && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
+                    {
+                        skip_until = end + 1;
+                        continue;
+                    }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     target.push_layer(
                         None,

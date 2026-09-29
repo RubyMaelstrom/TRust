@@ -4197,6 +4197,18 @@
     // derive each native insertion from canonical state after the keyboard
     // handlers/checkpoint. Queued keys must not reuse a frontend's stale value
     // or selection after script changes, cancellation, or a previous input.
+    trust.formEditingState = function (id) {
+        const frame = nativeInputChildFrame(id);
+        if (frame) return frame.__contentRealmWindow.__trust.formEditingState(id);
+        const el = wrap(id), tag = el && htmlElementName(el);
+        if (tag !== "input" && tag !== "textarea") return "null";
+        const selection = controlSelection(el, false);
+        if (!selection || !__dom_is_connected(id)) return "null";
+        // Presentation reads canonical host state without invoking an authored
+        // value accessor outside the key task's microtask checkpoint.
+        const text = tag === "textarea" ? __dom_text(id).replace(/\r\n?/g,"\n") : __dom_input(id,"get",null);
+        return JSON.stringify({node:id,text,selection:{start:selection[0],end:selection[1],direction:selection[2]}});
+    };
     trust.formInsertText = function (id, text) {
         const frame = nativeInputChildFrame(id);
         if (frame) return frame.__contentRealmWindow.__trust.formInsertText(id,text);
@@ -14764,8 +14776,20 @@
     // repeating timer is initialized again after its handler finishes, as the
     // standard requires, so a long callback never causes a catch-up burst.
     trust.now = () => currentTime() + agentTimeOffset;
+    // HTML #rendering-opportunity: the host may lower the rendering cadence
+    // when a frame is expensive. Delay rendering only; ordinary timers and
+    // networking tasks must remain runnable between those opportunities.
+    let renderingNotBefore = -Infinity;
+    trust.deferRenderingUntil = function (absMs) {
+        renderingNotBefore = absMs - agentTimeOffset;
+        for (const childTrust of childWindowTrusts) childTrust.deferRenderingUntil(absMs);
+    };
+    function animationFrameDeadline() {
+        return animationFrames.deadline === null ? null
+            : Math.max(animationFrames.deadline, renderingNotBefore);
+    }
     function ownNextDeadline() {
-        let best = animationFrames.deadline;
+        let best = animationFrameDeadline();
         for (const t of timers.q) if (best === null || t.at < best) best = t.at;
         return best;
     }
@@ -14791,9 +14815,10 @@
         }
         if (best === null) return false;
         if (owner !== trust) return owner.nextDeadlineIsAnimationFrame();
-        if (animationFrames.deadline === null) return false;
+        const frameDeadline = animationFrameDeadline();
+        if (frameDeadline === null) return false;
         for (const timer of timers.q)
-            if (timer.at < animationFrames.deadline) return false;
+            if (timer.at < frameDeadline) return false;
         return true;
     };
     trust.nextTimerInfo = function () {
@@ -14848,8 +14873,9 @@
             if (t.at > localAbsMs) continue;
             if (!task || t.at < task.at || (t.at === task.at && t.id < task.id)) task = t;
         }
-        if (animationFrames.deadline !== null && animationFrames.deadline <= localAbsMs &&
-            (!task || animationFrames.deadline <= task.at)) return null;
+        const frameDeadline = animationFrameDeadline();
+        if (frameDeadline !== null && frameDeadline <= localAbsMs &&
+            (!task || frameDeadline <= task.at)) return null;
         timers.now = localAbsMs;
         __clockSync();
         if (!task) return false;

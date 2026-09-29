@@ -7,7 +7,7 @@
 //! owns wgpu surface/device recovery without feeding capabilities back into
 //! DOM, style, layout, hit testing, or paint-order construction.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use crate::core::{BrowserSnapshot, CssPoint, CssSize, PhysicalSize, ViewportMetrics};
@@ -1260,8 +1260,9 @@ pub enum SceneDamage {
 /// Compute damage for a retained scene without weakening CSS painting order.
 ///
 /// CSS 2.2 Appendix E, CSS Transforms, and CSS Overflow make transforms,
-/// clips, and compositing scopes stateful. A change to any such command is
-/// therefore a full-frame fallback. When only leaf paint commands differ, we
+/// clips, and compositing scopes stateful. Structural changes require a
+/// full-frame fallback. Aligned transform/opacity changes damage all paint
+/// inside their scopes, using both the old and new coordinates. We
 /// replay both complete lists to recover their active transforms and clips,
 /// then union the old and new painted bounds. Removed paint is included so
 /// stale pixels are always cleared by the replacement crop.
@@ -1269,6 +1270,18 @@ pub enum SceneDamage {
 /// paint scopes between them. Compare those commands individually: an
 /// unchanged clip between two edits does not invalidate the whole canvas.
 pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
+    scene_damage_with_image_changes(old, new, &HashSet::new())
+}
+
+/// Include decoded image replacements under stable display-list handles.
+/// CSS Images 3 #the-object-fit and CSS Overflow 3 #overflow-control bound
+/// their paint to the replaced content box and its ancestor clips. Updating
+/// an avatar or an offscreen animation need not repaint the entire viewport.
+pub fn scene_damage_with_image_changes(
+    old: &Scene,
+    new: &Scene,
+    changed_images: &HashSet<ImageHandle>,
+) -> SceneDamage {
     if old.viewport != new.viewport || old.canvas_images != new.canvas_images {
         return SceneDamage::Full;
     }
@@ -1278,7 +1291,8 @@ pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
         .zip(&new.primitives)
         .take_while(|(old, new)| old == new)
         .count();
-    if prefix == old.primitives.len() && prefix == new.primitives.len() {
+    if prefix == old.primitives.len() && prefix == new.primitives.len() && changed_images.is_empty()
+    {
         return SceneDamage::Unchanged;
     }
     let suffix = old.primitives[prefix..]
@@ -1295,7 +1309,9 @@ pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
             .iter()
             .zip(&new.primitives[new_changed.clone()])
             .any(|(old, new)| {
-                (command_changes_paint_state(old) || command_changes_paint_state(new)) && old != new
+                (command_changes_paint_state(old) || command_changes_paint_state(new))
+                    && old != new
+                    && !bounded_scope_change(old, new)
             })
     } else {
         old.primitives[old_changed.clone()]
@@ -1306,10 +1322,14 @@ pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
     if state_changed {
         return SceneDamage::Full;
     }
-    let Some(old_bounds) = changed_command_bounds(old, old_changed, aligned.then_some(new)) else {
+    let Some(old_bounds) =
+        changed_command_bounds(old, old_changed, aligned.then_some(new), changed_images)
+    else {
         return SceneDamage::Full;
     };
-    let Some(new_bounds) = changed_command_bounds(new, new_changed, aligned.then_some(old)) else {
+    let Some(new_bounds) =
+        changed_command_bounds(new, new_changed, aligned.then_some(old), changed_images)
+    else {
         return SceneDamage::Full;
     };
     let bounds = match (old_bounds, new_bounds) {
@@ -1326,6 +1346,24 @@ pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
         CssRect::new(0.0, 0.0, new.viewport.css.width, new.viewport.css.height),
     )
     .map_or(SceneDamage::Unchanged, SceneDamage::Partial)
+}
+
+fn bounded_scope_change(old: &DisplayCommand, new: &DisplayCommand) -> bool {
+    // CSS Transforms 1 #transform-rendering and CSS Color 4 #transparency:
+    // transforms and group opacity affect the group's descendant paint.
+    // Keep clip topology and blending/filter changes on the full fallback.
+    match (old, new) {
+        (DisplayCommand::PushTransform(a), DisplayCommand::PushTransform(b)) => {
+            a.0.iter().chain(&b.0).all(|value| value.is_finite())
+        }
+        (DisplayCommand::PushLayer(a), DisplayCommand::PushLayer(b)) => {
+            a.blend == BlendMode::Normal
+                && b.blend == BlendMode::Normal
+                && a.color_filters.is_empty()
+                && b.color_filters.is_empty()
+        }
+        _ => false,
+    }
 }
 
 /// Quantize a logical damage rectangle outward exactly once and create the
@@ -1401,6 +1439,7 @@ fn changed_command_bounds(
     scene: &Scene,
     changed: std::ops::Range<usize>,
     aligned_other: Option<&Scene>,
+    changed_images: &HashSet<ImageHandle>,
 ) -> Option<Option<CssRect>> {
     let mut transforms = vec![Affine2d::IDENTITY];
     let mut clips = vec![CssRect::new(
@@ -1410,11 +1449,15 @@ fn changed_command_bounds(
         scene.viewport.css.height,
     )];
     let mut bounds = None;
+    let mut changed_transforms = vec![false];
+    let mut changed_layers = vec![false];
     for (index, command) in scene.primitives.iter().enumerate() {
         let transform = *transforms.last()?;
         let clip = *clips.last()?;
-        if changed.contains(&index)
-            && aligned_other.is_none_or(|other| other.primitives[index] != *command)
+        let differs = (changed.contains(&index)
+            && aligned_other.is_none_or(|other| other.primitives[index] != *command))
+            || matches!(command, DisplayCommand::Image { handle, .. } if changed_images.contains(handle));
+        if (differs || *changed_transforms.last()? || *changed_layers.last()?)
             && let Some(command_bounds) = leaf_command_bounds(command)
         {
             let command_bounds = transformed_css_bounds(command_bounds, transform);
@@ -1423,12 +1466,16 @@ fn changed_command_bounds(
             }
         }
         match command {
-            DisplayCommand::PushTransform(next) => transforms.push(transform.then(*next)),
+            DisplayCommand::PushTransform(next) => {
+                transforms.push(transform.then(*next));
+                changed_transforms.push(differs || *changed_transforms.last()?);
+            }
             DisplayCommand::PopTransform => {
                 if transforms.len() == 1 {
                     return None;
                 }
                 transforms.pop();
+                changed_transforms.pop();
             }
             DisplayCommand::PushClip(shape) => {
                 let shape = shape_css_bounds(shape)?;
@@ -1441,10 +1488,19 @@ fn changed_command_bounds(
                 }
                 clips.pop();
             }
+            DisplayCommand::PushLayer(_) => {
+                changed_layers.push(differs || *changed_layers.last()?);
+            }
+            DisplayCommand::PopLayer => {
+                if changed_layers.len() == 1 {
+                    return None;
+                }
+                changed_layers.pop();
+            }
             _ => {}
         }
     }
-    if transforms.len() != 1 || clips.len() != 1 {
+    if transforms.len() != 1 || clips.len() != 1 || changed_layers.len() != 1 {
         return None;
     }
     Some(bounds)
@@ -1512,6 +1568,32 @@ fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
         | DisplayCommand::BeginMarquee(_)
         | DisplayCommand::EndMarquee => None,
     }
+}
+
+/// CSS Masking 1 #clipping-paths intersects clipping regions; Compositing 1
+/// #groups composites the resulting group as one element. An entirely clipped
+/// group cannot contribute pixels, even with filters. Skip its backend work
+/// only if its independent clip/transform stacks are balanced: malformed or
+/// cross-scope lists retain the ordinary replay path.
+fn clipped_layer_end(commands: &[DisplayCommand], start: usize) -> Option<usize> {
+    let (mut layers, mut clips, mut transforms) = (1usize, 0usize, 0usize);
+    for (index, command) in commands.iter().enumerate().skip(start + 1) {
+        match command {
+            DisplayCommand::PushLayer(_) => layers += 1,
+            DisplayCommand::PopLayer => {
+                layers -= 1;
+                if layers == 0 {
+                    return (clips == 0 && transforms == 0).then_some(index);
+                }
+            }
+            DisplayCommand::PushClip(_) => clips += 1,
+            DisplayCommand::PopClip => clips = clips.checked_sub(1)?,
+            DisplayCommand::PushTransform(_) => transforms += 1,
+            DisplayCommand::PopTransform => transforms = transforms.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) fn shape_css_bounds(shape: &PaintShape) -> Option<CssRect> {
@@ -1620,7 +1702,78 @@ struct InteractionState {
     clips: Vec<(PaintShape, Affine2d)>,
 }
 
+#[derive(Clone, Copy)]
+struct ScrollProperty {
+    offset: CssPoint,
+    viewport: CssRect,
+}
+
+fn scroll_container_index(
+    page: &PagePaint,
+    offsets: &HashMap<usize, CssPoint>,
+) -> HashMap<usize, ScrollProperty> {
+    let mut index = HashMap::with_capacity(page.scroll_containers.len());
+    for container in &page.scroll_containers {
+        index.entry(container.node).or_insert(ScrollProperty {
+            offset: offsets
+                .get(&container.actor.unwrap_or(container.node))
+                .copied()
+                .unwrap_or(container.offset),
+            viewport: container.viewport,
+        });
+    }
+    index
+}
+
 impl Scene {
+    /// Snapshot identities only for images that can paint in this viewport.
+    /// Use the composed scroll/fixed transforms and overflow clips, rather
+    /// than the larger lazy-fetch look-ahead area. Missing images are retained
+    /// as `None` so decoding or cache eviction also invalidates their pixels.
+    pub fn visible_image_revisions(&self) -> HashMap<ImageHandle, Option<u64>> {
+        let mut transforms = vec![Affine2d::IDENTITY];
+        let mut clips = vec![CssRect::new(
+            0.0,
+            0.0,
+            self.viewport.css.width,
+            self.viewport.css.height,
+        )];
+        let mut visible = HashMap::new();
+        for command in &self.primitives {
+            let transform = *transforms.last().unwrap();
+            let clip = *clips.last().unwrap();
+            match command {
+                DisplayCommand::PushTransform(next) => transforms.push(transform.then(*next)),
+                DisplayCommand::PopTransform if transforms.len() > 1 => {
+                    transforms.pop();
+                }
+                DisplayCommand::PushClip(shape) => {
+                    clips.push(shape_css_bounds(shape).map_or(clip, |bounds| {
+                        intersect_css_rect(clip, transformed_css_bounds(bounds, transform))
+                            .unwrap_or_default()
+                    }));
+                }
+                DisplayCommand::PopClip if clips.len() > 1 => {
+                    clips.pop();
+                }
+                DisplayCommand::Image { handle, .. }
+                    if leaf_command_bounds(command).is_some_and(|bounds| {
+                        intersect_css_rect(clip, transformed_css_bounds(bounds, transform))
+                            .is_some()
+                    }) =>
+                {
+                    visible.insert(*handle, None);
+                }
+                _ => {}
+            }
+        }
+        let store = self.image_store.0.read().expect("image store poisoned");
+        for (handle, revision) in &mut visible {
+            *revision = store.entries.get(handle).map(|entry| entry.revision);
+        }
+        visible
+    }
+
     pub(crate) fn image(&self, handle: ImageHandle) -> Option<ImageResource> {
         self.canvas_images
             .get(&handle)
@@ -1647,37 +1800,49 @@ impl Scene {
     /// respecting the transform and clip stacks that were active when each
     /// region was emitted (Pointer Events §4.1.3.2 target determination).
     pub fn page_hit_at(&self, point: CssPoint) -> Option<PageHit> {
-        let states = interaction_states(&self.primitives);
-        self.primitives
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, primitive)| {
-                let DisplayCommand::HitRegion(region) = primitive else {
-                    return None;
-                };
-                // Paint emits geometry regions for ordinary boxes as well as
-                // actionable content. Hit testing must continue through a
-                // topmost decorative/anonymous region to the first semantic
-                // target beneath it; filtering only after this method returns
-                // made text/pseudo/SVG paint over a button swallow its click.
-                if region.link.is_none() && region.actor.is_none() && region.cursor.is_none() {
-                    return None;
+        // CSSOM View target determination uses the last eligible painted box.
+        // A point query needs only stack-depth scratch, not a clone of every
+        // polygon/clip stack for every region in an offscreen gallery.
+        let mut transforms = vec![Affine2d::IDENTITY];
+        let mut clips = vec![true];
+        let mut hit = None;
+        for primitive in &self.primitives {
+            let transform = *transforms.last().unwrap();
+            match primitive {
+                DisplayCommand::PushTransform(next) => transforms.push(transform.then(*next)),
+                DisplayCommand::PopTransform if transforms.len() > 1 => {
+                    transforms.pop();
                 }
-                let state = states.get(index)?.as_ref()?;
-                point_in_interaction_state(point, state)
-                    .then(|| state.transform.inverse())
-                    .flatten()
-                    .map(|inverse| inverse.map_point(point))
-                    .filter(|local| region.rect.contains(*local))
-                    .map(|_| PageHit {
-                        rect: transformed_bounds(region.rect, state.transform),
+                DisplayCommand::PushClip(shape) => clips.push(
+                    *clips.last().unwrap()
+                        && transform
+                            .inverse()
+                            .is_some_and(|inverse| shape_contains(shape, inverse.map_point(point))),
+                ),
+                DisplayCommand::PopClip if clips.len() > 1 => {
+                    clips.pop();
+                }
+                DisplayCommand::HitRegion(region)
+                    if *clips.last().unwrap()
+                        && (region.link.is_some()
+                            || region.actor.is_some()
+                            || region.cursor.is_some())
+                        && transform.inverse().is_some_and(|inverse| {
+                            region.rect.contains(inverse.map_point(point))
+                        }) =>
+                {
+                    hit = Some(PageHit {
+                        rect: transformed_bounds(region.rect, transform),
                         node: region.node,
                         actor: region.actor,
                         link: region.link.clone(),
                         cursor: region.cursor.clone(),
-                    })
-            })
+                    });
+                }
+                _ => {}
+            }
+        }
+        hit
     }
 
     /// Every CSS box at `point`, in topmost-first paint order, for CSSOM View's
@@ -1967,6 +2132,20 @@ impl Scene {
     /// on the document timeline. Keeping the time parameter in scene
     /// composition preserves a stable layout/display list between frames.
     pub fn append_page_at(&mut self, page: &PagePaint, scroll: CssPoint, elapsed_seconds: f32) {
+        self.append_page_with_scroll_offsets(page, scroll, elapsed_seconds, &HashMap::new());
+    }
+
+    /// CSSOM View #scrolling: native scrolling changes composition properties,
+    /// independently of page tasks. Keep the immutable layout shared with the
+    /// actor; changing an offset must not copy its entire display list.
+    pub fn append_page_with_scroll_offsets(
+        &mut self,
+        page: &PagePaint,
+        scroll: CssPoint,
+        elapsed_seconds: f32,
+        offsets: &HashMap<usize, CssPoint>,
+    ) {
+        let scroll_containers = scroll_container_index(page, offsets);
         self.canvas_images.extend(
             page.canvas_images
                 .iter()
@@ -1980,10 +2159,13 @@ impl Scene {
             .iter()
             .cloned()
             .map(|mut container| {
+                if let Some(property) = scroll_containers.get(&container.node) {
+                    container.offset = property.offset;
+                }
                 let ancestor_scroll = container
                     .ancestors
                     .iter()
-                    .filter_map(|node| page.scroll_containers.iter().find(|c| c.node == *node))
+                    .filter_map(|node| scroll_containers.get(node))
                     .fold(CssPoint::default(), |sum, c| {
                         CssPoint::new(sum.x + c.offset.x, sum.y + c.offset.y)
                     });
@@ -2019,7 +2201,7 @@ impl Scene {
                 )));
             self.append_sticky_commands(
                 &page.fixed_under_primitives,
-                page,
+                &scroll_containers,
                 CssPoint::default(),
                 elapsed_seconds,
             );
@@ -2030,7 +2212,12 @@ impl Scene {
                 self.content_viewport.x - scroll.x,
                 self.content_viewport.y - scroll.y,
             )));
-        self.append_sticky_commands(&page.primitives, page, scroll, elapsed_seconds);
+        self.append_sticky_commands(
+            &page.primitives,
+            &scroll_containers,
+            scroll,
+            elapsed_seconds,
+        );
         self.primitives.push(Primitive::PopTransform);
 
         // Fixed-position descendants use the viewport as their containing
@@ -2043,7 +2230,7 @@ impl Scene {
                 )));
             self.append_sticky_commands(
                 &page.fixed_primitives,
-                page,
+                &scroll_containers,
                 CssPoint::default(),
                 elapsed_seconds,
             );
@@ -2063,7 +2250,12 @@ impl Scene {
                     self.content_viewport.x - entry_scroll.x,
                     self.content_viewport.y - entry_scroll.y,
                 )));
-            self.append_sticky_commands(&entry.primitives, page, entry_scroll, elapsed_seconds);
+            self.append_sticky_commands(
+                &entry.primitives,
+                &scroll_containers,
+                entry_scroll,
+                elapsed_seconds,
+            );
             self.primitives.push(Primitive::PopTransform);
         }
         self.primitives.push(Primitive::PopClip);
@@ -2072,19 +2264,21 @@ impl Scene {
     fn append_sticky_commands(
         &mut self,
         commands: &[Primitive],
-        page: &PagePaint,
+        scroll_containers: &HashMap<usize, ScrollProperty>,
         viewport_scroll: CssPoint,
         elapsed_seconds: f32,
     ) {
+        // CSS Overflow scroll scopes retain their offsets between paints.
+        // Resolve each scope by identity, without scanning every unrelated
+        // scrollport for every command on a large page.
         for command in commands {
             match command {
                 Primitive::BeginSticky(constraint) => {
                     let (scroll, viewport) = constraint
                         .container
                         .and_then(|node| {
-                            page.scroll_containers
-                                .iter()
-                                .find(|container| container.node == node)
+                            scroll_containers
+                                .get(&node)
                                 .map(|container| (container.offset, container.viewport))
                         })
                         .unwrap_or((
@@ -2104,10 +2298,8 @@ impl Scene {
                 }
                 Primitive::EndSticky => self.primitives.push(Primitive::PopTransform),
                 Primitive::BeginScroll(node) => {
-                    let offset = page
-                        .scroll_containers
-                        .iter()
-                        .find(|container| container.node == *node)
+                    let offset = scroll_containers
+                        .get(node)
                         .map(|container| container.offset)
                         .unwrap_or_default();
                     self.primitives
@@ -3758,7 +3950,7 @@ mod tests {
     }
 
     #[test]
-    fn stateful_display_list_change_requires_full_damage() {
+    fn transformed_scope_damage_includes_old_and_new_descendant_positions() {
         let viewport =
             ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
         let mut old = desktop_shell(viewport, &snapshot());
@@ -3773,7 +3965,60 @@ mod tests {
         old.primitives.push(DisplayCommand::PopTransform);
         let mut new = old.clone();
         new.primitives[1] = DisplayCommand::PushTransform(Affine2d::translate(11.0, 5.0));
+        assert_eq!(
+            scene_damage(&old, &new),
+            SceneDamage::Partial(CssRect::new(8., 3., 25., 24.))
+        );
+        new.primitives.remove(1);
         assert_eq!(scene_damage(&old, &new), SceneDamage::Full);
+    }
+
+    #[test]
+    fn offscreen_opacity_and_transform_animation_has_no_raster_damage() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut old = desktop_shell(viewport, &snapshot());
+        old.primitives.extend([
+            DisplayCommand::PushLayer(CompositingLayer {
+                opacity: 0.5,
+                blend: BlendMode::Normal,
+                color_filters: Default::default(),
+            }),
+            DisplayCommand::PushTransform(Affine2d::translate(0., 500.)),
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 30., 30.))),
+            DisplayCommand::FillRect {
+                rect: CssRect::new(0., 0., 100., 100.),
+                color: PaintColor::Accent,
+            },
+            DisplayCommand::PopClip,
+            DisplayCommand::PopTransform,
+            DisplayCommand::PopLayer,
+        ]);
+        let mut new = old.clone();
+        if let DisplayCommand::PushLayer(layer) = &mut new.primitives[1] {
+            layer.opacity = 0.75;
+        }
+        new.primitives[2] = DisplayCommand::PushTransform(Affine2d::translate(10., 510.));
+        assert_eq!(scene_damage(&old, &new), SceneDamage::Unchanged);
+        new.primitives[2] = DisplayCommand::PushTransform(Affine2d::translate(10., 10.));
+        assert_eq!(
+            scene_damage(&old, &new),
+            SceneDamage::Partial(CssRect::new(8., 8., 34., 34.))
+        );
+        let SceneDamage::Partial(rect) = scene_damage(&old, &new) else {
+            unreachable!()
+        };
+        let crop = raster_damage(&new, rect).unwrap();
+        let mut renderer = vello_cpu::VelloCpuRenderer::new();
+        let mut composed = renderer.render_rgba(&old).unwrap();
+        let patch = renderer.render_rgba(&crop.scene).unwrap();
+        for y in 0..patch.size.height as usize {
+            let from = y * patch.size.width as usize * 4;
+            let to = ((y + crop.y as usize) * composed.size.width as usize + crop.x as usize) * 4;
+            let len = patch.size.width as usize * 4;
+            composed.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+        }
+        assert_eq!(composed.pixels, renderer.render_rgba(&new).unwrap().pixels);
     }
 
     #[test]
@@ -3951,6 +4196,20 @@ mod tests {
             command,
             DisplayCommand::BeginScroll(_) | DisplayCommand::EndScroll
         )));
+        let retained = Arc::new(page);
+        let shared = retained.clone();
+        let mut native = desktop_shell(viewport, &snapshot());
+        native.append_page_with_scroll_offsets(
+            &retained,
+            CssPoint::default(),
+            0.,
+            &HashMap::from([(77, CssPoint::new(0., 100.))]),
+        );
+        assert_eq!(native.page_scroll_containers[0].offset.y, 100.);
+        assert!(Arc::ptr_eq(&retained, &shared));
+        assert_eq!(retained.scroll_containers[0].offset.y, 80.);
+        assert!(native.primitives.iter().any(|command| matches!(command,
+            DisplayCommand::PushTransform(matrix) if matrix.0[5] == -100.)));
     }
 
     #[test]
@@ -3986,6 +4245,121 @@ mod tests {
             );
         }
         assert_eq!(store.generation(), 2);
+    }
+
+    #[test]
+    fn image_replacement_damage_respects_transformed_clips_and_matches_full_raster() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut scene = desktop_shell(viewport, &snapshot());
+        let visible = ImageHandle(1);
+        let offscreen = ImageHandle(2);
+        let image = |handle| DisplayCommand::Image {
+            rect: CssRect::new(0., 0., 100., 100.),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 1,
+            link: None,
+        };
+        scene.primitives.extend([
+            DisplayCommand::PushTransform(Affine2d::translate(10., 10.)),
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 20., 20.))),
+            image(visible),
+            DisplayCommand::PopClip,
+            DisplayCommand::PopTransform,
+            DisplayCommand::PushTransform(Affine2d::translate(0., 500.)),
+            image(offscreen),
+            DisplayCommand::PopTransform,
+        ]);
+        assert_eq!(
+            scene.visible_image_revisions(),
+            HashMap::from([(visible, None)])
+        );
+        let resource = |rgba| ImageResource {
+            svg_source: None,
+            width: 1,
+            height: 1,
+            rgba: Arc::from(rgba),
+            has_alpha: true,
+        };
+        scene
+            .image_store
+            .insert(visible, resource([255, 0, 0, 255]));
+        let revisions = scene.visible_image_revisions();
+        assert!(revisions[&visible].is_some());
+        let mut renderer = vello_cpu::VelloCpuRenderer::new();
+        let mut previous_pixels = renderer.render_rgba(&scene).unwrap();
+        scene
+            .image_store
+            .insert(visible, resource([0, 0, 255, 128]));
+        assert_ne!(revisions, scene.visible_image_revisions());
+        let damage = scene_damage_with_image_changes(&scene, &scene, &HashSet::from([visible]));
+        assert_eq!(damage, SceneDamage::Partial(CssRect::new(8., 8., 24., 24.)));
+        let SceneDamage::Partial(rect) = damage else {
+            unreachable!()
+        };
+        let crop = raster_damage(&scene, rect).unwrap();
+        let patch = renderer.render_rgba(&crop.scene).unwrap();
+        for y in 0..patch.size.height as usize {
+            let from = y * patch.size.width as usize * 4;
+            let to =
+                ((y + crop.y as usize) * previous_pixels.size.width as usize + crop.x as usize) * 4;
+            let len = patch.size.width as usize * 4;
+            previous_pixels.pixels[to..to + len].copy_from_slice(&patch.pixels[from..from + len]);
+        }
+        assert_eq!(
+            previous_pixels.pixels,
+            renderer.render_rgba(&scene).unwrap().pixels
+        );
+        scene
+            .image_store
+            .insert(offscreen, resource([0, 255, 0, 255]));
+        assert_eq!(
+            scene_damage_with_image_changes(&scene, &scene, &HashSet::from([offscreen])),
+            SceneDamage::Unchanged
+        );
+        scene.image_store.remove(visible);
+        assert_eq!(
+            scene.visible_image_revisions(),
+            HashMap::from([(visible, None)])
+        );
+    }
+
+    #[test]
+    fn visible_images_follow_nested_scroll_transforms_and_ancestor_clips() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut scene = desktop_shell(viewport, &snapshot());
+        let image = |handle, y| DisplayCommand::Image {
+            rect: CssRect::new(0., y, 20., 20.),
+            handle: ImageHandle(handle),
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 1,
+            link: None,
+        };
+        scene.primitives.extend([
+            DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 60., 40.))),
+            DisplayCommand::PushTransform(Affine2d::translate(0., -100.)),
+            image(1, 0.),
+            image(2, 100.),
+            image(3, 160.), // Inside the viewport, but outside its scrollport.
+            DisplayCommand::PopTransform,
+            DisplayCommand::PopClip,
+            image(4, 80.), // A fixed sibling escapes that scroll transform/clip.
+        ]);
+        assert_eq!(
+            scene
+                .visible_image_revisions()
+                .into_keys()
+                .collect::<HashSet<_>>(),
+            HashSet::from([ImageHandle(2), ImageHandle(4)])
+        );
     }
 
     #[test]
