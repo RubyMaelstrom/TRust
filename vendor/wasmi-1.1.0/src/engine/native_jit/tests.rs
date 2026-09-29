@@ -1,4 +1,5 @@
 use crate::{Config, Engine, Linker, Module as WasmModule, Store};
+use alloc::{format, string::String};
 
 fn run(source: &str, enabled: bool, input: (i32, i32)) -> (i32, Engine) {
     let mut config = Config::default();
@@ -25,8 +26,52 @@ fn compiled_regions(engine: &Engine) -> usize {
         .lock()
         .unwrap()
         .values()
-        .filter(|region| region.is_some())
+        .filter(|candidate| candidate.region.is_some())
         .count()
+}
+
+#[test]
+fn native_short_host_calls_accumulate_hotness_across_stores() {
+    // The exported-call boundary in the Wasm JS API does not reset a function's
+    // semantics or its engine-owned code. No individual call visits a PC twice.
+    let source = r#"(module
+        (memory (export "memory") 1)
+        (global $g (mut i32) (i32.const 0))
+        (func (export "run") (param $v i32) (result i32)
+            global.get $g local.get $v i32.add global.set $g
+            i32.const 0 global.get $g i32.store
+            i32.const 0 i32.load))"#;
+    for enabled in [false, true] {
+        let mut config = Config::default();
+        config.native_jit(enabled);
+        let engine = Engine::new(&config);
+        let module = WasmModule::new(&engine, wat::parse_str(source).unwrap()).unwrap();
+        let mut stores = [Store::new(&engine, ()), Store::new(&engine, ())];
+        let instances = stores.each_mut().map(|store| {
+            Linker::new(&engine)
+                .instantiate_and_start(store, &module)
+                .unwrap()
+        });
+        let functions = std::array::from_fn::<_, 2, _>(|i| {
+            instances[i]
+                .get_typed_func::<i32, i32>(&stores[i], "run")
+                .unwrap()
+        });
+        let mut sums = [0_i32; 2];
+        for call in 0..100 {
+            let i = call % 2;
+            let value = (call as i32).wrapping_mul(7919);
+            sums[i] = sums[i].wrapping_add(value);
+            assert_eq!(functions[i].call(&mut stores[i], value).unwrap(), sums[i]);
+            let memory = instances[i].get_memory(&stores[i], "memory").unwrap();
+            assert_eq!(&memory.data(&stores[i])[..4], &sums[i].to_le_bytes());
+            assert!(!memory.take_dirty_ranges(&mut stores[i]).is_empty());
+            if call < 32 {
+                assert_eq!(compiled_regions(&engine), 0);
+            }
+        }
+        assert_eq!(compiled_regions(&engine) > 0, enabled);
+    }
 }
 
 #[test]
@@ -47,6 +92,53 @@ fn native_global_loop_and_budget_exit_match_interpreter() {
             "the native path must have compiled"
         );
     }
+}
+
+#[test]
+fn native_cold_startup_cannot_exhaust_future_hotness() {
+    let mut source = String::from("(module");
+    for index in 0..super::MAX_CANDIDATES + 32 {
+        source.push_str(&format!(
+            "(func (export \"cold{index}\") (param i32) (result i32) local.get 0 i32.const {index} i32.add)"
+        ));
+    }
+    source.push_str(
+        "(memory 1) (global $g (mut i32) (i32.const 7919))
+         (func (export \"hot\") (param i32) (result i32)
+             i32.const 0 local.get 0 i32.store
+             i32.const 0 i32.load global.get $g i32.mul))",
+    );
+    let mut config = Config::default();
+    config.native_jit(true);
+    let engine = Engine::new(&config);
+    let module = WasmModule::new(&engine, wat::parse_str(source).unwrap()).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine)
+        .instantiate_and_start(&mut store, &module)
+        .unwrap();
+    for index in 0..super::MAX_CANDIDATES + 32 {
+        let function = instance
+            .get_typed_func::<i32, i32>(&store, &format!("cold{index}"))
+            .unwrap();
+        assert_eq!(function.call(&mut store, 17).unwrap(), index as i32 + 17);
+    }
+    assert_eq!(compiled_regions(&engine), 0);
+    let hot = instance.get_typed_func::<i32, i32>(&store, "hot").unwrap();
+    for value in 0..100 {
+        assert_eq!(hot.call(&mut store, value).unwrap(), value * 7919);
+    }
+    assert!(compiled_regions(&engine) > 0);
+    assert!(
+        engine
+            .inner
+            .code_map
+            .native_jit
+            .regions
+            .lock()
+            .unwrap()
+            .len()
+            <= super::MAX_CANDIDATES
+    );
 }
 
 #[test]
@@ -458,7 +550,7 @@ fn native_many_alternating_functions_keep_their_hotness() {
         assert!(
             regions
                 .values()
-                .flatten()
+                .filter_map(|candidate| candidate.region.as_ref())
                 .any(|region| region.function_base == function.instrs().as_ptr() as usize),
             "function {index} never reached native compilation"
         );

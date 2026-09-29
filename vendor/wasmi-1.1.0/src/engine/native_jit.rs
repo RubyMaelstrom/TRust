@@ -9,19 +9,19 @@
 use super::code_map::CodeMap;
 use crate::{
     core::UntypedVal,
-    ir::{index, Op, Slot},
+    ir::{Op, Slot, index},
 };
 use alloc::vec::Vec;
 use cranelift_codegen::{
     ir::{
-        condcodes::IntCC, types, AbiParam, Block, InstBuilder, MemFlagsData as MemFlags, Type,
-        UserFuncName, Value,
+        AbiParam, Block, InstBuilder, MemFlagsData as MemFlags, Type, UserFuncName, Value,
+        condcodes::IntCC, types,
     },
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{default_libcall_names, Linkage, Module};
+use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -40,8 +40,15 @@ mod tests;
 #[derive(Debug)]
 pub(crate) struct NativeJit {
     pub enabled: bool,
-    regions: Mutex<HashMap<usize, Option<Arc<NativeRegion>>>>,
+    regions: Mutex<HashMap<usize, Candidate>>,
     trace: bool,
+}
+
+#[derive(Debug, Default)]
+struct Candidate {
+    visits: u8,
+    attempted: bool,
+    region: Option<Arc<NativeRegion>>,
 }
 
 impl NativeJit {
@@ -53,14 +60,72 @@ impl NativeJit {
         }
     }
 
+    /// Observe one invocation's first visit. Hotness belongs to the Engine, just like
+    /// compiled code; short exported calls must not lose it at a JS/host boundary.
+    /// None means still warming; Some(None) is a checked interpreter fallback.
+    pub fn observe(&self, code_map: &CodeMap, address: usize) -> Option<Option<Arc<NativeRegion>>> {
+        let mut regions = self.regions.lock().ok()?;
+        if !regions.contains_key(&address) && !Self::make_room(&mut regions) {
+            return Some(None);
+        }
+        let candidate = regions.entry(address).or_default();
+        if candidate.attempted {
+            return Some(candidate.region.clone());
+        }
+        candidate.visits = candidate.visits.saturating_add(1);
+        if candidate.visits <= 32 {
+            return None;
+        }
+        Some(self.compile_candidate(code_map, address, &mut regions))
+    }
+
     pub fn get_or_compile(&self, code_map: &CodeMap, address: usize) -> Option<Arc<NativeRegion>> {
         let mut regions = self.regions.lock().ok()?;
-        if let Some(region) = regions.get(&address) {
-            return region.clone();
+        if !regions.contains_key(&address) && !Self::make_room(&mut regions) {
+            return None;
         }
-        if regions.len() >= MAX_CANDIDATES
-            || regions.values().filter(|r| r.is_some()).count() >= MAX_REGIONS
+        self.compile_candidate(code_map, address, &mut regions)
+    }
+
+    /// One-shot startup code must not fill the counter budget and disable later hot functions.
+    /// Recycle the coldest warming batch at capacity; completed compilation attempts, including
+    /// checked fallbacks, keep their identities. The scan is amortized over cold admissions.
+    fn make_room(regions: &mut HashMap<usize, Candidate>) -> bool {
+        if regions.len() < MAX_CANDIDATES {
+            return true;
+        }
+        let Some(coldest) = regions
+            .values()
+            .filter(|candidate| !candidate.attempted)
+            .map(|candidate| candidate.visits)
+            .min()
+        else {
+            return false;
+        };
+        regions.retain(|_, candidate| candidate.attempted || candidate.visits > coldest);
+        true
+    }
+
+    fn compile_candidate(
+        &self,
+        code_map: &CodeMap,
+        address: usize,
+        regions: &mut HashMap<usize, Candidate>,
+    ) -> Option<Arc<NativeRegion>> {
+        if let Some(candidate) = regions
+            .get(&address)
+            .filter(|candidate| candidate.attempted)
         {
+            return candidate.region.clone();
+        }
+        let full = regions
+            .values()
+            .filter(|candidate| candidate.region.is_some())
+            .count()
+            >= MAX_REGIONS;
+        let candidate = regions.entry(address).or_default();
+        candidate.attempted = true;
+        if full {
             return None;
         }
         let started = std::time::Instant::now();
@@ -78,7 +143,7 @@ impl NativeJit {
                 );
             }
         }
-        regions.insert(address, region.clone());
+        candidate.region = region.clone();
         region
     }
 }

@@ -1,7 +1,7 @@
 use super::Executor;
 use crate::{
     core::UntypedVal,
-    engine::native_jit::{NativeMemory, NativeRegion, MAX_CANDIDATES, MAX_GLOBALS},
+    engine::native_jit::{MAX_CANDIDATES, MAX_GLOBALS, NativeMemory, NativeRegion},
     store::StoreInner,
 };
 use rustc_hash::FxHashMap;
@@ -60,6 +60,12 @@ impl Executor<'_> {
         } else {
             self.native.entries.entry(address).or_default()
         };
+        if entry.visits == 0 {
+            if let Some(region) = self.code_map.native_jit.observe(self.code_map, address) {
+                entry.visits = 33;
+                entry.region = region;
+            }
+        }
         if entry.visits < 32 {
             entry.visits += 1;
             return false;

@@ -89,6 +89,9 @@ unsupported instructions and fuel-metered engines use the interpreter.
 compilation times. The per-engine cache accepts at most 128 native regions of
 256 Wasmi instruction words each and 2,048 candidate addresses. Native code
 allocations are released when the engine and its active calls are dropped.
+Compilation counters persist across host/JavaScript calls. The bounded cache
+recycles cold counters so one-shot startup code cannot exclude later hot functions;
+compiled regions and checked fallbacks retain their cache entries.
 
 The deterministic `src/fixtures/wasm_native_benchmark.html` fixture reports
 execution time and checks its result. Compare both modes without competing
