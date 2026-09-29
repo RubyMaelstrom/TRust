@@ -6246,8 +6246,11 @@
     // can create a suspended context while assembling their interface. TRust
     // has no audio graph renderer yet: acquisition fails asynchronously and
     // resume rejects, without advancing the sample clock or reporting playback.
-    // Only the context lifecycle is implemented here; graph nodes, decoding,
-    // offline rendering and worklets must not advertise fabricated support.
+    // The suspended graph supports ScriptProcessorNode and its destination.
+    // Web Audio #AudioContext-methods (suspend) forbids processing callbacks while
+    // suspended: connecting these nodes schedules no work and allocates no PCM.
+    // Decoding, other processing nodes, offline rendering and worklets remain
+    // unimplemented. This is not an audio renderer.
     function installAudioContexts() {
         const binding = g.__audio_context_binding;
         delete g.__audio_context_binding;
@@ -6256,10 +6259,134 @@
         const PromiseCtor = Promise, Exception = DOMException;
         const finite = Number.isFinite, fround = Math.fround;
         const define = Object.defineProperty;
+        const apply = Reflect.apply;
         function record(context) {
             const state = get(context);
-            if (!state) throw new TypeError("Illegal AudioContext invocation");
+            if (!state || state.kind !== "context") throw new TypeError("Illegal AudioContext invocation");
             return state;
+        }
+        function nodeRecord(node, kind) {
+            const state = get(node);
+            if (!state || (state.kind !== "processor" && state.kind !== "destination") ||
+                (kind && state.kind !== kind)) throw new TypeError("Illegal AudioNode invocation");
+            return state;
+        }
+        function eventTargetState(target, state) {
+            state.handlers = Object.create(null);
+            // Keep event registration in the target's Realm even when a setter
+            // is borrowed from another same-Agent Window.
+            state.add = (type, fn) => addL(target, type, fn, false);
+            state.remove = (type, fn) => removeL(target, type, fn, false);
+        }
+        function checkPort(port, count) {
+            if (port >= count) throw new Exception("Audio port index is out of range", "IndexSizeError");
+        }
+        // Web Audio #AudioNode-methods: preserve actual connection identity,
+        // including duplicate suppression and selective disconnect errors.
+        // Both endpoints retain an edge, so a reachable destination retains
+        // its connected processors. Unreachable graphs remain WeakMap keys.
+        class AudioNode extends EventTarget {
+            constructor(key, context, kind, channelCount) {
+                if (key !== token) throw new TypeError("Illegal constructor");
+                super();
+                const state = {kind, context, channelCount, mode: "explicit",
+                    interpretation: "speakers", inputs: 1, outputs: 1, edges: new Set()};
+                eventTargetState(this, state);
+                set(this, state);
+            }
+            get context() { return nodeRecord(this).context; }
+            get numberOfInputs() { return nodeRecord(this).inputs; }
+            get numberOfOutputs() { return nodeRecord(this).outputs; }
+            get channelCount() { return nodeRecord(this).channelCount; }
+            set channelCount(value) {
+                const state = nodeRecord(this);
+                value = value >>> 0;
+                if (state.kind === "processor") {
+                    if (value !== state.channelCount)
+                        throw new Exception("ScriptProcessor channel count is fixed", "NotSupportedError");
+                } else if (value < 1 || value > 2) {
+                    throw new Exception("Destination channel count is out of range", "IndexSizeError");
+                }
+                state.channelCount = value;
+            }
+            get channelCountMode() { return nodeRecord(this).mode; }
+            set channelCountMode(value) {
+                const state = nodeRecord(this);
+                value = enumValue(value, ["max", "clamped-max", "explicit"]);
+                if (state.kind === "processor" && value !== "explicit")
+                    throw new Exception("ScriptProcessor channel mode is explicit", "NotSupportedError");
+                state.mode = value;
+            }
+            get channelInterpretation() { return nodeRecord(this).interpretation; }
+            set channelInterpretation(value) {
+                const state = nodeRecord(this);
+                state.interpretation = enumValue(value, ["speakers", "discrete"]);
+            }
+            connect(destination, output = 0, input = 0) {
+                const state = nodeRecord(this), other = nodeRecord(destination);
+                // Web IDL converts every argument before method validation.
+                output = output >>> 0;
+                input = input >>> 0;
+                if (state.context !== other.context)
+                    throw new Exception("Audio nodes belong to different contexts", "InvalidAccessError");
+                checkPort(output, state.outputs);
+                checkPort(input, other.inputs);
+                for (const edge of state.edges) {
+                    if (edge.source === this && edge.destination === destination &&
+                        edge.output === output && edge.input === input) return destination;
+                }
+                const edge = {source: this, destination, output, input};
+                state.edges.add(edge);
+                other.edges.add(edge);
+                return destination;
+            }
+            disconnect(destination = undefined, output = undefined, input = undefined) {
+                const state = nodeRecord(this), count = Math.min(arguments.length, 3);
+                let other = null;
+                if (count) {
+                    const candidate = get(destination);
+                    if (count > 1 || (candidate &&
+                        (candidate.kind === "processor" || candidate.kind === "destination"))) {
+                        other = nodeRecord(destination);
+                        if (count > 1) output = output >>> 0;
+                        if (count > 2) input = input >>> 0;
+                    } else {
+                        // The one-argument overload falls back to unsigned long,
+                        // including null/undefined and objects with valueOf.
+                        output = destination >>> 0;
+                    }
+                    if (!other || count > 1) checkPort(output, state.outputs);
+                    if (other && count > 2) checkPort(input, other.inputs);
+                }
+                let removed = false;
+                for (const edge of state.edges) {
+                    if (edge.source !== this ||
+                        (other && edge.destination !== destination) ||
+                        (count && (!other || count > 1) && edge.output !== output) ||
+                        (other && count > 2 && edge.input !== input)) continue;
+                    state.edges.delete(edge);
+                    nodeRecord(edge.destination).edges.delete(edge);
+                    removed = true;
+                }
+                if (other && !removed)
+                    throw new Exception("Audio nodes are not connected", "InvalidAccessError");
+            }
+        }
+        class AudioDestinationNode extends AudioNode {
+            constructor(key, context) {
+                super(key, context, "destination", 2);
+            }
+            // Stereo graph capacity while device acquisition is unavailable.
+            get maxChannelCount() { nodeRecord(this, "destination"); return 2; }
+        }
+        class ScriptProcessorNode extends AudioNode {
+            constructor(key, context, bufferSize, inputs, outputs) {
+                super(key, context, "processor", inputs);
+                const state = nodeRecord(this);
+                state.bufferSize = bufferSize;
+                state.outputChannels = outputs;
+            }
+            get bufferSize() { return nodeRecord(this, "processor").bufferSize; }
         }
         function requireActive(contextId) {
             if (!binding("active", contextId))
@@ -6321,6 +6448,25 @@
             get currentTime() { record(this); return 0; }
             get state() { return record(this).closed ? "closed" : "suspended"; }
             get renderQuantumSize() { return record(this).quantum; }
+            get destination() { return record(this).destination; }
+            createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {
+                record(this);
+                bufferSize = bufferSize >>> 0;
+                numberOfInputChannels = numberOfInputChannels >>> 0;
+                numberOfOutputChannels = numberOfOutputChannels >>> 0;
+                // #BaseAudioContext-methods (createScriptProcessor): explicit sizes
+                // are powers of two from 256 through 16384; zero selects a
+                // stable implementation size. Channel counts include zero,
+                // but the input and output counts cannot both be zero.
+                if (bufferSize && (bufferSize < 256 || bufferSize > 16384 ||
+                    (bufferSize & (bufferSize - 1))))
+                    throw new Exception("Invalid ScriptProcessor buffer size", "IndexSizeError");
+                if (numberOfInputChannels > 32 || numberOfOutputChannels > 32 ||
+                    (!numberOfInputChannels && !numberOfOutputChannels))
+                    throw new Exception("Invalid ScriptProcessor channel count", "IndexSizeError");
+                return new ScriptProcessorNode(token, this, bufferSize || 4096,
+                    numberOfInputChannels, numberOfOutputChannels);
+            }
         }
         class AudioContext extends BaseAudioContext {
             constructor(contextOptions = undefined) {
@@ -6331,13 +6477,13 @@
                 if ((!state.hardware && state.quantum < 1) || state.quantum > 6 * state.rate)
                     throw new Exception("Unsupported render quantum size", "NotSupportedError");
                 state.closed = false;
+                state.kind = "context";
                 state.contextId = storageContextId;
-                state.handlers = Object.create(null);
                 super(token, state);
+                eventTargetState(this, state);
+                state.destination = new AudioDestinationNode(token, this);
                 state.enqueue = fn => __queue_dom_task(fn);
                 state.fire = type => dispatch(this, createTrustedEvent(Event, type), false);
-                state.add = (type, fn) => addL(this, type, fn, false);
-                state.remove = (type, fn) => removeL(this, type, fn, false);
                 // Sending a control message to start processing: acquisition
                 // failure queues an error event; it does not throw out of the
                 // constructor or start a timer to imitate an audio clock.
@@ -6378,28 +6524,33 @@
         }
         // HTML event handler activation preserves the listener's original
         // position when a non-null handler is replaced. Keep slots private.
-        for (const [proto, type] of [[BaseAudioContext.prototype, "statechange"],
-            [AudioContext.prototype, "error"]]) {
+        for (const [proto, type, getState] of [[BaseAudioContext.prototype, "statechange", record],
+            [AudioContext.prototype, "error", record],
+            [ScriptProcessorNode.prototype, "audioprocess", target => nodeRecord(target, "processor")]]) {
             define(proto, "on" + type, {
                 configurable: true, enumerable: true,
-                get() { const handler = record(this).handlers[type]; return handler ? handler.value : null; },
+                get() { const handler = getState(this).handlers[type]; return handler ? handler.value : null; },
                 set(value) {
-                    const state = record(this), handlers = state.handlers;
+                    const state = getState(this), handlers = state.handlers;
                     let handler = handlers[type];
-                    value = typeof value === "function" ? value : null;
+                    // Web IDL LegacyTreatNonObjectAsNull preserves objects;
+                    // a non-callable object fails only when the event fires.
+                    value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
                     if (value === null) {
                         if (handler) state.remove(type, handler.listener);
                         delete handlers[type];
                     } else if (handler) handler.value = value;
                     else {
-                        handler = {value, listener: event => handler.value.call(this, event)};
+                        handler = {value, listener: event => {
+                            if (apply(handler.value, this, [event]) === false) event.preventDefault();
+                        }};
                         handlers[type] = handler;
                         state.add(type, handler.listener);
                     }
                 }
             });
         }
-        for (const ctor of [BaseAudioContext, AudioContext]) {
+        for (const ctor of [BaseAudioContext, AudioContext, AudioNode, AudioDestinationNode, ScriptProcessorNode]) {
             for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
                 if (name === "constructor") continue;
                 const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);

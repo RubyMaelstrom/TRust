@@ -18490,6 +18490,73 @@ mod tests {
     }
 
     #[test]
+    fn audio_context_script_processor_suspended_graph() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/audio_script_processor.mjs")
+                ),
+                "audio-script-processor-ready",
+                "{tier:?}"
+            );
+            run_microtask_checkpoint(&mut engine);
+            for _ in 0..20 {
+                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
+                    break;
+                }
+                eval(&mut engine, "__trust.runPlatformTask()", "audio graph task").unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            engine.ctx().collect_garbage_for_host();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "[silentResume, silentContext.state, silentContext.currentTime, processCalls, __trust.hasPlatformTask()].join('|')"
+                ),
+                "NotSupportedError|suspended|0|0|false",
+                "{tier:?}"
+            );
+            // Connections remain valid across collection and context closure;
+            // close stops processing, not author access to retained objects.
+            eval(
+                &mut engine,
+                r#"
+                processor.disconnect(destination);
+                processor.connect(destination);
+                silentContext.close();
+            "#,
+                "close suspended graph",
+            )
+            .unwrap();
+            for _ in 0..20 {
+                if string_value(&mut engine, "__trust.hasPlatformTask()") == "false" {
+                    break;
+                }
+                eval(&mut engine, "__trust.runPlatformTask()", "audio close task").unwrap();
+                run_microtask_checkpoint(&mut engine);
+            }
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "[silentContext.state, silentContext.currentTime, processCalls, __trust.hasPlatformTask()].join('|')"
+                ),
+                "closed|0|0|false",
+                "{tier:?}"
+            );
+            eval(
+                &mut engine,
+                "processor.disconnect(destination)",
+                "disconnect closed graph",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn audio_context_construction_does_not_abort_module_ui() {
         let html = r#"<!doctype html><div id="root"></div><script type="module">
             const context = new AudioContext({latencyHint: 0.03});
@@ -18528,6 +18595,17 @@ mod tests {
             const context = new foreign.AudioContext();
             const getter = Object.getOwnPropertyDescriptor(BaseAudioContext.prototype, 'state').get;
             if (getter.call(context) !== 'suspended') throw Error('cross-realm context getter');
+            const node = context.createScriptProcessor(1024, 0, 2);
+            const contextGetter = Object.getOwnPropertyDescriptor(AudioNode.prototype, 'context').get;
+            if (contextGetter.call(node) !== context) throw Error('cross-realm node getter');
+            if (AudioNode.prototype.connect.call(node, context.destination) !== context.destination)
+                throw Error('cross-realm node connection');
+            const onprocess = Object.getOwnPropertyDescriptor(ScriptProcessorNode.prototype, 'onaudioprocess');
+            let events = 0;
+            onprocess.set.call(node, function() { if (this !== node) throw Error('foreign handler receiver'); events++; });
+            node.dispatchEvent(new foreign.Event('audioprocess'));
+            if (events !== 1) throw Error('foreign event registration');
+            AudioNode.prototype.disconnect.call(node, context.destination);
             frame.remove();
             try { new foreign.AudioContext(); throw Error('inactive constructor accepted'); }
             catch (error) { if (error.name !== 'InvalidStateError') throw error; }
@@ -18556,9 +18634,9 @@ mod tests {
         assert_eq!(
             string_value(
                 &mut worker,
-                "typeof AudioContext + '|' + typeof BaseAudioContext"
+                "[typeof AudioContext, typeof BaseAudioContext, typeof AudioNode, typeof AudioDestinationNode, typeof ScriptProcessorNode].join('|')"
             ),
-            "undefined|undefined"
+            "undefined|undefined|undefined|undefined|undefined"
         );
     }
 
