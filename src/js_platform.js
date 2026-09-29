@@ -243,7 +243,26 @@
     // wrapper must survive whenever its native node is reachable, including
     // through a detached descendant or a lazy static NodeList. The joint
     // native/JavaScript graph retains this state without rooting dead cycles.
-    const W = new Map();
+    // The native mixed-heap registry already owns wrapper reachability. Its
+    // identity-only index avoids a second Map/WeakRef/finalizer graph. Web IDL
+    // #interface-to-js applies across same-Agent Window realms as well.
+    const nativeWrapperCache = g.__dom_wrapper_cache_enabled();
+    const nativeCachedWrapper = g.__dom_cached_wrapper;
+    const nativeWrapperCacheState = g.__dom_wrapper_cache_state;
+    const nativeDomTraversal = g.__dom_traversal_enabled();
+    const nativeDomRelative = g.__dom_relative;
+    const installNativeCollection = g.__dom_install_live_collection;
+    const nativeCollectionLength = g.__dom_child_collection_length;
+    const __dom_register_wrapper = g.__dom_register_wrapper;
+    delete g.__dom_wrapper_cache_enabled;
+    delete g.__dom_cached_wrapper;
+    delete g.__dom_wrapper_cache_state;
+    delete g.__dom_traversal_enabled;
+    delete g.__dom_relative;
+    delete g.__dom_install_live_collection;
+    delete g.__dom_child_collection_length;
+    delete g.__dom_register_wrapper;
+    const W = nativeWrapperCache ? null : new Map();
     // Same-Agent Web IDL Element identity. Register only trusted wrapper
     // creation paths, never a public getter/prototype-based reconstruction.
     // The host roots this WeakMap without keeping detached elements alive.
@@ -264,12 +283,13 @@
     const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
     const XML_NS = "http://www.w3.org/XML/1998/namespace";
     const XMLNS_NS = "http://www.w3.org/2000/xmlns/";
-    const wrapperFinalizer = typeof g.FinalizationRegistry === "function"
+    const wrapperFinalizer = !nativeWrapperCache && typeof g.FinalizationRegistry === "function"
         ? new g.FinalizationRegistry(function (record) {
             if (W.get(record.id) === record.reference) W.delete(record.id);
         })
         : null;
     function cachedWrapper(id, knownConnected) {
+        if (nativeWrapperCache) return nativeCachedWrapper(id);
         const reference = W.get(id);
         if (!reference) return null;
         const wrapper = typeof reference.deref === "function" ? (reference.deref() || null) : reference;
@@ -280,6 +300,7 @@
         // preserve platform state, including detached ancestors and siblings.
         // The native handle is internal to the tracing graph, not a GC root.
         wrapper = __dom_register_wrapper(id, wrapper);
+        if (nativeWrapperCache) return wrapper;
         if (typeof g.WeakRef !== "function") {
             W.set(id, wrapper);
             return wrapper;
@@ -293,13 +314,10 @@
     // inserted subtree merely for cache bookkeeping. The Rust walk includes
     // light descendants, each attached shadow root, and its descendants.
     function syncKnownWrapperRetention(ids, connected) {
-        if (typeof g.WeakRef !== "function") return;
+        if (!nativeWrapperCache && typeof g.WeakRef !== "function") return;
         for (let i = 0; i < ids.length; i++) {
             const id = ids[i];
-            const reference = W.get(id);
-            const wrapper = reference && (typeof reference.deref === "function"
-                ? reference.deref() : reference);
-            if (!reference) continue;
+            const wrapper = cachedWrapper(id);
             if (wrapper) {
                 if (connected) attachListenerTarget(wrapper);
                 else detachListenerTarget(wrapper);
@@ -307,7 +325,7 @@
         }
     }
     function syncWrapperSubtreeRetention(rootId) {
-        if (typeof g.WeakRef !== "function") return;
+        if (!nativeWrapperCache && typeof g.WeakRef !== "function") return;
         syncKnownWrapperRetention(__dom_wrapper_subtree(rootId), __dom_is_connected(rootId));
     }
     // HTML innerHTML and DOM textContent both use DOM "replace all". Snapshot
@@ -316,7 +334,7 @@
     // element's own shadow tree is not among its children, so fall back to the
     // explicit old roots when the replacement target is itself a shadow host.
     function snapshotRemovedWrapperSubtrees(target, removedRoots) {
-        if (typeof g.WeakRef !== "function" || !removedRoots.length) return [];
+        if ((!nativeWrapperCache && typeof g.WeakRef !== "function") || !removedRoots.length) return [];
         const canWalkInclusiveTarget = target.__trustLN !== "template"
             && __dom_shadow_root(target.__id) == null;
         if (canWalkInclusiveTarget) {
@@ -420,6 +438,10 @@
     function wrap(id) {
         return wrapKnown(id, undefined);
     }
+    function relativeNode(node, edge) {
+        const value = nativeDomRelative(node, edge);
+        return typeof value === "number" ? wrap(value) : value;
+    }
     // DOM ParentNode.querySelectorAll returns a NEW STATIC NodeList. Preserve
     // the native IDs here and defer wrapper creation until an indexed access or
     // iteration actually consumes a node; `.length`-only queries stay entirely
@@ -445,6 +467,7 @@
     // Diagnostic-only census for focused host GC tests. The public DOM never
     // exposes the cache or its arena ids.
     trust.nodeWrapperCacheState = function () {
+        if (nativeWrapperCache) return nativeWrapperCacheState();
         let live = 0, connected = 0;
         for (const [id, reference] of W) {
             if (typeof reference.deref !== "function" || reference.deref() !== undefined) {
@@ -1792,6 +1815,13 @@
     // relatedTarget adjustment.
     function rootOfNode(a) {
         let r = a;
+        if (nativeDomTraversal) {
+            for (;;) {
+                const parent = relativeNode(r, 0);
+                if (!parent) return r;
+                r = parent;
+            }
+        }
         for (;;) {
             const target = formElementTargets.get(r) || r;
             const parent = target.parentNode;
@@ -3754,7 +3784,7 @@
         // Named form properties may shadow querySelectorAll/getRootNode, so
         // internal algorithms use the underlying platform object directly.
         const target = formElementTargets.get(form) || form;
-        const root = Node.prototype.getRootNode.call(target);
+        const root = Node.prototype.getRootNode.call(nativeDomTraversal ? form : target);
         return Array.from(wrapQueryResults(root, __dom_query(root.__id, selector, false)))
             .filter(el => el.namespaceURI === HTML_NS);
     }
@@ -4504,23 +4534,24 @@
         // incumbent settings object while this getter runs.
         get baseURI() { return nodeBaseHref(this); }
         get parentNode() {
+            if (nativeDomTraversal) return relativeNode(this, 0);
             if (this.nodeType === 9) return null;
             // Real child Documents now form this boundary natively. Ordinary author-created
             // children of an iframe still have that Element, not its contentDocument, as parent.
             return wrap(__dom_parent(this.__id));
         }
-        get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
+        get parentElement() { if (nativeDomTraversal) return relativeNode(this, 1); const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
         get childNodes() { return childNodeCollection(this); }
         get children() { return childElementCollection(this); }
-        get firstChild() { const c = __dom_children(this.__id); return c.length ? wrap(c[0]) : null; }
-        get lastChild() { const c = __dom_children(this.__id); return c.length ? wrap(c[c.length - 1]) : null; }
-        get firstElementChild() { return this.children[0] || null; }
-        get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
-        get childElementCount() { return this.children.length; }
-        get nextSibling() { return this.nodeType === 9 ? null : wrap(__dom_next(this.__id)); }
-        get previousSibling() { return this.nodeType === 9 ? null : wrap(__dom_prev(this.__id)); }
-        get nextElementSibling() { let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
-        get previousElementSibling() { let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
+        get firstChild() { if (nativeDomTraversal) return relativeNode(this, 2); const c = __dom_children(this.__id); return c.length ? wrap(c[0]) : null; }
+        get lastChild() { if (nativeDomTraversal) return relativeNode(this, 3); const c = __dom_children(this.__id); return c.length ? wrap(c[c.length - 1]) : null; }
+        get firstElementChild() { if (nativeDomTraversal) return relativeNode(this, 4); return this.children[0] || null; }
+        get lastElementChild() { if (nativeDomTraversal) return relativeNode(this, 5); const c = this.children; return c[c.length - 1] || null; }
+        get childElementCount() { if (nativeDomTraversal) return nativeDomRelative(this, 10); return this.children.length; }
+        get nextSibling() { if (nativeDomTraversal) return relativeNode(this, 6); return this.nodeType === 9 ? null : wrap(__dom_next(this.__id)); }
+        get previousSibling() { if (nativeDomTraversal) return relativeNode(this, 7); return this.nodeType === 9 ? null : wrap(__dom_prev(this.__id)); }
+        get nextElementSibling() { if (nativeDomTraversal) return relativeNode(this, 8); let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
+        get previousElementSibling() { if (nativeDomTraversal) return relativeNode(this, 9); let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
         get textContent() {
             const t = this.nodeType;
             return t === 9 || t === 10 ? null : __dom_text(this.__id);
@@ -4594,7 +4625,7 @@
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
             if (!__dom_append(this.__id, c.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             rangesRemove(c, oldParent, oldIndex);
-            rangesInsert(this, rangeIndex(c));
+            rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
             syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             moChildInsert(this, c);
@@ -4612,7 +4643,7 @@
             if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             rangesRemove(c, oldParent, oldIndex);
-            rangesInsert(this, rangeIndex(c));
+            rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
             syncWrapperSubtreeRetention(c.__id);
             slotQueueCheck(this);
             moChildInsert(this, c);
@@ -10548,7 +10579,7 @@
     function nodeListData(list) {
         const data = NODE_LIST_DATA.get(list);
         if (!data) throw new TypeError("Illegal invocation");
-        if (data.resolve && data.epoch !== __dom_epoch()) {
+        if (data.resolve && !data.liveGet && data.epoch !== __dom_epoch()) {
             data.ids = data.resolve();
             data.epoch = __dom_epoch();
             data.connected = undefined;
@@ -10613,11 +10644,15 @@
     }
     class NodeList {
         constructor() { throw new TypeError("Illegal constructor"); }
-        get length() { return nodeListData(this).ids.length; }
+        get length() {
+            const data = nodeListData(this);
+            return data.liveGet ? nativeCollectionLength(data.root, false) : data.ids.length;
+        }
         item(index) {
             if (arguments.length < 1) throw new TypeError("1 argument required");
             const data = nodeListData(this);
             index = index >>> 0;
+            if (data.liveGet) return data.liveGet(index);
             return index < data.ids.length ? nodeListItem(data, index) : null;
         }
         entries() { return nodeListData(this).resolve ? Array.prototype.entries.call(this) : materializeNodeList(this).entries(); }
@@ -10699,6 +10734,13 @@
     function childNodeCollection(root) {
         let list = CHILD_NODE_COLLECTIONS.get(root);
         if (!list) {
+            const target = Object.create(NodeList.prototype);
+            const liveGet = installNativeCollection(target, root, false, wrapKnown);
+            if (liveGet) {
+                NODE_LIST_DATA.set(target, { root, liveGet, resolve: true });
+                CHILD_NODE_COLLECTIONS.set(root, target);
+                return target;
+            }
             list = makeStaticNodeList(__dom_children(root.__id), __dom_epoch(), undefined,
                 () => __dom_children(root.__id));
             CHILD_NODE_COLLECTIONS.set(root, list);
@@ -10708,6 +10750,13 @@
     function childElementCollection(root) {
         let collection = CHILD_ELEMENT_COLLECTIONS.get(root);
         if (!collection) {
+            const target = new HTMLCollection(HTML_COLLECTION_TOKEN);
+            const liveGet = installNativeCollection(target, root, true, wrapKnown);
+            if (liveGet) {
+                HTML_COLLECTION_DATA.set(target, { root, liveGet });
+                CHILD_ELEMENT_COLLECTIONS.set(root, target);
+                return target;
+            }
             let epoch = -1, list;
             collection = makeHTMLCollection(() => {
                 const current = __dom_epoch();
@@ -10755,6 +10804,7 @@
     function htmlCollectionList(collection) {
         const resolve = HTML_COLLECTION_DATA.get(collection);
         if (!resolve) throw new TypeError("Illegal invocation");
+        if (resolve.liveGet) return collection;
         return resolve();
     }
     function collectionNamedItem(list, name) {
@@ -10771,12 +10821,17 @@
         constructor(...args) {
             if (args[0] !== HTML_COLLECTION_TOKEN) throw new TypeError("Illegal constructor");
         }
-        get length() { return htmlCollectionList(this).length; }
+        get length() {
+            const resolve = HTML_COLLECTION_DATA.get(this);
+            if (!resolve) throw new TypeError("Illegal invocation");
+            return resolve.liveGet ? nativeCollectionLength(resolve.root, true) : resolve().length;
+        }
         item(index) {
             if (!arguments.length) throw new TypeError("item requires an index");
             const resolve = HTML_COLLECTION_DATA.get(this);
             if (!resolve) throw new TypeError("Illegal invocation");
             index = (+index) >>> 0;
+            if (resolve.liveGet) return resolve.liveGet(index);
             return resolve()[index] || null;
         }
         namedItem(name) {
@@ -10784,6 +10839,7 @@
             const resolve = HTML_COLLECTION_DATA.get(this);
             if (!resolve) throw new TypeError("Illegal invocation");
             name = domString(name);
+            if (resolve.liveGet) return resolve.liveGet(name);
             return collectionNamedItem(resolve(), name);
         }
         [Symbol.iterator]() {
@@ -12498,8 +12554,7 @@
     // WeakRef.prototype edge, and the temporary snapshot owns its values until
     // this mutation finishes. Destroying a navigable does not delete a live
     // retained Range or stop updates to its detached Document.
-    function updateLiveRanges(boundary) {
-        const ranges = snapshotLiveRanges();
+    function updateLiveRanges(boundary, ranges = snapshotLiveRanges()) {
         if (!ranges) return;
         for (const range of ranges) {
             const start = boundary(range.startContainer, range.startOffset);
@@ -12521,8 +12576,14 @@
             : [container, rangeSame(container,parent) && position > index ? position - 1 : position]);
     }
     function rangesInsert(parent, index, count = 1) {
+        // DOM #concept-node-insert's live range adjustments only need
+        // a position when a live Range exists. Append-heavy construction must
+        // not rescan an ever-growing sibling list for an empty observer set.
+        const ranges = snapshotLiveRanges();
+        if (!ranges) return;
+        if (typeof index !== "number") index = rangeIndex(index);
         updateLiveRanges((container, position) => [container,
-            rangeSame(container,parent) && position > index ? position + count : position]);
+            rangeSame(container,parent) && position > index ? position + count : position], ranges);
     }
     function rangesReplaceChildren(parent) {
         // DOM string/fragment replace-all removes each old child before
@@ -12538,6 +12599,7 @@
         return a === b || !!(a && b && a.__id === b.__id && a.nodeType === b.nodeType);
     }
     function rangeParent(node) {
+        if (nativeDomTraversal) return relativeNode(node, 0);
         if (node.nodeType === 9) return null;
         const parent = wrap(__dom_parent(node.__id));
         return parent && (parent.__trustLN === "iframe" || parent.__trustLN === "frame") &&
@@ -12548,6 +12610,7 @@
         return false;
     }
     function rangeIndex(node) {
+        if (nativeDomTraversal) return nativeDomRelative(node, 11);
         const parent = rangeParent(node);
         return parent ? __dom_children(parent.__id).indexOf(node.__id) : -1;
     }

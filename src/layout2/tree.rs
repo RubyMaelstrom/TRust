@@ -341,6 +341,7 @@ pub(super) fn build_document(
     vp: Vp,
     reuse: bool,
 ) -> Option<SharedBox> {
+    dom.flush_style_invalidations();
     let root = dom
         .children(DOCUMENT)
         .into_iter()
@@ -382,6 +383,7 @@ pub(crate) fn build_at(
     vp: Vp,
     boundary: NodeId,
 ) -> Option<BoxNode> {
+    dom.flush_style_invalidations();
     let mut b = Builder {
         dom,
         base,

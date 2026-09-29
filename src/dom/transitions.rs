@@ -594,6 +594,7 @@ impl Dom {
         events.into_iter().map(|e| e.event).collect()
     }
     pub(crate) fn update_css_transitions(&mut self, seconds: f64) {
+        self.flush_style_invalidations();
         let diagnostic = casc_diag_on().then(std::time::Instant::now);
         // Pull the transition origin out while computing the after-change
         // style. Interpolated values are never written into author declarations.

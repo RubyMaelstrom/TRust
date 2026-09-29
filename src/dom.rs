@@ -16,7 +16,10 @@ use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
 
+#[cfg(feature = "architecture-diagnostics")]
+pub(crate) mod architecture_diagnostics;
 pub(crate) mod arena;
+mod child_collections;
 mod class_tokens;
 mod computed_cache;
 mod container_queries;
@@ -30,6 +33,9 @@ mod input;
 mod invalidation;
 mod media;
 mod properties;
+mod style_records;
+mod style_sharing;
+pub(crate) use style_records::BoxContext;
 
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
     properties::transform_number(text, angle, percentage)
@@ -217,6 +223,7 @@ pub struct Dom {
     /// Broad computed-style invalidation, independent of the observable DOM
     /// revision. Proven local mutations evict only their dependent elements.
     style_value_epoch: u64,
+    pending_style_invalidations: invalidation::Pending,
     /// Bounded, document-owned independent formatting-context results.
     pub(crate) layout_cache: RefCell<crate::layout2::LayoutCache>,
     /// Immutable formatting subtrees, separately bounded from laid fragments.
@@ -267,6 +274,7 @@ pub struct Dom {
     /// `style_value_epoch` expires broad changes; dependency invalidation
     /// removes local subjects and their inheriting descendants.
     computed_cache: RefCell<ComputedCache>,
+    style_sharing: RefCell<style_sharing::State>,
     /// Memoized inherited custom-property values for the style-value revision.
     /// CSS Custom Properties §2 makes every unregistered `--*`
     /// property inherited; a deep application tree otherwise re-walks the
@@ -289,6 +297,7 @@ pub struct Dom {
     /// Long class lists parsed once per attribute value, not once per restyle.
     /// Explicit class-attribute invalidation owns freshness (stamp is zero).
     class_cache: RefCell<NodeCache<class_tokens::ClassTokens>>,
+    child_lists: RefCell<child_collections::State>,
     /// Memoized per-element cascade WINNER MAPS for the current epoch (see
     /// `cascaded_maps`): the layout/serializer read 30+
     /// properties per element (across the flow AND the intrinsic-measurement
@@ -619,6 +628,7 @@ impl Dom {
             epoch,
             window_names_epoch,
             style_value_epoch,
+            pending_style_invalidations,
             layout_cache,
             box_tree_cache,
             svg_dependencies,
@@ -637,12 +647,14 @@ impl Dom {
             container_sizes,
             container_dependencies,
             computed_cache,
+            style_sharing,
             custom_prop_cache,
             generated_cache,
             matched_cache,
             selector_cache,
             selector_epoch,
             class_cache,
+            child_lists,
             cascaded_cache,
             hidden_cache,
             font_cache,
@@ -792,6 +804,7 @@ impl Dom {
         }
         fixed_map!(external_sheets, (NodeId, String));
         bytes = bytes.saturating_add(properties.retained_bytes());
+        bytes = bytes.saturating_add(pending_style_invalidations.retained_bytes());
         bytes = bytes.saturating_add(transitions.retained_bytes());
         fixed_map!(cssom_sheets, (NodeId, cssom::Sheet));
         fixed_map!(cssom_sheet_versions, (NodeId, u64));
@@ -836,6 +849,20 @@ impl Dom {
             Ok(cache) => {
                 let (_epoch, cache) = &*cache;
                 bytes = bytes.saturating_add(cache.retained_bytes());
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+        match child_lists.try_borrow() {
+            Ok(state) => {
+                bytes += state.retained_bytes();
+                opaque = true;
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+        match style_sharing.try_borrow() {
+            Ok(state) => {
+                bytes = bytes.saturating_add(state.retained_bytes());
+                opaque = true;
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
         }
@@ -1039,6 +1066,7 @@ impl Dom {
             epoch: 0,
             window_names_epoch: 0,
             style_value_epoch: 0,
+            pending_style_invalidations: invalidation::Pending::default(),
             layout_cache: RefCell::new(crate::layout2::LayoutCache::default()),
             box_tree_cache: RefCell::new(crate::layout2::BoxTreeCache::default()),
             svg_dependencies: RefCell::new(svg_dependencies::State::default()),
@@ -1057,12 +1085,14 @@ impl Dom {
             container_sizes: RefCell::new(FxHashMap::default()),
             container_dependencies: RefCell::new(container_queries::Dependencies::default()),
             computed_cache: RefCell::new(((u64::MAX, u64::MAX), computed_cache::Values::default())),
+            style_sharing: RefCell::new(style_sharing::State::default()),
             custom_prop_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
             generated_cache: RefCell::new(None),
             matched_cache: RefCell::new(NodeCache::default()),
             selector_cache: RefCell::new(NodeCache::default()),
             selector_epoch: 0,
             class_cache: RefCell::new(NodeCache::default()),
+            child_lists: RefCell::new(child_collections::State::default()),
             cascaded_cache: RefCell::new(NodeCache::default()),
             hidden_cache: RefCell::new(NodeCache::default()),
             font_cache: RefCell::new(NodeCache::default()),
@@ -2750,6 +2780,9 @@ impl Dom {
         n.parent = None;
         n.prev_sibling = None;
         n.next_sibling = None;
+        if let Some(parent) = parent {
+            self.child_collection_changed(parent, id, false);
+        }
     }
 
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
@@ -2768,6 +2801,7 @@ impl Dom {
         self.set_owner_document_subtree(child, owner_document);
         self.invalidate_style_subtree(child, true);
         self.touch_content(Some(parent));
+        self.child_collection_changed(parent, child, true);
     }
 
     /// Link a newly-created, detached node while constructing another detached
@@ -2789,6 +2823,7 @@ impl Dom {
             self.nodes[parent].first_child = Some(child);
         }
         self.nodes[parent].last_child = Some(child);
+        self.child_collection_changed(parent, child, true);
     }
 
     /// Unlink a node while html5ever is constructing its private parse arena.
@@ -2817,6 +2852,9 @@ impl Dom {
         node.parent = None;
         node.prev_sibling = None;
         node.next_sibling = None;
+        if let Some(parent) = parent {
+            self.child_collection_changed(parent, id, false);
+        }
     }
 
     /// Append within html5ever's private arena. Unlike [`Self::append_fresh`],
@@ -2833,6 +2871,7 @@ impl Dom {
             self.nodes[parent].first_child = Some(child);
         }
         self.nodes[parent].last_child = Some(child);
+        self.child_collection_changed(parent, child, true);
     }
 
     /// Insert within html5ever's private arena, preserving DOM pre-insert's
@@ -2860,6 +2899,7 @@ impl Dom {
         } else {
             self.nodes[parent].first_child = Some(child);
         }
+        self.child_collection_changed(parent, child, true);
     }
 
     fn parser_append_text(&mut self, parent: NodeId, text: &str) {
@@ -2938,10 +2978,9 @@ impl Dom {
         // Snapshot each next link before severing it. Removed subtrees remain
         // intact and detached, retaining their node identities and listeners.
         if !text_only {
-            // Invalidate while the removed nodes are still reachable. Their
-            // detached CSSOM and any external SVG references must not retain
-            // values from their old parent after replace-all.
-            self.invalidate_style_subtree(parent, true);
+            // Preserve the departing forest before links change. Detached
+            // CSSOM and SVG references must lose the old inheritance/ancestry.
+            self.invalidate_detaching_children(parent);
         }
         let mut old = self.nodes[parent].first_child;
         while let Some(child) = old {
@@ -2985,6 +3024,7 @@ impl Dom {
         } else {
             self.touch_content(Some(parent));
         }
+        self.child_lists.get_mut().remove(parent);
     }
 
     /// Insert `child` under `parent` immediately before `reference`;
@@ -3031,6 +3071,7 @@ impl Dom {
         self.set_owner_document_subtree(child, owner_document);
         self.invalidate_style_subtree(child, true);
         self.touch_content(Some(parent));
+        self.child_collection_changed(parent, child, true);
     }
 
     /// Implement the DOM Standard's adopt algorithm (DOM §4.5): remove the
@@ -3113,7 +3154,10 @@ impl Dom {
         }
     }
 
+    #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub fn tag_name(&self, id: NodeId) -> Option<&str> {
+        #[cfg(feature = "architecture-diagnostics")]
+        architecture_diagnostics::tag_name();
         match &self.nodes.get(id)?.data {
             NodeData::Element { name, .. } => Some(&name.local),
             _ => None,
@@ -3875,6 +3919,10 @@ impl Dom {
     /// is baked into the serialized HTML so the re-parsed layout arena
     /// sees the same computed display the engine did.
     pub fn computed_display(&self, id: NodeId) -> Option<String> {
+        self.retained_display(id, || self.computed_display_uncached(id))
+    }
+
+    fn computed_display_uncached(&self, id: NodeId) -> Option<String> {
         if self.attr(id, "hidden").is_some() {
             return Some("none".to_string());
         }
@@ -3883,7 +3931,7 @@ impl Dom {
         // value time. Keep this resolution in the canonical display path so
         // `display:var(--state)` has the same box-generation effect as its
         // substituted keyword (and invalid substitutions do not leak a box).
-        let v = self.resolve_vars(id, &v);
+        let v = self.resolve_vars_owned(id, v);
         if v.trim().is_empty() {
             // An invalid-at-computed-value-time declaration uses display's
             // initial value, inline, rather than silently becoming the UA
@@ -3895,8 +3943,8 @@ impl Dom {
             // computed display, `initial`/`unset` the initial value
             // (`inline`), `revert` the UA display table (`None` here — the
             // `effective_display` fallback).
-            Some(WideKeyword::Inherit) => self.nodes[id]
-                .parent
+            Some(WideKeyword::Inherit) => self
+                .style_parent(id)
                 .and_then(|p| self.effective_display(p)),
             Some(WideKeyword::Initial | WideKeyword::Unset) => Some("inline".to_string()),
             Some(WideKeyword::Revert) => None,
@@ -4163,6 +4211,7 @@ impl Dom {
     /// here, so a property inherits everywhere by being marked `inherited`
     /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
+        self.flush_style_invalidations();
         if name == "display" {
             return self.effective_display(id);
         }
@@ -4201,8 +4250,8 @@ impl Dom {
         // HTML Rendering §15.5.13 supplies `overflow:hidden !important` for
         // marquee viewports. This UA-important declaration outranks author
         // overflow on every axis and keeps only the animated contents clipped.
-        if self.tag_name(id) == Some("marquee")
-            && matches!(name, "overflow" | "overflow-x" | "overflow-y")
+        if matches!(name, "overflow" | "overflow-x" | "overflow-y")
+            && self.tag_name(id) == Some("marquee")
         {
             return Some(String::from("hidden"));
         }
@@ -4222,7 +4271,7 @@ impl Dom {
                 name,
                 "line-height" | "font-weight" | "-webkit-text-stroke-width"
             ) {
-                self.resolve_vars(id, &value)
+                self.resolve_vars_owned(id, value)
             } else {
                 value
             }
@@ -4320,7 +4369,7 @@ impl Dom {
         }
         let value = self
             .computed_value(id, name)
-            .map(|v| self.resolve_vars(id, &v))?;
+            .map(|v| self.resolve_vars_owned(id, v))?;
         let inherited = || prop_index(name).is_some_and(|index| PROPS[index].inherited);
         match resolved_wide_keyword(&value) {
             Some(WideKeyword::Initial) => None,
@@ -4440,6 +4489,7 @@ impl Dom {
         id: NodeId,
         compute: impl FnOnce() -> crate::layout2::Units,
     ) -> crate::layout2::Units {
+        self.flush_style_invalidations();
         let font_epoch = crate::font_system::page_font_epoch();
         if let Some(&(stamp, units)) = self
             .font_units_cache
@@ -4514,6 +4564,7 @@ impl Dom {
     /// Unresolvable declarations (such as dangling `var()`) inherit —
     /// fail-open, like the rest of the cascade. Memoized per epoch.
     pub(crate) fn font_px(&self, id: NodeId) -> f32 {
+        self.flush_style_invalidations();
         let Some(guard) = self.property_guard(id, None, "font-size") else {
             return self
                 .style_parent(id)
@@ -4551,14 +4602,34 @@ impl Dom {
     }
 
     fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
-        let cache = self.computed_cache.borrow();
-        (cache.0
-            == (
-                self.style_value_epoch,
-                crate::font_system::page_font_epoch(),
-            ))
-            .then(|| cache.1.get(&(id, idx)).cloned())
-            .flatten()
+        let stamp = (
+            self.style_value_epoch,
+            crate::font_system::page_font_epoch(),
+        );
+        let (mut result, prepare) = {
+            let cache = self.computed_cache.borrow();
+            let result = (cache.0 == stamp)
+                .then(|| cache.1.get(&(id, idx)))
+                .flatten();
+            let prepare = style_sharing::enabled()
+                && result.is_none()
+                && (cache.0 != stamp || !cache.1.has_row(id));
+            (result, prepare)
+        };
+        if prepare {
+            self.prepare_computed_row(id, 0);
+            result = self.computed_cache.borrow().1.get(&(id, idx));
+        }
+        #[cfg(feature = "architecture-diagnostics")]
+        architecture_diagnostics::cache_read(
+            idx,
+            result.is_some(),
+            result
+                .as_ref()
+                .and_then(Option::as_ref)
+                .map_or(0, String::len),
+        );
+        result
     }
 
     fn computed_cache_put(&self, id: NodeId, idx: usize, v: Option<String>) {
@@ -4572,6 +4643,8 @@ impl Dom {
             cache.1.clear();
         }
         cache.1.insert((id, idx), v);
+        drop(cache);
+        self.style_sharing.borrow_mut().trim_payloads();
     }
 
     /// The user-agent stylesheet defaults, below the author cascade and
@@ -4613,13 +4686,7 @@ impl Dom {
             }
             "white-space" if tag == "pre" => "pre",
             "list-style-type" if tag == "ul" => self.ul_marker_default(id),
-            "list-style-type" if tag == "ol" => match self.attr(id, "type") {
-                Some("a") => "lower-alpha",
-                Some("A") => "upper-alpha",
-                Some("i") => "lower-roman",
-                Some("I") => "upper-roman",
-                _ => "decimal",
-            },
+            "list-style-type" if tag == "ol" => self.ol_marker_default(id),
             // HTML Rendering #the-details-and-summary-elements: only the
             // first summary child is the disclosure's list-item caption.
             "display" if self.is_details_summary(id) => "list-item",
@@ -4637,18 +4704,27 @@ impl Dom {
             // sizing in the UA origin. An authored 30px button therefore
             // remains 30px including its padding and border.
             "box-sizing" if tag == "button" || tag == "select" => "border-box",
-            "box-sizing"
-                if tag == "input"
-                    && matches!(
-                        self.input_type(id).as_str(),
-                        "radio" | "checkbox" | "reset" | "button" | "submit" | "color" | "search"
-                    ) =>
-            {
-                "border-box"
-            }
+            "box-sizing" if tag == "input" && self.ua_input_border_box(id) => "border-box",
             _ => return None,
         };
         Some(v.to_string())
+    }
+
+    fn ol_marker_default(&self, id: NodeId) -> &'static str {
+        match self.attr(id, "type") {
+            Some("a") => "lower-alpha",
+            Some("A") => "upper-alpha",
+            Some("i") => "lower-roman",
+            Some("I") => "upper-roman",
+            _ => "decimal",
+        }
+    }
+
+    fn ua_input_border_box(&self, id: NodeId) -> bool {
+        matches!(
+            self.input_type(id).as_str(),
+            "radio" | "checkbox" | "reset" | "button" | "submit" | "color" | "search"
+        )
     }
 
     /// The default bullet for a `<ul>` by nesting depth, matching browsers:
@@ -4693,6 +4769,7 @@ impl Dom {
     /// parent recursion implements that accumulation for the element ancestry
     /// represented by the current layout.
     pub fn text_decoration(&self, id: NodeId) -> (bool, bool) {
+        self.flush_style_invalidations();
         if let Some(&hit) = self
             .decoration_cache
             .borrow()
@@ -4755,11 +4832,25 @@ impl Dom {
     /// on the first read of ANY of its properties (one pass over its author
     /// sources), then shared by every further read.
     fn cascaded_maps(&self, id: NodeId) -> std::rc::Rc<CascadedMaps> {
+        self.flush_style_invalidations();
         if let Some(hit) = self.cascaded_cache.borrow().get(id, self.style_value_epoch) {
             return hit.clone();
         }
+        let shared_input = self.shared_cascade_input(id);
+        if let Some(hit) = shared_input
+            .as_ref()
+            .and_then(|key| self.shared_cascade_get(key))
+        {
+            self.cascaded_cache
+                .borrow_mut()
+                .put(id, self.style_value_epoch, hit.clone());
+            return hit;
+        }
         let _t = casc_diag_on().then(std::time::Instant::now);
         let maps = std::rc::Rc::new(self.build_cascaded_maps(id));
+        if let Some(key) = shared_input {
+            self.shared_cascade_put(key, &maps);
+        }
         if let Some(t) = _t {
             let us = t.elapsed().as_micros() as u64;
             casc_bump(|d| d.cascaded_us += us);
@@ -5319,6 +5410,7 @@ impl Dom {
     /// transfers the parent's computed value, not its unresolved var() tokens.
     /// `None` represents the guaranteed-invalid initial value.
     fn custom_prop(&self, id: NodeId, name: &str) -> Option<String> {
+        self.flush_style_invalidations();
         if let Some(hit) = {
             let cache = self.custom_prop_cache.borrow();
             (cache.0
@@ -5361,6 +5453,20 @@ impl Dom {
     fn resolve_vars(&self, id: NodeId, value: &str) -> String {
         self.substitute_vars(id, value, &mut Vec::new())
             .unwrap_or_default()
+    }
+
+    /// CSS Variables 1 #using-variables (CSSWG 81c27f68): a value without a
+    /// substitution keeps its tokens. Reuse an already owned value on the same
+    /// no-substitution path as `substitute_vars_for`, avoiding a second copy
+    /// immediately after a computed-cache read. Escapes still take tokenization.
+    fn resolve_vars_owned(&self, id: NodeId, value: String) -> String {
+        if needs_var_substitution(&value) {
+            self.resolve_vars(id, &value)
+        } else {
+            #[cfg(feature = "architecture-diagnostics")]
+            architecture_diagnostics::resolved_value_reuse(value.len());
+            value
+        }
     }
 
     /// Resolve a shorthand that contains `var()` only after custom-property
@@ -5455,7 +5561,7 @@ impl Dom {
     ) -> Option<String> {
         // Keep the ordinary no-substitution path allocation-compatible. Escaped
         // function names require tokenization even without a literal "var(".
-        if find_var_function(value).is_none() && !value.contains('\\') {
+        if !needs_var_substitution(value) {
             return Some(value.to_owned());
         }
         properties::substitute(self, id, pseudo, value)
@@ -6081,7 +6187,7 @@ impl Dom {
         });
         index.has_container_queries = unique.iter().copied().any(|r| !r.containers.is_empty());
         index.selector_dependencies =
-            invalidation::SelectorDependencies::build(unique.iter().copied());
+            invalidation::SelectorDependencyIndex::build(self, &index.scopes);
         // The hover probes: only rules that could change what we paint under a
         // moved hover chain. Graphical paint properties such as `color` are in
         // the tracked registry too; they invalidate retained paint even when
@@ -6157,6 +6263,7 @@ impl Dom {
     /// O(elements × rules × props). Candidate rules come from the rightmost-key
     /// buckets; only those are full-matched.
     fn matched_rules(&self, id: NodeId) -> std::rc::Rc<Vec<u32>> {
+        self.flush_style_invalidations();
         if let Some(hit) = self.matched_cache.borrow().get(id, self.style_value_epoch) {
             return hit.clone();
         }
@@ -6807,10 +6914,10 @@ impl Dom {
         // Ownership does not depend on being inserted. A detached node created in a child
         // Window keeps that Document until adoption, including shadow descendants.
         let document = self.nodes.get(id)?.owner_document;
-        if let Some(parent) = self.nodes.get(document)?.parent {
-            if matches!(self.tag_name(parent), Some("iframe" | "frame")) {
-                return Some(parent);
-            }
+        if let Some(parent) = self.nodes.get(document)?.parent
+            && matches!(self.tag_name(parent), Some("iframe" | "frame"))
+        {
+            return Some(parent);
         }
         let mut current = Some(id);
         while let Some(node) = current {
@@ -9759,6 +9866,10 @@ enum VarResult {
     Resolved(String),
     Undefined,
     Cycle,
+}
+
+fn needs_var_substitution(value: &str) -> bool {
+    find_var_function(value).is_some() || value.contains('\\')
 }
 
 /// CSS function names are ASCII case-insensitive, while the custom-property
@@ -13321,7 +13432,7 @@ struct StyleIndex {
     font_sets: FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
     has_container_queries: bool,
     has_revert_layer: bool,
-    selector_dependencies: invalidation::SelectorDependencies,
+    selector_dependencies: invalidation::SelectorDependencyIndex,
     scopes: FxHashMap<NodeId, Vec<StyleRule>>,
     /// Per-scope rule index, keyed by each rule's rightmost-compound key
     /// (id/class/tag/universal) — the standard browser "rule hash" so an

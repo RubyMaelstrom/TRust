@@ -1,0 +1,82 @@
+Archive.org collection loading — 2026-09-28
+
+The blank main panel at https://archive.org/details/librivoxaudio was caused by
+Lumen rejecting valid ECMAScript in a dynamically imported dependency. The
+navigation loaded, but collection-page-BVnWcoTD.js depended on esm-CWeBglMZ.js,
+which failed at line 477, character 239572: expected ';' before the keyword in.
+The dependency's SHA256 is
+c1f9efe02db7d691a4c976e8e22aed514c46b773048fd882c11447d7c4f35bb4.
+
+The reduced failing shape is:
+
+    for (let C = class { m(o) { return 'x' in o; } }; false;) {}
+
+A for initializer uses the grammar parameter [~In], but ClassExpression and
+ClassTail do not inherit that parameter. Lumen incorrectly propagated it into
+class methods. Block arrow bodies and arrow parameter defaults had related
+gaps. Ordinary functions already reset this context.
+
+The fix belongs in ../Lumen/crates/lumen/src/parser.rs. It saves and restores
+the outer restriction at class definitions, formal parameters and FunctionBody.
+Arrow expression bodies retain the enclosing [In] parameter. Regression cases
+in ../Lumen/crates/lumen/src/tests.rs cover valid scripts, strict scripts and
+modules; methods, accessors, generators, async methods, fields and static blocks;
+arrow defaults and block bodies; nested contexts; and invalid outer expressions.
+The execution case runs in the interpreter, bytecode VM and native JIT.
+
+Normative source consulted through web-standards-skill:
+/big/web-standards/repositories/tc39/ecma262/spec.html at revision
+e28783d5fc9dc12b3de905961e2c71410b38a202 (local official snapshot, not a new
+upstream verification). Relevant clauses are The for Statement at line 22583,
+Parameter Lists at 23889 and BindingElement at 22238, Function Definitions at
+24185, Arrow Function Definitions at 24397, Method Definitions at 24519,
+Class Definitions at 25160, and Async Arrow Function Definitions at 26115.
+Official clause URLs:
+https://tc39.es/ecma262/#sec-for-statement
+https://tc39.es/ecma262/#sec-parameter-lists
+https://tc39.es/ecma262/#sec-function-definitions
+https://tc39.es/ecma262/#sec-arrow-function-definitions
+https://tc39.es/ecma262/#sec-method-definitions
+https://tc39.es/ecma262/#sec-class-definitions
+https://tc39.es/ecma262/#sec-async-arrow-function-definitions
+
+Preserved evidence is under
+target/architecture-rework-20260928-gGJhNCNs/archive-librivox-investigation:
+original HTML/headers, public module sources and hashes, baseline executable and
+source diffs, parser traces, reduced failures, release executables, test logs,
+the patch and exact changed-source copies. Failed and incomplete runs remain.
+The sibling archive-parser-fix-desktop directory contains private-compositor
+screenshots and the interaction record; no user desktop input was sent.
+
+Release desktop SHA256
+fa2197e77c9659caa924b92cd067bc5eb54c9eb700dfd759f90efd8172446bd1
+shows the collection title, description, 21,818 results, facets and audiobook
+covers. Scrolling reveals populated cards with authors and statistics.
+Release headless SHA256
+c3b8a0ce683f102ac4312b68176a99e52fe5b69df70a625ac3e7853a635bdfc2
+also returns populated item text/links with --timeout 180 --settle 30 and no
+reported script errors. A shorter quiet window captured a loading interface;
+quiet is an approximation and does not prove that asynchronous content is done.
+
+All 1,522 default engine tests pass in debug and release. The three focused
+grammar tests pass in both builds, and the official Test262 grammar subset
+passes all 12,524 tests with zero failures or skips. Engine and browser Clippy
+and formatting checks succeed with existing warnings.
+
+Browser debug and release suites pass: 2,159 library, 53 desktop, 14 headless
+and one replay test, with 32 library and three desktop tests explicitly ignored.
+The first release run exposed a separate cache-test race, retained in
+browser-release.log. A focused follow-up exposed the same assumption in an
+adjacent test; that failed result also remains. All three affected SVG fixtures
+now assert reuse only across unchanged global resource revisions, as the layout
+cache contract requires. Their rendering comparisons are unchanged. The final
+SVG module run passes 18 tests with two ignored in both builds; the full release
+suite, Clippy, formatting and release build pass after this test-only change.
+browser-validation-3.json records the completed follow-up checks.
+
+The final release build is byte-identical to the binaries exercised on the site,
+as recorded in final-release-validation.json.
+
+The parser fix is independent of the isolated optimizer candidate 30; neither
+its frozen source nor its prior validation was relabelled. No installed binary
+was replaced, and no source changes were committed or pushed.
