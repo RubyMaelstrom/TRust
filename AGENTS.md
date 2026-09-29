@@ -300,9 +300,11 @@ current behavior and limits; consult the governing standards before changing it.
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are
   unimplemented. Estimated buffer/image storage has a shared 256 MiB page budget
   and at most 16 contexts; driver overhead and CPU copies are additional.
-- Web Audio supports context construction/lifecycle only. Contexts stay
-  suspended with a stationary clock; renderer acquisition errors asynchronously
-  and `resume()` rejects with `NotSupportedError`. Graph nodes, decoding,
+- Web Audio supports context lifecycle and a suspended graph of
+  `ScriptProcessorNode`/`AudioDestinationNode` objects with validated connections.
+  Contexts stay suspended with a stationary clock and no audio processing
+  callbacks; renderer acquisition errors asynchronously and `resume()` rejects
+  with `NotSupportedError`. Other processing nodes, audio buffers/decoding,
   worklets, offline rendering, and playback are unimplemented.
 - Import maps cover static/dynamic imports, scopes, blocked specifiers, and
   integrity metadata. Navigation parses nested declarative Shadow DOM and
