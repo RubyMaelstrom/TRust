@@ -123,8 +123,8 @@ impl State {
         state.cyclic.clear();
         state.memo.clear();
     }
-    pub fn invalidate(&mut self, id: NodeId) {
-        let state = self.resolving.get_mut();
+    pub fn invalidate(&self, id: NodeId) {
+        let mut state = self.resolving.borrow_mut();
         debug_assert!(state.active.is_empty());
         state.cyclic.remove(&id);
         state.memo.clear();
@@ -239,6 +239,7 @@ impl Dom {
         pseudo: Option<PseudoEl>,
         name: &str,
     ) -> Option<Guard<'_>> {
+        self.flush_style_invalidations();
         self.properties.enter(
             id,
             pseudo,
@@ -252,26 +253,15 @@ impl Dom {
     /// Shadow roots share their document's registry. Embedded documents have
     /// independent registries even though their arenas share one allocation.
     pub(in crate::dom) fn registration_document(&self, id: NodeId) -> NodeId {
-        let mut current = id;
-        loop {
-            if current != id && matches!(self.tag_name(current), Some("iframe" | "frame")) {
-                return current;
-            }
-            let Some(node) = self.nodes.get(current) else {
-                return DOCUMENT;
-            };
-            if matches!(node.data, NodeData::Document) {
-                return current;
-            }
-            if let Some(parent) = node
-                .parent
-                .or_else(|| self.shadow_hosts.get(&current).copied())
-            {
-                current = parent;
-            } else {
-                return node.owner_document;
-            }
-        }
+        // DOM a2331a45 #concept-node-document / #concept-node-adopt and CSS
+        // Properties & Values 954df531 #determining-registration / #shadow-dom:
+        // provenance is maintained when nodes are created/adopted, including
+        // detached and shadow descendants. Presentation ancestry is neither
+        // necessary nor authoritative: light children of an iframe belong to
+        // its outer document, while its content Document owns its own tree.
+        self.nodes
+            .get(id)
+            .map_or(DOCUMENT, |node| node.owner_document)
     }
 
     pub(in crate::dom) fn property_base(&self, id: NodeId) -> Option<&url::Url> {
@@ -404,6 +394,7 @@ impl Dom {
         pseudo: Option<PseudoEl>,
         name: &str,
     ) -> VarResult {
+        self.flush_style_invalidations();
         let key = (id, pseudo, name.to_owned());
         if let Some(value) = {
             let state = self.properties.resolving.borrow();

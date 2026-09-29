@@ -341,6 +341,10 @@ struct DomGcOwner {
 #[derive(Default)]
 struct DomGcRegistry {
     owners: HashMap<usize, DomGcOwner>,
+    /// Web IDL #interface-to-js: one object represents each native node.
+    /// This reverse index borrows the mixed-heap owner table's identities;
+    /// it adds no JavaScript owner or collector root.
+    wrappers: rustc_hash::FxHashMap<usize, usize>,
     /// Canonical Document wrappers cross Window realms during adoption. Pointer identities
     /// borrow the existing owner records; this index adds no strong JavaScript references.
     documents: HashMap<usize, usize>,
@@ -366,6 +370,9 @@ impl DomGcRegistry {
                 if self.documents.get(node) == Some(&identity) {
                     self.documents.remove(node);
                 }
+                if self.wrappers.get(node) == Some(&identity) {
+                    self.wrappers.remove(node);
+                }
             }
         }
     }
@@ -380,6 +387,7 @@ impl DomGcRegistry {
             self.owners.remove(&identity);
             self.young_owners.remove(&identity);
         } else {
+            self.forget_document(identity);
             self.owners
                 .insert(identity, DomGcOwner { value, nodes, kind });
             self.young_owners.insert(identity);
@@ -763,6 +771,7 @@ impl RetainedMemory for HostState {
             dom_gc as *const _ as usize,
             dom_gc.owners.capacity() * std::mem::size_of::<(usize, DomGcOwner)>()
                 + dom_gc.documents.capacity() * std::mem::size_of::<(usize, usize)>()
+                + dom_gc.wrappers.capacity() * std::mem::size_of::<(usize, usize)>()
                 + dom_gc.young_owners.capacity() * std::mem::size_of::<usize>()
                 + dom_gc
                     .owners
@@ -1294,11 +1303,25 @@ impl HostGc for HostState {
             })
         };
         let minor = self.dom_gc.traced_minor.get();
-        let retain_entry = |entry: &mut DomGcOwner| {
+        let wrappers = &mut self.dom_gc.wrappers;
+        let mut retain_entry = |identity: usize, entry: &mut DomGcOwner| {
             if !is_live(&entry.value) {
+                if matches!(entry.kind, DomGcOwnerKind::Wrapper) {
+                    for node in &entry.nodes {
+                        if wrappers.get(node) == Some(&identity) {
+                            wrappers.remove(node);
+                        }
+                    }
+                }
                 return false;
             }
-            entry.nodes.retain(|&node| live(node));
+            entry.nodes.retain(|&node| {
+                let keep = live(node);
+                if !keep && wrappers.get(&node) == Some(&identity) {
+                    wrappers.remove(&node);
+                }
+                keep
+            });
             !entry.nodes.is_empty()
         };
         if minor {
@@ -1307,13 +1330,15 @@ impl HostGc for HostState {
                     .dom_gc
                     .owners
                     .get_mut(identity)
-                    .is_some_and(|entry| !retain_entry(entry))
+                    .is_some_and(|entry| !retain_entry(*identity, entry))
                 {
                     self.dom_gc.owners.remove(identity);
                 }
             }
         } else {
-            self.dom_gc.owners.retain(|_, entry| retain_entry(entry));
+            self.dom_gc
+                .owners
+                .retain(|&identity, entry| retain_entry(identity, entry));
             self.dom_gc
                 .documents
                 .retain(|_, identity| self.dom_gc.owners.contains_key(identity));
@@ -1325,6 +1350,7 @@ impl HostGc for HostState {
         };
         for node in &removed {
             self.dom_gc.documents.remove(node);
+            self.dom_gc.wrappers.remove(node);
         }
         dom.finish_gc_generation();
         self.dom_gc.young_owners.clear();
@@ -1334,42 +1360,47 @@ impl HostGc for HostState {
                 .documents
                 .shrink_to(self.dom_gc.documents.len().saturating_mul(2));
         }
+        if self.dom_gc.wrappers.capacity() > self.dom_gc.wrappers.len().saturating_mul(4).max(64) {
+            self.dom_gc
+                .wrappers
+                .shrink_to(self.dom_gc.wrappers.len().saturating_mul(2));
+        }
         if self.dom_gc.young_owners.capacity() > 64 {
             self.dom_gc.young_owners = Default::default();
         }
-        if !removed.is_empty() || !minor {
-            if let Ok(mut cache) = self.geom_cache.try_borrow_mut() {
-                if minor {
-                    for node in &removed {
-                        cache.boxes.remove(node);
-                        cache.tracks.remove(node);
-                        cache.scrolling_areas.remove(node);
-                        cache.frame_viewports.remove(node);
-                        cache.viewport_fixed_roots.remove(node);
-                    }
-                } else {
-                    cache.boxes.retain(|&node, _| dom.is_valid(node));
-                    cache.tracks.retain(|&node, _| dom.is_valid(node));
-                    cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
-                    cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
-                    cache
-                        .viewport_fixed_roots
-                        .retain(|&node| dom.is_valid(node));
+        if (!removed.is_empty() || !minor)
+            && let Ok(mut cache) = self.geom_cache.try_borrow_mut()
+        {
+            if minor {
+                for node in &removed {
+                    cache.boxes.remove(node);
+                    cache.tracks.remove(node);
+                    cache.scrolling_areas.remove(node);
+                    cache.frame_viewports.remove(node);
+                    cache.viewport_fixed_roots.remove(node);
                 }
-                macro_rules! shrink_cache {
-                    ($cache:expr) => {
-                        if $cache.capacity() > $cache.len().saturating_mul(4).max(64) {
-                            let capacity = $cache.len().saturating_mul(2);
-                            $cache.shrink_to(capacity);
-                        }
-                    };
-                }
-                shrink_cache!(cache.boxes);
-                shrink_cache!(cache.tracks);
-                shrink_cache!(cache.scrolling_areas);
-                shrink_cache!(cache.frame_viewports);
-                shrink_cache!(cache.viewport_fixed_roots);
+            } else {
+                cache.boxes.retain(|&node, _| dom.is_valid(node));
+                cache.tracks.retain(|&node, _| dom.is_valid(node));
+                cache.scrolling_areas.retain(|&node, _| dom.is_valid(node));
+                cache.frame_viewports.retain(|&node, _| dom.is_valid(node));
+                cache
+                    .viewport_fixed_roots
+                    .retain(|&node| dom.is_valid(node));
             }
+            macro_rules! shrink_cache {
+                ($cache:expr) => {
+                    if $cache.capacity() > $cache.len().saturating_mul(4).max(64) {
+                        let capacity = $cache.len().saturating_mul(2);
+                        $cache.shrink_to(capacity);
+                    }
+                };
+            }
+            shrink_cache!(cache.boxes);
+            shrink_cache!(cache.tracks);
+            shrink_cache!(cache.scrolling_areas);
+            shrink_cache!(cache.frame_viewports);
+            shrink_cache!(cache.viewport_fixed_roots);
         }
         // Contexts are removed by HTML navigable destruction, not by collection:
         // an active Window realm is an explicit root even while its iframe is
@@ -3276,6 +3307,8 @@ mod desktop {
     }
 
     fn drain_diagnostics(page: &mut LumenPage) {
+        #[cfg(feature = "architecture-diagnostics")]
+        crate::dom::architecture_diagnostics::report();
         if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
             page.outcome.modules_skipped += std::mem::take(&mut state.modules_skipped);
         }
@@ -6582,12 +6615,23 @@ mod desktop {
 
         #[tokio::test]
         async fn actor_starts_idle_period_only_after_ordinary_tasks_quiesce() {
+            // W3C requestIdleCallback c4604781, IdleDeadline / invoke idle callbacks:
+            // timeRemaining is max(deadline - now, 0). Compilation or scheduling after
+            // callback selection may exhaust the period before this observation; that
+            // does not set didTimeout. Requiring positive time made the test discard a
+            // valid update and then report an unrelated 30-second actor timeout.
             let html = r#"<!doctype html><html><body>
                 <output id="result">waiting</output>
                 <script>
+                    const order = [];
+                    setTimeout(() => order.push("task"), 0);
                     requestIdleCallback(function (deadline) {
+                        order.push("idle");
+                        const remaining = deadline.timeRemaining();
                         document.getElementById("result").textContent =
-                            "idle:" + deadline.didTimeout + ":" + (deadline.timeRemaining() > 0);
+                            "idle:" + deadline.didTimeout + ":" +
+                            (Number.isFinite(remaining) && remaining >= 0 && remaining <= 50) +
+                            ":" + order.join(",");
                     });
                 </script>
             </body></html>"#;
@@ -6595,8 +6639,13 @@ mod desktop {
             let rendered = tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Updated { html, .. }) if html.contains("idle:false:true") => {
+                        Some(PageEvt::Updated { html, .. })
+                            if html.contains("<output id=\"result\">idle:") =>
+                        {
                             break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("idle callback failed: {errors:?}")
                         }
                         Some(_) => {}
                         None => panic!("Lumen actor closed before its idle period"),
@@ -6605,7 +6654,10 @@ mod desktop {
             })
             .await
             .expect("idle callback did not receive an actor-selected idle period");
-            assert!(rendered.contains("<output id=\"result\">idle:false:true</output>"));
+            assert!(
+                rendered.contains("<output id=\"result\">idle:false:true:task,idle</output>"),
+                "idle callback did not observe a valid deadline after the ordinary task: {rendered}"
+            );
         }
 
         #[tokio::test]
@@ -7290,6 +7342,25 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__performance_binding", 1, host_performance_binding),
     ("__element_slots", 1, host_element_slots),
     ("__dom_register_wrapper", 2, host_register_dom_wrapper),
+    ("__dom_cached_wrapper", 1, host_cached_dom_wrapper),
+    (
+        "__dom_wrapper_cache_enabled",
+        0,
+        host_dom_wrapper_cache_enabled,
+    ),
+    ("__dom_wrapper_cache_state", 0, host_dom_wrapper_cache_state),
+    ("__dom_relative", 2, host_dom_relative),
+    ("__dom_traversal_enabled", 0, host_dom_traversal_enabled),
+    (
+        "__dom_install_live_collection",
+        4,
+        host_install_live_collection,
+    ),
+    (
+        "__dom_child_collection_length",
+        2,
+        host_child_collection_length,
+    ),
     ("__dom_node_identity", 1, host_node_identity),
     ("__dom_observer_targets", 2, host_dom_observer_targets),
     ("__live_range_register", 1, host_live_range_register),
@@ -7839,6 +7910,15 @@ fn host_register_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let mut dom = state.dom.borrow_mut();
     if let Some(node) = host_arg_node(&dom, args, 0) {
+        if native_wrapper_cache_enabled()
+            && let Some(entry) = state
+                .dom_gc
+                .wrappers
+                .get(&node)
+                .and_then(|identity| state.dom_gc.owners.get(identity))
+        {
+            return Ok(entry.value.clone());
+        }
         if matches!(dom.node(node).data, NodeData::Document) {
             if let Some(entry) = state
                 .dom_gc
@@ -7859,9 +7939,334 @@ fn host_register_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         state
             .dom_gc
             .retain(wrapper.clone(), vec![node], DomGcOwnerKind::Wrapper);
+        if native_wrapper_cache_enabled() {
+            state
+                .dom_gc
+                .wrappers
+                .insert(node, Rc::as_ptr(wrapper.as_obj().unwrap()) as usize);
+        }
         dom.release_gc_allocation(node);
     }
     Ok(wrapper.clone())
+}
+
+fn native_wrapper_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_WRAPPERS").as_deref() != Ok("0"))
+}
+
+fn host_dom_wrapper_cache_enabled(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
+    Ok(Value::Bool(native_wrapper_cache_enabled()))
+}
+
+fn host_cached_dom_wrapper(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let Some(number) = args.first().and_then(Value::as_num_opt) else {
+        return Ok(Value::Null);
+    };
+    let node = number as usize;
+    if !number.is_finite() || number < 0. || node as f64 != number {
+        return Ok(Value::Null);
+    }
+    Ok(state
+        .dom_gc
+        .wrappers
+        .get(&node)
+        .and_then(|identity| state.dom_gc.owners.get(identity))
+        .filter(|entry| {
+            matches!(entry.kind, DomGcOwnerKind::Wrapper) && entry.nodes.as_slice() == [node]
+        })
+        .map_or(Value::Null, |entry| entry.value.clone()))
+}
+
+fn host_dom_wrapper_cache_state(
+    ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let dom = state.dom.borrow();
+    let entries = state.dom_gc.wrappers.len();
+    let live = state
+        .dom_gc
+        .wrappers
+        .values()
+        .filter(|identity| state.dom_gc.owners.contains_key(identity))
+        .count();
+    let connected = state
+        .dom_gc
+        .wrappers
+        .keys()
+        .filter(|&&node| dom.is_connected(node))
+        .count();
+    drop(dom);
+    Ok(ctx.make_array(vec![
+        Value::Num(entries as f64),
+        Value::Num(live as f64),
+        Value::Num(connected as f64),
+    ]))
+}
+
+fn native_dom_traversal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_DOM_TRAVERSAL").as_deref() != Ok("0"))
+}
+
+fn host_dom_traversal_enabled(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
+    Ok(Value::Bool(native_dom_traversal_enabled()))
+}
+
+/// DOM a2331a45 #dom-node-firstchild / #dom-node-parentnode and the
+/// ParentNode/NonDocumentTypeChildNode getters read the native light tree.
+/// Do not materialize a retained ID array for a single edge, or consult
+/// author-overridable nodeType/children/parentNode properties. Web IDL
+/// 8f182624 #dfn-attribute-getter requires the actual platform receiver.
+fn host_dom_relative(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let Some(id) = args
+        .first()
+        .and_then(|value| state.dom_gc.node_identity(value))
+    else {
+        return Err(ctx.make_error("TypeError", "Node getter requires a Node receiver"));
+    };
+    let edge = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0) as i32;
+    let dom = state.dom.borrow();
+    if !dom.is_valid(id) {
+        drop(dom);
+        return Err(ctx.make_error("TypeError", "Node receiver is no longer live"));
+    }
+    let node = dom.node(id);
+    if edge == 11 {
+        // Internal Range index: only preceding light-tree siblings matter.
+        // DOM #concept-tree-index. Never allocate all of the parent's IDs.
+        if node.parent.is_none() || matches!(node.data, NodeData::Document) {
+            return Ok(Value::Num(-1.0));
+        }
+        let mut index = 0;
+        let mut previous = node.prev_sibling;
+        while let Some(sibling) = previous {
+            let sibling = dom.node(sibling);
+            if !matches!(sibling.data, NodeData::Document) {
+                index += 1;
+            }
+            previous = sibling.prev_sibling;
+        }
+        return Ok(Value::Num(index as f64));
+    }
+    if edge == 10 {
+        return Ok(Value::Num(
+            dom.child_iter(id)
+                .filter(|&child| matches!(dom.node(child).data, NodeData::Element { .. }))
+                .count() as f64,
+        ));
+    }
+    let document = matches!(node.data, NodeData::Document);
+    let mut target = match edge {
+        0 | 1 if !document => node.parent,
+        2 | 4 => node.first_child,
+        3 | 5 => node.last_child,
+        6 | 8 if !document => node.next_sibling,
+        7 | 9 if !document => node.prev_sibling,
+        _ => None,
+    };
+    if edge == 1 {
+        target = target.filter(|&parent| matches!(dom.node(parent).data, NodeData::Element { .. }));
+    } else if edge >= 2 {
+        // Frame Documents are stored as native arena children for lifetime
+        // ownership, but are separate DOM trees. Shadow/template contents
+        // likewise have their own roots, never substituted for light children.
+        let elements_only = matches!(edge, 4 | 5 | 8 | 9);
+        while let Some(candidate) = target {
+            let candidate = dom.node(candidate);
+            if !matches!(candidate.data, NodeData::Document)
+                && (!elements_only || matches!(candidate.data, NodeData::Element { .. }))
+            {
+                break;
+            }
+            target = if matches!(edge, 3 | 5 | 7 | 9) {
+                candidate.prev_sibling
+            } else {
+                candidate.next_sibling
+            };
+        }
+    }
+    Ok(target.map_or(Value::Null, |node| {
+        state
+            .dom_gc
+            .wrappers
+            .get(&node)
+            .and_then(|identity| state.dom_gc.owners.get(identity))
+            .map_or(Value::Num(node as f64), |entry| entry.value.clone())
+    }))
+}
+
+fn native_live_collections_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_NATIVE_LIVE_COLLECTIONS").as_deref() != Ok("0"))
+}
+
+fn live_collection_length(ctx: &Ctx, root: &Value, elements: bool) -> u32 {
+    let Some(state) = ctx.host::<HostState>() else {
+        return 0;
+    };
+    let Some(root) = state.dom_gc.node_identity(root) else {
+        return 0;
+    };
+    state
+        .dom
+        .borrow()
+        .child_collection_len(root, elements)
+        .min(u32::MAX as usize) as u32
+}
+
+fn live_node_list_length(ctx: &Ctx, root: &Value) -> u32 {
+    live_collection_length(ctx, root, false)
+}
+
+fn live_element_list_length(ctx: &Ctx, root: &Value) -> u32 {
+    live_collection_length(ctx, root, true)
+}
+
+fn host_child_collection_length(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let root = args.first().unwrap_or(&Value::Undefined);
+    Ok(Value::Num(
+        live_collection_length(ctx, root, matches!(args.get(1), Some(Value::Bool(true)))) as f64,
+    ))
+}
+
+fn live_element_list_names(ctx: &Ctx, root: &Value) -> Vec<String> {
+    let Some(state) = ctx.host::<HostState>() else {
+        return Vec::new();
+    };
+    let Some(root) = state.dom_gc.node_identity(root) else {
+        return Vec::new();
+    };
+    let dom = state.dom.borrow();
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut names = Vec::new();
+    for child in dom.child_iter(root) {
+        if !matches!(dom.node(child).data, NodeData::Element { .. }) {
+            continue;
+        }
+        let html = dom.namespace_uri(child) == Some("http://www.w3.org/1999/xhtml");
+        for name in [
+            dom.get_attribute(child, "id"),
+            html.then(|| dom.get_attribute(child, "name")).flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|name| !name.is_empty())
+        {
+            if seen.insert(name) {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Native membership never manufactures a JS ID array. Only a consumed node
+/// obtains a wrapper; its identity still belongs to the canonical mixed heap.
+fn live_child_collection_get(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+    captures: &[Value],
+) -> Result<Value, Value> {
+    let elements = matches!(captures.get(2), Some(Value::Bool(true)));
+    let state = ctx.host::<HostState>().expect("DOM host");
+    let Some(root) = state.dom_gc.node_identity(&captures[0]) else {
+        return Ok(Value::Null);
+    };
+    let dom = state.dom.borrow();
+    let target = match args.first() {
+        Some(Value::Num(index)) if index.is_finite() && *index >= 0.0 && index.fract() == 0.0 => {
+            dom.child_collection_item(root, *index as usize, elements)
+        }
+        Some(Value::Str(name)) if elements && !name.is_empty() => {
+            dom.child_iter(root).find(|&child| {
+                matches!(dom.node(child).data, NodeData::Element { .. })
+                    && (dom.get_attribute(child, "id") == Some(name.as_str())
+                        || (dom.namespace_uri(child) == Some("http://www.w3.org/1999/xhtml")
+                            && dom.get_attribute(child, "name") == Some(name.as_str())))
+            })
+        }
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Ok(Value::Null);
+    };
+    let cached = state
+        .dom_gc
+        .wrappers
+        .get(&target)
+        .and_then(|identity| state.dom_gc.owners.get(identity))
+        .map(|entry| entry.value.clone());
+    drop(dom);
+    if let Some(wrapper) = cached {
+        return Ok(wrapper);
+    }
+    ctx.invoke(
+        captures[1].clone(),
+        Value::Undefined,
+        &[Value::Num(target as f64)],
+    )
+}
+
+fn host_install_live_collection(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if !native_live_collections_enabled() {
+        return Ok(Value::Bool(false));
+    }
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let root = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let elements = matches!(args.get(2), Some(Value::Bool(true)));
+    let wrap = args.get(3).cloned().unwrap_or(Value::Undefined);
+    if ctx
+        .host::<HostState>()
+        .and_then(|state| state.dom_gc.node_identity(&root))
+        .is_none()
+        || !wrap.is_callable()
+    {
+        return Err(ctx.make_error(
+            "TypeError",
+            "live collection requires a Node and wrapper callback",
+        ));
+    }
+    let getter = ctx.new_native_fn_with_captures(
+        "collection item",
+        1,
+        live_child_collection_get,
+        vec![root.clone(), wrap, Value::Bool(elements)],
+    );
+    let length = if elements {
+        live_element_list_length
+    } else {
+        live_node_list_length
+    };
+    let named = elements.then(|| {
+        (
+            live_element_list_names as fn(&Ctx, &Value) -> Vec<String>,
+            getter.clone(),
+        )
+    });
+    ctx.install_live_readonly_indexed_properties(&target, root, length, getter.clone(), named)?;
+    Ok(getter)
 }
 
 fn host_node_identity(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -17099,7 +17504,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 178, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 185, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -17110,7 +17515,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 178);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 185);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -29135,11 +29540,389 @@ mod tests {
     }
 
     #[test]
+    fn native_wrapper_cache_form_named_getters_keep_platform_identity() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const root=document.createElement('main');document.appendChild(root);
+            root.innerHTML='<form><input name=parentNode><input id=a type=radio name=choice required><input id=b type=radio name=choice></form>';
+            const form=root.firstChild,a=document.getElementById('a'),b=document.getElementById('b');
+            const parent=Object.getOwnPropertyDescriptor(Node.prototype,'parentNode').get;
+            const missing=a.validity.valueMissing;b.checked=true;
+            return [form.parentNode===form.elements[0],parent.call(form)===root,
+                form.elements.length,missing,a.validity.valueMissing,form.getRootNode()===document].join('|');
+        })()"#
+            ),
+            "true|true|3|true|false|true"
+        );
+    }
+
+    #[test]
+    fn native_wrapper_cache_tree_edges_use_light_tree_and_platform_receivers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const check=(value,label)=>{if(!value)throw Error(label)};
+                const root=document.createElement('main');document.appendChild(root);
+                root.innerHTML='a<!--b--><i></i>c<b></b><!--d-->';
+                const a=root.childNodes[0], comment=root.childNodes[1], i=root.childNodes[2];
+                const c=root.childNodes[3], b=root.childNodes[4], tail=root.childNodes[5];
+                check(root.firstChild===a && root.lastChild===tail,'endpoints');
+                check(root.firstElementChild===i && root.lastElementChild===b && root.childElementCount===2,'elements');
+                check(a.nextSibling===comment && tail.previousSibling===b,'siblings');
+                check(a.nextElementSibling===i && tail.previousElementSibling===b && b.previousElementSibling===i,'element siblings');
+                check(root.parentNode===document && root.parentElement===null && i.parentElement===root,'parents');
+                check(document.parentNode===null && document.nextSibling===null && document.previousSibling===null,'Document root');
+                const fragment=document.createDocumentFragment();fragment.appendChild(i);
+                check(fragment.firstChild===i && i.parentNode===fragment && i.parentElement===null,'fragment');
+                const host=document.createElement('div'), shadow=host.attachShadow({mode:'open'});
+                shadow.appendChild(b);root.appendChild(host);
+                check(host.firstChild===null && shadow.firstChild===b && b.parentNode===shadow && b.parentElement===null && shadow.parentNode===null,'shadow boundary');
+                const template=document.createElement('template');template.innerHTML='<em></em>';
+                const content=template.content;
+                check(template.firstChild===null && content.firstChild.localName==='em','template boundary');
+                const frame=document.createElement('iframe'), fallback=document.createTextNode('fallback');
+                frame.appendChild(fallback);root.appendChild(frame);__trust.hydrateFrames();
+                check(frame.firstChild===fallback && frame.lastChild===fallback && fallback.nextSibling===null && frame.childElementCount===0,'frame boundary');
+                check(frame.contentDocument.parentNode===null,'frame document root');
+                root.insertBefore(i,root.firstChild);
+                check(root.firstChild===i && i.nextSibling===a && i.parentNode===root,'mutation');
+                root.removeChild(i);check(i.parentNode===null && i.nextSibling===null && i.previousSibling===null,'detach');
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+            if native_dom_traversal_enabled() {
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                    const root=document.firstChild, child=root.firstChild;
+                    const first=Object.getOwnPropertyDescriptor(Node.prototype,'firstChild').get;
+                    const parent=Object.getOwnPropertyDescriptor(Node.prototype,'parentNode').get;
+                    const nextElement=Object.getOwnPropertyDescriptor(CharacterData.prototype,'nextElementSibling').get;
+                    Object.defineProperties(root,{children:{get(){throw Error('children')}},nodeType:{get(){throw Error('nodeType')}}});
+                    Object.defineProperties(child,{nodeType:{get(){throw Error('nodeType')}},nextSibling:{get(){throw Error('nextSibling')}}});
+                    child.__id=-1;
+                    if(first.call(root)!==child || parent.call(child)!==root || !nextElement.call(child))throw Error('native slots');
+                    let errors=0;for(const fake of [{__id:root.__id},Object.create(Node.prototype),null]) {
+                        try{first.call(fake)}catch(e){if(e.name==='TypeError')errors++}
+                    }
+                    return [errors,typeof globalThis.__dom_relative].join('|');
+                })()"#
+                    ),
+                    "3|undefined",
+                    "{tier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_collections53_views_are_live_and_named_properties_follow_web_idl() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const check=(x,s)=>{if(!x)throw Error(s)};
+                const root=document.createElement('div');
+                root.innerHTML='text<i id=a name=n></i><!--c--><b id=b></b>';
+                const nodes=root.childNodes,children=root.children;
+                check(nodes===root.childNodes && children===root.children,'SameObject');
+                check(nodes.length===4 && children.length===2 && children[0]===nodes[1],'membership');
+                check(children.a===children[0] && children.n===children[0],'names');
+                const d=Object.getOwnPropertyDescriptor(children,'a');
+                check(d.value===children[0] && !d.enumerable && !d.writable && d.configurable,'named descriptor');
+                check(Object.keys(children).join()==='0,1','enumeration');
+                check(Reflect.ownKeys(children).join()==='0,1,a,n,b','own key order');
+                children[0].id='renamed';
+                check(children.a===undefined && children.renamed===children[0],'attribute membership');
+                children[0].id='length';
+                check(children.length===2 && children.namedItem('length')===children[0],'prototype precedence');
+                check(!Reflect.defineProperty(children,'length',{value:9}),'hidden supported name definition');
+                check(!Reflect.set(children,'0',null) && !Reflect.deleteProperty(children,'0'),'read only indices');
+                check(!Reflect.defineProperty(children,'20',{value:9}) && Reflect.deleteProperty(children,'20'),'unsupported indices');
+                check(!Reflect.preventExtensions(children),'extensible platform object');
+                const first=children[0];first.remove();
+                check(nodes.length===3 && children.length===1 && children[0].id==='b','removal');
+                root.insertBefore(first,root.firstChild);
+                check(nodes[0]===first && children[0]===first,'reinsertion');
+                root.textContent='replacement';
+                check(nodes.length===1 && children.length===0 && nodes[0].data==='replacement','replace all');
+                const fragment=document.createDocumentFragment();fragment.appendChild(first);
+                check(fragment.children[0]===first && fragment.childNodes.item(0)===first,'fragment');
+                const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+                svg.setAttribute('name','svgname');fragment.appendChild(svg);
+                check(fragment.children.namedItem('svgname')===null,'HTML name namespace');
+                svg.id='svgid';check(fragment.children.svgid===svg,'SVG ID');
+                let invalid=0;
+                for(const getter of [Object.getOwnPropertyDescriptor(NodeList.prototype,'length').get,Object.getOwnPropertyDescriptor(HTMLCollection.prototype,'length').get]) {
+                    try{getter.call({})}catch(e){if(e.name==='TypeError')invalid++}
+                }
+                check(invalid===2,'brands');
+                check(typeof globalThis.__dom_install_live_collection==='undefined','private capability');
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_collections53_iteration_observes_synchronous_mutation() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const root=document.createElement('div');
+            root.innerHTML='<i id=a></i><i id=b></i><i id=c></i>';
+            const list=root.childNodes, seen=[];
+            list.forEach((node,index,owner)=>{
+                if(owner!==list)throw Error('owner');
+                seen.push(node.id);
+                if(index===0){root.removeChild(root.lastChild);root.appendChild(document.createElement('b'));}
+            });
+            if(seen.join()!=='a,b,')throw Error('forEach membership: '+seen);
+            const it=list.values();
+            if(it.next().value.id!=='a')throw Error('first iterator value');
+            root.removeChild(root.firstChild);
+            if(it.next().value.localName!=='b')throw Error('shifted iterator value');
+            root.appendChild(document.createElement('em'));
+            if(it.next().value.localName!=='em' || !it.next().done)throw Error('live iteration length');
+            root.appendChild(document.createElement('strong'));
+            if(!it.next().done)throw Error('iterator completion must stick');
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn live_collections53_do_not_materialize_id_arrays_and_retain_detached_roots() {
+        if !native_live_collections_enabled() {
+            return;
+        }
+        let mut engine = platform_engine();
+        eval(&mut engine,"globalThis.collectionRoot=document.createElement('div');collectionRoot.innerHTML='<i></i>'.repeat(128);", "collection setup").unwrap();
+        let id_arrays = |engine: &mut lumen::Engine| {
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .dom_gc
+                .owners
+                .values()
+                .filter(|owner| matches!(owner.kind, DomGcOwnerKind::IdArray))
+                .count()
+        };
+        let before = id_arrays(&mut engine);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            globalThis.heldChildren=collectionRoot.children;
+            globalThis.heldNodes=collectionRoot.childNodes;
+            let sum=0;
+            for(let i=0;i<100;i++){
+                collectionRoot.setAttribute('data-test',i);
+                sum+=heldChildren.length+heldNodes.length;
+                if(heldChildren[i]!==heldNodes[i])throw Error('identity');
+            }
+            heldChildren[0].expando=71;
+            collectionRoot=null;
+            return String(sum);
+        })()"#
+            ),
+            "25600"
+        );
+        assert_eq!(
+            id_arrays(&mut engine),
+            before,
+            "native live views must not allocate retained child ID arrays"
+        );
+        engine.ctx().collect_garbage_for_host();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[heldChildren[0].expando,heldNodes.length,heldChildren[0].parentNode.children===heldChildren].join('|')"
+            ),
+            "71|128|true"
+        );
+        eval(
+            &mut engine,
+            "heldChildren=null;heldNodes=null",
+            "release collection",
+        )
+        .unwrap();
+        engine.ctx().collect_garbage_for_host();
+    }
+
+    #[test]
+    fn native_wrapper_cache_single_edges_do_not_allocate_child_id_arrays() {
+        if !native_dom_traversal_enabled() {
+            return;
+        }
+        let mut engine = platform_engine();
+        eval(&mut engine, "globalThis.edgeRoot=document.createElement('div');edgeRoot.innerHTML='<i></i>'.repeat(128);edgeRoot.firstChild;edgeRoot.lastChild;", "edge setup").unwrap();
+        let count = |engine: &mut lumen::Engine| {
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .dom_gc
+                .owners
+                .values()
+                .filter(|owner| matches!(owner.kind, DomGcOwnerKind::IdArray))
+                .count()
+        };
+        let before = count(&mut engine);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "(() => {let same=true;const first=edgeRoot.firstChild,last=edgeRoot.lastChild;for(let i=0;i<128;++i)same=same&&edgeRoot.firstChild===first&&edgeRoot.lastChild===last;return String(same)})()"
+            ),
+            "true"
+        );
+        assert!(
+            count(&mut engine) <= before,
+            "single-edge reads materialized retained child arrays"
+        );
+    }
+
+    #[test]
+    fn native_wrapper_cache_preserves_identity_without_javascript_weak_reads() {
+        // Web IDL 8f182624 #interface-to-js and DOM a2331a45 #concept-node-tree.
+        // The private cache is not an author WeakRef: its reads need no
+        // observable method dispatch or second kept-alive object graph.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let result = string_value(
+                &mut engine,
+                r#"(() => {
+                const root=document.createElement('main');
+                document.appendChild(root);
+                const node=document.createElement('span'); node.id='same';
+                node.expando={marker:42}; root.appendChild(node);
+                const original=WeakRef.prototype.deref;
+                let weakReads=0, same=true;
+                WeakRef.prototype.deref=function(){weakReads++;return original.call(this)};
+                try {
+                    for(let i=0;i<100;++i) {
+                        same = same && root.firstChild===node && document.getElementById('same')===node;
+                        same = same && root.firstChild.expando.marker===42;
+                    }
+                } finally { WeakRef.prototype.deref=original; }
+                return [same,weakReads,typeof globalThis.__dom_cached_wrapper,
+                    typeof globalThis.__dom_register_wrapper].join('|');
+            })()"#,
+            );
+            let parts: Vec<_> = result.split('|').collect();
+            assert_eq!(parts[0], "true", "{tier:?}: {result}");
+            assert_eq!(&parts[2..], &["undefined", "undefined"]);
+            if native_wrapper_cache_enabled() {
+                assert_eq!(parts[1], "0", "{tier:?}: {result}");
+            } else {
+                assert!(parts[1].parse::<usize>().unwrap() > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_wrapper_cache_retires_with_the_mixed_heap() {
+        let mut engine = platform_engine();
+        let result = eval_value(
+            &mut engine,
+            "globalThis.retireWrapper=document.createElement('p');retireWrapper.__id",
+            "native wrapper retirement",
+        )
+        .unwrap();
+        let id = result.as_num_opt().unwrap() as usize;
+        if native_wrapper_cache_enabled() {
+            assert!(
+                engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .dom_gc
+                    .wrappers
+                    .contains_key(&id)
+            );
+        }
+        eval(&mut engine, "retireWrapper=null", "release native wrapper").unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert!(matches!(
+            host_cached_dom_wrapper(engine.ctx(), Value::Undefined, &[Value::Num(id as f64)]),
+            Ok(Value::Null)
+        ));
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        assert!(!state.dom_gc.wrappers.contains_key(&id));
+        assert!(!state.dom.borrow().is_valid(id));
+        for (&node, identity) in &state.dom_gc.wrappers {
+            let owner = state
+                .dom_gc
+                .owners
+                .get(identity)
+                .expect("index never outlives owner");
+            assert!(matches!(owner.kind, DomGcOwnerKind::Wrapper));
+            assert_eq!(owner.nodes, [node]);
+            assert!(state.dom.borrow().is_valid(node));
+        }
+    }
+
+    #[test]
+    fn native_wrapper_cache_keeps_same_agent_identity_through_adoption() {
+        if !native_wrapper_cache_enabled() {
+            return; // The old per-Realm JS directories are the diagnostic control.
+        }
+        let mut engine = platform_engine();
+        let result = string_value(
+            &mut engine,
+            r##"(() => {
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame=document.createElement('iframe');
+            frame.srcdoc='<body><div id=foreign></div><script>globalThis.saved=document.getElementById("foreign");saved.marker=42;<\/script>';
+            body.appendChild(frame); __trust.hydrateFrames();
+            const foreign=frame.contentDocument.getElementById('foreign');
+            const same=foreign===frame.contentWindow.saved;
+            const prototype=Object.getPrototypeOf(foreign);
+            document.adoptNode(foreign); body.appendChild(foreign);
+            return [same,foreign.marker,document.getElementById('foreign')===foreign,
+                foreign.ownerDocument===document,Object.getPrototypeOf(foreign)===prototype].join('|');
+        })()"##,
+        );
+        assert_eq!(result, "true|42|true|true|true");
+    }
+
+    #[test]
     fn detached_node_wrapper_cache_does_not_root_unreachable_wrappers() {
         // Web IDL wrapper identity applies while a platform object remains
-        // observable. ECMA-262 WeakRef preserves same-job identity without a
-        // strong cache edge, and native FinalizationRegistry cleanup removes
-        // dead id entries after collection. A DOM churn workload must not
+        // observable. The native identity index follows the mixed-heap sweep;
+        // the diagnostic control uses weak references and finalizers. Neither
+        // directory adds a root for detached components. DOM churn must not
         // retain every transient wrapper for the lifetime of the page.
         let mut engine = platform_engine();
         eval(

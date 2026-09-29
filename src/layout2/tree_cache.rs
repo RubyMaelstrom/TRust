@@ -413,6 +413,9 @@ mod tests {
                 5 => dom.set_attr(list, "style", "display:block;width:100px"),
                 _ => unreachable!(),
             }
+            // Cache retirement now batches writes until the next style/layout
+            // observation. Verify ownership after that invalidation boundary.
+            dom.flush_style_invalidations();
             assert!(
                 old_root.upgrade().is_none(),
                 "invalidated ancestor must not retain an old tree"

@@ -87,7 +87,6 @@ mod tests {
                 .as_ptr()
         };
         let original = retained_token();
-        let bytes_before = dom.retained_memory().0;
         dom.set_attr(id, "style", "color:red");
         let child = dom.create_element("span");
         dom.append(id, child);
@@ -112,11 +111,16 @@ mod tests {
         assert!(dom.class_cache.borrow().get(id, 0).is_none());
         assert_eq!(dom.computed_style(id, "width").as_deref(), Some("29px"));
         assert!(dom.class_cache.borrow().get(id, 0).is_some());
+        // Other bounded style caches may retire entries during a restyle.
+        // Isolate the class-token payload instead of assuming that total DOM
+        // memory grows monotonically across unrelated mutations.
         let bytes_with_tokens = dom.retained_memory().0;
-        assert!(bytes_with_tokens >= bytes_before);
+        dom.class_cache.get_mut().invalidate(id);
+        assert!(dom.retained_memory().0 < bytes_with_tokens);
+        assert!(dom.matches_classes(id, &[String::from("miss")]));
+        assert_eq!(dom.retained_memory().0, bytes_with_tokens);
         dom.remove_attr(id, "CLASS");
         assert!(dom.class_cache.borrow().get(id, 0).is_none());
-        assert!(dom.retained_memory().0 < bytes_with_tokens);
         assert!(!dom.matches(id, &SelectorList::parse(".hit, .miss").unwrap()));
         dom.set_attr(id, "class", "hit");
         assert_eq!(dom.computed_style(id, "width").as_deref(), Some("17px"));

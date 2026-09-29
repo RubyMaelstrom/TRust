@@ -312,11 +312,11 @@ impl Dom {
     /// derived layout/box before completing the next mutation; serialized DOM
     /// getters and resident geometry also observe the mutation/presentation
     /// revision advanced by their caller. Raster data URLs are immutable keys.
-    pub(super) fn invalidate_untracked_svg_resources(&mut self) {
-        if self.svg_dependencies.get_mut().needs_global_invalidation() {
-            self.layout_cache.get_mut().clear();
-            self.box_tree_cache.get_mut().clear();
-            self.svg_dependencies.get_mut().clear_proofs();
+    pub(super) fn invalidate_untracked_svg_resources(&self) {
+        if self.svg_dependencies.borrow().needs_global_invalidation() {
+            self.layout_cache.borrow_mut().clear();
+            self.box_tree_cache.borrow_mut().clear();
+            self.svg_dependencies.borrow_mut().clear_proofs();
         }
     }
 
@@ -324,13 +324,12 @@ impl Dom {
     /// `binding_change` includes insertion/removal/reorder and ID mutations:
     /// successful lookups as well as unresolved ones must be reconsidered.
     pub(super) fn svg_dirty_consumers(
-        &mut self,
+        &self,
         changed: &[NodeId],
         binding_change: bool,
     ) -> Vec<NodeId> {
         self.invalidate_untracked_svg_resources();
-        let state = self.svg_dependencies.get_mut();
-        if state.consumers.is_empty() {
+        if self.svg_dependencies.borrow().consumers.is_empty() {
             return Vec::new();
         }
         let state = self.svg_dependencies.borrow();
@@ -344,10 +343,10 @@ impl Dom {
                 pending.extend(users.iter().copied());
             }
             if let Some(native) = self.nodes.get(node) {
-                if scopes.insert(native.owner_document) {
-                    if let Some(users) = state.conservative.get(&native.owner_document) {
-                        pending.extend(users.iter().copied());
-                    }
+                if scopes.insert(native.owner_document)
+                    && let Some(users) = state.conservative.get(&native.owner_document)
+                {
+                    pending.extend(users.iter().copied());
                 }
                 if binding_change {
                     // Preserve the actual legacy lookup domain: its native
@@ -402,8 +401,8 @@ impl Dom {
     /// A missing local cache entry is not a reason to stop: a parent can retain
     /// a cached box containing that node. Unrelated shadow roots do not make
     /// an ordinary edge require slot lookup.
-    pub(super) fn invalidate_layout_paths(&mut self, roots: impl IntoIterator<Item = NodeId>) {
-        let mut work = std::mem::take(&mut self.svg_dependencies.get_mut().work);
+    pub(super) fn invalidate_layout_paths(&self, roots: impl IntoIterator<Item = NodeId>) {
+        let mut work = std::mem::take(&mut self.svg_dependencies.borrow_mut().work);
         debug_assert!(work.pending.is_empty() && work.visited.is_empty());
         work.pending.extend(roots);
         if work.pending.len() == 1 && self.shadow_roots.is_empty() {
@@ -415,8 +414,8 @@ impl Dom {
                     break;
                 };
                 next = node.parent;
-                self.layout_cache.get_mut().invalidate(id);
-                self.box_tree_cache.get_mut().invalidate(id);
+                self.layout_cache.borrow_mut().invalidate(id);
+                self.box_tree_cache.borrow_mut().invalidate(id);
                 #[cfg(test)]
                 {
                     visited += 1;
@@ -426,7 +425,7 @@ impl Dom {
             {
                 work.last_visited = visited;
             }
-            self.svg_dependencies.get_mut().work = work;
+            self.svg_dependencies.borrow_mut().work = work;
             return;
         }
         while let Some(id) = work.pending.pop() {
@@ -447,8 +446,8 @@ impl Dom {
                     self.shadow_hosts.get(&parent).copied().or(Some(parent))
                 }
             });
-            self.layout_cache.get_mut().invalidate(id);
-            self.box_tree_cache.get_mut().invalidate(id);
+            self.layout_cache.borrow_mut().invalidate(id);
+            self.box_tree_cache.borrow_mut().invalidate(id);
             work.pending.extend(composed);
             if flat != composed {
                 work.pending.extend(flat);
@@ -459,8 +458,8 @@ impl Dom {
             work.last_visited = work.visited.len();
         }
         work.visited.clear();
-        self.svg_dependencies.get_mut().work = work;
-        self.svg_dependencies.get_mut().compact(self.nodes.len());
+        self.svg_dependencies.borrow_mut().work = work;
+        self.svg_dependencies.borrow_mut().compact(self.nodes.len());
     }
 }
 
@@ -495,6 +494,33 @@ mod tests {
             &ControlMap::new(),
             &ImageSizes::new(),
         )
+    }
+
+    fn warm_parent_cache(dom: &Dom) {
+        let resources = || {
+            (
+                crate::font_system::page_font_epoch(),
+                crate::img::svg_intrinsic_epoch(),
+                super::super::svg_sprite_revision(),
+            )
+        };
+        for _ in 0..16 {
+            // Parallel tests can install fonts or SVG resources between the two
+            // layouts. Those valid global invalidations deliberately clear the
+            // formatting cache; require a stable pair before asserting reuse.
+            let before = resources();
+            measure(dom);
+            let warm = measure(dom);
+            if before != resources() {
+                continue;
+            }
+            assert!(
+                warm.work.tree_hits > 0,
+                "fixture must exercise parent cache hits"
+            );
+            return;
+        }
+        panic!("resource revisions never settled for cache warmup");
     }
 
     fn warm_matches_cold(dom: &mut Dom) {
@@ -819,7 +845,7 @@ mod tests {
 
     #[test]
     fn svg_dependency_mutation_reaches_users_not_independent_resources() {
-        let mut dom = Dom::parse_document(
+        let dom = Dom::parse_document(
             r##"<svg><g id="source"><path id="path" d="M0 0h7v8z"/></g></svg>
             <svg id="first"><use href="#source"/></svg>
             <svg id="second"><use href="#source"/></svg>
@@ -850,7 +876,7 @@ mod tests {
 
     #[test]
     fn svg_dependency_candidate_only_reads_publish_negative_proof_without_narrowing_image_proof() {
-        let mut dom = Dom::parse_document(
+        let dom = Dom::parse_document(
             r##"<button id="button"><svg id="consumer"><use href="#late"/></svg></button>
             <svg id="painted"><rect fill="url(#paint)" width="5" height="5"/></svg>"##,
         );
@@ -961,11 +987,7 @@ mod tests {
             <section><svg id="second" width="20" height="20"><use href="#source"/></svg></section></main>"##,
         );
         let path = dom.get_by_id("path").unwrap();
-        measure(&dom);
-        assert!(
-            measure(&dom).work.tree_hits > 0,
-            "fixture must exercise parent cache hits"
-        );
+        warm_parent_cache(&dom);
         for color in ["red", "blue"] {
             dom.set_attr(path, "fill", color);
             warm_matches_cold(&mut dom);
@@ -990,9 +1012,8 @@ mod tests {
             <section><svg id="second" width="20" height="20"><rect id="rect" width="4" height="5"/></svg></section></main>"##,
         );
         dom.svg_dependencies.get_mut().limits = Some((1, 8));
-        measure(&dom);
+        warm_parent_cache(&dom);
         assert!(dom.svg_dependencies.borrow().global_conservative);
-        assert!(measure(&dom).work.tree_hits > 0);
         let rect = dom.get_by_id("rect").unwrap();
         dom.set_attr(rect, "id", "late");
         warm_matches_cold(&mut dom);
@@ -1145,8 +1166,7 @@ mod tests {
             r#"<main><section><svg id="icon" width="20" height="20"><use href="svg-dependency-generation.svg#fresh"/></svg></section></main>"#,
         );
         let url = "https://example.com/svg-dependency-generation.svg";
-        measure(&dom);
-        assert!(measure(&dom).work.tree_hits > 0);
+        warm_parent_cache(&dom);
         let before = super::super::svg_sprite_revision();
         super::super::prime_sprite_sheet(
             url,

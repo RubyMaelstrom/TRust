@@ -113,6 +113,9 @@ impl Dom {
     /// Retire only nursery identities. Old physical nodes and caches are never walked here;
     /// remaining queue work is proportional to pending native mutations/events, not tree size.
     pub(crate) fn sweep_gc_young_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) -> Vec<NodeId> {
+        let nodes = &self.nodes;
+        self.pending_style_invalidations
+            .retain_nodes(|id| !nodes.is_young(id) || live(id));
         let removed: Vec<_> = self.nodes.young_ids().filter(|&id| !live(id)).collect();
         if removed.is_empty() {
             return removed;
@@ -126,6 +129,7 @@ impl Dom {
             debug_assert_ne!(id, DOCUMENT);
             retired_slot |= self.tag_name(id) == Some("slot");
             svg_consumers.extend(self.svg_dependencies.get_mut().remove_node(id));
+            self.child_lists.get_mut().remove(id);
             self.nodes.remove(id);
             macro_rules! map_remove {
                 ($($field:ident),+ $(,)?) => {$(self.$field.remove(&id);)+};
@@ -294,6 +298,7 @@ impl Dom {
     /// Called only after joint tracing proves these native identities dead. No JS executes
     /// during sweeping, and borrowed DOMs must be conservatively excluded by the host.
     pub(crate) fn sweep_gc_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) -> Vec<NodeId> {
+        self.pending_style_invalidations.retain_nodes(live);
         let removed: Vec<_> = self.nodes.ids().filter(|&id| !live(id)).collect();
         if removed.is_empty() {
             return removed;
@@ -385,6 +390,7 @@ impl Dom {
             font_units_cache,
             decoration_cache
         );
+        self.child_lists.get_mut().retain(valid);
         self.computed_cache.get_mut().1.retain_nodes(valid);
         let custom = &mut self.custom_prop_cache.get_mut().1;
         custom.retain(|&id, _| valid(id));
@@ -476,10 +482,10 @@ mod tests {
         dom.visit_gc_roots(|id| pending.push(id));
         let mut live = FxHashSet::default();
         while let Some(id) = pending.pop() {
-            if live.insert(id) {
-                if let Some(edges) = edges.get(&id) {
-                    pending.extend_from_slice(edges);
-                }
+            if live.insert(id)
+                && let Some(edges) = edges.get(&id)
+            {
+                pending.extend_from_slice(edges);
             }
         }
         live
@@ -507,10 +513,10 @@ mod tests {
         dom.visit_gc_pending_allocations(|id| pending.push(id));
         let mut live = FxHashSet::default();
         while let Some(id) = pending.pop() {
-            if live.insert(id) {
-                if let Some(edges) = edges.get(&id) {
-                    pending.extend_from_slice(edges);
-                }
+            if live.insert(id)
+                && let Some(edges) = edges.get(&id)
+            {
+                pending.extend_from_slice(edges);
             }
         }
         (live, emitted)

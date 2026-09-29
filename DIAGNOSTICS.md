@@ -888,3 +888,63 @@ When adding an input:
 3. Include one copy-paste command for the test or executable path.
 4. Specify output destination and whether the input is read once or per use.
 5. Update this document and run `git diff --check`.
+# Architecture reassessment probes
+
+The optional `architecture-diagnostics` Cargo feature records cumulative DOM
+tag-lookup callers, computed-style cache hits and copied bytes, style invalidation
+fanout, and Lumen allocation/call-cache observations. It is off in ordinary builds.
+DOM reports are sampled at existing page diagnostic drains (at most once per two
+seconds); no reporting timer or background work is added. Allocation reports occur
+at completed collections. Counters and bounded site tables retain no DOM/JS owners.
+These builds are for causal diagnosis, never controlled acceptance timing.
+
+With `lumen/optimizing-jit`, `LUMEN_OPT_JIT_DIAGNOSTICS=1` additionally records
+optimizer compiler phases, code/IR sizes, native entries, helper calls, heap guards,
+ownership transfers and frame publication. Heap guards count the explicit property
+and ownership guard routines, not every conditional branch. Transfers count logical
+retains/releases, including alias-cancelled groups; they are not allocator calls.
+Existing artifacts stay under the architecture evidence directories; use new output
+names and retain failed attempts as well as completed runs.
+`LUMEN_OPT_JIT_DIAGNOSTICS=compile` records compiler/static observations without
+emitting native execution counters; use that mode to attribute compilation cost.
+
+### Representation and browser-work comparisons
+
+The following controls are enabled by default in ordinary builds. Each reads its
+environment variable once on first use; exactly `0` selects the comparison path.
+They produce no diagnostic output by themselves. Lumen controls affect every
+frontend using the engine; TRust controls affect the shared browser actor or DOM.
+Use a fresh process for each setting and retain complete results, including losses.
+
+| Control | Comparison selected by `0` |
+| --- | --- |
+| `LUMEN_DENSE_ELEMENTS` | Disable extended contiguous array descriptors; earlier tiny-array storage remains available. |
+| `LUMEN_ITERATOR_RESULTS` | Allocate iterator result objects in closed native consumers. Public `next()` results remain distinct in either mode. |
+| `LUMEN_ACTIVATION_PLANS` | Reconstruct compiled activation bindings for each invocation. |
+| `LUMEN_INDEXED_ACTIVATIONS` | Use linear planned-binding lookup for wide compiled environments. |
+| `LUMEN_LAYOUT_NAME_IC` | Disable fixed-layout name-cache proofs. |
+| `LUMEN_COLD_ENV_LAYOUTS` | Disable shared cold-environment name layouts. |
+| `LUMEN_SHARED_NATIVE_OPERATIONS` | Retain the older ARM64 region operation vocabulary. |
+| `TRUST_NATIVE_WRAPPERS` | Use the earlier JavaScript wrapper-identity management path. |
+| `TRUST_NATIVE_DOM_TRAVERSAL` | Use the earlier traversal path instead of single-edge native queries. |
+| `TRUST_NATIVE_LIVE_COLLECTIONS` | Use the earlier child-collection representation. |
+| `TRUST_DEFER_STYLE_INVALIDATION` | Walk invalidated style dependencies eagerly. |
+| `TRUST_STYLE_SHARING` | Disable shared cascade and common computed-property tables. |
+| `TRUST_VARIABLE_STYLE_CONTEXTS` | Exclude variable-dependent inputs from shared computation. |
+| `TRUST_PERSISTENT_STYLE_CONTEXTS` | Keep transient row ownership instead of bounded retention across invalidation. |
+| `TRUST_STYLE_RECORDS` | Recompute typed style records from canonical computed values. |
+
+For example, from the TRust root:
+
+```sh
+TRUST_PERSISTENT_STYLE_CONTEXTS=0 target/release/trust ./src/fixtures/number_input.html
+```
+
+Leave these variables unset to exercise the ordinary default. Each control changes
+the implementation path while preserving the same required web semantics; turning
+one off does not recreate an entire historical engine or browser revision.
+Cranelift remains a separate optional build feature with opt-in runtime policies.
+`LUMEN_OPT_JIT_OSR=1` is a restricted loop-continuation experiment, independent of
+whole-function `LUMEN_OPT_JIT` admission. Neither is enabled in an ordinary release.
+See the sibling Lumen `AGENTS.md` and `docs/optimizing-tier.txt` for its limits and
+the retained negative application results.

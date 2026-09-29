@@ -47,6 +47,8 @@ default = ["mimalloc"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Synthetic engine benchmark harness; omitted from ordinary browser builds.
 lumen-spike = []
+# Opt-in operation/lifetime accounting; never use this build for acceptance timing.
+architecture-diagnostics = ["lumen/architecture-diagnostics"]
 
 [dependencies]
 accesskit = "0.24.1"

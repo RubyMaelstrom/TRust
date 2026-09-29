@@ -299,6 +299,40 @@ impl BoxStyle {
         let u = Units::of(dom, id);
         let tag = dom.tag_name(id).unwrap_or("");
         let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
+        let context = crate::dom::BoxContext {
+            dimensions: [
+                u.fs,
+                u.root,
+                u.ch,
+                vp.w,
+                vp.h,
+                ua_margin[0],
+                ua_margin[1],
+                ua_margin[2],
+                ua_margin[3],
+                ua_padding[0],
+                ua_padding[1],
+                ua_padding[2],
+                ua_padding[3],
+            ]
+            .map(f32::to_bits),
+            document_element: dom.is_document_element(id),
+            display: dom.computed_display(id),
+        };
+        dom.retained_box_style(id, context, || {
+            Self::of_uncached(dom, id, vp, u, tag, ua_margin, ua_padding)
+        })
+    }
+
+    fn of_uncached(
+        dom: &Dom,
+        id: NodeId,
+        vp: Vp,
+        u: Units,
+        tag: &str,
+        ua_margin: [f32; 4],
+        ua_padding: [f32; 4],
+    ) -> BoxStyle {
         let transform = super::transform::Transform::parse(
             |property| dom.computed_value_resolved(id, property),
             u,
@@ -974,6 +1008,21 @@ impl InlineStyle {
 
     /// The context inside element `id`, derived from the parent's.
     pub fn derive(dom: &Dom, id: NodeId, parent: &InlineStyle, base: &Url) -> InlineStyle {
+        dom.retained_inline_style(id, parent, base, || {
+            Self::derive_uncached(dom, id, parent, base)
+        })
+    }
+
+    pub(crate) fn retained_text_bytes(&self) -> usize {
+        self.font_family.capacity()
+            + self.language.as_ref().map_or(0, String::capacity)
+            + self
+                .link
+                .as_ref()
+                .map_or(0, |link| link.retained_memory().0)
+    }
+
+    fn derive_uncached(dom: &Dom, id: NodeId, parent: &InlineStyle, base: &Url) -> InlineStyle {
         let u = Units::of(dom, id);
         let mut s = parent.clone();
         s.node = id;

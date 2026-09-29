@@ -119,7 +119,7 @@ impl Key {
     }
 }
 
-pub(super) fn box_style_bytes(s: &super::style::BoxStyle) -> usize {
+pub(crate) fn box_style_bytes(s: &super::style::BoxStyle) -> usize {
     s.margin
         .iter()
         .chain(&s.padding)

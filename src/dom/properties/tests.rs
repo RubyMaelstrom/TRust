@@ -441,6 +441,88 @@ fn registered_frames_have_separate_registries_and_reset_on_navigation() {
     );
 }
 
+// DOM a2331a45 #concept-node-document / #concept-node-adopt; CSS Properties &
+// Values 954df531 #determining-registration / #shadow-dom. Registration follows
+// the node document even when presentation links place a Document below an iframe.
+#[test]
+fn registration_uses_node_document_through_fallback_shadow_adoption_and_navigation() {
+    let mut dom = Dom::parse_document("<iframe id=f></iframe>");
+    let frame = dom.get_by_id("f").unwrap();
+    dom.install_frame_document(
+        frame,
+        "<div id=child><section id=host></section></div>",
+        "https://child.test/",
+    )
+    .unwrap();
+    let child_document = dom.frame_document(frame).unwrap();
+    let child = dom.get_by_id("child").unwrap();
+    let host = dom.get_by_id("host").unwrap();
+    let shadow = dom.attach_shadow(host);
+    let shadow_child = dom.create_element("span");
+    dom.append(shadow, shadow_child);
+    let fallback = dom.create_element("div");
+    dom.append(frame, fallback);
+    let other_document = dom.create_document("text/html");
+    for (document, value) in [
+        (DOCUMENT, "1"),
+        (child_document, "2"),
+        (other_document, "3"),
+    ] {
+        dom.register_property(
+            document,
+            "--identity",
+            "<number>",
+            false,
+            Some(value.into()),
+            None,
+        )
+        .unwrap();
+    }
+    let check = |dom: &Dom, node, document, expected| {
+        assert_eq!(dom.owner_document(node), Some(document));
+        assert_eq!(dom.registration_document(node), document);
+        assert_eq!(
+            dom.custom_prop(node, "--identity").as_deref(),
+            Some(expected)
+        );
+    };
+    check(&dom, frame, DOCUMENT, "1");
+    check(&dom, fallback, DOCUMENT, "1");
+    check(&dom, child, child_document, "2");
+    check(&dom, shadow_child, child_document, "2");
+
+    dom.detach(host);
+    check(&dom, shadow_child, child_document, "2");
+    dom.adopt_node(other_document, host).unwrap();
+    check(&dom, shadow_child, other_document, "3");
+    dom.adopt_node(other_document, frame).unwrap();
+    check(&dom, frame, other_document, "3");
+    check(&dom, fallback, other_document, "3");
+    check(&dom, child, child_document, "2");
+
+    let next_body = dom
+        .install_frame_document(frame, "<p id=next></p>", "https://child.test/next")
+        .unwrap();
+    let next = dom
+        .descendants(next_body)
+        .find(|&node| dom.attr(node, "id") == Some("next"))
+        .unwrap();
+    let next_document = dom.frame_document(frame).unwrap();
+    dom.register_property(
+        next_document,
+        "--identity",
+        "<number>",
+        false,
+        Some("4".into()),
+        None,
+    )
+    .unwrap();
+    check(&dom, next, next_document, "4");
+    check(&dom, child, child_document, "2");
+    check(&dom, shadow_child, other_document, "3");
+    check(&dom, fallback, other_document, "3");
+}
+
 #[test]
 fn registered_numeric_ranges_preserve_valid_calculations() {
     for (syntax, value, expected) in [

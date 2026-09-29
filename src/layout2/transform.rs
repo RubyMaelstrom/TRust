@@ -23,7 +23,7 @@ enum Operation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Transform {
+pub(crate) struct Transform {
     operations: Vec<Operation>,
     origin: [Len; 2],
     content_box: bool,

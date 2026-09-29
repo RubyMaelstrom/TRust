@@ -3,17 +3,123 @@
 //! Cache pure selector matches independently from the cascade and container
 //! conditions. Attribute writes invalidate the selector subjects reachable
 //! through compiled dependency paths, not every element merely because the
-//! DOM revision changed. Cross-shadow and untracked state associations retain
-//! an explicit full fallback; optional cache budgets never truncate content.
+//! DOM revision changed. Dependency proofs are owned by a Document, including
+//! its shadow trees, rather than the whole presentation arena. Cross-shadow
+//! and untracked state associations retain an explicit full fallback;
+//! optional cache budgets never truncate content.
 
 use super::*;
 
 mod attributes;
 
+/// CSSOM #dom-window-getcomputedstyle requires current, live values at reads;
+/// it does not require retiring derived cache entries after every write.
+/// Keep only stable node IDs and flush before any style/layout observation.
+#[derive(Clone, Default)]
+pub(super) struct Pending {
+    dirty: std::cell::Cell<bool>,
+    roots: RefCell<FxHashMap<NodeId, bool>>,
+    #[cfg(test)]
+    flushes: std::cell::Cell<usize>,
+    #[cfg(test)]
+    visited: std::cell::Cell<usize>,
+}
+
+impl Pending {
+    pub(super) fn retain_nodes(&mut self, live: impl Fn(NodeId) -> bool) {
+        self.roots.get_mut().retain(|&node, _| live(node));
+        self.dirty.set(!self.roots.get_mut().is_empty());
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.roots.borrow().capacity() * std::mem::size_of::<(NodeId, bool)>()
+    }
+}
+
+fn deferred_invalidation_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_DEFER_STYLE_INVALIDATION").as_deref() != Ok("0"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Impact {
     Element,
     SiblingSubtrees,
+}
+
+/// DOM #concept-node-document / #concept-document-tree, Selectors 4
+/// #match-against-tree and CSS Cascade 5 #filtering (local CSSWG 81c27f68,
+/// DOM a2331a45). Child navigables share storage, not selector dependencies.
+///
+/// Shadow rules remain in their owning Document's dependency union: :host,
+/// ::slotted(), inherited state and slot distribution can cross shadow roots.
+/// Actual rule matching remains tree-scoped. A detached node conservatively
+/// uses its node Document's proof; adoption updates that identity atomically.
+#[derive(Default)]
+pub(super) struct SelectorDependencyIndex {
+    documents: FxHashMap<NodeId, std::rc::Rc<SelectorDependencies>>,
+    empty: SelectorDependencies,
+}
+
+impl SelectorDependencyIndex {
+    pub(super) fn build(dom: &Dom, scopes: &FxHashMap<NodeId, Vec<StyleRule>>) -> Self {
+        let mut result = Self::default();
+        let mut documents = FxHashMap::<NodeId, Vec<&StyleRule>>::default();
+        for (&scope, rules) in scopes {
+            if !rules.is_empty() {
+                documents
+                    .entry(dom.nodes[scope].owner_document)
+                    .or_default()
+                    .extend(rules);
+            }
+        }
+        let mut shared =
+            FxHashMap::<Vec<*const StyleRuleData>, std::rc::Rc<SelectorDependencies>>::default();
+        for (document, mut rules) in documents {
+            // Source order does not affect a dependency union. Identity is
+            // safe here because the complete rule set remains Rc-owned by
+            // this immutable StyleIndex throughout construction and use.
+            rules.sort_unstable_by_key(|rule| std::rc::Rc::as_ptr(&rule.data));
+            rules.dedup_by(|a, b| std::rc::Rc::ptr_eq(&a.data, &b.data));
+            let key = rules
+                .iter()
+                .map(|rule| std::rc::Rc::as_ptr(&rule.data))
+                .collect();
+            // Compare the complete identity vector, never just its hash.
+            // Shared sheets contribute in EVERY Document without duplicating
+            // a potentially large compiled graph for identical rule sets.
+            let dependencies = shared.entry(key).or_insert_with(|| {
+                let mut dependencies = SelectorDependencies::default();
+                for rule in rules {
+                    dependencies.record(rule);
+                }
+                std::rc::Rc::new(dependencies)
+            });
+            result.documents.insert(document, dependencies.clone());
+        }
+        result
+    }
+
+    fn for_node(&self, dom: &Dom, node: NodeId) -> &SelectorDependencies {
+        self.documents
+            .get(&dom.nodes[node].owner_document)
+            .map(std::rc::Rc::as_ref)
+            .unwrap_or(&self.empty)
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        let mut seen = FxHashSet::default();
+        self.documents.capacity()
+            * std::mem::size_of::<(NodeId, std::rc::Rc<SelectorDependencies>)>()
+            + self
+                .documents
+                .values()
+                .filter(|dependencies| seen.insert(std::rc::Rc::as_ptr(dependencies)))
+                .map(|dependencies| {
+                    std::mem::size_of::<SelectorDependencies>() + dependencies.retained_bytes()
+                })
+                .sum::<usize>()
+    }
 }
 
 #[derive(Default)]
@@ -258,14 +364,10 @@ impl RelationalDependency {
 }
 
 impl SelectorDependencies {
-    pub(super) fn build<'a>(rules: impl Iterator<Item = &'a StyleRule>) -> Self {
-        let mut result = Self::default();
-        for rule in rules {
-            result.attributes.record(&rule.selector);
-            result.complex(&rule.selector);
-            result.record_structure(&rule.selector, &[], Impact::Element);
-        }
-        result
+    fn record(&mut self, rule: &StyleRule) {
+        self.attributes.record(&rule.selector);
+        self.complex(&rule.selector);
+        self.record_structure(&rule.selector, &[], Impact::Element);
     }
 
     /// Selectors 4 #child-index / #the-empty-pseudo / sibling combinators.
@@ -491,7 +593,12 @@ impl Dom {
             return false;
         }
         let root = |mut id| {
-            while let Some(parent) = self.parent_composed(id) {
+            // A Document's arena parent is only a presentation edge to its
+            // iframe. DOM's shadow-including root never traverses that edge.
+            while !matches!(self.nodes[id].data, NodeData::Document) {
+                let Some(parent) = self.parent_composed(id) else {
+                    break;
+                };
                 id = parent;
             }
             id
@@ -530,6 +637,7 @@ impl Dom {
             match cache.as_ref() {
                 Some((epoch, index)) if *epoch == self.style_epoch => index
                     .selector_dependencies
+                    .for_node(self, node)
                     .attributes
                     .subjects(self, node, name, old_class),
                 // No current rule index: no proof of independence.
@@ -557,6 +665,8 @@ impl Dom {
 
     #[track_caller]
     pub(super) fn invalidate_all_style_values(&mut self) {
+        #[cfg(feature = "architecture-diagnostics")]
+        super::architecture_diagnostics::invalidate(None);
         if casc_diag_on() {
             eprintln!(
                 "DIAGINVALID all-styles caller={}",
@@ -654,22 +764,91 @@ impl Dom {
         self.invalidate_style_subtrees(&[root], selectors);
     }
 
+    /// DOM #concept-node-replace-all removes a forest without routing each
+    /// child through detach(). Preserve those old roots before links change;
+    /// a later walk of only the parent cannot find its departed descendants.
+    pub(super) fn invalidate_detaching_children(&mut self, parent: NodeId) {
+        self.invalidate_style_subtree(parent, true);
+        if deferred_invalidation_enabled() {
+            let mut next = self.nodes[parent].first_child;
+            while let Some(child) = next {
+                next = self.nodes[child].next_sibling;
+                self.invalidate_style_subtree(child, true);
+            }
+        }
+    }
+
     fn invalidate_style_subtrees(&mut self, roots: &[NodeId], selectors: bool) {
+        if deferred_invalidation_enabled() {
+            let pending = &mut self.pending_style_invalidations;
+            for &root in roots {
+                *pending.roots.get_mut().entry(root).or_default() |= selectors;
+            }
+            pending.dirty.set(!pending.roots.get_mut().is_empty());
+        } else {
+            self.apply_style_invalidations(roots.iter().map(|&root| (root, selectors)));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn flush_style_invalidations(&self) {
+        if self.pending_style_invalidations.dirty.get() {
+            self.flush_style_invalidations_slow();
+        }
+    }
+
+    #[cold]
+    fn flush_style_invalidations_slow(&self) {
+        let pending = &self.pending_style_invalidations;
+        if !pending.dirty.replace(false) {
+            return;
+        }
+        let mut roots = std::mem::take(&mut *pending.roots.borrow_mut());
+        #[cfg(test)]
+        pending.flushes.set(pending.flushes.get() + 1);
+        self.apply_style_invalidations(roots.drain());
+        // Reuse bounded queue storage; no node owner or GC root is retained.
+        *pending.roots.borrow_mut() = roots;
+    }
+
+    fn apply_style_invalidations(&self, roots: impl IntoIterator<Item = (NodeId, bool)>) {
         // Even an own-element selector/inline style can change inherited
         // computed values, custom properties, link context or font metrics.
         // Coalesce overlapping subjects before visiting descendants. In
         // particular `:has()` can return an ancestor AND its descendants;
         // repeatedly walking each subtree would make one mutation quadratic.
-        let mut seen = FxHashSet::default();
-        let mut pending = roots.to_vec();
+        let mut seen = FxHashMap::<NodeId, bool>::default();
+        let mut pending: Vec<_> = roots.into_iter().collect();
+        let roots: Vec<_> = pending.iter().map(|&(node, _)| node).collect();
+        let selectors = pending.iter().any(|&(_, selectors)| selectors);
         let mut affected = Vec::new();
-        while let Some(node) = pending.pop() {
-            if seen.insert(node) {
-                affected.push(node);
-                pending.extend(self.child_iter(node));
+        while let Some((node, selectors)) = pending.pop() {
+            if self.nodes.get(node).is_none() {
+                continue;
             }
+            match seen.entry(node) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(selectors);
+                    affected.push(node);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if !selectors || *entry.get() {
+                        continue;
+                    }
+                    // A selector-dirty descendant can overlap an inherited-
+                    // value-only ancestor; propagate the stronger proof once.
+                    *entry.get_mut() = true;
+                }
+            }
+            pending.extend(self.child_iter(node).map(|child| (child, selectors)));
         }
+        #[cfg(test)]
+        self.pending_style_invalidations
+            .visited
+            .set(self.pending_style_invalidations.visited.get() + affected.len());
         let mut resource_roots = self.svg_dirty_consumers(&affected, selectors);
+        #[cfg(feature = "architecture-diagnostics")]
+        super::architecture_diagnostics::invalidate(Some(affected.len()));
         if casc_diag_on() && affected.len() > 256 {
             eprintln!(
                 "DIAGINVALID subtrees roots={} selectors={selectors} count={}",
@@ -679,33 +858,35 @@ impl Dom {
         }
         // Ownership is by node. Retirement visits only populated values;
         // neither the document nor the entire property registry is scanned.
-        let computed = &mut self.computed_cache.get_mut().1;
-        for &id in &affected {
-            computed.remove_node(id);
+        {
+            let mut computed = self.computed_cache.borrow_mut();
+            for &id in &affected {
+                computed.1.remove_node(id);
+            }
         }
         if affected
             .iter()
             .any(|&id| matches!(self.tag_name(id), Some("meta" | "base")))
         {
-            self.layout_cache.get_mut().clear();
-            self.box_tree_cache.get_mut().clear();
+            self.layout_cache.borrow_mut().clear();
+            self.box_tree_cache.borrow_mut().clear();
         }
         for id in affected {
             self.transitions.invalidate(id);
-            if selectors {
-                self.selector_cache.get_mut().invalidate(id);
+            if seen[&id] {
+                self.selector_cache.borrow_mut().invalidate(id);
             }
-            self.custom_prop_cache.get_mut().1.remove(&id);
+            self.custom_prop_cache.borrow_mut().1.remove(&id);
             self.properties.invalidate(id);
-            self.matched_cache.get_mut().invalidate(id);
-            self.cascaded_cache.get_mut().invalidate(id);
-            self.font_cache.get_mut().invalidate(id);
-            self.font_units_cache.get_mut().invalidate(id);
-            self.decoration_cache.get_mut().invalidate(id);
-            self.layout_cache.get_mut().invalidate(id);
-            self.box_tree_cache.get_mut().invalidate(id);
+            self.matched_cache.borrow_mut().invalidate(id);
+            self.cascaded_cache.borrow_mut().invalidate(id);
+            self.font_cache.borrow_mut().invalidate(id);
+            self.font_units_cache.borrow_mut().invalidate(id);
+            self.decoration_cache.borrow_mut().invalidate(id);
+            self.layout_cache.borrow_mut().invalidate(id);
+            self.box_tree_cache.borrow_mut().invalidate(id);
         }
-        resource_roots.extend_from_slice(roots);
+        resource_roots.extend_from_slice(&roots);
         self.invalidate_layout_paths(resource_roots);
     }
 
@@ -717,17 +898,18 @@ impl Dom {
             .then(|| {
                 let index = self.style_cache.borrow();
                 index.as_ref().and_then(|(epoch, index)| {
+                    let dependencies = index.selector_dependencies.for_node(self, parent);
                     (*epoch == self.style_epoch
-                        && !index.selector_dependencies.structure_global
-                        && !index.selector_dependencies.relational.iter().any(|dependency| {
+                        && !dependencies.structure_global
+                        && !dependencies.relational.iter().any(|dependency| {
                             dependency.may_affect(self, parent, true)
                         })
                         // Selectors 4 #the-dir-pseudo / HTML directionality:
                         // only an automatic-direction ancestor can acquire a
                         // different direction when its descendants change.
-                        && !(index.selector_dependencies.text_direction
+                        && !(dependencies.text_direction
                             && self.text_may_change_direction(parent)))
-                    .then(|| index.selector_dependencies.structure_impact(self, parent))
+                    .then(|| dependencies.structure_impact(self, parent))
                 })
             })
             .flatten();
@@ -739,17 +921,18 @@ impl Dom {
                     self.tag_name(parent),
                     self.attr(parent, "id"),
                     self.shadow_style_dependencies(parent),
-                    index.as_ref().map(|(epoch, index)| (
-                        *epoch == self.style_epoch,
-                        index.selector_dependencies.structure_global,
-                        index
-                            .selector_dependencies
-                            .relational
-                            .iter()
-                            .any(|d| d.may_affect(self, parent, true)),
-                        index.selector_dependencies.text_direction
-                            && self.text_may_change_direction(parent)
-                    ))
+                    index.as_ref().map(|(epoch, index)| {
+                        let dependencies = index.selector_dependencies.for_node(self, parent);
+                        (
+                            *epoch == self.style_epoch,
+                            dependencies.structure_global,
+                            dependencies
+                                .relational
+                                .iter()
+                                .any(|d| d.may_affect(self, parent, true)),
+                            dependencies.text_direction && self.text_may_change_direction(parent),
+                        )
+                    })
                 );
             }
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
@@ -803,7 +986,11 @@ impl Dom {
                 .borrow()
                 .as_ref()
                 .is_some_and(|(epoch, index)| {
-                    *epoch == self.style_epoch && !index.selector_dependencies.text_placeholder
+                    *epoch == self.style_epoch
+                        && !index
+                            .selector_dependencies
+                            .for_node(self, node)
+                            .text_placeholder
                 });
         if !independent {
             // Placeholder state must invalidate its selector subjects, even
@@ -833,13 +1020,13 @@ impl Dom {
         let independent = (!self.shadow_style_dependencies(parent) || stable_shadow_text) && {
             let index = self.style_cache.borrow();
             index.as_ref().is_some_and(|(epoch, index)| {
+                let dependencies = index.selector_dependencies.for_node(self, parent);
                 *epoch == self.style_epoch
                     && !(direction_changed
-                        && index.selector_dependencies.text_direction
+                        && dependencies.text_direction
                         && self.text_may_change_direction(parent))
-                    && !(index.selector_dependencies.text_placeholder
-                        && self.tag_name(parent) == Some("textarea"))
-                    && !(empty_changed && index.selector_dependencies.empty)
+                    && !(dependencies.text_placeholder && self.tag_name(parent) == Some("textarea"))
+                    && !(empty_changed && dependencies.empty)
             })
         };
         if !independent {
@@ -890,6 +1077,118 @@ impl Dom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_styles_coalesce_writes_and_keep_live_inherited_reads() {
+        let mut dom = Dom::parse_document(&format!(
+            "<style>#root {{color:red}} #stable {{color:blue}}</style><body><div id=root>{}</div><aside id=stable>other</aside>",
+            "<span>text</span>".repeat(200)
+        ));
+        let root = dom.get_by_id("root").unwrap();
+        let stable = dom.get_by_id("stable").unwrap();
+        let leaf = dom.child_iter(root).next().unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("red")
+        );
+        let retained = dom.cascaded_maps(stable);
+        let before = dom.pending_style_invalidations.flushes.get();
+        let visited = dom.pending_style_invalidations.visited.get();
+        for n in 0..100 {
+            dom.set_attr(root, "style", &format!("color:green;width:{n}px"));
+        }
+        if deferred_invalidation_enabled() {
+            assert_eq!(dom.pending_style_invalidations.flushes.get(), before);
+            assert_eq!(dom.pending_style_invalidations.visited.get(), visited);
+        }
+        assert_eq!(
+            dom.computed_value_resolved(root, "width").as_deref(),
+            Some("99px")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("green")
+        );
+        if deferred_invalidation_enabled() {
+            assert_eq!(dom.pending_style_invalidations.flushes.get(), before + 1);
+            assert!(dom.pending_style_invalidations.visited.get() - visited <= 401);
+        }
+        assert!(std::rc::Rc::ptr_eq(&retained, &dom.cascaded_maps(stable)));
+        dom.set_attr(root, "style", "color:purple");
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("purple")
+        );
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn deferred_styles_replace_all_preserves_departing_subtree_invalidation() {
+        let mut dom = Dom::parse_document(
+            "<style>#parent article span{height:41px}</style><div id=parent><article id=old><span id=leaf>kept identity</span></article></div>",
+        );
+        let parent = dom.get_by_id("parent").unwrap();
+        let old = dom.get_by_id("old").unwrap();
+        let leaf = dom.get_by_id("leaf").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "height").as_deref(),
+            Some("41px")
+        );
+        dom.replace_all_children(parent, Vec::new());
+        assert_eq!(dom.nodes[old].parent, None);
+        assert_eq!(dom.nodes[leaf].parent, Some(old));
+        assert_ne!(
+            dom.computed_value_resolved(leaf, "height").as_deref(),
+            Some("41px")
+        );
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn deferred_styles_follow_moves_and_overlapping_selector_and_inheritance_changes() {
+        let mut dom = Dom::parse_document(
+            "<style>#left{--c:red} #right{--c:blue} span{color:var(--c)} .flag{font-size:30px} span:nth-child(2){height:9px}</style><body><div id=left><span id=a>A</span><span id=b>B</span></div><div id=right><span id=c>C</span></div></body>",
+        );
+        let left = dom.get_by_id("left").unwrap();
+        let right = dom.get_by_id("right").unwrap();
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        let c = dom.get_by_id("c").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(a, "color").as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(b, "height").as_deref(),
+            Some("9px")
+        );
+        dom.set_attr(left, "style", "--c:green");
+        dom.set_attr(a, "class", "flag");
+        dom.append(right, a);
+        dom.append(left, c);
+        assert_eq!(
+            dom.computed_value_resolved(a, "color").as_deref(),
+            Some("blue")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(c, "color").as_deref(),
+            Some("green")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(a, "font-size").as_deref(),
+            Some("30px")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(c, "height").as_deref(),
+            Some("9px")
+        );
+        assert_ne!(
+            dom.computed_value_resolved(b, "height").as_deref(),
+            Some("9px")
+        );
+        assert_style_values_match_cold(&mut dom);
+    }
 
     fn assert_style_values_match_cold(dom: &mut Dom) {
         let properties = [
@@ -1091,6 +1390,281 @@ mod tests {
         let body = dom.get_by_id("body").unwrap();
         dom.append(body, measure);
         dom.detach(measure);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn document_dependencies_do_not_restyle_unrelated_frame_construction() {
+        // DOM #concept-document-tree; Selectors 4 #match-against-tree;
+        // CSS Cascade 5 #filtering. An arena presentation edge from a child
+        // Document to its iframe is not a CSS selector/inheritance edge.
+        let mut dom = Dom::parse_document(
+            "<style>:lang(fr){color:red} #outer{color:green}</style>\
+             <body><main id=outer>outer</main><iframe id=frame></iframe></body>",
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            "<style>#stable{color:blue}</style><body><main id=stable>stable</main>\
+             <section id=changing></section></body>",
+            "https://frame.test/",
+        )
+        .unwrap();
+        let find = |name| {
+            dom.descendants(frame)
+                .find(|&id| dom.attr(id, "id") == Some(name))
+                .unwrap()
+        };
+        let (stable, changing) = (find("stable"), find("changing"));
+        let outer = dom.get_by_id("outer").unwrap();
+        let child = dom.create_element("span");
+        dom.set_text(child, "new");
+        for append in [true, false, true] {
+            let retained_outer = dom.cascaded_maps(outer);
+            let retained_child = dom.cascaded_maps(stable);
+            if append {
+                dom.append(changing, child);
+            } else {
+                dom.detach(child);
+            }
+            assert!(std::rc::Rc::ptr_eq(
+                &retained_outer,
+                &dom.cascaded_maps(outer)
+            ));
+            assert!(std::rc::Rc::ptr_eq(
+                &retained_child,
+                &dom.cascaded_maps(stable)
+            ));
+            assert_eq!(dom.computed_value(outer, "color").as_deref(), Some("green"));
+            assert_eq!(dom.computed_value(stable, "color").as_deref(), Some("blue"));
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn document_attribute_dependencies_preserve_other_documents_and_live_matches() {
+        let mut dom = Dom::parse_document(
+            "<style>input:indeterminate{width:77px} #outer{color:green}</style>\
+             <body><main id=outer>outer</main><iframe id=frame></iframe></body>",
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            "<style>input{width:11px} input:checked{width:29px}</style>\
+             <body><input id=changing type=checkbox><main id=stable>stable</main></body>",
+            "https://frame.test/",
+        )
+        .unwrap();
+        let find = |name| {
+            dom.descendants(frame)
+                .find(|&id| dom.attr(id, "id") == Some(name))
+                .unwrap()
+        };
+        let (changing, stable) = (find("changing"), find("stable"));
+        let outer = dom.get_by_id("outer").unwrap();
+        for checked in [true, false, true] {
+            let retained_outer = dom.cascaded_maps(outer);
+            let retained_child = dom.cascaded_maps(stable);
+            if checked {
+                dom.set_attr(changing, "checked", "");
+            } else {
+                dom.remove_attr(changing, "checked");
+            }
+            assert!(std::rc::Rc::ptr_eq(
+                &retained_outer,
+                &dom.cascaded_maps(outer)
+            ));
+            assert!(std::rc::Rc::ptr_eq(
+                &retained_child,
+                &dom.cascaded_maps(stable)
+            ));
+            assert_eq!(
+                dom.computed_value(changing, "width").as_deref(),
+                Some(if checked { "29px" } else { "11px" })
+            );
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn shared_sheet_parses_contribute_dependencies_to_every_document() {
+        let mut dom =
+            Dom::parse_document("<body><iframe id=left></iframe><iframe id=right></iframe></body>");
+        let frames = [
+            dom.get_by_id("left").unwrap(),
+            dom.get_by_id("right").unwrap(),
+        ];
+        let html = "<style>.panel{height:11px}.panel:has(.flag){height:29px}</style>\
+                    <body><main class=panel><span></span></main></body>";
+        for &frame in &frames {
+            dom.install_frame_document(frame, html, "https://frame.test/")
+                .unwrap();
+        }
+        let documents = frames.map(|frame| dom.frame_document(frame).unwrap());
+        let panels = frames.map(|frame| {
+            dom.child_iter(dom.frame_body(frame).unwrap())
+                .next()
+                .unwrap()
+        });
+        let leaves = panels.map(|panel| dom.child_iter(panel).next().unwrap());
+        let index = dom.style_index();
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &index.scopes[&documents[0]][0].data,
+                &index.scopes[&documents[1]][0].data,
+            ),
+            "fixture must exercise one immutable parse shared by two Documents"
+        );
+        assert_eq!(index.selector_dependencies.documents.len(), 2);
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &index.selector_dependencies.documents[&documents[0]],
+                &index.selector_dependencies.documents[&documents[1]],
+            ),
+            "identical per-Document rule sets share one compiled dependency graph"
+        );
+        for changed in [0, 1] {
+            let retained = dom.cascaded_maps(panels[1 - changed]);
+            dom.set_attr(leaves[changed], "class", "flag");
+            assert_eq!(
+                dom.computed_value(panels[changed], "height").as_deref(),
+                Some("29px")
+            );
+            assert!(std::rc::Rc::ptr_eq(
+                &retained,
+                &dom.cascaded_maps(panels[1 - changed])
+            ));
+            assert_style_values_match_cold(&mut dom);
+            dom.remove_attr(leaves[changed], "class");
+            assert_eq!(
+                dom.computed_value(panels[changed], "height").as_deref(),
+                Some("11px")
+            );
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn document_dependency_proofs_follow_stylesheet_replacement() {
+        // HTML's "update a style block" removes the old sheet before installing
+        // the new one. A retained per-Document proof must never outlive that
+        // rule-set change, including newly introduced relational dependencies.
+        let mut dom = Dom::parse_document("<body><iframe id=frame></iframe></body>");
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            "<style>section{height:3px}</style><body><section></section></body>",
+            "https://frame.test/",
+        )
+        .unwrap();
+        let sheet = dom
+            .descendants(frame)
+            .find(|&id| dom.tag_name(id) == Some("style"))
+            .unwrap();
+        let section = dom
+            .child_iter(dom.frame_body(frame).unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(
+            dom.computed_value(section, "height").as_deref(),
+            Some("3px")
+        );
+        for height in [11, 17] {
+            dom.set_text(
+                sheet,
+                &format!(
+                    "section{{height:3px}} section:empty{{height:{height}px}} \
+                 section:has(> em){{height:29px}}"
+                ),
+            );
+            assert_eq!(
+                dom.computed_value(section, "height").as_deref(),
+                Some(format!("{height}px").as_str())
+            );
+            let child = dom.create_element("em");
+            dom.append(section, child);
+            assert_eq!(
+                dom.computed_value(section, "height").as_deref(),
+                Some("29px")
+            );
+            assert_style_values_match_cold(&mut dom);
+            dom.detach(child);
+            assert_eq!(
+                dom.computed_value(section, "height").as_deref(),
+                Some(format!("{height}px").as_str())
+            );
+            assert_style_values_match_cold(&mut dom);
+        }
+    }
+
+    #[test]
+    fn shadow_dependencies_stop_at_document_roots_and_follow_adoption() {
+        let mut dom = Dom::parse_document(
+            "<body><main id=outer>outer</main><iframe id=left></iframe>\
+             <iframe id=right></iframe></body>",
+        );
+        let (left, right) = (
+            dom.get_by_id("left").unwrap(),
+            dom.get_by_id("right").unwrap(),
+        );
+        for (frame, color) in [(left, "red"), (right, "blue")] {
+            dom.install_frame_document(
+                frame,
+                &format!(
+                    "<body style='color:{color}'><main>stable</main><section></section></body>"
+                ),
+                "https://frame.test/",
+            )
+            .unwrap();
+        }
+        let (left_body, right_body) = (
+            dom.frame_body(left).unwrap(),
+            dom.frame_body(right).unwrap(),
+        );
+        let host = dom.create_element("x-host");
+        dom.append(left_body, host);
+        let shadow = dom.attach_shadow(host);
+        let leaf = dom.create_element("span");
+        dom.append(shadow, leaf);
+        let outer = dom.get_by_id("outer").unwrap();
+        let stable = dom.child_iter(right_body).next().unwrap();
+        let changing = dom.child_iter(right_body).nth(1).unwrap();
+        assert!(dom.shadow_style_dependencies(leaf));
+        assert!(dom.shadow_style_dependencies(left_body));
+        assert!(!dom.shadow_style_dependencies(right_body));
+        assert!(!dom.shadow_style_dependencies(outer));
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("red")
+        );
+
+        let probe = dom.create_element("span");
+        let retained_outer = dom.cascaded_maps(outer);
+        let retained_child = dom.cascaded_maps(stable);
+        dom.append(changing, probe);
+        assert!(std::rc::Rc::ptr_eq(
+            &retained_outer,
+            &dom.cascaded_maps(outer)
+        ));
+        assert!(std::rc::Rc::ptr_eq(
+            &retained_child,
+            &dom.cascaded_maps(stable)
+        ));
+        assert_style_values_match_cold(&mut dom);
+
+        dom.append(right_body, host);
+        assert_eq!(dom.owner_document(leaf), dom.frame_document(right));
+        assert!(!dom.shadow_style_dependencies(left_body));
+        assert!(dom.shadow_style_dependencies(right_body));
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("blue")
+        );
+        dom.set_attr(host, "style", "color:purple");
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "color").as_deref(),
+            Some("purple")
+        );
         assert_style_values_match_cold(&mut dom);
     }
 

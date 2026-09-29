@@ -75,6 +75,8 @@ mod tree_cache;
 pub(crate) mod value;
 
 pub(crate) use memo::LayoutCache;
+pub(crate) use memo::box_style_bytes;
+pub(crate) use style::{BoxStyle, InlineStyle};
 pub(crate) use tree_cache::BoxTreeCache;
 
 pub(crate) fn container_query_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
