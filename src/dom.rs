@@ -2404,32 +2404,16 @@ impl Dom {
     /// `data-trust-scroll-top` so the app's `flow_region` can re-seed the
     /// region's scroll offset across the per-message re-parse.
     pub fn is_scroll_container(&self, id: NodeId) -> bool {
-        let v = match self.computed_style(id, "overflow-y") {
-            Some(v) => v,
-            None => match self.computed_style(id, "overflow") {
-                // shorthand `overflow: x [y]` — the y component defaults to x.
-                Some(sh) => {
-                    let mut toks = sh.split_whitespace();
-                    let x = toks.next().unwrap_or("");
-                    toks.next().unwrap_or(x).to_string()
-                }
-                None => return false,
-            },
-        };
-        matches!(v.trim().to_ascii_lowercase().as_str(), "auto" | "scroll")
+        // CSS Overflow 3 #overflow-control: visible computes to auto when
+        // the other axis has a scrollable value (including hidden). Use the
+        // same resolved axes as CSSOM geometry and graphical scrollports.
+        crate::layout2::Overflow::axes(|p| self.computed_value_resolved(id, p))[1].user_scrollable()
     }
 
     /// A horizontal scroll container (`overflow-x: auto|scroll`) — the strip
     /// axis of a carousel.
     pub fn is_hscroll_container(&self, id: NodeId) -> bool {
-        let v = match self.computed_style(id, "overflow-x") {
-            Some(v) => v,
-            None => match self.computed_style(id, "overflow") {
-                Some(sh) => sh.split_whitespace().next().unwrap_or("").to_string(),
-                None => return false,
-            },
-        };
-        matches!(v.trim().to_ascii_lowercase().as_str(), "auto" | "scroll")
+        crate::layout2::Overflow::axes(|p| self.computed_value_resolved(id, p))[0].user_scrollable()
     }
 
     /// Whether this element clips its overflow on the BLOCK (vertical) axis —
@@ -2439,18 +2423,10 @@ impl Dom {
     /// on the block axis only: the ubiquitous `overflow-x:hidden` "no sideways
     /// scrollbar" trick must NOT read as a locked viewport.
     fn clips_block_axis(&self, id: NodeId) -> bool {
-        let v = match self.computed_style(id, "overflow-y") {
-            Some(v) => v,
-            None => match self.computed_style(id, "overflow") {
-                Some(sh) => {
-                    let mut toks = sh.split_whitespace();
-                    let x = toks.next().unwrap_or("");
-                    toks.next().unwrap_or(x).to_string()
-                }
-                None => return false,
-            },
-        };
-        matches!(v.trim().to_ascii_lowercase().as_str(), "hidden" | "clip")
+        matches!(
+            crate::layout2::Overflow::axes(|p| self.computed_value_resolved(id, p))[1],
+            crate::layout2::Overflow::Hidden | crate::layout2::Overflow::Clip
+        )
     }
 
     /// Whether `id` is the page's PRINCIPAL scroll container — the one a LOCKED
@@ -2467,13 +2443,12 @@ impl Dom {
     /// sectioning landmarks (`<main>` is the dominant content, `<nav>`/`<aside>`
     /// are complementary) — never the host.
     ///
-    /// ONE upward walk from `id` to the root: a scroll-container ancestor ⇒ `id`
+    /// An upward walk from `id` to the root: a scroll-container ancestor ⇒ `id`
     /// is NESTED ⇒ not principal (a real inner region); the nearest sectioning
     /// landmark above `id` decides main-flow (`<main>`) vs a complementary
     /// sidebar (`<nav>`/`<aside>`, stays a plain region); and the viewport must
-    /// be block-axis LOCKED. Principal ⇔ locked AND (inside `<main>` OR the page
-    /// declares no enclosing landmark at all, i.e. this outermost scroller
-    /// carries the flow). Shared by both layout engines.
+    /// be block-axis LOCKED. The outermost scroller carrying `<main>`, or the
+    /// sole content spine of a landmark-less shell, is the page scroller.
     pub fn is_principal_scroller(&self, id: NodeId) -> bool {
         if !self.is_scroll_container(id) {
             return false;
@@ -2502,7 +2477,17 @@ impl Dom {
         // is the page only when it is the SOLE content spine of the app shell
         // (`<body><div>…<div overflow:auto>`) — otherwise two panels of a flex
         // row would BOTH read as principal (the humantooth over-match).
-        viewport_locked && (in_main || (!landmark_seen && self.is_sole_spine_to_body(id)))
+        // HTML #the-main-element allows presentation wrappers around main.
+        // The wrapper owning its scrollport carries the dominant content too;
+        // a header beside that wrapper must not disable page scrolling.
+        viewport_locked
+            && (in_main
+                || (!landmark_seen
+                    && (self.tag_name(id) == Some("main")
+                        || self.descendants(id).into_iter().any(|node| {
+                            self.tag_name(node) == Some("main") && !self.is_hidden(node)
+                        })
+                        || self.is_sole_spine_to_body(id))))
     }
 
     /// Whether every ancestor between `id` and `<body>`/`<html>` has `id`'s
