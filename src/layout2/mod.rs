@@ -62,7 +62,7 @@ mod overflow;
 mod replaced;
 mod session;
 mod spatial;
-pub(crate) use overflow::scroll_reverse;
+pub(crate) use overflow::{Overflow, scroll_reverse};
 mod style;
 mod table;
 mod transform;
@@ -7810,6 +7810,53 @@ mod tests {
             3,
             "the definite-height box still reserves its 3 rows"
         );
+    }
+
+    #[test]
+    fn implicit_auto_overflow_keeps_the_terminal_scroll_buffer() {
+        // CSS Overflow 3 #overflow-control (CSSWG 81c27f686901): hidden
+        // on x makes the initial visible y compute to auto, including when
+        // hidden comes from a custom property. The outer clip must not erase
+        // the nested scrollport's content before its buffer is extracted.
+        let lines = (0..40)
+            .map(|i| format!("<p style='margin:0'>ROW{i:02}</p>"))
+            .collect::<String>();
+        for overflow in ["overflow-x:hidden", "--ox:hidden;overflow-x:var(--ox)"] {
+            let out = lay(
+                &format!(
+                    "<html style='overflow:hidden'><body style='margin:0'><main style='height:96px;overflow:hidden'><div style='height:96px;{overflow}'>{lines}</div></main></body></html>"
+                ),
+                30,
+            );
+            assert_eq!(out.regions.len(), 1, "{overflow}");
+            let region = &out.regions[0];
+            assert!(region.principal);
+            assert!(region.buffer.len() > usize::from(region.height));
+            assert!(
+                region
+                    .buffer
+                    .iter()
+                    .flat_map(|row| &row.items)
+                    .any(|item| item.text.contains("ROW39")),
+                "{overflow}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_scrollport_wrapper_with_header_is_the_terminal_page_scroller() {
+        let lines = (0..40)
+            .map(|i| format!("<p style='margin:0'>ROW{i:02}</p>"))
+            .collect::<String>();
+        let out = lay(
+            &format!(
+                "<html style='overflow:hidden'><body style='margin:0'><div style='height:112px;overflow:hidden'><header style='height:16px'>Navigation</header><div style='height:96px;overflow-x:hidden'><main>{lines}</main></div></div></body></html>"
+            ),
+            30,
+        );
+        assert_eq!(out.regions.len(), 1);
+        assert!(out.regions[0].principal);
+        assert!(out.regions[0].buffer.len() >= 40);
     }
 
     #[test]
