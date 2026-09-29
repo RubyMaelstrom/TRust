@@ -7403,6 +7403,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_offset_style", 1, host_offset_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
+    ("__media_failed", 2, host_media_failed),
     ("__match_media", 3, host_match_media),
     ("__dom_rect", 1, host_rect),
     ("__geometry_bind", 2, geometry_host::bind),
@@ -13385,6 +13386,24 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Undefined)
 }
 
+fn host_media_failed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let base = ctx
+        .host_mut::<HostState>()
+        .expect("media host state")
+        .base
+        .clone();
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    if let Some(node) = host_arg_node(&dom, args, 0) {
+        if matches!(args.get(1), Some(Value::Bool(true))) {
+            dom.remember_media(node, &base);
+        } else {
+            dom.forget_media(node);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
 fn document_cookie_url(ctx: &mut Ctx, args: &[Value]) -> Option<url::Url> {
     let id = args.first()?.as_num_opt()? as usize;
     let context_id = args.get(1)?.as_num_opt()? as u64;
@@ -17080,7 +17099,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 177, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 178, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -17091,7 +17110,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 177);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 178);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -17792,6 +17811,46 @@ mod tests {
             ),
             "undefined|undefined"
         );
+    }
+
+    #[test]
+    fn media_error_handler_replacement_retains_external_playback_without_changing_dom() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                document.appendChild(document.createElement('body'));
+                document.body.innerHTML = '<section id="player" style="width:320px;height:180px"><video id="video"></video></section>';
+                const video = document.getElementById('video');
+                video.onerror = () => { document.getElementById('player').textContent = 'Cannot play inline'; };
+                video.src = '/clip.mp4';
+            "#, "media error replacement").unwrap();
+            run_microtask_checkpoint(&mut engine);
+            eval(
+                &mut engine,
+                "while (__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                "media tasks",
+            )
+            .unwrap();
+            let dom = host_dom(engine.ctx());
+            let dom = dom.borrow();
+            let player = dom.get_by_id("player").unwrap();
+            assert_eq!(
+                dom.retained_media_controls()
+                    .get(&player)
+                    .map(url::Url::as_str),
+                Some("https://example.com/clip.mp4"),
+                "{tier:?}"
+            );
+            assert_eq!(dom.text_content(player), "Cannot play inline");
+            assert!(dom.get_by_id("video").is_none());
+            drop(dom);
+            assert_eq!(
+                string_value(&mut engine, "typeof globalThis.__media_failed"),
+                "undefined"
+            );
+        }
     }
 
     #[test]

@@ -74,6 +74,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_offset_style", 1),
     ("__image_current_src", 1),
     ("__image_complete", 1),
+    ("__media_failed", 2),
     ("__match_media", 3),
     ("__dom_rect", 1),
     ("__geometry_bind", 2),

@@ -54,6 +54,7 @@ mod graphics;
 mod grid;
 pub(crate) use grid::serialize_subgrid_rows;
 mod inline;
+pub(crate) use inline::media_target;
 mod intrinsic;
 mod measure;
 mod memo;

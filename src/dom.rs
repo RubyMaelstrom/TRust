@@ -28,6 +28,7 @@ mod generated;
 mod html_hints;
 mod input;
 mod invalidation;
+mod media;
 mod properties;
 
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
@@ -195,6 +196,7 @@ pub struct Dom {
     /// Frame document entries use the arena's embedding-frame document root.
     document_modes: FxHashMap<NodeId, QuirksMode>,
     input_values: FxHashMap<NodeId, input::InputValue>,
+    media_fallbacks: RefCell<media::MediaFallbacks>,
     control_selections: FxHashMap<NodeId, crate::doc::ControlSelection>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
     /// host element → shadow root fragment (attachShadow).
@@ -607,6 +609,7 @@ impl Dom {
             document_content_types,
             document_modes,
             input_values,
+            media_fallbacks,
             control_selections,
             canvases,
             shadow_roots,
@@ -744,6 +747,9 @@ impl Dom {
         fixed_map!(document_content_types, (NodeId, String));
         fixed_map!(document_modes, (NodeId, QuirksMode));
         fixed_map!(input_values, (NodeId, input::InputValue));
+        bytes = bytes.saturating_add(media_fallbacks.borrow().retained_bytes());
+        // Url exposes its length but not its allocation capacity.
+        opaque |= media_fallbacks.borrow().retained_bytes() != 0;
         fixed_map!(control_selections, (NodeId, crate::doc::ControlSelection));
         for value in input_values.values() {
             bytes = bytes.saturating_add(value.value.capacity());
@@ -1023,6 +1029,7 @@ impl Dom {
             document_content_types: FxHashMap::default(),
             document_modes: FxHashMap::default(),
             input_values: FxHashMap::default(),
+            media_fallbacks: RefCell::new(media::MediaFallbacks::default()),
             control_selections: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
             shadow_roots: FxHashMap::default(),
@@ -2266,6 +2273,11 @@ impl Dom {
     /// The base also participates in registered URL and image computed values.
     pub fn set_doc_url(&mut self, url: Option<url::Url>) {
         if self.doc_url != url {
+            if !matches!((&self.doc_url, &url), (Some(old), Some(new))
+                if old[..url::Position::AfterQuery] == new[..url::Position::AfterQuery])
+            {
+                self.media_fallbacks.get_mut().clear();
+            }
             self.doc_url = url;
             self.touch_style();
         }
