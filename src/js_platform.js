@@ -354,6 +354,17 @@
         if (realmRootFrame && Number(id) === realmRootFrame.__id) return realmRootFrame;
         let w = cachedWrapper(id, knownConnected);
         if (w) return w;
+        // HTML #concept-bcc-content-document / Window.frameElement: a
+        // navigable container is the existing Element in its owning Realm.
+        // Ancestor frames already have a Window and processed attributes.
+        // Manufacturing another wrapper loses that state and a nested
+        // contentWindow lookup can spuriously reload the enclosing player.
+        let ancestor = realmRootFrame;
+        while (ancestor) {
+            if (Number(id) === ancestor.__id) return ancestor;
+            const owner = ancestor.ownerDocument;
+            ancestor = owner && owner.__frame || null;
+        }
         const t = __dom_node_type(id);
         // Queued frontend input can outlive its removed target. Public IDs are
         // never recycled; do not manufacture a wrapper for a retired ID.
@@ -509,20 +520,22 @@
         }
     }
 
-    // A freshly inserted <iframe>/<frame> connected to the document begins
-    // navigation (HTML "process the iframe attributes" runs on insertion). A frame
-    // built up inside a detached fragment waits until its root is connected —
-    // the next load/settle sweep (or a contentDocument read) realizes it then.
-    // (Forward-referenced by the Node insert methods; `queueFrameNavigation`
-    // is hoisted alongside the other iframe helpers below.)
-    function maybeProcessInsertedFrame(frame, parent) {
+    // DOM #concept-node-insert runs post-connection steps for ALL shadow-
+    // including inclusive descendants, in a static snapshot. HTML's iframe
+    // post-connection steps create a child navigable and process attributes.
+    // Inserting a detached wrapper/clone must start its frames just as inserting
+    // an iframe directly does; no contentDocument getter or later sweep is needed.
+    function maybeProcessInsertedFrames(root, parent) {
         if (!parent.isConnected) return;
-        const src = frame.getAttribute("src");
-        const blank = frame.getAttribute("srcdoc") === null &&
-            (src === null || src.trim() === "");
-        createInitialFrameWindow(frame, blank);
-        if (blank) return;
-        queueFrameNavigation(frame);
+        for (const id of __dom_rendering_frames(root.__id)) {
+            const frame = wrap(id);
+            if (!frame || !frame.isConnected || frame.ownerDocument !== root.ownerDocument) continue;
+            const src = frame.getAttribute("src");
+            const blank = frame.getAttribute("srcdoc") === null &&
+                (src === null || src.trim() === "");
+            createInitialFrameWindow(frame, blank);
+            if (!blank) queueFrameNavigation(frame);
+        }
     }
 
     // The document base URL: <base href> when present (archive.org sets
@@ -2660,6 +2673,7 @@
         return true;
     }
     function queueFrameNavigationsIn(root) {
+        if (!root || !root.isConnected) return 0;
         let frames;
         try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
         ftrace("queueFrameNavigationsIn root=" + (root && root.localName || "doc") + " frames=" + frames.length);
@@ -4586,7 +4600,7 @@
             maybeRunScript(c);
             maybeLoadStylesheet(c);
             if (c.__trustLN === "base") baseHrefCache = null; // maybeRunScript already read .localName
-            else if (c.__trustLN === "iframe" || c.__trustLN === "frame") maybeProcessInsertedFrame(c, this);
+            maybeProcessInsertedFrames(c, this);
             return c;
         }
         insertBefore(c, ref) {
@@ -4604,7 +4618,7 @@
             maybeRunScript(c);
             maybeLoadStylesheet(c);
             if (c.__trustLN === "base") baseHrefCache = null;
-            else if (c.__trustLN === "iframe" || c.__trustLN === "frame") maybeProcessInsertedFrame(c, this);
+            maybeProcessInsertedFrames(c, this);
             return c;
         }
         removeChild(c) {
@@ -4654,7 +4668,7 @@
             maybeRunScript(n);
             maybeLoadStylesheet(n);
             if (n.__trustLN === "base" || old.__trustLN === "base") baseHrefCache = null;
-            else if (n.__trustLN === "iframe" || n.__trustLN === "frame") maybeProcessInsertedFrame(n, this);
+            maybeProcessInsertedFrames(n, this);
             return old;
         }
         remove() { const parent = rangeParent(this); if (parent) Node.prototype.removeChild.call(parent,this); }

@@ -17487,6 +17487,70 @@ mod tests {
     }
 
     #[test]
+    fn nested_frame_window_lookup_preserves_ancestor_documents() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                    let mut engine = platform_engine();
+                    engine.set_tier(tier);
+                    engine.set_tier_threshold(0);
+                    assert_eq!(
+                        string_value(
+                            &mut engine,
+                            include_str!("fixtures/frame_ancestor_identity.mjs")
+                        ),
+                        "true|kept|true|ad",
+                        "{tier:?}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn iframe_subtree_connection_starts_navigation_without_a_document_getter() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                    let mut engine = platform_engine();
+                    engine.set_tier(tier);
+                    engine.set_tier_threshold(0);
+                    assert_eq!(
+                        string_value(
+                            &mut engine,
+                            include_str!("fixtures/frame_subtree_connection.mjs")
+                        ),
+                        "frame-connections-pending"
+                    );
+                    run_microtask_checkpoint(&mut engine);
+                    eval(
+                        &mut engine,
+                        "while (__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                        "connected frame tasks",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        string_value(&mut engine, "frameConnections.join(',')"),
+                        "append,insert,replace,clone,shadow,fragment",
+                        "{tier:?}"
+                    );
+                    assert_eq!(
+                        string_value(&mut engine, "frameConnectionLoads.sort().join(',')"),
+                        "append,fragment,insert,replace,shadow",
+                        "{tier:?}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn iframe_http_error_documents_load_but_no_content_preserves_document() {
         // Nested Window bootstrap in forced execution tiers needs more native
         // stack than Rust's default test thread, as does the resident page actor.
