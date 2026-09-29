@@ -1497,27 +1497,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
         let (play, src_node, streaming) = match media_source(self.dom, self.base, node) {
             Some((u, n)) => (Url::parse(&u).ok(), n, false),
-            None if video => {
-                let page = match &ctx.link {
-                    Some(Link::Http(u)) => u.clone(),
-                    // The resident-page serializer rewrites a live anchor to
-                    // `x-trust-js:<node>:<original href>` so activation can run
-                    // through the page actor. Media is intentionally delegated
-                    // to mpv instead; resolve that preserved href directly and
-                    // do not run the inline player UI (Twitch-style cards).
-                    Some(Link::JsClick { href, .. }) if !href.trim().is_empty() => {
-                        match crate::http::resolve(self.base, href) {
-                            Link::Http(u) => u,
-                            _ => self.base.clone(),
-                        }
-                    }
-                    _ => self.base.clone(),
-                };
-                (Some(page), None, true)
-            }
+            None if video => (media_target(self.dom, self.base, node), None, true),
             None => return, // sourceless audio: nothing to represent
         };
         let Some(play) = play else { return };
+        self.dom.remember_media_target(node, &play);
         let plays_this_page = streaming && play == *self.base;
         let link = Some(Link::Media(play));
         let poster = video
@@ -1994,25 +1978,31 @@ pub(crate) fn media_target(dom: &Dom, base: &Url, node: NodeId) -> Option<Url> {
     if dom.tag_name(node) != Some("video") {
         return None;
     }
+    let page = dom.media_document_url(node, base);
+    let base = dom.resource_base_url(node, base);
+    let document = dom.owner_document(node);
     let mut ancestor = dom.parent_composed(node);
     while let Some(id) = ancestor {
+        if dom.owner_document(id) != document {
+            break;
+        }
         if dom.tag_name(id) == Some("a")
             && let Some(href) = dom.attr(id, "href")
         {
-            return match crate::http::resolve(base, href) {
+            return match crate::http::resolve(&base, href) {
                 Link::Http(url) => Some(url),
                 Link::JsClick { href, .. } if !href.trim().is_empty() => {
-                    match crate::http::resolve(base, &href) {
+                    match crate::http::resolve(&base, &href) {
                         Link::Http(url) => Some(url),
-                        _ => Some(base.clone()),
+                        _ => Some(page),
                     }
                 }
-                _ => Some(base.clone()),
+                _ => Some(page),
             };
         }
         ancestor = dom.parent_composed(id);
     }
-    Some(base.clone())
+    Some(page)
 }
 
 /// If `image` repeats a nearby `<video poster>`, return that video's playable
@@ -2230,6 +2220,10 @@ fn justify(line: &mut LineOut, extra: f32) {
 /// its quality label): the element's own `src` if set, else the first
 /// `<source>` with an http(s) `src` (browser source-selection order).
 pub(crate) fn media_source(dom: &Dom, base: &Url, id: NodeId) -> Option<(String, Option<NodeId>)> {
+    // HTML #concept-media-load-algorithm parses sources relative to the
+    // media element's node Document, including dynamically assigned URLs.
+    let base_url = dom.resource_base_url(id, base);
+    let base = &base_url;
     if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
         && let Link::Http(u) = crate::http::resolve(base, src)
     {

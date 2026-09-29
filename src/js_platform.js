@@ -1,6 +1,8 @@
 (function () {
     "use strict";
     const g = globalThis;
+    const rememberMediaFailure = g.__media_failed;
+    delete g.__media_failed;
     // These capabilities are bootstrap-only. Author code cannot supply an
     // arbitrary cookie document or storage bucket to the native host.
     const __cookie_get = g.__cookie_get;
@@ -6088,6 +6090,7 @@
     }
     function loadMediaElement(element) {
         const state = mediaState(element), generation = ++state.generation;
+        rememberMediaFailure(element.__id, false);
         // HTML media element load algorithm: discard superseded tasks, then
         // abort/empty the old resource before starting resource selection.
         if (state.network === 1 || state.network === 2)
@@ -6113,11 +6116,15 @@
                 queueMediaEvent(element, state, generation, "error", function () {
                     state.error = new MediaError(mediaErrorToken);
                     state.network = 3;
+                    rememberMediaFailure(element.__id, true);
                 });
             } else {
                 // Child-source failures target each source, not the media
                 // element. Exhausting candidates leaves error null.
-                for (const source of sources) queueMediaEvent(source, state, generation, "error");
+                for (let i = 0; i < sources.length; i++)
+                    queueMediaEvent(sources[i], state, generation, "error", i === 0 ? function () {
+                        rememberMediaFailure(element.__id, true);
+                    } : null);
                 __queue_dom_task(function () {
                     if (state.generation === generation) state.network = 3;
                 });

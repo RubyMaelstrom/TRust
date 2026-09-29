@@ -997,17 +997,30 @@ fn paint_in_spaces(
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
     };
-    if builder.has_media_controls {
-        paint.collect_browser_media(|node, fallback| {
-            (matches!(dom.tag_name(node), Some("video" | "audio"))
-                && !dom.paint_suppressed(node)
-                && !dom.visibility_hidden(node))
+    let media_fallbacks = dom.retained_media_controls();
+    if builder.has_media_controls || !media_fallbacks.is_empty() {
+        paint.collect_browser_media(|hit| {
+            if let Some(target) = media_fallbacks.get(&hit.node) {
+                return Some((hit.rect, crate::doc::Link::Media(target.clone())));
+            }
+            let Some(link @ crate::doc::Link::Media(_)) = &hit.link else {
+                return None;
+            };
+            (matches!(dom.tag_name(hit.node), Some("video" | "audio"))
+                && !dom.paint_suppressed(hit.node)
+                && !dom.visibility_hidden(hit.node))
             .then(|| {
-                builder
-                    .replaced_border_boxes
-                    .get(&node)
-                    .copied()
-                    .unwrap_or(fallback)
+                if let crate::doc::Link::Media(target) = link {
+                    dom.remember_media_target(hit.node, target);
+                }
+                (
+                    builder
+                        .replaced_border_boxes
+                        .get(&hit.node)
+                        .copied()
+                        .unwrap_or(hit.rect),
+                    link.clone(),
+                )
             })
         });
     }

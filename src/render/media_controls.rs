@@ -14,7 +14,7 @@ impl PagePaint {
     /// `anchor` filters eligible media and supplies its actual replaced box.
     pub(crate) fn collect_browser_media(
         &mut self,
-        mut anchor: impl FnMut(usize, CssRect) -> Option<CssRect>,
+        mut anchor: impl FnMut(&HitRegion) -> Option<(CssRect, Link)>,
     ) {
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -52,20 +52,19 @@ impl PagePaint {
                 let Primitive::HitRegion(hit) = command else {
                     continue;
                 };
-                let Some(Link::Media(_)) = &hit.link else {
-                    continue;
-                };
                 if seen.contains(&hit.node) {
                     continue;
                 }
-                let Some(rect) = anchor(hit.node, hit.rect) else {
+                let Some((rect, link)) = anchor(hit) else {
                     continue;
                 };
                 if rect.width <= 0. || rect.height <= 0. {
                     continue;
                 }
                 seen.insert(hit.node);
-                append_button(&mut result, hit, rect);
+                let mut hit = hit.clone();
+                hit.link = Some(link);
+                append_button(&mut result, &hit, rect);
             }
             if fixed {
                 result.push(Primitive::EndFixed);
@@ -211,6 +210,175 @@ mod tests {
 
     fn center(rect: CssRect) -> CssPoint {
         CssPoint::new(rect.x + rect.width / 2., rect.y + rect.height / 2.)
+    }
+
+    #[test]
+    fn media_controls_survive_error_ui_replacement_and_retire_with_the_container() {
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><section id=player style="width:320px;height:180px;position:relative">
+                <div id=inner><video id=v src="/clip.mp4"></video></div></section>"#,
+        );
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let video = dom.get_by_id("v").unwrap();
+        let player = dom.get_by_id("player").unwrap();
+        dom.set_doc_url(Some(base.clone()));
+        dom.remember_media(video, &base);
+        assert!(
+            dom.retained_media_controls().is_empty(),
+            "existing media owns its control"
+        );
+        dom.set_text(player, "Unable to play inline");
+        let layout = layout(&dom);
+        assert_eq!(layout.paint.browser_media_nodes(), [player].into());
+        let scene = scene(&layout.paint, CssPoint::default());
+        let target = scene.ordered_focus_hits(&[player]).pop().unwrap();
+        assert!(
+            matches!(&target.link, Some(Link::Media(url)) if url.as_str() == "https://example.test/clip.mp4")
+        );
+        assert_eq!(
+            scene.page_hit_at(center(target.rect)).unwrap().link,
+            target.link
+        );
+        assert_eq!(
+            layout.boxes[&player].height, 180.,
+            "native UI does not change CSS geometry"
+        );
+        assert!(
+            !dom.serialize_js(crate::dom::DOCUMENT).contains("mpv"),
+            "no synthetic author DOM"
+        );
+        let terminal = crate::layout2::lay_out_document(
+            &dom,
+            &base,
+            crate::layout2::TerminalViewport::new(80, 30, 8., 16.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(
+            terminal
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .any(|item| matches!(item.link, Some(Link::Media(_))))
+        );
+        dom.detach(player);
+        assert!(
+            dom.retained_media_controls().is_empty(),
+            "do not move stale controls to the page body"
+        );
+    }
+
+    #[test]
+    fn media_controls_retained_failure_respects_visibility_reload_and_document_lifetime() {
+        let mut dom = Dom::parse_document(
+            r#"<body><div id=player><video id=v src="/clip.mp4"></video></div>"#,
+        );
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let video = dom.get_by_id("v").unwrap();
+        let player = dom.get_by_id("player").unwrap();
+        dom.set_doc_url(Some(base.clone()));
+        dom.remember_media(video, &base);
+        dom.detach(video);
+        assert_eq!(dom.retained_media_controls().len(), 1);
+        dom.set_attr(player, "style", "display:none");
+        assert!(dom.retained_media_controls().is_empty());
+        dom.set_attr(player, "style", "");
+        dom.forget_media(video);
+        assert!(
+            dom.retained_media_controls().is_empty(),
+            "reload retires the previous failure"
+        );
+        dom.append(player, video);
+        dom.remember_media(video, &base);
+        dom.detach(video);
+        dom.set_doc_url(Some(
+            url::Url::parse("https://example.test/#chapter").unwrap(),
+        ));
+        assert_eq!(
+            dom.retained_media_controls().len(),
+            1,
+            "fragment navigation preserves playback"
+        );
+        dom.set_doc_url(Some(url::Url::parse("https://example.test/next").unwrap()));
+        assert!(
+            dom.retained_media_controls().is_empty(),
+            "same-document route changes retire old resources"
+        );
+    }
+
+    #[test]
+    fn media_controls_remember_an_offered_frame_player_before_author_failure() {
+        let mut dom =
+            Dom::parse_document(r#"<body><iframe id=frame width=320 height=180></iframe>"#);
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            "<body><div><video width=320 height=180></video></div>",
+            "https://player.example.test/embed/123",
+        )
+        .unwrap();
+        let body = dom
+            .descendants(frame)
+            .find(|&id| dom.tag_name(id) == Some("body"))
+            .unwrap();
+        assert!(!layout(&dom).paint.browser_media.is_empty());
+        // Player libraries can reject their source before assigning video.src
+        // and replace the Document body without firing a native media error.
+        dom.set_text(body, "Network error");
+        let painted = layout(&dom);
+        assert_eq!(painted.paint.browser_media_nodes(), [body].into());
+        let scene = scene(&painted.paint, CssPoint::default());
+        let target = scene.ordered_focus_hits(&[body]).pop().unwrap();
+        assert!(
+            matches!(&target.link, Some(Link::Media(url)) if url.as_str() == "https://player.example.test/embed/123")
+        );
+    }
+
+    #[test]
+    fn media_controls_blob_failure_uses_the_document_url_despite_an_asset_base() {
+        let mut dom = Dom::parse_document(
+            r#"<head><base href="https://cdn.example.test/assets/"></head>
+                <body><section id=player><video id=v src="blob:https://example.test/123"></video></section>"#,
+        );
+        let base = url::Url::parse("https://example.test/watch/123").unwrap();
+        let video = dom.get_by_id("v").unwrap();
+        let player = dom.get_by_id("player").unwrap();
+        dom.remember_media(video, &base);
+        dom.set_text(player, "Unable to play inline");
+        assert_eq!(dom.retained_media_controls().get(&player), Some(&base));
+    }
+
+    #[test]
+    fn media_controls_in_frames_use_the_player_document_and_its_resource_base() {
+        let mut dom = Dom::parse_document(
+            r#"<body><a href="/outer-link"><iframe id=frame width=320 height=180></iframe></a>"#,
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(frame,
+            r#"<head><base href="https://cdn.example.test/assets/"></head><body><video id=video></video>"#,
+            "https://player.example.test/embed/123").unwrap();
+        let video = dom
+            .descendants(frame)
+            .find(|&id| dom.attr(id, "id") == Some("video"))
+            .unwrap();
+        let base = url::Url::parse("https://outer.example.test/page").unwrap();
+        assert_eq!(
+            crate::layout2::media_target(&dom, &base, video)
+                .unwrap()
+                .as_str(),
+            "https://player.example.test/embed/123",
+            "external playback uses the final frame page, not its embedding link or asset base"
+        );
+        dom.set_attr(video, "src", "clip.mp4");
+        assert_eq!(
+            crate::layout2::media_target(&dom, &base, video)
+                .unwrap()
+                .as_str(),
+            "https://cdn.example.test/assets/clip.mp4",
+            "dynamic sources resolve in their own Document"
+        );
     }
 
     #[test]
@@ -378,7 +546,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        page.collect_browser_media(|_, rect| Some(rect));
+        page.collect_browser_media(|hit| Some((hit.rect, hit.link.clone()?)));
         let scene = scene(&page, CssPoint::default());
         assert!(matches!(
             scene.page_hit_at(CssPoint::new(110., 10.)).unwrap().link,

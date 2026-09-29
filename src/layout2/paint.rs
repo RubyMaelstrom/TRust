@@ -59,6 +59,7 @@ pub(crate) struct TerminalPaintModel {
     links: HashMap<NodeId, Link>,
     has_editing_hosts: bool,
     page_media: Option<TerminalPageMedia>,
+    media_fallbacks: HashMap<NodeId, url::Url>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -306,6 +307,7 @@ impl TerminalPaintModel {
             has_editing_hosts: links.values().any(|link| matches!(link, Link::Form { .. })),
             links,
             page_media: None,
+            media_fallbacks: dom.retained_media_controls(),
         }
     }
 
@@ -2879,6 +2881,23 @@ fn fill_op(
     let col0 = ((f.x - ox) / cw).round() as i64;
     let col1 = ((f.x - ox + f.w) / cw).round() as i64;
     let clip = clip_cells(f.clip, ox, oy, cw, ch);
+    if let Some(target) = dom.media_fallbacks.get(&f.node)
+        && f.paint.pseudo.is_none()
+        && row1 > row0
+        && col1 > col0
+    {
+        let mut item = border_item(f.node, String::from("▶ Open in mpv"));
+        item.kind = ItemKind::Link;
+        item.link = Some(Link::Media(target.clone()));
+        ops.push(Op::Item {
+            row: row0,
+            col: col0,
+            item,
+            clip,
+            bounds: clipped_paint_bounds(f.x, f.y, f.x + f.w, f.y + f.h, f.clip),
+            text_clip_resolved: false,
+        });
+    }
     if f.paint.bg
         && dom.node(f.node).is_some_and(|node| node.background_covers)
         && row1 > row0
