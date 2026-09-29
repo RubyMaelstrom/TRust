@@ -27301,9 +27301,11 @@ mod tests {
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let serve = async move {
             for _ in 0..2 {
-                let Ok(Ok((mut socket, _))) =
-                    tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
-                else {
+                // The child Realm is bootstrapped before its synchronous navigation fetch.
+                // A server-side accept deadline can expire during that CPU work under libtest
+                // load, leaving an empty fallback Document instead of testing URL resolution.
+                // The test owns and aborts this server; accept stays pending without a timer.
+                let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let mut request = Vec::new();
@@ -27352,10 +27354,7 @@ mod tests {
         let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
         state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
         let mut engine = configured_engine(state, page.as_str());
-        // Start the request deadline after unrelated platform bootstrap.
-        // Compiling the initial prelude can otherwise exhaust the server's
-        // accept timeout before this test initiates its first navigation.
-        runtime.spawn(serve);
+        let server = runtime.spawn(serve);
 
         eval(
             &mut engine,
@@ -27391,6 +27390,7 @@ mod tests {
             request_rx.try_iter().collect::<Vec<_>>(),
             vec![String::from("/speedometer/resources/angular/index.html")]
         );
+        server.abort();
     }
 
     #[test]
