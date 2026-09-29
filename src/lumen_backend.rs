@@ -5861,6 +5861,42 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn actor_document_location_assignment_navigates_from_canceled_image_link_click() {
+            // HTML #dom-document-location, Web IDL #PutForwards: returning false
+            // cancels the anchor default, but not the handler's explicit navigation.
+            let html = r#"<base href="https://example.com/gallery/">
+                <a href="/wrong-default" onclick="document.location = 'next'; return false">
+                    <img id="arrow" src="arrow.png">
+                </a>"#;
+            let target = Dom::parse_document(html).get_by_id("arrow").unwrap();
+            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { .. }) => break,
+                        Some(PageEvt::Trouble(errors)) => panic!("initial page failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed"),
+                    }
+                }
+                handle.try_send_navigation_click(target).unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Navigate(url)) => {
+                            assert_eq!(url, "https://example.com/gallery/next");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("click failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before navigation"),
+                    }
+                }
+            })
+            .await
+            .expect("document.location assignment did not navigate");
+        }
+
+        #[tokio::test]
         async fn actor_emits_replace_for_a_same_url_location_request() {
             let html = r#"<button id="reload">Reload</button><script>
                 document.getElementById('reload').onclick = () => location.replace(location.href);
@@ -27191,6 +27227,49 @@ mod tests {
             string_value(&mut engine, "recreatedIframeRegistryResult"),
             "first|true|FirstFrameDefinition|SecondFrameDefinition|second"
         );
+    }
+
+    #[test]
+    fn document_location_assignment_forwards_to_href() {
+        // Local HTML e5071a20 §Document.location and Web IDL 8f182624
+        // §PutForwards / §LegacyUnforgeable (2026-09-06 snapshots).
+        let mut engine = platform_engine();
+        eval(&mut engine, r##"
+            function check(value, message) { if (!value) throw Error(message); }
+            const html = document.createElement('html'), head = document.createElement('head'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(head); html.appendChild(body);
+            const base = document.createElement('base'); base.href = 'https://example.com/gallery/'; head.appendChild(base);
+            const original = document.location;
+            const descriptor = Object.getOwnPropertyDescriptor(document, 'location');
+            check(descriptor && !descriptor.configurable && descriptor.enumerable && typeof descriptor.set === 'function', 'unforgeable forwarding property');
+            document.location = 'next';
+            check(__trust.navigation === 'https://example.com/gallery/next', 'relative navigation');
+            check(document.location === original && original === window.location, 'Location identity');
+            (function() { 'use strict'; document.location = {toString() { return 'strict'; }}; })();
+            check(__trust.navigation === 'https://example.com/gallery/strict', 'strict assignment and string conversion');
+            document.location += '?reload=1';
+            check(__trust.navigation === 'https://example.com/gallery/strict?reload=1', 'compound assignment');
+            let invalid = false;
+            try { document.location = 'https://['; } catch (error) { invalid = error.name === 'SyntaxError'; }
+            check(invalid, 'invalid URL throws');
+            const savedNavigation = __trust.navigation;
+            for (const detached of [new Document(), document.implementation.createHTMLDocument('detached'), new DOMParser().parseFromString('<p>detached</p>', 'text/html')]) {
+                check(detached.location === null, 'detached document has no Location');
+                let threw = false;
+                try { detached.location = '/unwanted'; } catch (error) { threw = error instanceof TypeError; }
+                check(threw && __trust.navigation === savedNavigation, 'null forwarding target throws without navigation');
+            }
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            const child = frame.contentWindow, childDocument = child.document, childLocation = child.location;
+            childDocument.location = 'child';
+            check(child.__trust.navigation === 'https://example.com/gallery/child', 'child Document forwards using caller base');
+            check(childDocument.location === childLocation && __trust.navigation === savedNavigation, 'only child navigates');
+            frame.remove();
+            check(childDocument.location === null, 'removed frame document inactive');
+            let removedThrew = false;
+            try { childDocument.location = '/unwanted'; } catch (error) { removedThrew = error.name === 'TypeError'; }
+            check(removedThrew, 'inactive frame forwarding throws');
+        "##, "Document.location forwarding").unwrap();
     }
 
     #[test]
