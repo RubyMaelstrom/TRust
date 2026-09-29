@@ -1575,7 +1575,22 @@ impl Dom {
         if changed.is_empty() {
             return false;
         }
-        self.mark();
+        // Selectors 4 #the-hover-pseudo: the comparison above identifies
+        // every changed rule subject, including relational/sibling selectors.
+        // CSS Cascade 5 #inheriting also requires restyling its descendants,
+        // but unrelated branches retain their computed styles and layout.
+        // Keep the broad fallback for cross-tree inheritance/distribution.
+        if changed
+            .keys()
+            .all(|&node| !self.shadow_style_dependencies(node))
+        {
+            for &node in changed.keys() {
+                self.invalidate_style_subtree(node, true);
+            }
+            self.mark_dom_revision();
+        } else {
+            self.mark();
+        }
         for (&node, &kind) in &changed {
             self.record_geometry_dirty(node, kind);
         }
@@ -3457,6 +3472,10 @@ impl Dom {
     }
 
     pub(crate) fn canvas_changed(&mut self, id: NodeId) {
+        self.replaced_pixels_changed(id);
+    }
+
+    pub(crate) fn replaced_pixels_changed(&mut self, id: NodeId) {
         if self.is_connected(id) {
             // HTML #the-canvas-element: drawing changes bitmap pixels, not the
             // element tree, selectors, or natural dimensions. Width/height
@@ -21887,6 +21906,44 @@ mod tests {
         assert!(dom.set_hover_chain(None), "clearing restyles back");
         assert_eq!(dom.computed_style(r, "letter-spacing"), None);
         assert!(!dom.is_hidden(d));
+    }
+
+    #[test]
+    fn hover_restyles_subjects_and_inheritance_without_expiring_unrelated_styles() {
+        let mut dom = Dom::parse_document(
+            "<style>.menu:hover{color:red;--gap:9px}.menu:hover + aside{width:41px}\
+             .leaf{padding-left:var(--gap,1px)} #stable{color:blue}</style>\
+             <div class=menu id=menu><span class=leaf id=leaf>menu</span></div>\
+             <aside id=sibling>related</aside><section id=stable>unrelated</section>",
+        );
+        let menu = dom.get_by_id("menu").unwrap();
+        let leaf = dom.get_by_id("leaf").unwrap();
+        let sibling = dom.get_by_id("sibling").unwrap();
+        let stable = dom.get_by_id("stable").unwrap();
+        // A detached feature probe is not in the subjects' inheritance tree.
+        let probe = dom.create_element("div");
+        dom.attach_shadow(probe);
+        let retained = dom.cascaded_maps(stable);
+        assert_eq!(
+            dom.computed_value_resolved(leaf, "padding-left").as_deref(),
+            Some("1px")
+        );
+        for (target, hovered) in [(Some(menu), true), (None, false)] {
+            assert!(dom.set_hover_chain(target));
+            assert_eq!(
+                dom.computed_value_resolved(leaf, "padding-left").as_deref(),
+                Some(if hovered { "9px" } else { "1px" })
+            );
+            assert_eq!(
+                dom.computed_value_resolved(leaf, "color").as_deref() == Some("red"),
+                hovered
+            );
+            assert_eq!(
+                dom.computed_value_resolved(sibling, "width").as_deref() == Some("41px"),
+                hovered
+            );
+            assert!(std::rc::Rc::ptr_eq(&retained, &dom.cascaded_maps(stable)));
+        }
     }
 
     #[test]

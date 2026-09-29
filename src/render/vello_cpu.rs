@@ -181,7 +181,11 @@ impl VelloCpuRenderer {
         ));
         self.context.set_transform(device);
         let mut layer_filters = Vec::new();
-        for command in &scene.primitives {
+        let mut skip_until = 0;
+        for (index, command) in scene.primitives.iter().enumerate() {
+            if index < skip_until {
+                continue;
+            }
             match command {
                 DisplayCommand::Fill { shape, brush } => {
                     if !shape_is_visible(
@@ -249,6 +253,23 @@ impl VelloCpuRenderer {
                     }
                 }
                 DisplayCommand::PushLayer(layer) => {
+                    let cull = {
+                        #[cfg(test)]
+                        {
+                            !self.eager_clips
+                        }
+                        #[cfg(not(test))]
+                        {
+                            true
+                        }
+                    };
+                    if cull
+                        && (clips.bounds().width <= 0. || clips.bounds().height <= 0.)
+                        && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
+                    {
+                        skip_until = end + 1;
+                        continue;
+                    }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.push_layer(
                         None,
@@ -1298,6 +1319,51 @@ mod tests {
             eager.render_rgba(&scene).unwrap().pixels,
         );
         assert_eq!(deferred.rasterized_clips, 2);
+    }
+
+    #[test]
+    fn clipped_compositing_groups_skip_backend_work_and_reappear_when_scrolled() {
+        use super::super::{BlendMode, CompositingLayer};
+        let mut scene = clip_test_scene(1.25);
+        scene
+            .primitives
+            .push(DisplayCommand::PushTransform(Affine2d::IDENTITY));
+        for row in 0..64 {
+            scene.primitives.extend([
+                DisplayCommand::PushTransform(Affine2d::translate(0., 1_000. + row as f32 * 40.)),
+                DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 90., 30.))),
+                DisplayCommand::PushLayer(CompositingLayer {
+                    opacity: 0.6,
+                    blend: BlendMode::Multiply,
+                    color_filters: Arc::from([]),
+                }),
+                DisplayCommand::PushTransform(Affine2d::translate(3., 2.)),
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0., 0., 90., 30.),
+                    color: PaintColor::Rgba(240, 0, 0, 255),
+                },
+                DisplayCommand::PopTransform,
+                DisplayCommand::PopLayer,
+                DisplayCommand::PopClip,
+                DisplayCommand::PopTransform,
+            ]);
+        }
+        scene.primitives.push(DisplayCommand::PopTransform);
+        let mut optimized = VelloCpuRenderer::new();
+        let mut reference = VelloCpuRenderer::new();
+        reference.eager_clips = true;
+        let before = optimized.render_rgba(&scene).unwrap();
+        assert_eq!(before.pixels, reference.render_rgba(&scene).unwrap().pixels);
+        assert_eq!(optimized.rasterized_clips, 0);
+        assert_eq!(reference.rasterized_clips, 64);
+        scene.primitives[1] = DisplayCommand::PushTransform(Affine2d::translate(0., -1_000.));
+        let scrolled = optimized.render_rgba(&scene).unwrap();
+        assert_eq!(
+            scrolled.pixels,
+            reference.render_rgba(&scene).unwrap().pixels
+        );
+        assert_ne!(scrolled.pixels, before.pixels);
+        assert!(optimized.rasterized_clips < 4);
     }
 
     #[test]

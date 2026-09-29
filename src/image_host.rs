@@ -24,12 +24,22 @@ pub(super) fn result_value(ctx: &mut Ctx, result: Option<LoadedImage>) -> Value 
         return Value::Null;
     };
     if let Some(state) = ctx.host_mut::<HostState>() {
-        state
+        let previous = state
             .images
             .borrow_mut()
             .insert(loaded.source, (image.width, image.height));
-        state.geom_cache.borrow_mut().epoch = u64::MAX;
-        state.dom.borrow_mut().image_changed(loaded.node_id);
+        if previous != Some((image.width, image.height)) {
+            state.geom_cache.borrow_mut().epoch = u64::MAX;
+            state.dom.borrow_mut().image_changed(loaded.node_id);
+        } else {
+            // CSS Images 3 #default-sizing: another element completing the
+            // same decoded source does not change the natural dimensions
+            // already used by layout. Its bitmap still needs presentation.
+            state
+                .dom
+                .borrow_mut()
+                .replaced_pixels_changed(loaded.node_id);
+        }
     }
     // Promise resolution must not consult an author-supplied Array/Object
     // prototype `then`: that would hand opaque image pixels to page script.

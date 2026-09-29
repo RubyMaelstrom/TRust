@@ -118,6 +118,21 @@ impl Sender {
 }
 
 impl Receiver {
+    /// Yield to native input even when producers continuously refill the queue.
+    /// The empty→nonempty wake is insufficient after a partial drain.
+    pub(super) fn wake_if_pending(&self) {
+        let pending = !self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .events
+            .is_empty();
+        if pending {
+            self.0.invalidation.request_redraw();
+        }
+    }
+
     pub(super) fn pop(&mut self) -> Option<CoreEvent> {
         let event = self
             .0
@@ -274,6 +289,23 @@ mod tests {
             panic!("expected FIFO event")
         };
         id.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn partial_drain_rearms_native_wake_without_losing_fifo() {
+        let (tx, mut rx, wakes) = counted_channel(4);
+        tx.send(semantic(1)).await.unwrap();
+        tx.send(semantic(2)).await.unwrap();
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(pop_id(&mut rx), 1);
+        rx.wake_if_pending();
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(pop_id(&mut rx), 2);
+        rx.wake_if_pending();
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        tx.send(semantic(3)).await.unwrap();
+        assert_eq!(wakes.load(Ordering::Relaxed), 3);
+        assert_eq!(pop_id(&mut rx), 3);
     }
 
     #[tokio::test]
@@ -478,7 +510,10 @@ mod tests {
                 url: "https://example.test/history".into(),
                 replace: false,
             },
-            PageEvt::KeyDefault { prevented: true },
+            PageEvt::KeyDefault {
+                prevented: true,
+                state: None,
+            },
             PageEvt::Settled,
             PageEvt::Trouble(vec!["error".into()]),
         ] {

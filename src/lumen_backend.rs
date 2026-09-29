@@ -1969,32 +1969,6 @@ mod desktop {
         Maintenance,
     }
 
-    struct InteractionTurn {
-        running: Arc<std::sync::Mutex<bool>>,
-    }
-
-    impl InteractionTurn {
-        fn begin(
-            running: &Arc<std::sync::Mutex<bool>>,
-            interrupt: &Arc<lumen::RuntimeInterrupt>,
-        ) -> Self {
-            *running.lock().unwrap_or_else(|error| error.into_inner()) = true;
-            interrupt.begin_user_interaction();
-            Self {
-                running: running.clone(),
-            }
-        }
-    }
-
-    impl Drop for InteractionTurn {
-        fn drop(&mut self) {
-            *self
-                .running
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = false;
-        }
-    }
-
     /// Spawn the production Lumen resident realm behind the actor contract
     /// shared by the terminal and desktop frontends.
     pub(crate) fn spawn_page(
@@ -2005,7 +1979,6 @@ mod desktop {
         let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(16);
-        let interaction_running = Arc::new(std::sync::Mutex::new(false));
         let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
             node: None,
             x: 0.0,
@@ -2014,7 +1987,6 @@ mod desktop {
         });
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
         let actor_interrupt = interrupt.clone();
-        let actor_running = interaction_running.clone();
         let spawned = crate::page_threads::spawn(
             std::thread::Builder::new()
                 .name(String::from("trust-page-lumen"))
@@ -2029,7 +2001,6 @@ mod desktop {
                     interaction_rx,
                     hover_rx,
                     event_tx,
-                    actor_running,
                     actor_interrupt,
                 );
                 crate::release_allocator_memory();
@@ -2040,19 +2011,11 @@ mod desktop {
             // to take its existing CSS-only fallback.
         }
         (
-            PageHandle::from_lumen_parts(
-                cmd_tx,
-                interaction_tx,
-                interaction_running,
-                hover_tx,
-                cache,
-                interrupt,
-            ),
+            PageHandle::from_lumen_parts(cmd_tx, interaction_tx, hover_tx, cache, interrupt),
             event_rx,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn page_actor(
         html: String,
         env: PageEnv,
@@ -2060,7 +2023,6 @@ mod desktop {
         mut interactions: tokio::sync::mpsc::Receiver<PageCmd>,
         mut hover: tokio::sync::watch::Receiver<PageHover>,
         events: tokio::sync::mpsc::Sender<PageEvt>,
-        interaction_running: Arc<std::sync::Mutex<bool>>,
         interrupt: Arc<lumen::RuntimeInterrupt>,
     ) {
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2172,6 +2134,8 @@ mod desktop {
         let mut deferred_host_task = None;
         let mut render_deadline = None;
         let mut last_render_opportunity = Instant::now();
+        let mut render_not_before = last_render_opportunity;
+        let mut input_burst_budget = INPUT_BURST_BUDGET;
         let mut interaction_burst_started: Option<Instant> = None;
         let mut background_service: Option<(Instant, usize)> = None;
         let mut task_gc_defer_until: Option<Instant> = None;
@@ -2211,8 +2175,11 @@ mod desktop {
             {
                 page.render_pending = true;
             }
-            if page.render_pending && render_deadline.is_none() {
+            if page.render_pending
+                && (render_deadline.is_none() || interaction_burst_started.is_some())
+            {
                 // Input need not wait an extra frame after its task finishes.
+                // Promote an already queued background rendering deadline too.
                 // Keep the ordinary-task coalescing interval for background
                 // messages/resources (HTML #event-loop-processing-model).
                 let origin = if interaction_burst_started.is_some() {
@@ -2220,7 +2187,11 @@ mod desktop {
                 } else {
                     Instant::now()
                 };
-                render_deadline = Some(origin + RENDER_INTERVAL);
+                render_deadline = Some(if interaction_burst_started.is_some() {
+                    origin + RENDER_INTERVAL
+                } else {
+                    (origin + RENDER_INTERVAL).max(render_not_before)
+                });
             }
             let render_due = render_deadline.is_some_and(|deadline| deadline <= Instant::now());
             let platform_ready = trust_bool(&mut page, "hasPlatformTask");
@@ -2246,7 +2217,7 @@ mod desktop {
             let yield_interactions = background_service.is_some_and(|(started, count)| {
                 count == 0 || (count < 8 && started.elapsed() < BACKGROUND_SERVICE_BUDGET)
             }) || interaction_burst_started
-                .is_some_and(|started| started.elapsed() >= INPUT_BURST_BUDGET);
+                .is_some_and(|started| started.elapsed() >= input_burst_budget);
             if !yield_interactions && let Ok(command) = interactions.try_recv() {
                 immediate = Some(Wake::Interaction(Some(command)));
             } else if !yield_interactions && hover.has_changed().unwrap_or(false) {
@@ -2341,20 +2312,20 @@ mod desktop {
             // requestAnimationFrame stream can keep an interaction queued in the HTML task
             // scheduler forever.
             let background_service_was_active = background_service.is_some();
-            let _interaction = match &wake {
+            match &wake {
                 Wake::Interaction(Some(_)) | Wake::Hover(Some(_)) => {
                     task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
                     page.engine.defer_task_garbage_collection(true);
                     background_service = None;
                     interaction_burst_started.get_or_insert_with(Instant::now);
-                    Some(InteractionTurn::begin(&interaction_running, &interrupt))
+                    interrupt.begin_user_interaction();
                 }
                 Wake::Cmd(Some(command)) if command.is_user_interaction() => {
                     task_gc_defer_until = Some(Instant::now() + INPUT_GC_QUIET_INTERVAL);
                     page.engine.defer_task_garbage_collection(true);
                     background_service = None;
                     interaction_burst_started.get_or_insert_with(Instant::now);
-                    Some(InteractionTurn::begin(&interaction_running, &interrupt))
+                    interrupt.begin_user_interaction();
                 }
                 _ => {
                     interaction_burst_started = None;
@@ -2363,9 +2334,8 @@ mod desktop {
                             && started.elapsed() < BACKGROUND_SERVICE_BUDGET)
                             .then_some((started, count + 1));
                     }
-                    None
                 }
-            };
+            }
 
             if let Some(trace) = page.task_trace.as_mut() {
                 trace.turns += 1;
@@ -2538,15 +2508,17 @@ mod desktop {
                     }
                     if animation_frame {
                         last_render_opportunity = Instant::now();
+                        input_burst_budget = rendering_input_budget(timer_started);
+                        render_not_before = defer_expensive_rendering(&mut page, timer_started);
                         render_deadline = None;
                         rearm_background_service_after_render(
                             &mut background_service,
                             background_service_was_active,
                         );
                     }
-                    if !animation_frame {
-                        prefer_timer = false;
-                    }
+                    // A continuously overdue rAF must not keep a ready
+                    // networking completion behind the timer preference.
+                    prefer_timer = false;
                     prefer_command = true;
                 }
                 Wake::Lifecycle => {
@@ -2570,6 +2542,7 @@ mod desktop {
                     prefer_command = true;
                 }
                 Wake::Render => {
+                    let render_started = Instant::now();
                     render_deadline = None;
                     prepare_unbounded_task(&interrupt);
                     let _animation_sample = CssAnimationSample::new(page.engine.ctx());
@@ -2585,6 +2558,8 @@ mod desktop {
                         break;
                     }
                     last_render_opportunity = Instant::now();
+                    input_burst_budget = rendering_input_budget(render_started);
+                    render_not_before = defer_expensive_rendering(&mut page, render_started);
                     // Rendering must leave time for the other task sources,
                     // including multiple already-ready short callbacks.
                     rearm_background_service_after_render(
@@ -2610,6 +2585,36 @@ mod desktop {
             Some(wait) => tokio::time::sleep(wait).await,
             None => std::future::pending::<()>().await,
         }
+    }
+
+    fn rendering_input_budget(started: Instant) -> Duration {
+        // HTML #event-loop-processing-model allows preferring user input.
+        // When a frame already costs more than two display intervals, let a
+        // short burst of queued edits share it. Bound the preference at 100 ms
+        // so continuously arriving input still yields to other task sources.
+        started
+            .elapsed()
+            .clamp(INPUT_BURST_BUDGET, Duration::from_millis(100))
+    }
+
+    fn defer_expensive_rendering(page: &mut LumenPage, started: Instant) -> Instant {
+        // HTML #rendering-opportunity is implementation-defined. Reserve time
+        // comparable to the preceding frame for other task sources, bounded
+        // so background changes still become visible. Native input retains
+        // its immediate acknowledgement/render path. Never sleep inside a task
+        // or skip its microtask checkpoint to enforce this cadence.
+        let delay = started
+            .elapsed()
+            .clamp(RENDER_INTERVAL, Duration::from_millis(250));
+        let until = Instant::now() + delay;
+        let now = trust_number(page, "now").unwrap_or(0.0);
+        let _ = call_trust(
+            page,
+            "deferRenderingUntil",
+            &[Value::Num(now + delay.as_secs_f64() * 1000.0)],
+            "rendering opportunity",
+        );
+        until
     }
 
     fn rearm_background_service_after_render(
@@ -3704,7 +3709,10 @@ mod desktop {
             // The authored key action already activated this submitter. Acknowledge
             // the key before submission so subsequent key-up/default replies stay FIFO.
             if events
-                .blocking_send(PageEvt::KeyDefault { prevented: true })
+                .blocking_send(PageEvt::KeyDefault {
+                    prevented: true,
+                    state: None,
+                })
                 .is_err()
             {
                 return false;
@@ -3717,9 +3725,28 @@ mod desktop {
                 })
                 .is_ok();
         }
+        let state = if node.is_some() {
+            node.and_then(|node| {
+                call_trust(
+                    page,
+                    "formEditingState",
+                    &[Value::Num(node as f64)],
+                    "text key acknowledgement",
+                )
+            })
+            .and_then(|value| value_to_string(page, &value))
+            .and_then(|json| {
+                serde_json::from_str::<Option<crate::js::EditableState>>(&json)
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
         events
             .blocking_send(PageEvt::KeyDefault {
                 prevented: prevented || edit_key.is_some(),
+                state,
             })
             .is_ok()
     }
@@ -4034,7 +4061,11 @@ mod desktop {
                     "scroll",
                 );
                 checkpoint(page, "scroll");
-                finish_task(page, events)
+                // CSSOM View #scrolling-events queues notifications per box.
+                // Scroll positions update immediately; dispatch/render waits
+                // for the rendering opportunity, allowing wheel bursts and
+                // following keys/clicks to progress without one layout per tick.
+                finish_internal_task(page, events)
             }
             PageCmd::Hover {
                 node,
@@ -4087,7 +4118,7 @@ mod desktop {
                         "element scroll",
                     );
                     checkpoint(page, "element scroll");
-                    finish_task(page, events)
+                    finish_internal_task(page, events)
                 } else {
                     events.blocking_send(PageEvt::Settled).is_ok()
                 }
@@ -4143,9 +4174,12 @@ mod desktop {
                         &[],
                         "decoded image load scan",
                     );
-                    let _ = call_trust(page, "updateIntersections", &[], "image geometry");
                     checkpoint(page, "image geometry");
-                    finish_task(page, events)
+                    // HTML #update-the-rendering and Intersection Observer
+                    // §3.4.1 update layout/observations at the next rendering
+                    // opportunity. Resource completions can share that pass;
+                    // an explicit CSSOM read still resolves geometry on demand.
+                    finish_internal_task(page, events)
                 } else {
                     true
                 }
@@ -4894,7 +4928,7 @@ mod desktop {
                 let mut acknowledged = false;
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::KeyDefault { prevented }) => {
+                        Some(PageEvt::KeyDefault { prevented, .. }) => {
                             assert!(
                                 prevented && !acknowledged,
                                 "keydown cancellation acknowledgement"
@@ -4968,7 +5002,7 @@ mod desktop {
                     .unwrap();
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::KeyDefault { prevented }) => {
+                        Some(PageEvt::KeyDefault { prevented, .. }) => {
                             assert!(!prevented, "page unexpectedly canceled PageDown");
                             break;
                         }
@@ -4983,6 +5017,54 @@ mod desktop {
             })
             .await
             .expect("continuous rendering starved a native page key");
+        }
+
+        #[tokio::test]
+        async fn continuous_rendering_allows_resource_completions_to_progress() {
+            // HTML #event-loop-processing-model: an overdue animation frame
+            // must yield to ready networking tasks, including their promise
+            // reactions, without waiting for the animation to stop.
+            let html = r#"<body><output>waiting</output><script>
+                let frames = 0, loaded = 0, checkpoints = 0;
+                function frame() {
+                    if (++frames === 1) {
+                        for (let i = 0; i < 4; ++i) {
+                            const script = document.createElement('script');
+                            script.src = 'data:text/javascript,' + encodeURIComponent(
+                                'loaded++;Promise.resolve().then(()=>{checkpoints++;});//' + i);
+                            document.body.appendChild(script);
+                        }
+                    }
+                    const end = performance.now() + 20;
+                    while (performance.now() < end) {}
+                    if (loaded === 4) {
+                        document.querySelector('output').textContent =
+                            checkpoints === loaded ? 'loaded during animation' : 'missing checkpoint';
+                    } else {
+                        requestAnimationFrame(frame);
+                    }
+                }
+                requestAnimationFrame(frame);
+            </script>"#;
+            let (_handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(!html.contains(">missing checkpoint</output>"));
+                            if html.contains(">loaded during animation</output>") {
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed before resource completions"),
+                    }
+                }
+            })
+            .await
+            .expect("animation starved ready resource completions");
         }
 
         #[tokio::test]
@@ -5084,6 +5166,90 @@ mod desktop {
             })
             .await
             .expect("click scroll animation timed out");
+        }
+
+        #[tokio::test]
+        async fn native_scroll_bursts_coalesce_notifications_before_following_keys() {
+            let html = r#"<body style="height:3000px"><input id=editor>
+                <div id=box style="height:50px;overflow:auto"><div style="height:1000px">scroll</div></div>
+                <output id=result></output><output id=after></output><script>
+                const box=document.getElementById('box'); let nested=0, viewport=0;
+                box.onscroll=()=>nested++; document.addEventListener('scroll',()=>viewport++);
+                document.getElementById('editor').onkeydown=()=>{
+                    document.getElementById('result').textContent='SCROLLED:'+box.scrollTop+':'+scrollY+':'+nested+':'+viewport;
+                    requestAnimationFrame(()=>document.getElementById('after').textContent='DELIVERED:'+nested+':'+viewport);
+                };
+                </script></body>"#;
+            let dom = Dom::parse_document(html);
+            let node = dom.get_by_id("box").unwrap();
+            let editor = dom.get_by_id("editor").unwrap();
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                // Fit the whole burst and its following key in the bounded
+                // interaction lane without waiting for author handlers.
+                for i in 1..=7 {
+                    handle
+                        .try_send_user(PageCmd::SetScroll {
+                            node,
+                            top: f64::from(i * 10),
+                            left: 0.,
+                        })
+                        .unwrap();
+                    handle
+                        .try_send_user(PageCmd::Scroll {
+                            x: 0.,
+                            y: f64::from(i * 10),
+                        })
+                        .unwrap();
+                }
+                handle
+                    .try_send_user(PageCmd::Key {
+                        node: Some(editor),
+                        input: crate::core::KeyInput {
+                            key: crate::core::Key::Character("x".into()),
+                            code: "KeyX".into(),
+                            location: 0,
+                            state: crate::core::KeyState::Pressed,
+                            modifiers: Default::default(),
+                            repeat: false,
+                            composing: false,
+                        },
+                    })
+                    .unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if let Some((_, result)) = html.split_once(">SCROLLED:") {
+                                let parts: Vec<_> =
+                                    result.split('<').next().unwrap().split(':').collect();
+                                assert_eq!(&parts[..2], ["70", "70"]);
+                                assert!(
+                                    parts[2].parse::<usize>().unwrap() < 7,
+                                    "nested wheel samples forced rendering: {result}"
+                                );
+                                assert!(
+                                    parts[3].parse::<usize>().unwrap() < 7,
+                                    "viewport wheel samples forced rendering: {result}"
+                                );
+                                if let Some((_, delivered)) = html.split_once(">DELIVERED:") {
+                                    let counts: Vec<usize> = delivered.split('<').next().unwrap()
+                                        .split(':').map(|count| count.parse().unwrap()).collect();
+                                    assert!(counts.iter().all(|count| (1..=7).contains(count)),
+                                        "scroll notifications must run before animation callbacks: {delivered}");
+                                    break;
+                                }
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor closed before queued key"),
+                    }
+                }
+            })
+            .await
+            .expect("native scrolling delayed its following key");
         }
 
         #[tokio::test]
@@ -5432,7 +5598,7 @@ mod desktop {
                 let (mut keys, mut renders, mut complete) = (0, 0, false);
                 while keys < 8 || !complete {
                     match events.recv().await {
-                        Some(PageEvt::KeyDefault { prevented }) => {
+                        Some(PageEvt::KeyDefault { prevented, .. }) => {
                             assert!(prevented);
                             keys += 1;
                         }
@@ -5526,7 +5692,18 @@ mod desktop {
                 let mut painted = false;
                 while keys < 12 || !painted {
                     match events.recv().await {
-                        Some(PageEvt::KeyDefault { prevented }) => {
+                        Some(PageEvt::KeyDefault { prevented, state }) => {
+                            let state = state
+                                .expect("native editing acknowledgement must not wait for layout");
+                            assert_eq!(state.node, node);
+                            let (value, start, end) = match keys {
+                                0 => ("[QaZ]", 2, 2),
+                                1 => ("[QaZ]", 1, 2),
+                                2..=7 => ("[baZ]", 2, 2),
+                                _ => ("[b🦀aZ]", 4, 4),
+                            };
+                            assert_eq!(state.text, value, "key {keys}");
+                            assert_eq!((state.selection.start, state.selection.end), (start, end));
                             assert!(prevented, "actor-owned default must not be applied twice");
                             keys += 1;
                         }
@@ -5689,7 +5866,7 @@ mod desktop {
                                 assert!(rendered);
                                 break;
                             }
-                            Some(PageEvt::KeyDefault { prevented }) if enter => {
+                            Some(PageEvt::KeyDefault { prevented, .. }) if enter => {
                                 assert!(prevented && rendered);
                                 break;
                             }
@@ -6089,6 +6266,61 @@ mod desktop {
             .await
             .expect("decoded image load event timed out");
             assert!(loaded.contains("loaded:true"), "{loaded}");
+        }
+
+        #[test]
+        fn decoded_images_share_the_next_rendering_opportunity() {
+            let html = r#"<!doctype html><style>img{display:block;width:40px;height:auto}</style>
+                <img id="first" src="/first.png"><img id="second" src="/second.png">
+                <script>
+                    const observed = [];
+                    new ResizeObserver(entries => {
+                        observed.push(entries.map(entry => entry.contentRect.height).join(','));
+                    }).observe(document.getElementById('second'));
+                </script>"#;
+            let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+            let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut page = load_page(
+                html,
+                PageEnv::bare(DEFAULT_URL),
+                host_tx,
+                &mut host_rx,
+                None,
+                interrupt.clone(),
+            )
+            .unwrap_or_else(|outcome| panic!("fixture load failed: {outcome:?}"));
+            let (_, rendered, _) = render_with_observers(&mut page);
+            page.last_render = Some(rendered);
+            let passes = crate::layout2::layout_pass_count();
+            let (events, mut receiver) = tokio::sync::mpsc::channel(16);
+            for (source, dimensions) in [("first.png", (80, 40)), ("second.png", (80, 120))] {
+                assert!(dispatch_command(
+                    &mut page,
+                    PageCmd::ImageSizes(vec![(
+                        format!("https://example.com/{source}"),
+                        dimensions
+                    )]),
+                    &events,
+                    &interrupt,
+                ));
+                assert_eq!(crate::layout2::layout_pass_count(), passes);
+                while let Ok(event) = receiver.try_recv() {
+                    assert!(!matches!(
+                        event,
+                        PageEvt::Updated { .. } | PageEvt::Patched { .. }
+                    ));
+                }
+            }
+            assert!(page.render_pending);
+            render_with_observers(&mut page);
+            assert_eq!(crate::layout2::layout_pass_count(), passes + 1);
+            let value = evaluate_task(
+                &mut page,
+                "[document.getElementById('first').getBoundingClientRect().height, document.getElementById('second').getBoundingClientRect().height, observed.at(-1)].join(':')",
+                "decoded geometry",
+            ).unwrap();
+            assert_eq!(value_string(&mut page.engine, &value), "20:60:60");
+            assert!(page.outcome.errors.is_empty(), "{:?}", page.outcome.errors);
         }
 
         #[tokio::test]
@@ -15333,6 +15565,82 @@ mod tests {
             &fragments,
             cache.borrow().fragments.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn deferred_rendering_keeps_ordinary_timers_runnable() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document("<body>")));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        eval(
+            &mut engine,
+            r#"
+            globalThis.order = [];
+            const start = __trust.now();
+            requestAnimationFrame(() => order.push('frame'));
+            setTimeout(() => order.push('timer'), 50);
+            __trust.deferRenderingUntil(start + 100000);
+            __trust.tickTo(start + 1000);
+            if (__trust.nextDeadlineIsAnimationFrame() !== true) throw Error('frame lost');
+            if (__trust.tickTo(start + 2000)) throw Error('frame ran too early');
+            __trust.tickTo(start + 100001);
+        "#,
+            "deferred rendering and timer sources",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "order.join(',')"), "timer,frame");
+    }
+
+    #[test]
+    fn repeated_image_completion_reuses_known_intrinsic_geometry() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<style>img{display:block;width:40px;height:auto}</style><img id=first><img id=second>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        let source = crate::canvas::Canvas::new(2, 1, true).unwrap().data_url();
+        eval(
+            &mut engine,
+            &format!(
+                r#"
+            globalThis.source = {source:?};
+            document.getElementById('first').src = source;
+        "#
+            ),
+            "first decoded source",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        eval(
+            &mut engine,
+            r#"
+            document.getElementById('second').src = source;
+        "#,
+            "second element requesting the same source",
+        )
+        .unwrap();
+        let height = "String(document.getElementById('second').getBoundingClientRect().height)";
+        assert_eq!(string_value(&mut engine, height), "20");
+        let passes = crate::layout2::layout_pass_count();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..4 {
+            eval(
+                &mut engine,
+                "__trust.tickTo(__trust.now() + 1)",
+                "image completion task",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(string_value(&mut engine, height), "20");
+        assert_eq!(crate::layout2::layout_pass_count(), passes);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "String(document.getElementById('second').complete && document.getElementById('second').naturalWidth === 2)"
+            ),
+            "true"
+        );
     }
 
     #[test]
@@ -31905,6 +32213,127 @@ mod tests {
             Some(0.0)
         );
         assert_eq!(string_value(&mut engine, "String(counter)"), "42");
+    }
+
+    #[test]
+    fn queued_link_click_preserves_running_task_and_controlled_input() {
+        // HTML #event-loop-processing-model / #user-interaction-task-source:
+        // input is queued behind the running task and its microtask checkpoint.
+        // DOM #dispatching-events: a hyperlink's click can cancel navigation.
+        // Killing the current callback first skips its finally block (HTML
+        // #abort-a-running-script), stranding application scheduler state.
+        struct QueuedClick {
+            handle: crate::js::PageHandle,
+            node: usize,
+            reserved: bool,
+        }
+        for reserved in [false, true] {
+            let dom = Rc::new(RefCell::new(Dom::parse_document(
+                "<a id=link href=/next>Next</a><input id=editor>",
+            )));
+            let node = dom.borrow().get_by_id("link").unwrap();
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            let interrupt = engine.interrupt_handle();
+            let (commands, _commands) = tokio::sync::mpsc::channel(16);
+            let (interactions, mut queued) = tokio::sync::mpsc::channel(16);
+            let (hover, _hover) = tokio::sync::watch::channel(crate::js::PageHover {
+                node: None,
+                x: 0.0,
+                y: 0.0,
+                metadata: Default::default(),
+            });
+            let handle = crate::js::PageHandle::from_lumen_parts(
+                commands,
+                interactions,
+                hover,
+                Default::default(),
+                interrupt.clone(),
+            );
+            engine.ctx().op_state().put(QueuedClick {
+                handle,
+                node,
+                reserved,
+            });
+            engine.define_global("queueNativeLinkClick", 0, |ctx, _, _| {
+                let click = ctx.host::<QueuedClick>().unwrap();
+                if click.reserved {
+                    let permit = click
+                        .handle
+                        .user_input_sender()
+                        .try_reserve_owned()
+                        .unwrap();
+                    click
+                        .handle
+                        .send_reserved_user(permit, crate::js::PageCmd::Click(click.node));
+                } else {
+                    click.handle.try_send_navigation_click(click.node).unwrap();
+                }
+                Ok(Value::Undefined)
+            });
+            eval(
+                &mut engine,
+                r#"
+                const order=[], state={running:false,ready:false,value:''};
+                document.getElementById('link').onclick=e=>{
+                    e.preventDefault();
+                    order.push('click');
+                    if(state.running || !state.ready) throw Error('unfinished task');
+                    history.pushState(null,'','/next');
+                };
+                document.getElementById('editor').oninput=e=>{
+                    order.push('input');
+                    if(!state.running && state.ready) state.value=e.target.value;
+                    e.target.value=state.value;
+                };
+                setTimeout(()=>{
+                    state.running=true;order.push('start');
+                    try { queueNativeLinkClick();order.push('finish'); }
+                    finally { state.running=false;order.push('finally'); }
+                    queueMicrotask(()=>{state.ready=true;order.push('microtask')});
+                },0);
+                "#,
+                "queued navigation setup",
+            )
+            .unwrap();
+            let deadline = call_trust_method(&mut engine, "now", &[])
+                .as_num_opt()
+                .unwrap()
+                + 1.0;
+            let task = dispatch_timer_task_to(&mut engine, deadline);
+            // Clear the old implementation's interrupt so a failure can still
+            // inspect the page state rather than interrupt the assertion itself.
+            interrupt.begin_user_interaction();
+            assert!(
+                matches!(task, Ok(true)),
+                "queued click aborted its preceding task"
+            );
+            run_microtask_checkpoint(&mut engine);
+            let crate::js::PageCmd::Click(target) = queued.try_recv().unwrap() else {
+                panic!("expected queued click");
+            };
+            call_trust_method(&mut engine, "click", &[Value::Num(target as f64)]);
+            run_microtask_checkpoint(&mut engine);
+            eval(
+                &mut engine,
+                "__trust.formInsertText(document.getElementById('editor').__id,'abc')",
+                "controlled input after navigation",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "order.join(',')"),
+                "start,finish,finally,microtask,click,input"
+            );
+            assert_eq!(string_value(&mut engine, "location.pathname"), "/next");
+            assert_eq!(
+                string_value(&mut engine, "document.getElementById('editor').value"),
+                "abc"
+            );
+            assert_eq!(
+                string_value(&mut engine, "String(__trust.takeNavigationRequest())"),
+                "null"
+            );
+        }
     }
 
     #[test]

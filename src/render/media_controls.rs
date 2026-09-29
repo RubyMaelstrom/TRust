@@ -156,6 +156,21 @@ impl Scene {
         scroll: CssPoint,
         elapsed_seconds: f32,
     ) {
+        self.append_browser_media_with_scroll_offsets(
+            page,
+            scroll,
+            elapsed_seconds,
+            &HashMap::new(),
+        );
+    }
+
+    pub fn append_browser_media_with_scroll_offsets(
+        &mut self,
+        page: &PagePaint,
+        scroll: CssPoint,
+        elapsed_seconds: f32,
+        offsets: &HashMap<usize, CssPoint>,
+    ) {
         if page.browser_media.is_empty() {
             return;
         }
@@ -166,7 +181,12 @@ impl Scene {
                 self.content_viewport.x - scroll.x,
                 self.content_viewport.y - scroll.y,
             )));
-        self.append_sticky_commands(&page.browser_media, page, scroll, elapsed_seconds);
+        self.append_sticky_commands(
+            &page.browser_media,
+            &scroll_container_index(page, offsets),
+            scroll,
+            elapsed_seconds,
+        );
         self.primitives.push(Primitive::PopTransform);
         self.primitives.push(Primitive::PopClip);
     }

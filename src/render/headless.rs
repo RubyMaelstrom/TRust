@@ -1112,6 +1112,11 @@ mod tests {
                 ),
             ),
         ];
+        let cases = if let Some(path) = std::env::var_os("TRUST_DESKTOP_BENCH_HTML") {
+            vec![("local-capture", std::fs::read_to_string(path).unwrap())]
+        } else {
+            cases.into_iter().collect()
+        };
         let iterations = std::env::var("TRUST_DESKTOP_BENCH_ITERATIONS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -1137,6 +1142,7 @@ mod tests {
             let mut cpu_total = Duration::ZERO;
             let mut hybrid_total = Duration::ZERO;
             let mut full_total = Duration::ZERO;
+            let mut interaction_total = Duration::ZERO;
             let mut cpu_renderer = VelloCpuRenderer::new();
             let mut full_cpu_renderer = VelloCpuRenderer::new();
             for iteration in 0..iterations {
@@ -1174,6 +1180,10 @@ mod tests {
                 scene.append_page(&layout.paint, CssPoint::default());
                 compose_total += compose_started.elapsed();
 
+                let interaction_started = Instant::now();
+                std::hint::black_box(scene.page_hit_at(CssPoint::new(400., 300.)));
+                interaction_total += interaction_started.elapsed();
+
                 let cpu_started = Instant::now();
                 cpu_renderer.render_rgba(&scene).unwrap();
                 cpu_total += cpu_started.elapsed();
@@ -1201,7 +1211,7 @@ mod tests {
             }
             let per = |duration: Duration| duration.as_secs_f64() * 1_000.0 / f64::from(iterations);
             eprintln!(
-                "{name:18} parse={:7.2}ms layout+paint={:8.2}ms compose={:7.2}ms cpu={:8.2}ms hybrid+readback={:8.2}ms full-cpu={:8.2}ms",
+                "{name:18} parse={:7.2}ms layout+paint={:8.2}ms compose={:7.2}ms cpu={:8.2}ms hybrid+readback={:8.2}ms full-cpu={:8.2}ms hit={:7.2}ms",
                 parse.as_secs_f64() * 1_000.0,
                 per(layout_total),
                 per(compose_total),
@@ -1212,6 +1222,7 @@ mod tests {
                     f64::NAN
                 },
                 per(full_total),
+                per(interaction_total),
             );
         }
 
