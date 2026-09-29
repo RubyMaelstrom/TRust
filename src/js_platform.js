@@ -8317,9 +8317,32 @@
         }
         get [Symbol.toStringTag]() { return "DOMImplementation"; }
     }
+    // HTML #dom-document-location; Web IDL #PutForwards / #LegacyUnforgeable.
+    // Assignment forwards to the same Location object's href, including from
+    // an inline handler that then cancels the anchor's default navigation.
+    function documentLocation() {
+        if (!(this instanceof Document)) throw new TypeError("Expected a Document");
+        if (this.__frame) {
+            if (this.__destroyed || __dom_frame_document(this.__frame.__id) !== this.__id ||
+                !this.__frame.isConnected || this.__frame.ownerDocument.location === null) return null;
+            return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location;
+        }
+        return this.__id === 0 ? g.location : null;
+    }
+    function setDocumentLocation(value) {
+        if (!(this instanceof Document)) throw new TypeError("Expected a Document");
+        const target = this.location;
+        // PutForwards throws when the getter returns null (an inactive Document).
+        if (target === null) throw new TypeError("Document has no active Location");
+        target.href = value;
+    }
     class Document extends Node {
         constructor(id) {
             super(id === undefined ? __dom_create_document("application/xml") : id);
+            Object.defineProperty(this, "location", {
+                get: documentLocation, set: setDocumentLocation,
+                enumerable: true, configurable: false,
+            });
             if (id === undefined) {
                 rememberWrapper(this.__id, this);
                 documentURLs.set(this, "about:blank");
@@ -8398,7 +8421,6 @@
             if (slot[2]) throw new DOMException("Cookie access requires a non-opaque origin.", "SecurityError");
             __cookie_set(slot[0], slot[1], slot[3], String(v));
         }
-        get location() { return g.location; }
         // HTML §2.4.3: the document base URL is used by relative URL APIs,
         // including new URL("_framework/dotnet.js", document.baseURI).
         // document.URL is the document URL and may differ when <base> exists.
@@ -8670,10 +8692,6 @@
         get readyState() { return this.__frame.__trustReadyState || "complete"; }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
-        get location() {
-            if (__dom_frame_document(this.__frame.__id) !== this.__id || !this.__frame.isConnected) return null;
-            return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location;
-        }
         get URL() { return documentURLs.get(this); }
         get documentURI() { return this.URL; }
         get referrer() { return documentReferrers.get(this) || ""; }
