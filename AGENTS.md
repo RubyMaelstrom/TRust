@@ -116,7 +116,7 @@ The project favors:
   `src/tls.rs`, and `src/ws.rs`: protocol implementations.
 - `vendor/`: owned forks of wasmi and frontend/font/image dependencies.
   The Lumen engine is maintained separately at the sibling
-  `../Lumen` checkout (integration revision below). A bug whose correct
+  `../Lumen` checkout. A bug whose correct
   fix belongs in an engine should be fixed in its engine repository rather
   than hidden behind a downstream workaround.
 
@@ -168,9 +168,8 @@ benefit both frontends.
 
 ## Development and Verification
 
-Keep the sibling Lumen checkout at integration revision
-`c8af769dd19b2abc8bbec540e6cdc7c544899080`. Cargo uses
-`../Lumen/crates/lumen` directly; TRust and Lumen are developed together while
+Cargo uses the sibling Lumen checkout (`../Lumen/crates/lumen`) directly;
+TRust and Lumen are developed together on their `main` branches while
 host-boundary work is upstreamed. TRust supplies networking and TLS.
 
 Build and test from the repository root:
@@ -201,7 +200,7 @@ acceptance testing and local installation stay fast. Public numbered releases
 use `cargo build --profile numbered-release --locked`; that explicit profile
 uses Fat-LTO and one codegen unit and is not part of the ordinary development
 or local-promotion cycle. Native ARM64/x86-64 Linux and Windows cross-build
-instructions are in `INSTALL.md`; use the same Lumen revision for each. With Wine installed,
+instructions are in `INSTALL.md`; use the same Lumen checkout for each. With Wine installed,
 `cargo xwin test --target x86_64-pc-windows-msvc` runs the Windows tests.
 
 Focused checks and diagnostics:
