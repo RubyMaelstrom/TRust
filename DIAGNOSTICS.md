@@ -463,6 +463,7 @@ own by design.
 | `LUMEN_FN_PROFILE` | presence flag | Opt-in interpreted function timing, including compiled execution entered through the interpreter; reports inclusive/self time and callers. Each reported entry also includes its internal compilation, activation, scope and same-realm state sampled on the first entry in that batch; this is not a count of fast-path misses. Adds overhead and is not an uninstrumented wall-time benchmark. `LUMEN_FN_PROFILE_FLUSH_SECONDS` sets the minimum elapsed time before a completed call can flush a batch. |
 | `LUMEN_FN_PROFILE_SOURCE` | presence flag | With function profiling, include up to 16,384 source characters for each reported hot function (at most 32 per batch). This can expose private page code; keep captures local. |
 | `LUMEN_JIT_CODE_BUDGET_MB` | integer, 1–1024 MiB | Process-wide requested executable-byte cap shared by JavaScript and native RegExp code. Read once; invalid values use the default (128 MiB). It does not reserve that much memory up front. The cap excludes page rounding and non-executable metadata. Function profiles and `LUMEN_PERF_METRICS` report live requested bytes, limit and rejected reservations. JavaScript bodies deferred for budget pressure retry only when their requested capacity becomes available; unsupported bodies remain on the checked VM. No live code is evicted or patched. |
+| `LUMEN_JIT_NO_JSCVT` | presence flag | ARM64 generated code uses the portable guarded ToInt32 sequence (with its checked-helper fallback) for bitwise operators even when the CPU implements FEAT_JSCVT (`fjcvtzs`). Read once per process. Use it to compare the two code paths or to rule out the instruction when diagnosing a numeric difference; results must be identical. |
 | `LUMEN_GC_LOG` | presence flag | Logs post-collection object counts at allocation and task-boundary collections, with retained Realm, template, pin and host-settings counts. A task-boundary reclaimed count excludes objects already released by reference counting while the task unwound. |
 | `LUMEN_GC_DUMP` | presence flag | Dumps bounded root-property/scope-name samples, object-kind and initial-root counts, root-array size buckets, kept/pool counts, largest array length and the current stack. Reports the six most frequent function bodies among at most 1,024 sampled distinct bodies, with omitted-instance counts and names capped at 80 characters. Counts describe the pre-sweep snapshot, not the final live graph. Uses internal metadata without invoking author hooks; may expose private names, so keep captures local. Adds diagnostic traversal overhead. |
 | `LUMEN_GC_DUMP_MIN_OBJECTS` | non-negative integer | With `LUMEN_GC_DUMP`, skip snapshots below this object count. Missing/invalid values use zero. Useful for restricting output to large-heap pressure events. |
@@ -846,6 +847,105 @@ wall-time thresholds.
 
 See [Layout performance and reuse](docs/layout-performance.md) for the reuse
 contracts, measurements, standards references, and remaining limits.
+
+## JavaScript engine profiling
+
+Two scripts in `tools/` measure Lumen from the outside, through either the Lumen
+CLI (`../Lumen`, `lumen FILE.js`) or a TRust binary such as `trust-headless`. They
+add no engine input of their own and change no behavior. Both require Linux; the
+sampler needs `kernel.perf_event_paranoid` of 2 or lower (it samples only user
+space). Run timing work on an otherwise idle machine and keep losses in the record.
+
+### `tools/psample.py`: sampling profiler
+
+```sh
+# Frame pointers make call chains usable; keep this build in its own target directory.
+(cd ../Lumen && RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --release -p lumen --features embed --bin lumen --target-dir target/fp)
+tools/psample.py /tmp/profile.txt --jitmap -- taskset -c 5 ../Lumen/target/fp/release/lumen bench.js
+tools/psample.py /tmp/page.txt -- taskset -c 5 target/release/trust-headless --settle 3 "file://$PWD/page.html"
+```
+
+The sampler starts the command stopped, attaches a `perf_event_open` task-clock
+event (default 4,000 Hz, `--freq`), resumes it, and records each sample's user
+instruction pointer and frame-pointer call chain (default 24 frames, `--depth`)
+until the process exits. It then symbolizes the samples against the mapped
+executables' ELF symbol tables (`nm`/`readelf`, demangled with `rustfilt` or
+`c++filt`) and writes one report file:
+
+* self and inclusive percentages, the leading callers of the hottest functions,
+  and the most frequent five-frame stacks;
+* an approximate category rollup (JIT code, JIT helper bridges, calls/frames,
+  property access, elements, allocation, reference counting, side tables,
+  strings, GC). Categories are name heuristics, useful for direction only.
+
+Without frame pointers only self times are reliable. The command's stdout is
+left alone. Mapping snapshots are taken every 0.5 s, so very short runs may
+misattribute late JIT code.
+
+`--jitmap` runs the command with `LUMEN_JIT_MAP=1` and redirects its stderr to
+`<report>.jitmap`. Samples in anonymous executable memory are then charged to
+`[jit <first local names>] pc<N> <op>`: the Lumen JIT function (named by its first
+four local slots) and the bytecode operation whose machine code contains the
+sample. Code between two operation offsets is charged to the earlier operation, so
+fused templates and the shared call-finish stub appear under a neighboring op.
+`LUMEN_JIT_MAP` is presence-only and ARM64-only: at each native compilation it
+prints `[jit-map-range] <base> <len> <names>` and one
+`[jit-map-pc] <base> <offset> <pc> <op> <names>` line per operation to stderr.
+Without `--jitmap`, generated code is reported as `[jit]`.
+
+Two environment inputs to the script add instruction-level detail:
+
+| Input | Value | Output |
+|---|---|---|
+| `PSAMPLE_HOT` | substring of a symbol name | Per-instruction histogram for matching functions, as executable virtual addresses for `objdump -d --start-address=...`. Entries below 0.1% of samples are omitted. |
+| `PSAMPLE_JITHOT` | substring of a JIT function's local names (needs `--jitmap`) | Per-offset histogram inside matching generated functions. Entries below 0.05% of samples are omitted. |
+
+To read generated code at those offsets, run the same script with
+`LUMEN_JIT_CODEDUMP=<substring>` (ARM64 only; also printed by `lumen --help`). It
+prints `[jit-codedump] fn(<names>) <N> words` followed by one hex instruction word
+per line for every chunk whose first four local names contain the substring. Any
+value also prints a `[jit-map] fn(<names>) base=<address> len=<bytes>` line per
+chunk. Write the words little-endian to a file and disassemble it with
+`objdump -D -b binary -m aarch64 FILE`. Base addresses change from run to run;
+take a dump and its map from the same run.
+
+### `tools/js_ab.py`: interleaved A/B timing
+
+```sh
+tools/js_ab.py --base ../Lumen/target/base/release/lumen \
+  --cand ../Lumen/target/release/lumen -n 5 --node bench.js other.js
+```
+
+Runs every script once per engine per round (default 3, `-n`), alternating the
+engine order between rounds and pinning with `taskset -c 5` (`--cpu`). Every
+stdout line of the form `name: <number> ...` is a measurement; the report gives
+the per-engine median and the candidate/baseline ratio (below 1 is faster for
+times, above 1 is better for scores). `--node` adds a Node.js reference column.
+Build the baseline and candidate with the same Cargo profile. Benchmarks should
+print through `typeof print === "function" ? print : console.log`.
+
+The Lumen CLI installs Lumen's own size-class allocator, while TRust installs
+mimalloc (the default `mimalloc` feature). For allocation-heavy comparisons,
+measure the browser build as well: the CLI can overstate allocation costs.
+
+### Lumen allocation measurements
+
+From `../Lumen`, two ignored Lumen tests print object-allocation costs and type
+sizes without JavaScript dispatch:
+
+```sh
+taskset -c 5 cargo test --release -p lumen --lib object_alloc_bench -- --ignored --nocapture
+cargo test --release -p lumen --lib object_layout_sizes -- --ignored --nocapture
+```
+
+`object_alloc_bench` reports nanoseconds per operation for object creation and
+destruction, templated creation, retained allocation and release, a raw `Rc`
+baseline, weak-pointer creation, a native stack probe, collector-registry churn,
+heap-handle cloning, `Props` creation, and active-heap lookup. Its filter also
+matches the second test, which lives in the same module. `object_layout_sizes`
+prints the sizes of `Object`, `Props`, `Callable`, `Exotic`, `Property`, and
+`RefCell<Object>`. Neither affects ordinary test runs.
 
 ## Terminal-capture diagnostics
 
