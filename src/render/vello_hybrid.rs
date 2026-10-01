@@ -31,8 +31,8 @@ use winit::window::Window;
 use super::vello_cpu::{
     ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, offset_shape, point_bounds,
     rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
-    vello_affine, vello_blend, vello_color, vello_color_filter, vello_rect, vello_stops,
-    vello_stroke,
+    text_shadow_blur, vello_affine, vello_blend, vello_color, vello_color_filter, vello_rect,
+    vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
@@ -939,6 +939,10 @@ impl VelloHybridRenderer {
                     for shadow in shadows.iter().rev() {
                         let shadow_origin =
                             CssPoint::new(origin.x + shadow.offset.x, origin.y + shadow.offset.y);
+                        let blurred = text_shadow_blur(shadow);
+                        if let Some(filter) = &blurred {
+                            target.push_layer(None, None, None, None, Some(filter.clone()));
+                        }
                         target.set_paint(vello_color(shadow.color));
                         paint_glyphs(
                             &mut target,
@@ -948,6 +952,9 @@ impl VelloHybridRenderer {
                             None,
                         );
                         paint_decorations(&mut target, shadow_origin, shaped, decoration.style);
+                        if blurred.is_some() {
+                            target.pop_layer();
+                        }
                     }
                     target.set_paint(vello_color(*color));
                     paint_glyphs(

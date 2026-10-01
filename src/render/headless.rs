@@ -381,6 +381,27 @@ mod tests {
     }
 
     #[test]
+    fn blurred_text_shadows_glow_beyond_the_glyphs_even_at_the_viewport_edge() {
+        // CSS Text Decoration 4 §4: a blurred shadow (σ = radius / 2) spreads
+        // ink beyond the glyph outline; a zero-offset unblurred one cannot.
+        let base = Url::parse("https://example.test/").unwrap();
+        let red = |shadow: &str, x: usize, y: usize| {
+            let html = format!(
+                "<body style='margin:0;background:#000'><p style='margin:0 0 0 6px;\
+                 font:40px serif;line-height:60px;color:#fff;text-shadow:{shadow}'>W</p>"
+            );
+            let frame = render_html(&html, &base, CssSize::new(200.0, 100.0)).unwrap();
+            let pixel = frame.pixels.as_chunks::<4>().0[y * 200 + x];
+            (pixel[0], pixel[1])
+        };
+        for (x, y) in [(1, 30), (25, 6)] {
+            let (r, g) = red("0 0 20px red", x, y);
+            assert!(r > 8 && g == 0, "glow at ({x},{y}): {r},{g}");
+            assert_eq!(red("0 0 0 red", x, y), (0, 0), "no blur at ({x},{y})");
+        }
+    }
+
+    #[test]
     fn fixture_builds_semantic_display_list_and_headless_pixels() {
         let base = Url::parse("https://example.test/").unwrap();
         let dom = crate::dom::Dom::parse_document(FIXTURE);
