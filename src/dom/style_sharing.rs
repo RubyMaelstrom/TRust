@@ -513,6 +513,8 @@ mod tests {
 
     #[test]
     fn style_sharing_repeated_subtrees_share_values_and_split_on_mutation() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<style>
             .row {color:red;white-space:pre}.row.done {color:blue}
@@ -550,6 +552,8 @@ mod tests {
 
     #[test]
     fn style_sharing_keeps_inheritance_inline_edits_and_presentational_hints_distinct() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<style>.child{width:inherit;color:inherit}</style>
             <div style='width:10px;color:red'><span id=x class=child>x</span></div>
@@ -576,6 +580,8 @@ mod tests {
 
     #[test]
     fn style_sharing_rechecks_structural_selectors_after_tree_changes() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<style>
             li{color:red}li:nth-child(2n){color:blue}li:has(.flag){color:green}
@@ -600,6 +606,8 @@ mod tests {
 
     #[test]
     fn style_sharing_preserves_custom_property_and_relative_font_context() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<style>
             .p{--edge:3px;font-size:10px}.p.large{--edge:9px;font-size:20px}
@@ -630,6 +638,8 @@ mod tests {
 
     #[test]
     fn style_sharing_directories_release_property_payloads_when_graph_is_evicted() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let dom = Dom::parse_document(
             "<style>span{color:red}</style><span id=x>x</span><span id=y>y</span>",
         );
@@ -651,6 +661,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_reuse_complete_inputs_across_mutations() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style>.a{--tone:red;color:var(--tone)}.b{--tone:blue;color:var(--tone)}</style>\
              <main id=p class=a><div><span id=x>text</span></div></main>",
@@ -712,6 +724,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_lists_retain_descendant_computations() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style>.done{color:blue}li{color:red}</style><body id=body>\
              <ul id=list><li id=a><label id=x>x</label></li>\
@@ -768,6 +782,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_ua_keys_follow_links_and_input_types() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<body style='color:red'><a id=a href=x>a</a><a id=b>b</a>\
              <input id=box type=checkbox><input id=text type=text>",
@@ -807,6 +823,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_summary_keys_follow_position_and_open_state() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<details id=d><summary id=a>a</summary><summary id=b>b</summary></details>\
              <details open><summary id=c>c</summary></details>",
@@ -848,6 +866,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_logical_cascades_include_inherited_axes_and_values() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style>.child{margin-inline-start:7px;padding-inline-start:inherit}</style>\
              <div id=a style='direction:ltr;padding-left:11px'><span id=x class=child>x</span></div>\
@@ -869,6 +889,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_environment_changes_retire_old_graphs() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style id=s>span{color:red}@media(min-width:500px){span{color:blue}}</style><span id=x>x</span>",
         );
@@ -887,6 +909,8 @@ mod tests {
 
     #[test]
     fn persistent_styles54_growing_payloads_evict_graph_owners_before_returning() {
+        // Shared rows are keyed by the process-wide page font epoch.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         if !enabled() || !persistent_contexts_enabled() {
             return;
         }
