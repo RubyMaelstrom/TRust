@@ -74,6 +74,9 @@ struct Builder<'a> {
     fixed: &'a [Frag],
     viewport_w: f32,
     viewport_h: f32,
+    /// Canvas background layers with `background-attachment: fixed`, pinned
+    /// to the viewport below the scrolling document.
+    fixed_under: Vec<DisplayCommand>,
     fixed_depth: usize,
     /// Finite extent used when a CSS clip is unbounded on one axis. CSS
     /// Overflow L3 §3 defines that axis as unclipped; display-list paths,
@@ -156,6 +159,7 @@ impl<'a> Builder<'a> {
             fixed,
             viewport_w,
             viewport_h,
+            fixed_under: Vec::new(),
             fixed_depth: 0,
             clip_extent: paint_extent(root, fixed, top_layer, flow_bottom),
             commands: Vec::new(),
@@ -999,7 +1003,7 @@ fn paint_in_spaces(
         background: root_background,
         lines: builder.lines,
         primitives,
-        fixed_under_primitives: Vec::new(),
+        fixed_under_primitives: std::mem::take(&mut builder.fixed_under),
         fixed_primitives,
         fixed_interleaved: true,
         top_layer: top_layer_entries,
@@ -2648,13 +2652,51 @@ fn paint_background_images_for_style(
     let repeat_layers = split_top_level(&repeat_value, ',');
     let position_layers = split_top_level(&position_value, ',');
     let size_layers = split_top_level(&size_value, ',');
+    let attachment_value = style
+        .value(builder.dom, "background-attachment")
+        .unwrap_or_else(|| "scroll".into());
+    let attachment_layers = split_top_level(&attachment_value, ',');
+    let viewport = CssRect::new(0.0, 0.0, builder.viewport_w, builder.viewport_h);
+    // A fixed canvas layer's commands move to the viewport-pinned underlay
+    // once that layer is done (every path below ends its iteration).
+    let mut fixed_start: Option<usize> = None;
+    let pin_fixed = |builder: &mut Builder<'_>, start: &mut Option<usize>| {
+        if let Some(start) = start.take() {
+            let commands = builder.commands.split_off(start);
+            builder.fixed_under.extend(commands);
+        }
+    };
     // CSS Backgrounds paints the first listed layer closest to the viewer, so
     // emit in reverse order after the background color.
     for (index, layer) in images.iter().enumerate().rev() {
+        pin_fixed(builder, &mut fixed_start);
         let layer = layer.trim();
         if layer.eq_ignore_ascii_case("none") || layer.is_empty() {
             continue;
         }
+        // CSS Backgrounds 3 #background-attachment: a fixed layer is
+        // positioned against the viewport. On the canvas it also paints the
+        // viewport and stays there while the document scrolls; other boxes
+        // keep their painting area (their snapshot is exact at scroll 0).
+        let fixed = layer_value(&attachment_layers, index, "scroll")
+            .trim()
+            .eq_ignore_ascii_case("fixed");
+        let canvas = if fixed && canvas.is_some() {
+            fixed_start = Some(builder.commands.len());
+            Some(viewport)
+        } else {
+            canvas
+        };
+        let shape = if fixed && canvas.is_some() {
+            PaintShape::Rect(viewport)
+        } else {
+            shape.clone()
+        };
+        let positioning_override = if fixed {
+            Some(viewport)
+        } else {
+            positioning_override
+        };
         let layer_shape = if canvas.is_some() {
             shape.clone()
         } else {
@@ -2829,6 +2871,7 @@ fn paint_background_images_for_style(
             builder.commands.push(DisplayCommand::PopClip);
         }
     }
+    pin_fixed(builder, &mut fixed_start);
 }
 
 /// What one background layer paints into each of its tiles.
@@ -5212,6 +5255,33 @@ mod tests {
                 "{overflow}: outer clip must remain stationary"
             );
         }
+    }
+
+    #[test]
+    fn fixed_canvas_backgrounds_cover_the_viewport_and_stay_pinned() {
+        // CSS Backgrounds 3 #background-attachment: a fixed layer is
+        // positioned against the viewport, not the 2000px-tall root box, and
+        // the canvas paints it in the viewport-pinned underlay.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:linear-gradient(red 50%,blue 50%) fixed}\
+             div{height:2000px}</style><div></div>",
+        );
+        assert!(!layout.paint.fixed_under_primitives.is_empty());
+        assert!(!layout.paint.primitives.iter().any(|command| matches!(
+            command,
+            DisplayCommand::Fill {
+                brush: PaintBrush::LinearGradient { .. },
+                ..
+            }
+        )));
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let at = |y: usize| {
+            let i = (y * 800 + 400) * 4;
+            [frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]]
+        };
+        assert_eq!(at(290), [255, 0, 0]);
+        assert_eq!(at(310), [0, 0, 255]);
     }
 
     #[test]
