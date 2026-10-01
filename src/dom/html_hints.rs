@@ -46,6 +46,28 @@ impl Dom {
                 }
             }
         }
+        // HTML Rendering #the-page: the first of the body's own margin
+        // attributes, else its container frame's, maps to a pixel length on
+        // both sides of its axis; an unparsable value uses the 8px default.
+        if tag == "body" {
+            let frame = self
+                .frame_owner(id)
+                .filter(|&frame| matches!(self.tag_name(frame), Some("iframe" | "frame")));
+            let margin = |own: [&str; 2], container: &str| {
+                own.iter()
+                    .find_map(|name| self.attr(id, name))
+                    .or_else(|| frame.and_then(|frame| self.attr(frame, container)))
+                    .map(|value| format!("{}px", non_negative_integer(value).unwrap_or(8)))
+            };
+            if let Some(value) = margin(["marginheight", "topmargin"], "marginheight") {
+                hint("margin-top", value.clone());
+                hint("margin-bottom", value);
+            }
+            if let Some(value) = margin(["marginwidth", "leftmargin"], "marginwidth") {
+                hint("margin-left", value.clone());
+                hint("margin-right", value);
+            }
+        }
         // HTML Rendering #tables-2: `cellspacing` and `border` map to pixel
         // lengths; a border that is not equivalent to zero is outset. The
         // cells of such a table get 1px inset borders, and every cell takes
@@ -526,6 +548,43 @@ mod tests {
         let table = dom.get_by_id("t").unwrap();
         dom.set_attr(table, "cellpadding", "9");
         assert_eq!(value(&dom, "c", "padding-top"), "9px");
+    }
+
+    #[test]
+    fn body_margin_attributes_map_to_margins() {
+        let margins = |html: &str| {
+            let dom = Dom::parse_document(html);
+            let root = dom.document_element().unwrap();
+            let body = dom
+                .child_iter(root)
+                .find(|&child| dom.tag_name(child) == Some("body"))
+                .unwrap();
+            ["margin-top", "margin-right", "margin-bottom", "margin-left"]
+                .map(|property| dom.computed_value(body, property).unwrap_or_default())
+        };
+        assert_eq!(
+            margins("<body topmargin=0 leftmargin=3>"),
+            ["0px", "3px", "0px", "3px"]
+        );
+        // marginheight/marginwidth come first; junk uses the 8px default.
+        assert_eq!(
+            margins("<body marginheight=5 topmargin=0 marginwidth=x leftmargin=2>"),
+            ["5px", "8px", "5px", "8px"]
+        );
+        assert_eq!(margins("<body>"), ["", "", "", ""]);
+        assert_eq!(
+            margins("<body topmargin=0 style=margin-top:4px>"),
+            ["4px", "", "0px", ""]
+        );
+        // A frame's marginheight/marginwidth are the fallbacks.
+        let mut dom = Dom::parse_document("<iframe id=f marginwidth=0 marginheight=12></iframe>");
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(frame, "<body leftmargin=4>x", "https://frame.test/")
+            .unwrap();
+        let body = dom.frame_body(frame).unwrap();
+        let value = |property| dom.computed_value(body, property).unwrap_or_default();
+        assert_eq!(value("margin-top"), "12px");
+        assert_eq!(value("margin-left"), "4px");
     }
 
     #[test]
