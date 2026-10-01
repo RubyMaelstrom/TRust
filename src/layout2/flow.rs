@@ -1107,6 +1107,7 @@ impl Flow<'_> {
                                     top,
                                     h.content_w,
                                     ifc_cb_h,
+                                    min_h,
                                     &inl,
                                     &mut cur.anchors,
                                 );
@@ -1128,6 +1129,7 @@ impl Flow<'_> {
                                 cur.preview(),
                                 h.content_w,
                                 ifc_cb_h,
+                                min_h,
                                 &inl,
                                 &mut Vec::new(),
                             );
@@ -2016,7 +2018,14 @@ impl Flow<'_> {
 
     /// A height-family property as content-box px, `None` when indefinite
     /// (`auto`, or a percentage against an indefinite CB height — §10.5).
-    fn height_px(&self, l: &Len, s: &BoxStyle, bt: f32, bb: f32, cb_h: Option<f32>) -> Option<f32> {
+    pub(super) fn height_px(
+        &self,
+        l: &Len,
+        s: &BoxStyle,
+        bt: f32,
+        bb: f32,
+        cb_h: Option<f32>,
+    ) -> Option<f32> {
         let v = l.resolve(cb_h)?;
         Some(if s.border_box {
             (v - bt - bb).max(0.0)
@@ -3305,6 +3314,7 @@ impl Flow<'_> {
                         bt,
                         content_w,
                         def_h,
+                        0.0,
                         &inl,
                         &mut cur.anchors,
                     );
@@ -3320,6 +3330,7 @@ impl Flow<'_> {
                         bt,
                         content_w,
                         def_h,
+                        0.0,
                         &inl,
                         &mut Vec::new(),
                     );
