@@ -96,6 +96,24 @@ pub(crate) struct Piece {
     /// Blockified controls already have an outer fragment and use their child
     /// form piece only for the label.
     pub(crate) paint_control_box: bool,
+    /// The decorated non-replaced inline boxes containing this piece.
+    pub(crate) boxes: Option<Box<InlineBoxes>>,
+}
+
+/// Paint geometry for the non-replaced inline boxes (with a background,
+/// border or shadow) that contain a piece. CSS Backgrounds 3
+/// #box-decoration-break (`slice`): a box's line fragment has its start edge
+/// only where the box begins and its end edge only where it ends.
+#[derive(Clone, Debug)]
+pub(crate) struct InlineBoxes {
+    /// Enclosing decorated inline boxes, outermost first.
+    pub chain: std::sync::Arc<[NodeId]>,
+    /// Boxes beginning before this piece: (box, distance from the box's
+    /// border-box start edge to the piece).
+    pub opens: Vec<(NodeId, f32)>,
+    /// Boxes ending after this piece: (box, distance from the piece's end to
+    /// the box's border-box end edge).
+    pub closes: Vec<(NodeId, f32)>,
 }
 
 /// Frontend-neutral inline paint and interaction payload. Canonical fragments
@@ -195,6 +213,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
+            boxes: None,
         }
     }
 
@@ -222,6 +241,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
+            boxes: None,
         }
     }
 }
@@ -330,6 +350,13 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// inline boxes), in px — folded into the next placement so an edge at a
     /// wrap point travels with the content it precedes.
     pending_gap_px: f32,
+    /// The decorated inline boxes currently open, outermost first, shared
+    /// by the pieces placed inside them.
+    box_stack: Vec<NodeId>,
+    box_chain: Option<std::sync::Arc<[NodeId]>>,
+    /// Opened boxes awaiting their first piece: (box, the offset of the
+    /// box's border-box start edge within `pending_gap_px`).
+    pending_opens: Vec<(NodeId, f32)>,
     // ---- floats (§9.5) — inert when `fc` is None ----
     /// The BFC's float context: queried per line (`band`) and appended to when
     /// an inline float is met (`place`). `None` = no floats (intrinsic probe,
@@ -422,6 +449,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             pending_space: false,
             preserved_break: false,
             pending_gap_px: 0.0,
+            box_stack: Vec::new(),
+            box_chain: None,
+            pending_opens: Vec::new(),
             fc,
             float_boxes,
             content_left_x,
@@ -647,9 +677,21 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 if *node != crate::layout2::NO_NODE {
                     self.marks.push((*node, self.lines.len()));
                 }
+                let decorated = *node != crate::layout2::NO_NODE
+                    && !self.measuring
+                    && inline_box_decorated(self.dom, *node, style);
+                if decorated {
+                    self.pending_opens
+                        .push((*node, self.pending_gap_px + self.margin_px(style, LEFT)));
+                    self.box_stack.push(*node);
+                    self.box_chain = Some(self.box_stack.as_slice().into());
+                }
                 self.pending_gap_px += self.edge_px(style, LEFT);
                 for k in kids.iter() {
                     self.walk(k, &inner);
+                }
+                if decorated {
+                    self.close_box(*node, style);
                 }
                 self.pending_gap_px += self.edge_px(style, RIGHT);
             }
@@ -1071,6 +1113,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         if !self.measuring
             && self.align != Align2::Justify
             && gap == 0.0
+            && self.pending_opens.is_empty()
             && let Some(last) = self.cur.last_mut()
             && last.item.kind == ctx.kind
             && last.item.emph == ctx.emph
@@ -1135,7 +1178,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box: false,
             paint_control_box: false,
+            boxes: None,
         });
+        self.attach_boxes(gap);
         self.pen = x + w;
         self.pending_space = false;
     }
@@ -1709,7 +1754,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box,
             paint_control_box,
+            boxes: None,
         });
+        self.attach_boxes(gap);
         self.pen = x + geometry.box_width;
         self.pending_space = false;
     }
@@ -1773,6 +1820,53 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
     }
 
+    /// Give the piece just placed (after folding `gap`) its enclosing
+    /// decorated boxes and the start edges of the boxes it begins.
+    fn attach_boxes(&mut self, gap: f32) {
+        let Some(chain) = self.box_chain.clone() else {
+            return;
+        };
+        let opens = self
+            .pending_opens
+            .drain(..)
+            .map(|(node, offset)| (node, gap - offset))
+            .collect();
+        if let Some(piece) = self.cur.last_mut() {
+            piece.boxes = Some(Box::new(InlineBoxes {
+                chain,
+                opens,
+                closes: Vec::new(),
+            }));
+        }
+    }
+
+    /// Close a decorated inline box: its end edge follows the last piece
+    /// placed inside it, past any edges owed since. A box that received no
+    /// piece has no line fragment.
+    fn close_box(&mut self, node: NodeId, style: &BoxStyle) {
+        self.pending_opens.retain(|&(open, _)| open != node);
+        let end = self.pending_gap_px
+            + style.border[RIGHT]
+            + style.padding[RIGHT]
+                .resolve(Some(self.cb_w_px))
+                .unwrap_or(0.0);
+        let last = match self.cur.last_mut() {
+            Some(piece) => Some(piece),
+            None => self
+                .lines
+                .last_mut()
+                .and_then(|line| line.pieces.last_mut()),
+        };
+        if let Some(boxes) = last
+            .and_then(|piece| piece.boxes.as_mut())
+            .filter(|boxes| boxes.chain.contains(&node))
+        {
+            boxes.closes.push((node, end));
+        }
+        self.box_stack.pop();
+        self.box_chain = (!self.box_stack.is_empty()).then(|| self.box_stack.as_slice().into());
+    }
+
     /// Consume the owed inline-box edge width without quantization.
     fn take_gap(&mut self) -> f32 {
         // CSS 2 #margin-properties / #inline-formatting: horizontal margins
@@ -1789,6 +1883,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// still yields a line box (`<br><br>` shows a blank row).
     pub fn forced_break(&mut self) {
         self.pen += self.take_gap();
+        // A box opened before the break begins on this (contentless) line;
+        // its later pieces are continuation fragments.
+        self.pending_opens.clear();
         self.flush_line(true);
     }
 
@@ -2353,6 +2450,22 @@ pub(crate) enum ControlWidthBasis {
     /// The min-content contribution, based on the displayed value or
     /// placeholder rather than the control's preferred width.
     MinContent,
+}
+
+/// Whether a non-replaced inline box paints a background, border or shadow.
+fn inline_box_decorated(dom: &Dom, node: NodeId, style: &BoxStyle) -> bool {
+    style.border.iter().any(|width| *width > 0.0)
+        || dom
+            .computed_value_resolved(node, "background-color")
+            .as_deref()
+            .and_then(crate::render::PaintColor::parse_css)
+            .is_some_and(|color| !color.is_transparent())
+        || dom
+            .computed_value_resolved(node, "background-image")
+            .is_some_and(|image| !image.trim().eq_ignore_ascii_case("none"))
+        || dom
+            .computed_value_resolved(node, "box-shadow")
+            .is_some_and(|shadow| !shadow.trim().eq_ignore_ascii_case("none"))
 }
 
 #[cfg(test)]
