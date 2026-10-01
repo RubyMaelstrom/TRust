@@ -569,9 +569,14 @@ impl SelectorDependencies {
             // selectedness, not unrelated child lists. Changes to those
             // states (including radio-group updates) still invalidate through
             // checked/selected below; moving a subtree invalidates its styles.
+            // Focus changes/removal explicitly invalidate focus-dependent
+            // styles; unrelated child-list edits do not change focus. Shadow
+            // slot redistribution already takes the shadow-scope fallback.
             self.structure_global |= !matches!(
                 state,
                 StatePseudo::AnyLink
+                    | StatePseudo::Focus
+                    | StatePseudo::FocusWithin
                     | StatePseudo::Checked
                     | StatePseudo::Disabled
                     | StatePseudo::Enabled

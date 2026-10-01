@@ -1,0 +1,28 @@
+<!doctype html>
+<title>CSS focus menus</title>
+<style>
+body { margin: 0; }
+ul { list-style: none; margin: 0; padding: 0; }
+nav > ul { display: flex; }
+nav { background: black; color: #33b5e5; }
+li { position: relative; padding: 8px; }
+li > ul { display: none; position: absolute; top: 100%; left: 0;
+          min-width: 200px; background: black; z-index: 2; }
+li:focus > ul, li:focus-within > ul { display: block; }
+li li > ul { left: 100%; top: 0; }
+a { color: black; text-decoration: underline; }
+li > ul a { all: unset; display: block; }
+</style>
+<nav><ul>
+  <li id="file" tabindex="0">File
+    <ul id="downloads">
+      <li id="version" tabindex="0">Downloads
+        <ul id="platforms"><li><a id="download" href="https://example.test/download">Linux</a></li></ul>
+      </li>
+    </ul>
+  </li>
+  <li id="help" tabindex="0"><span id="caption">Help</span>
+    <ul id="support"><li><a href="https://example.test/support">Support</a></li></ul>
+  </li>
+</ul></nav>
+<p id="outside">Click outside to close the menus.</p>

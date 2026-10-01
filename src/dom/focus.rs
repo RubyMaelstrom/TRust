@@ -15,6 +15,101 @@ fn tabindex(raw: &str) -> Option<i32> {
 }
 
 impl Dom {
+    pub(crate) fn has_tabindex(&self, node: NodeId) -> bool {
+        self.attr(node, "tabindex").and_then(tabindex).is_some()
+    }
+
+    pub(crate) fn focused_area(&self, document: NodeId) -> Option<NodeId> {
+        self.focused_areas.get(&document).copied()
+    }
+
+    pub(crate) fn focus_css_affects_rendering(&self) -> bool {
+        self.style_index().has_focus_rules
+    }
+
+    /// HTML #focus-update-steps and Selectors 4 #the-focus-pseudo /
+    /// #the-focus-within-pseudo (local HTML e5071a20, CSSWG 81c27f68).
+    /// Focus can restyle descendants, siblings, :has() subjects and shadow
+    /// scopes. Until there is a dependency proof, invalidate the whole render
+    /// while retaining the parsed sheet index. Repeated focus is a no-op.
+    pub(crate) fn set_focused_area(&mut self, document: NodeId, target: Option<NodeId>) {
+        let target = target.filter(|&node| {
+            self.is_valid(node)
+                && self.nodes[node].owner_document == document
+                && self.is_connected(node)
+        });
+        if self.focused_area(document) == target {
+            return;
+        }
+        if let Some(node) = target {
+            self.focused_areas.insert(document, node);
+        } else {
+            self.focused_areas.remove(&document);
+        }
+        if self.focus_css_affects_rendering() {
+            self.touch();
+        }
+    }
+
+    /// Removal moves focus to the viewport. Clear before unlinking so an
+    /// immediate reinsert cannot resurrect focus or cached ancestor styles.
+    pub(super) fn clear_focus_in_subtree(&mut self, root: NodeId) {
+        if self.focused_areas.is_empty() {
+            return;
+        }
+        let removed: Vec<_> = self
+            .focused_areas
+            .iter()
+            .filter_map(|(&doc, &node)| {
+                let mut current = Some(node);
+                while let Some(node) = current {
+                    if node == root {
+                        return Some(doc);
+                    }
+                    current = self.parent_composed(node);
+                }
+                None
+            })
+            .collect();
+        for document in removed {
+            self.set_focused_area(document, None);
+        }
+    }
+
+    /// HTML #selector-focus additionally matches shadow hosts, but excludes
+    /// navigable containers. Ordinary parents do not inherit :focus.
+    pub(super) fn matches_focus(&self, id: NodeId) -> bool {
+        let focused = self.focused_area(self.nodes[id].owner_document);
+        if focused.is_some_and(|node| matches!(self.tag_name(node), Some("iframe" | "frame"))) {
+            return false;
+        }
+        let mut current = focused;
+        while let Some(node) = current {
+            if node == id {
+                return true;
+            }
+            current = self.shadow_hosts.get(&self.tree_scope(node)).copied();
+        }
+        false
+    }
+
+    pub(super) fn matches_focus_within(&self, id: NodeId) -> bool {
+        let Some(focused) = self.focused_area(self.nodes[id].owner_document) else {
+            return false;
+        };
+        if !self.matches_focus(focused) {
+            return false;
+        }
+        let mut current = Some(focused);
+        while let Some(node) = current {
+            if node == id {
+                return true;
+            }
+            current = self.parent_flat(node);
+        }
+        false
+    }
+
     #[cfg(test)]
     pub(crate) fn sequential_focus_order(
         &self,
@@ -112,9 +207,52 @@ impl Dom {
     }
 }
 
+pub(super) fn complex_uses_focus(complex: &Complex) -> bool {
+    complex.0.iter().any(|(_, c)| compound_uses_focus(c))
+}
+
+fn compound_uses_focus(c: &Compound) -> bool {
+    c.states
+        .iter()
+        .any(|s| matches!(s, StatePseudo::Focus | StatePseudo::FocusWithin))
+        || c.nots.iter().flatten().any(complex_uses_focus)
+        || c.selects
+            .iter()
+            .any(|(group, _)| group.iter().any(complex_uses_focus))
+        || c.has
+            .iter()
+            .flatten()
+            .any(|arg| complex_uses_focus(&arg.complex))
+        || c.structural.iter().any(|s| match s {
+            Structural::Nth { of: Some(of), .. } => of.iter().any(complex_uses_focus),
+            _ => false,
+        })
+        || c.host_inner.as_deref().is_some_and(compound_uses_focus)
+        || c.slotted.as_deref().is_some_and(compound_uses_focus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_on_a_navigable_container_does_not_style_its_shadow_host() {
+        let mut dom = Dom::parse_document("<x-host id=host></x-host>");
+        let host = dom.get_by_id("host").unwrap();
+        let root = dom.attach_shadow(host);
+        let frame = dom.create_element("iframe");
+        dom.append(root, frame);
+        dom.set_focused_area(DOCUMENT, Some(frame));
+        for node in [frame, host] {
+            assert!(!dom.matches_focus(node));
+            assert!(!dom.matches_focus_within(node));
+        }
+        let button = dom.create_element("button");
+        dom.append(root, button);
+        dom.set_focused_area(DOCUMENT, Some(button));
+        assert!(dom.matches_focus(host));
+        assert!(dom.matches_focus_within(host));
+    }
 
     fn order(dom: &Dom) -> Vec<String> {
         let boxes = dom
