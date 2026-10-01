@@ -6143,12 +6143,27 @@ async fn css_only_with_sheets(
     // not `Send`, so it must never cross an `.await`), then installed into the
     // real arena synchronously.
     let frames = prefetch_frame_documents(&html, &base, &response.url).await;
+    // A nested document owns its stylesheets (HTML #the-iframe-element): fetch
+    // each frame's `<link rel=stylesheet>` against that frame's own URL. The
+    // installed frame tree carries absolutized hrefs, so key them absolutely.
+    let mut frame_sheets = Vec::new();
+    for (frame_url, markup) in frames.values() {
+        let frame_base = base_with_doc_base(markup, frame_url);
+        for (source, css) in fetch_page_sheets(markup, frame_url).await {
+            if let Ok(url) = frame_base.join(&source) {
+                frame_sheets.push((url.to_string(), css));
+            }
+        }
+    }
     let mut dom = crate::js::css_prepare(&html, viewport, cell_px);
     if !frames.is_empty() {
         install_page_frames(&mut dom, &response.url, &frames);
     }
     if !sheets.is_empty() {
         dom.attach_external_sheets(&sheets);
+    }
+    if !frame_sheets.is_empty() {
+        dom.attach_external_sheets(&frame_sheets);
     }
     dom.set_doc_url(Some(base.clone()));
     dom.set_device_pixel_ratio(device_pixel_ratio);
@@ -10642,6 +10657,63 @@ mod tests {
             body.contains(&format!("http://127.0.0.1:{port}/deep.html")),
             "relative link not resolved against the frame url: {body}"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn css_only_applies_stylesheets_linked_inside_frames() {
+        // A script-less page's frame documents own their stylesheets, and a
+        // relative href resolves against the frame's URL, not the parent's.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: &[u8] = if text.starts_with("GET /page ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><iframe src=\"/dir/inner\"></iframe></body>"
+                } else if text.starts_with("GET /dir/inner ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <link rel=stylesheet href=\"frame.css\"><p>FRAME TEXT</p>"
+                } else if text.starts_with("GET /dir/frame.css ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nConnection: close\r\n\r\n\
+                      p{color:rgb(1,2,3)}"
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = sock.write_all(reply).await;
+            }
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let rendered = response.rendered.expect("static render");
+        let color = rendered
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, color, .. }
+                    if shaped.text.contains("FRAME TEXT") =>
+                {
+                    Some(*color)
+                }
+                _ => None,
+            });
+        assert_eq!(color, Some(crate::render::PaintColor::Rgba(1, 2, 3, 255)));
         server.abort();
     }
 
