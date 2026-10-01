@@ -3771,6 +3771,44 @@ mod tests {
     }
 
     #[test]
+    fn table_heights_are_minimums_and_tables_grow_their_rows() {
+        // HTML Rendering #tables-2 maps the height attributes; CSS 2.2
+        // §17.5.3 makes row and cell heights minimums; CSS Tables 3
+        // #height-distribution-algorithm gives a taller table's extra height
+        // to its auto-height rows (here in proportion, as Gecko does). The
+        // expected heights were measured in LibreWolf 153.
+        let body = r#"<body style="margin:0">
+            <table cellspacing=0 style="width:400px"><tr><td id=a height=100>x</td><td>y</td></tr>
+            <tr height=60><td id=b>z</td><td height=20><div style="height:80px"></div></td></tr></table>
+            <table height=300 cellspacing=0><tr><td id=c>a</td></tr><tr><td id=d height=50>b</td></tr></table>
+            <table height=200 cellspacing=0><tr><td id=e><div style="height:55px"></div></td></tr>
+            <tr><td id=f><div style="height:18px"></div></td></tr></table>
+            <table cellspacing=0><tr><td id=g height=100 style="padding:10px">x</td></tr></table></body>"#;
+        for (doctype, padded) in [("", 100.0), ("<!DOCTYPE html>", 120.0)] {
+            let html = format!("{doctype}{body}");
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+            for (id, expected) in [
+                ("a", 100.0),
+                ("b", 80.0),
+                ("c", 250.0),
+                ("d", 50.0),
+                ("e", 55.0 + 127.0 * 55.0 / 73.0),
+                ("f", 18.0 + 127.0 * 18.0 / 73.0),
+                // Quirks Mode #the-table-cell-height-box-sizing-quirk.
+                ("g", padded),
+            ] {
+                assert!(
+                    (height(id) - expected).abs() < 0.01,
+                    "{doctype}{id}: {}",
+                    height(id)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn grid_items_and_rows_honor_min_heights() {
         // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
         // §12.1/§11.8: an auto row stretches into the container's definite
