@@ -123,6 +123,13 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
+    fn viewport(&self) -> Vp {
+        Vp {
+            w: self.viewport_w,
+            h: self.viewport_h,
+        }
+    }
+
     // The paint adapter's inputs are distinct borrowed engine products. A
     // parameter object would only move these references without simplifying
     // ownership or call sites.
@@ -1542,6 +1549,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     builder.dom,
                     layer_value(&clips, index, "border-box"),
                     &shape,
+                    builder.viewport(),
                 );
                 fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
             }
@@ -1583,6 +1591,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     builder.dom,
                     layer_value(&clips, index, "border-box"),
                     &shape,
+                    builder.viewport(),
                 );
                 fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
             }
@@ -2616,7 +2625,9 @@ fn paint_background_images_for_style(
     }
     let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     let padding_box = padding_box_with_style(fragment);
-    let content_box = content_box_with_style(builder.dom, fragment, padding_box);
+    let content_box =
+        content_box_with_style(builder.dom, fragment, padding_box, builder.viewport());
+    let lengths = LengthBasis::of(builder.dom, style.node(), builder.viewport());
     let clip_value = style
         .value(builder.dom, "background-clip")
         .unwrap_or_else(|| "border-box".into());
@@ -2652,6 +2663,7 @@ fn paint_background_images_for_style(
                 builder.dom,
                 layer_value(&clip_layers, index, "border-box"),
                 &shape,
+                builder.viewport(),
             )
         };
         {
@@ -2665,7 +2677,7 @@ fn paint_background_images_for_style(
             // repeated and clipped exactly like any other image (§§2.4-2.6).
             let gradient = is_gradient(layer);
             let (handle, (mut tile_w, mut tile_h)) = if gradient {
-                (None, gradient_size(size, positioning))
+                (None, gradient_size(size, positioning, lengths))
             } else if let Some(url) = css_url(layer) {
                 let source = resolve_image_source(builder.base, &url);
                 let handle = builder.image(source.clone());
@@ -2685,7 +2697,7 @@ fn paint_background_images_for_style(
                     .unwrap_or((300.0, 150.0));
                 (
                     Some(handle),
-                    background_size(size, natural, positioning, ratio_only),
+                    background_size(size, natural, positioning, ratio_only, lengths),
                 )
             } else {
                 continue;
@@ -2704,14 +2716,15 @@ fn paint_background_images_for_style(
                 continue;
             }
             let (mut start_x, mut start_y) =
-                background_position(position, positioning, (tile_w, tile_h));
+                background_position(position, positioning, (tile_w, tile_h), lengths);
             let mut repeat = repeat;
             if matches!(repeat, BackgroundRepeat::Round) {
                 let nx = (positioning.width / tile_w).round().max(1.0);
                 let ny = (positioning.height / tile_h).round().max(1.0);
                 tile_w = positioning.width / nx;
                 tile_h = positioning.height / ny;
-                (start_x, start_y) = background_position(position, positioning, (tile_w, tile_h));
+                (start_x, start_y) =
+                    background_position(position, positioning, (tile_w, tile_h), lengths);
                 repeat = BackgroundRepeat::Repeat;
             }
             let tile = match handle {
@@ -2893,7 +2906,7 @@ fn is_gradient(layer: &str) -> bool {
 /// CSS Backgrounds 3 #background-size for an image without natural
 /// dimensions or ratio: an `auto` axis, and cover/contain, take the
 /// positioning area's size.
-fn gradient_size(value: &str, area: CssRect) -> (f32, f32) {
+fn gradient_size(value: &str, area: CssRect, lengths: LengthBasis) -> (f32, f32) {
     let tokens = split_ws(value);
     if tokens.first().is_some_and(|token| {
         token.eq_ignore_ascii_case("cover") || token.eq_ignore_ascii_case("contain")
@@ -2903,11 +2916,11 @@ fn gradient_size(value: &str, area: CssRect) -> (f32, f32) {
     (
         tokens
             .first()
-            .and_then(|token| background_length(token, area.width))
+            .and_then(|token| background_length(token, area.width, lengths))
             .unwrap_or(area.width),
         tokens
             .get(1)
-            .and_then(|token| background_length(token, area.height))
+            .and_then(|token| background_length(token, area.height, lengths))
             .unwrap_or(area.height),
     )
 }
@@ -2940,11 +2953,12 @@ fn background_layer_shape(
     dom: &Dom,
     clip: &str,
     border: &PaintShape,
+    viewport: Vp,
 ) -> PaintShape {
     if clip.trim() != "text" {
         let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
         let padding = padding_box_with_style(fragment);
-        let content = content_box_with_style(dom, fragment, padding);
+        let content = content_box_with_style(dom, fragment, padding, viewport);
         return background_clip_shape(background_box(clip, rect, padding, content), border, rect);
     }
     fn collect(f: &Frag, dom: &Dom, path: &mut Vec<crate::render::PathElement>) {
@@ -3050,14 +3064,15 @@ fn padding_box_with_style(fragment: &Frag) -> CssRect {
     )
 }
 
-fn content_box_with_style(dom: &Dom, fragment: &Frag, padding: CssRect) -> CssRect {
+fn content_box_with_style(dom: &Dom, fragment: &Frag, padding: CssRect, viewport: Vp) -> CssRect {
     let width_basis = padding.width.max(0.0);
     let style = PaintStyle::of(fragment);
+    let lengths = LengthBasis::of(dom, style.map_or(NO_NODE, PaintStyle::node), viewport);
     let pad = ["top", "right", "bottom", "left"].map(|side| {
         style
             .and_then(|style| style.value(dom, &format!("padding-{side}")))
             .as_deref()
-            .and_then(|value| transform_length(value, width_basis))
+            .and_then(|value| lengths.resolve(value, width_basis))
             .unwrap_or(0.0)
             .max(0.0)
     });
@@ -3074,6 +3089,7 @@ fn background_size(
     natural: (f32, f32),
     area: CssRect,
     ratio_only: Option<f32>,
+    lengths: LengthBasis,
 ) -> (f32, f32) {
     // Keep a nonzero ratio basis even for a zero-size positioning area: a
     // definite background width/height must still resolve its other axis.
@@ -3095,10 +3111,10 @@ fn background_size(
     }
     let width = tokens
         .first()
-        .and_then(|token| background_length(token, area.width));
+        .and_then(|token| background_length(token, area.width, lengths));
     let height = tokens
         .get(1)
-        .and_then(|token| background_length(token, area.height));
+        .and_then(|token| background_length(token, area.height, lengths));
     match (width, height) {
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => (w, natural.1 * w / natural.0),
@@ -3111,15 +3127,23 @@ fn background_size(
     }
 }
 
-fn background_length(value: &str, basis: f32) -> Option<f32> {
+fn background_length(value: &str, basis: f32, lengths: LengthBasis) -> Option<f32> {
     if value.eq_ignore_ascii_case("auto") {
         return None;
     }
-    transform_length(value, basis).map(|value| value.max(0.01))
+    lengths.resolve(value, basis).map(|value| value.max(0.01))
 }
 
-fn background_position(value: &str, area: CssRect, image: (f32, f32)) -> (f32, f32) {
+fn background_position(
+    value: &str,
+    area: CssRect,
+    image: (f32, f32),
+    lengths: LengthBasis,
+) -> (f32, f32) {
     let tokens = split_ws(value);
+    if tokens.len() >= 3 {
+        return edge_offset_position(&tokens, area, image, lengths).unwrap_or((0.0, 0.0));
+    }
     let (x, y) = match tokens.as_slice() {
         [] => ("0%", "0%"),
         [one] if matches!(one.to_ascii_lowercase().as_str(), "top" | "bottom") => ("50%", *one),
@@ -3136,25 +3160,90 @@ fn background_position(value: &str, area: CssRect, image: (f32, f32)) -> (f32, f
         [x, y, ..] => (*x, *y),
     };
     (
-        background_position_component(x, area.width, image.0, false),
-        background_position_component(y, area.height, image.1, true),
+        background_position_component(x, area.width, image.0, false, lengths),
+        background_position_component(y, area.height, image.1, true, lengths),
     )
 }
 
-fn background_position_component(value: &str, area: f32, image: f32, vertical: bool) -> f32 {
+/// The three- and four-value `<bg-position>` forms (CSS Backgrounds 3
+/// #background-position): each edge keyword may be followed by an offset
+/// from that edge, and `center` takes whichever axis remains.
+fn edge_offset_position(
+    tokens: &[&str],
+    area: CssRect,
+    image: (f32, f32),
+    lengths: LengthBasis,
+) -> Option<(f32, f32)> {
+    let keyword = |token: &str| {
+        let lower = token.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "left" | "right" | "top" | "bottom" | "center"
+        )
+        .then_some(lower)
+    };
+    let (mut x, mut y, mut centers) = (None, None, 0);
+    let mut index = 0;
+    while index < tokens.len() {
+        let edge = keyword(tokens[index])?;
+        let offset = tokens
+            .get(index + 1)
+            .filter(|token| keyword(token).is_none())
+            .copied();
+        index += 1 + usize::from(offset.is_some());
+        let axis = match edge.as_str() {
+            "left" | "right" => &mut x,
+            "top" | "bottom" => &mut y,
+            _ if offset.is_none() => {
+                centers += 1;
+                continue;
+            }
+            _ => return None,
+        };
+        if axis.replace((edge, offset)).is_some() {
+            return None;
+        }
+    }
+    for _ in 0..centers {
+        if x.is_none() {
+            x = Some(("center".into(), None));
+        } else if y.is_none() {
+            y = Some(("center".into(), None));
+        } else {
+            return None;
+        }
+    }
+    let resolve = |(edge, offset): (String, Option<&str>), area: f32, image: f32| {
+        let offset = offset
+            .and_then(|offset| lengths.resolve(offset, area - image))
+            .unwrap_or(0.0);
+        match edge.as_str() {
+            "right" | "bottom" => area - image - offset,
+            "center" => (area - image) / 2.0,
+            _ => offset,
+        }
+    };
+    Some((
+        resolve(x.unwrap_or(("center".into(), None)), area.width, image.0),
+        resolve(y.unwrap_or(("center".into(), None)), area.height, image.1),
+    ))
+}
+
+fn background_position_component(
+    value: &str,
+    area: f32,
+    image: f32,
+    vertical: bool,
+    lengths: LengthBasis,
+) -> f32 {
     match value.trim().to_ascii_lowercase().as_str() {
         "left" if !vertical => 0.0,
         "top" if vertical => 0.0,
         "center" => (area - image) / 2.0,
         "right" if !vertical => area - image,
         "bottom" if vertical => area - image,
-        other => {
-            if let Some(percent) = other.strip_suffix('%').and_then(|v| v.parse::<f32>().ok()) {
-                (area - image) * percent / 100.0
-            } else {
-                px(other).unwrap_or(0.0)
-            }
-        }
+        // A percentage (also inside calc()) is of the area minus the image.
+        other => lengths.resolve(other, area - image).unwrap_or(0.0),
     }
 }
 
@@ -3479,6 +3568,7 @@ fn paint_box_shadows(dom: &Dom, style: PaintStyle, shape: &PaintShape, builder: 
     let Some(value) = style.value(dom, "box-shadow") else {
         return;
     };
+    let lengths = LengthBasis::of(dom, style.node(), builder.viewport());
     for shadow in split_top_level(&value, ',') {
         if shadow.trim().eq_ignore_ascii_case("none") {
             continue;
@@ -3489,7 +3579,10 @@ fn paint_box_shadows(dom: &Dom, style: PaintStyle, shape: &PaintShape, builder: 
             .iter()
             .find_map(|token| PaintColor::parse_css(token))
             .unwrap_or(PaintColor::Rgba(0, 0, 0, 85));
-        let lengths: Vec<f32> = tokens.iter().filter_map(|t| px(t)).collect();
+        let lengths: Vec<f32> = tokens
+            .iter()
+            .filter_map(|token| lengths.resolve(token, 0.0))
+            .collect();
         if lengths.len() < 2 {
             continue;
         }
@@ -3953,14 +4046,6 @@ fn angle(value: &str) -> Option<f32> {
     }
 }
 
-fn transform_length(value: &str, basis: f32) -> Option<f32> {
-    let value = value.trim();
-    if let Some(v) = value.strip_suffix('%') {
-        return v.trim().parse::<f32>().ok().map(|v| v * basis / 100.0);
-    }
-    px(value)
-}
-
 /// Resolve the `<length-percentage>` grammar used by CSS transform
 /// translations. In particular, math functions remain one component value
 /// and resolve percentages against the transform reference box.
@@ -4256,12 +4341,40 @@ fn split_ws(value: &str) -> Vec<&str> {
     result
 }
 
-fn px(value: &str) -> Option<f32> {
-    let value = value.trim();
-    if value == "0" {
-        return Some(0.0);
+/// What a paint-time CSS length resolves against: the element's font units
+/// and the viewport (CSS Values 4 #relative-lengths). Computed values keep
+/// their authored units, so `em`, `rem`, `vw` or `calc()` must not be read
+/// as if every length were `px`.
+#[derive(Clone, Copy)]
+struct LengthBasis {
+    units: Units,
+    viewport: Vp,
+}
+
+impl LengthBasis {
+    fn of(dom: &Dom, node: NodeId, viewport: Vp) -> Self {
+        Self {
+            units: if node == NO_NODE {
+                Units::default()
+            } else {
+                Units::of(dom, node)
+            },
+            viewport,
+        }
     }
-    value.strip_suffix("px")?.trim().parse().ok()
+
+    #[cfg(test)]
+    fn fixed() -> Self {
+        Self {
+            units: Units::default(),
+            viewport: Vp { w: 800.0, h: 600.0 },
+        }
+    }
+
+    /// A `<length-percentage>`, its percentages taken of `basis`.
+    fn resolve(self, value: &str, basis: f32) -> Option<f32> {
+        Len::parse(value.trim(), self.units, self.viewport)?.resolve(Some(basis))
+    }
 }
 
 impl PaintColor {
@@ -4883,11 +4996,23 @@ mod tests {
             br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 40"/>"#,
         );
         assert_eq!(
-            background_size("20px auto", (300., 150.), CssRect::default(), Some(2.)),
+            background_size(
+                "20px auto",
+                (300., 150.),
+                CssRect::default(),
+                Some(2.),
+                LengthBasis::fixed()
+            ),
             (20., 10.)
         );
         assert_eq!(
-            background_size("auto", (18., 9.), CssRect::new(0., 0., 80., 60.), None),
+            background_size(
+                "auto",
+                (18., 9.),
+                CssRect::new(0., 0., 80., 60.),
+                None,
+                LengthBasis::fixed()
+            ),
             (18., 9.)
         );
         for source in [
@@ -5087,6 +5212,36 @@ mod tests {
                 "{overflow}: outer clip must remain stationary"
             );
         }
+    }
+
+    #[test]
+    fn background_and_shadow_lengths_resolve_relative_units_and_edge_offsets() {
+        // Computed values keep authored units: `em`, `vw` and calc() lengths
+        // and the four-value <bg-position> must resolve at paint time.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;font-size:10px}div{width:200px;height:100px;\
+             background:#ddd linear-gradient(red,red) no-repeat}\
+             #a{background-size:5em 3em}\
+             #b{background-size:2em 2.5vw;background-position:right 1em bottom 2em}\
+             #c{background-size:0 0;box-shadow:1em 1em 0 blue}</style>\
+             <div id=a></div><div id=b></div><div id=c></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let at = |x: usize, y: usize| {
+            let i = (y * 800 + x) * 4;
+            [frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]]
+        };
+        let (red, grey, blue) = ([255, 0, 0], [221, 221, 221], [0, 0, 255]);
+        assert_eq!(at(45, 25), red, "5em x 3em tile");
+        assert_eq!(at(55, 25), grey);
+        assert_eq!(at(45, 35), grey);
+        // A 20px tile (2em; 2.5vw of the 800px viewport), 10px from the
+        // right and 20px from the bottom of the second box (y = 100..200).
+        assert_eq!(at(180, 170), red, "edge-offset tile");
+        assert_eq!(at(165, 170), grey);
+        assert_eq!(at(180, 182), grey);
+        assert_eq!(at(205, 295), blue, "1em shadow offset");
     }
 
     #[test]
