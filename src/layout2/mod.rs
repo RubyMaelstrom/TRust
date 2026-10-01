@@ -1941,7 +1941,7 @@ mod tests {
         let line = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz"; // 62
         let html = format!(
             "<div style=\"width:20ch;overflow:hidden\">\
-             <pre style=\"overflow-x:auto;white-space:pre\"><code>{line}</code></pre></div>"
+             <pre style=\"overflow-x:auto;white-space:pre;font:16px sans-serif\"><code style=\"font:inherit\">{line}</code></pre></div>"
         );
         let out = lay(&html, 40);
         assert_eq!(out.carousels.len(), 1, "the pre is a horizontal strip");
@@ -3046,7 +3046,12 @@ mod tests {
 
     #[test]
     fn tab_size_sets_preserved_tab_stops() {
-        let style = crate::text::TextStyle::default();
+        // <pre> is monospace at 13px (HTML Rendering; Gecko/Blink sizing).
+        let style = crate::text::TextStyle {
+            family: "monospace".into(),
+            size: 13.0,
+            ..Default::default()
+        };
         let space = crate::text::shape(" ", &style).advance;
         // The default: tabs advance to eight measured space advances in
         // preserved modes. This is canonical CSS geometry, not eight cells.
