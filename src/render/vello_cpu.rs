@@ -404,12 +404,15 @@ impl VelloCpuRenderer {
                     }
                     // CSS Text Decoration 4 §4 paints shadow layers below the
                     // decorated text, with the first authored shadow on top.
-                    // Vello CPU currently exposes arbitrary-path blur only for
-                    // rounded rectangles; glyph shadows retain blur/spread in
-                    // the display list and use the exact zero-blur path here.
+                    // A blurred shadow is drawn into a bounded blur layer.
                     for shadow in shadows.iter().rev() {
                         let shadow_origin =
                             CssPoint::new(origin.x + shadow.offset.x, origin.y + shadow.offset.y);
+                        let blurred = text_shadow_blur(shadow);
+                        if let Some(filter) = &blurred {
+                            self.context
+                                .push_layer(None, None, None, None, Some(filter.clone()));
+                        }
                         self.context.set_paint(vello_color(shadow.color));
                         paint_glyphs(
                             &mut self.context,
@@ -424,6 +427,9 @@ impl VelloCpuRenderer {
                             shaped,
                             decoration.style,
                         );
+                        if blurred.is_some() {
+                            self.context.pop_layer();
+                        }
                     }
                     self.context.set_paint(vello_color(*color));
                     paint_glyphs(
@@ -856,6 +862,24 @@ pub(super) fn vello_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
         BlendMode::Exclusion => Mix::Exclusion,
     };
     vello_cpu::peniko::BlendMode::new(mix, Compose::SrcOver)
+}
+
+/// CSS Text Decoration 4 §4 and CSS Backgrounds 3 #shadow-blur: a blurred
+/// text shadow is the glyph shadow under a Gaussian blur whose standard
+/// deviation is half the blur radius. The filter layer stays unclipped:
+/// Vello builds a filter layer's clip in its shifted source viewport, which
+/// cut glows within three deviations of the viewport's left and top edges.
+pub(super) fn text_shadow_blur(
+    shadow: &crate::render::TextShadowPaint,
+) -> Option<vello_common::filter_effects::Filter> {
+    use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
+    let blur = shadow.blur_radius;
+    (blur > 0.0 && blur.is_finite()).then(|| {
+        Filter::from_primitive(FilterPrimitive::GaussianBlur {
+            std_deviation: blur / 2.0,
+            edge_mode: EdgeMode::None,
+        })
+    })
 }
 
 pub(super) fn vello_color_filter(matrix: &[f32; 20]) -> vello_common::filter_effects::Filter {
