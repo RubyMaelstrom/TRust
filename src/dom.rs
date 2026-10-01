@@ -1888,7 +1888,7 @@ impl Dom {
             self.dirty_attributed = false;
             self.record_geometry_dirty(scope, DirtyKind::Attr);
         } else {
-            self.touch_content(Some(scope));
+            self.touch_content(Some(scope), &[]);
         }
     }
 
@@ -1947,7 +1947,8 @@ impl Dom {
     /// children changed, or a text node's parent element). `None` = a structural
     /// no-op for the rendered tree (detaching an already-orphan node) — still
     /// dirties the epoch but records no target and does NOT force a full relayout.
-    fn touch_content(&mut self, id: Option<NodeId>) {
+    /// `changed` names the inserted/removed nodes (empty when unknown).
+    fn touch_content(&mut self, id: Option<NodeId>, changed: &[NodeId]) {
         // Conservatively includes text-only changes; every element-tree
         // insertion, removal, replacement and adoption passes this boundary.
         self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
@@ -1955,7 +1956,7 @@ impl Dom {
             if self.tag_name(parent) == Some("style") {
                 self.reset_cssom_sheet(parent);
             }
-            self.invalidate_structure(parent);
+            self.invalidate_structure(parent, changed);
         }
         self.mark_dom_revision();
         if let Some(i) = id {
@@ -2813,7 +2814,7 @@ impl Dom {
             self.note_tree_style_mutation(parent, id);
             self.invalidate_style_subtree(id, true);
         }
-        self.touch_content(parent);
+        self.touch_content(parent, &[id]);
         if let Some(prev) = prev {
             self.nodes[prev].next_sibling = next;
         }
@@ -2853,7 +2854,7 @@ impl Dom {
         self.nodes[parent].last_child = Some(child);
         self.set_owner_document_subtree(child, owner_document);
         self.invalidate_style_subtree(child, true);
-        self.touch_content(Some(parent));
+        self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
     }
 
@@ -3035,6 +3036,7 @@ impl Dom {
             // CSSOM and SVG references must lose the old inheritance/ancestry.
             self.invalidate_detaching_children(parent);
         }
+        let mut changed: Vec<NodeId> = self.child_iter(parent).collect();
         let mut old = self.nodes[parent].first_child;
         while let Some(child) = old {
             old = self.nodes[child].next_sibling;
@@ -3046,6 +3048,7 @@ impl Dom {
         }
         self.nodes[parent].first_child = None;
         self.nodes[parent].last_child = None;
+        self.clear_modal_disconnected();
 
         let owner_document = self.nodes[parent].owner_document;
         let mut previous = None;
@@ -3076,7 +3079,8 @@ impl Dom {
                 None,
             );
         } else {
-            self.touch_content(Some(parent));
+            changed.extend(self.child_iter(parent));
+            self.touch_content(Some(parent), &changed);
         }
         self.child_lists.get_mut().remove(parent);
     }
@@ -3124,7 +3128,7 @@ impl Dom {
         }
         self.set_owner_document_subtree(child, owner_document);
         self.invalidate_style_subtree(child, true);
-        self.touch_content(Some(parent));
+        self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
     }
 
@@ -3166,7 +3170,7 @@ impl Dom {
             if self.tag_name(parent) == Some("style") {
                 self.touch_style_at(parent); // the sheet's text grew
             }
-            self.touch_content(Some(parent));
+            self.touch_content(Some(parent), &[last]);
             return;
         }
         let t = self.create_text(text);
@@ -6578,7 +6582,7 @@ impl Dom {
         // host as the mutation target: if it is connected the normal boundary
         // logic updates it; if it is a custom element being constructed in a
         // detached framework work tree, no rendered document is invalidated.
-        self.touch_content(Some(host));
+        self.touch_content(Some(host), &[root]);
         root
     }
 
@@ -7241,7 +7245,7 @@ impl Dom {
             // Comments never render; record the parent so this can't strand an
             // unattributed mutation, and let the per-boundary render-dedup drop it.
             let parent = self.nodes[id].parent;
-            self.touch_content(parent);
+            self.touch_content(parent, &[id]);
         }
     }
 
@@ -7336,7 +7340,7 @@ impl Dom {
             NodeData::CData(data) | NodeData::ProcessingInstruction { data, .. } => {
                 if data != text {
                     *data = text.to_owned();
-                    self.touch_content(Some(id));
+                    self.touch_content(Some(id), &[id]);
                 }
             }
             // Idempotent writes are free: no dirty, no redraw.
@@ -7360,7 +7364,7 @@ impl Dom {
                         Some(id),
                     );
                 } else {
-                    self.touch_content(None);
+                    self.touch_content(None, &[]);
                 }
             }
             _ => {

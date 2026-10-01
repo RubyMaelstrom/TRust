@@ -130,6 +130,10 @@ pub(super) struct SelectorDependencies {
     empty: bool,
     text_direction: bool,
     text_placeholder: bool,
+    /// `:indeterminate` radios read their whole group's checkedness (HTML
+    /// #selector-indeterminate), so only a child-list change that moves a radio
+    /// or a form can restyle an element outside the changed subtree.
+    indeterminate: bool,
     structure_global: bool,
 }
 
@@ -248,6 +252,44 @@ impl StructureDependency {
 /// can only observe an anchor's descendants or following-sibling forest.
 /// Positive anchor tests deliberately omit logical/state tests: extra possible
 /// anchors cost work, while excluding a real one could retain stale styles.
+/// The positive simple selectors a `:has()` subject must match: its own
+/// compound, conjoined with the compound around a `:not()`/`:is()` argument
+/// whose subject is the same element. Inside `:not()` the inner parts are
+/// negated, but the `:has()` result still only matters for elements matching
+/// both, so the conjunction stays a necessary anchor condition.
+#[derive(Clone, Default)]
+struct AnchorParts {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
+    attributes: Vec<String>,
+    /// Contradictory parts (`div:not(span:has(x))`): the `:has()` can never
+    /// change the result, so it needs no dependency.
+    impossible: bool,
+}
+
+impl AnchorParts {
+    fn and(&self, compound: &Compound) -> Self {
+        let mut parts = self.clone();
+        match (&parts.tag, compound.tag.as_deref()) {
+            (_, None | Some("*")) => {}
+            (None, Some(tag)) => parts.tag = Some(tag.to_string()),
+            (Some(current), Some(tag)) if current == "*" => parts.tag = Some(tag.to_string()),
+            (Some(current), Some(tag)) => parts.impossible |= current != tag,
+        }
+        match (&parts.id, &compound.id) {
+            (Some(current), Some(id)) => parts.impossible |= current != id,
+            (None, Some(id)) => parts.id = Some(id.clone()),
+            _ => {}
+        }
+        parts.classes.extend(compound.classes.iter().cloned());
+        parts
+            .attributes
+            .extend(compound.attrs.iter().map(|a| a.name.clone()));
+        parts
+    }
+}
+
 struct RelationalDependency {
     tag: Option<String>,
     id: Option<String>,
@@ -255,22 +297,38 @@ struct RelationalDependency {
     anchor_attributes: Vec<String>,
     attributes: Vec<String>,
     siblings: bool,
+    /// For an argument whose every combinator is `>` (`:has(> a > b)`), the
+    /// number of elements it spans: a changed node can only alter anchors that
+    /// close above it. `None` when a descendant step makes the reach unbounded.
+    depth: Option<usize>,
+    /// A `+`/`~` combinator follows the anchor's compound, so a subject can be
+    /// a following sibling of the anchor rather than inside it.
+    subject_siblings: bool,
 }
 
 impl RelationalDependency {
-    fn new(anchor: &Compound, argument: &HasArg) -> Option<Self> {
+    fn new(anchor: &AnchorParts, argument: &HasArg, subject_siblings: bool) -> Option<Self> {
         let mut attributes = Vec::new();
         // The first compound is the parser's synthetic :scope anchor.
         for (_, compound) in argument.complex.0.iter().skip(1) {
             // Logical arguments can look outside the relative subtree (e.g.
             // :has(:is(body.theme .hit))); inherited and positional states
             // have additional dependencies. Retain the full fallback for them.
+            // Focus and hover states read no attributes. Every focus change
+            // restyles the document (`set_focused_area`) and hover transitions
+            // compare every hover-dependent subject, :has() anchors included
+            // (`set_hover_chain`), so child-list and attribute mutations keep
+            // the anchor checks below. YouTube's
+            // `:not(:has(#masthead-container:focus-within))` and Discourse's
+            // `:has(.socket:hover)` otherwise made every insertion expire
+            // every style.
             if !compound.nots.is_empty()
                 || !compound.selects.is_empty()
                 || !compound.has.is_empty()
                 || !compound.structural.is_empty()
-                || !compound.states.is_empty()
-                || compound.hover
+                || compound.states.iter().any(|state| {
+                    !matches!(state, StatePseudo::Focus | StatePseudo::FocusWithin)
+                })
                 || compound.target
                 || compound.popover_open
                 || compound.scope
@@ -297,9 +355,18 @@ impl RelationalDependency {
             tag: anchor.tag.clone(),
             id: anchor.id.clone(),
             classes: anchor.classes.clone(),
-            anchor_attributes: anchor.attrs.iter().map(|a| a.name.clone()).collect(),
+            anchor_attributes: anchor.attributes.clone(),
             attributes,
             siblings: argument.sibling,
+            depth: (!argument.sibling
+                && argument
+                    .complex
+                    .0
+                    .iter()
+                    .skip(1)
+                    .all(|(combinator, _)| *combinator == Combinator::Child))
+            .then(|| argument.complex.0.len().saturating_sub(1)),
+            subject_siblings,
         })
     }
 
@@ -320,6 +387,40 @@ impl RelationalDependency {
         })
     }
 
+    /// The subtree a child-list change under `parent` can restyle through this
+    /// `:has()`, as (levels above `parent`, root): the topmost possible anchor,
+    /// or its parent when a sibling combinator follows it, because a selector's
+    /// subject is the anchor, a following sibling of it, or a descendant of
+    /// either. `Err` keeps the whole-document fallback for sibling-relative
+    /// arguments.
+    fn restyle_root(&self, dom: &Dom, parent: NodeId) -> Result<Option<(usize, NodeId)>, ()> {
+        if self.siblings {
+            return if self.may_affect(dom, parent, true) {
+                Err(())
+            } else {
+                Ok(None)
+            };
+        }
+        let mut root = None;
+        let mut next = Some(parent);
+        let mut level = 0;
+        while let Some(node) = next {
+            if self.depth.is_some_and(|depth| level >= depth) {
+                break;
+            }
+            level += 1;
+            next = dom.selector_parent(node);
+            if self.possible_anchor(dom, node) {
+                root = Some(if self.subject_siblings {
+                    (level, next.unwrap_or(node))
+                } else {
+                    (level - 1, node)
+                });
+            }
+        }
+        Ok(root)
+    }
+
     fn may_affect(&self, dom: &Dom, node: NodeId, child_list: bool) -> bool {
         // Insertion/removal may change the following siblings of any child,
         // including when the removed child is still linked during invalidation.
@@ -332,7 +433,14 @@ impl RelationalDependency {
             return true;
         }
         let mut next = Some(node);
+        let mut level = 0;
         while let Some(node) = next {
+            // `node` is the changed child's parent, so an anchor of a `>`-only
+            // argument lies fewer than `depth` levels up.
+            if self.depth.is_some_and(|depth| level >= depth) {
+                break;
+            }
+            level += 1;
             if self.possible_anchor(dom, node) {
                 return true;
             }
@@ -450,6 +558,20 @@ impl SelectorDependencies {
         }
     }
 
+    /// The single subtree covering every `:has()` restyle a child-list change
+    /// under `parent` can cause (all roots lie on its ancestor chain).
+    fn relational_root(&self, dom: &Dom, parent: NodeId) -> Result<Option<NodeId>, ()> {
+        let mut top: Option<(usize, NodeId)> = None;
+        for dependency in &self.relational {
+            if let Some(root) = dependency.restyle_root(dom, parent)?
+                && top.is_none_or(|(level, _)| root.0 > level)
+            {
+                top = Some(root);
+            }
+        }
+        Ok(top.map(|(_, root)| root))
+    }
+
     fn structure_impact(&self, dom: &Dom, parent: NodeId) -> (bool, bool) {
         let (mut siblings, mut children) = (false, false);
         for dependency in &self.structural {
@@ -494,12 +616,35 @@ impl SelectorDependencies {
     }
 
     fn complex(&mut self, selector: &Complex) {
-        for (_, compound) in &selector.0 {
-            self.compound(compound);
+        self.complex_in(selector, &AnchorParts::default(), false);
+    }
+
+    /// `subject` holds the enclosing compound's parts when `selector` is a
+    /// `:not()`/`:is()` argument: its last compound describes the same element,
+    /// which `subject_siblings` says may be followed by a sibling combinator.
+    fn complex_in(&mut self, selector: &Complex, subject: &AnchorParts, subject_siblings: bool) {
+        let last = selector.0.len().saturating_sub(1);
+        for (index, (_, compound)) in selector.0.iter().enumerate() {
+            let siblings_after = selector.0[index + 1..].iter().any(|(combinator, _)| {
+                matches!(
+                    combinator,
+                    Combinator::NextSibling | Combinator::SubsequentSibling
+                )
+            });
+            if index == last {
+                self.compound_in(compound, subject, subject_siblings);
+            } else {
+                self.compound_in(compound, &AnchorParts::default(), siblings_after);
+            }
         }
     }
 
     fn compound(&mut self, compound: &Compound) {
+        self.compound_in(compound, &AnchorParts::default(), false);
+    }
+
+    fn compound_in(&mut self, compound: &Compound, outer: &AnchorParts, siblings_after: bool) {
+        let anchor = outer.and(compound);
         // Exhaustive so future selector forms require a dependency decision.
         let Compound {
             tag: _,
@@ -530,10 +675,13 @@ impl SelectorDependencies {
             .flatten()
             .chain(selects.iter().flat_map(|(group, _)| group))
         {
-            self.complex(selector);
+            self.complex_in(selector, &anchor, siblings_after);
         }
         for argument in has.iter().flatten() {
-            if let Some(dependency) = RelationalDependency::new(compound, argument) {
+            if anchor.impossible {
+                continue;
+            }
+            if let Some(dependency) = RelationalDependency::new(&anchor, argument, siblings_after) {
                 self.relational.push(dependency);
             } else {
                 self.structure_global = true;
@@ -574,6 +722,12 @@ impl SelectorDependencies {
             // slot redistribution already takes the shadow-scope fallback.
             // Removing a modal dialog clears its flag through
             // `set_dialog_modal`, which invalidates every style.
+            // :required/:optional and :read-write/:read-only read the element's
+            // own attributes and type, editing-host and fieldset ancestry
+            // (covered like :disabled); :lang() reads ancestor attributes only.
+            // The tree operation already restyles the moved subtree, so none
+            // of them changes outside it. :placeholder-shown reads a textarea's
+            // own children, handled at that parent below.
             self.structure_global |= !matches!(
                 state,
                 StatePseudo::AnyLink
@@ -584,7 +738,15 @@ impl SelectorDependencies {
                     | StatePseudo::Enabled
                     | StatePseudo::Dir(_)
                     | StatePseudo::Modal
+                    | StatePseudo::Indeterminate
+                    | StatePseudo::Required
+                    | StatePseudo::Optional
+                    | StatePseudo::ReadWrite
+                    | StatePseudo::ReadOnly
+                    | StatePseudo::Lang(_)
+                    | StatePseudo::PlaceholderShown
             );
+            self.indeterminate |= matches!(state, StatePseudo::Indeterminate);
             self.text_direction |= matches!(state, StatePseudo::Dir(_));
             self.text_placeholder |= matches!(state, StatePseudo::PlaceholderShown);
         }
@@ -898,7 +1060,24 @@ impl Dom {
         self.invalidate_layout_paths(resource_roots);
     }
 
-    pub(super) fn invalidate_structure(&mut self, parent: NodeId) {
+    /// Whether `root`'s subtree holds a radio button or a form: either can
+    /// change another radio's group (HTML #radio-button-group), including
+    /// controls elsewhere that name the form through `form=`.
+    fn subtree_has_radio_group_member(&self, root: NodeId) -> bool {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match self.tag_name(node) {
+                Some("form") => return true,
+                Some("input") if self.input_type(node) == "radio" => return true,
+                _ => {}
+            }
+            self.push_composed_children(node, &mut stack);
+        }
+        false
+    }
+
+    /// `changed` names the inserted/removed children (empty when unknown).
+    pub(super) fn invalidate_structure(&mut self, parent: NodeId, changed: &[NodeId]) {
         // Detached construction uses the same dependency proof. Recursively
         // invalidating its entire growing root on each append would make a
         // fragment-building loop quadratic even without structural selectors.
@@ -907,21 +1086,28 @@ impl Dom {
                 let index = self.style_cache.borrow();
                 index.as_ref().and_then(|(epoch, index)| {
                     let dependencies = index.selector_dependencies.for_node(self, parent);
+                    let relational_root = dependencies.relational_root(self, parent).ok()?;
                     (*epoch == self.style_epoch
                         && !dependencies.structure_global
-                        && !dependencies.relational.iter().any(|dependency| {
-                            dependency.may_affect(self, parent, true)
-                        })
                         // Selectors 4 #the-dir-pseudo / HTML directionality:
                         // only an automatic-direction ancestor can acquire a
                         // different direction when its descendants change.
                         && !(dependencies.text_direction
-                            && self.text_may_change_direction(parent)))
-                    .then(|| dependencies.structure_impact(self, parent))
+                            && self.text_may_change_direction(parent))
+                        && !(dependencies.indeterminate
+                            && (changed.is_empty()
+                                || changed.iter().any(|&node| self.subtree_has_radio_group_member(node))))
+                        && !(dependencies.text_placeholder
+                            && self.tag_name(parent) == Some("textarea")))
+                    .then(|| {
+                        let (empty_siblings, restyle_children) =
+                            dependencies.structure_impact(self, parent);
+                        (empty_siblings, restyle_children, relational_root)
+                    })
                 })
             })
             .flatten();
-        let Some((empty_siblings, restyle_children)) = local else {
+        let Some((empty_siblings, restyle_children, relational_root)) = local else {
             if casc_diag_on() {
                 let index = self.style_cache.borrow();
                 eprintln!(
@@ -947,6 +1133,10 @@ impl Dom {
             self.invalidate_all_style_values();
             return;
         };
+        // Selectors 4 #relational: a possible :has() anchor above the change.
+        if let Some(root) = relational_root {
+            self.invalidate_style_subtree(root, true);
+        }
         // Insertions/removals change sibling ranks, adjacency, inherited
         // parentage and the parent's :empty state. A parent :empty followed
         // by a sibling combinator can also restyle its sibling forest.
@@ -1038,7 +1228,8 @@ impl Dom {
             })
         };
         if !independent {
-            self.touch_content(Some(parent));
+            // Character data moves no elements; only the text node changed.
+            self.touch_content(Some(parent), character_data.as_slice());
             return;
         }
         let mut roots = self.svg_dirty_consumers(&[parent], false);
@@ -1996,6 +2187,177 @@ mod tests {
         assert_matches_full_scan(&dom);
         dom.detach(measure);
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable")));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn focus_states_inside_has_keep_unrelated_child_list_changes_local() {
+        // YouTube's `ytd-app[masthead-hidden]:not(:has(#masthead-container:focus-within))`.
+        let mut dom = Dom::parse_document(
+            "<style>.app[hidden-top]:not(:has(#top:focus-within)) .content{color:red}\
+             .card:has(a:focus) .title{width:20px}</style>\
+             <main class=app hidden-top><div id=top><a id=link href=#>top</a></div>\
+             <p class=content id=content>content</p></main>\
+             <section id=list><div class=card><a id=card_link href=#>a</a><b class=title id=title>t</b></div></section>\
+             <aside id=stable><span id=stable_child>independent</span></aside>",
+        );
+        let red = |dom: &Dom| {
+            dom.computed_value_resolved(dom.get_by_id("content").unwrap(), "color")
+                .as_deref()
+                == Some("red")
+        };
+        assert!(red(&dom));
+        let before = cached(&dom, "stable_child");
+        let epoch = dom.style_value_epoch;
+        let list = dom.get_by_id("list").unwrap();
+        let row = dom.create_element("div");
+        dom.set_text(row, "row");
+        dom.append(list, row);
+        dom.detach(row);
+        assert_eq!(dom.style_value_epoch, epoch, "a child-list change expired the document");
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
+        assert_matches_full_scan(&dom);
+        // Focus changes still restyle the anchors.
+        dom.set_focused_area(DOCUMENT, dom.get_by_id("link"));
+        assert!(!red(&dom));
+        dom.set_focused_area(DOCUMENT, dom.get_by_id("card_link"));
+        assert!(red(&dom));
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("title").unwrap(), "width")
+                .as_deref(),
+            Some("20px")
+        );
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn indeterminate_rules_keep_radio_free_child_list_changes_local() {
+        // Twitch's checkbox styles: `:indeterminate + label`.
+        let mut dom = Dom::parse_document(
+            "<style>input:indeterminate + label{color:red}</style>\
+             <form id=form><input id=a type=radio name=g><label id=la>a</label>\
+             <input id=b type=radio name=g><label id=lb>b</label></form>\
+             <section id=list></section>\
+             <aside id=stable><span id=stable_child>independent</span></aside>",
+        );
+        let red = |dom: &Dom, id: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "color")
+                .as_deref()
+                == Some("red")
+        };
+        assert!(red(&dom, "la") && red(&dom, "lb"));
+        let before = cached(&dom, "stable_child");
+        let epoch = dom.style_value_epoch;
+        let list = dom.get_by_id("list").unwrap();
+        let row = dom.create_element("div");
+        dom.set_text(row, "row");
+        dom.append(list, row);
+        dom.detach(row);
+        assert_eq!(dom.style_value_epoch, epoch, "a radio-free change expired the document");
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
+        assert_matches_full_scan(&dom);
+        // HTML #selector-indeterminate: a checked radio joining the group
+        // clears every member's state, and leaving restores it.
+        let checked = dom.create_element("input");
+        dom.set_attr(checked, "type", "radio");
+        dom.set_attr(checked, "name", "g");
+        dom.set_attr(checked, "checked", "");
+        dom.append(dom.get_by_id("form").unwrap(), checked);
+        assert!(!red(&dom, "la") && !red(&dom, "lb"));
+        dom.detach(checked);
+        assert!(red(&dom, "la") && red(&dom, "lb"));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn has_anchors_restyle_only_their_parent_subtree() {
+        // YouTube: `.ytwChannelBlocksViewModelListWrapper :has(>.yt-icon-shape)`
+        // has no constraints of its own, so every element is a possible anchor.
+        let mut dom = Dom::parse_document(
+            "<style>.wrap :has(> .icon){width:9px} .wrap :has(> .icon) + .after{color:red}\
+             .card:has(.badge) .title{height:5px}</style>\
+             <div class=wrap><section id=box><p id=para>x</p><b class=after id=after>a</b></section></div>\
+             <div class=card id=card><div id=inner><b class=title id=title>t</b></div></div>\
+             <aside id=stable><span id=stable_child>independent</span></aside>",
+        );
+        let value = |dom: &Dom, id: &str, property: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), property)
+        };
+        let before = cached(&dom, "stable_child");
+        let epoch = dom.style_value_epoch;
+        let para = dom.get_by_id("para").unwrap();
+        let icon = dom.create_element("i");
+        dom.set_attr(icon, "class", "icon");
+        dom.append(para, icon);
+        assert_eq!(value(&dom, "para", "width").as_deref(), Some("9px"));
+        assert_eq!(value(&dom, "after", "color").as_deref(), Some("red"));
+        let inner = dom.get_by_id("inner").unwrap();
+        let badge = dom.create_element("span");
+        dom.set_attr(badge, "class", "badge");
+        dom.append(inner, badge);
+        assert_eq!(value(&dom, "title", "height").as_deref(), Some("5px"));
+        assert_eq!(dom.style_value_epoch, epoch, "a :has() anchor expired the document");
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
+        assert_matches_full_scan(&dom);
+        dom.detach(icon);
+        dom.detach(badge);
+        assert_ne!(value(&dom, "para", "width").as_deref(), Some("9px"));
+        assert_ne!(value(&dom, "after", "color").as_deref(), Some("red"));
+        assert_ne!(value(&dom, "title", "height").as_deref(), Some("5px"));
+        assert_eq!(dom.style_value_epoch, epoch);
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn local_state_selectors_keep_unrelated_child_list_changes_local() {
+        // Discourse: `:lang(zh_CN)`, `#input:not(:placeholder-shown)+.submit`,
+        // `:focus:required`, `.node:has(.socket:hover) .icon`.
+        let mut dom = Dom::parse_document(
+            "<style>.activity:lang(zh){color:red} #input:not(:placeholder-shown)+.submit{width:20px}\
+             input:required{height:7px} textarea:placeholder-shown{color:blue}\
+             .node:has(.socket:hover) .icon{width:9px} [contenteditable]:read-write{color:green}</style>\
+             <div lang=zh><span class=activity id=activity>x</span></div>\
+             <input id=input placeholder=p required><b class=submit id=submit>s</b>\
+             <textarea id=area placeholder=hint></textarea>\
+             <div class=node><i class=socket id=socket>o</i><b class=icon id=icon>i</b></div>\
+             <div contenteditable id=editor><span id=editable>e</span></div>\
+             <section id=list></section>\
+             <aside id=stable><span id=stable_child>independent</span></aside>",
+        );
+        let value = |dom: &Dom, id: &str, property: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), property)
+        };
+        assert_eq!(value(&dom, "activity", "color").as_deref(), Some("red"));
+        assert_eq!(value(&dom, "area", "color").as_deref(), Some("blue"));
+        let before = cached(&dom, "stable_child");
+        let epoch = dom.style_value_epoch;
+        let list = dom.get_by_id("list").unwrap();
+        let row = dom.create_element("div");
+        dom.set_text(row, "row");
+        dom.append(list, row);
+        dom.detach(row);
+        assert_eq!(dom.style_value_epoch, epoch, "a child-list change expired the document");
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
+        assert_matches_full_scan(&dom);
+        // A textarea's own text children decide its :placeholder-shown.
+        let area = dom.get_by_id("area").unwrap();
+        let text = dom.create_text("typed");
+        dom.append(area, text);
+        assert_ne!(value(&dom, "area", "color").as_deref(), Some("blue"));
+        dom.detach(text);
+        assert_eq!(value(&dom, "area", "color").as_deref(), Some("blue"));
+        // Moved content takes its new ancestors' language and editability.
+        let moved = dom.get_by_id("activity").unwrap();
+        dom.append(dom.get_by_id("editor").unwrap(), moved);
+        assert_ne!(value(&dom, "activity", "color").as_deref(), Some("red"));
+        assert_eq!(value(&dom, "editable", "color").as_deref(), Some("green"));
+        // Hover transitions still restyle :has() anchors.
+        dom.set_hover_chain(dom.get_by_id("socket"));
+        assert_eq!(value(&dom, "icon", "width").as_deref(), Some("9px"));
+        assert_matches_full_scan(&dom);
         assert_style_values_match_cold(&mut dom);
     }
 

@@ -17605,10 +17605,17 @@ mod tests {
                 document.body.appendChild(dialog);
                 states.push(dialog.open, dialog.matches(":modal"));
                 try { document.querySelector(":modal(x)"); } catch (error) { states.push(error.name); }
+                dialog.close();
+                const holder = document.createElement("div");
+                document.body.appendChild(holder);
+                holder.appendChild(dialog);
+                dialog.showModal();
+                holder.innerHTML = "";
+                states.push(dialog.matches(":modal"));
                 states.join("|");
             "#
                 ),
-                "false|true|true|false|false|false|true|InvalidStateError|false|true|false|SyntaxError"
+                "false|true|true|false|false|false|true|InvalidStateError|false|true|false|SyntaxError|false"
             );
         }
     }
