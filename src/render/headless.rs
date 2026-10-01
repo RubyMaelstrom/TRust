@@ -15,15 +15,17 @@ use crate::layout2::{ControlMap, ImageSizes, Viewport};
 /// Rasterize an existing authoritative display list with its inline resources.
 /// No reparse/relayout and no network requests; useful for release diagnostics.
 pub fn render_paint(page: &super::PagePaint, viewport: CssSize) -> Result<OwnedRgbaFrame, String> {
-    render_paint_with_images(page, viewport, ImageStore::default())
+    render_paint_with_images(page, viewport, ImageStore::default(), 0.0)
 }
 
 /// [`render_paint`] with images the caller already decoded (keyed by request
 /// handle); `data:` images missing from `store` are still decoded inline.
+/// CSS animations are sampled `elapsed_seconds` into the document timeline.
 pub fn render_paint_with_images(
     page: &super::PagePaint,
     viewport: CssSize,
     store: ImageStore,
+    elapsed_seconds: f32,
 ) -> Result<OwnedRgbaFrame, String> {
     for request in page
         .image_requests
@@ -50,7 +52,7 @@ pub fn render_paint_with_images(
         page_scroll_containers: Vec::new(),
         page_size: CssSize::default(),
     };
-    scene.append_page(page, CssPoint::default());
+    scene.append_page_at(page, CssPoint::default(), elapsed_seconds);
     scene.append_browser_media(page, CssPoint::default(), 0.);
     VelloCpuRenderer::new().render_rgba(&scene)
 }

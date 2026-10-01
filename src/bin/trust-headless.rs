@@ -267,6 +267,9 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
     let started = Instant::now();
     let mut last_change = started;
     let mut revision = 0u64;
+    // Web Animations #document-timelines: like the desktop frontend, the
+    // timeline starts once the navigation has produced its document.
+    let mut timeline_origin: Option<Instant> = None;
     let mut settled = Settle::Timeout;
     loop {
         let outcome = controller.process_async_events();
@@ -275,6 +278,9 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         if outcome.invalidated || snapshot.page_revision != revision {
             revision = snapshot.page_revision;
             last_change = now;
+        }
+        if timeline_origin.is_none() && controller.current_page().is_some() {
+            timeline_origin = Some(now);
         }
         let elapsed = now - started;
         if elapsed >= options.timeout {
@@ -441,10 +447,18 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         && let Some((layout, store, loaded, failed)) =
             snapshot_with_images(&mut controller, options).await
     {
+        // A document that went final at once would otherwise be captured
+        // at the first frame of its CSS animations. Let animated pages run
+        // for the settle time, as an interactive viewer would see them.
+        let origin = timeline_origin.unwrap_or(started);
+        if layout.paint.has_css_animations() {
+            tokio::time::sleep(options.settle.saturating_sub(origin.elapsed())).await;
+        }
         let frame = trust::render::headless::render_paint_with_images(
             &layout.paint,
             CssSize::new(options.width, options.height),
             store,
+            origin.elapsed().as_secs_f32(),
         )?;
         trust::render::headless::write_png(&frame, path)?;
         eprintln!("[snapshot] display list with {loaded} image(s) loaded, {failed} failed");
