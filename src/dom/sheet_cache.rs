@@ -6,6 +6,10 @@
 use super::*;
 use std::hash::{Hash, Hasher};
 
+// Past either bound, a miss evicts the sheets the last two index builds did
+// not use. Sheets in use stay whatever their size: the live index already
+// shares their rules, and a site's main sheet (YouTube's is 3.7 MB) is exactly
+// what each rebuild must not parse again.
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENTRIES: usize = 256;
 
@@ -13,6 +17,7 @@ const MAX_ENTRIES: usize = 256;
 pub(super) struct Cache {
     entries: Vec<Entry>,
     bytes: usize,
+    build: u64,
     #[cfg(test)]
     pub misses: usize,
 }
@@ -29,11 +34,19 @@ struct Entry {
     parsed: StyleIndex,
     fonts: Vec<crate::http::CssFontFace>,
     orders: usize,
+    /// The last build that used this entry.
+    used: u64,
+    bytes: usize,
 }
 
 impl Cache {
     pub fn retained_bytes(&self) -> usize {
         self.bytes + self.entries.capacity() * std::mem::size_of::<Entry>()
+    }
+
+    /// Starts assembling a new sheet list.
+    pub fn begin_build(&mut self) {
+        self.build += 1;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -62,8 +75,8 @@ impl Cache {
                 && entry.before == *layers
                 && entry.css.as_ref() == css
         });
-        let fresh;
         let entry = if let Some(hit) = hit {
+            self.entries[hit].used = self.build;
             &self.entries[hit]
         } else {
             #[cfg(test)]
@@ -87,7 +100,7 @@ impl Cache {
                 &mut after,
                 "",
             );
-            fresh = Entry {
+            let mut fresh = Entry {
                 hash,
                 css: css.into(),
                 base: base.cloned(),
@@ -97,19 +110,18 @@ impl Cache {
                 parsed,
                 fonts: parsed_fonts,
                 orders,
+                used: self.build,
+                bytes: 0,
             };
-            let bytes = fresh.retained_bytes();
-            if bytes <= MAX_BYTES {
-                if self.bytes + bytes > MAX_BYTES || self.entries.len() >= MAX_ENTRIES {
-                    self.entries.clear();
-                    self.bytes = 0;
-                }
-                self.bytes += bytes;
-                self.entries.push(fresh);
-                self.entries.last().unwrap()
-            } else {
-                &fresh
+            fresh.bytes = fresh.retained_bytes();
+            if self.bytes + fresh.bytes > MAX_BYTES || self.entries.len() >= MAX_ENTRIES {
+                let build = self.build;
+                self.entries.retain(|entry| entry.used + 1 >= build);
+                self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
             }
+            self.bytes += fresh.bytes;
+            self.entries.push(fresh);
+            self.entries.last().unwrap()
         };
         // Keep use-site source order independent of the cached parse. In
         // particular, inserting/reordering sheets cannot reuse old order keys.
@@ -279,5 +291,47 @@ mod tests {
             );
         }
         assert_eq!(cache.misses, 6);
+    }
+
+    #[test]
+    fn sheets_in_use_survive_eviction_and_stale_ones_do_not() {
+        fn build(cache: &mut Cache, sheets: impl Iterator<Item = String>) {
+            cache.begin_build();
+            let mut index = StyleIndex::default();
+            let mut layers = LayerRegistry::default();
+            for css in sheets {
+                cache.append(
+                    &css,
+                    &mut 0,
+                    index.scopes.entry(DOCUMENT).or_default(),
+                    &mut index.keyframes,
+                    index.counter_styles.entry(DOCUMENT).or_default(),
+                    index.properties.entry(DOCUMENT).or_default(),
+                    &mut Vec::new(),
+                    None,
+                    MediaEnvironment {
+                        viewport: (800., 600.),
+                        density: 1.,
+                    },
+                    &mut layers,
+                );
+            }
+        }
+        // More live sheets than MAX_ENTRIES, plus one whose text changes on
+        // every rebuild (a style element that keeps receiving rules).
+        let live = || (0..MAX_ENTRIES + 40).map(|i| format!(".c{i}{{width:{i}px}}"));
+        let mut cache = Cache::default();
+        for round in 0..6 {
+            build(
+                &mut cache,
+                live().chain(std::iter::once(format!(".grow{{width:{round}px}}"))),
+            );
+            assert_eq!(
+                cache.misses,
+                MAX_ENTRIES + 40 + round + 1,
+                "only the changed sheet is parsed again"
+            );
+            assert!(cache.entries.len() <= MAX_ENTRIES + 40 + 2);
+        }
     }
 }
