@@ -4101,6 +4101,9 @@ fn px(value: &str) -> Option<f32> {
 impl PaintColor {
     pub fn parse_css(value: &str) -> Option<Self> {
         let value = value.trim();
+        if let Some(resolved) = crate::relative_color::resolve(value) {
+            return Self::parse_css(&resolved?);
+        }
         if value.eq_ignore_ascii_case("transparent") {
             return Some(Self::Rgba(0, 0, 0, 0));
         }
@@ -4122,15 +4125,23 @@ impl PaintColor {
     }
 }
 
-/// CSS Color 4 #color-function, #specifying-lab-lch and #specifying-oklab-oklch,
-/// using the local 2026-09-06
+/// CSS Color 4 #color-function (every predefined space), #the-hwb-notation,
+/// #specifying-lab-lch and #specifying-oklab-oklch, using the local 2026-09-06
 /// CSSWG snapshot (81c27f686901). Display P3 uses D65; Lab uses D50, so the
 /// conversion includes Bradford white-point adaptation. Keep source components
 /// unclipped until actual-value conversion to our sRGB paint surface.
 fn parse_perceptual_or_p3(value: &str) -> Option<PaintColor> {
-    use color::ColorSpaceTag::{DisplayP3, Lab, Lch, Oklab, Oklch};
+    use color::ColorSpaceTag::{Hwb, Lab, Lch, Oklab, Oklch};
     let origin = color::parse_color(value).ok()?;
-    if !matches!(origin.cs, DisplayP3 | Lab | Lch | Oklab | Oklch)
+    let function = value.get(..value.find('(')?)?.trim();
+    let supported = if function.eq_ignore_ascii_case("color") {
+        true
+    } else if function.eq_ignore_ascii_case("hwb") {
+        origin.cs == Hwb
+    } else {
+        matches!(origin.cs, Lab | Lch | Oklab | Oklch)
+    };
+    if !supported
         || !origin
             .components
             .iter()

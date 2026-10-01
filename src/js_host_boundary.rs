@@ -158,6 +158,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__body_buffer", 1),
     ("__base64_convert", 2),
     ("__dom_popover", 2),
+    ("__dom_dialog_modal", 2),
     ("__ws_open", 2),
     ("__ws_send", 3),
     ("__ws_close", 3),

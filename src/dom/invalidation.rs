@@ -572,6 +572,8 @@ impl SelectorDependencies {
             // Focus changes/removal explicitly invalidate focus-dependent
             // styles; unrelated child-list edits do not change focus. Shadow
             // slot redistribution already takes the shadow-scope fallback.
+            // Removing a modal dialog clears its flag through
+            // `set_dialog_modal`, which invalidates every style.
             self.structure_global |= !matches!(
                 state,
                 StatePseudo::AnyLink
@@ -581,6 +583,7 @@ impl SelectorDependencies {
                     | StatePseudo::Disabled
                     | StatePseudo::Enabled
                     | StatePseudo::Dir(_)
+                    | StatePseudo::Modal
             );
             self.text_direction |= matches!(state, StatePseudo::Dir(_));
             self.text_placeholder |= matches!(state, StatePseudo::PlaceholderShown);

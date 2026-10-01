@@ -304,6 +304,10 @@ fn component_text<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, String> {
 fn computed_color(text: &str) -> Option<String> {
     let decoded = ident(text);
     let text = decoded.as_deref().unwrap_or(text);
+    // CSS Color 5 #resolving-rcs: a relative color computes to its absolute color.
+    if let Some(resolved) = crate::relative_color::resolve(text) {
+        return computed_color(&resolved?);
+    }
     if text.eq_ignore_ascii_case("currentcolor") {
         return Some("currentcolor".into());
     }
