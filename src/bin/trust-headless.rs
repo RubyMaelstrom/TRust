@@ -83,6 +83,7 @@ struct Options {
     list_links: bool,
     max_chars: usize,
     js_diagnostics: bool,
+    site_data: bool,
 }
 
 const USAGE: &str = "\
@@ -99,6 +100,8 @@ usage: trust-headless [options] URL|FILE
   --links         also list every linked target found in the page
   --js-diagnostics  print the last page-script outcome: JS errors, console
                   output, module skips, panic flag, and fetch count
+  --site-data     load the saved profile's bookmarked-site cookies and
+                  storage (under XDG_DATA_HOME) and write changes back to it
   -h, --help      show this message
 
 Exit status: 0 when the dump is complete, 1 when no page loaded, 2 on a bad
@@ -117,6 +120,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut list_links = false;
     let mut max_chars = 8000usize;
     let mut js_diagnostics = false;
+    let mut site_data = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -139,6 +143,7 @@ fn parse_args() -> Result<Option<Options>, String> {
             }
             "--links" => list_links = true,
             "--js-diagnostics" => js_diagnostics = true,
+            "--site-data" => site_data = true,
             "--max-chars" => {
                 let raw = string("--max-chars", &mut args)?;
                 max_chars = match raw.as_str() {
@@ -169,6 +174,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         list_links,
         max_chars,
         js_diagnostics,
+        site_data,
     }))
 }
 
@@ -204,10 +210,22 @@ fn main() {
         }
     };
 
-    let outcome = match try_run(options) {
+    // Site storage is opt-in: without it a dump never reads or writes the profile.
+    let site_data = options.site_data;
+    if site_data && let Err(error) = trust::site_storage::initialize() {
+        eprintln!("trust-headless: site data: {error}");
+        std::process::exit(1);
+    }
+    let mut outcome = match try_run(options) {
         Ok(complete) => Ok(complete),
         Err(error) => Err(error.to_string()),
     };
+    if site_data
+        && let Err(error) = trust::site_storage::shutdown()
+        && outcome.is_ok()
+    {
+        outcome = Err(format!("site data: {error}"));
+    }
     // Navigation boundaries are where the allocator's arenas get their largest
     // one-off reclaim, and this process exits after exactly one of them.
     trust::release_allocator_memory();
