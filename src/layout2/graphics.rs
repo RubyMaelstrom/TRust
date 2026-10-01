@@ -2730,13 +2730,19 @@ fn paint_background_images_for_style(
                 let ratio_only = crate::img::svg_url_ratio_only(&source)
                     .or_else(|| crate::img::svg_ratio_only_get(&source))
                     .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-                let natural = builder
+                // CSS Backgrounds 3 #background-image and CSS Images 3
+                // #invalid-image: a loading image, or one that failed to load,
+                // still counts as a layer but draws nothing. Only decoded
+                // resources have an entry (pending ones carry a sentinel).
+                let Some(natural) = builder
                     .images
                     .get(&source)
                     .copied()
                     .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
                     .map(|(w, h)| (w as f32, h as f32))
-                    .unwrap_or((300.0, 150.0));
+                else {
+                    continue;
+                };
                 (
                     Some(handle),
                     background_size(size, natural, positioning, ratio_only, lengths),
@@ -4746,6 +4752,13 @@ mod tests {
     }
 
     fn render_fixture(html: &str) -> (Dom, crate::layout2::GraphicalLayout) {
+        render_fixture_with_images(html, &Default::default())
+    }
+
+    fn render_fixture_with_images(
+        html: &str,
+        images: &crate::layout2::ImageSizes,
+    ) -> (Dom, crate::layout2::GraphicalLayout) {
         let mut dom = Dom::parse_document(html);
         dom.set_render_clickables(Default::default(), true);
         let layout = crate::layout2::lay_out_graphical(
@@ -4754,7 +4767,7 @@ mod tests {
             crate::layout2::Viewport::new(800., 600.),
             &[],
             &Default::default(),
-            &Default::default(),
+            images,
         );
         (dom, layout)
     }
@@ -5071,9 +5084,14 @@ mod tests {
                 ("50% auto", (40., 20.)),
                 ("16px 36px", (16., 36.)),
             ] {
-                let (dom, layout) = render_fixture(&format!(
-                    r#"<div id=tile style="width:80px;height:60px;background-image:url(&quot;{source}&quot;);background-repeat:no-repeat;background-size:{size}"></div>"#
-                ));
+                // The decoder's fallback raster is loaded but not natural.
+                let decoded = [(source.to_string(), (300, 150))].into_iter().collect();
+                let (dom, layout) = render_fixture_with_images(
+                    &format!(
+                        r#"<div id=tile style="width:80px;height:60px;background-image:url(&quot;{source}&quot;);background-repeat:no-repeat;background-size:{size}"></div>"#
+                    ),
+                    &decoded,
+                );
                 let node = dom.get_by_id("tile").unwrap();
                 let rect = layout
                     .paint
@@ -5086,6 +5104,46 @@ mod tests {
                     .expect("background image tile");
                 assert_eq!((rect.width, rect.height), expected, "{source}: {size}");
             }
+        }
+    }
+
+    #[test]
+    fn unloaded_background_images_draw_nothing_but_are_requested() {
+        // CSS Backgrounds 3 #background-image: an image that is still loading
+        // or failed to download counts as a layer but draws nothing; the
+        // background color below it still paints.
+        let html = r#"<div id=tile style="width:80px;height:60px;background:#151515 url(tile.png)"></div>"#;
+        let source = "https://example.test/tile.png";
+        for (sizes, painted) in [
+            (Default::default(), false),
+            (
+                [(source.to_string(), (u32::MAX, u32::MAX))]
+                    .into_iter()
+                    .collect(),
+                false,
+            ),
+            ([(source.to_string(), (20, 10))].into_iter().collect(), true),
+        ] {
+            let (dom, layout) = render_fixture_with_images(html, &sizes);
+            let node = dom.get_by_id("tile").unwrap();
+            let image = layout.paint.primitives.iter().any(
+                |command| matches!(command, DisplayCommand::Image { node: n, .. } if *n == node),
+            );
+            assert_eq!(image, painted, "{sizes:?}");
+            assert!(layout.paint.primitives.iter().any(|command| matches!(
+                command,
+                DisplayCommand::Fill { brush: PaintBrush::Solid(color), .. }
+                    if *color == PaintColor::Rgba(0x15, 0x15, 0x15, 255)
+            )));
+            assert_eq!(
+                layout
+                    .paint
+                    .image_requests
+                    .iter()
+                    .map(|request| request.source.as_str())
+                    .collect::<Vec<_>>(),
+                [source]
+            );
         }
     }
 
