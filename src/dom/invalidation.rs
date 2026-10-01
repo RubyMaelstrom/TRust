@@ -93,6 +93,7 @@ impl SelectorDependencyIndex {
                 for rule in rules {
                     dependencies.record(rule);
                 }
+                dependencies.finish();
                 std::rc::Rc::new(dependencies)
             });
             result.documents.insert(document, dependencies.clone());
@@ -135,6 +136,101 @@ pub(super) struct SelectorDependencies {
     /// or a form can restyle an element outside the changed subtree.
     indeterminate: bool,
     structure_global: bool,
+    /// `structural`/`relational` positions bucketed by one necessary key, built
+    /// by `finish`. Every child-list change consults them, so a page's many
+    /// `:first-child`, sibling and `:has()` rules must not each scan the tree.
+    empty_keys: KeyIndex,
+    child_index_keys: KeyIndex,
+    sibling_left_keys: KeyIndex,
+    sibling_right_keys: KeyIndex,
+    anchor_keys: KeyIndex,
+    sibling_anchors: Vec<u32>,
+}
+
+/// Dependencies bucketed by one necessary key of the compound they test, like
+/// `RuleBuckets`: a node can only satisfy those under its id, one of its
+/// classes or its tag, plus the unkeyed ones.
+#[derive(Default)]
+struct KeyIndex {
+    by_id: FxHashMap<String, Vec<u32>>,
+    by_class: FxHashMap<String, Vec<u32>>,
+    by_tag: FxHashMap<String, Vec<u32>>,
+    unkeyed: Vec<u32>,
+}
+
+impl KeyIndex {
+    fn insert(&mut self, index: usize, tag: Option<&str>, id: Option<&str>, classes: &[String]) {
+        let index = index as u32;
+        if let Some(id) = id {
+            self.by_id.entry(id.to_string()).or_default().push(index);
+        } else if let Some(class) = classes.first() {
+            self.by_class.entry(class.clone()).or_default().push(index);
+        } else if let Some(tag) = tag.filter(|tag| *tag != "*") {
+            self.by_tag.entry(tag.to_string()).or_default().push(index);
+        } else {
+            self.unkeyed.push(index);
+        }
+    }
+
+    fn insert_step(&mut self, index: usize, guard: Option<&StructureGuard>) {
+        match guard.and_then(|guard| guard.0.last()) {
+            Some((_, tag, id, classes)) => {
+                self.insert(index, tag.as_deref(), id.as_deref(), classes)
+            }
+            None => self.insert(index, None, None, &[]),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+            && self.by_class.is_empty()
+            && self.by_tag.is_empty()
+            && self.unkeyed.is_empty()
+    }
+
+    /// Calls `visit` with every dependency `node` might satisfy until it
+    /// returns true; returns whether it did.
+    fn any(&self, dom: &Dom, node: NodeId, mut visit: impl FnMut(u32) -> bool) -> bool {
+        if self.unkeyed.iter().any(|&index| visit(index)) {
+            return true;
+        }
+        if !self.by_id.is_empty()
+            && let Some(indices) = dom.attr(node, "id").and_then(|id| self.by_id.get(id))
+            && indices.iter().any(|&index| visit(index))
+        {
+            return true;
+        }
+        if !self.by_class.is_empty()
+            && let Some(classes) = dom.attr(node, "class")
+        {
+            for class in classes.split_ascii_whitespace() {
+                if let Some(indices) = self.by_class.get(class)
+                    && indices.iter().any(|&index| visit(index))
+                {
+                    return true;
+                }
+            }
+        }
+        !self.by_tag.is_empty()
+            && dom
+                .tag_name(node)
+                .and_then(|tag| self.by_tag.get(tag))
+                .is_some_and(|indices| indices.iter().any(|&index| visit(index)))
+    }
+
+    fn retained_bytes(&self) -> usize {
+        [&self.by_id, &self.by_class, &self.by_tag]
+            .into_iter()
+            .map(|map| {
+                map.capacity() * std::mem::size_of::<(String, Vec<u32>)>()
+                    + map
+                        .iter()
+                        .map(|(key, indices)| key.capacity() + indices.capacity() * 4)
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self.unkeyed.capacity() * 4
+    }
 }
 
 /// A necessary, positive part of a selector. State/logical/positional tests
@@ -510,6 +606,35 @@ impl RelationalDependency {
 }
 
 impl SelectorDependencies {
+    fn finish(&mut self) {
+        for (index, dependency) in self.structural.iter().enumerate() {
+            match dependency {
+                StructureDependency::Empty { guards, .. } => {
+                    self.empty_keys.insert_step(index, guards.first());
+                }
+                StructureDependency::ChildIndex(guards) => {
+                    self.child_index_keys.insert_step(index, guards.first());
+                }
+                StructureDependency::Siblings { left, right } => {
+                    self.sibling_left_keys.insert_step(index, Some(left));
+                    self.sibling_right_keys.insert_step(index, Some(right));
+                }
+            }
+        }
+        for (index, dependency) in self.relational.iter().enumerate() {
+            if dependency.siblings {
+                self.sibling_anchors.push(index as u32);
+            } else {
+                self.anchor_keys.insert(
+                    index,
+                    dependency.tag.as_deref(),
+                    dependency.id.as_deref(),
+                    &dependency.classes,
+                );
+            }
+        }
+    }
+
     fn record(&mut self, rule: &StyleRule) {
         self.attributes.record(&rule.selector);
         self.complex(&rule.selector);
@@ -600,11 +725,37 @@ impl SelectorDependencies {
     /// under `parent` can cause (all roots lie on its ancestor chain).
     fn relational_root(&self, dom: &Dom, parent: NodeId) -> Option<NodeId> {
         let mut top: Option<(usize, NodeId)> = None;
-        for dependency in &self.relational {
-            if let Some(root) = dependency.restyle_root(dom, parent)
-                && top.is_none_or(|(level, _)| root.0 > level)
-            {
+        let mut raise = |root: (usize, NodeId)| {
+            if top.is_none_or(|(level, _)| root.0 > level) {
                 top = Some(root);
+            }
+        };
+        for &index in &self.sibling_anchors {
+            if let Some(root) = self.relational[index as usize].restyle_root(dom, parent) {
+                raise(root);
+            }
+        }
+        if !self.anchor_keys.is_empty() {
+            // One ancestor walk for every other dependency (see `restyle_root`).
+            let mut next = Some(parent);
+            let mut level = 0;
+            while let Some(node) = next {
+                level += 1;
+                let up = dom.selector_parent(node);
+                self.anchor_keys.any(dom, node, |index| {
+                    let dependency = &self.relational[index as usize];
+                    if dependency.depth.is_none_or(|depth| level <= depth)
+                        && dependency.possible_anchor(dom, node)
+                    {
+                        raise(if dependency.subject_siblings {
+                            (level, up.unwrap_or(node))
+                        } else {
+                            (level - 1, node)
+                        });
+                    }
+                    false
+                });
+                next = up;
             }
         }
         top.map(|(_, root)| root)
@@ -612,27 +763,52 @@ impl SelectorDependencies {
 
     fn structure_impact(&self, dom: &Dom, parent: NodeId) -> (bool, bool) {
         let (mut siblings, mut children) = (false, false);
-        for dependency in &self.structural {
-            match dependency {
-                StructureDependency::Empty {
-                    guards,
-                    siblings: affects_siblings,
-                } => {
-                    if guards.iter().all(|guard| guard.matches(dom, parent)) {
-                        children = true;
-                        siblings |= affects_siblings;
-                    }
-                }
-                StructureDependency::ChildIndex(guards) => {
-                    children |= dom
-                        .child_iter(parent)
-                        .any(|node| guards.iter().all(|guard| guard.matches(dom, node)));
-                }
-                StructureDependency::Siblings { left, right } => {
-                    children |= dom.child_iter(parent).any(|node| left.matches(dom, node))
-                        && dom.child_iter(parent).any(|node| right.matches(dom, node));
-                }
+        self.empty_keys.any(dom, parent, |index| {
+            if let StructureDependency::Empty {
+                guards,
+                siblings: affects_siblings,
+            } = &self.structural[index as usize]
+                && guards.iter().all(|guard| guard.matches(dom, parent))
+            {
+                children = true;
+                siblings |= affects_siblings;
             }
+            siblings
+        });
+        if children {
+            return (siblings, children);
+        }
+        // Each remaining form only adds `children`; stop at the first proof.
+        children = dom.child_iter(parent).any(|node| {
+            self.child_index_keys.any(dom, node, |index| {
+                matches!(
+                    &self.structural[index as usize],
+                    StructureDependency::ChildIndex(guards)
+                        if guards.iter().all(|guard| guard.matches(dom, node))
+                )
+            })
+        });
+        if !children && !self.sibling_left_keys.is_empty() {
+            let side = |keys: &KeyIndex, left: bool| {
+                let mut matched = FxHashSet::default();
+                for node in dom.child_iter(parent) {
+                    keys.any(dom, node, |index| {
+                        if let StructureDependency::Siblings { left: l, right: r } =
+                            &self.structural[index as usize]
+                            && (if left { l } else { r }).matches(dom, node)
+                        {
+                            matched.insert(index);
+                        }
+                        false
+                    });
+                }
+                matched
+            };
+            let left = side(&self.sibling_left_keys, true);
+            children = !left.is_empty()
+                && side(&self.sibling_right_keys, false)
+                    .iter()
+                    .any(|index| left.contains(index));
         }
         (siblings, children)
     }
@@ -651,6 +827,17 @@ impl SelectorDependencies {
                 .iter()
                 .map(StructureDependency::retained_bytes)
                 .sum::<usize>()
+            + [
+                &self.empty_keys,
+                &self.child_index_keys,
+                &self.sibling_left_keys,
+                &self.sibling_right_keys,
+                &self.anchor_keys,
+            ]
+            .into_iter()
+            .map(KeyIndex::retained_bytes)
+            .sum::<usize>()
+            + self.sibling_anchors.capacity() * 4
     }
 
     fn complex(&mut self, selector: &Complex) {
