@@ -58,6 +58,11 @@ impl CssRect {
     }
 }
 
+/// The initial `color` (CSS Color 4 #propdef-color: CanvasText). Gecko,
+/// Blink and WebKit render CanvasText as black in the light color scheme,
+/// and 3D border relief special-cases exactly that black.
+pub const CANVAS_TEXT: PaintColor = PaintColor::Rgba(0, 0, 0, 255);
+
 /// Small initial palette. It remains TRust-owned so backend color APIs do not
 /// escape the adapter; arbitrary page colors can extend this display contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

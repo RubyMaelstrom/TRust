@@ -426,7 +426,7 @@ pub(crate) fn rich_editor_presentation(
             .or_else(|| dom.computed_value_resolved(node, "color"))
             .as_deref()
             .and_then(crate::render::PaintColor::parse_css)
-            .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+            .unwrap_or(crate::render::CANVAS_TEXT);
         return Some(RichEditorPresentation {
             style,
             caret_color,
@@ -494,7 +494,7 @@ pub(crate) fn rich_editor_presentation(
             .computed_value_resolved(node, "color")
             .as_deref()
             .and_then(crate::render::PaintColor::parse_css)
-            .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+            .unwrap_or(crate::render::CANVAS_TEXT);
         let caret_color = dom
             .computed_value_resolved(node, "caret-color")
             .filter(|value| !matches!(value.trim(), "auto" | "currentcolor" | "currentColor"))
@@ -533,7 +533,7 @@ pub(crate) fn rich_editor_presentation(
         .or_else(|| dom.computed_value_resolved(style_node, "color"))
         .as_deref()
         .and_then(crate::render::PaintColor::parse_css)
-        .unwrap_or(crate::render::PaintColor::Rgba(20, 20, 20, 255));
+        .unwrap_or(crate::render::CANVAS_TEXT);
     let nodes: Vec<_> = std::iter::once(node).chain(dom.descendants(node)).collect();
     let mut paragraphs = 0;
     let plain = nodes.iter().all(|&id| {
@@ -4102,11 +4102,7 @@ mod tests {
                 "underline",
                 crate::render::PaintColor::Rgba(161, 47, 255, 255),
             ),
-            (
-                "",
-                "underline",
-                crate::render::PaintColor::Rgba(20, 20, 20, 255),
-            ),
+            ("", "underline", crate::render::CANVAS_TEXT),
         ] {
             let layout = lay_graphical(
                 &format!(

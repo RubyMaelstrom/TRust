@@ -4142,7 +4142,7 @@ fn text_color(dom: &Dom, node: NodeId, link: bool) -> PaintColor {
     if link {
         PaintColor::Rgba(0, 70, 190, 255)
     } else {
-        PaintColor::Rgba(20, 20, 20, 255)
+        crate::render::CANVAS_TEXT
     }
 }
 
@@ -4157,7 +4157,7 @@ fn text_color_for_style(dom: &Dom, style: PaintStyle) -> PaintColor {
     // HTML #phrasing-content-3 supplies hyperlink color in the UA cascade.
     // An activation target (summary, button, onclick host) is not a hyperlink
     // and must not acquire link styling from its frontend action descriptor.
-    PaintColor::Rgba(20, 20, 20, 255)
+    crate::render::CANVAS_TEXT
 }
 
 fn resolve_color(dom: &Dom, node: NodeId, value: &str) -> Option<PaintColor> {
