@@ -932,7 +932,7 @@ Two environment inputs to the script add instruction-level detail:
 |---|---|---|
 | `PSAMPLE_HOT` | substring of a symbol name | Per-instruction histogram for matching functions, as executable virtual addresses for `objdump -d --start-address=...`. Entries below 0.1% of samples are omitted. |
 | `PSAMPLE_JITHOT` | substring of a JIT function's local names (needs `--jitmap`) | Per-offset histogram inside matching generated functions. Entries below 0.05% of samples are omitted. |
-| `PSAMPLE_FOCUS` | substring of a symbol name | Direct callees and inclusive costs beneath the outermost matching frame, as percentages of all samples. |
+| `PSAMPLE_FOCUS` | substring of a symbol name | Callers of the outermost matching frame, and the direct callees and inclusive costs beneath it, as percentages of all samples. |
 
 To read generated code at those offsets, run the same script with
 `LUMEN_JIT_CODEDUMP=<substring>` (ARM64 only; also printed by `lumen --help`). It

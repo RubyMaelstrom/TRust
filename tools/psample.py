@@ -16,8 +16,8 @@ the ELF symbol tables of the mapped executables (`nm`, `readelf`; names demangle
     (addresses are executable virtual addresses for `objdump --start-address`);
   * with --jitmap and PSAMPLE_JITHOT=<substring>: a per-offset histogram inside matching
     Lumen JIT functions (offsets line up with a LUMEN_JIT_CODEDUMP of the same function);
-  * with PSAMPLE_FOCUS=<substring>: the direct callees and inclusive costs beneath the
-    outermost matching frame, as percentages of all samples.
+  * with PSAMPLE_FOCUS=<substring>: the callers of the outermost matching frame, and the
+    direct callees and inclusive costs beneath it, as percentages of all samples.
 
 Anonymous executable mappings are reported as `[jit]`. With --jitmap the child runs with
 LUMEN_JIT_MAP=1, its stderr goes to OUT.txt.jitmap, and JIT samples are attributed to
@@ -402,16 +402,21 @@ def report(args, samples, threads, sym):
         focus = os.environ.get("PSAMPLE_FOCUS")
         if focus:
             direct, below, within = collections.Counter(), collections.Counter(), 0
+            entry = collections.Counter()
             for frames in decoded:
                 names = [pretty[sym.name(a)] for a in frames]
                 at = next((i for i in range(len(names) - 1, -1, -1) if focus in names[i]), None)
                 if at is None:
                     continue
                 within += 1
+                entry[names[at + 1] if at + 1 < len(names) else "(root)"] += 1
                 direct[names[at - 1] if at else "(self)"] += 1
                 for name in set(names[:at]):
                     below[name] += 1
-            f.write(f"\n== under *{focus}* ({100 * within / n:.2f}%): direct callees ==\n")
+            f.write(f"\n== *{focus}* ({100 * within / n:.2f}%): callers ==\n")
+            for k, v in entry.most_common(20):
+                f.write(f"{100 * v / n:6.2f}% {k}\n")
+            f.write(f"\n== under *{focus}*: direct callees ==\n")
             for k, v in direct.most_common(30):
                 f.write(f"{100 * v / n:6.2f}% {k}\n")
             f.write(f"\n== under *{focus}*: inclusive ==\n")
