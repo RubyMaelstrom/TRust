@@ -530,10 +530,13 @@ impl State {
 /// CSS Transitions 1 #starting: detached or non-rendered elements have no
 /// before/after pair. Memoizing common ancestors keeps a large dirty subtree
 /// linear without traversing unrelated branches or relying on dirty-set order.
+/// Ancestors are resolved first: nothing below a non-rendered ancestor needs
+/// its own `display`, which layout never computes either (a full pass visits
+/// every element, so hidden menus would otherwise each pay a cascade).
 fn participates(dom: &Dom, node: NodeId, memo: &mut FxHashMap<NodeId, bool>) -> bool {
     let mut path = Vec::new();
     let mut cursor = Some(node);
-    let result = loop {
+    let mut result = loop {
         let Some(id) = cursor else { break false };
         if id == DOCUMENT {
             break true;
@@ -542,16 +545,17 @@ fn participates(dom: &Dom, node: NodeId, memo: &mut FxHashMap<NodeId, bool>) -> 
             break result;
         }
         path.push(id);
-        if !dom.is_valid(id)
-            || (dom.tag_name(id).is_some()
-                && (dom.computed_display(id).as_deref() == Some("none")
-                    || dom.subtree_omitted_from_box_tree(id)))
-        {
+        if !dom.is_valid(id) {
             break false;
         }
         cursor = dom.parent_composed(id);
     };
-    for id in path {
+    for &id in path.iter().rev() {
+        result = result
+            && dom.is_valid(id)
+            && !(dom.tag_name(id).is_some()
+                && (dom.computed_display(id).as_deref() == Some("none")
+                    || dom.subtree_omitted_from_box_tree(id)));
         memo.insert(id, result);
     }
     result
