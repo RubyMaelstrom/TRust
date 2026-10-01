@@ -3707,6 +3707,29 @@ mod tests {
     }
 
     #[test]
+    fn shrink_to_fit_text_stays_on_the_line_it_was_measured_on() {
+        // A max-content box must hold its own text on one line: the wrap
+        // decision compares end positions, so the different summation order
+        // of the intrinsic probe cannot push the last word over by a hair
+        // (letter-spaced flex/inline-block labels wrapped their last word).
+        for spacing in ["1.54px", ".14em", "0.7px"] {
+            let html = format!(
+                r#"<body style="margin:0"><div style="font:11px monospace;letter-spacing:{spacing}">
+                <span style="display:inline-block">Independent web archive / 001</span></div>
+                <div style="display:flex;font:11px monospace;letter-spacing:{spacing}">Independent web archive / 001</div></body>"#
+            );
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let runs = layout
+                .paint
+                .primitives
+                .iter()
+                .filter(|command| matches!(command, crate::render::DisplayCommand::GlyphRun { .. }))
+                .count();
+            assert_eq!(runs, 2, "letter-spacing:{spacing}");
+        }
+    }
+
+    #[test]
     fn legacy_text_align_keywords_align_descendant_blocks() {
         // The -webkit-/-moz- keywords expose HTML's descendant alignment to
         // CSS; a plain text-align on an intermediate element ends it.
