@@ -2272,7 +2272,10 @@ mod tests {
         dom.set_text(row, "row");
         dom.append(list, row);
         dom.detach(row);
-        assert_eq!(dom.style_value_epoch, epoch, "a child-list change expired the document");
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a child-list change expired the document"
+        );
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
         assert_matches_full_scan(&dom);
         // Focus changes still restyle the anchors.
@@ -2312,7 +2315,10 @@ mod tests {
         dom.set_text(row, "row");
         dom.append(list, row);
         dom.detach(row);
-        assert_eq!(dom.style_value_epoch, epoch, "a radio-free change expired the document");
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a radio-free change expired the document"
+        );
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
         assert_matches_full_scan(&dom);
         // HTML #selector-indeterminate: a checked radio joining the group
@@ -2356,7 +2362,10 @@ mod tests {
         dom.set_attr(badge, "class", "badge");
         dom.append(inner, badge);
         assert_eq!(value(&dom, "title", "height").as_deref(), Some("5px"));
-        assert_eq!(dom.style_value_epoch, epoch, "a :has() anchor expired the document");
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a :has() anchor expired the document"
+        );
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
         assert_matches_full_scan(&dom);
         dom.detach(icon);
@@ -2437,9 +2446,15 @@ mod tests {
         // Discourse: `.d-toggle-switch:has(.composer-event__livestream-switch:disabled)`;
         // moving the control into a disabled fieldset disables it.
         assert_ne!(value(&dom, "knob", "width").as_deref(), Some("4px"));
-        dom.append(dom.get_by_id("fieldset").unwrap(), dom.get_by_id("switch").unwrap());
+        dom.append(
+            dom.get_by_id("fieldset").unwrap(),
+            dom.get_by_id("switch").unwrap(),
+        );
         assert_eq!(value(&dom, "knob", "width").as_deref(), Some("4px"));
-        assert_eq!(dom.style_value_epoch, epoch, "a :has() argument expired the document");
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a :has() argument expired the document"
+        );
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
         assert_matches_full_scan(&dom);
         assert_style_values_match_cold(&mut dom);
@@ -2475,7 +2490,10 @@ mod tests {
         dom.set_text(row, "row");
         dom.append(list, row);
         dom.detach(row);
-        assert_eq!(dom.style_value_epoch, epoch, "a child-list change expired the document");
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a child-list change expired the document"
+        );
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
         assert_matches_full_scan(&dom);
         // A textarea's own text children decide its :placeholder-shown.

@@ -44,10 +44,38 @@ fn function_form(name: &str) -> Option<Form> {
         "rgb" | "rgba" => form(Space::Srgb, ["r", "g", "b"], None, [255.; 3], 255., true),
         "hsl" | "hsla" => form(Space::Hsl, ["h", "s", "l"], Some(0), [100.; 3], 1., true),
         "hwb" => form(Space::Hwb, ["h", "w", "b"], Some(0), [100.; 3], 1., true),
-        "lab" => form(Space::Lab, ["l", "a", "b"], None, [100., 125., 125.], 1., false),
-        "lch" => form(Space::Lch, ["l", "c", "h"], Some(2), [100., 150., 1.], 1., false),
-        "oklab" => form(Space::Oklab, ["l", "a", "b"], None, [1., 0.4, 0.4], 1., false),
-        "oklch" => form(Space::Oklch, ["l", "c", "h"], Some(2), [1., 0.4, 1.], 1., false),
+        "lab" => form(
+            Space::Lab,
+            ["l", "a", "b"],
+            None,
+            [100., 125., 125.],
+            1.,
+            false,
+        ),
+        "lch" => form(
+            Space::Lch,
+            ["l", "c", "h"],
+            Some(2),
+            [100., 150., 1.],
+            1.,
+            false,
+        ),
+        "oklab" => form(
+            Space::Oklab,
+            ["l", "a", "b"],
+            None,
+            [1., 0.4, 0.4],
+            1.,
+            false,
+        ),
+        "oklch" => form(
+            Space::Oklch,
+            ["l", "c", "h"],
+            Some(2),
+            [1., 0.4, 1.],
+            1.,
+            false,
+        ),
         _ => return None,
     })
 }
@@ -116,7 +144,9 @@ fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
     if p.expect_function().is_err() {
         return Some(None);
     }
-    let resolved = p.parse_nested_block(|p| relative_body(p, &name, depth)).ok();
+    let resolved = p
+        .parse_nested_block(|p| relative_body(p, &name, depth))
+        .ok();
     Some(resolved.filter(|_| p.is_exhausted()))
 }
 
@@ -128,10 +158,17 @@ fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i
         let space = p.expect_ident_cloned()?.to_ascii_lowercase();
         let form = color_function_form(&space).ok_or_else(|| p.new_custom_error(()))?;
         // "xyz" is an alias; serialize the canonical name.
-        let canonical = if space == "xyz" { "xyz-d65".to_string() } else { space };
+        let canonical = if space == "xyz" {
+            "xyz-d65".to_string()
+        } else {
+            space
+        };
         (form, Some(canonical))
     } else {
-        (function_form(name).ok_or_else(|| p.new_custom_error(()))?, None)
+        (
+            function_form(name).ok_or_else(|| p.new_custom_error(()))?,
+            None,
+        )
     };
 
     // Component keywords: the origin in the processing space.
@@ -303,7 +340,13 @@ fn channel_value<'i>(
     let value = match (channel, typed.unit) {
         (_, Unit::Number) => typed.value,
         (Channel::Component { hue: true, .. }, Unit::Angle) => typed.value,
-        (Channel::Component { hue: false, percent }, Unit::Percent) => typed.value / 100. * percent,
+        (
+            Channel::Component {
+                hue: false,
+                percent,
+            },
+            Unit::Percent,
+        ) => typed.value / 100. * percent,
         (Channel::Alpha, Unit::Percent) => typed.value / 100.,
         _ => return Err(p.new_custom_error(())),
     };
@@ -338,7 +381,9 @@ fn term<'i>(
             value: f64::from(unit_value) * 100.,
             unit: Unit::Percent,
         },
-        Token::Dimension { value, ref unit, .. } => {
+        Token::Dimension {
+            value, ref unit, ..
+        } => {
             let value = f64::from(value);
             let degrees = match unit.to_ascii_lowercase().as_str() {
                 "deg" => value,
@@ -384,8 +429,14 @@ fn math_function<'i>(
                 return Err(p.new_custom_error(()));
             }
             let value = match name {
-                "min" => args.iter().map(|arg| arg.value).fold(f64::INFINITY, f64::min),
-                "max" => args.iter().map(|arg| arg.value).fold(f64::NEG_INFINITY, f64::max),
+                "min" => args
+                    .iter()
+                    .map(|arg| arg.value)
+                    .fold(f64::INFINITY, f64::min),
+                "max" => args
+                    .iter()
+                    .map(|arg| arg.value)
+                    .fold(f64::NEG_INFINITY, f64::max),
                 _ => args[1].value.min(args[2].value).max(args[0].value),
             };
             Typed { value, unit }
@@ -399,7 +450,11 @@ fn math_function<'i>(
 }
 
 /// `<calc-sum>`: products joined by `+`/`-`, which must share a type.
-fn sum<'i>(p: &mut Parser<'i, '_>, keywords: &[(&str, Option<f64>)], depth: usize) -> Res<'i, Typed> {
+fn sum<'i>(
+    p: &mut Parser<'i, '_>,
+    keywords: &[(&str, Option<f64>)],
+    depth: usize,
+) -> Res<'i, Typed> {
     let mut left = product(p, keywords, depth)?;
     loop {
         let state = p.state();
@@ -470,7 +525,10 @@ mod tests {
     fn components(text: &str) -> (String, Vec<f64>) {
         let value = resolved(text).unwrap_or_else(|| panic!("{text} should resolve"));
         let body = &value[value.find('(').unwrap() + 1..value.len() - 1];
-        let numbers = body.split_whitespace().filter_map(|part| part.parse().ok()).collect();
+        let numbers = body
+            .split_whitespace()
+            .filter_map(|part| part.parse().ok())
+            .collect();
         (value, numbers)
     }
 
@@ -510,32 +568,60 @@ mod tests {
         let (value, values) = components("rgb(from rebeccapurple r g b)");
         assert!(value.starts_with("color(srgb "), "{value}");
         close(&values, &[0.4, 0.2, 0.6, 1.]);
-        close(&components("rgb(from rgb(20% 40% 60% / 80%) r g b)").1, &[0.2, 0.4, 0.6, 0.8]);
-        close(&components("rgb(from rebeccapurple b alpha r / g)").1, &[0.6, 1. / 255., 0.4, 1.]);
-        close(&components("rgb(from rebeccapurple r calc(g * 2) 10)").1, &[0.4, 0.4, 10. / 255., 1.]);
+        close(
+            &components("rgb(from rgb(20% 40% 60% / 80%) r g b)").1,
+            &[0.2, 0.4, 0.6, 0.8],
+        );
+        close(
+            &components("rgb(from rebeccapurple b alpha r / g)").1,
+            &[0.6, 1. / 255., 0.4, 1.],
+        );
+        close(
+            &components("rgb(from rebeccapurple r calc(g * 2) 10)").1,
+            &[0.4, 0.4, 10. / 255., 1.],
+        );
         close(
             &components("rgb(from rebeccapurple calc((r / 255) * 100%) g b / calc(alpha * 50%))").1,
             &[0.4, 0.2, 0.6, 0.5],
         );
-        close(&components("hsl(from rebeccapurple h s l)").1, &[0.4, 0.2, 0.6, 1.]);
+        close(
+            &components("hsl(from rebeccapurple h s l)").1,
+            &[0.4, 0.2, 0.6, 1.],
+        );
         close(
             &components("hsl(from hsl(20 30 40 / 0.8) calc(h + 1) calc(s + 1) calc(l + 1) / calc(alpha + 0.01))").1,
             &[0.537, 0.372, 0.283, 0.81],
         );
-        close(&components("hwb(from rebeccapurple h w b)").1, &[0.4, 0.2, 0.6, 1.]);
+        close(
+            &components("hwb(from rebeccapurple h w b)").1,
+            &[0.4, 0.2, 0.6, 1.],
+        );
         let (value, values) = components("lab(from lab(25 20 50 / 40%) l a b)");
         assert!(value.starts_with("lab("), "{value}");
         close(&values, &[25., 20., 50., 0.4]);
-        close(&components("oklch(from oklch(0.7 0.1 300) l c calc(h + 90))").1, &[0.7, 0.1, 30., 1.]);
+        close(
+            &components("oklch(from oklch(0.7 0.1 300) l c calc(h + 90))").1,
+            &[0.7, 0.1, 30., 1.],
+        );
         // WPT: the result is clamped like a parsed color.
-        close(&components("oklch(from oklch(0.7 0.45 30 / 40%) 2 3 400 / 500)").1, &[1., 3., 40., 1.]);
+        close(
+            &components("oklch(from oklch(0.7 0.45 30 / 40%) 2 3 400 / 500)").1,
+            &[1., 3., 40., 1.],
+        );
         let (value, values) =
             components("color(from color(display-p3 0.7 0.5 0.3) display-p3 r g calc(b + 0.5))");
         assert!(value.starts_with("color(display-p3 "), "{value}");
         close(&values, &[0.7, 0.5, 0.8, 1.]);
-        assert!(resolved("color(from red xyz x y z)").unwrap().starts_with("color(xyz-d65 "));
+        assert!(
+            resolved("color(from red xyz x y z)")
+                .unwrap()
+                .starts_with("color(xyz-d65 ")
+        );
         // Nested origins and `none`.
-        close(&components("rgb(from rgb(from rebeccapurple r g b) r g b)").1, &[0.4, 0.2, 0.6, 1.]);
+        close(
+            &components("rgb(from rgb(from rebeccapurple r g b) r g b)").1,
+            &[0.4, 0.2, 0.6, 1.],
+        );
         let (value, values) = components("rgb(from rebeccapurple r g none / none)");
         assert!(value.ends_with(" none / none)"), "{value}");
         close(&values, &[0.4, 0.2]);
