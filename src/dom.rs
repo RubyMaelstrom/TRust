@@ -6128,6 +6128,7 @@ impl Dom {
         // resolve to the same layer order document-wide.
         let mut layer_regs: std::collections::HashMap<NodeId, LayerRegistry> =
             std::collections::HashMap::new();
+        self.parsed_sheets.borrow_mut().begin_build();
         for id in self.composed_descendants(DOCUMENT) {
             if id != DOCUMENT && matches!(self.nodes[id].data, NodeData::Document) {
                 // Each content Document has an independent font environment,
