@@ -19062,7 +19062,10 @@ mod tests {
             let value = dom.computed_value_resolved(node, property).unwrap();
             crate::render::PaintColor::parse_css(&value)
         };
-        assert_eq!(paint("color"), Some(crate::render::PaintColor::Rgba(0, 0, 255, 128)));
+        assert_eq!(
+            paint("color"),
+            Some(crate::render::PaintColor::Rgba(0, 0, 255, 128))
+        );
         assert_eq!(
             paint("background-color"),
             Some(crate::render::PaintColor::Rgba(255, 0, 0, 255))
