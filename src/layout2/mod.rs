@@ -3707,6 +3707,21 @@ mod tests {
     }
 
     #[test]
+    fn shrink_to_fit_boxes_size_percentage_iframes_by_the_default_object_size() {
+        // css-sizing-3 §5.2.1 and HTML Rendering §15.4.1: a cyclic `80%`
+        // iframe width is auto (300px) for the max-content contribution; its
+        // nested document's content does not size it.
+        let html = r#"<body style="margin:0"><span id=box style="display:inline-block">
+            <iframe id=frame srcdoc="<p>tiny" width="80%" height="100" frameborder="0"></iframe>
+            </span></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1000.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        assert!((width("box") - 300.0).abs() < 1.0, "{}", width("box"));
+        assert!((width("frame") - 240.0).abs() < 1.0, "{}", width("frame"));
+    }
+
+    #[test]
     fn grid_items_and_rows_honor_min_heights() {
         // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
         // §12.1/§11.8: an auto row stretches into the container's definite
