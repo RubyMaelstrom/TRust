@@ -438,20 +438,168 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
     }
     let _ = out.flush();
     if let Some(path) = std::env::var_os("TRUST_HEADLESS_PNG")
-        && let Some(rendered) = controller
-            .current_page()
-            .and_then(|page| page.rendered_page())
+        && let Some((layout, store, loaded, failed)) =
+            snapshot_with_images(&mut controller, options).await
     {
-        let frame = trust::render::headless::render_paint(
-            &rendered.layout.paint,
+        let frame = trust::render::headless::render_paint_with_images(
+            &layout.paint,
             CssSize::new(options.width, options.height),
+            store,
         )?;
         trust::render::headless::write_png(&frame, path)?;
-        eprintln!(
-            "[snapshot] canonical display list with inline image resources (no additional image fetches)"
-        );
+        eprintln!("[snapshot] display list with {loaded} image(s) loaded, {failed} failed");
     }
     Ok(settled != Settle::Timeout)
+}
+
+/// Images one snapshot round may start, and how long all rounds may take.
+const SNAPSHOT_IMAGE_LIMIT: usize = 200;
+const SNAPSHOT_IMAGE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The page's layout and decoded images for a PNG snapshot. Like the desktop
+/// frontend, fetch the eager, painted and near-viewport image sources, decode
+/// them, and lay the page out again with their intrinsic sizes (in the page
+/// actor when it is live), repeating while that reveals further images.
+async fn snapshot_with_images(
+    controller: &mut BrowserController,
+    options: &Options,
+) -> Option<(
+    std::sync::Arc<trust::layout2::PixelLayout>,
+    trust::render::ImageStore,
+    usize,
+    usize,
+)> {
+    use futures::StreamExt;
+    let deadline = Instant::now() + SNAPSHOT_IMAGE_DEADLINE;
+    let mut sizes = trust::layout2::ImageSizes::new();
+    let mut decoded: HashMap<String, trust::render::ImageResource> = HashMap::new();
+    let mut failed: HashSet<String> = HashSet::new();
+    let mut relaid: Option<trust::http::RenderedPage> = None;
+    loop {
+        let page = controller.current_page()?;
+        let FetchedDocument::Http(response) = &page.document else {
+            break;
+        };
+        let rendered = relaid.as_ref().or(page.rendered_page())?;
+        let near = options.height * 2.0;
+        let mut sources: Vec<String> = Vec::new();
+        for source in rendered
+            .eager_image_urls
+            .iter()
+            .chain(
+                rendered
+                    .layout
+                    .paint
+                    .image_requests
+                    .iter()
+                    .map(|r| &r.source),
+            )
+            .chain(
+                rendered
+                    .deferred_images
+                    .iter()
+                    .filter(|image| image.fixed || image.rect.y < near)
+                    .map(|image| &image.source),
+            )
+        {
+            if !decoded.contains_key(source)
+                && !failed.contains(source)
+                && !sources.contains(source)
+                && sources.len() < SNAPSHOT_IMAGE_LIMIT
+            {
+                sources.push(source.clone());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if sources.is_empty() || remaining.is_zero() {
+            break;
+        }
+        let base = response.url.clone();
+        let blobs = response.blobs.clone();
+        let restricted = rendered.cookie_restricted_images.clone();
+        let results: Vec<_> = futures::stream::iter(sources)
+            .map(|source| {
+                let (base, blobs) = (base.clone(), blobs.clone());
+                let restricted = restricted.contains(&source);
+                async move {
+                    let fetched = tokio::time::timeout(
+                        remaining,
+                        trust::http::fetch_graphical_image_with_cookie_policy(
+                            &base,
+                            &source,
+                            blobs.as_ref(),
+                            restricted,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(String::from("timed out")));
+                    let image = match fetched {
+                        Ok(bytes) => {
+                            let decode_source = source.clone();
+                            tokio::task::spawn_blocking(move || {
+                                trust::img::decode_graphical_image_for_source(&decode_source, bytes)
+                            })
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result)
+                            .map(|decoded| decoded.image)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    (source, image)
+                }
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        for (source, image) in results {
+            match image {
+                Ok(image) => {
+                    sizes.insert(source.clone(), (image.width, image.height));
+                    decoded.insert(source, image);
+                }
+                Err(_) => {
+                    failed.insert(source);
+                }
+            }
+        }
+        if controller.page_is_live() {
+            let before = controller.current_page()?.rendered_revision();
+            if !controller.send_image_sizes(&sizes) {
+                break;
+            }
+            let waited = Instant::now();
+            while waited.elapsed() < Duration::from_secs(5) {
+                controller.process_async_events();
+                if controller
+                    .current_page()
+                    .is_some_and(|page| page.rendered_revision() != before)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        } else {
+            relaid = trust::http::render_html_for_environment(
+                response,
+                trust::layout2::Viewport::new(options.width, options.height),
+                1.0,
+                None,
+                &sizes,
+            );
+        }
+    }
+    let layout = match relaid {
+        Some(rendered) => rendered.layout,
+        None => controller.current_page()?.rendered_page()?.layout.clone(),
+    };
+    let store = trust::render::ImageStore::default();
+    for request in &layout.paint.image_requests {
+        if let Some(image) = decoded.get(&request.source) {
+            store.insert(request.handle, image.clone());
+        }
+    }
+    Some((layout, store, decoded.len(), failed.len()))
 }
 
 /// What the protocol said about a fetched document, in the same words the

@@ -15,8 +15,21 @@ use crate::layout2::{ControlMap, ImageSizes, Viewport};
 /// Rasterize an existing authoritative display list with its inline resources.
 /// No reparse/relayout and no network requests; useful for release diagnostics.
 pub fn render_paint(page: &super::PagePaint, viewport: CssSize) -> Result<OwnedRgbaFrame, String> {
-    let store = ImageStore::default();
-    for request in &page.image_requests {
+    render_paint_with_images(page, viewport, ImageStore::default())
+}
+
+/// [`render_paint`] with images the caller already decoded (keyed by request
+/// handle); `data:` images missing from `store` are still decoded inline.
+pub fn render_paint_with_images(
+    page: &super::PagePaint,
+    viewport: CssSize,
+    store: ImageStore,
+) -> Result<OwnedRgbaFrame, String> {
+    for request in page
+        .image_requests
+        .iter()
+        .filter(|request| !store.contains(request.handle))
+    {
         if let Some(bytes) = crate::img::decode_data_url(&request.source)
             && let Ok(image) = crate::img::decode_graphical(&bytes)
         {
