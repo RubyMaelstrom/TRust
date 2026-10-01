@@ -15,7 +15,9 @@ the ELF symbol tables of the mapped executables (`nm`, `readelf`; names demangle
   * with PSAMPLE_HOT=<substring>: a per-instruction histogram for matching functions
     (addresses are executable virtual addresses for `objdump --start-address`);
   * with --jitmap and PSAMPLE_JITHOT=<substring>: a per-offset histogram inside matching
-    Lumen JIT functions (offsets line up with a LUMEN_JIT_CODEDUMP of the same function).
+    Lumen JIT functions (offsets line up with a LUMEN_JIT_CODEDUMP of the same function);
+  * with PSAMPLE_FOCUS=<substring>: the direct callees and inclusive costs beneath the
+    outermost matching frame, as percentages of all samples.
 
 Anonymous executable mappings are reported as `[jit]`. With --jitmap the child runs with
 LUMEN_JIT_MAP=1, its stderr goes to OUT.txt.jitmap, and JIT samples are attributed to
@@ -397,6 +399,24 @@ def report(args, samples, threads, sym):
             for a, v in sorted(hist.items()):
                 if v * 1000 >= n:
                     f.write(f"{a:#x} {100 * v / n:6.2f}%\n")
+        focus = os.environ.get("PSAMPLE_FOCUS")
+        if focus:
+            direct, below, within = collections.Counter(), collections.Counter(), 0
+            for frames in decoded:
+                names = [pretty[sym.name(a)] for a in frames]
+                at = next((i for i in range(len(names) - 1, -1, -1) if focus in names[i]), None)
+                if at is None:
+                    continue
+                within += 1
+                direct[names[at - 1] if at else "(self)"] += 1
+                for name in set(names[:at]):
+                    below[name] += 1
+            f.write(f"\n== under *{focus}* ({100 * within / n:.2f}%): direct callees ==\n")
+            for k, v in direct.most_common(30):
+                f.write(f"{100 * v / n:6.2f}% {k}\n")
+            f.write(f"\n== under *{focus}*: inclusive ==\n")
+            for k, v in below.most_common(50):
+                f.write(f"{100 * v / n:6.2f}% {k}\n")
         jithot = os.environ.get("PSAMPLE_JITHOT")
         if jithot:
             hist = collections.Counter()
