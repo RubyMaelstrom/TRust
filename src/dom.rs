@@ -15072,11 +15072,10 @@ fn parse_sheet(
             }
             // Other @-rules (@charset/@import end at ';'; block at-rules at
             // their balanced '}') are skipped whole.
-            rest = match (after.find(';'), after.find('{')) {
-                (Some(s), Some(b)) if s < b => &after[s + 1..],
-                (_, Some(b)) => take_block(&after[b..]).1,
-                (Some(s), None) => &after[s + 1..],
-                (None, None) => return,
+            rest = match at_rule_prelude_end(after) {
+                Some((end, b';')) => &after[end + 1..],
+                Some((brace, _)) => take_block(&after[brace..]).1,
+                None => return,
             };
             continue;
         }
@@ -15086,6 +15085,31 @@ fn parse_sheet(
         rest = after;
         parse_style_rule(selector_text, block, order, out, media, &lpath);
     }
+}
+
+/// Where an at-rule's prelude ends: its first `;` or `{` outside quoted
+/// strings and parenthesized blocks (CSS Syntax 3 #consume-at-rule). A Google
+/// Fonts `@import url('...ital@0;1...')` must not end at the quoted `;`.
+fn at_rule_prelude_end(text: &str) -> Option<(usize, u8)> {
+    let bytes = text.as_bytes();
+    let (mut i, mut depth, mut quote) = (0, 0usize, None);
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match quote {
+            Some(_) if byte == b'\\' => i += 1,
+            Some(q) if byte == q => quote = None,
+            Some(_) => {}
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b';' | b'{' if depth == 0 => return Some((i, byte)),
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Process one style-rule body into `out`: emit its own declarations for the
@@ -17984,6 +18008,25 @@ mod tests {
         assert!(dom.serialize(DOCUMENT).contains("payload"));
         dom.set_attr(m, "class", "menu");
         assert!(!dom.serialize(DOCUMENT).contains("payload"));
+    }
+
+    #[test]
+    fn quoted_semicolons_do_not_end_an_import_statement() {
+        // CSS Syntax 3 #consume-at-rule: strings and parenthesized blocks are
+        // component values of the prelude. Google Fonts URLs carry `;`.
+        let mut dom = Dom::parse_document(
+            "<style>@import url('https://fonts.example/css2?family=A:ital@0;1&display=swap');\
+             @import \"b;{.css\" screen;\
+             @import url(c;d.css);\
+             body { background-color: black } p { color: red }</style><body id=body><p id=p>x</p>",
+        );
+        let body = dom.get_by_id("body").unwrap();
+        assert_eq!(
+            dom.computed_value(body, "background-color").as_deref(),
+            Some("black")
+        );
+        let p = dom.get_by_id("p").unwrap();
+        assert_eq!(dom.computed_value(p, "color").as_deref(), Some("red"));
     }
 
     #[test]
