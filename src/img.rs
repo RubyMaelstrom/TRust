@@ -1041,6 +1041,8 @@ pub(crate) fn svg_intrinsic_epoch() -> u64 {
 /// can be revalidated to different bytes, so a now-dimensioned SVG or raster
 /// image must also clear an older ratio-only entry for the same URL.
 pub(crate) fn record_svg_intrinsic_metadata(url: &str, bytes: &[u8]) {
+    #[cfg(test)]
+    let _inputs = crate::layout2::global_layout_input_change();
     let ratio = svg_bytes_ratio_only(bytes).filter(|ratio| ratio.is_finite() && *ratio > 0.0);
     let mut ratios = SVG_RATIO_ONLY.lock().unwrap();
     if ratios.get(url).copied() == ratio {

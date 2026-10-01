@@ -75,6 +75,28 @@ mod tree_cache;
 pub(crate) mod value;
 
 pub(crate) use memo::LayoutCache;
+
+/// Test-only serialization of the process-wide layout inputs that `memo`
+/// compares before reusing any retained layout: page fonts, external SVG ratio
+/// metadata and sprite sheets. Their writers take the write side; tests that
+/// assert retained subtrees hold the read side, so a test running in parallel
+/// cannot change those inputs (and expire every cache) between two layouts.
+#[cfg(test)]
+static GLOBAL_LAYOUT_INPUTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+pub(crate) fn global_layout_input_change() -> std::sync::RwLockWriteGuard<'static, ()> {
+    GLOBAL_LAYOUT_INPUTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn stable_global_layout_inputs() -> std::sync::RwLockReadGuard<'static, ()> {
+    GLOBAL_LAYOUT_INPUTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 pub(crate) use memo::box_style_bytes;
 pub(crate) use style::{BoxStyle, InlineStyle};
 pub(crate) use tree_cache::BoxTreeCache;

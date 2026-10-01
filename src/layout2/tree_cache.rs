@@ -196,6 +196,7 @@ mod tests {
 
     #[test]
     fn measured_terminal_metadata_preserves_full_adapter_output() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let dom = Dom::parse_document(
             r#"<style>
             #hidden { display:none } #contents { display:contents }
@@ -322,6 +323,7 @@ mod tests {
 
     #[test]
     fn state_and_relational_mutations_retain_independent_formatting_subtrees() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         for count in [16, 256] {
             let mut dom = Dom::parse_document(&format!(
                 "<style>body{{margin:0}} input:checked + nav{{height:80px}}\
@@ -353,6 +355,7 @@ mod tests {
 
     #[test]
     fn local_class_changes_retain_layout_despite_unrelated_sibling_selectors() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(&format!(
             "{HTML}<style>.some-other-class + section{{height:91px}} .local{{height:40px}} .local.open{{height:80px}}</style>"
         ));
@@ -369,6 +372,7 @@ mod tests {
 
     #[test]
     fn transition_frames_reuse_independent_subtrees_and_match_cold_layout() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(HTML);
         let changing = dom.get_by_id("changing").unwrap();
         dom.set_attr(changing, "style", "height:40px;transition:height 1s linear");
@@ -391,6 +395,7 @@ mod tests {
 
     #[test]
     fn immutable_subtrees_survive_local_attributes_and_child_list_edits() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(HTML);
         let list = dom.get_by_id("list").unwrap();
         for op in 0..6 {
@@ -432,6 +437,7 @@ mod tests {
 
     #[test]
     fn structural_selectors_anonymous_boxes_and_reparenting_match_cold() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         for selector in [
             "#list > :nth-child(2n) {padding:7px}",
             "#list > b + i {font-size:22px}",
@@ -466,6 +472,7 @@ mod tests {
 
     #[test]
     fn reused_list_subtrees_transfer_counter_state_in_tree_order() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<style>li {display:list-item} main{display:flex} aside{width:100px}</style>
           <main><ol id=list start=3><li id=a>alpha</li><li id=b>beta<ol reversed><li>nested</li><li>nested two</li></ol></li><li id=c value=20>gamma</li><li id=d>delta</li></ol>
@@ -493,6 +500,7 @@ mod tests {
 
     #[test]
     fn referenced_svg_mutations_do_not_leave_shared_resources_stale() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r##"<svg style="display:none"><symbol id="shape" viewBox="0 0 20 20"><path id="path" d="M0 0H20V20Z"/><text id="text">old</text></symbol></svg>
           <main style="display:flex"><section><svg width="40" height="40"><use href="#shape"/></svg></section><section>other</section></main>"##,
@@ -511,6 +519,7 @@ mod tests {
 
     #[test]
     fn tree_cache_bounds_and_replacement_account_for_shared_ownership() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut cache = BoxTreeCache::default();
         let value = Built::Inline(Inline::Text("x".repeat(16384)));
         for node in 0..5000 {
@@ -534,6 +543,7 @@ mod tests {
 
     #[test]
     fn disabled_selectors_keep_local_edits_local_but_expire_first_legend_state() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<style>
               input:disabled + span {font-size:30px;color:red}
@@ -569,6 +579,7 @@ mod tests {
 
     #[test]
     fn picture_source_siblings_and_shadow_distribution_expire_affected_trees() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             r#"<picture id=picture><source id=source srcset='a.png 1x'><img id=image width=80 height=40 src=fallback.png></picture>"#,
         );
