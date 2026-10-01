@@ -18,7 +18,7 @@ use crate::layout2::{Units, css_length_px};
 
 use super::flow::{Flow, Frag, FragKind};
 use super::intrinsic::IMode;
-use super::style::{Align2, InlineStyle, LEFT, RIGHT};
+use super::style::{Align2, BOTTOM, InlineStyle, LEFT, RIGHT, TOP};
 use super::tree::{ColSpec, TableBox, declared_track_width};
 
 /// The resolved column geometry of a table.
@@ -214,8 +214,27 @@ impl Flow<'_> {
                 + self.pad(s, LEFT, cell_w)
                 + self.pad(s, RIGHT, cell_w);
             let content_w = (cell_w - 2.0 * ph - cbp).max(0.0);
-            let def_h = s.height.resolve(def_ch).map(|v| v.max(0.0));
-            let (frag, anc) = self.item_frag(&cell.b, content_w, cell_w, def_h, inl);
+            // CSS 2.2 §17.5.3: a cell's 'height' is a minimum for its row;
+            // content taller than it grows the cell. Quirks Mode #the-table-
+            // cell-height-box-sizing-quirk measures it as a border box.
+            let vertical_edges = s.border[TOP]
+                + s.border[BOTTOM]
+                + self.pad(s, TOP, cell_w)
+                + self.pad(s, BOTTOM, cell_w);
+            let def_h = s.height.resolve(def_ch).map(|v| {
+                if self.in_quirks_document(cell.b.node) {
+                    (v - vertical_edges - 2.0 * pv).max(0.0)
+                } else {
+                    v.max(0.0)
+                }
+            });
+            let natural = self.item_frag(&cell.b, content_w, cell_w, None, inl);
+            let (frag, anc) = match def_h {
+                Some(h) if natural.0.h - vertical_edges < h => {
+                    self.item_frag(&cell.b, content_w, cell_w, Some(h), inl)
+                }
+                _ => natural,
+            };
             laid.push(Laid {
                 frag,
                 anchors: anc,
@@ -224,38 +243,6 @@ impl Flow<'_> {
                 pv,
             });
         }
-
-        // Row heights (§17.5.3): the tallest single-row cell sets each row; a
-        // row-spanning cell whose box exceeds its spanned rows pushes the
-        // deficit onto its last row.
-        let mut row_h = vec![0.0f32; nrows];
-        for (cell, l) in tb.cells.iter().zip(&laid) {
-            if cell.rowspan <= 1 && cell.row < nrows {
-                row_h[cell.row] = row_h[cell.row].max(l.frag.h + 2.0 * l.pv);
-            }
-        }
-        for (cell, l) in tb.cells.iter().zip(&laid) {
-            if cell.rowspan <= 1 {
-                continue;
-            }
-            let end = (cell.row + cell.rowspan).min(nrows);
-            if end <= cell.row {
-                continue;
-            }
-            let need = l.frag.h + 2.0 * l.pv;
-            let have: f32 =
-                row_h[cell.row..end].iter().sum::<f32>() + bs_y * (end - cell.row - 1) as f32;
-            if need > have {
-                row_h[end - 1] += need - have;
-            }
-        }
-        let mut row_y = vec![0.0f32; nrows];
-        let mut acc = bs_y;
-        for r in 0..nrows {
-            row_y[r] = acc;
-            acc += row_h[r] + bs_y;
-        }
-        let table_h = acc.max(0.0);
 
         // CSS 2.2 §17.5.1: row backgrounds extend through cells originating
         // in that row (including rowspans), but their image positioning area
@@ -290,6 +277,78 @@ impl Flow<'_> {
                 (row, group)
             })
             .collect();
+
+        // Row heights (§17.5.3): the tallest single-row cell sets each row; a
+        // row-spanning cell whose box exceeds its spanned rows pushes the
+        // deficit onto its last row.
+        let mut row_h = vec![0.0f32; nrows];
+        for (cell, l) in tb.cells.iter().zip(&laid) {
+            if cell.rowspan <= 1 && cell.row < nrows {
+                row_h[cell.row] = row_h[cell.row].max(l.frag.h + 2.0 * l.pv);
+            }
+        }
+        // A row's own 'height' is also a minimum (HTML maps `tr height`).
+        // Rows sized only by their content are the auto-height rows of CSS
+        // Tables 3 #height-distribution-algorithm.
+        let mut sized = vec![false; nrows];
+        for (cell, &(row, _)) in tb.cells.iter().zip(&cell_rows) {
+            if cell.row >= nrows {
+                continue;
+            }
+            if cell.rowspan <= 1 && !cell.b.style.height.is_auto() {
+                sized[cell.row] = true;
+            }
+            if let Some(height) = row.and_then(|row| self.row_height(row, def_ch)) {
+                row_h[cell.row] = row_h[cell.row].max(height);
+                sized[cell.row] = true;
+            }
+        }
+        for (cell, l) in tb.cells.iter().zip(&laid) {
+            if cell.rowspan <= 1 {
+                continue;
+            }
+            let end = (cell.row + cell.rowspan).min(nrows);
+            if end <= cell.row {
+                continue;
+            }
+            let need = l.frag.h + 2.0 * l.pv;
+            let have: f32 =
+                row_h[cell.row..end].iter().sum::<f32>() + bs_y * (end - cell.row - 1) as f32;
+            if need > have {
+                row_h[end - 1] += need - have;
+            }
+        }
+        // CSS Tables 3 #height-distribution-algorithm: a definite table
+        // height beyond its rows grows them. Like Gecko, auto-height rows
+        // share the extra in proportion to their heights (equally when all
+        // are empty); with no auto-height row, every row does.
+        if let Some(target) = def_ch {
+            let used = row_h.iter().sum::<f32>() + bs_y * (nrows + 1) as f32;
+            let extra = target - used;
+            if extra > 0.0 {
+                let auto: Vec<usize> = (0..nrows).filter(|&r| !sized[r]).collect();
+                let rows = if auto.is_empty() {
+                    (0..nrows).collect()
+                } else {
+                    auto
+                };
+                let total: f32 = rows.iter().map(|&r| row_h[r]).sum();
+                for &r in &rows {
+                    row_h[r] += if total > 0.0 {
+                        extra * row_h[r] / total
+                    } else {
+                        extra / rows.len() as f32
+                    };
+                }
+            }
+        }
+        let mut row_y = vec![0.0f32; nrows];
+        let mut acc = bs_y;
+        for r in 0..nrows {
+            row_y[r] = acc;
+            acc += row_h[r] + bs_y;
+        }
+        let table_h = acc.max(0.0);
 
         // Place each cell at its column/row origin, vertically aligned in its
         // (possibly taller) row band per `vertical-align`/`valign`.
@@ -522,6 +581,19 @@ impl Flow<'_> {
                 .max(0.0)
         };
         (length(first), length(second))
+    }
+
+    /// A table row's used minimum height from its computed 'height' (px),
+    /// percentages against the table's definite height.
+    fn row_height(&self, row: NodeId, table_h: Option<f32>) -> Option<f32> {
+        let value = self.dom.computed_value_resolved(row, "height")?;
+        let length = super::value::Len::parse_or(
+            Some(&value),
+            Units::of(self.dom, row),
+            self.vp,
+            super::value::Len::Auto,
+        );
+        length.resolve(table_h).filter(|height| *height > 0.0)
     }
 
     /// Vertical offset of a cell within its (possibly taller) row band (CSS

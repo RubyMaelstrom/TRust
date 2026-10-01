@@ -27,6 +27,18 @@ impl Dom {
                 }
             }
         }
+        // HTML Rendering #tables-2: table, row-group and row heights map to
+        // the dimension property 'height'; cell heights ignore zero.
+        let height = match tag {
+            "table" | "thead" | "tbody" | "tfoot" | "tr" => {
+                self.attr(id, "height").and_then(dimension_value)
+            }
+            "td" | "th" => self.attr(id, "height").and_then(nonzero_dimension_value),
+            _ => None,
+        };
+        if let Some(height) = height {
+            hint("height", height);
+        }
         if matches!(
             tag,
             "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "marquee"
@@ -144,6 +156,17 @@ fn dimension_value(input: &str) -> Option<String> {
         "px"
     };
     Some(format!("{value}{unit}"))
+}
+
+/// HTML #rules-for-parsing-nonzero-dimension-values: as dimension values,
+/// except that zero is an error.
+fn nonzero_dimension_value(input: &str) -> Option<String> {
+    dimension_value(input).filter(|value| {
+        value
+            .trim_end_matches(['%', 'p', 'x'])
+            .parse::<f64>()
+            .is_ok_and(|number| number != 0.0)
+    })
 }
 
 /// HTML #rules-for-parsing-a-legacy-colour-value. In particular, this is not
@@ -342,6 +365,27 @@ mod tests {
         );
         dom.set_attr(cell, "style", "background-image:none");
         assert_eq!(image(&dom, "c"), "none");
+    }
+
+    #[test]
+    fn table_height_attributes_map_to_the_height_property() {
+        let dom = Dom::parse_document(
+            r#"<table id=t height="80%"><tbody id=g height=0><tr id=r height=" 40.5">
+            <td id=c height=0>a</td><td id=d height="12x">b</td><th id=h height="0%">c</th></tr></tbody></table>
+            <div id=v height=40></div>"#,
+        );
+        let height = |id: &str| {
+            dom.computed_value(dom.get_by_id(id).unwrap(), "height")
+                .unwrap_or_else(|| "auto".into())
+        };
+        assert_eq!(height("t"), "80%");
+        assert_eq!(height("g"), "0px");
+        assert_eq!(height("r"), "40.5px");
+        // td/th use the nonzero dimension rules.
+        assert_eq!(height("c"), "auto");
+        assert_eq!(height("d"), "12px");
+        assert_eq!(height("h"), "auto");
+        assert_eq!(height("v"), "auto");
     }
 
     #[test]

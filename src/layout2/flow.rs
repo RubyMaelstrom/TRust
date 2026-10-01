@@ -2053,6 +2053,15 @@ impl Flow<'_> {
             .flatten()
     }
 
+    /// Whether `node`'s own Document (a frame's, not the top-level page's)
+    /// is in quirks mode.
+    pub(super) fn in_quirks_document(&self, node: NodeId) -> bool {
+        node != NO_NODE
+            && self.dom.owner_document(node).is_some_and(|document| {
+                self.dom.document_mode(document) == html5ever::tree_builder::QuirksMode::Quirks
+            })
+    }
+
     /// Quirks Mode #the-percentage-height-calculation-quirk: in a quirks
     /// document an auto-height block container is skipped when its children
     /// resolve percentage heights, so they inherit its own basis. A table
@@ -2074,9 +2083,7 @@ impl Flow<'_> {
             || !s.height.is_auto()
             || s.position.out_of_flow()
             || !matches!(b.content, Content::Blocks(_) | Content::Inlines(_))
-            || self.dom.owner_document(style_node).is_none_or(|document| {
-                self.dom.document_mode(document) != html5ever::tree_builder::QuirksMode::Quirks
-            })
+            || !self.in_quirks_document(style_node)
         {
             return None;
         }
