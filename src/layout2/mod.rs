@@ -3707,6 +3707,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_text_align_keywords_align_descendant_blocks() {
+        // The -webkit-/-moz- keywords expose HTML's descendant alignment to
+        // CSS; a plain text-align on an intermediate element ends it.
+        let html = r#"<body style="margin:0">
+            <div style="text-align:-webkit-center"><div id="center" style="width:100px;height:1px"></div></div>
+            <div style="text-align:-moz-right"><div id="right" style="width:100px;height:1px"></div></div>
+            <div style="text-align:-webkit-center"><div style="text-align:left">
+                <div id="reset" style="width:100px;height:1px"></div></div></div>
+        </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 300.0, &HashMap::new());
+        let x = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].left;
+        assert!((x("center") - 100.0).abs() < 0.01);
+        assert!((x("right") - 200.0).abs() < 0.01);
+        assert!((x("reset") - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_level_static_positions_follow_line_alignment() {
+        // CSS 2.2 §10.3.7: an originally inline-level absolute box's static
+        // position is its hypothetical box on the aligned line, even a line
+        // without in-flow content; a block-level one starts at the edge.
+        let html = r#"<body style="margin:0">
+            <div style="text-align:center;height:20px"><span id="alone" style="position:absolute;width:10px;height:5px"></span></div>
+            <div style="text-align:right;height:20px">ab<span id="after" style="position:absolute;width:10px;height:5px"></span></div>
+            <div style="text-align:center;height:20px"><div id="block" style="position:absolute;width:10px;height:5px"></div></div>
+        </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 300.0, &HashMap::new());
+        let x = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].left;
+        assert!((x("alone") - 150.0).abs() < 0.01, "{}", x("alone"));
+        assert!((x("after") - 300.0).abs() < 0.01, "{}", x("after"));
+        assert!((x("block") - 0.0).abs() < 0.01, "{}", x("block"));
+    }
+
+    #[test]
     fn relative_positioning_visually_offsets_a_float_without_moving_its_shelf() {
         // CSS Positioned Layout 3 §2/§3.3: relative positioning moves the
         // rendered float, but does not change where later floats see its

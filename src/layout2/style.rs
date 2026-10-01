@@ -864,6 +864,20 @@ pub(crate) fn legacy_descendant_align(dom: &Dom, id: NodeId) -> Option<Align2> {
         return None;
     }
 
+    // The legacy `-webkit-`/`-moz-` text-align keywords expose the same
+    // descendant alignment to CSS. They inherit, so the parent's computed
+    // value is the nearest one, and an intervening plain value ends it.
+    if let Some(parent) = dom.node(id).parent
+        && let Some(value) = dom.computed_value_resolved(parent, "text-align")
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "-webkit-center" | "-moz-center" => return Some(Align2::Center),
+            "-webkit-right" | "-moz-right" => return Some(Align2::Right),
+            "-webkit-left" | "-moz-left" => return Some(Align2::Left),
+            _ => {}
+        }
+    }
+
     let mut cur = dom.node(id).parent;
     while let Some(n) = cur {
         let tag = dom.tag_name(n).unwrap_or("");
@@ -890,9 +904,9 @@ pub(crate) fn legacy_descendant_align(dom: &Dom, id: NodeId) -> Option<Align2> {
 
 fn align_from_css(value: &str) -> Option<Align2> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "left" | "start" => Some(Align2::Left),
+        "left" | "start" | "-webkit-left" | "-moz-left" => Some(Align2::Left),
         "center" | "-webkit-center" | "-moz-center" => Some(Align2::Center),
-        "right" | "end" => Some(Align2::Right),
+        "right" | "end" | "-webkit-right" | "-moz-right" => Some(Align2::Right),
         "justify" => Some(Align2::Justify),
         _ => None,
     }

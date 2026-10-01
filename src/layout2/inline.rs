@@ -52,6 +52,8 @@ pub(crate) struct OofMark<'t> {
     pub line: usize,
     pub x_px: f32,
     pub ctx: InlineStyle,
+    /// `x_px` includes its line's text-align offset.
+    aligned: bool,
 }
 
 /// One placed inline item in CSS pixels. Shaped text is retained so paint does
@@ -608,12 +610,24 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // A static-position mark, nothing more: the hypothetical box
             // would have entered here (§10.3.7 — "UAs are free to make a
             // guess"; ours is the exact pen position).
-            Inline::OutOfFlow(b) => self.oofs.push(OofMark {
-                b,
-                line: self.lines.len(),
-                x_px: self.pen + self.pending_gap_px,
-                ctx: ctx.clone(),
-            }),
+            Inline::OutOfFlow(b) => {
+                // §10.3.7: only an originally inline-level box's hypothetical
+                // box sits on the line (and follows text-align); a block-level
+                // one starts at the containing block's edge. Generated boxes
+                // default to inline.
+                let inline_level = b.node == NO_NODE
+                    || self
+                        .dom
+                        .effective_display(b.node)
+                        .is_some_and(|display| display.starts_with("inline"));
+                self.oofs.push(OofMark {
+                    b,
+                    line: self.lines.len(),
+                    x_px: self.pen + self.pending_gap_px,
+                    ctx: ctx.clone(),
+                    aligned: !inline_level,
+                })
+            }
             // A float (§9.5): pulled aside into the float context; it emits no
             // inline content, but shortens the line boxes beside it.
             Inline::Float(_) => self.place_float(),
@@ -1771,9 +1785,31 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.flush_line(true);
     }
 
+    /// CSS 2.2 §10.3.7: a static position is that of the hypothetical box
+    /// on its line, so it moves with the line's center/right alignment —
+    /// including a line with no in-flow content.
+    fn align_oof_marks(&mut self, width: f32) {
+        let line = self.lines.len();
+        let free = (self.line_right - self.line_left - width).max(0.0);
+        let off = match self.align {
+            Align2::Center => free / 2.0,
+            Align2::Right => free,
+            Align2::Left | Align2::Justify => 0.0,
+        };
+        for mark in self
+            .oofs
+            .iter_mut()
+            .filter(|m| m.line == line && !m.aligned)
+        {
+            mark.x_px += off;
+            mark.aligned = true;
+        }
+    }
+
     fn flush_line(&mut self, forced: bool) {
         let mut pieces = std::mem::take(&mut self.cur);
         if pieces.is_empty() && !forced {
+            self.align_oof_marks(0.0);
             self.pen = self.line_start;
             self.pending_space = false;
             return;
@@ -1868,6 +1904,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         };
         // Center/right shift now, within this line's (float-shortened) band;
         // justification waits for `finish`, where "last line" is known.
+        self.align_oof_marks(self.pen - self.line_left);
         let free = (self.line_right - self.pen).max(0.0);
         if free > 0.0 {
             let off = match self.align {
