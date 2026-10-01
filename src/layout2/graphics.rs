@@ -3682,6 +3682,18 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
         parts.remove(0);
     }
     let mut stops = parse_stops(&parts)?;
+    // CSS Color 4 #interpolation: without a <color-interpolation-method>,
+    // stops written only in legacy sRGB syntax still interpolate in
+    // gamma-encoded sRGB, for Web compatibility; any other stop selects Oklab.
+    let interpolation =
+        if !explicit_interpolation && stops.iter().all(|stop| legacy_srgb(&stop.color)) {
+            GradientInterpolation {
+                space: color::ColorSpaceTag::Srgb,
+                ..interpolation
+            }
+        } else {
+            interpolation
+        };
     if repeating && stops.last().is_some_and(|stop| stop.offset > 0.0) {
         let end = stops.last().unwrap().offset;
         for stop in &mut stops {
@@ -3706,6 +3718,17 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
             stops,
             interpolation,
         })
+    }
+}
+
+/// Whether `color` was written as a hex, named, `rgb()`, `hsl()` or `hwb()`
+/// color: the parser marks the sRGB ones as named (`color(srgb ...)` is not).
+fn legacy_srgb(color: &color::DynamicColor) -> bool {
+    use color::ColorSpaceTag as Space;
+    match color.cs {
+        Space::Srgb => color.flags.named(),
+        Space::Hsl | Space::Hwb => true,
+        _ => false,
     }
 }
 
@@ -4977,13 +5000,19 @@ mod tests {
                 "{invalid}"
             );
         }
-        for (method, expected) in [
-            ("in srgb", 128u8),
-            ("in srgb-linear", 188),
-            ("in oklab", 99),
+        // CSS Color 4 #interpolation: legacy sRGB stops default to sRGB.
+        for (method, stops, expected) in [
+            ("in srgb", "black,white", 128u8),
+            ("in srgb-linear", "black,white", 188),
+            ("in oklab", "black,white", 99),
+            ("", "black,white", 128),
+            ("", "#000,rgb(255 255 255)", 128),
+            ("", "hsl(0 0% 0%),hwb(0 100% 0%)", 128),
+            ("", "black,color(srgb 1 1 1)", 99),
+            ("", "oklab(0 0 0),oklab(1 0 0)", 99),
         ] {
             let (_, layout) = render_fixture(&format!(
-                "<style>body{{margin:0}}div{{width:100px;height:20px;background-image:linear-gradient(to right {method},black,white)}}</style><div></div>"
+                "<style>body{{margin:0}}div{{width:100px;height:20px;background-image:linear-gradient(to right {method},{stops})}}</style><div></div>"
             ));
             let frame =
                 crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
@@ -4991,7 +5020,7 @@ mod tests {
             let actual = frame.pixels[(10 * 800 + 50) * 4];
             assert!(
                 actual.abs_diff(expected) <= 3,
-                "{method}: {actual} != {expected}"
+                "{method} {stops}: {actual} != {expected}"
             );
         }
     }
