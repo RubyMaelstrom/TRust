@@ -393,11 +393,17 @@ mod tests {
             &controls,
             &ImageSizes::new(),
         );
+        // The padding-box gradient tile repeats into the dashed border area,
+        // clipped to the rounded border box.
+        assert!(layout.paint.primitives.iter().any(|command| matches!(
+            command,
+            DisplayCommand::PushClip(PaintShape::RoundedRect { .. })
+        )));
         assert!(layout.paint.primitives.iter().any(|command| matches!(
             command,
             DisplayCommand::Fill {
                 brush: PaintBrush::LinearGradient { .. },
-                shape: PaintShape::RoundedRect { .. }
+                ..
             }
         )));
         assert!(layout.paint.primitives.iter().any(

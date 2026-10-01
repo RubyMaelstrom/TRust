@@ -2638,14 +2638,42 @@ fn paint_background_images_for_style(
                 &shape,
             )
         };
-        if let Some(brush) = parse_gradient(layer, positioning_override.unwrap_or(border_box)) {
-            fill_background(builder, layer_shape, brush, &shape);
-        } else if let Some(url) = css_url(layer) {
-            let source = resolve_image_source(builder.base, &url);
-            let handle = builder.image(source.clone());
+        {
             let origin = layer_value(&origin_layers, index, "padding-box");
             let positioning = positioning_override
                 .unwrap_or_else(|| background_box(origin, border_box, padding_box, content_box));
+            let size = layer_value(&size_layers, index, "auto auto");
+            // A gradient is an image with no natural size or ratio: CSS
+            // Backgrounds 3 #background-size resolves its `auto` axes, and
+            // cover/contain, to the positioning area. It is then positioned,
+            // repeated and clipped exactly like any other image (§§2.4-2.6).
+            let gradient = is_gradient(layer);
+            let (handle, (mut tile_w, mut tile_h)) = if gradient {
+                (None, gradient_size(size, positioning))
+            } else if let Some(url) = css_url(layer) {
+                let source = resolve_image_source(builder.base, &url);
+                let handle = builder.image(source.clone());
+                // CSS Backgrounds 3 #background-size: auto/auto with a natural
+                // ratio but neither natural dimension uses contain. SVG decoder
+                // fallback pixels are not intrinsic width/height. This also keeps
+                // the exact ratio for contain/cover and a single definite axis.
+                let ratio_only = crate::img::svg_url_ratio_only(&source)
+                    .or_else(|| crate::img::svg_ratio_only_get(&source))
+                    .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+                let natural = builder
+                    .images
+                    .get(&source)
+                    .copied()
+                    .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
+                    .map(|(w, h)| (w as f32, h as f32))
+                    .unwrap_or((300.0, 150.0));
+                (
+                    Some(handle),
+                    background_size(size, natural, positioning, ratio_only),
+                )
+            } else {
+                continue;
+            };
             let clip = canvas.unwrap_or_else(|| {
                 background_box(
                     layer_value(&clip_layers, index, "border-box"),
@@ -2656,22 +2684,6 @@ fn paint_background_images_for_style(
             });
             let repeat = parse_background_repeat(layer_value(&repeat_layers, index, "repeat"));
             let position = layer_value(&position_layers, index, "0% 0%");
-            let size = layer_value(&size_layers, index, "auto auto");
-            // CSS Backgrounds 3 #background-size: auto/auto with a natural
-            // ratio but neither natural dimension uses contain. SVG decoder
-            // fallback pixels are not intrinsic width/height. This also keeps
-            // the exact ratio for contain/cover and a single definite axis.
-            let ratio_only = crate::img::svg_url_ratio_only(&source)
-                .or_else(|| crate::img::svg_ratio_only_get(&source))
-                .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-            let natural = builder
-                .images
-                .get(&source)
-                .copied()
-                .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
-                .map(|(w, h)| (w as f32, h as f32))
-                .unwrap_or((300.0, 150.0));
-            let (mut tile_w, mut tile_h) = background_size(size, natural, positioning, ratio_only);
             if !tile_w.is_finite() || !tile_h.is_finite() || tile_w <= 0.0 || tile_h <= 0.0 {
                 continue;
             }
@@ -2686,6 +2698,32 @@ fn paint_background_images_for_style(
                 (start_x, start_y) = background_position(position, positioning, (tile_w, tile_h));
                 repeat = BackgroundRepeat::Repeat;
             }
+            let tile = match handle {
+                Some(handle) => LayerTile::Image(handle),
+                None => match parse_gradient(layer, CssRect::new(0.0, 0.0, tile_w, tile_h)) {
+                    Some(brush) => LayerTile::Gradient(brush),
+                    None => continue,
+                },
+            };
+            // Most gradients are one tile covering the whole painting area:
+            // fill the clip shape directly, as a single command.
+            let placed = CssRect::new(
+                positioning.x + start_x,
+                positioning.y + start_y,
+                tile_w,
+                tile_h,
+            );
+            if let LayerTile::Gradient(_) = tile
+                && !matches!(repeat, BackgroundRepeat::Space)
+                && placed.x <= clip.x
+                && placed.y <= clip.y
+                && placed.x + placed.width >= clip.x + clip.width
+                && placed.y + placed.height >= clip.y + clip.height
+                && let DisplayCommand::Fill { brush, .. } = tile.command(placed, style.node())
+            {
+                fill_background(builder, layer_shape, brush, &shape);
+                continue;
+            }
             if matches!(repeat, BackgroundRepeat::Space) {
                 // `space` preserves the intrinsic tile size and distributes
                 // the remaining space between complete tiles. If only one
@@ -2697,7 +2735,7 @@ fn paint_background_images_for_style(
                     builder,
                     clip,
                     style.node(),
-                    handle,
+                    &tile,
                     positioning,
                     (tile_w, tile_h),
                     (start_x, start_y),
@@ -2743,22 +2781,9 @@ fn paint_background_images_for_style(
                 let mut x = x0;
                 let mut x_count = 0usize;
                 while x < x_end && x_count < 4096 {
-                    let tile = CssRect::new(x, y, tile_w, tile_h);
-                    builder.commands.push(DisplayCommand::Image {
-                        rect: tile,
-                        handle,
-                        source_rect: None,
-                        // `rect` is the used background image size after
-                        // CSS Backgrounds §2.9. Rendering at intrinsic pixels
-                        // here ignores an authored `background-size` (a 2x
-                        // source paints about twice as large); fill the already
-                        // aspect-correct tile rectangle exactly.
-                        fit: ImageFit::Fill,
-                        sampling: ImageSampling::Smooth,
-                        clip: None,
-                        node: style.node(),
-                        link: None,
-                    });
+                    builder
+                        .commands
+                        .push(tile.command(CssRect::new(x, y, tile_w, tile_h), style.node()));
                     if !x_repeat {
                         break;
                     }
@@ -2775,6 +2800,100 @@ fn paint_background_images_for_style(
             builder.commands.push(DisplayCommand::PopClip);
         }
     }
+}
+
+/// What one background layer paints into each of its tiles.
+enum LayerTile {
+    Image(ImageHandle),
+    /// Laid out for a tile at the origin, and translated to each tile.
+    Gradient(PaintBrush),
+}
+
+impl LayerTile {
+    fn command(&self, rect: CssRect, node: NodeId) -> DisplayCommand {
+        match self {
+            Self::Image(handle) => DisplayCommand::Image {
+                rect,
+                handle: *handle,
+                source_rect: None,
+                // `rect` is the used background image size after CSS
+                // Backgrounds §2.9. Rendering at intrinsic pixels here ignores
+                // an authored `background-size` (a 2x source paints about twice
+                // as large); fill the already aspect-correct tile exactly.
+                fit: ImageFit::Fill,
+                sampling: ImageSampling::Smooth,
+                clip: None,
+                node,
+                link: None,
+            },
+            Self::Gradient(brush) => {
+                let shift = |point: CssPoint| CssPoint::new(point.x + rect.x, point.y + rect.y);
+                let brush = match brush.clone() {
+                    PaintBrush::LinearGradient {
+                        start,
+                        end,
+                        stops,
+                        interpolation,
+                    } => PaintBrush::LinearGradient {
+                        start: shift(start),
+                        end: shift(end),
+                        stops,
+                        interpolation,
+                    },
+                    PaintBrush::RadialGradient {
+                        center,
+                        radius,
+                        stops,
+                        interpolation,
+                    } => PaintBrush::RadialGradient {
+                        center: shift(center),
+                        radius,
+                        stops,
+                        interpolation,
+                    },
+                    solid => solid,
+                };
+                DisplayCommand::Fill {
+                    shape: PaintShape::Rect(rect),
+                    brush,
+                }
+            }
+        }
+    }
+}
+
+fn is_gradient(layer: &str) -> bool {
+    let lower = layer.trim_start().to_ascii_lowercase();
+    [
+        "linear-gradient(",
+        "radial-gradient(",
+        "repeating-linear-gradient(",
+        "repeating-radial-gradient(",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+/// CSS Backgrounds 3 #background-size for an image without natural
+/// dimensions or ratio: an `auto` axis, and cover/contain, take the
+/// positioning area's size.
+fn gradient_size(value: &str, area: CssRect) -> (f32, f32) {
+    let tokens = split_ws(value);
+    if tokens.first().is_some_and(|token| {
+        token.eq_ignore_ascii_case("cover") || token.eq_ignore_ascii_case("contain")
+    }) {
+        return (area.width, area.height);
+    }
+    (
+        tokens
+            .first()
+            .and_then(|token| background_length(token, area.width))
+            .unwrap_or(area.width),
+        tokens
+            .get(1)
+            .and_then(|token| background_length(token, area.height))
+            .unwrap_or(area.height),
+    )
 }
 
 // A glyph mask can extend beyond the background border; ordinary background
@@ -3042,7 +3161,7 @@ fn paint_spaced_background(
     builder: &mut Builder<'_>,
     clip: CssRect,
     node: NodeId,
-    handle: ImageHandle,
+    layer: &LayerTile,
     area: CssRect,
     tile: (f32, f32),
     start: (f32, f32),
@@ -3069,16 +3188,9 @@ fn paint_spaced_background(
         for col in 0..x_count {
             let x = area.x + start.0 + col as f32 * (tile_w + gap_x);
             let y = area.y + start.1 + row as f32 * (tile_h + gap_y);
-            builder.commands.push(DisplayCommand::Image {
-                rect: CssRect::new(x, y, tile_w, tile_h),
-                handle,
-                source_rect: None,
-                fit: ImageFit::Fill,
-                sampling: ImageSampling::Smooth,
-                clip: None,
-                node,
-                link: None,
-            });
+            builder
+                .commands
+                .push(layer.command(CssRect::new(x, y, tile_w, tile_h), node));
         }
     }
     builder.commands.push(DisplayCommand::PopClip);
@@ -4605,16 +4717,19 @@ mod tests {
     fn empty_background_layers_preserve_image_indices_and_color_clip() {
         // CSS Backgrounds 3 #background-image / #background-color: `none`
         // still occupies its index, including the bottom layer's color clip.
-        for (images, gradient_clip) in [
-            ("none, none", None),
+        // A gradient covering its content-box clip is one fill; over the
+        // border box, its padding-box tile repeats into the border area.
+        let border_tiles: Vec<_> = [-56., 4., 64.]
+            .into_iter()
+            .flat_map(|y| [-96., 4., 104.].map(|x| CssRect::new(x, y, 100., 60.)))
+            .collect();
+        for (images, gradient_rects_expected) in [
+            ("none, none", Vec::new()),
             (
                 "none, linear-gradient(red, blue)",
-                Some(CssRect::new(14., 14., 80., 40.)),
+                vec![CssRect::new(14., 14., 80., 40.)],
             ),
-            (
-                "linear-gradient(red, blue), none",
-                Some(CssRect::new(0., 0., 108., 68.)),
-            ),
+            ("linear-gradient(red, blue), none", border_tiles),
         ] {
             let (_, layout) = render_fixture(&format!(
                 r#"<body style="margin:0"><div style="width:80px;height:40px;padding:10px;border:4px solid black;background-color:#123456;background-image:{images};background-clip:border-box,content-box"></div>"#
@@ -4647,11 +4762,7 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(
-                gradient_rects,
-                gradient_clip.into_iter().collect::<Vec<_>>(),
-                "{images}"
-            );
+            assert_eq!(gradient_rects, gradient_rects_expected, "{images}");
         }
     }
 
@@ -4945,6 +5056,50 @@ mod tests {
                 "{overflow}: outer clip must remain stationary"
             );
         }
+    }
+
+    #[test]
+    fn gradient_backgrounds_are_sized_positioned_and_tiled_like_images() {
+        // CSS Backgrounds 3 §§2.4-2.6 and #background-size: a gradient has no
+        // natural size, so `auto` is the positioning (padding) box; the tile is
+        // then positioned, repeated into the border area, and clipped.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0}div{width:100px;height:40px}\
+             #stripes{background:linear-gradient(red 50%,blue 50%) 0 0/100% 10px}\
+             #border{border:10px solid transparent;background:linear-gradient(90deg,red 50%,blue 50%)}\
+             #single{background:linear-gradient(red,red) 50% 50%/20px 20px no-repeat,lime}</style>\
+             <div id=stripes></div><div id=border></div><div id=single></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let at = |x: usize, y: usize| {
+            let i = (y * 800 + x) * 4;
+            [frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]]
+        };
+        for (y, expected) in [
+            (2, [255, 0, 0]),
+            (7, [0, 0, 255]),
+            (12, [255, 0, 0]),
+            (37, [0, 0, 255]),
+        ] {
+            assert_eq!(at(50, y), expected, "stripes at y={y}");
+        }
+        // The border-box div starts at y=40; its padding box spans x=10..110.
+        assert_eq!(
+            at(15, 60),
+            [255, 0, 0],
+            "first tile starts at the padding edge"
+        );
+        assert_eq!(at(105, 60), [0, 0, 255]);
+        assert_eq!(
+            at(5, 60),
+            [0, 0, 255],
+            "the tile repeats into the left border"
+        );
+        assert_eq!(at(115, 60), [255, 0, 0], "and into the right border");
+        // A positioned no-repeat tile over the background color.
+        assert_eq!(at(50, 120), [255, 0, 0]);
+        assert_eq!(at(10, 120), [0, 255, 0]);
     }
 
     #[test]
