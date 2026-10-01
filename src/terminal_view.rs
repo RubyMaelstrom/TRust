@@ -231,6 +231,8 @@ impl TerminalView {
                             } else {
                                 DecorationStyle::Solid
                             },
+                            thickness: None,
+                            underline_offset: None,
                         },
                         shadows: Vec::new(),
                         clip: Some(rect),

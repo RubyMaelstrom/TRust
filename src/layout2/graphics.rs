@@ -1833,9 +1833,25 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     shaped.underline = underline;
                     shaped.strikethrough = strikethrough;
                 }
+                let viewport = Vp {
+                    w: builder.viewport_w,
+                    h: builder.viewport_h,
+                };
                 let decoration = TextDecorationPaint {
                     color: decoration_color(builder.dom, style_node).unwrap_or(current_color),
                     style: decoration_style(builder.dom, style_node),
+                    thickness: decoration_metric(
+                        builder.dom,
+                        style_node,
+                        "text-decoration-thickness",
+                        viewport,
+                    ),
+                    underline_offset: decoration_metric(
+                        builder.dom,
+                        style_node,
+                        "text-underline-offset",
+                        viewport,
+                    ),
                 };
                 let shadows = text_shadows(builder.dom, style_node, current_color);
                 builder.push_marquee_content(
@@ -4052,6 +4068,21 @@ fn decoration_style(dom: &Dom, node: NodeId) -> DecorationStyle {
         Some("wavy") => DecorationStyle::Wavy,
         _ => DecorationStyle::Solid,
     }
+}
+
+/// CSS Text Decoration 4 #text-decoration-width-property and
+/// #underline-offset, read from the decorating box: a length, or a
+/// percentage of its 1em. `auto` and `from-font` keep the automatic geometry.
+fn decoration_metric(dom: &Dom, node: NodeId, property: &str, viewport: Vp) -> Option<f32> {
+    let node = decoration_origin(dom, node)?;
+    let value = dom.computed_value_resolved(node, property)?;
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("from-font") {
+        return None;
+    }
+    Len::parse(value, Units::of(dom, node), viewport)?
+        .resolve(Some(dom.font_px(node)))
+        .filter(|value| value.is_finite())
 }
 
 fn decoration_origin(dom: &Dom, mut node: NodeId) -> Option<NodeId> {

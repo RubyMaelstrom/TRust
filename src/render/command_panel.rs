@@ -385,6 +385,8 @@ fn label(
         decoration: TextDecorationPaint {
             color,
             style: DecorationStyle::Solid,
+            thickness: None,
+            underline_offset: None,
         },
         shadows: Vec::new(),
         clip: Some(rect),

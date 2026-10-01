@@ -783,6 +783,12 @@ pub enum DecorationStyle {
 pub struct TextDecorationPaint {
     pub color: PaintColor,
     pub style: DecorationStyle,
+    /// `text-decoration-thickness` in CSS px; `None` is the renderer's
+    /// automatic thickness.
+    pub thickness: Option<f32>,
+    /// `text-underline-offset` from the alphabetic baseline in CSS px;
+    /// `None` is the automatic position.
+    pub underline_offset: Option<f32>,
 }
 
 /// One computed `text-shadow` layer retained with a shaped glyph run. Text
@@ -3555,6 +3561,8 @@ pub fn paint_pending_editor_text(
             decoration: TextDecorationPaint {
                 color: pending.color,
                 style: DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
             },
             shadows: Vec::new(),
             clip: None,
@@ -3656,6 +3664,8 @@ fn paint_chrome_text(
         decoration: TextDecorationPaint {
             color,
             style: DecorationStyle::Solid,
+            thickness: None,
+            underline_offset: None,
         },
         shadows: Vec::new(),
         clip: None,
@@ -3692,6 +3702,8 @@ fn paint_ui_text(
         decoration: TextDecorationPaint {
             color,
             style: DecorationStyle::Solid,
+            thickness: None,
+            underline_offset: None,
         },
         shadows: Vec::new(),
         clip: None,
@@ -4698,6 +4710,8 @@ mod tests {
             decoration: TextDecorationPaint {
                 color: PaintColor::Foreground,
                 style: DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
             },
             shadows: Vec::new(),
             clip: None,

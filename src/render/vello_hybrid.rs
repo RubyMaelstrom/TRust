@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vello_common::color::PremulRgba8;
-use vello_common::kurbo::{Affine, BezPath, Cap, Diagonal2, Rect, Stroke};
+use vello_common::kurbo::{Affine, BezPath, Diagonal2, Rect};
 use vello_common::paint::ImageSource;
 use vello_common::peniko::{ImageBrush, ImageQuality, ImageSampler};
 use vello_hybrid::{Pixmap, RenderSize, RenderTargetConfig, Resources, TextureBindings};
@@ -29,15 +29,15 @@ use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureVi
 use winit::window::Window;
 
 use super::vello_cpu::{
-    ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, offset_shape, point_bounds,
-    rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
-    text_shadow_blur, vello_affine, vello_blend, vello_color, vello_color_filter, vello_rect,
-    vello_stops, vello_stroke,
+    ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, decoration_strokes,
+    offset_shape, point_bounds, rect_is_visible, rect_path, shape_fill, shape_is_visible,
+    shape_path, simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend, vello_color,
+    vello_color_filter, vello_rect, vello_stops, vello_stroke,
 };
 use super::{
-    Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
-    ImageSampling, PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind,
-    Scene, is_desktop_heart_image_handle, raster_damage,
+    Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
+    PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind, Scene,
+    is_desktop_heart_image_handle, raster_damage,
 };
 use crate::core::{CssPoint, PhysicalSize};
 
@@ -951,7 +951,7 @@ impl VelloHybridRenderer {
                             shaped,
                             None,
                         );
-                        paint_decorations(&mut target, shadow_origin, shaped, decoration.style);
+                        paint_decorations(&mut target, shadow_origin, shaped, decoration);
                         if blurred.is_some() {
                             target.pop_layer();
                         }
@@ -965,7 +965,7 @@ impl VelloHybridRenderer {
                         Some(*color),
                     );
                     target.set_paint(vello_color(decoration.color));
-                    paint_decorations(&mut target, *origin, shaped, decoration.style);
+                    paint_decorations(&mut target, *origin, shaped, decoration);
                     if clip.is_some() {
                         target.pop_clip_path();
                     }
@@ -1486,45 +1486,11 @@ fn paint_decorations(
     target: &mut vello_hybrid::Scene,
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
-    style: DecorationStyle,
+    decoration: &crate::render::TextDecorationPaint,
 ) {
-    let thickness = (shaped.line_height / 18.0).max(1.0);
-    let paint_line = |target: &mut vello_hybrid::Scene, y: f32| {
-        let mut stroke = Stroke::new(f64::from(thickness));
-        match style {
-            DecorationStyle::Dotted => {
-                stroke = stroke
-                    .with_caps(Cap::Round)
-                    .with_dashes(0.0, [0.0, f64::from(thickness * 2.0)]);
-            }
-            DecorationStyle::Dashed => {
-                stroke = stroke.with_dashes(
-                    0.0,
-                    [f64::from(thickness * 3.0), f64::from(thickness * 2.0)],
-                );
-            }
-            _ => {}
-        }
+    for (stroke, path) in decoration_strokes(origin, shaped, decoration) {
         target.set_stroke(stroke);
-        let mut path = BezPath::new();
-        path.move_to((f64::from(origin.x), f64::from(y)));
-        path.line_to((f64::from(origin.x + shaped.advance), f64::from(y)));
         target.stroke_path(&path);
-        if style == DecorationStyle::Double {
-            let mut second = BezPath::new();
-            second.move_to((f64::from(origin.x), f64::from(y + thickness * 2.0)));
-            second.line_to((
-                f64::from(origin.x + shaped.advance),
-                f64::from(y + thickness * 2.0),
-            ));
-            target.stroke_path(&second);
-        }
-    };
-    if shaped.underline {
-        paint_line(target, origin.y + shaped.baseline + thickness);
-    }
-    if shaped.strikethrough {
-        paint_line(target, origin.y + shaped.baseline - shaped.ascent * 0.32);
     }
 }
 
@@ -1591,7 +1557,9 @@ mod tests {
                 color: PaintColor::Rgba(0, 0, 0, 255),
                 decoration: crate::render::TextDecorationPaint {
                     color: PaintColor::Rgba(0, 0, 0, 255),
-                    style: DecorationStyle::Solid,
+                    style: crate::render::DecorationStyle::Solid,
+                    thickness: None,
+                    underline_offset: None,
                 },
                 shadows: Vec::new(),
                 clip: None,

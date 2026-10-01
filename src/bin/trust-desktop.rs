@@ -3459,6 +3459,8 @@ impl DesktopApp {
                     decoration: trust::render::TextDecorationPaint {
                         color: PaintColor::Rgba(220, 232, 245, 255),
                         style: trust::render::DecorationStyle::Solid,
+                        thickness: None,
+                        underline_offset: None,
                     },
                     shadows: Vec::new(),
                     clip: Some(rect),
@@ -8912,6 +8914,8 @@ mod tests {
                         decoration: trust::render::TextDecorationPaint {
                             color: PaintColor::Rgba(20, 30, 40, 255),
                             style: trust::render::DecorationStyle::Solid,
+                            thickness: None,
+                            underline_offset: None,
                         },
                         shadows: Vec::new(),
                         clip: Some(clip),
