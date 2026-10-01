@@ -492,6 +492,43 @@ mod tests {
     }
 
     #[test]
+    fn table_attributes_style_the_table_and_its_cells() {
+        let mut dom = Dom::parse_document(
+            r#"<table id=t border=" +3px" cellspacing=6 cellpadding=5 bordercolor=red>
+            <tr><td id=c style="padding-left:0">a</td></tr></table>
+            <table id=z border=0><tbody><tr><td id=zc>b</td></tr></tbody></table>
+            <table id=d><tr><th id=dc>c</th></tr></table>
+            <table id=n border=1><tr><td><table><tr><td id=nested>d</td></tr></table></td></tr></table>"#,
+        );
+        let value = |dom: &Dom, id: &str, property: &str| {
+            dom.computed_value(dom.get_by_id(id).unwrap(), property)
+                .unwrap_or_default()
+        };
+        assert_eq!(value(&dom, "t", "border-spacing"), "6px");
+        assert_eq!(value(&dom, "t", "border-top-width"), "3px");
+        assert_eq!(value(&dom, "t", "border-left-style"), "outset");
+        assert_eq!(value(&dom, "c", "border-bottom-style"), "inset");
+        assert_eq!(value(&dom, "c", "border-bottom-width"), "1px");
+        assert_eq!(value(&dom, "c", "border-top-color"), "#ff0000");
+        assert_eq!(value(&dom, "c", "padding-top"), "5px");
+        assert_eq!(value(&dom, "c", "padding-left"), "0");
+        // A zero border keeps zero widths and no styles, here or on cells.
+        assert_eq!(value(&dom, "z", "border-top-width"), "0px");
+        assert_eq!(value(&dom, "z", "border-top-style"), "");
+        assert_eq!(value(&dom, "zc", "border-top-style"), "");
+        // UA defaults (HTML Rendering #tables-2).
+        assert_eq!(value(&dom, "d", "border-spacing"), "2px");
+        assert_eq!(value(&dom, "d", "box-sizing"), "border-box");
+        assert_eq!(value(&dom, "dc", "padding-right"), "1px");
+        // Cells belong to their own table only.
+        assert_eq!(value(&dom, "nested", "border-top-style"), "");
+        // Changing the table's attribute restyles its cells.
+        let table = dom.get_by_id("t").unwrap();
+        dom.set_attr(table, "cellpadding", "9");
+        assert_eq!(value(&dom, "c", "padding-top"), "9px");
+    }
+
+    #[test]
     fn legacy_color_follows_html_code_point_and_component_rules() {
         for (input, expected) in [
             ("", None),
