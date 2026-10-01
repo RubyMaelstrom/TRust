@@ -12506,6 +12506,86 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ),
         ];
     }
+    // `grid` (css-grid-1 §7.8): a `grid-template` value also resets the
+    // implicit grid properties; `<rows> / [auto-flow && dense?] <auto-cols>?`
+    // and `[auto-flow && dense?] <auto-rows>? / <columns>` set up auto-flow in
+    // one axis and reset the other axis' template and auto tracks.
+    if prop == "grid" {
+        const LONGHANDS: [&str; 6] = [
+            "grid-template-rows",
+            "grid-template-columns",
+            "grid-template-areas",
+            "grid-auto-rows",
+            "grid-auto-columns",
+            "grid-auto-flow",
+        ];
+        let v = value.trim();
+        if wide_keyword(v).is_some() {
+            return LONGHANDS
+                .iter()
+                .map(|name| (name.to_string(), v.to_string()))
+                .collect();
+        }
+        let auto_flow = |part: &str| {
+            let tokens = split_top_level_ws(part);
+            let keyword = |token: &&str, word: &str| token.eq_ignore_ascii_case(word);
+            tokens.iter().any(|t| keyword(t, "auto-flow")).then(|| {
+                let tracks = tokens
+                    .iter()
+                    .filter(|t| !keyword(t, "auto-flow") && !keyword(t, "dense"))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    tokens.iter().any(|t| keyword(t, "dense")),
+                    if tracks.is_empty() {
+                        "auto".to_string()
+                    } else {
+                        tracks
+                    },
+                )
+            })
+        };
+        let values = match split_top_level_slash(v) {
+            Some((rows, columns)) => match (auto_flow(rows), auto_flow(columns)) {
+                (Some((dense, auto_rows)), None) => Some([
+                    "none".to_string(),
+                    columns.trim().to_string(),
+                    "none".to_string(),
+                    auto_rows,
+                    "auto".to_string(),
+                    if dense { "row dense" } else { "row" }.to_string(),
+                ]),
+                (None, Some((dense, auto_columns))) => Some([
+                    rows.trim().to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                    "auto".to_string(),
+                    auto_columns,
+                    if dense { "column dense" } else { "column" }.to_string(),
+                ]),
+                (Some(_), Some(_)) => return Vec::new(),
+                (None, None) => None,
+            },
+            None => None,
+        };
+        if let Some(values) = values {
+            return LONGHANDS
+                .iter()
+                .map(|name| name.to_string())
+                .zip(values)
+                .collect();
+        }
+        let mut longhands = expand_box_shorthand("grid-template", v);
+        if !longhands.is_empty() {
+            longhands.extend([
+                ("grid-auto-rows".to_string(), "auto".to_string()),
+                ("grid-auto-columns".to_string(), "auto".to_string()),
+                ("grid-auto-flow".to_string(), "row".to_string()),
+            ]);
+        }
+        return longhands;
+    }
     // `grid-template` (css-grid-1 §7.1): `none` and the CSS-wide keywords
     // reset all three longhands; `<rows> / <columns>` splits on the
     // top-level `/`; the areas form (`"a a" 1fr "b b" / 1fr 1fr`) extracts
@@ -18008,6 +18088,64 @@ mod tests {
         assert!(dom.serialize(DOCUMENT).contains("payload"));
         dom.set_attr(m, "class", "menu");
         assert!(!dom.serialize(DOCUMENT).contains("payload"));
+    }
+
+    #[test]
+    fn grid_shorthand_sets_explicit_and_implicit_grid_longhands() {
+        // css-grid-1 §7.8: the grid-template form resets the auto-* longhands;
+        // the auto-flow forms set one axis explicitly and auto-repeat the other.
+        let mut dom = Dom::parse_document(
+            "<style>#a{grid:\"h h\" auto \"l b\" 1fr / auto 1fr;grid-auto-rows:9px}\
+             #a{grid:\"h h\" auto \"l b\" 1fr / auto 1fr}\
+             #b{grid:auto-flow dense 40px / 100px 1fr}\
+             #c{grid:60px 30px / auto-flow 120px}\
+             #d{grid:var(--rows) / auto-flow;--rows:10px 20px}</style>\
+             <div id=a></div><div id=b></div><div id=c></div><div id=d></div>",
+        );
+        let value = |dom: &mut Dom, id: &str, name: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.computed_value(node, name)
+        };
+        for (id, expected) in [
+            (
+                "a",
+                [
+                    "auto 1fr",
+                    "auto 1fr",
+                    "\"h h\" \"l b\"",
+                    "auto",
+                    "auto",
+                    "row",
+                ],
+            ),
+            (
+                "b",
+                ["none", "100px 1fr", "none", "40px", "auto", "row dense"],
+            ),
+            (
+                "c",
+                ["60px 30px", "none", "none", "auto", "120px", "column"],
+            ),
+            ("d", ["10px 20px", "none", "none", "auto", "auto", "column"]),
+        ] {
+            for (name, expected) in [
+                "grid-template-rows",
+                "grid-template-columns",
+                "grid-template-areas",
+                "grid-auto-rows",
+                "grid-auto-columns",
+                "grid-auto-flow",
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    value(&mut dom, id, name).as_deref().map(str::trim),
+                    Some(expected),
+                    "#{id} {name}"
+                );
+            }
+        }
     }
 
     #[test]
