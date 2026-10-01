@@ -88,6 +88,12 @@ impl Kind {
     }
 }
 
+/// Whether `text` is a `<color>` (named, legacy, modern, relative or system
+/// color, or `currentcolor`) as the color properties accept it.
+pub(super) fn is_color(text: &str) -> bool {
+    values::computed_color(text).is_some()
+}
+
 pub(super) fn ident(text: &str) -> Option<String> {
     let mut input = ParserInput::new(text);
     let mut parser = Parser::new(&mut input);
