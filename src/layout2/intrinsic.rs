@@ -26,6 +26,8 @@ use super::value::Len;
 
 /// The max-content probe's effectively infinite CSS-pixel width.
 const PROBE_MAX_PX: f32 = 10_000_000.0;
+/// HTML Rendering §15.4.1: an iframe's default object width.
+const FRAME_DEFAULT_WIDTH: f32 = 300.0;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum IMode {
@@ -255,11 +257,17 @@ impl Flow<'_> {
         // for its min-content contribution; this is what lets an image with
         // `max-width:100%` shrink inside an intrinsically-sized flex item.
         let side = |l: &Len| l.resolve(Some(0.0)).unwrap_or(0.0);
+        // An iframe is replaced too: its nested document's content is not its
+        // intrinsic size (HTML Rendering §15.4.1's 300×150 default object
+        // size is, once a cyclic percentage behaves as auto).
+        let frame =
+            b.node != NO_NODE && matches!(self.dom.tag_name(b.node), Some("iframe" | "frame"));
         let compressible_min = mode == IMode::Min
-            && matches!(
-                &b.content,
-                Content::Atomic(atom) if matches!(&atom.kind, AtomKind::Img { .. })
-            );
+            && (frame
+                || matches!(
+                    &b.content,
+                    Content::Atomic(atom) if matches!(&atom.kind, AtomKind::Img { .. })
+                ));
         let preferred_basis = compressible_min.then_some(0.0);
         let bp = s.border[super::style::LEFT]
             + s.border[super::style::RIGHT]
@@ -275,7 +283,13 @@ impl Flow<'_> {
         let content = self
             .intrinsic_width_value(&s.width, b, preferred_basis, inl)
             .or_else(|| s.width.resolve(preferred_basis).map(to_content))
-            .unwrap_or_else(|| self.intrinsic_w(b, mode, inl));
+            .unwrap_or_else(|| {
+                if frame {
+                    FRAME_DEFAULT_WIDTH
+                } else {
+                    self.intrinsic_w(b, mode, inl)
+                }
+            });
         let min = self
             .intrinsic_width_value(&s.min_width, b, Some(0.), inl)
             .or_else(|| s.min_width.resolve(Some(0.0)).map(to_content))
