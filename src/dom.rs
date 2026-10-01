@@ -13353,23 +13353,39 @@ fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&s
         "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset",
         "outset",
     ];
+    parse_line_shorthand(value, STYLES)
+}
+
+/// The `(width, style, color)` of a `<line-width> || <line-style> || <color>`
+/// shorthand (`border`, `border-<side>`, `outline`). Order-independent, but a
+/// component may appear once, and any other token makes the whole value
+/// invalid (CSS Syntax 3: `border: px solid red` is dropped, not solid red).
+/// A unitless number stays a width, for the HTML quirks-mode length quirk.
+fn parse_line_shorthand<'v>(
+    value: &'v str,
+    styles: &[&str],
+) -> (Option<&'v str>, Option<&'v str>, Option<&'v str>) {
     let mut width = None;
     let mut style = None;
     let mut color = None;
     for tok in split_value_tokens(value) {
-        if STYLES.contains(&tok) {
-            style = Some(tok);
-        } else if tok == "thin"
-            || tok == "medium"
-            || tok == "thick"
-            || tok.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        let lower = tok.to_ascii_lowercase();
+        let slot = if styles.contains(&lower.as_str()) {
+            &mut style
+        } else if matches!(lower.as_str(), "thin" | "medium" | "thick")
+            || tok.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
+            || ["calc(", "min(", "max(", "clamp("]
+                .iter()
+                .any(|function| lower.starts_with(function))
         {
-            width = Some(tok);
-        } else if tok.eq_ignore_ascii_case("currentcolor")
-            || tok.eq_ignore_ascii_case("transparent")
-            || crate::render::PaintColor::parse_css(tok).is_some()
-        {
-            color = Some(tok);
+            &mut width
+        } else if properties::is_color(tok) || crate::render::PaintColor::parse_css(tok).is_some() {
+            &mut color
+        } else {
+            return (None, None, None);
+        };
+        if slot.replace(tok).is_some() {
+            return (None, None, None);
         }
     }
     (width, style, color)
@@ -13380,26 +13396,7 @@ fn parse_outline_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&
         "auto", "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge",
         "inset", "outset",
     ];
-    let mut width = None;
-    let mut style = None;
-    let mut color = None;
-    for tok in split_value_tokens(value) {
-        if STYLES.contains(&tok) {
-            style = Some(tok);
-        } else if tok == "thin"
-            || tok == "medium"
-            || tok == "thick"
-            || tok.starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '-')
-        {
-            width = Some(tok);
-        } else if tok.eq_ignore_ascii_case("currentcolor")
-            || tok.eq_ignore_ascii_case("transparent")
-            || crate::render::PaintColor::parse_css(tok).is_some()
-        {
-            color = Some(tok);
-        }
-    }
-    (width, style, color)
+    parse_line_shorthand(value, STYLES)
 }
 
 fn outline_longhands(w: Option<&str>, s: Option<&str>, c: Option<&str>) -> Vec<(String, String)> {
@@ -18177,6 +18174,35 @@ mod tests {
         assert!(dom.serialize(DOCUMENT).contains("payload"));
         dom.set_attr(m, "class", "menu");
         assert!(!dom.serialize(DOCUMENT).contains("payload"));
+    }
+
+    #[test]
+    fn invalid_border_shorthands_are_dropped_whole() {
+        // CSS Syntax 3 / Backgrounds 3 #border-shorthands: an unknown token or
+        // a repeated component invalidates the declaration, which then leaves
+        // earlier declarations in effect.
+        let dom = Dom::parse_document(
+            "<style>p{border:1px dotted blue}\
+             #a{border:px solid red} #b{border:2px solid solid red}\
+             #c{border:calc(1px + 1px) SOLID ButtonText} #d{border:3 dashed}\
+             #e{outline:thick auto green}</style>\
+             <p id=a>a</p><p id=b>b</p><p id=c>c</p><p id=d>d</p><p id=e>e</p>",
+        );
+        let value = |id: &str, name: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.computed_value(node, name)
+        };
+        for id in ["a", "b"] {
+            assert_eq!(
+                value(id, "border-top-style").as_deref(),
+                Some("dotted"),
+                "#{id}"
+            );
+        }
+        assert_eq!(value("c", "border-top-style").as_deref(), Some("solid"));
+        assert!(value("c", "border-top-width").is_some_and(|w| w.contains("calc") || w == "2px"));
+        assert_eq!(value("d", "border-top-style").as_deref(), Some("dashed"));
+        assert_eq!(value("e", "outline-style").as_deref(), Some("auto"));
     }
 
     #[test]

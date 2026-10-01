@@ -301,7 +301,7 @@ fn component_text<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, String> {
     Ok(p.slice_from(start).to_string())
 }
 
-fn computed_color(text: &str) -> Option<String> {
+pub(super) fn computed_color(text: &str) -> Option<String> {
     let decoded = ident(text);
     let text = decoded.as_deref().unwrap_or(text);
     // CSS Color 5 #resolving-rcs: a relative color computes to its absolute color.
