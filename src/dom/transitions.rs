@@ -890,6 +890,9 @@ mod tests {
 
     #[test]
     fn local_transition_detection_does_not_visit_independent_endpoints() {
+        // Exact restyle counts: a parallel test changing process-wide layout
+        // inputs (the page font epoch) would expire unrelated styles.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         for siblings in [16, 1024] {
             let mut checked = false;
             for _ in 0..16 {
@@ -1005,6 +1008,7 @@ mod tests {
 
     #[test]
     fn container_query_changes_are_transition_style_events_without_dom_mutations() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         // CSS Conditional 5 #animated-containers: query and container-unit
         // changes participate in style change events even without DOM edits.
         let mut dom = Dom::parse_document(

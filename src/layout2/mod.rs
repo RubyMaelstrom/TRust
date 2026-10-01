@@ -3778,12 +3778,12 @@ mod tests {
         // to its auto-height rows (here in proportion, as Gecko does). The
         // expected heights were measured in LibreWolf 153.
         let body = r#"<body style="margin:0">
-            <table cellspacing=0 style="width:400px"><tr><td id=a height=100>x</td><td>y</td></tr>
+            <table cellspacing=0 cellpadding=0 style="width:400px"><tr><td id=a height=100>x</td><td>y</td></tr>
             <tr height=60><td id=b>z</td><td height=20><div style="height:80px"></div></td></tr></table>
-            <table height=300 cellspacing=0><tr><td id=c>a</td></tr><tr><td id=d height=50>b</td></tr></table>
-            <table height=200 cellspacing=0><tr><td id=e><div style="height:55px"></div></td></tr>
+            <table height=300 cellspacing=0 cellpadding=0><tr><td id=c>a</td></tr><tr><td id=d height=50>b</td></tr></table>
+            <table height=200 cellspacing=0 cellpadding=0><tr><td id=e><div style="height:55px"></div></td></tr>
             <tr><td id=f><div style="height:18px"></div></td></tr></table>
-            <table cellspacing=0><tr><td id=g height=100 style="padding:10px">x</td></tr></table></body>"#;
+            <table cellspacing=0 cellpadding=0><tr><td id=g height=100 style="padding:10px">x</td></tr></table></body>"#;
         for (doctype, padded) in [("", 100.0), ("<!DOCTYPE html>", 120.0)] {
             let html = format!("{doctype}{body}");
             let dom = Dom::parse_document(&html);
@@ -8863,7 +8863,7 @@ mod tests {
         // §17.5.2: a `<col width="10%">` of a width:100% table in a 40-col
         // (320px) band is 32px = 4 cols, so the second column starts at col 4.
         let out = lay(
-            r#"<body style="margin:0"><table width="100%"><colgroup><col width="10%"><col></colgroup>
+            r#"<body style="margin:0"><table width="100%" cellspacing=0 cellpadding=0><colgroup><col width="10%"><col></colgroup>
                  <tr><td>a</td><td>bb</td></tr></table></body>"#,
             40,
         );
@@ -8874,7 +8874,7 @@ mod tests {
     fn col_span_repeats_its_width() {
         // `<col span="2" width="25%">` covers two 25% (80px = 10-col) columns.
         let out = lay(
-            r#"<body style="margin:0"><table width="100%"><colgroup><col span="2" width="25%"></colgroup>
+            r#"<body style="margin:0"><table width="100%" cellspacing=0 cellpadding=0><colgroup><col span="2" width="25%"></colgroup>
                  <tr><td>a</td><td>b</td><td>c</td></tr></table></body>"#,
             40,
         );
@@ -8888,7 +8888,7 @@ mod tests {
         // an 80px (10-col) first column holds its width even when the TABLE
         // declares none.
         let out = lay(
-            r#"<body style="margin:0"><table><tr><td width="80">a</td><td>b</td></tr></table></body>"#,
+            r#"<body style="margin:0"><table cellspacing=0 cellpadding=0><tr><td width="80">a</td><td>b</td></tr></table></body>"#,
             40,
         );
         assert_eq!(cell_at(&out, "b").1, 10);
@@ -9063,18 +9063,18 @@ mod tests {
     }
 
     #[test]
-    fn css_padding_suppresses_cellpadding() {
-        // The presentational-hint priority: a cell with ANY CSS padding ignores
-        // the `cellpadding` attribute, so its content is not inset.
+    fn css_padding_overrides_cellpadding_per_side() {
+        // HTML Rendering #tables-2: `cellpadding` is a presentational hint for
+        // each padding longhand, so author CSS overrides only the sides it
+        // sets; padding-bottom leaves the 8px left inset in place.
         let out = lay(
-            r#"<body style="margin:0"><table cellpadding="8"><tr><td style="padding-bottom:4px">x</td></tr></table></body>"#,
+            r#"<body style="margin:0"><table cellpadding="8" cellspacing="0"><tr><td style="padding-left:0">x</td>
+                <td style="padding-bottom:4px">y</td></tr></table></body>"#,
             40,
         );
-        assert_eq!(
-            cell_at(&out, "x").1,
-            0,
-            "CSS padding wins — no cellpadding inset"
-        );
+        assert_eq!(cell_at(&out, "x").1, 0, "CSS padding-left wins");
+        // The first cell is 16px (8px text + 8px right padding).
+        assert_eq!(cell_at(&out, "y").1, 3, "8px left inset kept");
     }
 
     #[test]
@@ -9115,7 +9115,7 @@ mod tests {
         // whose content is a table — two sit side by side and text follows.
         // 48px = 6 cells.
         let out = lay(
-            r#"<body style="margin:0"><table style="display:inline-table;width:48px"><tr><td>AA</td></tr></table><table style="display:inline-table;width:48px"><tr><td>BB</td></tr></table>after</body>"#,
+            r#"<body style="margin:0"><table style="display:inline-table;width:48px" cellspacing=0 cellpadding=0><tr><td>AA</td></tr></table><table style="display:inline-table;width:48px" cellspacing=0 cellpadding=0><tr><td>BB</td></tr></table>after</body>"#,
             80,
         );
         let (ra, a) = find(&out, "AA");

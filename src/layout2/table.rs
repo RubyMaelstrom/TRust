@@ -60,12 +60,10 @@ impl Flow<'_> {
         let spacing = bs * (ncols + 1) as f32;
         // Space available to the columns' content (the band, less spacing).
         let avail = (avail_w - spacing).max(1.0);
-        let cellpad = self.table_cellpadding(table_node);
 
         // Per-column min/max content widths + explicit width preferences (the
         // shared metrics; a declared px cap clamps to the band for layout).
-        let (col_min, col_max, col_w) =
-            self.table_col_metrics(tb, bs, cellpad, Some(avail), avail, inl);
+        let (col_min, col_max, col_w) = self.table_col_metrics(tb, bs, Some(avail), avail, inl);
 
         // Fixed layout: a definite width + `table-layout:fixed` ignores
         // content and divides by declared column widths (§17.5.2.1).
@@ -153,7 +151,6 @@ impl Flow<'_> {
     pub(super) fn table_grid(
         &self,
         tb: &TableBox,
-        table_node: NodeId,
         cols: &TableCols,
         content_x: f32,
         content_top: f32,
@@ -176,22 +173,13 @@ impl Flow<'_> {
             acc += cols.widths.get(c).copied().unwrap_or(1.0) + bs;
         }
 
-        // `cellpadding` (a legacy HTML attribute) insets a cell's content when
-        // the cell sets NO CSS padding of its own — the CSS padding, applied by
-        // the cell's own box, wins per the presentational-hint priority. It is
-        // already folded into the column widths (via `cell_min_max`), so a
-        // cellpadded auto column is wide enough for content + padding.
-        let cellpad = self.table_cellpadding(table_node);
-
-        // Lay every cell at its spanned-column width. Each entry:
-        // (fragment, its local anchors, horizontal pad, vertical pad).
+        // Lay every cell at its spanned-column width. HTML's `cellpadding`
+        // is an ordinary padding hint on the cells (HTML Rendering #tables-2).
         struct Laid {
             frag: Frag,
             anchors: Vec<(NodeId, f32)>,
             /// The cell's spanned border-box width (px) — its CB for %.
             cell_w: f32,
-            ph: f32,
-            pv: f32,
         }
         let mut laid: Vec<Laid> = Vec::with_capacity(tb.cells.len());
         for cell in &tb.cells {
@@ -200,20 +188,13 @@ impl Flow<'_> {
             let cell_w =
                 (cols.widths[cell.col..end].iter().sum::<f32>() + bs * (span - 1) as f32).max(1.0);
             let s = &cell.b.style;
-            let has_css_pad = cell_has_css_padding(self, cell.b.node);
-            let (ph, pv) = if has_css_pad || cellpad == 0.0 {
-                (0.0, 0.0)
-            } else {
-                (cellpad, cellpad)
-            };
             // The cell's own border+padding wrap its content (item_frag adds
-            // them around the imposed content width). The cellpadding inset is
-            // an extra frame OUTSIDE the cell's fragment.
+            // them around the imposed content width).
             let cbp = s.border[LEFT]
                 + s.border[RIGHT]
                 + self.pad(s, LEFT, cell_w)
                 + self.pad(s, RIGHT, cell_w);
-            let content_w = (cell_w - 2.0 * ph - cbp).max(0.0);
+            let content_w = (cell_w - cbp).max(0.0);
             // CSS 2.2 §17.5.3: a cell's 'height' is a minimum for its row;
             // content taller than it grows the cell. Quirks Mode #the-table-
             // cell-height-box-sizing-quirk measures it as a border box.
@@ -223,7 +204,7 @@ impl Flow<'_> {
                 + self.pad(s, BOTTOM, cell_w);
             let def_h = s.height.resolve(def_ch).map(|v| {
                 if self.in_quirks_document(cell.b.node) {
-                    (v - vertical_edges - 2.0 * pv).max(0.0)
+                    (v - vertical_edges).max(0.0)
                 } else {
                     v.max(0.0)
                 }
@@ -239,8 +220,6 @@ impl Flow<'_> {
                 frag,
                 anchors: anc,
                 cell_w,
-                ph,
-                pv,
             });
         }
 
@@ -284,7 +263,7 @@ impl Flow<'_> {
         let mut row_h = vec![0.0f32; nrows];
         for (cell, l) in tb.cells.iter().zip(&laid) {
             if cell.rowspan <= 1 && cell.row < nrows {
-                row_h[cell.row] = row_h[cell.row].max(l.frag.h + 2.0 * l.pv);
+                row_h[cell.row] = row_h[cell.row].max(l.frag.h);
             }
         }
         // A row's own 'height' is also a minimum (HTML maps `tr height`).
@@ -311,7 +290,7 @@ impl Flow<'_> {
             if end <= cell.row {
                 continue;
             }
-            let need = l.frag.h + 2.0 * l.pv;
+            let need = l.frag.h;
             let have: f32 =
                 row_h[cell.row..end].iter().sum::<f32>() + bs_y * (end - cell.row - 1) as f32;
             if need > have {
@@ -357,20 +336,19 @@ impl Flow<'_> {
             let end = (cell.row + cell.rowspan).min(nrows);
             let span_h = row_h[cell.row..end].iter().sum::<f32>()
                 + bs_y * (end.saturating_sub(cell.row + 1)) as f32;
-            let cell_outer_h = l.frag.h + 2.0 * l.pv;
-            let dy_valign = self.cell_valign_offset(cell.b.node, cell_outer_h, span_h);
+            let dy_valign = self.cell_valign_offset(cell.b.node, l.frag.h, span_h);
             // §9.4.3 relative offset / transform translation — a cell's CB for
             // percentages is its own box.
             let (rx, ry) =
                 self.paint_offset(&cell.b.style, l.cell_w, Some(span_h), l.frag.w, l.frag.h);
-            let x = content_x + col_x[cell.col] + l.ph + rx;
-            let y = content_top + row_y[cell.row] + l.pv + ry;
+            let x = content_x + col_x[cell.col] + rx;
+            let y = content_top + row_y[cell.row] + ry;
             // Vertical alignment moves content, not the cell's background
             // and border. Every cell occupies its full resolved row span.
             for child in &mut l.frag.children {
                 Flow::offset_frag(child, 0.0, dy_valign);
             }
-            l.frag.h = (span_h - 2.0 * l.pv).max(l.frag.h);
+            l.frag.h = span_h.max(l.frag.h);
             let mut layers = Vec::new();
             if let Some(group) = group {
                 let (first, end) = group_rows[&group];
@@ -419,7 +397,6 @@ impl Flow<'_> {
         &self,
         tb: &TableBox,
         bs: f32,
-        cellpad: f32,
         cap: Option<f32>,
         pct_basis: f32,
         inl: &InlineStyle,
@@ -444,7 +421,7 @@ impl Flow<'_> {
             if cell.colspan != 1 || cell.col >= ncols {
                 continue;
             }
-            let (mn, mx) = self.cell_min_max(cell, cellpad, cap, pct_basis, inl);
+            let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
             col_min[cell.col] = col_min[cell.col].max(mn);
             col_max[cell.col] = col_max[cell.col].max(mx);
         }
@@ -459,7 +436,7 @@ impl Flow<'_> {
             if span == 0 {
                 continue;
             }
-            let (mn, mx) = self.cell_min_max(cell, cellpad, cap, pct_basis, inl);
+            let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
             let inner_bs = bs * (span - 1) as f32;
             distribute_deficit(&mut col_min[cell.col..end], (mn - inner_bs).max(0.0));
             distribute_deficit(&mut col_max[cell.col..end], (mx - inner_bs).max(0.0));
@@ -489,8 +466,7 @@ impl Flow<'_> {
             return 0.0;
         }
         let (bs, _) = self.table_border_spacing(table_node);
-        let cellpad = self.table_cellpadding(table_node);
-        let (col_min, col_max, _) = self.table_col_metrics(tb, bs, cellpad, None, 0.0, inl);
+        let (col_min, col_max, _) = self.table_col_metrics(tb, bs, None, 0.0, inl);
         let cols = match mode {
             IMode::Min => col_min,
             IMode::Max => col_max,
@@ -507,26 +483,15 @@ impl Flow<'_> {
     fn cell_min_max(
         &self,
         cell: &super::tree::TableCell,
-        cellpad: f32,
         cap: Option<f32>,
         pct_basis: f32,
         inl: &InlineStyle,
     ) -> (f32, f32) {
         let s = &cell.b.style;
-        // The cell's own border + padding, plus the legacy `cellpadding`
-        // inset when the cell declares no CSS padding of its own (so an
-        // auto column reserves room for it — matching how `table_grid` lays
-        // the cell).
-        let extra_pad = if cellpad > 0.0 && !cell_has_css_padding(self, cell.b.node) {
-            2.0 * cellpad
-        } else {
-            0.0
-        };
         let bp = s.border[LEFT]
             + s.border[RIGHT]
             + self.pad(s, LEFT, pct_basis)
-            + self.pad(s, RIGHT, pct_basis)
-            + extra_pad;
+            + self.pad(s, RIGHT, pct_basis);
         let mut mn = self.intrinsic_w(&cell.b, IMode::Min, inl) + bp;
         let mut mx = self.intrinsic_w(&cell.b, IMode::Max, inl) + bp;
         if let Some(ColSpec::Px(px)) = declared_track_width(self.dom, cell.b.node) {
@@ -537,19 +502,9 @@ impl Flow<'_> {
         (mn.max(1.0), mx.max(mn))
     }
 
-    /// The table's `cellpadding` attribute (px). Legacy HTML; 0 when unset.
-    fn table_cellpadding(&self, table: NodeId) -> f32 {
-        self.dom
-            .attr(table, "cellpadding")
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .unwrap_or(0.0)
-            .max(0.0)
-    }
-
-    /// Horizontal border-spacing (px): CSS `border-spacing` if set, else the
-    /// HTML `cellspacing` attribute (HTML §15.3.13 maps it to `border-spacing`).
-    /// Default 0; content/cellpadding still separates columns.
-    /// CSS 2.2 §17.6.1: one length sets both axes, two set horizontal and
+    /// The used border-spacing (px) from the cascade: the HTML UA default
+    /// is 2px, and `cellspacing` is a presentational hint for it (HTML
+    /// Rendering #tables-2). CSS 2.2 §17.6.1: one length sets both axes, two set horizontal and
     /// vertical. Spacing includes the outside edges and does not participate
     /// in the collapsed border model. Read inherited values from the cascade.
     fn table_border_spacing(&self, table: NodeId) -> (f32, f32) {
@@ -561,15 +516,9 @@ impl Flow<'_> {
         {
             return (0.0, 0.0);
         }
-        let raw = self
-            .dom
-            .computed_value_resolved(table, "border-spacing")
-            .or_else(|| {
-                self.dom
-                    .attr(table, "cellspacing")
-                    .map(|s| s.trim().to_string())
-            });
-        let Some(raw) = raw else { return (0.0, 0.0) };
+        let Some(raw) = self.dom.computed_value_resolved(table, "border-spacing") else {
+            return (0.0, 0.0);
+        };
         let mut parts = raw.split_whitespace();
         let first = parts.next().unwrap_or("0");
         let second = parts.next().unwrap_or(first);
@@ -661,23 +610,6 @@ impl Flow<'_> {
             },
         }
     }
-}
-
-/// Whether the cell sets any CSS padding of its own (so `cellpadding` loses).
-fn cell_has_css_padding(flow: &Flow<'_>, node: NodeId) -> bool {
-    // No HTML cellpadding hint applies to a generated anonymous cell.
-    if node == super::NO_NODE {
-        return true;
-    }
-    [
-        "padding",
-        "padding-left",
-        "padding-right",
-        "padding-top",
-        "padding-bottom",
-    ]
-    .iter()
-    .any(|p| flow.dom.computed_style(node, p).is_some())
 }
 
 /// Fixed table layout column widths (§17.5.2.1): declared column widths are

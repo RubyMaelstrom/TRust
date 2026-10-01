@@ -4765,6 +4765,14 @@ impl Dom {
             // WHATWG HTML Rendering §15.3.10: these widgets use border-box
             // sizing in the UA origin. An authored 30px button therefore
             // remains 30px including its padding and border.
+            // HTML Rendering #tables-2.
+            "border-spacing" if tag == "table" => "2px",
+            "box-sizing" if tag == "table" => "border-box",
+            "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
+                if matches!(tag, "td" | "th") =>
+            {
+                "1px"
+            }
             "box-sizing" if tag == "button" || tag == "select" => "border-box",
             "box-sizing" if tag == "input" && self.ua_input_border_box(id) => "border-box",
             _ => return None,

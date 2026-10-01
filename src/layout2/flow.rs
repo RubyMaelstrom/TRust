@@ -1195,7 +1195,6 @@ impl Flow<'_> {
                             let grid_top = cur.flush();
                             let (frags, gh) = self.table_grid(
                                 tb,
-                                b.node,
                                 &cols,
                                 cap_x,
                                 grid_top,
@@ -3440,16 +3439,8 @@ impl Flow<'_> {
                     children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl, &mut tfc));
                 }
                 let grid_top = cur.flush();
-                let (frags, gh) = self.table_grid(
-                    tb,
-                    b.node,
-                    &cols,
-                    cap_x,
-                    grid_top,
-                    def_h,
-                    &inl,
-                    &mut cur.anchors,
-                );
+                let (frags, gh) =
+                    self.table_grid(tb, &cols, cap_x, grid_top, def_h, &inl, &mut cur.anchors);
                 children.extend(frags);
                 cur.y = grid_top + gh;
                 for cap in &tb.bottom_captions {

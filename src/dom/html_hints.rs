@@ -8,6 +8,25 @@
 use super::{Dom, NodeId};
 
 impl Dom {
+    /// The table a td/th belongs to through its row (and row group): the
+    /// `table > tr > td` and `table > tbody > tr > td` shapes the HTML
+    /// rendering rules select.
+    fn cell_table(&self, cell: NodeId) -> Option<NodeId> {
+        let row = self
+            .node(cell)
+            .parent
+            .filter(|&row| self.tag_name(row) == Some("tr"))?;
+        let parent = self.node(row).parent?;
+        let table = match self.tag_name(parent) {
+            Some("table") => parent,
+            Some("thead" | "tbody" | "tfoot") => self.node(parent).parent?,
+            _ => return None,
+        };
+        (self.tag_name(table) == Some("table")
+            && self.namespace_uri(table) == Some("http://www.w3.org/1999/xhtml"))
+        .then_some(table)
+    }
+
     pub(super) fn html_presentational_hints(
         &self,
         id: NodeId,
@@ -24,6 +43,57 @@ impl Dom {
             for property in ["width", "height"] {
                 if let Some(value) = self.attr(id, property).and_then(dimension_value) {
                     hint(property, value);
+                }
+            }
+        }
+        // HTML Rendering #tables-2: `cellspacing` and `border` map to pixel
+        // lengths; a border that is not equivalent to zero is outset. The
+        // cells of such a table get 1px inset borders, and every cell takes
+        // the table's `cellpadding`. Like Gecko and Blink, cells also take a
+        // `bordercolor` (Gecko's `table[bordercolor] td { border-color:
+        // inherit }`).
+        if tag == "table" {
+            if let Some(spacing) = self.attr(id, "cellspacing").and_then(non_negative_integer) {
+                hint("border-spacing", format!("{spacing}px"));
+            }
+            if let Some(border) = self.attr(id, "border") {
+                let width = non_negative_integer(border).unwrap_or(1);
+                for side in ["top", "right", "bottom", "left"] {
+                    hint(border_property(side, "width"), format!("{width}px"));
+                    if width != 0 {
+                        hint(border_property(side, "style"), "outset".into());
+                    }
+                }
+            }
+        }
+        if matches!(tag, "td" | "th")
+            && let Some(table) = self.cell_table(id)
+        {
+            if self
+                .attr(table, "border")
+                .is_some_and(|border| non_negative_integer(border) != Some(0))
+            {
+                for side in ["top", "right", "bottom", "left"] {
+                    hint(border_property(side, "width"), "1px".into());
+                    hint(border_property(side, "style"), "inset".into());
+                }
+            }
+            if let Some(color) = self.attr(table, "bordercolor").and_then(legacy_color) {
+                for side in ["top", "right", "bottom", "left"] {
+                    hint(border_property(side, "color"), color.clone());
+                }
+            }
+            if let Some(padding) = self
+                .attr(table, "cellpadding")
+                .and_then(non_negative_integer)
+            {
+                for property in [
+                    "padding-top",
+                    "padding-right",
+                    "padding-bottom",
+                    "padding-left",
+                ] {
+                    hint(property, format!("{padding}px"));
                 }
             }
         }
@@ -156,6 +226,39 @@ fn dimension_value(input: &str) -> Option<String> {
         "px"
     };
     Some(format!("{value}{unit}"))
+}
+
+/// HTML #rules-for-parsing-non-negative-integers.
+fn non_negative_integer(input: &str) -> Option<u32> {
+    let digits = input.trim_start_matches(ascii_whitespace);
+    let digits = digits.strip_prefix('+').unwrap_or(digits);
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    (end > 0).then(|| {
+        digits[..end].bytes().fold(0_u32, |value, digit| {
+            value
+                .saturating_mul(10)
+                .saturating_add(u32::from(digit - b'0'))
+        })
+    })
+}
+
+fn border_property(side: &str, part: &str) -> &'static str {
+    match (side, part) {
+        ("top", "width") => "border-top-width",
+        ("right", "width") => "border-right-width",
+        ("bottom", "width") => "border-bottom-width",
+        ("left", "width") => "border-left-width",
+        ("top", "style") => "border-top-style",
+        ("right", "style") => "border-right-style",
+        ("bottom", "style") => "border-bottom-style",
+        ("left", "style") => "border-left-style",
+        ("top", _) => "border-top-color",
+        ("right", _) => "border-right-color",
+        ("bottom", _) => "border-bottom-color",
+        _ => "border-left-color",
+    }
 }
 
 /// HTML #rules-for-parsing-nonzero-dimension-values: as dimension values,

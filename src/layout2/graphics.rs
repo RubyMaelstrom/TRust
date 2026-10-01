@@ -3442,18 +3442,24 @@ fn border_ring(
     PaintShape::Path(path)
 }
 
+/// The light and dark relief of a 3D border style. CSS Backgrounds 3
+/// #border-style leaves the exact colors to the UA; like Gecko
+/// (`NS_GetSpecial3DColors`), the light side keeps the border color and the
+/// dark side is two thirds of it, except that black uses 70%/30% gray so
+/// its relief stays visible.
 fn border_shade(color: PaintColor, light: bool) -> PaintColor {
     let PaintColor::Rgba(r, g, b, a) = color else {
         return color;
     };
-    let shade = |v: u8| {
-        if light {
-            (u16::from(v) + (255 - u16::from(v)) / 3) as u8
-        } else {
-            (u16::from(v) * 2 / 3) as u8
-        }
-    };
-    PaintColor::Rgba(shade(r), shade(g), shade(b), a)
+    if (r, g, b) == (0, 0, 0) {
+        let gray = if light { 178 } else { 76 };
+        return PaintColor::Rgba(gray, gray, gray, a);
+    }
+    if light {
+        return color;
+    }
+    let dark = |v: u8| (f32::from(v) * (2.0 / 3.0)) as u8;
+    PaintColor::Rgba(dark(r), dark(g), dark(b), a)
 }
 
 /// CSS Backgrounds and Borders §6: background first, then border. Uniform
