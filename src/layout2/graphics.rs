@@ -1685,6 +1685,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             ascent: line.ascent,
             descent: line.descent,
         });
+        paint_inline_box_decorations(builder, fragment, line, anonymous_line);
         for piece in &line.pieces {
             let node = piece.item.node;
             let style_node = piece.item.style_node;
@@ -3462,6 +3463,175 @@ fn border_shade(color: PaintColor, light: bool) -> PaintColor {
     PaintColor::Rgba(dark(r), dark(g), dark(b), a)
 }
 
+/// CSS 2.2 Appendix E step 7.2.1.4.1 and CSS Backgrounds 3
+/// #box-decoration-break: each line fragment of a non-replaced inline box
+/// paints its shadow, background and border beneath the line's content. The
+/// fragment spans the box's pieces on this line horizontally and its content
+/// area (font ascent to descent, CSS 2.2 §10.6.1) plus vertical padding and
+/// border; with `slice`, the start/end edges appear only where the box
+/// begins/ends.
+fn paint_inline_box_decorations(
+    builder: &mut Builder<'_>,
+    fragment: &Frag,
+    line: &super::flow::LineFrag,
+    anonymous_line: bool,
+) {
+    struct Run {
+        node: NodeId,
+        left: f32,
+        right: f32,
+        top: f32,
+        bottom: f32,
+        starts: bool,
+        ends: bool,
+    }
+    if line.sideways {
+        return;
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for piece in &line.pieces {
+        let Some(boxes) = &piece.boxes else {
+            continue;
+        };
+        let start = fragment.x + piece.x;
+        let end = start + piece.box_width;
+        let (top, bottom) =
+            piece
+                .shaped
+                .as_ref()
+                .map_or((f32::INFINITY, f32::NEG_INFINITY), |text| {
+                    let baseline = fragment.y + piece.y + text.baseline;
+                    (baseline - text.ascent, baseline + text.descent)
+                });
+        for &node in boxes.chain.iter() {
+            let index = runs
+                .iter()
+                .position(|run| run.node == node)
+                .unwrap_or_else(|| {
+                    runs.push(Run {
+                        node,
+                        left: start,
+                        right: end,
+                        top,
+                        bottom,
+                        starts: false,
+                        ends: false,
+                    });
+                    runs.len() - 1
+                });
+            let run = &mut runs[index];
+            run.left = run.left.min(start);
+            run.right = run.right.max(end);
+            run.top = run.top.min(top);
+            run.bottom = run.bottom.max(bottom);
+            if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == node) {
+                run.left = run.left.min(start - distance);
+                run.starts = true;
+            }
+            if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == node) {
+                run.right = run.right.max(end + distance);
+                run.ends = true;
+            }
+        }
+    }
+    for run in runs {
+        let style = PaintStyle::Element(run.node);
+        if builder.dom.visibility_hidden(run.node) {
+            continue;
+        }
+        let (top, bottom) = if run.top.is_finite() {
+            (run.top, run.bottom)
+        } else {
+            let baseline = fragment.y + line.baseline;
+            (baseline - line.ascent, baseline + line.descent)
+        };
+        let box_style = super::style::BoxStyle::of(builder.dom, run.node, builder.viewport());
+        let basis = Some(fragment.w);
+        let pad = |side: usize| box_style.padding[side].resolve(basis).unwrap_or(0.0);
+        let [bt, br, bb, bl] = box_style.border;
+        let border = [
+            bt,
+            if run.ends { br } else { 0.0 },
+            bb,
+            if run.starts { bl } else { 0.0 },
+        ];
+        let y = top - pad(super::style::TOP) - bt;
+        let rect = CssRect::new(
+            run.left,
+            y,
+            (run.right - run.left).max(0.0),
+            bottom + pad(super::style::BOTTOM) + bb - y,
+        );
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            continue;
+        }
+        let decoration = Frag {
+            flow: fragment.flow.clone(),
+            node: run.node,
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+            border,
+            css_size: None,
+            content_size: None,
+            content_offset: [border[3], border[0]],
+            paint: fragment.paint.clone(),
+            clip: fragment.clip,
+            kind: FragKind::Block,
+            children: Vec::new(),
+        };
+        let mut radii = border_radii(builder.dom, style, rect);
+        if !run.starts {
+            radii.corners[0] = (0.0, 0.0);
+            radii.corners[3] = (0.0, 0.0);
+        }
+        if !run.ends {
+            radii.corners[1] = (0.0, 0.0);
+            radii.corners[2] = (0.0, 0.0);
+        }
+        let scroll_depth = if fragment.paint.outside_marker {
+            builder.push_scroll_ancestors(run.node)
+        } else if anonymous_line {
+            builder.push_scroll_content_chain(run.node)
+        } else {
+            0
+        };
+        let clipped = anonymous_line
+            .then(|| builder.ancestor_clip(run.node, fragment.clip))
+            .flatten()
+            .is_some_and(|clip| builder.push_hard_clip(clip));
+        let shape = rounded_shape(rect, radii);
+        paint_box_shadows(builder.dom, style, &shape, builder);
+        if let Some(color) = background_color_for_style(builder.dom, style)
+            && !color.is_transparent()
+        {
+            let clips = style
+                .value(builder.dom, "background-clip")
+                .unwrap_or_default();
+            let clips = split_top_level(&clips, ',');
+            let images = style
+                .value(builder.dom, "background-image")
+                .unwrap_or_else(|| "none".into());
+            let index = split_top_level(&images, ',').len().saturating_sub(1);
+            let color_shape = background_layer_shape(
+                &decoration,
+                builder.dom,
+                layer_value(&clips, index, "border-box"),
+                &shape,
+                builder.viewport(),
+            );
+            fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
+        }
+        paint_background_images(&decoration, shape, builder, None);
+        paint_borders(&decoration, radii, builder);
+        if clipped {
+            builder.pop_hard_clip();
+        }
+        builder.pop_scroll_ancestors(scroll_depth);
+    }
+}
+
 /// CSS Backgrounds and Borders §6: background first, then border. Uniform
 /// rounded borders use one true stroked rounded path; non-uniform sides retain
 /// each side's own color/style and CSS-pixel width.
@@ -5111,6 +5281,56 @@ mod tests {
                 assert_eq!((rect.width, rect.height), expected, "{source}: {size}");
             }
         }
+    }
+
+    #[test]
+    fn inline_boxes_paint_sliced_backgrounds_and_borders_per_line() {
+        // CSS 2.2 Appendix E / CSS Backgrounds 3 #box-decoration-break: a
+        // wrapped span paints one background per line over its content area
+        // (not the 24px line height); its start border appears only on the
+        // first fragment. An undecorated span paints nothing of its own.
+        let (dom, layout) = render_fixture(
+            r#"<body style="margin:0;font:16px/24px sans-serif;width:200px"><p style="margin:0">a <span id=s style="background:#ff0000;padding:0 5px;border-left:3px solid #0000ff">long text that wraps across lines</span> b <span>plain</span></p>"#,
+        );
+        let span = dom.get_by_id("s").unwrap();
+        let fills = |color: PaintColor| {
+            layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    DisplayCommand::Fill {
+                        shape: PaintShape::Rect(rect),
+                        brush: PaintBrush::Solid(fill),
+                    } if *fill == color => Some(*rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let red = fills(PaintColor::Rgba(255, 0, 0, 255));
+        assert_eq!(red.len(), 2, "{red:?}");
+        assert!(
+            red.iter()
+                .all(|rect| rect.height > 14.0 && rect.height < 24.0),
+            "{red:?}"
+        );
+        assert!(red[0].x > 10.0, "{red:?}");
+        assert!(
+            red[1].x.abs() < 0.01,
+            "continuation starts at the line edge: {red:?}"
+        );
+        assert!(red[1].y > red[0].y + 20.0, "{red:?}");
+        let blue = layout
+            .paint
+            .primitives
+            .iter()
+            .filter(|command| {
+                matches!(command, DisplayCommand::Fill { brush: PaintBrush::Solid(color), .. }
+                    if *color == PaintColor::Rgba(0, 0, 255, 255))
+            })
+            .count();
+        assert_eq!(blue, 1, "start border on the first fragment only");
+        assert!(layout.boxes.contains_key(&span));
     }
 
     #[test]
