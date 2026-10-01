@@ -568,13 +568,17 @@ async fn snapshot_with_images(
             if !controller.send_image_sizes(&sizes) {
                 break;
             }
+            // A page that keeps rendering (marquees, timers) can publish
+            // revisions the sizes have not reached yet: take the render only
+            // once the actor has gone quiet after the first new revision.
             let waited = Instant::now();
+            let mut last = (before, Instant::now());
             while waited.elapsed() < Duration::from_secs(5) {
                 controller.process_async_events();
-                if controller
-                    .current_page()
-                    .is_some_and(|page| page.rendered_revision() != before)
-                {
+                let revision = controller.current_page()?.rendered_revision();
+                if revision != last.0 {
+                    last = (revision, Instant::now());
+                } else if revision != before && last.1.elapsed() >= Duration::from_millis(400) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
