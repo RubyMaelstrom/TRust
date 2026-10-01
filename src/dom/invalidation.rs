@@ -306,6 +306,39 @@ struct RelationalDependency {
     subject_siblings: bool,
 }
 
+/// Whether a `:has()` argument compound only tests its own element (see
+/// `RelationalDependency::new`). A one-compound `:not()`/`:is()` argument
+/// (`.bar:not(.--dismissed)`) does too, so it is checked recursively.
+fn relational_compound(compound: &Compound) -> bool {
+    let local_logical = compound
+        .nots
+        .iter()
+        .flatten()
+        .chain(compound.selects.iter().flat_map(|(group, _)| group))
+        .all(|selector| selector.0.len() == 1 && relational_compound(&selector.0[0].1));
+    local_logical
+        && compound.has.is_empty()
+        && !compound
+            .structural
+            .iter()
+            .any(|structural| matches!(structural, Structural::Nth { of: Some(_), .. }))
+        // Radio groups associate controls across the tree; every other state
+        // reads the element, its ancestry or its own children.
+        && !compound
+            .states
+            .iter()
+            .any(|state| matches!(state, StatePseudo::Indeterminate))
+        && !compound.target
+        && !compound.popover_open
+        && !compound.scope
+        && !compound.root
+        && !compound.host
+        && compound.host_inner.is_none()
+        && compound.slotted.is_none()
+        && compound.pseudo.is_none()
+        && !compound.inert_pseudo_element
+}
+
 impl RelationalDependency {
     fn new(anchor: &AnchorParts, argument: &HasArg, subject_siblings: bool) -> Option<Self> {
         let mut attributes = Vec::new();
@@ -313,47 +346,23 @@ impl RelationalDependency {
         for (_, compound) in argument.complex.0.iter().skip(1) {
             // Logical arguments can look outside the relative subtree (e.g.
             // :has(:is(body.theme .hit))), as can `:nth-child(of S)` and
-            // association states; retain the full fallback for them. This
-            // dependency only answers child-list changes (attribute changes
-            // reverse :has() paths in `attributes`), and every child-list
-            // change that can alter an argument match lies below or beside a
-            // possible anchor, which `restyle_root` walks. So states without
-            // cross-tree associations and positional pseudo-classes are safe:
-            // focus changes restyle the document (`set_focused_area`), hover
+            // association states (:indeterminate radio groups); retain the
+            // full fallback for them. This dependency only answers child-list
+            // changes (attribute changes reverse :has() paths in `attributes`),
+            // and every child-list change that can alter an argument match lies
+            // below or beside a possible anchor, which `restyle_root` walks.
+            // So other states and positional pseudo-classes are safe: focus
+            // changes restyle the document (`set_focused_area`), hover
             // transitions compare every hover subject including :has()
             // anchors (`set_hover_chain`), :dir() keeps the text-direction
-            // fallback, and :checked/:any-link changes are attribute changes.
+            // fallback, fieldset parents restyle their subtree (:disabled),
+            // and attribute-backed states change through attributes.
             // YouTube's `:not(:has(#masthead-container:focus-within))`,
-            // Discourse's `:has(.socket:hover)` and Wikipedia's
+            // Discourse's `:has(.socket:hover)`, `:has(.switch:disabled)` and
+            // Wikipedia's
             // `:has(.reference-text:dir(ltr))` / `a:has(+ … + a:last-of-type)`
             // otherwise made every insertion expire every style.
-            if !compound.nots.is_empty()
-                || !compound.selects.is_empty()
-                || !compound.has.is_empty()
-                || compound
-                    .structural
-                    .iter()
-                    .any(|structural| matches!(structural, Structural::Nth { of: Some(_), .. }))
-                || compound.states.iter().any(|state| {
-                    !matches!(
-                        state,
-                        StatePseudo::Focus
-                            | StatePseudo::FocusWithin
-                            | StatePseudo::Dir(_)
-                            | StatePseudo::AnyLink
-                            | StatePseudo::Checked
-                    )
-                })
-                || compound.target
-                || compound.popover_open
-                || compound.scope
-                || compound.root
-                || compound.host
-                || compound.host_inner.is_some()
-                || compound.slotted.is_some()
-                || compound.pseudo.is_some()
-                || compound.inert_pseudo_element
-            {
+            if !relational_compound(compound) {
                 return None;
             }
             if compound.id.is_some() {
@@ -2364,11 +2373,15 @@ mod tests {
             "<style>.cite:has(.ref:dir(rtl)) .num{color:red}\
              a:has(+ .divider + a.ve:last-of-type){width:7px}\
              .menu:has(input:checked) .label{height:3px}\
-             ul.list:has(> li.hot:first-child){color:blue}</style>\
+             ul.list:has(> li.hot:first-child){color:blue}\
+             .chat:has(.bar:not(.dismissed, .loading)) .note{color:green}\
+             .toggle:has(.switch:disabled) .knob{width:4px}</style>\
              <div class=cite id=cite><span class=num id=num>1</span><span class=ref id=ref>r</span></div>\
              <p id=edit><a id=edit_link href=#>edit</a><span class=divider>|</span><a class=ve id=ve href=#>ve</a></p>\
              <div class=menu><input type=checkbox id=box><b class=label id=label>l</b></div>\
              <ul class=list id=list><li id=first>a</li></ul>\
+             <div class=chat id=chat><b class=note id=note>n</b></div>\
+             <div class=toggle><fieldset disabled id=fieldset></fieldset><input class=switch id=switch><b class=knob id=knob>k</b></div>\
              <section id=elsewhere></section>\
              <aside id=stable><span id=stable_child>independent</span></aside>",
         );
@@ -2410,6 +2423,18 @@ mod tests {
         // :checked inside :has() follows the attribute path.
         dom.set_attr(dom.get_by_id("box").unwrap(), "checked", "");
         assert_eq!(value(&dom, "label", "height").as_deref(), Some("3px"));
+        // Discourse: `:has(.chat-pinned-bar:not(.--dismissed,.--loading))`.
+        let bar = dom.create_element("i");
+        dom.set_attr(bar, "class", "bar");
+        dom.append(dom.get_by_id("chat").unwrap(), bar);
+        assert_eq!(value(&dom, "note", "color").as_deref(), Some("green"));
+        dom.set_attr(bar, "class", "bar dismissed");
+        assert_ne!(value(&dom, "note", "color").as_deref(), Some("green"));
+        // Discourse: `.d-toggle-switch:has(.composer-event__livestream-switch:disabled)`;
+        // moving the control into a disabled fieldset disables it.
+        assert_ne!(value(&dom, "knob", "width").as_deref(), Some("4px"));
+        dom.append(dom.get_by_id("fieldset").unwrap(), dom.get_by_id("switch").unwrap());
+        assert_eq!(value(&dom, "knob", "width").as_deref(), Some("4px"));
         assert_eq!(dom.style_value_epoch, epoch, "a :has() argument expired the document");
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
         assert_matches_full_scan(&dom);
