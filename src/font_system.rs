@@ -255,6 +255,8 @@ pub(crate) fn font_context() -> FontContext {
 /// foreground page, so rebuilding from the immutable installed-font catalog on
 /// navigation both enforces that scope and bounds retained font bytes.
 pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
+    #[cfg(test)]
+    let _inputs = crate::layout2::global_layout_input_change();
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         let catalog = catalog();

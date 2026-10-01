@@ -10574,6 +10574,8 @@ const MAX_SPRITE_SHEETS: usize = 16;
 /// `rewrite_inline_svgs` then reads the table. Idempotent: an already-primed
 /// URL is left alone (the sheet is immutable for the session).
 pub fn prime_sprite_sheet(abs_url: &str, text: &str) {
+    #[cfg(test)]
+    let _inputs = crate::layout2::global_layout_input_change();
     // SVG 2 linking.html#processingURL permits UA security restrictions.
     // This process-wide cache has no document provenance: accepting file
     // symbols here would let a later web document reuse private local data
