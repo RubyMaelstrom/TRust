@@ -11434,6 +11434,10 @@ const PROPS: &[PropDef] = &[
     prop("text-decoration-line", false, true),
     prop("text-decoration-color", false, true),
     prop("text-decoration-style", false, true),
+    // CSS Text Decoration 4 #text-decoration-width-property and
+    // #underline-offset: the line's thickness and the underline's offset.
+    prop("text-decoration-thickness", false, true),
+    prop("text-underline-offset", true, true),
     prop("text-shadow", true, true),
     prop("content", false, true),
     prop("counter-reset", false, false),
@@ -11599,6 +11603,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
     match name {
         "text-decoration-line" => Some("none"),
         "text-decoration-style" => Some("solid"),
+        "text-decoration-thickness" | "text-underline-offset" => Some("auto"),
         "text-decoration-color" => Some("currentcolor"),
         "-webkit-text-fill-color" | "-webkit-text-stroke-color" => Some("currentcolor"),
         "-webkit-text-stroke-width" => Some("0px"),
@@ -12028,12 +12033,14 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             .collect();
     }
     if prop == "text-decoration" {
-        // CSS Text Decoration 3 #text-decoration-property: unordered line,
-        // style and color; every omitted component resets to its initial value.
+        // CSS Text Decoration 4 #text-decoration-property: unordered line,
+        // thickness, style and color; every omitted component resets to its
+        // initial value.
         let names = [
             "text-decoration-line",
             "text-decoration-style",
             "text-decoration-color",
+            "text-decoration-thickness",
         ];
         if wide_keyword(value).is_some() {
             return names
@@ -12042,10 +12049,11 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .collect();
         }
         let mut lines = Vec::new();
-        let (mut style, mut color) = (None, None);
+        let (mut style, mut color, mut thickness) = (None, None, None);
         for token in split_top_level_ws(value) {
             let lower = token.to_ascii_lowercase();
             match lower.as_str() {
+                "auto" | "from-font" if thickness.is_none() => thickness = Some(lower),
                 "none" | "underline" | "overline" | "line-through" | "blink" => {
                     if lines.contains(&lower)
                         || (!lines.is_empty() && lower == "none")
@@ -12064,10 +12072,13 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 {
                     color = Some(token.to_string());
                 }
+                _ if thickness.is_none() && decoration_length(token) => {
+                    thickness = Some(token.to_string());
+                }
                 _ => return Vec::new(),
             }
         }
-        if lines.is_empty() && style.is_none() && color.is_none() {
+        if lines.is_empty() && style.is_none() && color.is_none() && thickness.is_none() {
             return Vec::new();
         }
         return vec![
@@ -12084,6 +12095,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 names[2].into(),
                 color.unwrap_or_else(|| "currentcolor".into()),
             ),
+            (names[3].into(), thickness.unwrap_or_else(|| "auto".into())),
         ];
     }
     if prop == "-webkit-text-stroke" {
@@ -15167,6 +15179,18 @@ fn parse_sheet(
     }
 }
 
+/// A `<length-percentage>` component of a text-decoration shorthand (its
+/// thickness). Keywords and colors are matched before this is consulted.
+fn decoration_length(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    ["calc(", "min(", "max(", "clamp("]
+        .iter()
+        .any(|function| lower.starts_with(function))
+        || lower
+            .trim_start_matches(['+', '-'])
+            .starts_with(|c: char| c.is_ascii_digit() || c == '.')
+}
+
 /// Where an at-rule's prelude ends: its first `;` or `{` outside quoted
 /// strings and parenthesized blocks (CSS Syntax 3 #consume-at-rule). A Google
 /// Fonts `@import url('...ital@0;1...')` must not end at the quoted `;`.
@@ -18088,6 +18112,47 @@ mod tests {
         assert!(dom.serialize(DOCUMENT).contains("payload"));
         dom.set_attr(m, "class", "menu");
         assert!(!dom.serialize(DOCUMENT).contains("payload"));
+    }
+
+    #[test]
+    fn text_decoration_shorthand_accepts_a_thickness() {
+        // CSS Text Decoration 4 #text-decoration-property: line || thickness
+        // || style || color, each omitted part reset to its initial value.
+        let mut dom = Dom::parse_document(
+            "<style>#a{text-decoration:solid underline #a7521e 3px;text-underline-offset:2px}\
+             #b{text-decoration-thickness:4px;text-decoration:underline}\
+             #c{text-decoration:underline 10% wavy}</style>\
+             <p id=a>a</p><p id=b>b</p><p id=c>c</p>",
+        );
+        let value = |dom: &mut Dom, id: &str, name: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.computed_value(node, name)
+        };
+        assert_eq!(
+            value(&mut dom, "a", "text-decoration-thickness").as_deref(),
+            Some("3px")
+        );
+        assert_eq!(
+            value(&mut dom, "a", "text-decoration-line").as_deref(),
+            Some("underline")
+        );
+        assert_eq!(
+            value(&mut dom, "a", "text-underline-offset").as_deref(),
+            Some("2px")
+        );
+        assert_eq!(
+            value(&mut dom, "b", "text-decoration-thickness").as_deref(),
+            Some("auto"),
+            "the shorthand resets an omitted thickness"
+        );
+        assert_eq!(
+            value(&mut dom, "c", "text-decoration-thickness").as_deref(),
+            Some("10%")
+        );
+        assert_eq!(
+            value(&mut dom, "c", "text-decoration-style").as_deref(),
+            Some("wavy")
+        );
     }
 
     #[test]

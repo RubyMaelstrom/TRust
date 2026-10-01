@@ -81,6 +81,8 @@ impl TerminalInputView {
             decoration: TextDecorationPaint {
                 color,
                 style: crate::render::DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
             },
             shadows: Vec::new(),
             clip: Some(self.clip),

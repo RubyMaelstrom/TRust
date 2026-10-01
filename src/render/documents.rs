@@ -299,6 +299,8 @@ pub fn paint_doc_selected(
                 decoration: TextDecorationPaint {
                     color,
                     style: DecorationStyle::Solid,
+                    thickness: None,
+                    underline_offset: None,
                 },
                 shadows: Vec::new(),
                 clip: None,

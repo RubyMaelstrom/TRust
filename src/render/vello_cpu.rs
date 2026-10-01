@@ -421,12 +421,7 @@ impl VelloCpuRenderer {
                             shaped,
                             None,
                         );
-                        paint_decorations(
-                            &mut self.context,
-                            shadow_origin,
-                            shaped,
-                            decoration.style,
-                        );
+                        paint_decorations(&mut self.context, shadow_origin, shaped, decoration);
                         if blurred.is_some() {
                             self.context.pop_layer();
                         }
@@ -440,7 +435,7 @@ impl VelloCpuRenderer {
                         Some(*color),
                     );
                     self.context.set_paint(vello_color(decoration.color));
-                    paint_decorations(&mut self.context, *origin, shaped, decoration.style);
+                    paint_decorations(&mut self.context, *origin, shaped, decoration);
                     if clip.is_some() {
                         self.context.pop_clip_path();
                     }
@@ -784,10 +779,32 @@ fn paint_decorations(
     context: &mut RenderContext,
     origin: crate::core::CssPoint,
     shaped: &crate::text::ShapedText,
-    style: DecorationStyle,
+    decoration: &super::TextDecorationPaint,
 ) {
-    let thickness = (shaped.line_height / 18.0).max(1.0);
-    let paint_line = |context: &mut RenderContext, y: f32| {
+    for (stroke, path) in decoration_strokes(origin, shaped, decoration) {
+        context.set_stroke(stroke);
+        context.stroke_path(&path);
+    }
+}
+
+/// The strokes of a glyph run's underline and line-through (CSS Text
+/// Decoration 4): an authored `text-decoration-thickness`, else one
+/// eighteenth of the line height; an underline sits `text-underline-offset`
+/// below the alphabetic baseline (by default, one thickness). `wavy` is a
+/// smooth wave of period six thicknesses.
+pub(super) fn decoration_strokes(
+    origin: CssPoint,
+    shaped: &crate::text::ShapedText,
+    decoration: &super::TextDecorationPaint,
+) -> Vec<(Stroke, BezPath)> {
+    let style = decoration.style;
+    let thickness = decoration
+        .thickness
+        .filter(|thickness| *thickness > 0.0)
+        .unwrap_or((shaped.line_height / 18.0).max(1.0));
+    let (left, right) = (f64::from(origin.x), f64::from(origin.x + shaped.advance));
+    let mut strokes = Vec::new();
+    let mut line = |y: f32| {
         let mut stroke = Stroke::new(f64::from(thickness));
         match style {
             DecorationStyle::Dotted => {
@@ -803,27 +820,46 @@ fn paint_decorations(
             }
             _ => {}
         }
-        context.set_stroke(stroke);
+        let y = f64::from(y);
         let mut path = BezPath::new();
-        path.move_to((f64::from(origin.x), f64::from(y)));
-        path.line_to((f64::from(origin.x + shaped.advance), f64::from(y)));
-        context.stroke_path(&path);
+        if style == DecorationStyle::Wavy {
+            let amplitude = f64::from(thickness.max(1.0));
+            let half = f64::from((thickness * 3.0).max(3.0));
+            path.move_to((left, y));
+            let mut x = left;
+            let mut up = true;
+            while x < right {
+                let end = (x + half).min(right);
+                let peak = if up {
+                    y - amplitude * 2.0
+                } else {
+                    y + amplitude * 2.0
+                };
+                path.quad_to(((x + end) / 2.0, peak), (end, y));
+                x = end;
+                up = !up;
+            }
+        } else {
+            path.move_to((left, y));
+            path.line_to((right, y));
+        }
+        strokes.push((stroke.clone(), path));
         if style == DecorationStyle::Double {
+            let second_y = y + f64::from(thickness * 2.0);
             let mut second = BezPath::new();
-            second.move_to((f64::from(origin.x), f64::from(y + thickness * 2.0)));
-            second.line_to((
-                f64::from(origin.x + shaped.advance),
-                f64::from(y + thickness * 2.0),
-            ));
-            context.stroke_path(&second);
+            second.move_to((left, second_y));
+            second.line_to((right, second_y));
+            strokes.push((stroke, second));
         }
     };
     if shaped.underline {
-        paint_line(context, origin.y + shaped.baseline + thickness);
+        let offset = decoration.underline_offset.unwrap_or(thickness / 2.0);
+        line(origin.y + shaped.baseline + offset + thickness / 2.0);
     }
     if shaped.strikethrough {
-        paint_line(context, origin.y + shaped.baseline - shaped.ascent * 0.32);
+        line(origin.y + shaped.baseline - shaped.ascent * 0.32);
     }
+    strokes
 }
 
 pub(super) fn vello_stops(stops: &[super::GradientStop]) -> Vec<ColorStop> {
@@ -1646,6 +1682,49 @@ mod tests {
     }
 
     #[test]
+    fn decoration_strokes_follow_thickness_offset_and_style() {
+        use vello_cpu::kurbo::Shape;
+        let style = crate::text::TextStyle {
+            size: 20.0,
+            ..Default::default()
+        };
+        let mut shaped = crate::text::shape("underlined", &style);
+        shaped.underline = true;
+        let origin = CssPoint::new(10.0, 50.0);
+        let decoration = |style, thickness, underline_offset| crate::render::TextDecorationPaint {
+            color: PaintColor::Rgba(0, 0, 0, 255),
+            style,
+            thickness,
+            underline_offset,
+        };
+        // CSS Text Decoration 4: `text-underline-offset` moves the line's
+        // top edge from the alphabetic baseline; the thickness is the width.
+        let strokes = decoration_strokes(
+            origin,
+            &shaped,
+            &decoration(DecorationStyle::Solid, Some(3.0), Some(2.0)),
+        );
+        assert_eq!(strokes.len(), 1);
+        assert_eq!(strokes[0].0.width, 3.0);
+        let bounds = strokes[0].1.bounding_box();
+        let center = f64::from(origin.y + shaped.baseline) + 2.0 + 1.5;
+        assert!((bounds.y0 - center).abs() < 0.01 && (bounds.y1 - center).abs() < 0.01);
+        // A wavy line oscillates around that center; double draws two lines.
+        let wavy = decoration_strokes(
+            origin,
+            &shaped,
+            &decoration(DecorationStyle::Wavy, Some(1.0), Some(0.0)),
+        );
+        assert!(wavy[0].1.bounding_box().height() > 1.0);
+        let double = decoration_strokes(
+            origin,
+            &shaped,
+            &decoration(DecorationStyle::Double, None, None),
+        );
+        assert_eq!(double.len(), 2);
+    }
+
+    #[test]
     fn cpu_raster_paints_retained_text_shadow_ink() {
         let snapshot = BrowserSnapshot {
             address: String::new(),
@@ -1672,6 +1751,8 @@ mod tests {
             decoration: crate::render::TextDecorationPaint {
                 color: PaintColor::Rgba(0, 0, 0, 255),
                 style: DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
             },
             shadows: Vec::new(),
             clip: None,

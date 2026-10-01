@@ -131,6 +131,8 @@ fn append_button(commands: &mut Vec<Primitive>, hit: &HitRegion, anchor: CssRect
         decoration: TextDecorationPaint {
             color: PaintColor::Rgba(255, 255, 255, 255),
             style: DecorationStyle::Solid,
+            thickness: None,
+            underline_offset: None,
         },
         shadows: Vec::new(),
         clip: None,

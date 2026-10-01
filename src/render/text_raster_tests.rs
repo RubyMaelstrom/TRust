@@ -66,6 +66,8 @@ fn glyph_scene(scale: f64) -> Scene {
             decoration: TextDecorationPaint {
                 color: PaintColor::Rgba(0, 0, 0, 255),
                 style: DecorationStyle::Solid,
+                thickness: None,
+                underline_offset: None,
             },
             shadows: Vec::new(),
             clip: None,
