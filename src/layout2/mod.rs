@@ -3722,6 +3722,55 @@ mod tests {
     }
 
     #[test]
+    fn quirks_percentage_heights_skip_auto_height_blocks() {
+        // Quirks Mode #the-percentage-height-calculation-quirk: auto-height
+        // block containers are skipped up to the body, which (with the root)
+        // fills the 600px viewport less its 8px margins; a definite ancestor
+        // or a flex container ends the walk. Standards mode keeps `auto`.
+        let body = r#"<body><div id=half style="height:50%"></div>
+            <div style="border:2px solid"><div id=nested style="height:25%"></div></div>
+            <div style="height:200px"><div style="padding:4px"><div id=definite style="height:50%"></div></div></div>
+            <div style="display:flex"><div id=flex style="height:30%"></div></div></body>"#;
+        for (doctype, half, nested, definite) in [
+            ("", 292.0, 146.0, 100.0),
+            ("<!DOCTYPE html>", 0.0, 0.0, 0.0),
+        ] {
+            let html = format!("{doctype}{body}");
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+            assert!(
+                (height("half") - half).abs() < 0.01,
+                "{doctype}: {}",
+                height("half")
+            );
+            assert!(
+                (height("nested") - nested).abs() < 0.01,
+                "{doctype}: {}",
+                height("nested")
+            );
+            assert!(
+                (height("definite") - definite).abs() < 0.01,
+                "{}",
+                height("definite")
+            );
+            assert!(height("flex").abs() < 0.01, "{}", height("flex"));
+        }
+        // The html/body fill quirks size only that basis (as in Gecko): the
+        // boxes themselves keep their content height.
+        let html = r#"<body style="margin:10px"><p style="margin:0;height:20px">x</p></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let root = dom.document_element().unwrap();
+        let body = dom
+            .child_iter(root)
+            .find(|&child| dom.tag_name(child) == Some("body"))
+            .unwrap();
+        assert!((layout.boxes[&body].height - 20.0).abs() < 0.01);
+        assert!((layout.boxes[&root].height - 40.0).abs() < 0.01);
+    }
+
+    #[test]
     fn grid_items_and_rows_honor_min_heights() {
         // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
         // §12.1/§11.8: an auto row stretches into the container's definite
@@ -5031,8 +5080,9 @@ mod tests {
         // CSS Sizing 3 §§3.2.1 and 5.1: the percentage cannot resolve against
         // this content-sized containing block, so it behaves as auto; an
         // iframe has no natural dimensions and uses the 300x150 fallback.
+        // (A quirks document would resolve it against the viewport.)
         let mut dom = Dom::parse_document(
-            r#"<body style="margin:0"><div style="width:200px">
+            r#"<!DOCTYPE html><body style="margin:0"><div style="width:200px">
                <iframe id=f style="width:100%;height:100%;overflow:scroll"></iframe>
                </div></body>"#,
         );
