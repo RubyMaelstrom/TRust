@@ -175,7 +175,7 @@ impl Flow<'_> {
                     None,
                     &atom_sizes,
                 );
-                ifc.mark_measuring();
+                ifc.mark_measuring(mode == IMode::Min);
                 ifc.run(inls, &here);
                 let (lines, _, _, _, _) = ifc.finish();
                 let inline_w = lines.iter().map(|l| l.width).fold(0.0, f32::max);
