@@ -56,6 +56,7 @@ def parse_args(argv):
     parser.add_argument("--freq", type=int, default=4000, help="samples per second (default 4000)")
     parser.add_argument("--depth", type=int, default=24, help="call-chain frames kept (default 24)")
     parser.add_argument("--jitmap", action="store_true", help="attribute Lumen JIT code by op")
+    parser.add_argument("--thread", help="report only samples from threads whose name contains this")
     args = parser.parse_args(argv[:split])
     args.command = argv[split + 1:]
     if not args.command:
@@ -63,26 +64,30 @@ def parse_args(argv):
     return args
 
 
-def open_event(pid, freq, depth):
+def open_event(pid, cpu, freq, depth):
     syscall = NR_PERF_EVENT_OPEN.get(os.uname().machine)
     if syscall is None:
         raise SystemExit(f"unsupported machine {os.uname().machine}")
     attr = bytearray(128)
-    # disabled | exclude_kernel | exclude_hv | freq | enable_on_exec | exclude_callchain_kernel
-    flags = (1 << 0) | (1 << 5) | (1 << 6) | (1 << 10) | (1 << 12) | (1 << 21)
+    # disabled | inherit | exclude_kernel | exclude_hv | freq | enable_on_exec |
+    # exclude_callchain_kernel. Threads the command spawns inherit the event; the kernel only
+    # allows mapping an inherited task event per CPU, so `run` opens one per CPU.
+    flags = (1 << 0) | (1 << 1) | (1 << 5) | (1 << 6) | (1 << 10) | (1 << 12) | (1 << 21)
     struct.pack_into("<IIQQQQQ", attr, 0, PERF_TYPE_SOFTWARE, 128, PERF_COUNT_SW_TASK_CLOCK,
                      freq, SAMPLE_IP | SAMPLE_TID | SAMPLE_CALLCHAIN, 0, flags)
     struct.pack_into("<H", attr, 108, depth + 2)  # sample_max_stack
     libc = ctypes.CDLL(None, use_errno=True)
     buf = ctypes.create_string_buffer(bytes(attr), 128)
-    fd = libc.syscall(syscall, buf, pid, -1, -1, 0)
+    fd = libc.syscall(syscall, buf, pid, cpu, -1, 0)
     if fd < 0:
         raise OSError(ctypes.get_errno(), "perf_event_open failed (check kernel.perf_event_paranoid)")
     return fd
 
 
 class Ring:
-    PAGES = 1 + 512
+    # One ring per CPU: 64 data pages each keeps all of them inside the default
+    # kernel.perf_event_mlock_kb allowance; the loop drains them every few milliseconds.
+    PAGES = 1 + 64
 
     def __init__(self, fd):
         self.page = mmap.PAGESIZE
@@ -100,8 +105,8 @@ class Ring:
             kind, _misc, size = struct.unpack("<IHH", header)
             if kind == PERF_RECORD_SAMPLE:
                 record = self._read(data, off, size)
-                ip, _pid, _tid, count = struct.unpack_from("<QIIQ", record, 8)
-                samples.append((ip, struct.unpack_from(f"<{count}Q", record, 32)))
+                ip, _pid, tid, count = struct.unpack_from("<QIIQ", record, 8)
+                samples.append((ip, tid, struct.unpack_from(f"<{count}Q", record, 32)))
             tail += size
         struct.pack_into("<Q", self.map, 1032, tail)
 
@@ -122,14 +127,16 @@ def run(args):
         os.kill(os.getpid(), signal.SIGSTOP)
         os.execvp(args.command[0], args.command)
     os.waitpid(pid, os.WUNTRACED)
+    rings = []
     try:
-        fd = open_event(pid, args.freq, args.depth)
+        for cpu in sorted(os.sched_getaffinity(0)):
+            rings.append(Ring(open_event(pid, cpu, args.freq, args.depth)))
     except OSError:
         os.kill(pid, signal.SIGKILL)
         raise
-    ring = Ring(fd)
     os.kill(pid, signal.SIGCONT)
     samples, maps_text, exe, last = [], "", None, 0.0
+    threads = {}
     while True:
         done, _status = os.waitpid(pid, os.WNOHANG)
         now = time.time()
@@ -139,15 +146,20 @@ def run(args):
                 with open(f"/proc/{pid}/maps") as f:
                     maps_text = f.read() or maps_text
                 exe = os.readlink(f"/proc/{pid}/exe")
+                for tid in os.listdir(f"/proc/{pid}/task"):
+                    with open(f"/proc/{pid}/task/{tid}/comm") as f:
+                        threads[int(tid)] = f.read().strip()
             except OSError:
                 pass
             last = now
-        ring.drain(samples)
+        for ring in rings:
+            ring.drain(samples)
         if done:
             break
         time.sleep(0.005)
-    ring.drain(samples)
-    return samples, maps_text, exe, jitmap_path
+    for ring in rings:
+        ring.drain(samples)
+    return samples, threads, maps_text, exe, jitmap_path
 
 
 class Symbolizer:
@@ -275,6 +287,19 @@ def simplify(name):
 # Approximate rollup by function name; the first matching rule wins.
 CATEGORIES = [
     ("jit code", r"^\[jit"),
+    ("js parse/compile", r"lumen::parser|lumen::lexer|bytecode::compile|Compiler|scope_analysis|lumen::ast"
+                         r"|^parser::|^lexer::"),
+    ("html parse", r"html5ever|markup5ever|tokenizer::|tree_builder"),
+    ("style/selectors", r"rule_index|computed_cache|prop_index|cascade|Cascade|selector|Selector"
+                        r"|matches_compound|match_complex|style_cache|dom::properties|StyleRecord"
+                        r"|invalidat|computed_value"),
+    ("layout/text", r"trust::layout2|lay_out|Fragment|skrifa|swash|harfrust|shaping|parley|fontique"
+                    r"|glyph|trust::text"),
+    ("paint/raster", r"paint|vello|raster|trust::render"),
+    ("dom/host", r"trust::dom|Dom>::|NodeCache|lumen_backend|trust::js::|host_dom|js_host"),
+    ("net/tls/crypto", r"rustls|ring::|aws_lc|h2::|quinn|hyper|tokio|openssl|sha2|aes|chacha|flate"
+                       r"|brotli|zstd|trust::http"),
+    ("images", r"image::|png::|jpeg|webp|zune|gif::|trust::img"),
     ("jit->rust helper bridge", r"^bytecode::jit_|^bytecode::native_deopt|jit_call_hit|jit_exec"),
     ("calls/frames", r"call_jit|call_native|call_dispatch|call_user|call_inner|call_prepared|run_moved"
                      r"|JitFrame|callback::|resolve_cached_call|call_tail|with_values|Interp>::call\b"
@@ -290,9 +315,12 @@ CATEGORIES = [
 ]
 
 
-def report(args, samples, sym):
+def report(args, samples, threads, sym):
+    by_thread = collections.Counter(threads.get(tid, str(tid)) for _ip, tid, _chain in samples)
+    if args.thread:
+        samples = [s for s in samples if args.thread in threads.get(s[1], str(s[1]))]
     decoded = []
-    for ip, chain in samples:
+    for ip, _tid, chain in samples:
         frames = [ip] + [a for a in chain if a < PERF_CONTEXT_MAX]
         if len(frames) > 1 and frames[1] == ip:  # the chain repeats the sampled ip
             frames.pop(1)
@@ -315,7 +343,12 @@ def report(args, samples, sym):
         label = next((label for label, pat in CATEGORIES if re.search(pat, name)), "other")
         categories[label] += count
     with open(args.out, "w") as f:
-        f.write(f"samples {len(decoded)} ({args.freq} Hz) exe {sym.exe}\n\n== self ==\n")
+        total = sum(by_thread.values())
+        f.write(f"samples {len(decoded)} of {total} ({args.freq} Hz) exe {sym.exe}"
+                f"{f' threads *{args.thread}*' if args.thread else ''}\n\n== threads ==\n")
+        for k, v in by_thread.most_common(20):
+            f.write(f"{100 * v / max(total, 1):6.2f}% {k}\n")
+        f.write("\n== self ==\n")
         for k, v in self_c.most_common(60):
             f.write(f"{100 * v / n:6.2f}% {k}\n")
         f.write("\n== inclusive ==\n")
@@ -359,9 +392,9 @@ def report(args, samples, sym):
 
 def main():
     args = parse_args(sys.argv[1:])
-    samples, maps_text, exe, jitmap_path = run(args)
+    samples, threads, maps_text, exe, jitmap_path = run(args)
     sym = Symbolizer(maps_text, exe, jitmap_path if args.jitmap else None)
-    report(args, samples, sym)
+    report(args, samples, threads, sym)
 
 
 if __name__ == "__main__":
