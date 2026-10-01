@@ -92,6 +92,8 @@ allocations are released when the engine and its active calls are dropped.
 Compilation counters persist across host/JavaScript calls. The bounded cache
 recycles cold counters so one-shot startup code cannot exclude later hot functions;
 compiled regions and checked fallbacks retain their cache entries.
+`TRUST_WASM_TRACE=1` logs page WebAssembly imports and exported calls (the first 64,
+then every 1,000th) as `wasm:` lines on stderr.
 
 The deterministic `src/fixtures/wasm_native_benchmark.html` fixture reports
 execution time and checks its result. Compare both modes without competing
@@ -220,7 +222,7 @@ The terminal browser accepts `trust [URL-or-host] [port]`. Press Ctrl+] and type
 
 | Input | Meaning | Default |
 |---|---|---:|
-| `URL` | Required initial navigation | — |
+| `URL` or `FILE` | Required initial navigation; a local path loads as a `file://` page | — |
 | `--width N` | CSS viewport width in CSS pixels | `1024` |
 | `--height N` | CSS viewport height in CSS pixels | `768` |
 | `--timeout SECS` | Hard wall-clock limit for navigation/settling | `10` |
@@ -230,6 +232,9 @@ The terminal browser accepts `trust [URL-or-host] [port]`. Press Ctrl+] and type
 | `--links` | Include link targets in text output | off |
 | `--js-diagnostics` | Print the last page-script outcome to stderr: JS errors, captured console lines, panic flag, skipped modules, and page fetch count (`[js-errors]`/`[js-console]`/`[js-outcome]` blocks) | off |
 | `-h`, `--help` | Print usage | — |
+
+`TRUST_HEADLESS_PNG=PATH` also writes the final display list as a PNG, using only
+images already inline in it (no additional fetches).
 
 #### How `trust-headless` decides it is finished
 
@@ -398,6 +403,15 @@ It lives under `target/release/examples/` and is not part of the distributed bro
 
 Both binaries support `-h`/`--help`.
 
+`trust-browser-replay` runs with no network and virtual time, and prints a JSON report
+(per-sample timings, errors, console, fetch counts, SHA-256 of inputs and output). A
+fixture passes when it sets `data-replay-state="complete"` and matching nonempty
+`data-replay-checksum`/`data-replay-expected` attributes without a JavaScript error
+or panic; any failure exits nonzero. `--external` names must equal a script's `src`
+attribute exactly, and only parser-inserted classic scripts are served: module
+scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. Lumen's
+`benchmarks/browser-replays/` holds the current fixtures and their run command.
+
 ## Live runtime diagnostics
 
 ### Cross-frontend and terminal diagnostics
@@ -415,6 +429,7 @@ Both binaries support `-h`/`--help`.
 | `TRUST_FRAG_DIAG` | presence flag | Dumps the resolved graphical fragment tree (tag, position, size, and clip). Used with `layout_dump` for layout/paint discrepancies. |
 | `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
 | `TRUST_UA_FIREFOX` | affirmative value (`1`, `true`, `yes`, `on`) | Replaces TRust's `TRust/0.1` User-Agent with Firefox's current one (`Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0`) for diagnostics. Selection happens once per process, so the header on every HTTP/1.1, HTTP/2 and HTTP/3 request, fetch/XHR, WebSocket handshake and download matches `navigator.userAgent` in the page, every frame and every worker; HTML's `navigator.appVersion` then derives as `5.0 (X11)`. Prints one stderr line naming the active string. Nothing else about the request changes: `Accept`, `Accept-Language`, Fetch Metadata `Sec-*` and `Sec-GPC` keep TRust's own values. Unset, empty or `0` keeps TRust's User-Agent. |
+| `TRUST_WEBGL_TRACE` | presence flag | Prints why a page's WebGL context could not be created. |
 | `TRUST_TRACE_PAGE_EVENTS` | presence flag | Prints a `[trace-event] <variant>` line to stderr for every page event the shared controller handles (`Updated`, `Static`, `Patched`, `Trouble`, navigation/settle events). Useful for proving which render path a page reached and in what order. |
 
 #### A/B-testing a site's User-Agent gate
@@ -802,6 +817,21 @@ Fetches a WPT testharness page, injects a completion callback, and reports each
 subtest's PASS/FAIL/TIMEOUT/NOTRUN status. It accepts `TRUST_NET_DIAG`,
 `TRUST_DIAG_VP` (default `200x50`), and `TRUST_NET_DIAG_OUT`.
 
+### Captured-document diagnostics
+
+These ignored `--lib` tests read saved files and use no network.
+
+| Test | Inputs | Output |
+|---|---|---|
+| `captured_classic_script_error_diagnostic` | `TRUST_CAPTURE_SCRIPT_DOCUMENT`: saved HTML | Runs each inline classic script in a fresh engine (external scripts are skipped) and prints its completion, error and stack. |
+| `captured_page_computed_style_diagnostic` | `TRUST_CAPTURE_DIR` containing `reference-dom.html` and `reference-raw-css.json` | Prints boxes and computed styles for selected nodes. Hard-coded to an openai.com capture. |
+| `captured_vega_svg_resource_diagnostic` | `TRUST_CAPTURE_DOM` (HTML) and `TRUST_CAPTURE_DIR` (output) | Writes each Vega chart's SVG resource and decoded PNG. Hard-coded to an openai.com capture. |
+
+```sh
+TRUST_CAPTURE_SCRIPT_DOCUMENT=/tmp/page.html \
+  cargo test --release --lib captured_classic_script_error_diagnostic -- --ignored --nocapture
+```
+
 ## Desktop and layout benchmarks
 
 | Input | Value | Effect and default |
@@ -965,6 +995,11 @@ TRUST_TTY_CAPTURE=/tmp/session.out \
 | `TRUST_TTY_CAPTURE` | `script(1)` capture path | Required terminal byte stream. |
 | `TRUST_TTY_TIMING` | `script(1)` timing-log path | Required timing data; only `O` output records are replayed. |
 | `TRUST_TTY_SIZE` | `COLUMNSxROWS` | Parser viewport. Default: `130x20`. |
+
+The ordinary `terminal_input_raster_preview` test accepts
+`TRUST_TERMINAL_INPUT_SNAPSHOT=PREFIX` to save `PREFIX-<scale>.png` renders of the
+input field, and `TRUST_TERMINAL_INPUT_HYBRID=1` to also compare them with a
+headless Hybrid GPU render (saved as `PREFIX-hybrid-<scale>.png`).
 
 ## TLS and client-identity inputs
 
