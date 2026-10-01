@@ -1261,17 +1261,25 @@ fn size_tracks_constrained(
     }
 
     // §11.8 stretch auto tracks.
-    if stretch && let Some(av) = track_avail {
-        let free = av - tracks.iter().map(|t| t.base).sum::<f32>();
-        if free > 0.0 {
-            let autos: Vec<usize> = (0..tracks.len())
-                .filter(|&i| !tracks[i].collapsed && matches!(tracks[i].size.max, TrackFn::Auto))
-                .collect();
-            if !autos.is_empty() {
-                let share = free / autos.len() as f32;
-                for i in autos {
-                    tracks[i].base += share;
-                }
+    if stretch && let Some(av) = avail {
+        stretch_auto_tracks(tracks, av, gap);
+    }
+}
+
+/// §11.8 Stretch auto Tracks: share the free space left in `avail` (this
+/// axis' content size, gutters included) equally among `auto`-max tracks.
+fn stretch_auto_tracks(tracks: &mut [Track], avail: f32, gap: f32) {
+    let n_live = tracks.iter().filter(|t| !t.collapsed).count();
+    let used = tracks.iter().map(|t| t.base).sum::<f32>() + gap * n_live.saturating_sub(1) as f32;
+    let free = avail - used;
+    if free > 0.0 {
+        let autos: Vec<usize> = (0..tracks.len())
+            .filter(|&i| !tracks[i].collapsed && matches!(tracks[i].size.max, TrackFn::Auto))
+            .collect();
+        if !autos.is_empty() {
+            let share = free / autos.len() as f32;
+            for i in autos {
+                tracks[i].base += share;
             }
         }
     }
@@ -1943,6 +1951,7 @@ impl Flow<'_> {
         content_top: f32,
         content_w: f32,
         def_ch: Option<f32>,
+        min_ch: f32,
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
     ) -> (Vec<Frag>, f32) {
@@ -2010,6 +2019,8 @@ impl Flow<'_> {
             area_w: f32,
             /// The item's cross (height) property is auto — stretch applies.
             cross_auto: bool,
+            /// Content-box min-/max-height clamps for a stretched height.
+            clamp_h: (f32, f32),
             subgrid: Option<RowInput>,
             row_contributions: Option<Vec<Contrib>>,
         }
@@ -2081,7 +2092,27 @@ impl Flow<'_> {
             } else {
                 s.height.resolve(def_ch).map(|v| v.max(0.0))
             };
-            let (frag, anc) = self.item_frag(it, w.max(0.0), area_w, def_h, inl);
+            // CSS 2.2 §10.7: min-height/max-height clamp the item's used
+            // height whether it is auto or definite (percentages of the not
+            // yet sized grid area stay unresolved here).
+            let item_bt = s.border[TOP] + self.pad(s, TOP, area_w);
+            let item_bb = s.border[BOTTOM] + self.pad(s, BOTTOM, area_w);
+            let min_h = self
+                .height_px(&s.min_height, s, item_bt, item_bb, None)
+                .unwrap_or(0.0);
+            let max_h = self
+                .height_px(&s.max_height, s, item_bt, item_bb, None)
+                .unwrap_or(f32::INFINITY)
+                .max(min_h);
+            let def_h = def_h.map(|h| h.clamp(min_h, max_h));
+            let (mut frag, mut anc) = self.item_frag(it, w.max(0.0), area_w, def_h, inl);
+            if def_h.is_none() && subgrid.is_none() {
+                let content_h = (frag.h - bp_cross).max(0.0);
+                let clamped = content_h.clamp(min_h, max_h);
+                if (clamped - content_h).abs() > 0.01 {
+                    (frag, anc) = self.item_frag(it, w.max(0.0), area_w, Some(clamped), inl);
+                }
+            }
             let row_contributions = if subgrid.is_some() {
                 let mut state = self.subgrid_rows.borrow_mut();
                 state.inputs.remove(&it.node);
@@ -2121,6 +2152,7 @@ impl Flow<'_> {
                 content_w: w.max(0.0),
                 bp_cross,
                 cross_auto: subgrid.is_some() || matches!(s.height, Len::Auto),
+                clamp_h: (min_h, max_h),
                 area_w,
                 frag,
                 anchors: anc,
@@ -2244,6 +2276,11 @@ impl Flow<'_> {
                 gap_row,
                 dist_stretches(ac.as_deref()),
             );
+            // §12.1: with an indefinite height, a definite min-height still
+            // supplies the free space auto rows stretch into.
+            if def_ch.is_none() && min_ch > 0.0 && dist_stretches(ac.as_deref()) {
+                stretch_auto_tracks(&mut rows, min_ch, gap_row);
+            }
             positions(
                 &rows,
                 gap_row,
@@ -2287,7 +2324,9 @@ impl Flow<'_> {
                 // the stretched containing block; patching only `frag.h`
                 // leaves their backgrounds and hit regions at the old
                 // intrinsic height.
-                let stretched = (area_h - g.m[TOP] - g.m[BOTTOM] - g.bp_cross).max(0.0);
+                let stretched = (area_h - g.m[TOP] - g.m[BOTTOM] - g.bp_cross)
+                    .max(0.0)
+                    .clamp(g.clamp_h.0, g.clamp_h.1);
                 if let Some(input) = &g.subgrid {
                     let mut input = input.clone();
                     input.tracks = rows[p.rows.clone()].to_vec();

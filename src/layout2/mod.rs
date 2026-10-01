@@ -3707,6 +3707,31 @@ mod tests {
     }
 
     #[test]
+    fn grid_items_and_rows_honor_min_heights() {
+        // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
+        // §12.1/§11.8: an auto row stretches into the container's definite
+        // min-height (border-box 400px minus 110px of padding).
+        let html = r#"<style>*{box-sizing:border-box;margin:0}
+            .hero{min-height:400px;display:grid;grid-template-columns:1fr 1fr;align-items:center;padding:50px 0 60px;width:800px}
+            #copy{height:100px}#box{min-height:220px;display:flex}#box div{height:80px}</style>
+            <section class=hero><div id=copy></div><div id=box><div></div></div></section>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!(
+            (rect("box").height - 220.0).abs() < 0.01,
+            "{:?}",
+            rect("box")
+        );
+        assert!((rect("box").top - 85.0).abs() < 0.01, "{:?}", rect("box"));
+        assert!(
+            (rect("copy").top - 145.0).abs() < 0.01,
+            "{:?}",
+            rect("copy")
+        );
+    }
+
+    #[test]
     fn shrink_to_fit_text_stays_on_the_line_it_was_measured_on() {
         // A max-content box must hold its own text on one line: the wrap
         // decision compares end positions, so the different summation order
