@@ -136,7 +136,7 @@ def run(args):
         raise
     os.kill(pid, signal.SIGCONT)
     samples, maps_text, exe, last = [], "", None, 0.0
-    threads = {}
+    threads, snapshots = {}, []
     while True:
         done, _status = os.waitpid(pid, os.WNOHANG)
         now = time.time()
@@ -145,6 +145,8 @@ def run(args):
             try:
                 with open(f"/proc/{pid}/maps") as f:
                     maps_text = f.read() or maps_text
+                if not snapshots or snapshots[-1] != maps_text:
+                    snapshots.append(maps_text)
                 exe = os.readlink(f"/proc/{pid}/exe")
                 for tid in os.listdir(f"/proc/{pid}/task"):
                     with open(f"/proc/{pid}/task/{tid}/comm") as f:
@@ -159,26 +161,45 @@ def run(args):
         time.sleep(0.005)
     for ring in rings:
         ring.drain(samples)
-    return samples, threads, maps_text, exe, jitmap_path
+    return samples, threads, snapshots, exe, jitmap_path
 
 
 class Symbolizer:
-    def __init__(self, maps_text, exe, jitmap_path):
+    def __init__(self, snapshots, exe, jitmap_path):
         self.exe = exe
-        self.regions = []
-        for line in maps_text.splitlines():
-            parts = line.split()
-            if "x" not in parts[1]:
-                continue
-            start, end = (int(x, 16) for x in parts[0].split("-"))
-            path = parts[5] if len(parts) > 5 else ""
-            self.regions.append((start, end, path, int(parts[2], 16)))
+        self.regions = self._parse(snapshots[-1] if snapshots else "")
+        # JIT code can be mapped and released between snapshots; keep earlier anonymous
+        # executable regions that the final snapshot does not cover.
+        final = sorted(self.regions)
+        starts = [r[0] for r in final]
+        seen = set(final)
+        for text in snapshots[:-1]:
+            for region in self._parse(text):
+                if region[2] or region in seen:
+                    continue
+                i = bisect.bisect_right(starts, region[1] - 1) - 1
+                if i >= 0 and final[i][1] > region[0]:
+                    continue
+                seen.add(region)
+                self.regions.append(region)
         self.regions.sort()
         self.starts = [r[0] for r in self.regions]
         self.symbols = {}
         self.cache = {}
         self.jit = self._load_jitmap(jitmap_path)
         self.jit_starts = [r[0] for r in self.jit]
+
+    @staticmethod
+    def _parse(maps_text):
+        regions = []
+        for line in maps_text.splitlines():
+            parts = line.split()
+            if len(parts) < 5 or "x" not in parts[1]:
+                continue
+            start, end = (int(x, 16) for x in parts[0].split("-"))
+            path = parts[5] if len(parts) > 5 else ""
+            regions.append((start, end, path, int(parts[2], 16)))
+        return regions
 
     @staticmethod
     def _load_jitmap(path):
@@ -392,8 +413,8 @@ def report(args, samples, threads, sym):
 
 def main():
     args = parse_args(sys.argv[1:])
-    samples, threads, maps_text, exe, jitmap_path = run(args)
-    sym = Symbolizer(maps_text, exe, jitmap_path if args.jitmap else None)
+    samples, threads, snapshots, exe, jitmap_path = run(args)
+    sym = Symbolizer(snapshots, exe, jitmap_path if args.jitmap else None)
     report(args, samples, threads, sym)
 
 
