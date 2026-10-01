@@ -231,6 +231,7 @@ The terminal browser accepts `trust [URL-or-host] [port]`. Press Ctrl+] and type
 | `--format text\|semantic` | Display-list text or accessibility tree output | `text` |
 | `--links` | Include link targets in text output | off |
 | `--js-diagnostics` | Print the last page-script outcome to stderr: JS errors, captured console lines, panic flag, skipped modules, and page fetch count (`[js-errors]`/`[js-console]`/`[js-outcome]` blocks) | off |
+| `--site-data` | Load the saved profile's bookmarked-site cookies and storage (resolved through `XDG_DATA_HOME`) and write changes back to it. For profiling with a user's site permissions, point `XDG_DATA_HOME` at a copy of the profile. | off |
 | `-h`, `--help` | Print usage | — |
 
 `TRUST_HEADLESS_PNG=PATH` also writes the final display list as a PNG, using only
