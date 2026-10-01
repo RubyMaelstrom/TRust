@@ -839,7 +839,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // on one line (including very wide intrinsic-size probes).
             let style = ctx.text_style();
             let full = crate::text::shape(t, &style);
-            if super::css_px_fits(full.advance, available) {
+            if super::css_px_fits(
+                self.pen + self.pending_gap_px + full.advance,
+                self.line_right,
+            ) {
                 self.place_shaped(t, full, ctx, false, false);
                 return;
             }
@@ -896,6 +899,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 0.0
             };
             let avail = (self.line_right - self.pen - gap - space).max(0.0);
+            // Compare end positions, not the remaining width: the pen sums
+            // per-word advances in another order than the intrinsic probe
+            // that sized this line, so their rounding differs on the scale
+            // of the line, not of the word (letter-spaced text otherwise
+            // wrapped its last word inside its own max-content box).
+            let (line_end, line_right) = (self.pen + gap + space, self.line_right);
+            let fits = move |width: f32| super::css_px_fits(line_end + width, line_right);
             let full = crate::text::shape(rest, &ctx.text_style());
             // Parley line breaking is substantially more expensive than
             // retaining an already-shaped run. If the complete run fits,
@@ -911,7 +921,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             if break_style.wrap
                 && emergency_wrap
                 && may_wrap
-                && !super::css_px_fits(full.advance, avail)
+                && !fits(full.advance)
                 && self.pen > self.line_start
             {
                 // CSS Text 3 §5/§5.4: overflow wrapping adds an
@@ -936,10 +946,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // the preceding space still supplies an acceptable break.
                 if normal_cut == 0
                     || normal_cut == rest.len()
-                    || !super::css_px_fits(
-                        crate::text::shape(&rest[..normal_cut], &ctx.text_style()).advance,
-                        avail,
-                    )
+                    || !fits(crate::text::shape(&rest[..normal_cut], &ctx.text_style()).advance)
                 {
                     self.soft_break();
                     spaced = false;
@@ -961,7 +968,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 ) && rest
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '_'));
-            let cut = if super::css_px_fits(full.advance, avail) || plainly_unbreakable {
+            let cut = if fits(full.advance) || plainly_unbreakable {
                 rest.len()
             } else {
                 crate::text::first_line_end(rest, &ctx.text_style(), avail, break_style)
@@ -992,7 +999,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 continue;
             }
             if ctx.ws.wraps()
-                && !super::css_px_fits(full.advance, avail)
+                && !fits(full.advance)
                 && self.pen > self.line_start
                 && (may_wrap || cut == 0)
             {
