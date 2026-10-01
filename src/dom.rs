@@ -18152,7 +18152,7 @@ mod tests {
     fn quoted_semicolons_do_not_end_an_import_statement() {
         // CSS Syntax 3 #consume-at-rule: strings and parenthesized blocks are
         // component values of the prelude. Google Fonts URLs carry `;`.
-        let mut dom = Dom::parse_document(
+        let dom = Dom::parse_document(
             "<style>@import url('https://fonts.example/css2?family=A:ital@0;1&display=swap');\
              @import \"b;{.css\" screen;\
              @import url(c;d.css);\
