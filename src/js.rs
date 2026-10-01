@@ -769,6 +769,7 @@ fn phase(label: &str) {
 /// loading paths must retain the canonical page actor for native controls.
 pub(crate) fn needs_live_dom(dom: &Dom) -> bool {
     dom.hover_css_affects_rendering()
+        || dom.focus_css_affects_rendering()
         || clickable_set_for_dom(dom, &std::collections::HashSet::new()).1
 }
 
@@ -828,6 +829,15 @@ pub(crate) fn clickable_set_for_dom(
     }
     let mut clickable: HashSet<usize> = candidates.difference(&containers).copied().collect();
     clickable.extend(anchors);
+    // HTML #tabindex-value / #click-focusable: generic focusable elements
+    // need their own native activation identity, including nested menus.
+    // Do not prune a focus target merely because it contains another target.
+    clickable.extend(
+        everyone
+            .iter()
+            .copied()
+            .filter(|&node| dom.has_tabindex(node)),
+    );
     let has_forms = everyone.iter().copied().any(|node| {
         matches!(
             dom.tag_name(node),

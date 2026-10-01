@@ -360,6 +360,8 @@ pub struct Dom {
     doc_url: Option<url::Url>,
     /// HTML #scroll-to-the-fragment-identifier, independent of history URL rewrites.
     fragment_target: Option<NodeId>,
+    /// HTML focused DOM anchor per Document, shared with the page focus model.
+    focused_areas: FxHashMap<NodeId, NodeId>,
     /// Incremental layout (incremental-layout contract): the element nodes mutated
     /// since the last `take_dirty_targets`, with the kind of change. A mutation
     /// confined to a relayout boundary's subtree lets the app re-lay ONLY that
@@ -668,6 +670,7 @@ impl Dom {
             scroll_changes,
             doc_url,
             fragment_target: _,
+            focused_areas,
             dirty_nodes,
             dirty_attributed,
             hover_hosts,
@@ -1024,6 +1027,7 @@ impl Dom {
         fixed_set!(paint_patch_hosts, NodeId);
         fixed_set!(render_clickables, NodeId);
         fixed_set!(hover_chain, NodeId);
+        bytes += focused_areas.capacity() * std::mem::size_of::<(NodeId, NodeId)>();
         fixed_set!(popover_open, NodeId);
         bytes = bytes.saturating_add(
             popover_order
@@ -1106,6 +1110,7 @@ impl Dom {
             scroll_changes: Vec::new(),
             doc_url: None,
             fragment_target: None,
+            focused_areas: FxHashMap::default(),
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
             hover_hosts: std::collections::HashSet::new(),
@@ -2758,6 +2763,7 @@ impl Dom {
         // orphan case skips the check entirely — the fresh-node append path
         // stays one tag check total, paid on the append side).
         if parent.is_some() {
+            self.clear_focus_in_subtree(id);
             self.note_tree_style_mutation(parent, id);
             self.invalidate_style_subtree(id, true);
         }
@@ -2985,6 +2991,7 @@ impl Dom {
         let mut old = self.nodes[parent].first_child;
         while let Some(child) = old {
             old = self.nodes[child].next_sibling;
+            self.clear_focus_in_subtree(child);
             let node = &mut self.nodes[child];
             node.parent = None;
             node.prev_sibling = None;
@@ -6190,6 +6197,11 @@ impl Dom {
                 .any(|(_, (_, value))| value.to_ascii_lowercase().contains("revert-layer"))
         });
         index.has_container_queries = unique.iter().copied().any(|r| !r.containers.is_empty());
+        index.has_focus_rules = index
+            .scopes
+            .values()
+            .flatten()
+            .any(|rule| rule_affects_render(rule) && focus::complex_uses_focus(&rule.selector));
         index.selector_dependencies =
             invalidation::SelectorDependencyIndex::build(self, &index.scopes);
         // The hover probes: only rules that could change what we paint under a
@@ -9304,6 +9316,8 @@ impl Dom {
     /// the arena. `tag` is the element's tag name (the caller already has it).
     fn matches_state(&self, id: NodeId, tag: &str, st: &StatePseudo) -> bool {
         match st {
+            StatePseudo::Focus => self.matches_focus(id),
+            StatePseudo::FocusWithin => self.matches_focus_within(id),
             StatePseudo::AnyLink => matches!(tag, "a" | "area") && self.attr(id, "href").is_some(),
             StatePseudo::Checked => match tag {
                 "input" => {
@@ -10033,11 +10047,12 @@ impl Nth {
 
 /// An element-state pseudo-class evaluable from the arena (Selectors 4 §9
 /// link pseudos + the HTML "Pseudo-classes" section's input-state semantics).
-/// All are static tests against attributes/tree state; content mutations bump
-/// the epoch, so the per-epoch match memos stay fresh (the prelude routes
-/// `.checked`/`.value` writes through `setAttribute`, which mutates the
-/// arena).
+/// Tests against attributes, tree state, or the canonical focused area.
+/// Their state writers invalidate dependent style and selector caches.
 enum StatePseudo {
+    /// Selectors 4 / HTML focus state, synchronized before focus events fire.
+    Focus,
+    FocusWithin,
     /// `:link` / `:any-link` — an `<a>`/`<area>` with an `href`. History-
     /// based styling isn't modeled yet, so `:link` matches every hyperlink
     /// and `:visited` is a never-pseudo for now.
@@ -10079,6 +10094,8 @@ enum StatePseudo {
 /// parse failure of the whole selector (the engine-wide fail-open rule).
 fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
     Some(match name {
+        "focus" if arg.is_none() => StatePseudo::Focus,
+        "focus-within" if arg.is_none() => StatePseudo::FocusWithin,
         "link" | "any-link" => StatePseudo::AnyLink,
         "checked" => StatePseudo::Checked,
         "indeterminate" => StatePseudo::Indeterminate,
@@ -11040,10 +11057,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // argument fails the parse (rule dropped, fail-open).
                     compound.states.push(state);
                     compound.pseudos += 1;
-                } else if matches!(
-                    name.as_str(),
-                    "active" | "focus" | "focus-within" | "focus-visible" | "visited"
-                ) {
+                } else if matches!(name.as_str(), "active" | "focus-visible" | "visited") {
                     compound.never = true;
                     compound.pseudos += 1;
                 } else {
@@ -11098,12 +11112,7 @@ fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String>
     if out.is_empty() { None } else { Some(out) }
 }
 
-// ---- CSS visibility cascade (step 1) ---------------------------------
-// A real mini-cascade for exactly two properties, `display` and
-// `visibility`, so stylesheet-class hiding (.hidden{display:none}) and
-// class-toggle re-showing (.menu.open{display:block}) work. Everything
-// unparseable is IGNORED — fail-open always means "visible", never
-// "hidden". `:hover`/`:focus` never match; @-blocks are skipped whole.
+// ---- CSS cascade property registry and value processing ---------------
 
 /// One CSS property the engine understands — the single source of truth
 /// for the whole property surface. `is_tracked` (what the cascade stores)
@@ -11943,6 +11952,19 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 .collect();
         }
     }
+    if prop == "all" {
+        // CSS Cascade 5 #all-shorthand (CSSWG snapshot 81c27f68): reset
+        // every supported property except direction, unicode-bidi and custom
+        // properties. Expand at the declaration's original cascade position,
+        // preserving importance, layer order and later longhand overrides.
+        let Some(keyword) = properties::ident(value).filter(|v| wide_keyword(v).is_some()) else {
+            return Vec::new();
+        };
+        return all_longhand_names()
+            .iter()
+            .map(|name| (name.clone(), keyword.clone()))
+            .collect();
+    }
     if prop == "text-decoration" {
         // CSS Text Decoration 3 #text-decoration-property: unordered line,
         // style and color; every omitted component resets to its initial value.
@@ -12691,6 +12713,24 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     vec![(prop.to_string(), value.to_string())]
 }
 
+/// Derive the `all` reset surface from the same registry and shorthand
+/// grammar as ordinary declarations. Cache names, never element values.
+fn all_longhand_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut seen = FxHashSet::default();
+        PROPS
+            .iter()
+            .flat_map(|property| expand_box_shorthand(property.name, "initial"))
+            .map(|(name, _)| name)
+            .filter(|name| {
+                !matches!(name.as_str(), "direction" | "unicode-bidi") && is_tracked(name)
+            })
+            .filter(|name| seen.insert(name.clone()))
+            .collect()
+    })
+}
+
 const PENDING_BACKGROUND_SHORTHAND: &str = "\0trust-pending-background:";
 const PENDING_BOX_SHORTHAND: &str = "\0trust-pending-box:";
 
@@ -13433,6 +13473,7 @@ struct SlotAssignments {
 /// document sheets never reach in.
 #[derive(Default)]
 struct StyleIndex {
+    has_focus_rules: bool,
     font_sets: FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
     has_container_queries: bool,
     has_revert_layer: bool,
@@ -13699,6 +13740,7 @@ impl StyleIndex {
 
     fn retained_memory(&self) -> (usize, bool) {
         let StyleIndex {
+            has_focus_rules: _,
             font_sets,
             has_container_queries,
             has_revert_layer,
@@ -22714,6 +22756,63 @@ mod tests {
             dom.computed_value(id("sl"), "list-style-position")
                 .as_deref(),
             Some("inside")
+        );
+    }
+
+    #[test]
+    fn all_shorthand_preserves_exceptions_and_obeys_the_cascade() {
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            #parent { color:#33b5e5; width:90px; --tone:gold }
+            a { color:black; width:40px; margin-left:7px }
+            #unset { direction:rtl; --own:blue; all:unset; display:block }
+            #initial { all:initial }
+            #inherit { all:inherit }
+            #invalid { all:red }
+            #variable { all:var(--missing, unset) }
+            #important { all:unset!important; color:red; width:12px!important }
+            @layer base, reset;
+            @layer base { #rollback { color:green; width:44px } }
+            @layer reset { #rollback { all:revert-layer } }
+        </style><div id=parent>
+            <a id=unset>Download</a><div id=initial></div><a id=inherit></a>
+            <a id=invalid></a><a id=variable></a><a id=important></a><div id=rollback></div>
+        </div>"#,
+        );
+        let value = |dom: &Dom, id: &str, property| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), property)
+        };
+        for id in ["unset", "variable", "important"] {
+            assert_eq!(value(&dom, id, "color").as_deref(), Some("#33b5e5"));
+            assert_eq!(
+                dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "margin-left")
+                    .as_deref(),
+                Some("0px")
+            );
+        }
+        assert_eq!(value(&dom, "unset", "display").as_deref(), Some("block"));
+        // Internally None denotes the initial width (auto).
+        assert_eq!(value(&dom, "unset", "width"), None);
+        assert_eq!(value(&dom, "unset", "direction").as_deref(), Some("rtl"));
+        let unset = dom.get_by_id("unset").unwrap();
+        assert_eq!(dom.resolve_vars(unset, "var(--own)"), "blue");
+        assert_eq!(dom.resolve_vars(unset, "var(--tone)"), "gold");
+        assert_eq!(value(&dom, "initial", "display").as_deref(), Some("inline"));
+        assert_eq!(value(&dom, "inherit", "width").as_deref(), Some("90px"));
+        assert_eq!(value(&dom, "invalid", "color").as_deref(), Some("black"));
+        assert_eq!(value(&dom, "important", "width").as_deref(), Some("12px"));
+        assert_eq!(value(&dom, "rollback", "color").as_deref(), Some("green"));
+        assert_eq!(value(&dom, "rollback", "width").as_deref(), Some("44px"));
+        dom.set_attr(
+            unset,
+            "style",
+            "margin-inline-start:19px;all:unset;margin-right:3px",
+        );
+        assert_eq!(value(&dom, "unset", "margin-right").as_deref(), Some("3px"));
+        dom.set_attr(unset, "style", "all:unset;margin-inline-start:19px");
+        assert_eq!(
+            value(&dom, "unset", "margin-right").as_deref(),
+            Some("19px")
         );
     }
 

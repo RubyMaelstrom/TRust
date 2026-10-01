@@ -3121,6 +3121,7 @@ mod desktop {
         if has_interaction
             || page.dom.borrow().css_transition_work_pending()
             || page.dom.borrow().hover_css_affects_rendering()
+            || page.dom.borrow().focus_css_affects_rendering()
             || !page.dom.borrow().hover_hosts_is_empty()
         {
             return true;
@@ -7669,6 +7670,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_nodelist_for_each", 4, host_nodelist_for_each),
     ("__dom_contains", 2, host_contains),
     ("__dom_set_hover", 1, host_set_hover),
+    ("__dom_focus", 2, host_focus),
     ("__dom_fragment_target", 1, host_fragment_target),
     ("__dom_children", 1, host_children),
     ("__dom_slot_assigned", 1, host_slot_assigned),
@@ -12491,6 +12493,21 @@ fn host_set_hover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Bool(affected))
 }
 
+fn host_focus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(document) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Null);
+    };
+    if args.len() > 1 {
+        let target = host_arg_node(&dom, args, 1);
+        dom.set_focused_area(document, target);
+    }
+    Ok(dom
+        .focused_area(document)
+        .map_or(Value::Null, |node| Value::Num(node as f64)))
+}
+
 fn host_children(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let ids = {
@@ -16511,6 +16528,160 @@ mod tests {
     }
 
     #[test]
+    fn focus_selectors_open_nested_menus_and_match_during_focus_events() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(include_str!(
+                    "fixtures/focus_menus.html"
+                )))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const check = (ok, label) => { if (!ok) throw new Error(label); };
+            const file = document.getElementById('file');
+            const version = document.getElementById('version');
+            const downloads = document.getElementById('downloads');
+            const platforms = document.getElementById('platforms');
+            const help = document.getElementById('help');
+            const events = [];
+            file.onfocus = () => events.push(file.matches(':focus') && file.matches(':focus-within'));
+            file.onblur = () => events.push(!file.matches(':focus') && !file.matches(':focus-within'));
+            check(!file.matches(':focus') && getComputedStyle(downloads).display === 'none', 'initial');
+            file.click();
+            check(!file.matches(':focus'), 'synthetic click must not focus');
+            file.focus({preventScroll:true});
+            check(getComputedStyle(downloads).display === 'block' && downloads.getClientRects().length, 'first menu');
+            version.focus({preventScroll:true});
+            check(!file.matches(':focus') && file.matches(':focus-within'), 'ancestor focus-within only');
+            check(getComputedStyle(platforms).display === 'block' && platforms.getClientRects().length, 'nested menu');
+            check(getComputedStyle(document.getElementById('download')).color === '#33b5e5', 'all unset inherits visible menu text');
+            check(document.querySelector('nav:has(:focus)') && document.querySelector('li:is(:focus)') === version, 'logical selectors');
+            check(events.join() === 'true,true', 'synchronous focus event state');
+            help.addEventListener('mousedown', e => e.preventDefault(), {once:true});
+            __trust.pointerButton(help.__id, true, 150, 10);
+            __trust.pointerButton(help.__id, false, 150, 10);
+            check(version.matches(':focus'), 'canceled pointer down');
+            __trust.focusPage(document.getElementById('caption').__id);
+            check(help.matches(':focus') && getComputedStyle(downloads).display === 'none', 'descendant click transfers focus');
+            __trust.focusPage(document.getElementById('outside').__id);
+            check(!document.querySelector(':focus') && !document.querySelector(':focus-within'), 'viewport focus');
+            return 'focus-menus-ok';
+        })()"#
+            ),
+            "focus-menus-ok"
+        );
+    }
+
+    #[test]
+    fn focus_selectors_follow_shadow_slots_and_clear_on_removal() {
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><body></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const check = (ok, label) => { if (!ok) throw new Error(label); };
+            document.body.innerHTML = '<style>x-host:focus-within + p { color:red }</style><x-host></x-host><p>After</p>';
+            const host = document.querySelector('x-host');
+            const root = host.attachShadow({mode:'open'});
+            root.innerHTML = '<style>:host(:focus-within) { color:blue }</style><section><slot></slot><button>Shadow</button></section>';
+            const section = root.querySelector('section'), slot = root.querySelector('slot');
+            const button = document.createElement('button');
+            button.textContent = 'Slotted'; host.appendChild(button);
+            button.focus();
+            check(button.matches(':focus') && !host.matches(':focus'), 'slotted focus not retargeted');
+            check(slot.matches(':focus-within') && section.matches(':focus-within') && host.matches(':focus-within'), 'flat ancestors');
+            check(getComputedStyle(document.querySelector('p')).color === 'red', 'sibling invalidation');
+            const shadow = root.querySelector('button'); shadow.focus();
+            check(shadow.matches(':focus') && host.matches(':focus') && !section.matches(':focus'), 'shadow host focus');
+            check(!slot.matches(':focus-within'), 'old flat ancestor cleared');
+            host.innerHTML = ''; // Does not remove the focused shadow child.
+            check(shadow.matches(':focus'), 'light replace preserves shadow focus');
+            shadow.remove(); section.appendChild(shadow);
+            check(!shadow.matches(':focus') && !host.matches(':focus-within'), 'removal and reinsert');
+            check(document.activeElement === document.body, 'removal focus fixup');
+            shadow.focus();
+            check(shadow.matches(':focus'), 'removed element can focus again');
+            root.innerHTML = '<span>replacement</span>';
+            check(!host.matches(':focus-within') && !shadow.matches(':focus'), 'bulk removal');
+            return 'focus-shadow-ok';
+        })()"#
+            ),
+            "focus-shadow-ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_menus_without_scripts_render_in_both_presentations() {
+        use crate::js::{PageCmd, PageEvt};
+        let html = include_str!("fixtures/focus_menus.html");
+        let dom = Dom::parse_document(html);
+        let file = dom.get_by_id("file").unwrap();
+        let version = dom.get_by_id("version").unwrap();
+        let downloads = dom.get_by_id("downloads").unwrap();
+        let platforms = dom.get_by_id("platforms").unwrap();
+        let help = dom.get_by_id("help").unwrap();
+        let support = dom.get_by_id("support").unwrap();
+        let (clickable, live) = crate::js::clickable_set_for_dom(&dom, &Default::default());
+        assert!(live && clickable.contains(&file) && clickable.contains(&version));
+        for terminal_presentation in [true, false] {
+            let mut env = crate::js::PageEnv::bare(DEFAULT_URL);
+            env.terminal_presentation = terminal_presentation;
+            let (handle, mut events) = spawn_page(html.into(), env);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                for (command, visible) in [
+                    (None, [false, false, false]),
+                    (Some(PageCmd::Click(file)), [true, false, false]),
+                    (Some(PageCmd::Click(version)), [true, true, false]),
+                    (Some(PageCmd::Focus(Some(help))), [false, false, true]),
+                    (Some(PageCmd::Focus(None)), [false, false, false]),
+                ] {
+                    if let Some(command) = command {
+                        handle.try_send_user(command).unwrap();
+                    }
+                    loop {
+                        match events.recv().await {
+                            Some(PageEvt::Updated { outcome, .. }) => {
+                                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                                let rendered = outcome.rendered.expect("rendered focus transition");
+                                let boxes = &rendered.layout.boxes;
+                                assert_eq!(
+                                    [downloads, platforms, support]
+                                        .map(|id| boxes.contains_key(&id)),
+                                    visible,
+                                    "terminal={terminal_presentation}"
+                                );
+                                assert!(rendered.focus_order.contains(&file));
+                                assert_eq!(rendered.focus_order.contains(&version), visible[0]);
+                                break;
+                            }
+                            Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                            Some(PageEvt::Static { .. }) | None => {
+                                panic!("focus menu actor retired")
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("focus menus stalled");
+        }
+    }
+
+    #[test]
     fn focus_requires_rendering_but_allows_contents_transparency_and_offscreen_boxes() {
         let mut engine = configured_engine(
             HostState::new(
@@ -17848,7 +18019,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 185, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 186, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -17859,7 +18030,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 185);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 186);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

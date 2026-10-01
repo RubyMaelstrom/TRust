@@ -609,6 +609,12 @@
     // getter does. Keep the focused DOM anchor itself when an element owns
     // focus so modal/focus-restoration code never observes `undefined`.
     let focusedArea = null;
+    function setFocusedArea(el) {
+        focusedArea = el;
+        // CSS :focus / :focus-within observe the same focused area as
+        // activeElement, including inside synchronous blur/focus listeners.
+        __dom_focus(g.document.__id, el ? el.__id : -1);
+    }
     function viewportFocusAnchor(doc) {
         return (doc && (doc.body || doc.documentElement)) || null;
     }
@@ -617,7 +623,8 @@
             // Focus-fixup: once the focused element leaves its document, the
             // viewport is the surviving focusable area. The activeElement
             // getter must not return a detached stale wrapper.
-            if (!focusedArea.isConnected) focusedArea = null;
+            if (!focusedArea.isConnected || __dom_focus(g.document.__id) !== focusedArea.__id)
+                setFocusedArea(null);
         }
         if (!focusedArea) return root.nodeType === 9 ? viewportFocusAnchor(root) : null;
         // DocumentOrShadowRoot.activeElement retargets a focused shadow-tree
@@ -711,19 +718,20 @@
         return false;
     }
     function focusElement(el, options) {
+        activeElementFor(g.document);
         if (focusedArea === el || !elementCanFocus(el)) return;
         const old = focusedArea;
         // HTML §6.6.4's focus update steps remove focus before firing blur;
         // UI Events §3.3.2 orders blur, focusout, focus, then focusin. A handler
         // reading activeElement during blur therefore sees the viewport
         // fallback, not the future target.
-        focusedArea = null;
+        setFocusedArea(null);
         if (old && old.isConnected) {
             commitTextControl(old);
             focusEvent(old, "blur", el, false);
             focusEvent(old, "focusout", el, true);
         }
-        focusedArea = el;
+        setFocusedArea(el);
         if (isTextControl(el)) textEditBaselines.set(el, el.value);
         focusEvent(el, "focus", old, false);
         focusEvent(el, "focusin", old, true);
@@ -733,7 +741,7 @@
     }
     function blurElement(el) {
         if (!el || focusedArea !== el) return;
-        focusedArea = null;
+        setFocusedArea(null);
         commitTextControl(el);
         focusEvent(el, "blur", null, false);
         focusEvent(el, "focusout", null, true);

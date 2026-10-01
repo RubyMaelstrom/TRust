@@ -841,6 +841,10 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
     ];
     let mut done = FxHashSet::default();
     let mut result = Vec::new();
+    // CSSOM #serialize-into-a-shorthand-form: all has the largest reset
+    // surface. A short declaration block cannot contain every longhand, so
+    // skip it without repeatedly building/comparing that surface.
+    let all = (declarations.len() >= all_longhand_names().len()).then_some("all");
     for (name, value, important) in declarations {
         if done.contains(name) {
             continue;
@@ -848,7 +852,11 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
         let mut serialized = None;
         if !internal {
             let pending = pending_shorthand(value).map(|(name, _)| name);
-            for shorthand in pending.into_iter().chain(SHORTHANDS.iter().copied()) {
+            for shorthand in pending
+                .into_iter()
+                .chain(all)
+                .chain(SHORTHANDS.iter().copied())
+            {
                 let names = property_names(shorthand);
                 if !names.iter().any(|n| n == name) || names.iter().any(|n| done.contains(n)) {
                     continue;
@@ -955,6 +963,28 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_shorthand_cssom_accepts_resets_and_roundtrips_exceptions() {
+        for keyword in ["initial", "inherit", "unset", "revert", "revert-layer"] {
+            assert!(supports("all", keyword));
+            let source = format!("direction:rtl;--tone:blue;all:{keyword}!important");
+            let declarations = parse(&source);
+            assert_eq!(get("all", &declarations), keyword);
+            let serialized = serialize(&declarations, false);
+            assert!(
+                serialized.contains(&format!("all: {keyword} !important;")),
+                "{serialized}"
+            );
+            assert_eq!(get("direction", &parse(&serialized)), "rtl");
+            assert_eq!(get("--tone", &parse(&serialized)), "blue");
+        }
+        for invalid in ["red", "unset inherit", "initial, unset", "12px"] {
+            assert!(!supports("all", invalid), "{invalid}");
+        }
+        assert!(supports("all", "var(--missing, unset)"));
+        assert_eq!(get("all", &parse("all:unset;color:red")), "");
+    }
 
     #[test]
     fn logical_declaration_parse_and_serialization_preserve_cascade_order() {

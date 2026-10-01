@@ -260,6 +260,7 @@ impl Dependencies {
         }
         for state in states {
             let (names, inherited): (&[&str], bool) = match state {
+                StatePseudo::Focus | StatePseudo::FocusWithin => (&[], false),
                 StatePseudo::AnyLink => (&["href"], false),
                 StatePseudo::Checked => {
                     // HTML #selector-checked. Radio-group state writers must
