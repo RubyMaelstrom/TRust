@@ -14374,7 +14374,8 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     let k = if custom {
         k.to_string()
     } else {
-        k.to_ascii_lowercase()
+        let lower = k.to_ascii_lowercase();
+        legacy_name_alias(&lower).map_or(lower, str::to_string)
     };
     let v = v.trim();
     // CSS Syntax 3 #consume-declaration: only top-level trailing tokens
@@ -15177,6 +15178,70 @@ fn parse_sheet(
         rest = after;
         parse_style_rule(selector_text, block, order, out, media, &lpath);
     }
+}
+
+/// WHATWG Compatibility #css-legacy-name-aliases: a `-webkit-` name that
+/// parses exactly as its unprefixed property.
+fn legacy_name_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "-webkit-align-items" => "align-items",
+        "-webkit-align-content" => "align-content",
+        "-webkit-align-self" => "align-self",
+        "-webkit-animation-name" => "animation-name",
+        "-webkit-animation-duration" => "animation-duration",
+        "-webkit-animation-timing-function" => "animation-timing-function",
+        "-webkit-animation-iteration-count" => "animation-iteration-count",
+        "-webkit-animation-direction" => "animation-direction",
+        "-webkit-animation-play-state" => "animation-play-state",
+        "-webkit-animation-delay" => "animation-delay",
+        "-webkit-animation-fill-mode" => "animation-fill-mode",
+        "-webkit-animation" => "animation",
+        "-webkit-backface-visibility" => "backface-visibility",
+        "-webkit-background-clip" => "background-clip",
+        "-webkit-background-origin" => "background-origin",
+        "-webkit-background-size" => "background-size",
+        "-webkit-border-bottom-left-radius" => "border-bottom-left-radius",
+        "-webkit-border-bottom-right-radius" => "border-bottom-right-radius",
+        "-webkit-border-top-left-radius" => "border-top-left-radius",
+        "-webkit-border-top-right-radius" => "border-top-right-radius",
+        "-webkit-border-radius" => "border-radius",
+        "-webkit-box-shadow" => "box-shadow",
+        "-webkit-box-sizing" => "box-sizing",
+        "-webkit-flex-basis" => "flex-basis",
+        "-webkit-flex-direction" => "flex-direction",
+        "-webkit-flex-flow" => "flex-flow",
+        "-webkit-flex-grow" => "flex-grow",
+        "-webkit-flex-shrink" => "flex-shrink",
+        "-webkit-flex-wrap" => "flex-wrap",
+        "-webkit-filter" => "filter",
+        "-webkit-justify-content" => "justify-content",
+        "-webkit-mask" => "mask",
+        "-webkit-mask-box-image" => "mask-border",
+        "-webkit-mask-box-image-outset" => "mask-border-outset",
+        "-webkit-mask-box-image-repeat" => "mask-border-repeat",
+        "-webkit-mask-box-image-slice" => "mask-border-slice",
+        "-webkit-mask-box-image-source" => "mask-border-source",
+        "-webkit-mask-box-image-width" => "mask-border-width",
+        "-webkit-mask-clip" => "mask-clip",
+        "-webkit-mask-composite" => "mask-composite",
+        "-webkit-mask-image" => "mask-image",
+        "-webkit-mask-origin" => "mask-origin",
+        "-webkit-mask-position" => "mask-position",
+        "-webkit-mask-repeat" => "mask-repeat",
+        "-webkit-mask-size" => "mask-size",
+        "-webkit-order" => "order",
+        "-webkit-perspective" => "perspective",
+        "-webkit-perspective-origin" => "perspective-origin",
+        "-webkit-transform-origin" => "transform-origin",
+        "-webkit-transform-style" => "transform-style",
+        "-webkit-transform" => "transform",
+        "-webkit-transition-delay" => "transition-delay",
+        "-webkit-transition-duration" => "transition-duration",
+        "-webkit-transition-property" => "transition-property",
+        "-webkit-transition-timing-function" => "transition-timing-function",
+        "-webkit-transition" => "transition",
+        _ => return None,
+    })
 }
 
 /// A `<length-percentage>` component of a text-decoration shorthand (its
@@ -18112,6 +18177,33 @@ mod tests {
         assert!(dom.serialize(DOCUMENT).contains("payload"));
         dom.set_attr(m, "class", "menu");
         assert!(!dom.serialize(DOCUMENT).contains("payload"));
+    }
+
+    #[test]
+    fn legacy_webkit_names_parse_as_their_standard_properties() {
+        // WHATWG Compatibility #css-legacy-name-aliases.
+        let dom = Dom::parse_document(
+            "<style>#a{-webkit-background-clip:text;-webkit-transform:rotate(5deg);\
+             -WEBKIT-BORDER-RADIUS:4px;-webkit-animation:spin 2s linear infinite}\
+             #b{-webkit-box-shadow:1px 1px red;box-shadow:none}</style>\
+             <p id=a>a</p><p id=b style='-webkit-box-sizing:border-box'>b</p>",
+        );
+        let value = |id: &str, name: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.computed_value(node, name)
+        };
+        assert_eq!(value("a", "background-clip").as_deref(), Some("text"));
+        assert_eq!(value("a", "transform").as_deref(), Some("rotate(5deg)"));
+        assert!(
+            value("a", "border-top-left-radius").is_some_and(|radius| radius.starts_with("4px"))
+        );
+        assert_eq!(
+            value("a", "animation").as_deref(),
+            Some("spin 2s linear infinite")
+        );
+        // An alias cascades as its standard name: the later declaration wins.
+        assert_eq!(value("b", "box-shadow").as_deref(), Some("none"));
+        assert_eq!(value("b", "box-sizing").as_deref(), Some("border-box"));
     }
 
     #[test]
