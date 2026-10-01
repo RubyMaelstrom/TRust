@@ -844,18 +844,6 @@ impl Dom {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             return None;
         }
-        // Selector matching never crosses into another tree, and inserting a
-        // detached tree restyles all of it. Frameworks set attributes on nodes
-        // before inserting them; with a broad dependency (`dir`, `lang`, …)
-        // that expired every style of the live document.
-        if !self.is_dom_connected(node) && !self.shadow_style_dependencies(node) {
-            let mut root = node;
-            while let Some(parent) = self.parent_composed(root) {
-                root = parent;
-            }
-            self.invalidate_style_subtree(root, true);
-            return Some(Vec::new());
-        }
         let subjects = {
             let cache = self.style_cache.borrow();
             match cache.as_ref() {
@@ -868,6 +856,22 @@ impl Dom {
                 _ => None,
             }
         };
+        // Selector matching never crosses into another tree, and inserting a
+        // detached tree restyles all of it. Frameworks set attributes on nodes
+        // before inserting them; with a broad dependency (`dir`, `lang`, …)
+        // that expired every style of the live document. Only that fallback
+        // takes the detached tree: a local proof stays cheaper than a walk.
+        if subjects.is_none()
+            && !self.shadow_style_dependencies(node)
+            && !self.is_dom_connected(node)
+        {
+            let mut root = node;
+            while let Some(parent) = self.parent_composed(root) {
+                root = parent;
+            }
+            self.invalidate_style_subtree(root, true);
+            return Some(Vec::new());
+        }
         if subjects.is_none() || self.shadow_style_dependencies(node) {
             if casc_diag_on() {
                 eprintln!(
@@ -2443,13 +2447,15 @@ mod tests {
 
     #[test]
     fn local_state_selectors_keep_unrelated_child_list_changes_local() {
-        // Discourse: `:lang(zh_CN)`, `#input:not(:placeholder-shown)+.submit`,
+        // Discourse: `:lang(zh_CN)` (a Latin language here: CJK text would load
+        // a process-wide fallback font under parallel layout-cache tests),
+        // `#input:not(:placeholder-shown)+.submit`,
         // `:focus:required`, `.node:has(.socket:hover) .icon`.
         let mut dom = Dom::parse_document(
-            "<style>.activity:lang(zh){color:red} #input:not(:placeholder-shown)+.submit{width:20px}\
+            "<style>.activity:lang(fr){color:red} #input:not(:placeholder-shown)+.submit{width:20px}\
              input:required{height:7px} textarea:placeholder-shown{color:blue}\
              .node:has(.socket:hover) .icon{width:9px} [contenteditable]:read-write{color:green}</style>\
-             <div lang=zh><span class=activity id=activity>x</span></div>\
+             <div lang=fr><span class=activity id=activity>x</span></div>\
              <input id=input placeholder=p required><b class=submit id=submit>s</b>\
              <textarea id=area placeholder=hint></textarea>\
              <div class=node><i class=socket id=socket>o</i><b class=icon id=icon>i</b></div>\
