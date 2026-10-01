@@ -260,7 +260,10 @@ impl Dependencies {
         }
         for state in states {
             let (names, inherited): (&[&str], bool) = match state {
-                StatePseudo::Focus | StatePseudo::FocusWithin => (&[], false),
+                // Modal state changes only through `set_dialog_modal`, which
+                // invalidates every style; the `open` attribute alone does not
+                // change it (HTML dialog attribute change steps).
+                StatePseudo::Focus | StatePseudo::FocusWithin | StatePseudo::Modal => (&[], false),
                 StatePseudo::AnyLink => (&["href"], false),
                 StatePseudo::Checked => {
                     // HTML #selector-checked. Radio-group state writers must

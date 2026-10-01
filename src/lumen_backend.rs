@@ -7776,6 +7776,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__body_buffer", 1, host_body_buffer),
     ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, host_dom_popover),
+    ("__dom_dialog_modal", 2, host_dom_dialog_modal),
     ("__wasm_validate", 1, lumen_wasm::host_validate),
     ("__wasm_compile", 1, lumen_wasm::host_compile),
     ("__wasm_module_imports", 1, lumen_wasm::host_module_imports),
@@ -14632,6 +14633,20 @@ fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     Ok(Value::Undefined)
 }
 
+/// `__dom_dialog_modal(node[, modal])`: optionally set a dialog's "is modal"
+/// flag, then return it. The arena owns the flag so removal and `:modal` agree.
+fn host_dom_dialog_modal(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    if let Some(Value::Bool(modal)) = args.get(1) {
+        dom.set_dialog_modal(id, *modal);
+    }
+    Ok(Value::Bool(dom.is_modal(id)))
+}
+
 fn eval(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<(), String> {
     eval_value(engine, source, label).map(|_| ())
 }
@@ -17552,6 +17567,53 @@ mod tests {
     }
 
     #[test]
+    fn modal_pseudo_class_follows_dialog_is_modal() {
+        // HTML #selector-modal with the dialog show/showModal/close and removing
+        // steps (local WHATWG HTML e5071a20c856, 2026-09-06).
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document(
+                        "<!doctype html><html><body></body></html>",
+                    ))),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const dialog = document.createElement("dialog");
+                document.body.appendChild(dialog);
+                const states = [dialog.matches(":modal")];
+                dialog.showModal();
+                states.push(dialog.matches(":modal"), document.querySelector("dialog:modal") === dialog,
+                    dialog.matches("[open]:not(:modal)"));
+                dialog.showModal();
+                dialog.close();
+                states.push(dialog.matches(":modal"));
+                dialog.show();
+                states.push(dialog.matches(":modal"), dialog.matches("[open]:not(:modal)"));
+                try { dialog.showModal(); } catch (error) { states.push(error.name); }
+                dialog.close();
+                dialog.showModal();
+                dialog.remove();
+                states.push(dialog.matches(":modal"));
+                document.body.appendChild(dialog);
+                states.push(dialog.open, dialog.matches(":modal"));
+                try { document.querySelector(":modal(x)"); } catch (error) { states.push(error.name); }
+                states.join("|");
+            "#
+                ),
+                "false|true|true|false|false|false|true|InvalidStateError|false|true|false|SyntaxError"
+            );
+        }
+    }
+
+    #[test]
     fn image_data_constructor_and_structured_clone_conformance() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
@@ -18019,7 +18081,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 186, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 187, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -18030,7 +18092,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 186);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 187);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

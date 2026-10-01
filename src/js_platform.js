@@ -7625,9 +7625,10 @@
     // <dialog> (HTML §4.11.4). We implement the observable method/event surface;
     // the modal TOP LAYER + backdrop + inertness are deliberately NOT rendered
     // (her call — a dialog just paints where it flows, overlaps allowed). `open`
-    // reflects the boolean attribute (the layout's visibility gate); modal-ness
-    // is tracked in `__dlgModal`. show/showModal/close/requestClose follow the
-    // spec steps: InvalidStateError on an already-open show(Modal), showModal
+    // reflects the boolean attribute (the layout's visibility gate); the "is
+    // modal" flag lives in the arena (`__dom_dialog_modal`, read by `:modal` and
+    // cleared on removal). show/showModal/close/requestClose follow the spec
+    // steps: InvalidStateError on an already-open show(Modal), showModal
     // also requires connection; requestClose fires a cancelable `cancel` and
     // aborts if prevented; "close the dialog" removes `open`, sets returnValue,
     // and fires `close`. beforetoggle/toggle (ToggleEvent) fire like popovers.
@@ -7640,24 +7641,26 @@
         set returnValue(v) { this.__dlgReturn = v == null ? "" : String(v); }
         show() {
             if (this.hasAttribute("open")) {
-                if (!this.__dlgModal) return;               // already open (non-modal): no-op
+                if (!__dom_dialog_modal(this.__id)) return; // already open (non-modal): no-op
                 throw new DOMException("The dialog is already open as a modal dialog", "InvalidStateError");
             }
             const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
             dispatch(this, bev, false);
             if (bev.defaultPrevented || this.hasAttribute("open")) return;
             this.setAttribute("open", "");
-            this.__dlgModal = false;
             this.__dlgToggle("closed", "open");
         }
         showModal() {
-            if (this.hasAttribute("open")) throw new DOMException("The dialog is already open", "InvalidStateError");
+            if (this.hasAttribute("open")) {
+                if (__dom_dialog_modal(this.__id)) return;  // already open as a modal: no-op
+                throw new DOMException("The dialog is already open", "InvalidStateError");
+            }
             if (!this.isConnected) throw new DOMException("The dialog is not connected", "InvalidStateError");
             const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
             dispatch(this, bev, false);
             if (bev.defaultPrevented || this.hasAttribute("open")) return;
             this.setAttribute("open", "");
-            this.__dlgModal = true;
+            __dom_dialog_modal(this.__id, true);
             this.__dlgToggle("closed", "open");
         }
         close(returnValue) {
@@ -7676,7 +7679,7 @@
             dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
             if (!this.hasAttribute("open")) return;
             this.removeAttribute("open");
-            this.__dlgModal = false;
+            __dom_dialog_modal(this.__id, false);
             if (result !== null) this.__dlgReturn = result;
             const self = this;
             g.setTimeout(function () {

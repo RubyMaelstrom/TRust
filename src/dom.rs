@@ -428,6 +428,10 @@ pub struct Dom {
     /// an ordered set and paints its last element on top; a hash-set alone
     /// loses that observable order when more than one manual popover is open.
     popover_order: Vec<NodeId>,
+    /// `dialog` elements whose "is modal" flag is true (HTML §4.11.4), written
+    /// by `showModal()`/close through the `__dom_dialog_modal` syscall and
+    /// cleared when the dialog is removed. Read by `:modal` (HTML #selector-modal).
+    modal_dialogs: FxHashSet<NodeId>,
 }
 
 /// The kind of DOM mutation, for incremental-layout boundary mapping. See
@@ -684,6 +688,7 @@ impl Dom {
             hover_chain,
             popover_open,
             popover_order,
+            modal_dialogs,
         } = self;
         let _ = (
             gc_allocation_leases,
@@ -1034,6 +1039,7 @@ impl Dom {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         );
+        fixed_set!(modal_dialogs, NodeId);
 
         match layout_cache.try_borrow() {
             Ok(cache) => {
@@ -1124,6 +1130,7 @@ impl Dom {
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
             popover_order: Vec::new(),
+            modal_dialogs: FxHashSet::default(),
         };
         dom.new_node(NodeData::Document);
         dom
@@ -1412,6 +1419,45 @@ impl Dom {
                 self.attr(id, "data-trust-popover-open")
                     .and_then(|value| value.parse().ok())
             })
+    }
+
+    /// Set a `dialog`'s "is modal" flag (HTML §4.11.4: true from showing it
+    /// modally until it is closed or removed). Like popover state, a change
+    /// can alter `:modal` matches, so the match memos must refresh.
+    pub fn set_dialog_modal(&mut self, id: NodeId, modal: bool) {
+        let changed = if modal {
+            self.modal_dialogs.insert(id)
+        } else {
+            self.modal_dialogs.remove(&id)
+        };
+        if changed {
+            self.touch();
+        }
+    }
+
+    /// HTML #selector-modal: a `dialog` whose "is modal" flag is true. TRust
+    /// has no Fullscreen API, so no element has a fullscreen flag. Serialized
+    /// presentation arenas carry the state as an internal marker.
+    pub fn is_modal(&self, id: NodeId) -> bool {
+        self.modal_dialogs.contains(&id) || self.attr(id, "data-trust-modal").is_some()
+    }
+
+    /// The dialog removing steps set "is modal" to false. Removal is the only
+    /// tree mutation that changes the flag, and every modal dialog is connected,
+    /// so after unlinking a subtree the flag survives exactly on connected dialogs.
+    fn clear_modal_disconnected(&mut self) {
+        if self.modal_dialogs.is_empty() {
+            return;
+        }
+        let removed: Vec<_> = self
+            .modal_dialogs
+            .iter()
+            .copied()
+            .filter(|&id| !self.is_dom_connected(id))
+            .collect();
+        for id in removed {
+            self.set_dialog_modal(id, false);
+        }
     }
 
     /// Move the live `:hover` state to `target`, its flat-tree ancestors, and
@@ -2788,6 +2834,7 @@ impl Dom {
         n.next_sibling = None;
         if let Some(parent) = parent {
             self.child_collection_changed(parent, id, false);
+            self.clear_modal_disconnected();
         }
     }
 
@@ -8593,6 +8640,10 @@ impl Dom {
         if let Some(order) = self.popover_top_layer_order(id) {
             out.push_str(&format!(" data-trust-popover-open=\"{order}\""));
         }
+        // A dialog's "is modal" flag is likewise DOM state, not an attribute.
+        if self.modal_dialogs.contains(&id) {
+            out.push_str(" data-trust-modal=\"\"");
+        }
         // A scroll container's current `scrollTop` signal (CSSOM View) rides the
         // HTML in CSS pixels so it survives the live snapshot/re-parse exactly
         // like a baked form value. A terminal consumer quantizes this value only
@@ -9370,6 +9421,7 @@ impl Dom {
                 })
             }
             StatePseudo::Dir(want_rtl) => self.direction_rtl(id) == *want_rtl,
+            StatePseudo::Modal => tag == "dialog" && self.is_modal(id),
         }
     }
 
@@ -10086,6 +10138,8 @@ enum StatePseudo {
     /// `:dir(rtl)` / `:dir(ltr)` — the nearest `dir` attribute (`auto`
     /// approximates to `ltr`: the engine lays out LTR only). `true` = rtl.
     Dir(bool),
+    /// `:modal` — a `dialog` shown with `showModal()` (`Dom::is_modal`).
+    Modal,
 }
 
 /// Parse a state pseudo-class by name (+ its argument for the functional
@@ -10106,6 +10160,7 @@ fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
         "read-write" => StatePseudo::ReadWrite,
         "read-only" => StatePseudo::ReadOnly,
         "placeholder-shown" => StatePseudo::PlaceholderShown,
+        "modal" if arg.is_none() => StatePseudo::Modal,
         "lang" => {
             let ranges: Vec<String> = split_top_level(arg?, ',')
                 .into_iter()
@@ -18946,13 +19001,29 @@ mod tests {
                 "oklch(0.5 0.1 120)",
                 "oklab(50% 0.1 0.2)",
                 "lch(50% 20 120)",
+                // CSS Color 4 #color-function spaces and hwb(), and CSS Color 5
+                // relative colors (Discourse gates its app on the hsl() form).
+                "color(srgb 0.4 0.2 0.6)",
+                "color(xyz 0.2 0.3 0.4)",
+                "hwb(120 10% 20%)",
+                "hsl(from white h s l)",
+                "rgb(from #0000ff r g b / 80%)",
+                "oklch(from red calc(l * 0.8) c h)",
+                "color(from red display-p3 r g b)",
             ] {
                 assert!(
                     supports_condition(&format!("({property}: {value})")),
                     "supported: {property}: {value}"
                 );
             }
-            for value in ["color(unknown-space 0 0 0)", "lab(0%, 0, 0)", "not-a-color"] {
+            for value in [
+                "color(unknown-space 0 0 0)",
+                "lab(0%, 0, 0)",
+                "not-a-color",
+                "rgb(from white, r, g, b)",
+                "hsl(from white 10% s l)",
+                "rgb(from white r g)",
+            ] {
                 assert!(
                     !supports_condition(&format!("({property}: {value})")),
                     "unsupported: {property}: {value}"
@@ -18969,6 +19040,27 @@ mod tests {
             "(color: lab(0% 0 0)) or (color: #111110)"
         ));
         assert!(supports_condition("(color: white !important)"));
+    }
+
+    #[test]
+    fn relative_color_declarations_apply_and_paint() {
+        // CSS Color 5 #relative-colors: previously dropped as invalid, which
+        // kept the earlier fallback declaration.
+        let dom = Dom::parse_document(
+            "<style>#x {color:white; color:rgb(from blue r g b / 50%); \
+             background-color:#111110; background-color:hwb(from red h w b / alpha)}</style>\
+             <p id=x>Readable</p>",
+        );
+        let node = dom.get_by_id("x").unwrap();
+        let paint = |property| {
+            let value = dom.computed_value_resolved(node, property).unwrap();
+            crate::render::PaintColor::parse_css(&value)
+        };
+        assert_eq!(paint("color"), Some(crate::render::PaintColor::Rgba(0, 0, 255, 128)));
+        assert_eq!(
+            paint("background-color"),
+            Some(crate::render::PaintColor::Rgba(255, 0, 0, 255))
+        );
     }
 
     #[test]

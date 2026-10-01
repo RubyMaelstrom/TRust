@@ -38,6 +38,7 @@ mod history;
 mod import_maps;
 mod page_threads;
 mod referrer_policy;
+mod relative_color;
 pub mod render;
 pub mod responsive_image;
 pub mod site_storage;
