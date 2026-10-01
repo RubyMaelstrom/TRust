@@ -3290,6 +3290,36 @@ mod tests {
     }
 
     #[test]
+    fn shrink_to_fit_boxes_size_cyclic_percentage_images_by_their_natural_width() {
+        // css-sizing-3 §5.2.1: while measuring a fit-content, inline-block,
+        // float or flex item, an image's percentage width is cyclic: auto for
+        // the max-content contribution, zero for the min-content one.
+        let images = HashMap::from([("http://e.com/i.png".to_string(), (64u32, 80u32))]);
+        let dom = Dom::parse_document(
+            r#"<style>*{margin:0;padding:0}img{width:105%}div,span{border:2px solid}</style>
+            <div id=fit style="width:fit-content"><img src="i.png"></div>
+            <span id=inline style="display:inline-block"><img src="i.png"></span>
+            <div style="display:flex;width:600px"><div style="flex:none;width:300px"></div>
+            <div id=item><img src="i.png"></div></div>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(1000.0, 600.0),
+            &forms,
+            &controls,
+            &images,
+        );
+        for id in ["fit", "inline", "item"] {
+            let node = dom.get_by_id(id).unwrap();
+            let width = layout.boxes[&node].width;
+            assert!((width - 68.0).abs() < 1.0, "#{id}: {width}");
+        }
+    }
+
+    #[test]
     fn graphical_inline_image_and_text_share_a_css_baseline() {
         let images = HashMap::from([("http://e.com/i.png".to_string(), (80u32, 48u32))]);
         let layout = lay_graphical(

@@ -364,6 +364,8 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// `overflow-wrap: break-word`'s emergency breaks must NOT count as
     /// min-content opportunities (CSS Text §5.5 — unlike `anywhere`).
     measuring: bool,
+    /// The probe measures min-content (else max-content).
+    measuring_min: bool,
     /// Block-level replaced content is positioned by its enclosing fragment.
     /// Only genuine inline atoms need their own post-line position adjustment.
     position_inline_atoms: bool,
@@ -433,6 +435,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             indent,
             on_first_line: true,
             measuring: false,
+            measuring_min: false,
             position_inline_atoms: true,
             strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
         };
@@ -441,8 +444,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 
     /// Mark this IFC as an intrinsic-size probe (see the `measuring` field).
-    pub fn mark_measuring(&mut self) {
+    pub fn mark_measuring(&mut self, min_content: bool) {
         self.measuring = true;
+        self.measuring_min = min_content;
     }
 
     /// Set the current line box's left/right boundaries from the float band at
@@ -1392,6 +1396,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
             density,
         );
+        // css-sizing-3 §5.2.1: a probe's containing block width is the
+        // unknown size being measured. A cyclic percentage width behaves as
+        // auto for the max-content contribution and resolves against zero
+        // for the min-content one (`img { width: 105% }` in a fit-content box).
+        let cb_w = if self.measuring {
+            self.measuring_min.then_some(0.0)
+        } else {
+            Some(self.cb_w_px)
+        };
         if let Some(r) = super::replaced::size(
             self.dom,
             node,
@@ -1400,7 +1413,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 natural,
                 url,
             },
-            Some(self.cb_w_px),
+            cb_w,
             self.cb_h_px,
             self.vp,
         ) {
