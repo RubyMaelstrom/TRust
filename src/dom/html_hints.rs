@@ -605,6 +605,40 @@ mod tests {
     }
 
     #[test]
+    fn monospace_elements_use_the_monospace_medium_size() {
+        // HTML Rendering makes pre/code/kbd/samp/tt monospace; Gecko and
+        // Blink size a keyword-derived font against a 13px monospace medium
+        // only when the family list is exactly `monospace`.
+        let dom = Dom::parse_document(
+            r#"<pre id=pre>a</pre><code id=code>a</code><kbd id=kbd>a</kbd>
+            <span id=pair style="font-family:monospace, serif">a</span>
+            <div style="font-size:20px"><code id=fixed>a</code></div>
+            <h1><code id=heading>a</code></h1><small><tt id=small>a</tt></small>
+            <pre><span id=back style="font-family:sans-serif">a</span></pre>
+            <code id=em style="font-size:1.5em">a</code>"#,
+        );
+        let px = |id: &str| dom.font_px(dom.get_by_id(id).unwrap());
+        assert_eq!(
+            dom.computed_value(dom.get_by_id("pre").unwrap(), "font-family")
+                .as_deref(),
+            Some("monospace")
+        );
+        for (id, expected) in [
+            ("pre", 13.0),
+            ("code", 13.0),
+            ("kbd", 13.0),
+            ("pair", 16.0),
+            ("fixed", 20.0),
+            ("heading", 26.0),
+            ("small", 13.0 / 1.2),
+            ("back", 16.0),
+            ("em", 19.5),
+        ] {
+            assert!((px(id) - expected).abs() < 0.01, "{id}: {}", px(id));
+        }
+    }
+
+    #[test]
     fn legacy_color_follows_html_code_point_and_component_rules() {
         for (input, expected) in [
             ("", None),
@@ -697,7 +731,8 @@ mod tests {
         }
         assert_eq!(value("font", "color").as_deref(), Some("#4a90d9"));
         assert_eq!(value("font", "font-size").as_deref(), Some("xxx-large"));
-        assert_eq!(dom.font_px(dom.get_by_id("font").unwrap()), 48.);
+        // face=monospace sizes the keyword from the 13px monospace row.
+        assert_eq!(dom.font_px(dom.get_by_id("font").unwrap()), 39.);
         assert_eq!(value("font", "font-family").as_deref(), Some("monospace"));
         assert_eq!(value("sheet", "color").as_deref(), Some("lime"));
         assert_eq!(value("sheet", "font-size").as_deref(), Some("20px"));

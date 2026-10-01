@@ -4656,11 +4656,80 @@ impl Dom {
                 .and_then(ua_font_factor)
                 .map_or(parent_px, |f| f * parent_px)
         };
-        let v = if guard.cyclic() { parent_px } else { v };
+        let v = if guard.cyclic() {
+            parent_px
+        } else {
+            self.generic_keyword_font_px(id).unwrap_or(v)
+        };
         self.font_cache
             .borrow_mut()
             .put(id, self.style_value_epoch, v);
         v
+    }
+
+    /// Gecko and Blink size a keyword-derived font against the medium size
+    /// of its generic family when the family list is exactly `monospace`
+    /// (13px rather than 16px, hence the `monospace, monospace` idiom); a
+    /// descendant leaving that family returns to the ordinary table. Sizes
+    /// fixed by an absolute length keep it.
+    fn generic_keyword_font_px(&self, id: NodeId) -> Option<f32> {
+        let monospace = |node: NodeId| {
+            self.computed_value_resolved(node, "font-family")
+                .is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"))
+        };
+        let own = monospace(id);
+        if !own
+            && !self
+                .style_parent(id)
+                .is_some_and(|parent| parent != DOCUMENT && monospace(parent))
+        {
+            return None;
+        }
+        let (keyword, factor) = self.font_size_keyword(id)?;
+        let size = if own {
+            monospace_absolute_size_px(keyword)
+        } else {
+            absolute_size_px(keyword)
+        }?;
+        Some(size * factor)
+    }
+
+    /// The absolute-size keyword `id`'s font size derives from, and the
+    /// factor relative sizes applied since (Gecko's `KeywordInfo`); `None`
+    /// once an absolute length or root-relative size intervenes. The root's
+    /// initial size is `medium`.
+    fn font_size_keyword(&self, id: NodeId) -> Option<(&'static str, f32)> {
+        let mut factor = 1.0;
+        let mut node = Some(id);
+        while let Some(current) = node.filter(|&node| node != DOCUMENT) {
+            if let Some(raw) = self.cascaded(current, "font-size") {
+                let value = self.resolve_vars(current, &raw).trim().to_ascii_lowercase();
+                if let Some(keyword) = ABSOLUTE_SIZE_KEYWORDS
+                    .iter()
+                    .find(|keyword| **keyword == value)
+                {
+                    return Some((keyword, factor));
+                }
+                match value.as_str() {
+                    "larger" => factor *= 1.2,
+                    "smaller" => factor /= 1.2,
+                    "inherit" | "unset" | "revert" => {}
+                    "initial" => return Some(("medium", factor)),
+                    _ => {
+                        let (number, unit) = crate::layout2::css_number_prefix(&value)?;
+                        match unit {
+                            "em" => factor *= number,
+                            "%" => factor *= number / 100.0,
+                            _ => return None,
+                        }
+                    }
+                }
+            } else if let Some(scale) = self.tag_name(current).and_then(ua_font_factor) {
+                factor *= scale;
+            }
+            node = self.style_parent(current);
+        }
+        Some(("medium", factor))
     }
 
     fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
@@ -4747,6 +4816,15 @@ impl Dom {
                 "underline"
             }
             "white-space" if tag == "pre" => "pre",
+            // HTML Rendering #flow-content-3 and #phrasing-content-3.
+            "font-family"
+                if matches!(
+                    tag,
+                    "pre" | "listing" | "plaintext" | "xmp" | "code" | "kbd" | "samp" | "tt"
+                ) =>
+            {
+                "monospace"
+            }
             "list-style-type" if tag == "ul" => self.ul_marker_default(id),
             "list-style-type" if tag == "ol" => self.ol_marker_default(id),
             // HTML Rendering #the-details-and-summary-elements: only the
@@ -11818,6 +11896,33 @@ fn ua_font_factor(tag: &str) -> Option<f32> {
         "h6" => 0.67,
         "small" | "sub" | "sup" => 1.0 / 1.2,
         "big" => 1.2,
+        _ => return None,
+    })
+}
+
+const ABSOLUTE_SIZE_KEYWORDS: [&str; 8] = [
+    "xx-small",
+    "x-small",
+    "small",
+    "medium",
+    "large",
+    "x-large",
+    "xx-large",
+    "xxx-large",
+];
+
+/// The keyword sizes for the `monospace` generic, whose medium is 13px in
+/// Gecko and Blink (their pixel tables' 13px row).
+fn monospace_absolute_size_px(keyword: &str) -> Option<f32> {
+    Some(match keyword {
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 12.0,
+        "medium" => 13.0,
+        "large" => 16.0,
+        "x-large" => 20.0,
+        "xx-large" => 26.0,
+        "xxx-large" => 39.0,
         _ => return None,
     })
 }
