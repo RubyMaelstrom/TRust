@@ -901,6 +901,14 @@ impl Flow<'_> {
         // The definite content height children/replaced content resolve
         // percentages against (clamped — §10.5 wants the used basis).
         let ifc_cb_h = spec_h.map(|v| v.clamp(min_h, max_h.max(min_h)));
+        // Quirks Mode: an auto-height block container hands its children a
+        // percentage-height basis.
+        let child_cb_h = ifc_cb_h.or_else(|| {
+            spec_h
+                .is_none()
+                .then(|| self.quirks_percentage_basis(b, style_node, cb_h, mt + mb, bt + bb))
+                .flatten()
+        });
 
         let mut y_border: Option<f32> = None;
         if bt > 0.0 || own_bfc {
@@ -956,7 +964,7 @@ impl Flow<'_> {
                                 k,
                                 content_x,
                                 h.content_w,
-                                ifc_cb_h,
+                                child_cb_h,
                                 cur,
                                 &inl,
                                 cfc,
@@ -996,7 +1004,7 @@ impl Flow<'_> {
                             content_x,
                             content_top_y,
                             h.content_w,
-                            ifc_cb_h,
+                            child_cb_h,
                             block_align(self.dom, style_node),
                             self.indent_px(style_node, h.content_w),
                             marker,
@@ -2043,6 +2051,75 @@ impl Flow<'_> {
         (b.node != NO_NODE && matches!(self.dom.tag_name(b.node), Some("iframe" | "frame")))
             .then(|| self.height_px(&Len::px(150.0), s, bt, bb, Some(150.0)))
             .flatten()
+    }
+
+    /// Quirks Mode #the-percentage-height-calculation-quirk: in a quirks
+    /// document an auto-height block container is skipped when its children
+    /// resolve percentage heights, so they inherit its own basis. A table
+    /// cell or an absolutely positioned box ends the walk. The root and body
+    /// contribute the sizes that #the-html-element-fills-the-viewport-quirk
+    /// and #the-body-element-fills-the-html-element-quirk give them: the
+    /// viewport less margins, borders and padding. Like Gecko, those fills
+    /// only feed this percentage basis; the boxes keep their content height.
+    fn quirks_percentage_basis(
+        &self,
+        b: &BoxNode,
+        style_node: NodeId,
+        cb_h: Option<f32>,
+        margins: f32,
+        edges: f32,
+    ) -> Option<f32> {
+        let s = &b.style;
+        if style_node == NO_NODE
+            || !s.height.is_auto()
+            || s.position.out_of_flow()
+            || !matches!(b.content, Content::Blocks(_) | Content::Inlines(_))
+            || self.dom.owner_document(style_node).is_none_or(|document| {
+                self.dom.document_mode(document) != html5ever::tree_builder::QuirksMode::Quirks
+            })
+        {
+            return None;
+        }
+        if b.node == NO_NODE {
+            return cb_h;
+        }
+        let fills = match self.dom.tag_name(b.node) {
+            Some("html") => self.dom.is_document_element(b.node),
+            // HTML #the-body-element-2: the root html element's first body
+            // or frameset child.
+            Some("body")
+                if s.float.is_none()
+                    && s.vertical != Some(true)
+                    && !self
+                        .dom
+                        .effective_display(b.node)
+                        .is_some_and(|display| display.starts_with("inline")) =>
+            {
+                self.dom
+                    .node(b.node)
+                    .parent
+                    .filter(|&root| {
+                        self.dom.tag_name(root) == Some("html")
+                            && self.dom.is_document_element(root)
+                    })
+                    .is_some_and(|root| {
+                        self.dom.child_iter(root).find(|&child| {
+                            matches!(self.dom.tag_name(child), Some("body" | "frameset"))
+                        }) == Some(b.node)
+                    })
+            }
+            _ => {
+                if self.dom.effective_display(b.node).as_deref() == Some("table-cell") {
+                    return None;
+                }
+                false
+            }
+        };
+        if fills {
+            cb_h.map(|available| (available - margins - edges).max(0.0))
+        } else {
+            cb_h
+        }
     }
 
     /// `text-indent` in px for a box's IFC (inherited; percentages against
