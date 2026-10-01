@@ -59,14 +59,9 @@ impl TextState {
             return;
         }
         let size = match font.font_size {
-            "xx-small" => Some(9.6),
-            "x-small" => Some(12.),
-            "small" => Some(16. * 8. / 9.),
-            "medium" => Some(16.),
-            "large" => Some(19.2),
-            "x-large" => Some(24.),
-            "xx-large" => Some(32.),
-            "xxx-large" => Some(48.),
+            keyword if crate::dom::absolute_size_px(keyword).is_some() => {
+                crate::dom::absolute_size_px(keyword)
+            }
             "larger" => Some(units.fs * 1.2),
             "smaller" => Some(units.fs / 1.2),
             size if size.ends_with('%') => size[..size.len() - 1]

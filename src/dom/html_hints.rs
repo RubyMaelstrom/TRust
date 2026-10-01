@@ -588,6 +588,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_font_sizes_use_browser_keyword_pixels() {
+        // HTML Rendering maps <font size> 1-7 to x-small..xxx-large; CSS
+        // Fonts 4 #absolute-size-mapping lets UAs tune the keyword sizes,
+        // and Gecko and Blink agree on these for a 16px medium.
+        let dom = Dom::parse_document(
+            "<font id=f1 size=1>a</font><font id=f2 size=2>a</font><font id=f3 size=3>a</font>\
+             <font id=f4 size=4>a</font><font id=f5 size=5>a</font><font id=f6 size=6>a</font>\
+             <font id=f7 size=7>a</font><span id=xxs style=font-size:xx-small>a</span>",
+        );
+        let px = |id: &str| dom.font_px(dom.get_by_id(id).unwrap());
+        assert_eq!(
+            ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "xxs"].map(px),
+            [10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0, 9.0]
+        );
+    }
+
+    #[test]
     fn legacy_color_follows_html_code_point_and_component_rules() {
         for (input, expected) in [
             ("", None),
@@ -721,7 +738,8 @@ mod tests {
         );
         dom.set_attr(font, "size", "-2");
         dom.set_attr(font, "color", "transparent");
-        assert_eq!(dom.font_px(font), 12.);
+        // size -2 is x-small: 10px for a 16px medium, as in Gecko and Blink.
+        assert_eq!(dom.font_px(font), 10.);
         assert_eq!(
             dom.computed_value(font, "color").as_deref(),
             Some("#ffffff")

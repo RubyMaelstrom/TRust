@@ -11822,24 +11822,37 @@ fn ua_font_factor(tag: &str) -> Option<f32> {
     })
 }
 
+/// CSS Fonts 4 #absolute-size-mapping lets UAs fine-tune the keyword
+/// scaling factors. Gecko and Blink share these pixel sizes for a 16px
+/// medium (Gecko's `FONT_SIZE_MAPPING`, Blink's `kFontSizeTable`), which
+/// legacy `<font size>` relies on: size 4 is 18px, not 6/5 of 16px.
+pub(crate) fn absolute_size_px(keyword: &str) -> Option<f32> {
+    Some(match keyword {
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
+        "medium" => FONT_SIZE_INITIAL,
+        "large" => 18.0,
+        "x-large" => 24.0,
+        "xx-large" => 32.0,
+        "xxx-large" => 48.0,
+        _ => return None,
+    })
+}
+
 /// A `font-size` declaration in CSS px, resolved against the inherited
 /// (`parent`) and root sizes per CSS Fonts §6.1: the absolute keywords map
-/// through the medium-relative table, `larger`/`smaller` step the inherited
+/// through `absolute_size_px`, `larger`/`smaller` step the inherited
 /// size by 1.2, `em`/`%`/`ex`/`ch` multiply the inherited size, `rem` the
 /// root's, and the physical units convert at CSS's fixed ratios (96px/in).
 /// `None` (→ inherit) for anything unresolvable: `calc()`, a dangling
 /// `var()`, negative sizes, garbage.
 pub(crate) fn font_size_px(value: &str, parent: f32, root: f32) -> Option<f32> {
     let v = value.trim().to_ascii_lowercase();
+    if let Some(size) = absolute_size_px(&v) {
+        return Some(size);
+    }
     match v.as_str() {
-        "xx-small" => return Some(FONT_SIZE_INITIAL * 3.0 / 5.0),
-        "x-small" => return Some(FONT_SIZE_INITIAL * 3.0 / 4.0),
-        "small" => return Some(FONT_SIZE_INITIAL * 8.0 / 9.0),
-        "medium" => return Some(FONT_SIZE_INITIAL),
-        "large" => return Some(FONT_SIZE_INITIAL * 6.0 / 5.0),
-        "x-large" => return Some(FONT_SIZE_INITIAL * 3.0 / 2.0),
-        "xx-large" => return Some(FONT_SIZE_INITIAL * 2.0),
-        "xxx-large" => return Some(FONT_SIZE_INITIAL * 3.0),
         "larger" => return Some(parent * 1.2),
         "smaller" => return Some(parent / 1.2),
         "inherit" | "unset" | "revert" => return Some(parent),
