@@ -34,6 +34,26 @@ impl Dom {
         {
             hint("background-color", color);
         }
+        // HTML Rendering #the-page and #tables-2: a non-empty `background`
+        // attribute is a background-image hint, its URL parsed relative to
+        // the node document; a parse failure contributes no hint. Without
+        // any document URL the reference stays relative, like author CSS.
+        if matches!(
+            tag,
+            "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+        ) && let Some(source) = self.attr(id, "background").filter(|s| !s.is_empty())
+            && let Some(resolved) = match self.doc_url.as_ref() {
+                Some(page) => self
+                    .resource_base_url(id, page)
+                    .join(source)
+                    .ok()
+                    .map(String::from),
+                None => Some(source.trim().to_string()),
+            }
+        {
+            let escaped = resolved.replace('\\', "\\\\").replace('"', "\\\"");
+            hint("background-image", format!("url(\"{escaped}\")"));
+        }
         let color_attribute = match tag {
             "body" => Some("text"),
             "font" | "hr" => Some("color"),
@@ -287,6 +307,41 @@ mod tests {
         let snapshot = dom.serialize(frame);
         assert!(snapshot.contains("width:300px"), "{snapshot}");
         assert!(snapshot.contains("height:150px"), "{snapshot}");
+    }
+
+    #[test]
+    fn background_attribute_hints_resolve_against_the_document_base() {
+        let mut dom = Dom::parse_document(
+            r#"<base href="/art/"><body id=b background="stars.gif">
+            <table id=t background=""><tr id=r background=" ">
+            <td id=c background='tile "1".gif'>x</td></tr></table>
+            <div id=d background=stars.gif></div>"#,
+        );
+        dom.set_doc_url(url::Url::parse("https://site.example/dir/page.html").ok());
+        let image = |dom: &Dom, id: &str| {
+            dom.computed_value(dom.get_by_id(id).unwrap(), "background-image")
+                .unwrap_or_else(|| "none".into())
+        };
+        assert_eq!(
+            image(&dom, "b"),
+            r#"url("https://site.example/art/stars.gif")"#
+        );
+        // Only an empty value is ignored; whitespace parses as the base.
+        assert_eq!(image(&dom, "t"), "none");
+        assert_eq!(image(&dom, "r"), r#"url("https://site.example/art/")"#);
+        assert_eq!(
+            image(&dom, "c"),
+            r#"url("https://site.example/art/tile%20%221%22.gif")"#
+        );
+        assert_eq!(image(&dom, "d"), "none");
+        let cell = dom.get_by_id("c").unwrap();
+        dom.set_attr(cell, "background", "moon.png");
+        assert_eq!(
+            image(&dom, "c"),
+            r#"url("https://site.example/art/moon.png")"#
+        );
+        dom.set_attr(cell, "style", "background-image:none");
+        assert_eq!(image(&dom, "c"), "none");
     }
 
     #[test]
