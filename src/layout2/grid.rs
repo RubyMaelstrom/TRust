@@ -1896,8 +1896,8 @@ impl Flow<'_> {
             .iter()
             .zip(&placed)
             .map(|(it, p)| {
-                let min = self.contribution(it, IMode::Min, inl);
-                let max = self.contribution(it, IMode::Max, inl);
+                let min = self.contribution(it, IMode::Min, inl, None);
+                let max = self.contribution(it, IMode::Max, inl, None);
                 let s = &it.style;
                 let bp = s.border[LEFT]
                     + s.border[RIGHT]
