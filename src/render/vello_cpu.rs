@@ -201,6 +201,7 @@ impl VelloCpuRenderer {
                     self.context.set_fill_rule(shape_fill(shape));
                     self.context.fill_path(&shape_path(shape));
                     self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+                    self.context.reset_paint_transform();
                 }
                 DisplayCommand::Stroke {
                     shape,
@@ -219,6 +220,7 @@ impl VelloCpuRenderer {
                     self.set_brush(brush);
                     self.context.set_stroke(vello_stroke(style));
                     self.context.stroke_path(&shape_path(shape));
+                    self.context.reset_paint_transform();
                 }
                 DisplayCommand::PushClip(shape) => {
                     clips.push(
@@ -523,7 +525,6 @@ impl VelloCpuRenderer {
                 repeat,
             } => {
                 let stops = vello_stops(stops);
-                self.context.reset_paint_transform();
                 self.context.set_paint(
                     Gradient::new_linear(
                         (f64::from(start.x), f64::from(start.y)),
