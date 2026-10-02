@@ -1795,6 +1795,7 @@ mod desktop {
             net: env.net.clone(),
             storage: env.storage.clone(),
             blobs: env.blobs.clone(),
+            scripted_frames: env.scripted_frames,
         };
         let mut page = match load_page(html, env, host_tx, &mut host_rx, None, interrupt.clone()) {
             Ok(page) => page,
@@ -2660,7 +2661,7 @@ mod desktop {
             .into_iter()
             .map(|(_, _, _, node)| node)
             .collect();
-        if scripts.is_empty() && !crate::js::needs_live_dom(&dom.borrow()) {
+        if scripts.is_empty() && !env.scripted_frames && !crate::js::needs_live_dom(&dom.borrow()) {
             return Err(outcome);
         }
 
