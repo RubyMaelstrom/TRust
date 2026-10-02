@@ -4553,9 +4553,46 @@ impl Dom {
                     .map_or(value.clone(), |n| format!("{}px", n * self.font_px(id))),
             );
         }
+        // CSS Backgrounds 3 #border-width: the computed width is an absolute
+        // length, and zero when the side's style is none or hidden.
+        if let Some(side) = name
+            .strip_prefix("border-")
+            .and_then(|rest| rest.strip_suffix("-width"))
+            .filter(|side| matches!(*side, "top" | "right" | "bottom" | "left"))
+        {
+            let style = self.cssom_resolved_value(id, &format!("border-{side}-style"));
+            if style
+                .as_deref()
+                .is_none_or(|style| matches!(style, "none" | "hidden"))
+            {
+                return Some("0px".into());
+            }
+            let width = self
+                .computed_value_resolved(id, name)
+                .unwrap_or_else(|| "medium".into());
+            return Some(self.cssom_line_width(id, &width));
+        }
+        if name == "outline-width" {
+            let width = self
+                .computed_value_resolved(id, name)
+                .unwrap_or_else(|| "medium".into());
+            return Some(self.cssom_line_width(id, &width));
+        }
         let value = self
             .computed_value_resolved(id, name)
             .or_else(|| cssom_initial_value(name).map(str::to_string));
+        // CSSOM #resolved-values: a color property's resolved value is its
+        // used color, so `currentcolor` takes the element's color.
+        if (is_color_property(name) || matches!(name, "column-rule-color" | "caret-color"))
+            && let Some(color) = value.as_deref()
+        {
+            let color = if color.trim().eq_ignore_ascii_case("auto") {
+                "currentcolor"
+            } else {
+                color
+            };
+            return Some(self.cssom_color(id, name, color));
+        }
         // Absolute box-edge lengths need no geometry flush. In particular,
         // JS measuring a text area's line count must receive `16px`, not
         // `calc(.25rem * 4)`. Percentage/auto edges still need used geometry;
@@ -4577,6 +4614,50 @@ impl Dom {
             return Some(format!("{px}px"));
         }
         value
+    }
+
+    /// A `<line-width>` computed value: its keyword's or length's px.
+    fn cssom_line_width(&self, id: NodeId, width: &str) -> String {
+        match width.trim().to_ascii_lowercase().as_str() {
+            "thin" => "1px".into(),
+            "medium" => "3px".into(),
+            "thick" => "5px".into(),
+            other => crate::layout2::absolute_css_length(self, id, other)
+                .map_or_else(|| width.to_string(), |px| format!("{px}px")),
+        }
+    }
+
+    /// The resolved value of color property `name` whose computed value is
+    /// `color`: `currentcolor` is the element's (for `color`, its parent's)
+    /// color, and system colors use the light palette TRust renders with.
+    fn cssom_color(&self, id: NodeId, name: &str, color: &str) -> String {
+        if color.trim().eq_ignore_ascii_case("currentcolor") {
+            return match name {
+                "color" => self
+                    .style_parent(id)
+                    .and_then(|parent| self.cssom_resolved_value(parent, "color"))
+                    .unwrap_or_else(|| "rgb(0, 0, 0)".into()),
+                _ => self
+                    .cssom_resolved_value(id, "color")
+                    .unwrap_or_else(|| "rgb(0, 0, 0)".into()),
+            };
+        }
+        if let Some(resolved) = properties::resolved_color(color) {
+            return resolved;
+        }
+        match color.trim().to_ascii_lowercase().as_str() {
+            "canvas" | "field" | "buttonface" => "rgb(255, 255, 255)".into(),
+            "canvastext" | "fieldtext" | "buttontext" | "highlighttext" | "selecteditemtext"
+            | "marktext" | "accentcolortext" => "rgb(0, 0, 0)".into(),
+            "linktext" => "rgb(0, 0, 238)".into(),
+            "visitedtext" => "rgb(85, 26, 139)".into(),
+            "activetext" => "rgb(255, 0, 0)".into(),
+            "graytext" => "rgb(109, 109, 109)".into(),
+            "buttonborder" => "rgb(118, 118, 118)".into(),
+            "highlight" | "selecteditem" | "accentcolor" => "rgb(0, 120, 215)".into(),
+            "mark" => "rgb(255, 255, 0)".into(),
+            _ => color.to_string(),
+        }
     }
 
     /// Pure memoization for CSS Values 3 #font-relative-lengths. Repeated
@@ -11941,6 +12022,92 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "clip-path" => Some("none"),
         "-webkit-line-clamp" => Some("none"),
         "-webkit-box-orient" => Some("horizontal"),
+        // Each property's initial value (its definition table), so
+        // getComputedStyle never answers an undeclared property with "".
+        "color" => Some("canvastext"),
+        "background-color" => Some("transparent"),
+        "border-top-color"
+        | "border-right-color"
+        | "border-bottom-color"
+        | "border-left-color"
+        | "outline-color"
+        | "column-rule-color"
+        | "caret-color" => Some("currentcolor"),
+        "border-top-style"
+        | "border-right-style"
+        | "border-bottom-style"
+        | "border-left-style"
+        | "outline-style"
+        | "column-rule-style" => Some("none"),
+        "border-top-left-radius"
+        | "border-top-right-radius"
+        | "border-bottom-right-radius"
+        | "border-bottom-left-radius"
+        | "outline-offset"
+        | "text-indent"
+        | "word-spacing" => Some("0px"),
+        "background-image"
+        | "box-shadow"
+        | "text-shadow"
+        | "filter"
+        | "backdrop-filter"
+        | "float"
+        | "clear"
+        | "text-transform"
+        | "resize"
+        | "perspective"
+        | "contain"
+        | "animation-name"
+        | "animation-fill-mode"
+        | "mask-image"
+        | "border-image-source" => Some("none"),
+        "background-repeat" => Some("repeat"),
+        "background-position" => Some("0% 0%"),
+        "background-size" => Some("auto"),
+        "background-attachment" => Some("scroll"),
+        "background-clip" => Some("border-box"),
+        "background-origin" => Some("padding-box"),
+        "font-family" => Some("sans-serif"),
+        "font-style"
+        | "font-variant"
+        | "letter-spacing"
+        | "white-space"
+        | "word-break"
+        | "overflow-wrap"
+        | "unicode-bidi"
+        | "mix-blend-mode"
+        | "animation-direction"
+        | "content"
+        | "justify-content"
+        | "align-items"
+        | "align-content"
+        | "row-gap"
+        | "column-gap"
+        | "line-break" => Some("normal"),
+        "font-stretch" => Some("100%"),
+        "text-align" => Some("start"),
+        "vertical-align" => Some("baseline"),
+        "text-overflow" => Some("clip"),
+        "object-fit" => Some("fill"),
+        "cursor" | "isolation" | "will-change" | "user-select" | "touch-action"
+        | "scroll-behavior" | "aspect-ratio" | "align-self" | "justify-self" | "flex-basis"
+        | "min-width" | "min-height" | "width" | "height" | "table-layout" | "column-count"
+        | "column-width" | "clip" | "image-rendering" | "text-rendering" | "font-kerning"
+        | "quotes" => Some("auto"),
+        "flex-grow" | "order" => Some("0"),
+        "flex-shrink" | "animation-iteration-count" => Some("1"),
+        "flex-direction" => Some("row"),
+        "flex-wrap" => Some("nowrap"),
+        "border-collapse" => Some("separate"),
+        "caption-side" => Some("top"),
+        "empty-cells" => Some("show"),
+        "backface-visibility" => Some("visible"),
+        "animation-duration" | "animation-delay" => Some("0s"),
+        "animation-play-state" => Some("running"),
+        "animation-timing-function" => Some("ease"),
+        "object-position" => Some("50% 50%"),
+        "tab-size" => Some("8"),
+        "hyphens" => Some("manual"),
         _ => None,
     }
 }
@@ -19392,7 +19559,7 @@ mod tests {
         assert_eq!(
             dom.cssom_resolved_value(dom.get_by_id("order").unwrap(), "text-decoration")
                 .as_deref(),
-            Some("underline solid blue")
+            Some("underline solid rgb(0, 0, 255)")
         );
         assert_eq!(
             value("invalid", "text-decoration-color").as_deref(),

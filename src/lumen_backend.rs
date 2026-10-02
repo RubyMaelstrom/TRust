@@ -16578,7 +16578,7 @@ mod tests {
             version.focus({preventScroll:true});
             check(!file.matches(':focus') && file.matches(':focus-within'), 'ancestor focus-within only');
             check(getComputedStyle(platforms).display === 'block' && platforms.getClientRects().length, 'nested menu');
-            check(getComputedStyle(document.getElementById('download')).color === '#33b5e5', 'all unset inherits visible menu text');
+            check(getComputedStyle(document.getElementById('download')).color === 'rgb(51, 181, 229)', 'all unset inherits visible menu text');
             check(document.querySelector('nav:has(:focus)') && document.querySelector('li:is(:focus)') === version, 'logical selectors');
             check(events.join() === 'true,true', 'synchronous focus event state');
             help.addEventListener('mousedown', e => e.preventDefault(), {once:true});
@@ -16622,7 +16622,7 @@ mod tests {
             button.focus();
             check(button.matches(':focus') && !host.matches(':focus'), 'slotted focus not retargeted');
             check(slot.matches(':focus-within') && section.matches(':focus-within') && host.matches(':focus-within'), 'flat ancestors');
-            check(getComputedStyle(document.querySelector('p')).color === 'red', 'sibling invalidation');
+            check(getComputedStyle(document.querySelector('p')).color === 'rgb(255, 0, 0)', 'sibling invalidation');
             const shadow = root.querySelector('button'); shadow.focus();
             check(shadow.matches(':focus') && host.matches(':focus') && !section.matches(':focus'), 'shadow host focus');
             check(!slot.matches(':focus-within'), 'old flat ancestor cleared');
@@ -17060,6 +17060,41 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_resolves_colors_line_widths_and_initial_values() {
+        // CSSOM #resolved-values: colors are used colors (CSS Color 4
+        // #serializing-sRGB-values), border widths are zero for a `none`
+        // style, and an undeclared property reads its initial value, never
+        // "". Expected values measured in LibreWolf 153.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><div id=b style='border:2px dotted red;color:#0a0b0c;\
+                     background:hsl(120 50% 50%)'>z</div><div id=c style='border-top:medium solid;\
+                     outline:thick dashed;background:rgba(0,0,0,.5)'>w</div><span id=d>q</span>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const cs = id => getComputedStyle(document.getElementById(id));
+            const b = cs('b'), c = cs('c'), d = cs('d');
+            [b.borderTopWidth, b.borderTopColor, b.color, b.backgroundColor, b.outlineColor,
+             c.borderTopWidth, c.borderLeftWidth, c.borderTopColor, c.outlineWidth, c.backgroundColor,
+             d.borderTopStyle, d.color, d.backgroundColor, d.textAlign, d.verticalAlign,
+             d.float, d.cursor, d.flexGrow, d.width].join('|');
+        "#
+            ),
+            "2px|rgb(255, 0, 0)|rgb(10, 11, 12)|rgb(64, 191, 64)|rgb(10, 11, 12)|\
+             3px|0px|rgb(0, 0, 0)|5px|rgba(0, 0, 0, 0.5)|\
+             none|rgb(0, 0, 0)|rgba(0, 0, 0, 0)|start|baseline|none|auto|0|auto"
+        );
+    }
+
+    #[test]
     fn cssom_logical_properties_keep_specified_names_and_mutation_order() {
         let mut engine = configured_engine(
             HostState::new(
@@ -17073,7 +17108,7 @@ mod tests {
                 &mut engine,
                 r#"
             const box = document.getElementById('box'), s = box.style;
-            s.cssText='direction:rtl;border-inline-end-width:1px;border-left-width:2px';
+            s.cssText='direction:rtl;border-style:solid;border-inline-end-width:1px;border-left-width:2px';
             const specified = [s.borderInlineEndWidth,s.borderLeftWidth].join(',');
             s.borderInlineEndWidth='1px';
             const first = getComputedStyle(box).borderLeftWidth;
