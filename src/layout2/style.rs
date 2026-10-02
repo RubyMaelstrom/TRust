@@ -1481,10 +1481,26 @@ impl InlineStyle {
     /// text properties take effect there; others, such as `vertical-align`,
     /// `opacity` and `text-decoration`, do not apply to the marker box.
     pub fn marker(&self, dom: &Dom) -> std::borrow::Cow<'_, Self> {
+        // The UA style sheet gives ::marker `text-transform: none`, which
+        // only an author ::marker declaration overrides.
         if self.node == NO_NODE || !dom.has_marker_style(self.node) {
-            return std::borrow::Cow::Borrowed(self);
+            return if self.transform == TextTransform::None {
+                std::borrow::Cow::Borrowed(self)
+            } else {
+                std::borrow::Cow::Owned(Self {
+                    transform: TextTransform::None,
+                    ..self.clone()
+                })
+            };
         }
         let mut s = self.with_pseudo(dom, Some((self.node, PseudoEl::Marker)));
+        if dom
+            .pseudo_style(self.node, PseudoEl::Marker, "text-transform")
+            .or_else(|| dom.baked_pseudo_value(self.node, PseudoEl::Marker, "text-transform"))
+            .is_none()
+        {
+            s.transform = TextTransform::None;
+        }
         s.vertical_align = self.vertical_align;
         s.emph.underline = self.emph.underline;
         s.emph.strike = self.emph.strike;
