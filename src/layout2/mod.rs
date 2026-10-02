@@ -3853,6 +3853,33 @@ mod tests {
     }
 
     #[test]
+    fn words_continue_across_inline_box_boundaries() {
+        // CSS Text 3 #line-breaking: an inline box boundary is not itself a
+        // soft wrap opportunity. A word split across elements, or a link and
+        // its following period, wraps as one unit; a hyphen still breaks.
+        let html = r#"<!doctype html><body style="margin:0;font:10px/10px monospace">
+            <p style="margin:0;width:70px">aaa bbb <span id=a>ccc</span><b id=b>ddd</b></p>
+            <p style="margin:0;width:70px">aaa bbb <a id=c href=#>ccc</a><i id=d>.</i></p>
+            <p style="margin:0;width:70px">aaa bbb <span id=e>cc-</span><b id=f>ddd</b></p>
+            <p style="margin:0;width:70px">aaa bbb <span id=g>ccc</span> <b id=h>ddd</b></p></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let line = |id: &str| {
+            let b = &layout.boxes[&dom.get_by_id(id).unwrap()];
+            let p = dom.parent_flat(dom.get_by_id(id).unwrap()).unwrap();
+            ((b.top - layout.boxes[&p].top) / 10.0).round() as i32
+        };
+        assert_eq!((line("a"), line("b")), (1, 1), "a split word moves whole");
+        assert_eq!(
+            (line("c"), line("d")),
+            (1, 1),
+            "the period stays with its link"
+        );
+        assert_eq!((line("e"), line("f")), (0, 1), "a hyphen allows the break");
+        assert_eq!((line("g"), line("h")), (0, 1), "a space allows the break");
+    }
+
+    #[test]
     fn a_fixed_cell_width_is_its_columns_preferred_width() {
         // In automatic table layout a cell's or column's fixed width replaces
         // the column's max-content preference, though never below its

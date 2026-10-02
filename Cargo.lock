@@ -31,6 +31,7 @@ dependencies = [
  "http",
  "httpdate",
  "icu_properties",
+ "icu_segmenter",
  "image",
  "khronos-egl",
  "libmimalloc-sys",

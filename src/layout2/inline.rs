@@ -120,6 +120,38 @@ pub(crate) struct InlineBoxes {
 /// (`::before`/`::after`/`::first-letter`) boxes of an originating element.
 pub(crate) type InlineBoxKey = (NodeId, Option<PseudoEl>);
 
+/// What follows an inline item in its formatting context: the rest of its
+/// sibling list (in their context), then, past the end edge of the box that
+/// holds them, what follows that box.
+struct Following<'s, 't> {
+    rest: &'t [Inline],
+    ctx: &'s InlineStyle,
+    closing_edge: f32,
+    outer: Option<&'s Following<'s, 't>>,
+}
+
+/// Whether a scan for a word's continuation met a break opportunity.
+enum Continues {
+    Stopped,
+    Through,
+}
+
+/// UAX #14 (CSS Text 3 #line-breaking) between two adjacent characters,
+/// using the rule-based segmenter Parley breaks text runs with.
+fn breaks_between(before: char, after: char) -> bool {
+    let mut pair = String::with_capacity(8);
+    pair.push(before);
+    pair.push(after);
+    let segmenter = const {
+        icu_segmenter::LineSegmenter::new_for_non_complex_scripts(
+            icu_segmenter::options::LineBreakOptions::default(),
+        )
+    };
+    segmenter
+        .segment_str(&pair)
+        .any(|index| index == before.len_utf8())
+}
+
 /// Frontend-neutral inline paint and interaction payload. Canonical fragments
 /// never carry the terminal `Item`'s cell coordinates or dimensions; the
 /// terminal adapter constructs those only while quantizing a piece.
@@ -348,6 +380,10 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     pen: f32,
     line_start: f32,
     pending_space: bool,
+    /// The last character of the text just placed in a collapsing mode,
+    /// while no space or atomic inline has followed it: a following text run
+    /// continues its word unless UAX #14 breaks between them.
+    word_end: Option<char>,
     /// A break-spaces opportunity survives inline element/text boundaries.
     preserved_break: bool,
     /// Owed inline-box edge width (margins/borders/padding of opened/closed
@@ -456,6 +492,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
+            word_end: None,
             preserved_break: false,
             pending_gap_px: 0.0,
             box_stack: Vec::new(),
@@ -590,8 +627,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.quirky_strut_root = (self.dom.document_mode(document)
             != html5ever::tree_builder::QuirksMode::NoQuirks)
             .then_some(root.node);
-        for inl in content {
-            self.walk(inl, &root);
+        for (index, inl) in content.iter().enumerate() {
+            let following = Following {
+                rest: &content[index + 1..],
+                ctx: &root,
+                closing_edge: 0.0,
+                outer: None,
+            };
+            self.walk(inl, &root, &following);
         }
     }
 
@@ -620,9 +663,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         context
     }
 
-    fn walk(&mut self, inl: &'t Inline, ctx: &InlineStyle) {
+    fn walk(&mut self, inl: &'t Inline, ctx: &InlineStyle, following: &Following<'_, 't>) {
         match inl {
-            Inline::Text(t) => self.text(t, ctx),
+            Inline::Text(t) => self.text_followed(t, ctx, Some(following)),
             Inline::Br => self.forced_break(),
             // An inline-level replaced box: its margin/border/padding edges
             // take real inline space around the content box (§9.4.2/§10.8),
@@ -709,8 +752,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.box_chain = Some(self.box_stack.as_slice().into());
                 }
                 self.pending_gap_px += self.edge_px(style, LEFT);
-                for k in kids.iter() {
-                    self.walk(k, &inner);
+                let closing_edge = self.edge_px(style, RIGHT);
+                for (index, k) in kids.iter().enumerate() {
+                    let rest = Following {
+                        rest: &kids[index + 1..],
+                        ctx: &inner,
+                        closing_edge,
+                        outer: Some(following),
+                    };
+                    self.walk(k, &inner, &rest);
                 }
                 if let Some(key) = decorated {
                     self.close_box(key, style);
@@ -741,6 +791,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
 
     /// Emit a text run under `ctx`.
     pub fn text(&mut self, t: &str, ctx: &InlineStyle) {
+        self.text_followed(t, ctx, None);
+    }
+
+    /// `text` within the inline tree, where a word ending the run can be
+    /// continued by the following items: CSS Text 3 #line-breaking provides
+    /// no soft wrap opportunity at an inline box boundary itself, so
+    /// `<a>link</a>.` or `<b>W</b>ord` wraps as one word.
+    fn text_followed(&mut self, t: &str, ctx: &InlineStyle, following: Option<&Following<'_, 't>>) {
         if ctx.font_zero {
             // `font-size:0` text occupies no CSS geometry (the copyable-but-unseen
             // idiom); it neither paints nor owes spaces.
@@ -759,7 +817,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             for c in t.chars() {
                 if is_collapsible_space(c) {
                     if !word.is_empty() {
-                        self.word(&word, ctx);
+                        self.word(&word, ctx, 0.0);
                         word.clear();
                     }
                     if c == '\n' && ctx.ws.preserves_newlines() {
@@ -767,14 +825,19 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     } else {
                         self.pending_space = true;
                     }
+                    self.word_end = None;
                 } else {
                     word.push(c);
                 }
             }
             if !word.is_empty() {
-                self.word(&word, ctx);
+                let continuation = following.map_or(0.0, |following| {
+                    self.continuation(word.chars().next_back().unwrap(), following)
+                });
+                self.word(&word, ctx, continuation);
             }
         } else {
+            self.word_end = None;
             // Preserved modes: newlines force breaks; tabs advance to the
             // next `tab-size` stop (CSS Text §3; a 0 tab renders no advance);
             // spaces are literal.
@@ -860,8 +923,100 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// One word in a collapsing mode. Parley's Unicode line breaker supplies
     /// UAX #14 opportunities (including CJK and complex scripts); CSS remains
     /// responsible for the selected word/overflow break strengths.
-    fn word(&mut self, word: &str, ctx: &InlineStyle) {
-        self.place_wrapped(word, ctx, true, true);
+    ///
+    /// A word continuing the previous run's (no space, and no UAX #14
+    /// opportunity between them) never wraps away from it; `continuation` is
+    /// the width of what continues this word, which must share its line.
+    fn word(&mut self, word: &str, ctx: &InlineStyle, continuation: f32) {
+        let continues = !self.pending_space
+            && self.word_end.is_some_and(|end| {
+                word.chars()
+                    .next()
+                    .is_some_and(|start| !breaks_between(end, start))
+            });
+        self.place_wrapped(word, ctx, !continues, true, continuation);
+        self.word_end = word.chars().next_back();
+    }
+
+    /// The width of the content after this item that continues a word ending
+    /// in `end`, up to the next soft wrap opportunity: text without spaces
+    /// and the inline box edges between, across inline box boundaries.
+    fn continuation(&self, end: char, following: &Following<'_, 't>) -> f32 {
+        let mut width = 0.0;
+        let mut end = Some(end);
+        let mut level = Some(following);
+        while let Some(current) = level {
+            match self.continuation_in(current.rest, current.ctx, &mut end, &mut width) {
+                Continues::Stopped => return width,
+                Continues::Through => width += current.closing_edge,
+            }
+            level = current.outer;
+        }
+        width
+    }
+
+    fn continuation_in(
+        &self,
+        items: &[Inline],
+        ctx: &InlineStyle,
+        end: &mut Option<char>,
+        width: &mut f32,
+    ) -> Continues {
+        for item in items {
+            match item {
+                Inline::Text(text) => {
+                    if !ctx.ws.collapses_spaces() || ctx.font_zero {
+                        return Continues::Stopped;
+                    }
+                    let text = ctx.transform.apply(text);
+                    let lead = text.split(is_collapsible_space).next().unwrap_or("");
+                    if lead.is_empty() {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        return Continues::Stopped;
+                    }
+                    let Some(before) = end.take() else {
+                        return Continues::Stopped;
+                    };
+                    let mut chars = lead.chars();
+                    let first = chars.next().unwrap();
+                    if breaks_between(before, first) {
+                        return Continues::Stopped;
+                    }
+                    // Up to the first opportunity inside the run itself.
+                    let mut cut = lead.len();
+                    let mut previous = first;
+                    for (index, c) in lead.char_indices().skip(1) {
+                        if breaks_between(previous, c) {
+                            cut = index;
+                            break;
+                        }
+                        previous = c;
+                    }
+                    *width += crate::text::shape(&lead[..cut], &ctx.text_style()).advance;
+                    if cut < text.len() {
+                        return Continues::Stopped;
+                    }
+                    *end = lead.chars().next_back();
+                }
+                Inline::Box { node, style, kids } => {
+                    let inner = if *node == NO_NODE {
+                        ctx.with_pseudo(self.dom, style.pseudo)
+                    } else {
+                        self.form_context(*node, ctx)
+                    };
+                    *width += self.edge_px(style, LEFT);
+                    if let Continues::Stopped = self.continuation_in(kids, &inner, end, width) {
+                        return Continues::Stopped;
+                    }
+                    *width += self.edge_px(style, RIGHT);
+                }
+                Inline::Float(_) | Inline::OutOfFlow(_) => {}
+                Inline::Atom(_) | Inline::AtomBox(_) | Inline::Br => return Continues::Stopped,
+            }
+        }
+        Continues::Through
     }
 
     /// Preserved-mode text: wrap at CSS/Unicode opportunities when permitted,
@@ -883,7 +1038,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 )
             };
             for part in t.split_inclusive(separator) {
-                self.place_wrapped(part, ctx, self.preserved_break, true);
+                self.place_wrapped(part, ctx, self.preserved_break, true, 0.0);
                 self.preserved_break = part.chars().next_back().is_some_and(separator);
             }
             return;
@@ -921,7 +1076,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             }
             return;
         }
-        self.place_wrapped(t, ctx, false, true);
+        self.place_wrapped(t, ctx, false, true, 0.0);
     }
 
     fn break_style(&self, ctx: &InlineStyle) -> crate::text::TextBreakStyle {
@@ -954,6 +1109,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         ctx: &InlineStyle,
         may_wrap: bool,
         mut spaced: bool,
+        continuation: f32,
     ) {
         while !rest.is_empty() {
             let gap = self.pending_gap_px;
@@ -1037,6 +1193,19 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             } else {
                 crate::text::first_line_end(rest, &ctx.text_style(), avail, break_style)
             };
+            // The run's last segment and the content continuing it share one
+            // line: when only the segment fits, wrap before it.
+            if continuation > 0.0
+                && may_wrap
+                && break_style.wrap
+                && self.pen > self.line_start
+                && fits(full.advance)
+                && !fits(full.advance + continuation)
+            {
+                self.soft_break();
+                spaced = false;
+                continue;
+            }
             if cut > 0 && cut < rest.len() {
                 let (head, tail) = rest.split_at(cut);
                 // Parley returns the first legal in-word break even when that
