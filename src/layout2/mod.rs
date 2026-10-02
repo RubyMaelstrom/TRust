@@ -4090,6 +4090,37 @@ mod tests {
     }
 
     #[test]
+    fn noembed_and_the_other_hidden_elements_have_no_box() {
+        // HTML Rendering #hidden-elements: `area, base, basefont, datalist,
+        // head, link, meta, noembed, noframes, param, rp, script, style,
+        // template, title { display: none }`. An embed has a box in TRust,
+        // so the noembed beside it inside an object's fallback must not show.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:16px/20px sans-serif">
+            <p><object><param id=p name=movie value=x.swf><embed id=e src="x.swf" width=40 height=20><noembed id=n>NOEMBED TEXT</noembed></object></p>
+            <p><embed src="y.swf" width=10 height=10><noembed>NOEMBED TOP</noembed><basefont id=b></p>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!((rect("e").width, rect("e").height), (40.0, 20.0));
+        for id in ["n", "p", "b"] {
+            assert_eq!(
+                dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "display")
+                    .as_deref(),
+                Some("none"),
+                "{id}"
+            );
+        }
+        assert!(
+            !layout.paint.primitives.iter().any(|primitive| matches!(
+                primitive,
+                crate::render::Primitive::GlyphRun { shaped, .. } if shaped.text.contains("NOEMBED")
+            )),
+            "noembed is display:none"
+        );
+    }
+
+    #[test]
     fn quirks_percentage_heights_skip_auto_height_blocks() {
         // Quirks Mode #the-percentage-height-calculation-quirk: auto-height
         // block containers are skipped up to the body, which (with the root)

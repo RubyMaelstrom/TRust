@@ -12664,8 +12664,11 @@ fn ua_display(tag: &str) -> &'static str {
         "button" | "input" | "select" | "textarea" | "meter" | "progress" | "marquee" => {
             "inline-block"
         }
+        // HTML Rendering #hidden-elements (noembed holds the content for
+        // user agents without embed support; TRust gives every embed a box).
         "head" | "title" | "meta" | "link" | "style" | "script" | "base" | "noscript"
-        | "template" | "source" | "track" | "datalist" | "noframes" => "none",
+        | "template" | "source" | "track" | "datalist" | "noframes" | "noembed" | "param"
+        | "basefont" => "none",
         // HTML Rendering #frames-and-framesets: a frameset's cols/rows grid
         // (see `html_presentational_hints`); its frames fill their cells.
         "frameset" => "grid",
