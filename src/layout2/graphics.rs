@@ -2296,16 +2296,23 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
             .dom
             .computed_value_resolved(node, "background-image")
             .is_some();
-    // An authored border color or width also replaces the native edge, as in
-    // Gecko and Blink: `border-color: transparent` hides a button's border.
+    // An authored border style replaces the native edge with the CSS border.
+    // An authored color or width alone restyles the UA border, as in Gecko
+    // and Blink: `border-color: transparent` hides a button's border, and a
+    // colored field keeps a border in that color.
     let border_declared = ["top", "right", "bottom", "left"].into_iter().any(|side| {
-        ["style", "width", "color"].into_iter().any(|part| {
-            builder
-                .dom
-                .computed_value_resolved(node, &format!("border-{side}-{part}"))
-                .is_some()
-        })
+        builder
+            .dom
+            .computed_value_resolved(node, &format!("border-{side}-style"))
+            .is_some()
     });
+    let edge_width = builder
+        .dom
+        .computed_value_resolved(node, "border-top-width")
+        .and_then(|value| {
+            LengthBasis::of(builder.dom, node, builder.viewport()).resolve(&value, 0.0)
+        })
+        .unwrap_or(1.0);
     // CSS Color Adjust 1 #color-scheme-effect: form controls take the
     // default colors of the element's color scheme.
     let scheme = builder.dom.color_scheme(node);
@@ -2317,7 +2324,8 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
             "field"
         },
     );
-    let edge = scheme_color(scheme, "buttonborder");
+    let edge = border_color(builder.dom, PaintStyle::Element(node), "top")
+        .unwrap_or_else(|| scheme_color(scheme, "buttonborder"));
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     if !background_declared {
         builder.commands.push(DisplayCommand::Fill {
@@ -2325,19 +2333,20 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
             brush: PaintBrush::Solid(surface),
         });
     }
-    if !border_declared {
+    if !border_declared && edge_width > 0.0 && !edge.is_transparent() {
+        let half = edge_width / 2.0;
         builder.commands.push(DisplayCommand::Stroke {
             shape: rounded_shape(
                 CssRect::new(
-                    rect.x + 0.5,
-                    rect.y + 0.5,
-                    (rect.width - 1.0).max(0.0),
-                    (rect.height - 1.0).max(0.0),
+                    rect.x + half,
+                    rect.y + half,
+                    (rect.width - edge_width).max(0.0),
+                    (rect.height - edge_width).max(0.0),
                 ),
                 radii,
             ),
             brush: PaintBrush::Solid(edge),
-            style: StrokeStyle::solid(1.0),
+            style: StrokeStyle::solid(edge_width),
         });
     }
 }
@@ -5763,10 +5772,10 @@ mod tests {
     }
 
     #[test]
-    fn an_authored_border_color_replaces_a_buttons_native_edge() {
-        // CSS UI 4 #appearance-switching, as Gecko and Blink apply it: any
-        // authored border property drops the native edge, so a transparent
-        // border color leaves an image button borderless.
+    fn an_authored_border_color_or_width_restyles_a_buttons_native_edge() {
+        // As Gecko and Blink apply CSS UI 4 #appearance-switching: an
+        // authored border color or width restyles the UA border, so a
+        // transparent border color leaves an image button borderless.
         let ink = |style: &str| {
             let (_, layout) = render_fixture(&format!(
                 "<style>body{{margin:0;background:white}}</style>\
@@ -5785,6 +5794,8 @@ mod tests {
         };
         assert!(ink("") > 50, "the native edge");
         assert_eq!(ink("border-color:transparent"), 0);
+        assert_eq!(ink("border-width:0"), 0);
+        assert!(ink("border-color:blue") > 50, "a recolored edge");
     }
 
     #[test]
