@@ -653,6 +653,20 @@ impl Builder<'_> {
         if matches!(rep, Replaced::Skip) {
             return Built::Skip;
         }
+        if let Replaced::Atom(kind) = &rep
+            && let Some(alt) = self.alt_text_box(id, disp, kind)
+        {
+            let alt = Arc::new(alt);
+            return if Pos::of(self.dom, id).out_of_flow() {
+                Built::Inline(Inline::OutOfFlow(alt))
+            } else if super::float::float_side(self.dom, id).is_some() {
+                Built::Inline(Inline::Float(alt))
+            } else if atomic_inline_disp(self.dom, id).is_some() {
+                Built::Inline(Inline::AtomBox(alt))
+            } else {
+                Built::Block(alt)
+            };
+        }
         // Out-of-flow (§9.3/§9.7): the box is removed from normal flow, its
         // display blockified, and it rides the inline list as a
         // static-position mark for the positioned post-pass.
@@ -875,6 +889,70 @@ impl Builder<'_> {
         // (including styled paragraphs and generated placeholders). The form
         // binding remains available for input/focus without replacing paint.
         Replaced::No
+    }
+
+    /// HTML Rendering #images-3: an img representing its alt text is a
+    /// non-replaced element whose content is that text. Displayed `inline`
+    /// it is an inline box, which the inline formatting context lays as the
+    /// text itself; with any other display (the common `img { display:
+    /// inline-block }` reset, a block, a float, a positioned box) it is a box
+    /// of that display holding the text. #dimRendering still maps the img's
+    /// width and height attributes to its dimension properties, and their
+    /// pixel pair to `aspect-ratio: auto w / h`, which a non-replaced box
+    /// uses; author declarations outrank both hints.
+    fn alt_text_box(&self, id: NodeId, disp: Disp, kind: &AtomKind) -> Option<BoxNode> {
+        let AtomKind::Img {
+            url,
+            dimension_source,
+            alt,
+            ..
+        } = kind
+        else {
+            return None;
+        };
+        let inline = disp == Disp::Inline
+            && atomic_inline_disp(self.dom, id).is_none()
+            && !Pos::of(self.dom, id).out_of_flow()
+            && super::float::float_side(self.dom, id).is_none();
+        if inline
+            || !super::replaced::represents_alt_text(
+                self.dom,
+                id,
+                *dimension_source,
+                url.as_deref(),
+                self.vp,
+            )
+        {
+            return None;
+        }
+        let mut style = BoxStyle::of(self.dom, id, self.vp);
+        if !self.dom.author_declares(id, "width")
+            && let Some(width) =
+                super::replaced::dimension_attribute(self.dom, *dimension_source, "width")
+        {
+            style.width = width;
+        }
+        if !self.dom.author_declares(id, "height")
+            && let Some(height) =
+                super::replaced::dimension_attribute(self.dom, *dimension_source, "height")
+        {
+            style.height = height;
+        }
+        if !self.dom.author_declares(id, "aspect-ratio")
+            && let Some(ratio) =
+                super::replaced::dimension_attribute_ratio(self.dom, *dimension_source)
+        {
+            style.aspect_ratio = Some(ratio);
+        }
+        Some(BoxNode {
+            node: id,
+            style,
+            content: Content::Inlines(vec![Inline::Text(alt.clone())]),
+            marker: None,
+            marker_image: None,
+            marker_inside: false,
+            oof: Vec::new(),
+        })
     }
 
     /// A replaced element: inline-level by default, block-level when its

@@ -1179,6 +1179,9 @@ impl InlineStyle {
             }
             Some("blockquote") => s.kind = ItemKind::Quote,
             Some("pre") => s.kind = ItemKind::Pre,
+            // The only text an img holds is its alt text (HTML Rendering
+            // #images-3), whether laid inline or in the img's own box.
+            Some("img") => s.kind = ItemKind::Image,
             Some(t) => {
                 if let Some(level) = heading_level(t) {
                     s.kind = ItemKind::Heading(level);

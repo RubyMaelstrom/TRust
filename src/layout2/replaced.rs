@@ -374,6 +374,29 @@ pub(crate) fn apply_fit(
     out
 }
 
+/// HTML #maps-to-the-dimension-property: an img dimension attribute as the
+/// `width`/`height` value it maps to, a pixel length or a percentage of the
+/// containing block (the rules for parsing dimension values accept zero).
+pub(crate) fn dimension_attribute(dom: &Dom, dimension_source: NodeId, name: &str) -> Option<Len> {
+    match dom.attr(dimension_source, name).and_then(html_dimension)? {
+        HtmlDimension::Pixels(px) => (px >= 0.0).then(|| Len::px(px)),
+        HtmlDimension::Percentage(percent) => Some(Len::Val(super::value::Node::Lin {
+            k: percent / 100.0,
+            b: 0.0,
+        })),
+    }
+}
+
+/// HTML #map-to-the-aspect-ratio-property-(using-dimension-rules): two
+/// positive pixel dimension attributes give `aspect-ratio: auto w / h`.
+pub(crate) fn dimension_attribute_ratio(dom: &Dom, dimension_source: NodeId) -> Option<f32> {
+    let attr = |name: &str| match dom.attr(dimension_source, name).and_then(html_dimension) {
+        Some(HtmlDimension::Pixels(px)) if px > 0.0 => Some(px),
+        _ => None,
+    };
+    Some(attr("width")? / attr("height")?).filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+}
+
 /// The natural-ratio chain a replaced element sizes through: intrinsic,
 /// else the width/height ATTRIBUTE pair (HTML's pre-decode reservation
 /// rule), else CSS `aspect-ratio`.

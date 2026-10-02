@@ -5849,6 +5849,50 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn sourceless_images_with_alt_and_a_box_display_hold_the_text_in_that_box() {
+        // HTML Rendering #images-3: such an img is a non-replaced element,
+        // so with `display:inline-block` (a common reset), a block-level
+        // display or a float it is a box of that display holding the text,
+        // which exports its line's baseline (CSS 2 §10.8.1). #dimRendering
+        // still maps the width/height attributes to its dimension properties
+        // and their pair to `aspect-ratio: auto w / h`, below author styles.
+        let html = r#"<!DOCTYPE html><style>img{display:inline-block}</style>
+            <body style="margin:0;font:16px/20px sans-serif">
+            <p>x <img id=a alt="Album Cover" width=125 height=60>|after</p>
+            <p><img id=b alt="Logo" style="width:100px;height:40px"></p>
+            <p><img id=c alt="Auto" width=125 height=60 style="height:auto"></p>
+            <p><img id=d alt="Ratio" style="height:40px;aspect-ratio:2"></p>
+            <p><img id=e alt="Wide" width=125 height=60 style="width:200px;height:auto"></p>
+            <p><img id=f alt="Block" width=125 height=60 style="display:block"></p>
+            <div><img id=g alt="Float" width=100 height=50 style="float:left"></div>
+            <p style="clear:both"><img id=h alt="Inline" width=125 height=60 style="display:inline"></p>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let size = |id: &str| {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (rect.width, rect.height)
+        };
+        for (id, expected) in [
+            ("a", (125.0, 60.0)),
+            ("b", (100.0, 40.0)),
+            ("c", (125.0, 60.0)),
+            ("d", (80.0, 40.0)),
+            ("e", (200.0, 96.0)),
+            ("f", (125.0, 60.0)),
+            ("g", (100.0, 50.0)),
+        ] {
+            assert_eq!(size(id), expected, "{id}");
+        }
+        // A non-replaced inline box takes no dimension properties.
+        assert!(size("h").1 < 25.0, "{:?}", size("h"));
+        let a = layout.boxes[&dom.get_by_id("a").unwrap()];
+        let (x, y, _) = graphical_text(&layout, "Album Cover");
+        assert!(x >= a.left as f32 && y >= a.top as f32, "{x},{y} in {a:?}");
+        assert_eq!(y, graphical_text(&layout, "|after").1);
+    }
+
+    #[test]
     fn undecoded_image_with_aspect_ratio_reserves_box() {
         let out = lay(
             r#"<body style="margin:0"><img src="i.png" style="width:160px;aspect-ratio:2/1" alt="x"></body>"#,
