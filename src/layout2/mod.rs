@@ -5055,6 +5055,48 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn control_text_hit_regions_stay_inside_the_painted_control() {
+        // CSS Overflow 3 #overflow-control: a textarea's overflowing lines
+        // are clipped to its scrollport, and an input's long value to its
+        // content box. Their hit targets must be clipped the same way, or a
+        // line drawn nowhere steals the clicks of the content below it.
+        let html = "<body style=margin:0>\
+             <textarea id=a rows=2 cols=20 style='font:13px/16px monospace;padding:4px;\
+             border:1px solid;margin:0;vertical-align:top'>1\n2\n3\n4\n5\n6\n7\n8</textarea>\
+             <div style=height:100px>below</div>\
+             <input id=b style='font:13px monospace;width:60px;padding:0;border:1px solid;\
+             margin:0' value='a value far wider than the input box'>\
+             <span>right</span></body>";
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        for id in ["a", "b"] {
+            let node = dom.get_by_id(id).unwrap();
+            let bounds = layout.boxes[&node];
+            let hits: Vec<_> = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    crate::render::DisplayCommand::HitRegion(region) if region.node == node => {
+                        Some(region.rect)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!hits.is_empty(), "{id}");
+            for rect in hits {
+                assert!(
+                    rect.x >= bounds.left as f32
+                        && rect.y >= bounds.top as f32
+                        && rect.x + rect.width <= (bounds.left + bounds.width) as f32
+                        && rect.y + rect.height <= (bounds.top + bounds.height) as f32,
+                    "{id}: {rect:?} escapes {bounds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn textarea_editing_origin_is_the_content_box_whatever_its_first_line() {
         // HTML Rendering #the-textarea-element-2: the value starts at the top
         // of the content box. A leading blank line paints no glyph run, and
