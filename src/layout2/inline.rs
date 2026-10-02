@@ -1932,18 +1932,30 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             Some((width, height)) => (Some(width), height),
             None => (Some(self.cb_w_px), self.cb_h_px),
         };
-        if let Some(r) = super::replaced::size(
-            self.dom,
-            node,
-            super::replaced::ImageInput {
-                dimension_source,
-                natural,
-                url,
-            },
-            cb_w,
-            cb_h,
-            self.vp,
-        ) {
+        let size = |natural| {
+            super::replaced::size(
+                self.dom,
+                node,
+                super::replaced::ImageInput {
+                    dimension_source,
+                    natural,
+                    url,
+                },
+                cb_w,
+                cb_h,
+                self.vp,
+            )
+        };
+        // HTML Rendering #images-3: an unavailable image without alt text is
+        // still a replaced element. Rule two (loading, or no alt attribute)
+        // gives it no content; rule four gives one that represents nothing
+        // zero natural dimensions. Either way it has a box: an empty line
+        // box holding it takes the strut's height, as in Gecko and Blink,
+        // and the lazy-load intersection observer (#lazy-loading-attributes)
+        // can find a pending `loading=lazy` image to start its fetch.
+        let sized =
+            size(natural).or_else(|| alt.is_empty().then(|| size(Some((0.0, 0.0)))).flatten());
+        if let Some(r) = sized {
             let pixelated = matches!(
                 self.dom
                     .computed_value_resolved(node, "image-rendering")
