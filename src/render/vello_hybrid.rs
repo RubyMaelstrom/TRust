@@ -762,6 +762,7 @@ impl VelloHybridRenderer {
                         target.set_fill_rule(shape_fill(shape));
                         target.fill_path(&shape_path(shape));
                         target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+                        target.reset_paint_transform();
                     }
                 }
                 DisplayCommand::Stroke {
@@ -779,6 +780,7 @@ impl VelloHybridRenderer {
                         set_brush(&mut target, brush);
                         target.set_stroke(vello_stroke(style));
                         target.stroke_path(&shape_path(shape));
+                        target.reset_paint_transform();
                     }
                 }
                 DisplayCommand::PushClip(shape) => {
@@ -1440,7 +1442,6 @@ fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
             repeat,
         } => {
             let stops = vello_stops(stops);
-            target.set_paint_transform(Affine::IDENTITY);
             target.set_paint(
                 vello_common::peniko::Gradient::new_linear(
                     (f64::from(start.x), f64::from(start.y)),
