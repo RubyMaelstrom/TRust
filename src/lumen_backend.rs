@@ -97,6 +97,21 @@ enum LumenResourceKind {
     ClassicScript,
     ModuleScript,
     Stylesheet,
+    /// A parser-inserted style sheet that navigation already obtained (or
+    /// failed to obtain) before scripting began; only its event remains.
+    ParsedStylesheet {
+        obtained: bool,
+    },
+    /// HTML #link-type-preload, which never delays the load event.
+    Preload,
+}
+
+impl LumenResourceKind {
+    /// HTML #delay-the-load-event: script and style sheet loads delay their
+    /// document's load event; #link-type-preload must not.
+    fn delays_load(self) -> bool {
+        !matches!(self, Self::Preload)
+    }
 }
 
 /// Send-only work returned by background platform operations. Engine values never enter this
@@ -459,6 +474,9 @@ struct HostState {
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
     task_events: Option<LumenTaskSender>,
     pending_resources: usize,
+    /// HTML #link-type-preload fetches in flight. They never delay the load
+    /// event, but the document is not quiescent until they settle.
+    pending_preloads: usize,
     pending_module_evaluations: usize,
     modules_skipped: usize,
     pending_dynamic_modules: Arc<std::sync::atomic::AtomicUsize>,
@@ -536,6 +554,7 @@ impl HostState {
             images: Default::default(),
             task_events: None,
             pending_resources: 0,
+            pending_preloads: 0,
             pending_module_evaluations: 0,
             modules_skipped: 0,
             pending_dynamic_modules: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -730,6 +749,7 @@ impl RetainedMemory for HostState {
             images,
             task_events,
             pending_resources,
+            pending_preloads: _,
             pending_module_evaluations: _,
             modules_skipped: _,
             pending_dynamic_modules,
@@ -2830,6 +2850,20 @@ mod desktop {
         );
         let mut tasks = ParserTasks::new(host_rx, events, &mut page);
         let mut deferred = Vec::new();
+        // HTML #link-type-stylesheet / #link-type-preload: the parser fetches
+        // and processes each external resource link as it connects it, in
+        // token order (arena IDs are allocated monotonically by the tree
+        // builder, as for `Dom::scripts`), before any later parser script.
+        let mut parser_links: std::collections::VecDeque<usize> = {
+            let dom = page.dom.borrow();
+            let mut links: Vec<_> = dom
+                .shadow_including_subtree(DOCUMENT)
+                .into_iter()
+                .filter(|&node| dom.tag_name(node) == Some("link"))
+                .collect();
+            links.sort_unstable();
+            links.into()
+        };
         // The parser owns its pending script list independently of the live DOM.
         // An earlier script may detach a later entry while this native list still
         // needs its identity for the preparation/connectedness checks.
@@ -2840,6 +2874,7 @@ mod desktop {
             .map(|state| {
                 scripts
                     .iter()
+                    .chain(&parser_links)
                     .map(|&node| {
                         state.dom_gc.start_resource(node);
                         state.dom_gc.resource_lease(node)
@@ -2848,6 +2883,7 @@ mod desktop {
             })
             .unwrap_or_default();
         for node in scripts {
+            process_parser_links(&mut page, &mut parser_links, Some(node));
             // Earlier scripts may change a later element before the parser
             // prepares it. The speculative scanner is never authoritative.
             let (src, inline, ty) = {
@@ -2945,6 +2981,7 @@ mod desktop {
                 return Err(page.outcome);
             }
         }
+        process_parser_links(&mut page, &mut parser_links, None);
         let _ = evaluate_task(
             &mut page,
             "__trust.setDocumentReadiness('interactive');",
@@ -2963,6 +3000,62 @@ mod desktop {
         );
         checkpoint(&mut page, "DOMContentLoaded");
         Ok(page)
+    }
+
+    /// Process the parser-inserted links that precede `before` (all of them
+    /// at the end of parsing) in token order.
+    fn process_parser_links(
+        page: &mut LumenPage,
+        links: &mut std::collections::VecDeque<usize>,
+        before: Option<usize>,
+    ) {
+        while let Some(&link) = links.front() {
+            if before.is_some_and(|script| link > script) {
+                break;
+            }
+            links.pop_front();
+            process_parser_link(page, link);
+        }
+    }
+
+    /// HTML #link-type-stylesheet: navigation obtained the parser's style
+    /// sheets before scripting began, so a sheet link queues only its `load`
+    /// (or, for a sheet that could not be obtained, `error`) as a resource
+    /// task that delays the load event. A preload link starts its fetch
+    /// (#link-type-preload). An earlier script may have detached the link.
+    fn process_parser_link(page: &mut LumenPage, node: usize) {
+        let (sheet, preload, href) = {
+            let dom = page.dom.borrow();
+            if dom.tag_name(node) != Some("link") || !dom.is_connected(node) {
+                return;
+            }
+            let rel = dom.attr(node, "rel").unwrap_or("");
+            (
+                dom.parsed_link_sheet(node),
+                rel.split_ascii_whitespace()
+                    .any(|word| word.eq_ignore_ascii_case("preload")),
+                dom.attr(node, "href").unwrap_or("").to_string(),
+            )
+        };
+        if let Some(obtained) = sheet {
+            send_resource_completion(
+                page.engine.ctx(),
+                node,
+                href,
+                LumenResourceKind::ParsedStylesheet { obtained },
+                None,
+                true,
+            );
+        } else if preload
+            && let Err(error) = host_preload_link(
+                page.engine.ctx(),
+                Value::Undefined,
+                &[Value::Num(node as f64)],
+            )
+        {
+            let message = describe_throw(&mut page.engine, error, "preload link");
+            page.outcome.errors.push(message);
+        }
     }
 
     fn is_classic(type_attr: &Option<String>) -> bool {
@@ -3117,6 +3210,7 @@ mod desktop {
             .host_mut::<HostState>()
             .is_some_and(|state| {
                 state.pending_resources > state.pending_module_evaluations
+                    || state.pending_preloads > 0
                     || state
                         .pending_dynamic_modules
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -3143,6 +3237,7 @@ mod desktop {
             .host_mut::<HostState>()
             .is_some_and(|state| {
                 state.pending_resources > 0
+                    || state.pending_preloads > 0
                     || state
                         .pending_dynamic_modules
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -7794,6 +7889,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
         1,
         host_load_injected_stylesheet,
     ),
+    ("__dom_preload_link", 1, host_preload_link),
     ("__ws_open", 2, host_ws_open),
     ("__ws_send", 3, host_ws_send),
     ("__ws_close", 3, host_ws_close),
@@ -9789,11 +9885,15 @@ fn send_resource_completion(
     external: bool,
 ) -> bool {
     let context = ctx.host_job_context();
-    let Some((events, pending)) = ctx.host_mut::<HostState>().and_then(|state| {
+    let Some(events) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
-        state.pending_resources += 1;
+        if kind.delays_load() {
+            state.pending_resources += 1;
+        } else {
+            state.pending_preloads += 1;
+        }
         state.dom_gc.start_resource(node_id);
-        Some((events, state.pending_resources))
+        Some(events)
     }) else {
         return false;
     };
@@ -9811,11 +9911,205 @@ fn send_resource_completion(
         .is_err()
     {
         if let Some(state) = ctx.host_mut::<HostState>() {
-            state.pending_resources = pending.saturating_sub(1);
+            if kind.delays_load() {
+                state.pending_resources = state.pending_resources.saturating_sub(1);
+            } else {
+                state.pending_preloads = state.pending_preloads.saturating_sub(1);
+            }
             state.dom_gc.finish_resource(node_id);
         }
         return false;
     }
+    true
+}
+
+/// HTML #link-type-preload "fetch and process the linked resource": the
+/// `as` attribute's preload destination selects the request destination
+/// (#translate-a-preload-destination), a `type` that does not match it skips
+/// the preload (#match-preload-type), and so does a `media` query that does
+/// not match the environment (#processing-the-media-attribute). The response
+/// enters the document's map of preloaded resources; `error` fires at the
+/// element for a network error and `load` for any other response. Unlike
+/// style sheets and scripts, a preload does not delay the load event.
+fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (node_id, href, destination, type_matches) = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(node_id) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Undefined);
+        };
+        if dom
+            .attr(node_id, "media")
+            .is_some_and(|media| !media.trim().is_empty() && !dom.media_matches(media))
+        {
+            return Ok(Value::Undefined);
+        }
+        let Some(destination) = dom.attr(node_id, "as").and_then(preload_destination) else {
+            return Ok(Value::Undefined);
+        };
+        (
+            node_id,
+            dom.attr(node_id, "href").map(str::to_string),
+            destination,
+            preload_type_matches(dom.attr(node_id, "type").unwrap_or(""), destination),
+        )
+    };
+    if !type_matches {
+        return Ok(Value::Undefined);
+    }
+    let Some(href) = host_resource_url(ctx, node_id, href) else {
+        return Ok(Value::Undefined);
+    };
+    if href.trim_start().starts_with("data:") {
+        let result = data_resource_result(href.trim());
+        if !send_resource_completion(ctx, node_id, href, LumenResourceKind::Preload, result, true) {
+            host_fire_script_event(ctx, node_id, "error");
+        }
+        return Ok(Value::Undefined);
+    }
+    let fetched = prepare_element_request(ctx, node_id, &href, destination, false)
+        .is_some_and(|request| spawn_preload_fetch(ctx, node_id, destination, request));
+    if !fetched {
+        queue_resource_error(ctx, node_id, LumenResourceKind::Preload, href);
+    }
+    Ok(Value::Undefined)
+}
+
+/// HTML #translate-a-preload-destination: the `as` keywords (an enumerated
+/// attribute without missing or invalid value defaults) that are preload
+/// destinations, translated by Fetch #concept-potential-destination-translate.
+fn preload_destination(value: &str) -> Option<&'static str> {
+    [
+        ("fetch", ""),
+        ("font", "font"),
+        ("image", "image"),
+        ("script", "script"),
+        ("style", "style"),
+        ("track", "track"),
+    ]
+    .into_iter()
+    .find_map(|(keyword, destination)| value.eq_ignore_ascii_case(keyword).then_some(destination))
+}
+
+/// HTML #match-preload-type, with MIME Sniffing's MIME type groups.
+fn preload_type_matches(type_: &str, destination: &str) -> bool {
+    if type_.is_empty() || destination.is_empty() {
+        return true;
+    }
+    let Some((kind, subtype)) = type_.split(';').next().and_then(|essence| {
+        let (kind, subtype) = essence.trim().split_once('/')?;
+        (!kind.is_empty() && !subtype.trim().is_empty()).then(|| {
+            (
+                kind.to_ascii_lowercase(),
+                subtype.trim().to_ascii_lowercase(),
+            )
+        })
+    }) else {
+        return false;
+    };
+    let essence = format!("{kind}/{subtype}");
+    match destination {
+        "script" => crate::http::is_javascript_mime_type(&essence),
+        "image" => {
+            matches!(
+                subtype.as_str(),
+                "png"
+                    | "apng"
+                    | "jpeg"
+                    | "pjpeg"
+                    | "gif"
+                    | "webp"
+                    | "avif"
+                    | "bmp"
+                    | "svg+xml"
+                    | "x-icon"
+                    | "vnd.microsoft.icon"
+            ) && kind == "image"
+        }
+        "font" => {
+            kind == "font"
+                || matches!(
+                    essence.as_str(),
+                    "application/font-cff"
+                        | "application/font-off"
+                        | "application/font-sfnt"
+                        | "application/font-ttf"
+                        | "application/font-woff"
+                        | "application/vnd.ms-fontobject"
+                        | "application/vnd.ms-opentype"
+                )
+        }
+        "style" => essence == "text/css",
+        "track" => essence == "text/vtt",
+        _ => false,
+    }
+}
+
+/// HTML #preload: fetch into the page's preload map without delaying the
+/// load event, then queue the element's `load`/`error` on its own Realm.
+fn spawn_preload_fetch(
+    ctx: &mut Ctx,
+    node_id: usize,
+    destination: &'static str,
+    request: crate::http::Request,
+) -> bool {
+    let started = crate::performance::now_ms();
+    let name = request.url.to_string();
+    let client = element_request_client_url(ctx, node_id);
+    let credentials = request
+        .fetch_policy
+        .as_ref()
+        .map(|policy| policy.credentials);
+    let context = ctx.host_job_context();
+    let Some((handle, cache, events)) = ctx.host_mut::<HostState>().and_then(|state| {
+        let events = state.task_events.clone()?;
+        let network = state.network.as_ref()?;
+        state.pending_preloads += 1;
+        state.dom_gc.start_resource(node_id);
+        Some((network.handle.clone(), network.cache.clone(), events))
+    }) else {
+        return false;
+    };
+    let (shared, preloaded) =
+        cache.preload_resource(&handle, request, &client, destination, credentials);
+    cache.spawn(&handle, async move {
+        let (result, timing) = match shared.await {
+            Ok(response) => {
+                // Resource Timing: a preload that started the fetch reports it
+                // with the `link` initiator type; its consumer reports none.
+                let timing = if preloaded {
+                    LumenResourceTiming::fetched(
+                        name.clone(),
+                        "link",
+                        response.timing.clone(),
+                        started,
+                    )
+                } else {
+                    None
+                };
+                (
+                    Some((
+                        response.status,
+                        response.content_type.clone(),
+                        Vec::new(),
+                        response.headers.clone(),
+                    )),
+                    timing,
+                )
+            }
+            Err(()) => (None, None),
+        };
+        let _ = events.send(LumenHostTask::ResourceDone {
+            context,
+            node_id,
+            name,
+            kind: LumenResourceKind::Preload,
+            result,
+            stylesheet: None,
+            timing,
+            external: true,
+        });
+    });
     true
 }
 
@@ -9828,14 +10122,12 @@ fn spawn_resource_fetch(
     let started = crate::performance::now_ms();
     let name = request.url.to_string();
     let client = element_request_client_url(ctx, node_id);
-    let destination = match kind {
-        LumenResourceKind::Stylesheet => "style",
-        LumenResourceKind::ClassicScript | LumenResourceKind::ModuleScript => "script",
-    };
-    let initiator = if matches!(kind, LumenResourceKind::Stylesheet) {
-        "css"
-    } else {
-        "script"
+    // Preloads use `spawn_preload_fetch`; navigation obtained parsed sheets.
+    let (destination, initiator) = match kind {
+        LumenResourceKind::Stylesheet
+        | LumenResourceKind::ParsedStylesheet { .. }
+        | LumenResourceKind::Preload => ("style", "css"),
+        LumenResourceKind::ClassicScript | LumenResourceKind::ModuleScript => ("script", "script"),
     };
     let credentials = request
         .fetch_policy
@@ -11827,6 +12119,19 @@ fn run_resource_task(
             }
             _ => fire_engine_script_event(engine, node_id, "error"),
         },
+        // HTML #link-type-stylesheet "process the linked resource": the sheet
+        // is already attached; only the element's event remains.
+        LumenResourceKind::ParsedStylesheet { obtained } => {
+            fire_engine_script_event(engine, node_id, if obtained { "load" } else { "error" });
+        }
+        // HTML #link-type-preload: `error` only for a network error.
+        LumenResourceKind::Preload => {
+            fire_engine_script_event(
+                engine,
+                node_id,
+                if result.is_some() { "load" } else { "error" },
+            );
+        }
     }
     Ok(())
 }
@@ -12022,7 +12327,11 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .host_mut::<HostState>()
                 .map(|state| state.dom_gc.resource_lease(node_id));
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
-                state.pending_resources = state.pending_resources.saturating_sub(1);
+                if kind.delays_load() {
+                    state.pending_resources = state.pending_resources.saturating_sub(1);
+                } else {
+                    state.pending_preloads = state.pending_preloads.saturating_sub(1);
+                }
             }
             // HTML §8.1.7.2 queues element work against the element's relevant
             // global/Document. A parallel resource fetch therefore retains
@@ -18218,7 +18527,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 187, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 188, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -18229,7 +18538,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 187);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 188);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -23744,6 +24053,26 @@ mod tests {
             imported.contains(&format!("{origin}/a/sheets/deep/c.png")),
             "{imported}"
         );
+    }
+
+    #[test]
+    fn preload_destinations_and_types_follow_html() {
+        // HTML #translate-a-preload-destination and #match-preload-type.
+        assert_eq!(preload_destination("STYLE"), Some("style"));
+        assert_eq!(preload_destination("fetch"), Some(""));
+        assert_eq!(preload_destination("worker"), None);
+        assert_eq!(preload_destination(""), None);
+        assert!(preload_type_matches("", "style"));
+        assert!(preload_type_matches("text/CSS; charset=utf-8", "style"));
+        assert!(!preload_type_matches("text/plain", "style"));
+        assert!(!preload_type_matches("nonsense", "style"));
+        assert!(preload_type_matches("anything/at-all", ""));
+        assert!(preload_type_matches("text/javascript", "script"));
+        assert!(!preload_type_matches("text/css", "script"));
+        assert!(preload_type_matches("font/woff2", "font"));
+        assert!(preload_type_matches("image/webp", "image"));
+        assert!(!preload_type_matches("image/x-unknown", "image"));
+        assert!(preload_type_matches("text/vtt", "track"));
     }
 
     #[test]

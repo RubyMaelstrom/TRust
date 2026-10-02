@@ -134,6 +134,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_set_job_context", 1),
     ("__dom_release_job_context", 1),
     ("__dom_load_injected_stylesheet", 1),
+    ("__dom_preload_link", 1),
     ("__cookie_get", 3),
     ("__cookie_set", 4),
     ("__clock_now", 0),

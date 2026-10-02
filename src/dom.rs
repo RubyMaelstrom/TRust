@@ -7141,6 +7141,15 @@ impl Dom {
         }
     }
 
+    /// HTML #link-type-stylesheet for a parser-inserted `<link>`: `None` when
+    /// it is not a style sheet link that navigation fetches (no href, an
+    /// alternate or a disabled sheet), otherwise whether navigation obtained
+    /// its sheet (`attach_external_sheets`).
+    pub(crate) fn parsed_link_sheet(&self, id: NodeId) -> Option<bool> {
+        (self.is_stylesheet_link(id) && self.attr(id, "href").is_some_and(|h| !h.trim().is_empty()))
+            .then(|| self.external_sheets.contains_key(&id))
+    }
+
     /// Attach ONE fetched external stylesheet body to its `<link>` element —
     /// the incremental sibling of `attach_external_sheets`, for a sheet whose
     /// link was INJECTED by page JS after load (webpack's mini-css chunk

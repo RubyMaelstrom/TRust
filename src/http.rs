@@ -1101,12 +1101,50 @@ impl PageCache {
         self.fetch_request_reporting(handle, request, context, None)
     }
 
+    /// HTML #preload: start an element's preload into the document's map of
+    /// preloaded resources. The first later load with the same URL,
+    /// destination, client origin and credentials mode consumes this response
+    /// (#consume-a-preloaded-resource) instead of fetching again, and the
+    /// preloading element reports the resource's timing. The flag is false
+    /// when an equivalent shared fetch already exists and serves the preload.
+    pub(crate) fn preload_resource(
+        &self,
+        handle: &tokio::runtime::Handle,
+        request: Request,
+        client: &Url,
+        destination: &'static str,
+        cors_credentials: Option<CredentialsMode>,
+    ) -> (SharedFetch, bool) {
+        if let Some(shared) =
+            self.peek_resource(&request.url, client, destination, cors_credentials)
+        {
+            return (shared, false);
+        }
+        let context = ResourceCacheContext::new(client, destination, cors_credentials);
+        (
+            self.fetch_request_inner(handle, request, context, None, true),
+            true,
+        )
+    }
+
     fn fetch_request_reporting(
         &self,
         handle: &tokio::runtime::Handle,
         request: Request,
         context: ResourceCacheContext,
         report: Option<FetchTimingReporter>,
+    ) -> SharedFetch {
+        let preload = report.is_some();
+        self.fetch_request_inner(handle, request, context, report, preload)
+    }
+
+    fn fetch_request_inner(
+        &self,
+        handle: &tokio::runtime::Handle,
+        request: Request,
+        context: ResourceCacheContext,
+        report: Option<FetchTimingReporter>,
+        preload: bool,
     ) -> SharedFetch {
         use futures::future::FutureExt as _;
         let key = request.url.to_string();
@@ -1118,7 +1156,6 @@ impl PageCache {
         }
         let (abort, registration) = futures::future::AbortHandle::new_pair();
         self.tasks.track_fetch(abort);
-        let preload = report.is_some();
         let fut = futures::future::Abortable::new(
             async move {
                 match fetch_with_timing(&request, Default::default()).await {
@@ -4900,7 +4937,7 @@ pub(crate) fn decode_body(content_type: &str, body: &[u8]) -> String {
 
 /// Whether a MIME type is a JavaScript MIME type (MIME Sniffing §4.2).
 /// Parameters do not participate in the essence match.
-fn is_javascript_mime_type(content_type: &str) -> bool {
+pub(crate) fn is_javascript_mime_type(content_type: &str) -> bool {
     let essence = content_type
         .split(';')
         .next()
@@ -15562,6 +15599,97 @@ mod tests {
         assert!(!body.contains("css secret"), "{body}");
         assert!(body.contains("css public"), "{body}");
         server.abort();
+    }
+
+    /// HTML #link-type-stylesheet and #link-type-preload: parser-inserted
+    /// links fire `load`/`error`, a preload fetches its `as` destination
+    /// (a non-network-error response is `load`), and setting `rel` to
+    /// "stylesheet" on a connected preload applies the sheet from the
+    /// preloaded response. Deferred-CSS loaders (blog.google, the
+    /// `media=print onload` idiom) depend on all three.
+    #[tokio::test]
+    async fn parser_links_fire_events_and_preloads_become_stylesheets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let deferred_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = deferred_requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, ctype, body): (u16, &str, &str) = match path.as_str() {
+                    "/page" => (
+                        200,
+                        "text/html",
+                        r#"<head><script>var seen = [];</script>
+                        <link rel=stylesheet href=/s.css onload="seen.push('sheet')">
+                        <link rel=stylesheet href=/print.css media=print
+                              onload="this.media='all'; seen.push('print')">
+                        <link rel=stylesheet href=/missing.css onerror="seen.push('missing')">
+                        <link rel=preload as=style href=/missing.css onload="seen.push('preload-404')">
+                        <link rel=preload as=bogus href=/s.css onload="seen.push('bogus')">
+                        <link class=deferred rel=preload as=style href=/deferred.css>
+                        <script>
+                        document.querySelector('.deferred').addEventListener('load', function () {
+                            seen.push('preload');
+                            this.rel = 'stylesheet';
+                            this.addEventListener('load', function () { seen.push('deferred'); });
+                        }, { once: true });
+                        </script></head>
+                        <body><p id=a>a</p><p id=b>b</p><p id=c>c</p><script>
+                        (function wait(tries) {
+                            if (seen.length < 6 && tries) return setTimeout(wait, 20, tries - 1);
+                            var shown = ['a', 'b', 'c'].map(function (id) {
+                                return getComputedStyle(document.getElementById(id)).display;
+                            });
+                            document.body.setAttribute('data-links',
+                                seen.sort().join() + '|' + shown.join());
+                        })(500);
+                        </script></body>"#,
+                    ),
+                    "/s.css" => (200, "text/css", "#a { display: none }"),
+                    "/print.css" => (200, "text/css", "#b { display: none }"),
+                    "/deferred.css" => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (200, "text/css", "#c { display: none }")
+                    }
+                    _ => (404, "text/plain", "missing"),
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let rendered = navigation_timing_snapshot_after(response, "data-links=").await;
+        server.abort();
+        assert!(
+            rendered.contains(
+                "data-links=\"deferred,missing,preload,preload-404,print,sheet|none,none,none\""
+            ),
+            "{rendered}"
+        );
+        assert_eq!(deferred_requests.load(Ordering::SeqCst), 1);
     }
 
     /// REAL Lit 3 (lit-core.min.js from target/canary) driving the full
