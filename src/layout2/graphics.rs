@@ -3744,9 +3744,9 @@ fn border_shade(color: PaintColor, light: bool) -> PaintColor {
 /// #box-decoration-break: each line fragment of a non-replaced inline box
 /// paints its shadow, background and border beneath the line's content. The
 /// fragment spans the box's pieces on this line horizontally and its content
-/// area (font ascent to descent, CSS 2.2 §10.6.1) plus vertical padding and
-/// border; with `slice`, the start/end edges appear only where the box
-/// begins/ends.
+/// area (its own font's ascent to descent, CSS 2.2 §10.6.1) plus vertical
+/// padding and border; with `slice`, the start/end edges appear only where
+/// the box begins/ends.
 fn paint_inline_box_decorations(
     builder: &mut Builder<'_>,
     fragment: &Frag,
@@ -3772,24 +3772,13 @@ fn paint_inline_box_decorations(
         };
         let start = fragment.x + piece.x;
         let end = start + piece.box_width;
-        let (top, bottom) =
-            piece
-                .shaped
-                .as_ref()
-                .map_or((f32::INFINITY, f32::NEG_INFINITY), |text| {
-                    let baseline = fragment.y + piece.y + text.baseline;
-                    (baseline - text.ascent, baseline + text.descent)
-                });
-        for node in boxes
-            .chain
-            .iter()
-            .filter(|entry| entry.decorated)
-            .map(|entry| entry.key)
-        {
+        for entry in boxes.chain.iter().filter(|entry| entry.decorated) {
+            let node = entry.key;
             let index = runs
                 .iter()
                 .position(|run| run.node == node)
                 .unwrap_or_else(|| {
+                    let (top, bottom) = entry.content_area(fragment.y, line.height, line.baseline);
                     runs.push(Run {
                         node,
                         left: start,
@@ -3804,8 +3793,6 @@ fn paint_inline_box_decorations(
             let run = &mut runs[index];
             run.left = run.left.min(start);
             run.right = run.right.max(end);
-            run.top = run.top.min(top);
-            run.bottom = run.bottom.max(bottom);
             if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == node) {
                 run.left = run.left.min(start - distance);
                 run.starts = true;
@@ -3831,12 +3818,7 @@ fn paint_inline_box_decorations(
         if hidden {
             continue;
         }
-        let (top, bottom) = if run.top.is_finite() {
-            (run.top, run.bottom)
-        } else {
-            let baseline = fragment.y + line.baseline;
-            (baseline - line.ascent, baseline + line.descent)
-        };
+        let (top, bottom) = (run.top, run.bottom);
         let box_style = match pseudo {
             None => super::style::BoxStyle::of(builder.dom, node, builder.viewport()),
             Some(which) => {
@@ -8103,6 +8085,41 @@ mod tests {
             .count();
         assert_eq!(blue, 1, "start border on the first fragment only");
         assert!(layout.boxes.contains_key(&span));
+    }
+
+    #[test]
+    fn an_inline_box_paints_its_own_fonts_content_area() {
+        // CSS 2 #inline-non-replaced / #inline-box-height: neither a
+        // descendant's larger font nor an image stretches an inline box's
+        // background; it paints the border area CSSOM View reports.
+        let (dom, layout) = render_fixture(
+            r#"<body style="margin:0;font:16px/60px sans-serif"><p style="margin:0">x<a id=m style="font-size:10px;background:#ff0000">y<span style="font-size:32px">Z</span></a></p><p style="margin:0"><a id=l style="background:#0000ff"><img src="i.png" width=88 height=80></a></p>"#,
+        );
+        for (id, color) in [
+            ("m", PaintColor::Rgba(255, 0, 0, 255)),
+            ("l", PaintColor::Rgba(0, 0, 255, 255)),
+        ] {
+            let painted = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    DisplayCommand::Fill {
+                        shape: PaintShape::Rect(rect),
+                        brush: PaintBrush::Solid(fill),
+                    } if *fill == color => Some(*rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let measured = layout.boxes[&dom.get_by_id(id).unwrap()];
+            assert_eq!(painted.len(), 1, "#{id}: {painted:?}");
+            assert!(
+                (f64::from(painted[0].y) - measured.top).abs() < 0.01
+                    && (f64::from(painted[0].height) - measured.height).abs() < 0.01,
+                "#{id}: {painted:?} {measured:?}"
+            );
+            assert!(measured.height < 24.0, "#{id}: {measured:?}");
+        }
     }
 
     #[test]
