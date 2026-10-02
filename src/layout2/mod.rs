@@ -4888,6 +4888,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tables_width_attribute_includes_its_border() {
+        // HTML Rendering #tables-2: `table { box-sizing: border-box }`, so
+        // the width attribute, mapped to 'width', sets the border box.
+        let html = r#"<!doctype html><body style="margin:0">
+            <table id=a width=80% style="border:6px solid"><tr><td>a</td></tr></table>
+            <table id=b width=300 border=5 cellpadding=0><tr><td>b</td></tr></table>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1000.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        assert_eq!(width("a"), 800.0);
+        assert_eq!(width("b"), 300.0);
+    }
+
+    #[test]
     fn spanning_cells_distribute_widths_by_column_measures() {
         // CSS Tables 3 #computing-column-measures: a spanning cell's
         // min-content first fills its columns' min-to-max gaps in proportion
