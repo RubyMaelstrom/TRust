@@ -20393,16 +20393,20 @@ mod tests {
         // A box type we don't lay out, and visual-only properties we don't
         // track, are unsupported → the page's fallback applies.
         assert!(!supports_condition("(display: ruby)"));
-        assert!(!supports_condition("(filter: blur(1px))"));
         assert!(!supports_condition("(backdrop-filter: blur(1px))"));
+        assert!(supports_condition(
+            "(filter: blur(1px) drop-shadow(0 0 2px red))"
+        ));
         // not / and / or / nesting.
         assert!(!supports_condition("not (display: grid)"));
-        assert!(supports_condition("not (filter: blur(1px))"));
+        assert!(supports_condition("not (backdrop-filter: blur(1px))"));
         assert!(supports_condition("(display: grid) and (gap: 1rem)"));
         assert!(!supports_condition(
-            "(display: grid) and (filter: blur(1px))"
+            "(display: grid) and (backdrop-filter: blur(1px))"
         ));
-        assert!(supports_condition("(filter: blur(1px)) or (display: grid)"));
+        assert!(supports_condition(
+            "(backdrop-filter: blur(1px)) or (display: grid)"
+        ));
         assert!(supports_condition("((display: grid))"));
         assert!(supports_condition("selector(.a)"));
     }
@@ -20530,14 +20534,14 @@ mod tests {
         // We implement grid, so `@supports (display:grid)` applies (hiding
         // `.grid-only`); the old-browser `@supports not (display:grid)` fallback
         // is dropped (`.no-grid` stays); a property we don't implement
-        // (`@supports (filter:…)`) is dropped (`.fancy` stays). This is the
+        // (`@supports (backdrop-filter:…)`) is dropped (`.fancy` stays). This is the
         // progressive-enhancement pattern (the IA infinite-scroller serves a
         // flex fallback + `@supports (display:grid)` uniform-track grid).
         let dom = Dom::parse_document(
             "<head><style>
                 @supports (display: grid) { .grid-only { display: none } }
                 @supports not (display: grid) { .no-grid { display: none } }
-                @supports (filter: blur(1px)) { .fancy { display: none } }
+                @supports (backdrop-filter: blur(1px)) { .fancy { display: none } }
                 @supports (display: grid) and (gap: 1rem) { .both { display: none } }
              </style></head>
              <body>
@@ -20555,7 +20559,7 @@ mod tests {
         assert!(html.contains("nogrid kept"), "not(grid) dropped: {html}");
         assert!(
             html.contains("fancy kept"),
-            "@supports(filter) dropped: {html}"
+            "@supports(backdrop-filter) dropped: {html}"
         );
         assert!(!html.contains("both gone"), "grid and gap applies: {html}");
     }

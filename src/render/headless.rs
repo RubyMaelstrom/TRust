@@ -408,6 +408,46 @@ mod tests {
     }
 
     #[test]
+    fn css_drop_shadow_and_blur_filters_paint_on_both_backends() {
+        // Filter Effects 1 #FilterFunction: drop-shadow() paints the
+        // offset alpha in its color under the element, blur() spreads it.
+        let html = r#"<!doctype html><style>
+            body{margin:0;background:white} .tile{position:absolute;top:4px;width:20px;height:20px;background:blue}
+            #shadow{left:4px;filter:drop-shadow(10px 10px 0 red)}
+            #chain{left:64px;filter:drop-shadow(10px 0 0 lime) drop-shadow(0 10px 0 red)}
+            #blur{left:124px;filter:blur(4px)}
+        </style><div class=tile id=shadow></div><div class=tile id=chain></div><div class=tile id=blur></div>"#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(html);
+        let scene = scene_for_dom(
+            &dom,
+            &base,
+            CssSize::new(180., 48.),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+            ImageStore::default(),
+        );
+        let check = |frame: &OwnedRgbaFrame| {
+            let at = |x: usize, y: usize| frame.pixels[(y * 180 + x) * 4..][..3].to_vec();
+            assert_eq!(at(8, 8), [0, 0, 255], "the element over its shadow");
+            assert_eq!(at(28, 28), [255, 0, 0], "the shadow");
+            assert_eq!(at(28, 8), [255, 255, 255]);
+            assert_eq!(at(88, 8), [0, 255, 0], "the first shadow");
+            assert_eq!(at(88, 28), [255, 0, 0], "the second shadows the first");
+            assert_eq!(at(68, 28), [255, 0, 0]);
+            let edge = at(124, 14);
+            assert!(edge[0] > 60 && edge[0] < 220, "a blurred edge: {edge:?}");
+        };
+        check(&VelloCpuRenderer::new().render_rgba(&scene).unwrap());
+        if let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) {
+            check(&hybrid.render_rgba(&scene).unwrap());
+        }
+    }
+
+    #[test]
     fn legacy_html_colors_reach_desktop_pixels_without_a_stylesheet() {
         // HTML #the-page / #phrasing-content-3: these hints must reach the
         // same cascade and canvas painting path as authored CSS.

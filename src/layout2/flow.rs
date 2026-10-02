@@ -202,7 +202,7 @@ pub(crate) struct PaintFlags {
     pub z: Option<i32>,
     /// Exact group opacity retained from the typed box snapshot.
     pub opacity: f32,
-    pub color_filters: std::sync::Arc<[[f32; 20]]>,
+    pub filters: std::sync::Arc<[crate::render::CssFilter]>,
     pub transform: Option<std::sync::Arc<super::transform::Transform>>,
     pub child_viewport: bool,
     /// Paints a background over the border box in display-list order.
@@ -234,7 +234,7 @@ impl Default for PaintFlags {
             sc: false,
             z: None,
             opacity: 1.0,
-            color_filters: Default::default(),
+            filters: Default::default(),
             transform: None,
             child_viewport: false,
             bg: false,
@@ -259,15 +259,15 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         sc: s.stacking_context(item),
         z: s.z_index,
         opacity: s.opacity,
-        color_filters: s.color_filters.clone(),
+        filters: s.filters.clone(),
         transform: s.transform.clone(),
         child_viewport: s.child_viewport,
         bg: s.bg,
         outline: s.outline,
         cb_abs: s.position.positioned()
             || s.has_transform
-            || (s.filter_containing_block && !s.color_filters.is_empty()),
-        cb_fixed: s.has_transform || (s.filter_containing_block && !s.color_filters.is_empty()),
+            || (s.filter_containing_block && !s.filters.is_empty()),
+        cb_fixed: s.has_transform || (s.filter_containing_block && !s.filters.is_empty()),
         // Set on the laid float fragment by `lay_inlines`, not from style
         // (positioning wins over `float`, so the style bit alone is ambiguous).
         float: false,
