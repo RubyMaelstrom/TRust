@@ -382,7 +382,12 @@ impl PageHitIndex {
                         ));
                     constraint.offset(offset, viewport)
                 }
-                Motion::Animation(scope) => sample_css_animation_scope(scope, elapsed_seconds),
+                Motion::Animation(scope) => {
+                    self.world[id] = self.world[space.parent.dynamic]
+                        .then(space.parent.local)
+                        .then(sample_css_animation_scope(scope, elapsed_seconds));
+                    continue;
+                }
                 Motion::Marquee(scope) => sample_marquee_scope(scope, elapsed_seconds),
             };
             self.world[id] = self.world[space.parent.dynamic]
@@ -505,8 +510,18 @@ impl PageHitIndex {
                             + animation.direction.capacity()
                             + animation.fill_mode.capacity()
                             + animation.timing_function.capacity()
-                            + (animation.position.capacity() + animation.transform.capacity())
-                                * std::mem::size_of::<CssAnimationPoint>();
+                            + animation.position.capacity()
+                                * std::mem::size_of::<CssAnimationPoint>()
+                            + animation.transform.capacity()
+                                * std::mem::size_of::<super::CssTransformFrame>()
+                            + animation
+                                .transform
+                                .iter()
+                                .map(|frame| {
+                                    frame.steps.capacity()
+                                        * std::mem::size_of::<super::TransformStep>()
+                                })
+                                .sum::<usize>();
                     }
                 }
                 Motion::Marquee(_)
@@ -766,15 +781,17 @@ mod tests {
                 opacity: Vec::new(),
                 position: Vec::new(),
                 transform: vec![
-                    CssAnimationPoint {
+                    super::super::CssTransformFrame {
                         offset: 0.,
-                        value: CssPoint::default(),
+                        steps: vec![super::super::TransformStep::Translate(0., 0.)],
                     },
-                    CssAnimationPoint {
+                    super::super::CssTransformFrame {
                         offset: 1.,
-                        value: CssPoint::new(160., 80.),
+                        steps: vec![super::super::TransformStep::Translate(160., 80.)],
                     },
                 ],
+                transform_origin: CssPoint::default(),
+                static_transform: Affine2d::IDENTITY,
             }],
         };
         let marquee = MarqueeScope {

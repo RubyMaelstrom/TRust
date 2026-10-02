@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crate::core::CssPoint;
-use crate::render::{Affine2d, CssRect};
+use crate::render::{Affine2d, CssRect, TransformStep};
 
 use super::Units;
 use super::flow::Frag;
@@ -342,6 +342,104 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
         operations.push(Operation::Matrix(matrix));
     }
     (!operations.is_empty()).then_some(operations)
+}
+
+/// An animated `transform` value's functions as interpolable steps (CSS
+/// Transforms 1 #interpolation-of-transforms): lengths resolved against the
+/// `reference` box, angles in radians. `none` is the empty list.
+pub(super) fn animation_steps(
+    text: &str,
+    units: Units,
+    viewport: Vp,
+    reference: CssRect,
+) -> Option<Vec<TransformStep>> {
+    if none(text) {
+        return Some(Vec::new());
+    }
+    let mut input = cssparser::ParserInput::new(text);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let x_length = |text: &str| length(text, units, viewport)?.resolve(Some(reference.width));
+    let y_length = |text: &str| length(text, units, viewport)?.resolve(Some(reference.height));
+    let mut steps = Vec::new();
+    while !parser.is_exhausted() {
+        let name = parser.expect_function().ok()?.to_ascii_lowercase();
+        let args = parser
+            .parse_nested_block(|p| {
+                p.parse_comma_separated(|p| {
+                    let start = p.position();
+                    while p.next().is_ok() {}
+                    Ok::<_, cssparser::ParseError<'_, ()>>(p.slice_from(start).trim())
+                })
+            })
+            .ok()?;
+        steps.push(match (name.as_str(), args.as_slice()) {
+            ("translate" | "translatex", [x]) => TransformStep::Translate(x_length(x)?, 0.),
+            ("translatey", [y]) => TransformStep::Translate(0., y_length(y)?),
+            ("translate", [x, y]) | ("translate3d", [x, y, _]) => {
+                TransformStep::Translate(x_length(x)?, y_length(y)?)
+            }
+            ("scale", [x]) => TransformStep::Scale(scale(x)?, scale(x)?),
+            ("scale", [x, y]) | ("scale3d", [x, y, _]) => {
+                TransformStep::Scale(scale(x)?, scale(y)?)
+            }
+            ("scalex", [x]) => TransformStep::Scale(scale(x)?, 1.),
+            ("scaley", [y]) => TransformStep::Scale(1., scale(y)?),
+            ("rotate" | "rotatez", [a]) => TransformStep::Rotate(angle(a)?),
+            ("rotate3d", [x, y, z, a]) if number(x)? == 0. && number(y)? == 0. => {
+                TransformStep::Rotate(angle(a)? * number(z)?.signum())
+            }
+            ("skew" | "skewx", [a]) => TransformStep::Skew(angle(a)?, 0.),
+            ("skewy", [a]) => TransformStep::Skew(0., angle(a)?),
+            ("skew", [x, y]) => TransformStep::Skew(angle(x)?, angle(y)?),
+            ("matrix", [a, b, c, d, e, f]) => TransformStep::Matrix(Affine2d([
+                number(a)?,
+                number(b)?,
+                number(c)?,
+                number(d)?,
+                number(e)?,
+                number(f)?,
+            ])),
+            ("matrix3d", values) if values.len() == 16 => {
+                let m = values
+                    .iter()
+                    .map(|v| number(v))
+                    .collect::<Option<Vec<_>>>()?;
+                TransformStep::Matrix(Affine2d([m[0], m[1], m[4], m[5], m[12], m[13]]))
+            }
+            ("translatez" | "scalez" | "rotatex" | "rotatey" | "perspective", [_]) => {
+                TransformStep::Matrix(Affine2d::IDENTITY)
+            }
+            _ => return None,
+        });
+    }
+    Some(steps)
+}
+
+/// The reference box and absolute transform origin (CSS Transforms 1
+/// #transform-box, #transform-origin-property) of a fragment whose
+/// `transform` animates, with or without a static transform.
+pub(super) fn animation_origin(
+    value: impl Fn(&str) -> Option<String>,
+    units: Units,
+    viewport: Vp,
+    fragment: &Frag,
+) -> (CssRect, CssPoint) {
+    let reference =
+        if value("transform-box").is_some_and(|v| matches!(v.trim(), "content-box" | "fill-box")) {
+            fragment.content_box()
+        } else {
+            CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h)
+        };
+    let [x, y] = value("transform-origin")
+        .and_then(|s| origin(&s, units, viewport))
+        .unwrap_or_else(|| [percent(50.), percent(50.)]);
+    (
+        reference,
+        CssPoint::new(
+            reference.x + x.resolve(Some(reference.width)).unwrap_or(0.),
+            reference.y + y.resolve(Some(reference.height)).unwrap_or(0.),
+        ),
+    )
 }
 
 #[cfg(test)]
