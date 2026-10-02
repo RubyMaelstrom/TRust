@@ -1145,9 +1145,11 @@ fn append_resolved_name_inner(
         return;
     }
     for candidate in catalog.alias_candidates.get(&key).into_iter().flatten() {
-        if GenericFamily::parse(&candidate.to_ascii_lowercase()).is_some() {
-            output.push(candidate.to_ascii_lowercase());
-        } else {
+        // A fontconfig default to a generic family (`Comic Sans MS` →
+        // cursive) names a category, not a substitute. CSS Fonts 4
+        // #font-style-matching skips an unavailable family, and the list's
+        // own generic serves at its own position.
+        if GenericFamily::parse(&candidate.to_ascii_lowercase()).is_none() {
             append_resolved_name_inner(output, candidate, catalog, visited, depth + 1);
         }
     }
@@ -1888,6 +1890,41 @@ mod tests {
         );
         dedup_folded(&mut output);
         assert_eq!(output, ["Installed"]);
+    }
+
+    #[test]
+    fn a_missing_family_takes_substitutes_but_not_its_generic_default() {
+        // CSS Fonts 4 #font-style-matching walks the list in order: an
+        // unavailable family whose fontconfig default is a generic family
+        // is skipped, not replaced by a family literally named "cursive".
+        let collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        let catalog = Catalog {
+            alias_candidates: HashMap::from([
+                ("comic sans ms".to_string(), vec!["cursive".to_string()]),
+                ("arial".to_string(), vec!["Liberation Sans".to_string()]),
+            ]),
+            paths: Vec::new(),
+            embedded_fallback: false,
+            text_collection: Mutex::new(collection.clone()),
+            base_text_collection: collection,
+            installed_names: HashMap::from([(
+                fold("Liberation Sans"),
+                "Liberation Sans".to_string(),
+            )]),
+            generic_names: HashMap::new(),
+            family_expansions: Mutex::default(),
+        };
+        assert_eq!(
+            expand_css_family_list(r#""Comic Sans MS", "Comic Sans", cursive"#, &catalog),
+            r#""Comic Sans MS", "Comic Sans", cursive"#
+        );
+        assert_eq!(
+            expand_css_family_list("Arial, serif", &catalog),
+            r#""Liberation Sans", serif"#
+        );
     }
 
     #[test]
