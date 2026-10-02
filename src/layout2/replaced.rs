@@ -135,6 +135,10 @@ pub(crate) fn size(
         attr("height", cb_h)
     }
     .map(content_h);
+    // An img representing its alt text is not a replaced box.
+    if represents_alt_text(dom, node, dimension_source, url, vp) {
+        return None;
+    }
     // CSS 2.2 §10.3.2/§10.6.2: a replaced element with an intrinsic
     // ratio but NO intrinsic width or height (an SVG referenced with only a
     // `viewBox`), sized auto/auto, takes its width from the block constraint
@@ -276,6 +280,51 @@ pub(crate) fn size(
     // documented paint-model approximation; `scale-down` is its ≤-natural
     // half and identical whenever the image doesn't overflow the box).
     Some(apply_fit(dom, node, natural, box_w, box_h))
+}
+
+/// HTML Rendering #images-3: an img with no image to show (no source, or
+/// an unusable one) and a non-empty alt represents that text, and the user
+/// agent does not expect it to change. In no-quirks and limited-quirks
+/// documents it is then a non-replaced phrasing element whose content is the
+/// text, whatever its dimension attributes or aspect ratio (which applies to
+/// no inline box, css-sizing-4 #aspect-ratio). Only a quirks-mode img that
+/// already has both dimensions stays a replaced element (holding the text).
+pub(crate) fn represents_alt_text(
+    dom: &Dom,
+    node: NodeId,
+    dimension_source: NodeId,
+    url: Option<&str>,
+    vp: Vp,
+) -> bool {
+    if url.is_some()
+        || dom.tag_name(node) != Some("img")
+        || dom
+            .attr(node, "alt")
+            .is_none_or(|alt| alt.trim().is_empty())
+    {
+        return false;
+    }
+    let quirks = dom.owner_document(node).is_some_and(|document| {
+        dom.document_mode(document) == html5ever::tree_builder::QuirksMode::Quirks
+    });
+    if !quirks {
+        return true;
+    }
+    let u = Units::of(dom, node);
+    let sized = |prop: &str| {
+        if dom.author_declares(node, prop) {
+            matches!(
+                dom.computed_value_resolved(node, prop)
+                    .and_then(|v| Len::parse(&v, u, vp)),
+                Some(Len::Val(_))
+            )
+        } else {
+            dom.attr(dimension_source, prop)
+                .and_then(html_dimension)
+                .is_some()
+        }
+    };
+    !(sized("width") && sized("height"))
 }
 
 /// css-images-3 §5.5 `object-fit` over a used box: the paint rect and crop

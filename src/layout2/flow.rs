@@ -3434,12 +3434,21 @@ impl Flow<'_> {
                 children.extend(atom_frags);
             }
             Content::Atomic(atom) => match &atom.kind {
+                // An img representing its alt text lays that text as the
+                // item's content instead (HTML Rendering #images-3).
                 AtomKind::Img {
                     url,
                     density,
                     dimension_source,
                     alt: _,
-                } => {
+                } if !super::replaced::represents_alt_text(
+                    self.dom,
+                    atom.node,
+                    *dimension_source,
+                    url.as_deref(),
+                    self.vp,
+                ) =>
+                {
                     // The imposed width IS the replaced item's used main
                     // size; the cross comes from its definite height, else
                     // through the natural ratio (§9.4 replaced hypothetical
