@@ -422,14 +422,38 @@ impl Flow<'_> {
 
         let mut col_min = vec![0.0f32; ncols];
         let mut col_max = vec![0.0f32; ncols];
+        // A fixed width replaces the max-content preference of its column:
+        // as in Gecko and Blink, the column's other cells then contribute
+        // only their min-content.
+        let fixed_cols: Vec<bool> = (0..ncols)
+            .map(|c| {
+                matches!(col_w[c], Some(ColSpec::Px(_)))
+                    || tb.cells.iter().any(|cell| {
+                        cell.colspan == 1
+                            && cell.col == c
+                            && matches!(
+                                declared_track_width(self.dom, cell.b.node),
+                                Some(ColSpec::Px(_))
+                            )
+                    })
+            })
+            .collect();
         // Single-column cells first.
         for cell in &tb.cells {
             if cell.colspan != 1 || cell.col >= ncols {
                 continue;
             }
             let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
+            let fixed = matches!(
+                declared_track_width(self.dom, cell.b.node),
+                Some(ColSpec::Px(_))
+            );
             col_min[cell.col] = col_min[cell.col].max(mn);
-            col_max[cell.col] = col_max[cell.col].max(mx);
+            col_max[cell.col] = col_max[cell.col].max(if fixed_cols[cell.col] && !fixed {
+                mn
+            } else {
+                mx
+            });
         }
         // Spanning cells widen the spanned columns so the span fits (§17.5.2.2
         // step 3 — widen all spanned columns by ~the same amount).
@@ -447,10 +471,11 @@ impl Flow<'_> {
             distribute_deficit(&mut col_min[cell.col..end], (mn - inner_bs).max(0.0));
             distribute_deficit(&mut col_max[cell.col..end], (mx - inner_bs).max(0.0));
         }
-        // A declared px column width raises the column's max-content.
+        // A declared px column width is its preference, never below its
+        // min-content.
         for c in 0..ncols {
             if let Some(ColSpec::Px(px)) = col_w[c] {
-                col_max[c] = col_max[c].max(cap.map_or(px, |a| px.min(a)));
+                col_max[c] = col_max[c].max(col_min[c].max(cap.map_or(px, |a| px.min(a))));
             }
         }
         (col_min, col_max, col_w)
@@ -482,10 +507,11 @@ impl Flow<'_> {
 
     /// A cell's min-content and max-content OUTER (border-box) widths (px):
     /// its content intrinsic widths plus its own border and padding (margins
-    /// don't apply to table cells — §17.5.1). A declared width raises both
-    /// (§17.5.2.2 step 1 — "if W is greater than MCW, W is the minimum"); it is
-    /// clamped to `cap` when set (the band) so one huge declared cell can't
-    /// dominate the layout. `pct_basis` resolves percentage padding.
+    /// don't apply to table cells — §17.5.1). A declared width raises the
+    /// minimum (§17.5.2.2 step 1 — "if W is greater than MCW, W is the
+    /// minimum") and, as in browsers, replaces the max-content preference;
+    /// it is clamped to `cap` when set (the band) so one huge declared cell
+    /// can't dominate the layout. `pct_basis` resolves percentage padding.
     fn cell_min_max(
         &self,
         cell: &super::tree::TableCell,
@@ -503,7 +529,7 @@ impl Flow<'_> {
         if let Some(ColSpec::Px(px)) = declared_track_width(self.dom, cell.b.node) {
             let px = cap.map_or(px, |a| px.min(a));
             mn = mn.max(px);
-            mx = mx.max(px);
+            mx = mn;
         }
         (mn.max(1.0), mx.max(mn))
     }

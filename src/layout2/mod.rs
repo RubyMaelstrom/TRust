@@ -3853,6 +3853,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_cell_width_is_its_columns_preferred_width() {
+        // In automatic table layout a cell's or column's fixed width replaces
+        // the column's max-content preference, though never below its
+        // min-content, and the column's other cells then wrap to it, as in
+        // Gecko and Blink. Widths measured in LibreWolf 153.
+        let html = r#"<!doctype html><body style="margin:0;font:16px sans-serif">
+            <table cellspacing=0 cellpadding=0><tr><td id=a width=100>long long long long text here</td><td>x</td></tr></table>
+            <table cellspacing=0 cellpadding=0><tr><td id=b width=100>short</td></tr><tr><td id=c>a much longer line of text in row two</td></tr></table>
+            <table cellspacing=0 cellpadding=0><col width=100><tr><td id=d>col element long long long text</td></tr></table>
+            <table cellspacing=0 cellpadding=0><tr><td id=e width=50>Unbreakablewordthatislong</td></tr></table>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(width(id), 100.0, "{id}");
+        }
+        assert!(width("e") > 150.0, "min-content still wins: {}", width("e"));
+    }
+
+    #[test]
     fn content_of_a_cell_taller_than_it_is_vertically_aligned() {
         // CSS 2.2 §17.5.3/§17.5.4: a cell's 'height' makes the cell taller,
         // and its content is aligned in the extra space (middle by default).
