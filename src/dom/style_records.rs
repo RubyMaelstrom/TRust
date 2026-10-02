@@ -245,6 +245,7 @@ mod tests {
 
     #[test]
     fn style_contexts_share_variable_dependent_boxes_and_split_on_inherited_changes() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         // CSS Variables 1 #using-variables: lookup is at the element, with
         // inherited computed streams rather than reinterpreted parent tokens.
         let mut dom = Dom::parse_document(
@@ -357,6 +358,8 @@ mod tests {
 
     #[test]
     fn style_records_share_typed_boxes_but_preserve_node_and_font_context() {
+        // Cache-hit counts: a parallel page-font install would expire rows.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style>.same {width:2em;padding:3px}</style><div style='font-size:10px'><span class=same id=x>x</span><span class=same id=y>y</span></div>",
         );
@@ -385,6 +388,7 @@ mod tests {
 
     #[test]
     fn style_records_keep_inline_links_language_and_parent_alignment_live() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<div lang=en><a id=x href=next style='font-size:12px;letter-spacing:1px'>x</a></div>",
         );
@@ -418,6 +422,7 @@ mod tests {
 
     #[test]
     fn style_records_display_tracks_variables_hidden_and_document_roots() {
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style>html {display:contents}.same {display:var(--mode, inline)}</style><div id=p style='--mode:block'><span id=x class=same>x</span><span id=y class=same hidden>y</span></div>",
         );
