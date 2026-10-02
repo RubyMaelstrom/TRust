@@ -912,6 +912,17 @@ impl Builder<'_> {
         let mut run: Vec<Inline> = Vec::new();
         let flush = |run: &mut Vec<Inline>, items: &mut Vec<SharedBox>| {
             if run.iter().any(inline_has_content) {
+                // A `<br>` with no text beside it is an item of its own, but
+                // an empty one (as in Gecko and Blink): it takes a grid cell
+                // and flex gaps, not a line. Next to text it breaks the line
+                // inside that text's anonymous item.
+                let only_breaks = run.iter().all(|inline| {
+                    matches!(inline, Inline::Br)
+                        || matches!(inline, Inline::Text(text) if text.chars().all(is_collapsible_space))
+                });
+                if only_breaks {
+                    run.clear();
+                }
                 items.push(Arc::new(BoxNode {
                     node: crate::layout2::NO_NODE,
                     style: BoxStyle::anonymous(),
