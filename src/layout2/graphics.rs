@@ -3727,7 +3727,12 @@ fn paint_inline_box_decorations(
                     let baseline = fragment.y + piece.y + text.baseline;
                     (baseline - text.ascent, baseline + text.descent)
                 });
-        for &node in boxes.chain.iter() {
+        for node in boxes
+            .chain
+            .iter()
+            .filter(|entry| entry.decorated)
+            .map(|entry| entry.key)
+        {
             let index = runs
                 .iter()
                 .position(|run| run.node == node)
@@ -3906,7 +3911,7 @@ fn text_clip_line(
             piece
                 .boxes
                 .as_ref()
-                .is_some_and(|boxes| boxes.chain.contains(&node))
+                .is_some_and(|boxes| boxes.chain.iter().any(|entry| entry.key == node))
         })
         .cloned()
         .collect();
