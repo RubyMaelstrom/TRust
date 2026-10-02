@@ -5001,17 +5001,7 @@ impl Flow<'_> {
             ifc.set_align_last(align_last);
         }
         ifc.set_first_line_ascent(first_line_ascent);
-        // CSS Lists 3 #marker-properties: the marker's own text style.
-        if let Some(source) = marker_image {
-            let mut mctx = inl.marker(self.dom).into_owned();
-            mctx.kind = crate::layout2::ItemKind::Image;
-            ifc.marker_image(source, &mctx);
-        }
-        if let Some(m) = marker {
-            let mut mctx = inl.marker(self.dom).into_owned();
-            mctx.kind = crate::layout2::ItemKind::Text;
-            ifc.text(m, &mctx);
-        }
+        ifc.inside_marker(marker, marker_image, inl);
         ifc.run(inls, inl);
         let (lines, marks, oofs, placements, atom_places) = ifc.finish();
         if lines.is_empty() {
