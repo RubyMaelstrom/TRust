@@ -5217,11 +5217,12 @@ fn balance_columns(breaks: &[f32], top: f32, end: f32, n: usize) -> Vec<f32> {
             if end - start <= height + 0.01 {
                 break;
             }
+            // `breaks` is ascending: the furthest one within `height`.
             let next = breaks
                 .iter()
                 .copied()
-                .filter(|&b| b > start + 0.01 && b <= start + height + 0.01)
-                .last()
+                .rev()
+                .find(|&b| b > start + 0.01 && b <= start + height + 0.01)
                 .or_else(|| breaks.iter().copied().find(|&b| b > start + 0.01));
             match next {
                 Some(next) => starts.push(next),
