@@ -9526,6 +9526,40 @@ mod tests {
     }
 
     #[test]
+    fn graphical_discovery_keeps_unsized_lazy_images_in_the_viewport() {
+        // HTML #lazy-load-intersection-observer resumes an image when the
+        // Intersection Observer entry is intersecting, which includes a
+        // zero-area target edge-adjacent to the root (IntersectionObserver
+        // #update-intersection-observations-algo). An image without
+        // dimensions is 0x0 until its natural size is known, so its
+        // deferred entry must not depend on having area.
+        let base = Url::parse("https://www.example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<p>text <img loading="lazy" src="art.webp"></p>
+               <div style="display:flex"><a style="display:block"><img loading="lazy" src="card.webp"></a></div>"#,
+        );
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        for source in ["art.webp", "card.webp"] {
+            let url = format!("https://www.example.test/{source}");
+            assert!(
+                rendered
+                    .deferred_images
+                    .iter()
+                    .any(|image| image.source == url && image.rect.y < 600.0),
+                "{source}: {:?}",
+                rendered.deferred_images
+            );
+        }
+    }
+
+    #[test]
     fn graphical_discovery_marks_lazy_images_in_fixed_subtrees_viewport_relative() {
         let base = Url::parse("https://www.example.test/").unwrap();
         let dom = crate::dom::Dom::parse_document(

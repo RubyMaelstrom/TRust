@@ -11156,6 +11156,57 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn unavailable_images_without_alt_text_are_empty_replaced_boxes() {
+        // HTML Rendering #images-3: an image that is loading, has no alt
+        // attribute, or represents nothing is a replaced element with no
+        // content (zero natural dimensions). It still sits on the baseline
+        // of a line box, which takes the strut's height, as in Gecko and
+        // Blink. Dimensions still apply. The quirks-mode line height
+        // calculation quirk leaves such a line without a strut.
+        let dom = Dom::parse_document(
+            r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+               <div id=a><img id=ia src="pending.png"></div>
+               <div id=b><img id=ib src="pending.png" alt="" loading=lazy></div>
+               <div id=c><img id=ic src="pending.png" width=30 height=10></div>
+               <div id=d>after</div></body>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let rect = |id: &str| layout.boxes[&node_by_id(&dom, id)];
+        for (block, image) in [("a", "ia"), ("b", "ib")] {
+            assert!((rect(block).height - 20.0).abs() < 0.5, "{:?}", rect(block));
+            let image = rect(image);
+            assert_eq!((image.width, image.height), (0.0, 0.0), "{image:?}");
+            assert!(
+                image.top > rect(block).top + 10.0,
+                "on the baseline: {image:?}"
+            );
+        }
+        assert_eq!((rect("ic").width, rect("ic").height), (30.0, 10.0));
+        assert!((rect("d").top - 60.0).abs() < 0.5, "{:?}", rect("d"));
+
+        let quirks = Dom::parse_document(
+            r#"<body style="margin:0;font:16px/20px sans-serif"><div id=a><img src="pending.png"></div></body>"#,
+        );
+        let layout = lay_out_graphical(
+            &quirks,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(layout.boxes[&node_by_id(&quirks, "a")].height, 0.0);
+    }
+
+    #[test]
     fn horizontal_marquees_have_no_min_content_width() {
         // HTML Rendering #the-marquee-element-2 slides the contents across
         // the box; Gecko and Blink give a horizontal marquee a zero
