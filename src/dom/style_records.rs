@@ -129,7 +129,13 @@ impl Dom {
         // Container/rollback cascades deliberately install provisional maps
         // while resolving their dependencies. They retain the ordinary path.
         let index = self.style_index();
-        if index.has_container_queries || index.has_revert_layer {
+        if index.has_container_queries
+            || index.has_container_units
+            || index.has_revert_layer
+            || self
+                .attr(id, "style")
+                .is_some_and(super::mentions_container_unit)
+        {
             return None;
         }
         {
