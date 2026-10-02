@@ -2307,14 +2307,12 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
         return;
     }
 
-    let background_declared = builder
-        .dom
-        .computed_value_resolved(node, "background-color")
-        .is_some()
-        || builder
-            .dom
-            .computed_value_resolved(node, "background-image")
-            .is_some();
+    // CSS UI 4 #appearance-disabling-properties: an author-origin cascaded
+    // value counts even when it is `initial` or `unset`, whose computed
+    // value is the transparent, borderless initial value rather than the
+    // UA's native surface.
+    let background_declared = builder.dom.author_cascades(node, "background-color")
+        || builder.dom.author_cascades(node, "background-image");
     // An authored border style replaces the native edge with the CSS border.
     // An authored color or width alone restyles the UA border, as in Gecko
     // and Blink: `border-color: transparent` hides a button's border, and a
@@ -2322,8 +2320,7 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
     let border_declared = ["top", "right", "bottom", "left"].into_iter().any(|side| {
         builder
             .dom
-            .computed_value_resolved(node, &format!("border-{side}-style"))
-            .is_some()
+            .author_cascades(node, &format!("border-{side}-style"))
     });
     let edge_width = builder
         .dom
@@ -7015,6 +7012,47 @@ mod tests {
         assert_eq!(ink("border-color:transparent"), 0);
         assert_eq!(ink("border-width:0"), 0);
         assert!(ink("border-color:blue") > 50, "a recolored edge");
+    }
+
+    #[test]
+    fn an_authored_initial_or_unset_background_devolves_a_native_button() {
+        // CSS UI 4 #appearance-disabling-properties: any author-origin
+        // cascaded value, `initial` and `unset` included, replaces the
+        // native surface with the CSS background (here transparent). Only a
+        // `revert` rolled back to the UA origin keeps the native surface.
+        let center = |style: &str| {
+            let (_, layout) = render_fixture(&format!(
+                "<style>body{{margin:0;background:rgb(200,208,224)}}</style>\
+                 <button style='width:60px;height:30px;border:none;{style}'></button>"
+            ));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let at = (15 * 800 + 30) * 4;
+            <[u8; 3]>::try_from(&frame.pixels[at..at + 3]).unwrap()
+        };
+        let page = [200, 208, 224];
+        for style in [
+            "background-color:unset",
+            "background-color:initial",
+            "background:unset",
+            "background-color:transparent",
+        ] {
+            assert_eq!(center(style), page, "{style}");
+        }
+        assert_ne!(center(""), page, "the native surface");
+        assert_ne!(center("background-color:revert"), page, "revert");
+        // `border: unset` computes to no border, so no native edge either.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white}</style>\
+             <button style='width:60px;height:30px;background-color:unset;border:unset'></button>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        assert!(
+            frame.pixels.as_chunks::<4>().0.iter().all(|p| p[0] > 200),
+            "no native edge"
+        );
     }
 
     #[test]

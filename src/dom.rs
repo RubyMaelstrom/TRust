@@ -5316,6 +5316,16 @@ impl Dom {
         self.cascaded_maps(id).elem.contains_key(prop)
     }
 
+    /// Whether the author origin gives `prop` a cascaded value once any
+    /// `revert`/`revert-layer` has rolled back, as CSS UI 4
+    /// #appearance-disabling-properties asks. Unlike the computed value, an
+    /// authored `initial`, `unset` or `inherit` counts.
+    pub(crate) fn author_cascades(&self, id: NodeId, prop: &str) -> bool {
+        self.cascaded(id, prop).is_some_and(|value| {
+            !matches!(resolved_wide_keyword(&value), Some(WideKeyword::Revert))
+        })
+    }
+
     /// The element's full cascade winner maps for the current epoch, built
     /// on the first read of ANY of its properties (one pass over its author
     /// sources), then shared by every further read.
