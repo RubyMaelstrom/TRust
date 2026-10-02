@@ -993,7 +993,13 @@ impl VelloHybridRenderer {
                             shaped,
                             None,
                         );
-                        paint_decorations(&mut target, shadow_origin, shaped, decoration);
+                        paint_decorations(
+                            &mut target,
+                            shadow_origin,
+                            shaped,
+                            decoration,
+                            *transforms.last().unwrap(),
+                        );
                         if blurred.is_some() {
                             target.pop_layer();
                         }
@@ -1007,7 +1013,13 @@ impl VelloHybridRenderer {
                         Some(*color),
                     );
                     target.set_paint(vello_color(decoration.color));
-                    paint_decorations(&mut target, *origin, shaped, decoration);
+                    paint_decorations(
+                        &mut target,
+                        *origin,
+                        shaped,
+                        decoration,
+                        *transforms.last().unwrap(),
+                    );
                     if clip.is_some() {
                         target.pop_clip_path();
                     }
@@ -1580,8 +1592,9 @@ fn paint_decorations(
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
     decoration: &crate::render::TextDecorationPaint,
+    transform: Affine,
 ) {
-    for (stroke, path) in decoration_strokes(origin, shaped, decoration) {
+    for (stroke, path) in decoration_strokes(origin, shaped, decoration, transform) {
         if let Some(stroke) = stroke {
             target.set_stroke(stroke);
             target.stroke_path(&path);

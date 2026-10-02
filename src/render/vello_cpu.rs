@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vello_cpu::color::palette::css::{
     BLACK, BLUE, CYAN, DARK_GRAY, GRAY, LIGHT_GRAY, WHITE, YELLOW,
 };
-use vello_cpu::kurbo::{Affine, BezPath, Cap, Circle, Join, Rect, Shape as _, Stroke};
+use vello_cpu::kurbo::{Affine, BezPath, Cap, Ellipse, Join, Rect, Shape as _, Stroke};
 use vello_cpu::peniko::{
     ColorStop, Compose, Gradient, ImageBrush, ImageQuality, ImageSampler, Mix,
 };
@@ -467,7 +467,13 @@ impl VelloCpuRenderer {
                             shaped,
                             None,
                         );
-                        paint_decorations(&mut self.context, shadow_origin, shaped, decoration);
+                        paint_decorations(
+                            &mut self.context,
+                            shadow_origin,
+                            shaped,
+                            decoration,
+                            *transforms.last().unwrap(),
+                        );
                         if blurred.is_some() {
                             self.context.pop_layer();
                         }
@@ -481,7 +487,13 @@ impl VelloCpuRenderer {
                         Some(*color),
                     );
                     self.context.set_paint(vello_color(decoration.color));
-                    paint_decorations(&mut self.context, *origin, shaped, decoration);
+                    paint_decorations(
+                        &mut self.context,
+                        *origin,
+                        shaped,
+                        decoration,
+                        *transforms.last().unwrap(),
+                    );
                     if clip.is_some() {
                         self.context.pop_clip_path();
                     }
@@ -890,8 +902,9 @@ fn paint_decorations(
     origin: crate::core::CssPoint,
     shaped: &crate::text::ShapedText,
     decoration: &super::TextDecorationPaint,
+    transform: Affine,
 ) {
-    for (stroke, path) in decoration_strokes(origin, shaped, decoration) {
+    for (stroke, path) in decoration_strokes(origin, shaped, decoration, transform) {
         if let Some(stroke) = stroke {
             context.set_stroke(stroke);
             context.stroke_path(&path);
@@ -906,11 +919,13 @@ fn paint_decorations(
 /// eighteenth of the line height; an underline sits `text-underline-offset`
 /// below the alphabetic baseline (by default, one thickness). `wavy` is a
 /// smooth wave of period six thicknesses. Each path is stroked, or filled
-/// when it has no stroke.
+/// when it has no stroke. `transform` maps CSS pixels to the device pixels
+/// the paths are drawn on.
 pub(super) fn decoration_strokes(
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
     decoration: &super::TextDecorationPaint,
+    transform: Affine,
 ) -> Vec<(Option<Stroke>, BezPath)> {
     let style = decoration.style;
     let thickness = decoration
@@ -921,7 +936,10 @@ pub(super) fn decoration_strokes(
     let mut strokes = Vec::new();
     let mut line = |y: f32| {
         if style == DecorationStyle::Dotted {
-            strokes.push((None, decoration_dots(left, right, f64::from(y), thickness)));
+            strokes.push((
+                None,
+                decoration_dots(left, right, f64::from(y), thickness, transform),
+            ));
             return;
         }
         let mut stroke = Stroke::new(f64::from(thickness));
@@ -974,25 +992,48 @@ pub(super) fn decoration_strokes(
 }
 
 /// A `dotted` decoration line from `left` to `right` centered on `y`: dots
-/// one thickness across, one thickness apart, starting at `left`. As for
-/// dotted borders, dots at most two pixels across are squares on whole CSS
-/// pixels, since so small a circle only rasterizes as a blur.
-fn decoration_dots(left: f64, right: f64, y: f64, thickness: f32) -> BezPath {
-    let width = f64::from(thickness);
-    let radius = width / 2.0;
-    let thin = thickness <= 2.0;
+/// one thickness across, one thickness apart, starting at `left`, laid out
+/// on the device pixels of `transform` (the CSS-to-device transform the
+/// path is drawn with). The thickness rounds to whole device pixels, at
+/// least one (CSS Text Decoration 4 #text-decoration-thickness-property),
+/// and the dots, the gaps between them and the line's edges fall on pixel
+/// boundaries. As for dotted borders, dots at most two device pixels across
+/// are squares, since so small a circle only rasterizes as a blur. Under a
+/// transform that rotates or skews, CSS pixels stand in for device pixels.
+fn decoration_dots(left: f64, right: f64, y: f64, thickness: f32, transform: Affine) -> BezPath {
+    let [a, b, c, d, e, f] = transform.as_coeffs();
+    let aligned =
+        b == 0. && c == 0. && a != 0. && d != 0. && [a, d, e, f].iter().all(|v| v.is_finite());
+    // Device coordinate = scale * CSS coordinate + offset, along each axis.
+    let ((scale_x, offset_x), (scale_y, offset_y)) = if aligned {
+        ((a, e), (d, f))
+    } else {
+        ((1., 0.), (1., 0.))
+    };
+    let thickness = f64::from(thickness);
+    let size_x = (thickness * scale_x.abs()).round().max(1.);
+    let size_y = (thickness * scale_y.abs()).round().max(1.);
+    let thin = size_y <= 2.;
+    let (start, end) = (left * scale_x + offset_x, right * scale_x + offset_x);
+    let (start, end) = (start.min(end).round(), start.max(end).round());
+    let top = (y * scale_y + offset_y - size_y / 2.).round();
+    let css_x = |x: f64| (x - offset_x) / scale_x;
+    let (y0, y1) = (
+        (top - offset_y) / scale_y,
+        (top + size_y - offset_y) / scale_y,
+    );
     let mut path = BezPath::new();
-    let start = if thin { left.round() } else { left };
     let mut x = start;
     let mut count = 0usize;
-    while x + width <= right + 1e-3 && count < 1 << 16 {
+    while x + size_x <= end && count < 1 << 16 {
+        let dot = Rect::new(css_x(x), y0, css_x(x + size_x), y1).abs();
         if thin {
-            path.extend(Rect::new(x, y - radius, x + width, y + radius).path_elements(0.1));
+            path.extend(dot.path_elements(0.1));
         } else {
-            path.extend(Circle::new((x + radius, y), radius).path_elements(0.1));
+            path.extend(Ellipse::from_rect(dot).path_elements(0.1));
         }
-        x = start + width * 2.0 * (count + 1) as f64;
         count += 1;
+        x = start + size_x * 2. * count as f64;
     }
     path
 }
@@ -1960,6 +2001,7 @@ mod tests {
             origin,
             &shaped,
             &decoration(DecorationStyle::Solid, Some(3.0), Some(2.0)),
+            Affine::IDENTITY,
         );
         assert_eq!(strokes.len(), 1);
         assert_eq!(strokes[0].0.as_ref().map(|stroke| stroke.width), Some(3.0));
@@ -1971,12 +2013,14 @@ mod tests {
             origin,
             &shaped,
             &decoration(DecorationStyle::Wavy, Some(1.0), Some(0.0)),
+            Affine::IDENTITY,
         );
         assert!(wavy[0].1.bounding_box().height() > 1.0);
         let double = decoration_strokes(
             origin,
             &shaped,
             &decoration(DecorationStyle::Double, None, None),
+            Affine::IDENTITY,
         );
         assert_eq!(double.len(), 2);
         // CSS Text Decoration 4 #text-decoration-style: `dotted` is a row of
@@ -1985,6 +2029,7 @@ mod tests {
             origin,
             &shaped,
             &decoration(DecorationStyle::Dotted, Some(3.0), Some(0.0)),
+            Affine::IDENTITY,
         );
         assert_eq!(dotted.len(), 1);
         assert!(dotted[0].0.is_none());
@@ -2020,7 +2065,13 @@ mod tests {
             thickness: Some(4.0),
             underline_offset: Some(0.0),
         };
-        paint_decorations(&mut context, CssPoint::new(10.0, 0.0), &shaped, &decoration);
+        paint_decorations(
+            &mut context,
+            CssPoint::new(10.0, 0.0),
+            &shaped,
+            &decoration,
+            Affine::IDENTITY,
+        );
         let mut pixmap = Pixmap::new(200, 20);
         context.flush();
         context.render(&mut pixmap, &mut Resources::new());
@@ -2031,6 +2082,87 @@ mod tests {
         for dot in 0..22 {
             assert!(blue(12 + dot * 8), "dot {dot}");
             assert!(!blue(16 + dot * 8), "gap {dot}");
+        }
+    }
+
+    #[test]
+    fn thin_dotted_decorations_fill_whole_device_pixels() {
+        // CSS Text Decoration 4 #text-decoration-thickness-property: the
+        // thickness should round to whole device pixels, at least one; and
+        // `dotted` means what it does for borders, whose thin dots are
+        // squares on the pixel grid. A default-thickness dotted underline
+        // (about 1.03px at 16px) used to be judged thin in CSS rather than
+        // device pixels and left off the grid, so it rasterized as a gray
+        // smear instead of dots.
+        let mut shaped = crate::text::shape(
+            " ",
+            &crate::text::TextStyle {
+                size: 16.0,
+                ..Default::default()
+            },
+        );
+        shaped.underline = true;
+        shaped.advance = 100.3;
+        let decoration = crate::render::TextDecorationPaint {
+            color: PaintColor::Rgba(0, 0, 255, 255),
+            style: DecorationStyle::Dotted,
+            thickness: None,
+            underline_offset: None,
+        };
+        let thickness = shaped.line_height / 18.0;
+        assert!((0.9..1.2).contains(&thickness), "{thickness}");
+        for (scale, size) in [(1.0, 1), (1.5, 2), (2.0, 2)] {
+            let (width, height) = ((140.0 * scale) as u16, (40.0 * scale) as u16);
+            let transform = Affine::scale(scale);
+            let mut context = RenderContext::new(width, height);
+            context.set_transform(transform);
+            context.set_paint(vello_color(decoration.color));
+            paint_decorations(
+                &mut context,
+                CssPoint::new(10.3, 0.4),
+                &shaped,
+                &decoration,
+                transform,
+            );
+            let mut pixmap = Pixmap::new(width, height);
+            context.flush();
+            context.render(&mut pixmap, &mut Resources::new());
+            let (width, height) = (usize::from(width), usize::from(height));
+            let alpha = |x: usize, y: usize| pixmap.data()[y * width + x].a;
+            // Every pixel is fully inked or untouched.
+            for y in 0..height {
+                for x in 0..width {
+                    assert!(
+                        matches!(alpha(x, y), 0 | 255),
+                        "{scale}x: ({x}, {y}) {}",
+                        alpha(x, y)
+                    );
+                }
+            }
+            // `size` rows of `size`-pixel dots and gaps from the start.
+            let rows = (0..height)
+                .filter(|&y| (0..width).any(|x| alpha(x, y) > 0))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), size, "{scale}x: {rows:?}");
+            let mut runs = Vec::new();
+            let mut x = 0;
+            while x < width {
+                if alpha(x, rows[0]) == 0 {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < width && alpha(x, rows[0]) > 0 {
+                    x += 1;
+                }
+                runs.push((start, x));
+            }
+            assert_eq!(runs[0].0, (10.3 * scale).round() as usize, "{scale}x");
+            assert!(runs.len() > 20, "{scale}x: {runs:?}");
+            for pair in runs.windows(2) {
+                assert_eq!(pair[0].1 - pair[0].0, size, "{scale}x: {runs:?}");
+                assert_eq!(pair[1].0 - pair[0].1, size, "{scale}x: {runs:?}");
+            }
         }
     }
 
