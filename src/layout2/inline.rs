@@ -493,6 +493,11 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// Block-level replaced content is positioned by its enclosing fragment.
     /// Only genuine inline atoms need their own post-line position adjustment.
     position_inline_atoms: bool,
+    /// A block-level replaced element's own containing block (width, and
+    /// height when definite). Its synthetic content line is laid inside the
+    /// element's content box, which is not the basis its percentages and
+    /// box-sizing resolve against.
+    replaced_cb: Option<(f32, Option<f32>)>,
     /// The block container's inherited font/line-height strut. CSS Inline 3
     /// §5.1 requires it to participate even on an otherwise empty line.
     strut: crate::text::ShapedText,
@@ -577,11 +582,18 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             measuring: false,
             measuring_min: false,
             position_inline_atoms: true,
+            replaced_cb: None,
             strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
             quirky_strut_root: None,
         };
         ifc.begin_line();
         ifc
+    }
+
+    /// Size a block-level replaced element laid by `block_atom_content`
+    /// against its own containing block rather than this IFC's width.
+    pub fn set_replaced_containing_block(&mut self, width: f32, height: Option<f32>) {
+        self.replaced_cb = Some((width, height));
     }
 
     /// Mark this IFC as an intrinsic-size probe (see the `measuring` field).
@@ -1915,10 +1927,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // unknown size being measured. A cyclic percentage width behaves as
         // auto for the max-content contribution and resolves against zero
         // for the min-content one (`img { width: 105% }` in a fit-content box).
-        let cb_w = if self.measuring {
-            self.measuring_min.then_some(0.0)
-        } else {
-            Some(self.cb_w_px)
+        let (cb_w, cb_h) = match self.replaced_cb {
+            _ if self.measuring => (self.measuring_min.then_some(0.0), self.cb_h_px),
+            Some((width, height)) => (Some(width), height),
+            None => (Some(self.cb_w_px), self.cb_h_px),
         };
         if let Some(r) = super::replaced::size(
             self.dom,
@@ -1929,7 +1941,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 url,
             },
             cb_w,
-            self.cb_h_px,
+            cb_h,
             self.vp,
         ) {
             let pixelated = matches!(

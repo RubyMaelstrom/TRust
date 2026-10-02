@@ -1291,6 +1291,11 @@ impl Flow<'_> {
                             None,
                             &[],
                         );
+                        // css-sizing-3 #box-sizing and CSS 2 §10.2/§10.5: the
+                        // image's own percentages and border-box lengths
+                        // resolve against its containing block, as the auto
+                        // width above did, not against its content box.
+                        ifc.set_replaced_containing_block(cb_w, cb_h);
                         ifc.block_atom_content(atom, &inl);
                         let (lines, _, _, _, _) = ifc.finish();
                         if !lines.is_empty() {
