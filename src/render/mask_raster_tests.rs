@@ -109,11 +109,45 @@ fn check_mask_composite(mut render: impl FnMut(&Scene) -> OwnedRgbaFrame) {
     }
 }
 
+fn check_luminance_mask(mut render: impl FnMut(&Scene) -> OwnedRgbaFrame) {
+    // CSS Masking 1 #MaskValues: a luminance mask layer is its tiles' alpha
+    // multiplied (destination-in) by their luminanceToAlpha.
+    let tiles = [
+        fill(CssRect::new(0., 0., 20., 20.), WHITE),
+        fill(
+            CssRect::new(20., 0., 10., 20.),
+            PaintColor::Rgba(0, 0, 0, 255),
+        ),
+        fill(
+            CssRect::new(30., 0., 10., 20.),
+            PaintColor::Rgba(255, 255, 255, 128),
+        ),
+    ];
+    let luminance = CssFilter::ColorMatrix([
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2125, 0.7154,
+        0.0721, 0.0, 0.0,
+    ]);
+    let mut mask = vec![layer(CompositeOperator::SourceOver, None)];
+    mask.extend(tiles.clone());
+    mask.push(DisplayCommand::PushLayer(CompositingLayer {
+        compose: CompositeOperator::DestinationIn,
+        ..CompositingLayer::new(1.0, BlendMode::Normal, Arc::from([luminance]))
+    }));
+    mask.extend(tiles);
+    mask.extend([DisplayCommand::PopLayer, DisplayCommand::PopLayer]);
+    let frame = render(&masked_scene(None, mask));
+    assert_eq!(pixel(&frame, 10, 10), [255, 0, 0, 255]);
+    assert_eq!(pixel(&frame, 25, 10), [255, 255, 255, 255]);
+    let half = pixel(&frame, 35, 10);
+    assert!(half[0] == 255 && (120..=135).contains(&half[1]), "{half:?}");
+}
+
 #[test]
 fn destination_in_groups_mask_their_backdrop_cpu() {
     let mut renderer = VelloCpuRenderer::new();
     check_alpha_mask(|scene| renderer.render_rgba(scene).unwrap());
     check_mask_composite(|scene| renderer.render_rgba(scene).unwrap());
+    check_luminance_mask(|scene| renderer.render_rgba(scene).unwrap());
 }
 
 #[test]
@@ -124,4 +158,5 @@ fn destination_in_groups_mask_their_backdrop_hybrid() {
     };
     check_alpha_mask(|scene| renderer.render_rgba(scene).unwrap());
     check_mask_composite(|scene| renderer.render_rgba(scene).unwrap());
+    check_luminance_mask(|scene| renderer.render_rgba(scene).unwrap());
 }
