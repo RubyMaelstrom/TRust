@@ -470,11 +470,42 @@ pub(crate) struct Flow<'a> {
     /// `measure_boxes_and_grid_tracks`.
     pub grid_tracks: std::cell::RefCell<GridTrackMap>,
     pub subgrid_rows: std::cell::RefCell<super::grid::SubgridRows>,
+    /// An outside list marker's ascent above its baseline, until the list
+    /// item's first in-flow line box takes it (`lay_inlines`). Blink grows
+    /// that line to hold a marker taller than its content, by the marker's
+    /// ascent only; Gecko does so when the item's own content forms it.
+    pub marker_line: std::cell::Cell<Option<f32>>,
 }
 
 /// Each grid container's used track sizes in px `(columns, rows)`, keyed by node
 /// — the CSSOM resolved value for `grid-template-columns`/`-rows`.
 pub(crate) type GridTrackMap = std::collections::HashMap<NodeId, (Vec<f32>, Vec<f32>)>;
+
+/// The top and baseline of the first line box among `frags`.
+fn first_line(frags: &[Frag]) -> Option<(f32, f32)> {
+    let mut best: Option<(f32, f32)> = None;
+    for f in frags {
+        let line = match &f.kind {
+            FragKind::Line(line) => Some((f.y, line.baseline)),
+            FragKind::Block | FragKind::TableCell(_) => first_line(&f.children),
+            FragKind::Oof(..) | FragKind::Fixed(_) => None,
+        };
+        if let Some(line) = line
+            && best.is_none_or(|best| line.0 < best.0)
+        {
+            best = Some(line);
+        }
+    }
+    best
+}
+
+/// An outside list marker's line box, before it is placed.
+struct MarkerLine {
+    pieces: Vec<Piece>,
+    w: f32,
+    h: f32,
+    baseline: f32,
+}
 
 /// Resolved horizontal geometry of one block box (§10.3.3/§10.4).
 struct H {
@@ -660,10 +691,13 @@ impl Flow<'_> {
         fc: &mut FloatCtx,
     ) -> Frag {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::Block);
+        // A block holding a pending marker line lays it into its own first
+        // line, which its cache key does not record.
         let reuse = self.reuse
             && b.node != NO_NODE
             && fc.is_empty()
-            && !self.subgrid_rows.borrow().active();
+            && !self.subgrid_rows.borrow().active()
+            && self.marker_line.get().is_none();
         let request = super::memo::Request {
             node: b,
             parent: parent_inl,
@@ -930,6 +964,32 @@ impl Flow<'_> {
         // this box establishes a BFC (its floats stay contained), else the
         // ancestor's (so a float wraps content ACROSS sibling blocks — §9.5).
         let mut children: Vec<Frag> = Vec::new();
+        // The outside marker's line box joins the first line of an in-flow
+        // block container's content, combined with an enclosing item's
+        // still-pending one. Other content (flex, grid, tables, multicol,
+        // vertical lines) keeps the marker on its own line, and an
+        // independent formatting context keeps an enclosing item's marker out,
+        // so it lays the same alone as a relayout boundary: CSS Lists 3
+        // #list-style-position-outside leaves this interaction undefined.
+        let flow_content = multicol.is_none()
+            && match &b.content {
+                Content::Blocks(_) => true,
+                Content::Inlines(_) => !self.vertical_text(b),
+                _ => false,
+            };
+        let outer_marker_line = self.marker_line.take().filter(|_| !own_bfc);
+        let marker = (!b.marker_inside && (b.marker.is_some() || b.marker_image.is_some()))
+            .then(|| self.marker_line_box(b.marker.as_deref(), b.marker_image.as_deref(), &inl));
+        if flow_content {
+            let own = marker.as_ref().map(|m| m.baseline);
+            self.marker_line.set(match (outer_marker_line, own) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            });
+        }
+        // Where this item's own marker line box sits below its content top,
+        // when it has to make one.
+        let mut own_marker_line = None;
         {
             let cfc: &mut FloatCtx = if own_bfc { &mut own_fc } else { fc };
             if let Some((n, col_w, gap_px)) = multicol {
@@ -1256,6 +1316,31 @@ impl Flow<'_> {
                 }
             } // end multicol else
         } // end cfc borrow
+        // A marker line that no line box took, when this content has no line
+        // at all, gives an item's own marker a line box at its content top,
+        // holding an enclosing item's marker too: an empty <li> is one line
+        // tall in Gecko and Blink, and Blink seats an outer marker on it.
+        // Without an own marker, it stays pending for later content.
+        if flow_content
+            && let Some(ascent) = self.marker_line.take()
+            && first_line(&children).is_none()
+        {
+            match &marker {
+                Some(marker) => {
+                    let yb = *y_border.get_or_insert_with(|| {
+                        let yb = cur.flush();
+                        cur.y = yb;
+                        yb
+                    });
+                    let line_ascent = ascent.max(marker.baseline);
+                    own_marker_line = Some(line_ascent - marker.baseline);
+                    cur.y = cur
+                        .y
+                        .max(content_top_of(yb) + line_ascent + marker.h - marker.baseline);
+                }
+                None => self.marker_line.set(outer_marker_line),
+            }
+        }
 
         // A generated clearing pseudo-element participates as the final
         // in-flow child. The live serializer bakes this signal because the
@@ -1310,16 +1395,9 @@ impl Flow<'_> {
         }
 
         // ---- the ::marker (outside position) ----
-        if !b.marker_inside && (b.marker.is_some() || b.marker_image.is_some()) {
-            let marker = self.marker_frag(
-                b.marker.as_deref(),
-                b.marker_image.as_deref(),
-                &inl,
-                content_x,
-                &children,
-                y_border,
-                bt,
-            );
+        if let Some(marker) = marker {
+            let marker =
+                self.marker_frag(marker, content_x, &children, y_border, bt, own_marker_line);
             // CSS Lists 3 §3.1 defines ::marker as the list item's first
             // child, before ::before and principal content. Preserve that
             // painting order too. At the terminal boundary a sub-cell marker
@@ -1742,46 +1820,27 @@ impl Flow<'_> {
         }
     }
 
-    /// The outside `::marker` of a list item: right-aligned against the
-    /// content edge, on the first line box (CSS Lists — the marker sits in
-    /// the gutter the UA list padding provides).
-    #[allow(clippy::too_many_arguments)]
-    fn marker_frag(
+    /// The line box of an outside `::marker`: its pieces, width, height and
+    /// baseline, measured before the list item's content so that the item's
+    /// first line can make room for it.
+    fn marker_line_box(
         &self,
         marker: Option<&str>,
         marker_image: Option<&str>,
         inl: &InlineStyle,
-        content_x: f32,
-        children: &[Frag],
-        y_border: Option<f32>,
-        bt: f32,
-    ) -> Frag {
-        /// The top and baseline of the first line box.
-        fn first_line(frags: &[Frag]) -> Option<(f32, f32)> {
-            let mut best: Option<(f32, f32)> = None;
-            for f in frags {
-                let line = match &f.kind {
-                    FragKind::Line(line) => Some((f.y, line.baseline)),
-                    FragKind::Block | FragKind::TableCell(_) => first_line(&f.children),
-                    FragKind::Oof(..) | FragKind::Fixed(_) => None,
-                };
-                if let Some(line) = line
-                    && best.is_none_or(|best| line.0 < best.0)
-                {
-                    best = Some(line);
-                }
-            }
-            best
-        }
-        let first = first_line(children);
-        let (pieces, w, h, baseline) = if let Some(source) = marker_image {
+    ) -> MarkerLine {
+        if let Some(source) = marker_image {
             // CSS Lists 3 §3.2 represents a list-style-image marker as an
             // anonymous inline replaced element followed by one U+0020. Until
             // the image has natural dimensions it is one em square; the image
-            // decode pass triggers a later layout with them.
+            // decode pass triggers a later layout with them. Both sit on one
+            // baseline, the image's bottom edge on it.
             let (width, height) =
                 super::inline::marker_image_size(self.dom, self.images, source, inl.font_size);
-            let image = Piece::boxed(
+            let space = crate::text::shape(" ", &inl.text_style());
+            let baseline = height.max(space.baseline);
+            let descent = space.line_height - space.baseline;
+            let mut image = Piece::boxed(
                 InlineItem {
                     text: String::new(),
                     terminal_text: None,
@@ -1804,7 +1863,7 @@ impl Flow<'_> {
                 width,
                 height,
             );
-            let space = crate::text::shape(" ", &inl.text_style());
+            image.y = baseline - height;
             let mut space_piece = Piece::shaped(
                 InlineItem {
                     text: " ".to_string(),
@@ -1824,18 +1883,17 @@ impl Flow<'_> {
                 space.clone(),
             );
             space_piece.x = width;
-            (
-                vec![image, space_piece],
-                width + space.advance,
-                height.max(space.line_height),
-                height,
-            )
+            space_piece.y = baseline - space.baseline;
+            MarkerLine {
+                pieces: vec![image, space_piece],
+                w: width + space.advance,
+                h: (baseline + descent).max(height),
+                baseline,
+            }
         } else {
             let marker = marker.unwrap_or_default();
             let shaped = crate::text::shape(marker, &inl.text_style());
-            let w = shaped.advance;
-            let h = shaped.line_height;
-            let baseline = shaped.baseline;
+            let (w, h, baseline) = (shaped.advance, shaped.line_height, shaped.baseline);
             let piece = Piece::shaped(
                 InlineItem {
                     text: marker.to_string(),
@@ -1854,15 +1912,49 @@ impl Flow<'_> {
                 },
                 shaped,
             );
-            (vec![piece], w, h, baseline)
-        };
-        // The marker shares the first line's baseline, so a small image
-        // marker sits on it as in Gecko and Blink. A marker taller than the
-        // line's ascent stays at the line's top rather than rising above it,
-        // which keeps it on that line in a character grid.
-        let y = match first {
+            MarkerLine {
+                pieces: vec![piece],
+                w,
+                h,
+                baseline,
+            }
+        }
+    }
+
+    /// The outside `::marker` of a list item: right-aligned against the
+    /// content edge, on the first line box (CSS Lists — the marker sits in
+    /// the gutter the UA list padding provides).
+    fn marker_frag(
+        &self,
+        marker: MarkerLine,
+        content_x: f32,
+        children: &[Frag],
+        y_border: Option<f32>,
+        bt: f32,
+        own_line: Option<f32>,
+    ) -> Frag {
+        let MarkerLine {
+            mut pieces,
+            w,
+            mut h,
+            mut baseline,
+        } = marker;
+        // The marker shares the first line's baseline; that line grew to
+        // hold it (`marker_line`). Content that took no marker line (a
+        // table or flex box first) keeps the marker from rising above it.
+        // A line box of its own spans the item's content top, where an
+        // enclosing item's marker on the same line aligns with it.
+        let y = match first_line(children) {
             Some((top, line_baseline)) => top + (line_baseline - baseline).max(0.0),
-            None => y_border.map_or(0.0, |yb| yb + bt),
+            None => {
+                let offset = own_line.unwrap_or(0.0);
+                for piece in &mut pieces {
+                    piece.y += offset;
+                }
+                h += offset;
+                baseline += offset;
+                y_border.map_or(0.0, |yb| yb + bt)
+            }
         };
         let x = (content_x - w).max(0.0);
         Frag {
@@ -4527,6 +4619,9 @@ impl Flow<'_> {
         fc: &mut FloatCtx,
     ) -> InlineLaid<'t> {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::Inline);
+        // This content's first line holds a pending outside marker; floats
+        // and inline-blocks laid below do not.
+        let first_line_ascent = self.marker_line.take();
         // Pre-lay every float in walk order; `boxes[k]` is the k-th one the IFC
         // meets, `prelaid[k]` its laid fragment.
         let mut float_nodes: Vec<(&'t BoxNode, InlineStyle)> = Vec::new();
@@ -4580,6 +4675,7 @@ impl Flow<'_> {
         if let Some(align_last) = super::style::block_align_last(self.dom, inl.node) {
             ifc.set_align_last(align_last);
         }
+        ifc.set_first_line_ascent(first_line_ascent);
         if let Some(source) = marker_image {
             let mut mctx = inl.clone();
             mctx.kind = crate::layout2::ItemKind::Image;
@@ -4592,6 +4688,9 @@ impl Flow<'_> {
         }
         ifc.run(inls, inl);
         let (lines, marks, oofs, placements, atom_places) = ifc.finish();
+        if lines.is_empty() {
+            self.marker_line.set(first_line_ascent);
+        }
         // Place each float's fragment: its margin-box top-left is the IFC's
         // resolved position, the border box sits inside it by the leading
         // margins.

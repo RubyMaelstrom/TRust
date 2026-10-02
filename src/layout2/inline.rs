@@ -371,6 +371,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     align_last: Align2,
     /// Set while `finish` flushes the final line.
     finishing: bool,
+    /// A list item's outside marker ascent, which the first line box grows
+    /// to hold, as in Blink.
+    first_line_ascent: Option<f32>,
     lines: Vec<LineOut>,
     cur: Vec<Piece>,
     /// Every inline ELEMENT entered, with the index of the line it entered
@@ -496,6 +499,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 align
             },
             finishing: false,
+            first_line_ascent: None,
             lines: Vec::new(),
             cur: Vec::new(),
             marks: Vec::new(),
@@ -2098,6 +2102,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.align_last = align_last;
     }
 
+    /// An outside list marker's line, for the first line box to hold.
+    pub fn set_first_line_ascent(&mut self, ascent: Option<f32>) {
+        self.first_line_ascent = ascent;
+    }
+
     /// The alignment of the line being flushed.
     fn line_align(&self, forced: bool) -> Align2 {
         if forced || self.finishing {
@@ -2205,6 +2214,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // CSS 2.2 §10.8.1: a line-height below the content area gives a
             // negative half-leading, so these depths can be negative.
             .fold(strut.line_height - strut.baseline, f32::max);
+        let ascent = match self.first_line_ascent {
+            Some(marker_ascent) if self.lines.is_empty() => ascent.max(marker_ascent),
+            _ => ascent,
+        };
         let height = (ascent + descent)
             .max(strut.line_height)
             .max(edge_aligned_height);
