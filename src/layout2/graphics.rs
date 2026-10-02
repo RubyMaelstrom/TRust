@@ -1843,40 +1843,71 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     let right = rect.x + rect.width - rect.width.clamp(8.0, 18.0);
                     label_rect.width = label_rect.width.min((right - label_rect.x).max(0.0));
                 }
+                // A multiline control's text scrolls within, and clips to,
+                // its padding box.
+                if let Some(text) = &piece.control_text {
+                    let [top, right, bottom, left] = text.scrollport;
+                    label_rect = CssRect::new(
+                        label_rect.x - left,
+                        label_rect.y - top,
+                        label_rect.width + left + right,
+                        label_rect.height + top + bottom,
+                    );
+                }
                 clip = intersect_css_rects(clip, label_rect);
             }
-            if let Some(shaped) = &piece.shaped {
-                let mut origin = CssPoint::new(
+            if let Some(label) = &piece.shaped {
+                let content_origin = CssPoint::new(
                     fragment.x + piece.x + piece.paint_x,
                     fragment.y + piece.y + piece.paint_y,
                 );
-                if form_piece && style_node != NO_NODE {
-                    // CSS Text 3 #text-indent-property: the control's inner
-                    // line inherits indentation, including negative lengths.
-                    // Move its text, never its content clip or hit target.
-                    let indent = builder
-                        .dom
-                        .computed_value_resolved(style_node, "text-indent")
-                        .and_then(|v| {
-                            Len::parse(
-                                &v,
-                                Units::of(builder.dom, style_node),
-                                Vp {
-                                    w: builder.viewport_w,
-                                    h: builder.viewport_h,
-                                },
+                // A multiline control (`<textarea>`) carries its value as
+                // laid-out line runs whose wrapping, alignment and indent
+                // are already resolved. Every other piece paints one run.
+                let runs: Vec<(CssPoint, &crate::text::ShapedText)> = match &piece.control_text {
+                    Some(text) => text
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            (
+                                CssPoint::new(content_origin.x + line.x, content_origin.y + line.y),
+                                &line.shaped,
                             )
                         })
-                        .and_then(|v| v.resolve(Some(piece.paint_width)))
-                        .unwrap_or(0.0);
-                    origin.x += indent;
-                    let spare = (piece.paint_width - indent - shaped.advance).max(0.0);
-                    origin.x += match super::style::block_align(builder.dom, style_node) {
-                        super::style::Align2::Center => spare / 2.0,
-                        super::style::Align2::Right => spare,
-                        _ => 0.0,
-                    };
-                }
+                        .collect(),
+                    None => {
+                        let mut origin = content_origin;
+                        if form_piece && style_node != NO_NODE {
+                            // CSS Text 3 #text-indent-property: the control's
+                            // inner line inherits indentation, including
+                            // negative lengths. Move its text, never its
+                            // content clip or hit target.
+                            let indent = builder
+                                .dom
+                                .computed_value_resolved(style_node, "text-indent")
+                                .and_then(|v| {
+                                    Len::parse(
+                                        &v,
+                                        Units::of(builder.dom, style_node),
+                                        Vp {
+                                            w: builder.viewport_w,
+                                            h: builder.viewport_h,
+                                        },
+                                    )
+                                })
+                                .and_then(|v| v.resolve(Some(piece.paint_width)))
+                                .unwrap_or(0.0);
+                            origin.x += indent;
+                            let spare = (piece.paint_width - indent - label.advance).max(0.0);
+                            origin.x += match super::style::block_align(builder.dom, style_node) {
+                                super::style::Align2::Center => spare / 2.0,
+                                super::style::Align2::Right => spare,
+                                _ => 0.0,
+                            };
+                        }
+                        vec![(origin, label)]
+                    }
+                };
                 let paint_style = piece
                     .item
                     .pseudo
@@ -1894,12 +1925,6 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     .as_deref()
                     .and_then(|value| resolve_color_for_style(builder.dom, paint_style, value))
                     .unwrap_or(current_color);
-                let mut shaped = shaped.clone();
-                if style_node != NO_NODE {
-                    let (underline, strikethrough) = builder.dom.text_decoration(style_node);
-                    shaped.underline = underline;
-                    shaped.strikethrough = strikethrough;
-                }
                 let viewport = Vp {
                     w: builder.viewport_w,
                     h: builder.viewport_h,
@@ -1921,82 +1946,92 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     ),
                 };
                 let shadows = text_shadows(builder.dom, style_node, current_color);
-                builder.push_marquee_content(
-                    node,
-                    DisplayCommand::GlyphRun {
-                        origin,
-                        shaped: shaped.clone(),
-                        color,
-                        decoration,
-                        shadows,
-                        clip,
-                        node,
-                        link: piece.item.link.clone(),
-                    },
-                );
-                // WHATWG Compatibility #the-webkit-text-stroke-width: stroke
-                // glyph edges even when their foreground fill is transparent.
-                // Reuse the shaped outline (including font variation/skew)
-                // and the shared path command so both raster backends agree.
-                if let Some(width) = paint_style
-                    .value(builder.dom, "-webkit-text-stroke-width")
-                    .as_deref()
-                    .and_then(|value| {
-                        crate::dom::text_stroke_width_px(
-                            value,
-                            super::Units {
-                                fs: shaped.runs.first().map_or(16., |run| run.font_size),
-                                root: builder.dom.root_font_px(),
-                                ch: shaped.runs.first().map_or(8., |run| run.font_size * 0.5),
-                            },
-                            builder.dom.viewport_px(),
-                        )
-                    })
-                    .filter(|width| *width > 0.)
-                {
-                    let stroke_color = paint_style
-                        .value(builder.dom, "-webkit-text-stroke-color")
-                        .as_deref()
-                        .and_then(|value| resolve_color_for_style(builder.dom, paint_style, value))
-                        .unwrap_or(current_color);
-                    let mut path = Vec::new();
-                    crate::text::append_glyph_path(&mut path, &shaped, origin);
-                    if let Some(clip) = clip {
-                        builder.push_marquee_content(
-                            node,
-                            DisplayCommand::PushClip(PaintShape::Rect(clip)),
-                        );
+                for (origin, shaped) in runs {
+                    let mut shaped = shaped.clone();
+                    if style_node != NO_NODE {
+                        let (underline, strikethrough) = builder.dom.text_decoration(style_node);
+                        shaped.underline = underline;
+                        shaped.strikethrough = strikethrough;
                     }
                     builder.push_marquee_content(
                         node,
-                        DisplayCommand::Stroke {
-                            shape: PaintShape::Path(path),
-                            brush: PaintBrush::Solid(stroke_color),
-                            style: StrokeStyle::solid(width),
+                        DisplayCommand::GlyphRun {
+                            origin,
+                            shaped: shaped.clone(),
+                            color,
+                            decoration,
+                            shadows: shadows.clone(),
+                            clip,
+                            node,
+                            link: piece.item.link.clone(),
                         },
                     );
-                    if clip.is_some() {
-                        builder.push_marquee_content(node, DisplayCommand::PopClip);
-                    }
-                }
-                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
-                    builder.has_media_controls |=
-                        matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
-                    builder.push_marquee_content(
-                        node,
-                        DisplayCommand::HitRegion(HitRegion {
-                            rect: CssRect::new(
-                                origin.x,
-                                origin.y,
-                                shaped.advance,
-                                shaped.line_height,
-                            ),
+                    // WHATWG Compatibility #the-webkit-text-stroke-width: stroke
+                    // glyph edges even when their foreground fill is transparent.
+                    // Reuse the shaped outline (including font variation/skew)
+                    // and the shared path command so both raster backends agree.
+                    if let Some(width) = paint_style
+                        .value(builder.dom, "-webkit-text-stroke-width")
+                        .as_deref()
+                        .and_then(|value| {
+                            crate::dom::text_stroke_width_px(
+                                value,
+                                super::Units {
+                                    fs: shaped.runs.first().map_or(16., |run| run.font_size),
+                                    root: builder.dom.root_font_px(),
+                                    ch: shaped.runs.first().map_or(8., |run| run.font_size * 0.5),
+                                },
+                                builder.dom.viewport_px(),
+                            )
+                        })
+                        .filter(|width| *width > 0.)
+                    {
+                        let stroke_color = paint_style
+                            .value(builder.dom, "-webkit-text-stroke-color")
+                            .as_deref()
+                            .and_then(|value| {
+                                resolve_color_for_style(builder.dom, paint_style, value)
+                            })
+                            .unwrap_or(current_color);
+                        let mut path = Vec::new();
+                        crate::text::append_glyph_path(&mut path, &shaped, origin);
+                        if let Some(clip) = clip {
+                            builder.push_marquee_content(
+                                node,
+                                DisplayCommand::PushClip(PaintShape::Rect(clip)),
+                            );
+                        }
+                        builder.push_marquee_content(
                             node,
-                            actor: interaction_actor(builder.dom, node),
-                            link: piece.item.link.clone(),
-                            cursor: cursor_value(builder.dom, style_node),
-                        }),
-                    );
+                            DisplayCommand::Stroke {
+                                shape: PaintShape::Path(path),
+                                brush: PaintBrush::Solid(stroke_color),
+                                style: StrokeStyle::solid(width),
+                            },
+                        );
+                        if clip.is_some() {
+                            builder.push_marquee_content(node, DisplayCommand::PopClip);
+                        }
+                    }
+                    if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                        builder.has_media_controls |=
+                            matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
+                        builder.push_marquee_content(
+                            node,
+                            DisplayCommand::HitRegion(HitRegion {
+                                rect: CssRect::new(
+                                    origin.x,
+                                    origin.y,
+                                    shaped.advance,
+                                    shaped.line_height,
+                                ),
+                                node,
+                                actor: interaction_actor(builder.dom, node),
+                                link: piece.item.link.clone(),
+                                cursor: cursor_value(builder.dom, style_node),
+                            }),
+                        );
+                    }
                 }
             } else if piece.item.graphical_image.is_some()
                 || piece.item.image.is_some()
@@ -3242,19 +3277,37 @@ fn background_layer_shape(
                 if node != NO_NODE && dom.visibility_hidden(node) {
                     continue;
                 }
-                let Some(shaped) = &piece.shaped else {
+                let Some(label) = &piece.shaped else {
                     continue;
                 };
-                let mut shaped = shaped.clone();
-                if node != NO_NODE {
-                    (shaped.underline, shaped.strikethrough) = dom.text_decoration(node);
+                let origin =
+                    CssPoint::new(f.x + piece.x + piece.paint_x, f.y + piece.y + piece.paint_y);
+                // A multiline control's value is its laid-out line runs.
+                let runs: Vec<(CssPoint, &crate::text::ShapedText)> = match &piece.control_text {
+                    Some(text) => text
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            (
+                                CssPoint::new(origin.x + line.x, origin.y + line.y),
+                                &line.shaped,
+                            )
+                        })
+                        .collect(),
+                    None => vec![(origin, label)],
+                };
+                for (origin, shaped) in runs {
+                    let mut shaped = shaped.clone();
+                    if node != NO_NODE {
+                        (shaped.underline, shaped.strikethrough) = dom.text_decoration(node);
+                    }
+                    crate::text::append_text_path(
+                        path,
+                        &shaped,
+                        origin,
+                        decoration_style(dom, node),
+                    );
                 }
-                crate::text::append_text_path(
-                    path,
-                    &shaped,
-                    CssPoint::new(f.x + piece.x + piece.paint_x, f.y + piece.y + piece.paint_y),
-                    decoration_style(dom, node),
-                );
             }
         }
         for child in &f.children {

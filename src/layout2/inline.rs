@@ -96,8 +96,34 @@ pub(crate) struct Piece {
     /// Blockified controls already have an outer fragment and use their child
     /// form piece only for the label.
     pub(crate) paint_control_box: bool,
+    /// A multiline text control's (`<textarea>`) laid-out value. When
+    /// present, graphical paint draws its line runs instead of `shaped`,
+    /// which remains the single-run label for the other consumers.
+    pub(crate) control_text: Option<std::sync::Arc<ControlText>>,
     /// The non-replaced inline boxes containing this piece.
     pub(crate) boxes: Option<Box<InlineBoxes>>,
+}
+
+/// A multiline control's laid-out content.
+#[derive(Clone, Debug)]
+pub(crate) struct ControlText {
+    /// Shaped text runs at their CSS-pixel offsets from the control's
+    /// content (paint) rectangle, with wrapping, alignment and indentation
+    /// already resolved.
+    pub lines: Vec<ControlLine>,
+    /// The control's scrollport — its padding box — as outsets of the
+    /// content rectangle (top, right, bottom, left). Like Gecko's and
+    /// Blink's textarea, overflowing lines clip there, not at the content
+    /// edge (CSS Overflow 3 #overflow-clip-edge of a scroll container).
+    pub scrollport: [f32; 4],
+}
+
+/// One shaped text run of a multiline control's content.
+#[derive(Clone, Debug)]
+pub(crate) struct ControlLine {
+    pub x: f32,
+    pub y: f32,
+    pub shaped: crate::text::ShapedText,
 }
 
 /// Line-fragment geometry for the non-replaced inline boxes that contain a
@@ -226,6 +252,12 @@ impl Piece {
                 .shaped
                 .as_ref()
                 .map_or(0, crate::text::ShapedText::retained_bytes)
+            + self.control_text.as_ref().map_or(0, |text| {
+                text.lines
+                    .iter()
+                    .map(|line| std::mem::size_of::<ControlLine>() + line.shaped.retained_bytes())
+                    .sum()
+            })
             + self.text_style.as_ref().map_or(0, |style| {
                 style.family.capacity() + style.language.as_ref().map_or(0, String::capacity)
             })
@@ -262,6 +294,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
+            control_text: None,
             boxes: None,
         }
     }
@@ -290,6 +323,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
+            control_text: None,
             boxes: None,
         }
     }
@@ -1474,6 +1508,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box: false,
             paint_control_box: false,
+            control_text: None,
             boxes: None,
         });
         self.attach_boxes(gap);
@@ -1595,6 +1630,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     shaped.runs.clear();
                     shaped.clusters.clear();
                 }
+                let lines = (f.kind == crate::doc::FieldKind::Textarea)
+                    .then(|| {
+                        self.textarea_lines(
+                            a.node,
+                            &labels.visual,
+                            ctx,
+                            labels.geometry.paint_width,
+                            Some(self.cb_w_px),
+                        )
+                    })
+                    .flatten();
                 self.place_atom(
                     labels.geometry,
                     InlineItem {
@@ -1622,8 +1668,87 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     Self::space_advance(ctx),
                     can_wrap,
                 );
+                // `place_atom` always ends by pushing this control's piece.
+                if let Some(piece) = self.cur.last_mut() {
+                    piece.control_text = lines;
+                }
             }
         }
+    }
+
+    /// HTML Rendering #the-textarea-element-2: a textarea is an inline-block
+    /// depicting a multiline text control, and user agents apply its
+    /// `white-space` (UA `pre-wrap`, or `pre` for `wrap=off`). Its value or
+    /// placeholder therefore lays out as ordinary text at the content width:
+    /// preserved newlines force breaks and long lines take soft wraps (CSS
+    /// Text 3 §4/§5). Laying it as its own inline formatting context shares
+    /// the IFC's white-space processing, tab stops, breaking, `text-align`
+    /// and `text-indent` with every other block of text. Intrinsic probes
+    /// skip this: the control's preferred size comes from `cols`/`rows`.
+    ///
+    /// `padding_basis` resolves percentage padding for the scrollport: the
+    /// control's containing-block width, when known.
+    fn textarea_lines(
+        &self,
+        node: NodeId,
+        text: &str,
+        ctx: &InlineStyle,
+        width: f32,
+        padding_basis: Option<f32>,
+    ) -> Option<std::sync::Arc<ControlText>> {
+        if self.measuring || text.is_empty() {
+            return None;
+        }
+        let indent = self
+            .dom
+            .computed_value_resolved(node, "text-indent")
+            .and_then(|value| {
+                super::value::Len::parse(&value, crate::layout2::Units::of(self.dom, node), self.vp)
+            })
+            .and_then(|length| length.resolve(Some(width)))
+            .unwrap_or(0.0);
+        let content = [Inline::Text(text.to_string())];
+        let mut ifc = Ifc::new(
+            self.dom,
+            self.base,
+            self.images,
+            self.forms,
+            self.vp,
+            width.max(0.0),
+            None,
+            super::style::block_align(self.dom, node),
+            indent,
+            None,
+            &[],
+        );
+        if let Some(align_last) = super::style::block_align_last(self.dom, node) {
+            ifc.set_align_last(align_last);
+        }
+        let mut root = ctx.clone();
+        root.vertical_align = VerticalAlign::Baseline;
+        ifc.run(&content, &root);
+        let (lines, _, _, _, _) = ifc.finish();
+        let mut runs = Vec::new();
+        let mut top = 0.0;
+        for line in &lines {
+            for piece in &line.pieces {
+                if let Some(shaped) = piece.shaped.as_ref().filter(|s| !s.runs.is_empty()) {
+                    runs.push(ControlLine {
+                        x: piece.x + piece.paint_x,
+                        y: top + piece.y + piece.paint_y,
+                        shaped: shaped.clone(),
+                    });
+                }
+            }
+            top += line.height;
+        }
+        let padding = BoxStyle::of(self.dom, node, self.vp)
+            .padding
+            .map(|length| length.resolve(padding_basis).unwrap_or(0.0).max(0.0));
+        Some(std::sync::Arc::new(ControlText {
+            lines: runs,
+            scrollport: padding,
+        }))
     }
 
     /// Paint the CONTENT of an atom whose blockified/flex-item border box is
@@ -1686,18 +1811,43 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // Using the old glyph advance here clips each newly typed character
         // and makes the desktop scroll a short value unnecessarily.
         let width = self.cap.max(0.0);
-        let height = self
-            .cb_h_px
-            .unwrap_or(shaped.line_height)
-            .max(shaped.line_height);
+        // HTML Rendering #the-textarea-element-2: a textarea's content is
+        // multiline text starting at the content-box top, and its automatic
+        // height is the textarea effective height (`rows` lines), whatever
+        // its outer display type.
+        let textarea = f.kind == crate::doc::FieldKind::Textarea;
+        if textarea {
+            // The control's own box carries no inline baseline here: like a
+            // block-level replaced image, its synthetic content line must not
+            // add a strut descent below the `rows`-tall text area.
+            self.strut = crate::text::ShapedText::default();
+        }
+        let height = if textarea {
+            self.cb_h_px
+                .unwrap_or(shaped.line_height * textarea_rows(self.dom, a.node) as f32)
+                .max(0.0)
+        } else {
+            self.cb_h_px
+                .unwrap_or(shaped.line_height)
+                .max(shaped.line_height)
+        };
+        let lines = textarea
+            // The outer fragment resolved this box's percentage padding;
+            // the content-width IFC no longer knows that basis.
+            .then(|| self.textarea_lines(a.node, &labels.visual, ctx, width, None))
+            .flatten();
         self.place_atom(
             AtomGeometry {
                 box_width: width,
                 box_height: height,
                 paint_x: 0.0,
-                paint_y: ((height - shaped.line_height) / 2.0).max(0.0),
+                paint_y: if textarea {
+                    0.0
+                } else {
+                    ((height - shaped.line_height) / 2.0).max(0.0)
+                },
                 paint_width: width,
-                paint_height: shaped.line_height,
+                paint_height: if textarea { height } else { shaped.line_height },
             },
             InlineItem {
                 text: labels.visual,
@@ -1724,6 +1874,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             Self::space_advance(ctx),
             false,
         );
+        if let Some(piece) = self.cur.last_mut() {
+            piece.control_text = lines;
+        }
     }
 
     /// An `<img>`: a decoded or dimension-declared image reserves its used
@@ -2050,6 +2203,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box,
             paint_control_box,
+            control_text: None,
             boxes: None,
         });
         self.attach_boxes(gap);
@@ -2871,6 +3025,15 @@ struct ControlLabels {
     geometry: AtomGeometry,
 }
 
+/// HTML #attr-textarea-rows: the textarea's character height, a positive
+/// integer defaulting to 2.
+fn textarea_rows(dom: &Dom, node: NodeId) -> usize {
+    dom.attr(node, "rows")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&rows| rows > 0)
+        .unwrap_or(2)
+}
+
 fn control_labels(
     dom: &Dom,
     node: NodeId,
@@ -2973,7 +3136,7 @@ fn control_labels(
     // HTML Rendering #the-textarea-element-2: the textarea effective height
     // is its character height (`rows`, default 2) in lines; its text starts
     // at the top of the content box.
-    let rows = (f.kind == FieldKind::Textarea).then(|| attr_ch("rows").unwrap_or(2));
+    let rows = (f.kind == FieldKind::Textarea).then(|| textarea_rows(dom, node));
     let natural_height = rows.map_or(shaped.line_height, |rows| shaped.line_height * rows as f32);
     let mut box_height = specified_height.map_or(natural_height + vertical_edges, |height| {
         if box_style.border_box {

@@ -474,46 +474,43 @@ pub(crate) fn rich_editor_presentation(
         // adds a caret and any pending user edit in that same box. Replacing it
         // with desktop chrome loses the author's appearance and geometry.
         let bounds = layout.boxes.get(&node)?;
-        let painted = layout.paint.primitives.iter().find_map(|command| {
-            if let crate::render::DisplayCommand::GlyphRun {
-                node: id,
-                origin,
-                clip,
-                ..
-            } = command
-                && *id == node
-            {
-                Some((*origin, *clip))
-            } else {
-                None
-            }
-        });
-        let (origin, clip) = painted.unwrap_or_else(|| {
-            // An empty textarea without a placeholder has no glyph run. Its
-            // insertion point still starts at the used content-box edge.
-            let viewport = layout.paint_cache.as_ref().map_or(
-                Viewport::new(layout.paint.width, layout.paint.height),
-                |cache| cache.viewport,
-            );
-            let vp = value::Vp {
-                w: viewport.width,
-                h: viewport.height,
-            };
-            let box_style = style::BoxStyle::of(dom, node, vp);
-            let basis = dom
-                .parent_flat(node)
-                .and_then(|parent| layout.boxes.get(&parent))
-                .map_or(bounds.width as f32, |parent| parent.width as f32);
-            let inset = |side: usize| {
-                box_style.border[side] + box_style.padding[side].resolve(Some(basis)).unwrap_or(0.0)
-            };
-            let x = bounds.left as f32 + inset(style::LEFT);
-            let y = bounds.top as f32 + inset(style::TOP);
-            let width = (bounds.width as f32 - inset(style::LEFT) - inset(style::RIGHT)).max(0.0);
-            let height = (bounds.height as f32 - inset(style::TOP) - inset(style::BOTTOM)).max(0.0);
-            let clip = crate::render::CssRect::new(x, y, width, height);
-            (crate::core::CssPoint::new(x, y), Some(clip))
-        });
+        // The editing width is the used content box. The painted runs clip
+        // to the wider scrollport (padding box), so derive it from the box.
+        let viewport = layout.paint_cache.as_ref().map_or(
+            Viewport::new(layout.paint.width, layout.paint.height),
+            |cache| cache.viewport,
+        );
+        let vp = value::Vp {
+            w: viewport.width,
+            h: viewport.height,
+        };
+        let box_style = style::BoxStyle::of(dom, node, vp);
+        let basis = dom
+            .parent_flat(node)
+            .and_then(|parent| layout.boxes.get(&parent))
+            .map_or(bounds.width as f32, |parent| parent.width as f32);
+        let inset = |side: usize| {
+            box_style.border[side] + box_style.padding[side].resolve(Some(basis)).unwrap_or(0.0)
+        };
+        let width = (bounds.width as f32 - inset(style::LEFT) - inset(style::RIGHT)).max(0.0);
+        // An empty textarea without a placeholder has no glyph run. Its
+        // insertion point still starts at the used content-box edge.
+        let origin = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun {
+                    node: id, origin, ..
+                } if *id == node => Some(*origin),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                crate::core::CssPoint::new(
+                    bounds.left as f32 + inset(style::LEFT),
+                    bounds.top as f32 + inset(style::TOP),
+                )
+            });
         let style =
             style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), base).text_style();
         let color = dom
@@ -534,7 +531,7 @@ pub(crate) fn rich_editor_presentation(
                 origin.x - bounds.left as f32,
                 origin.y - bounds.top as f32,
             ),
-            width: clip.map_or(bounds.width as f32, |clip| clip.width),
+            width,
             pending_text: Some(PendingEditorText {
                 text: dom.text_content(node),
                 nodes: vec![node],
@@ -4550,6 +4547,113 @@ b</xmp></body>"#;
             height("two")
         );
         assert!((height("zero") - height("two")).abs() < 0.01);
+    }
+
+    #[test]
+    fn textarea_values_break_into_lines_inside_the_control() {
+        // HTML Rendering #form-controls (`textarea { white-space: pre-wrap }`)
+        // and #the-textarea-element-2: preserved newlines force breaks, a
+        // long line soft-wraps at the content width, `wrap=off` maps to
+        // `white-space: pre`, and the text starts at the content-box top for
+        // an inline or a blockified textarea alike.
+        let style = "font:12px/15px monospace;padding:4px;border:1px solid;margin:0";
+        let html = format!(
+            "<body style=margin:0><form>\
+             <textarea id=a cols=20 rows=5 style='{style}'>line one\nline two\nline three</textarea>\
+             <textarea id=b cols=20 rows=5 style='{style}'>a long single line that must soft wrap inside the box</textarea>\
+             <textarea id=c cols=20 rows=5 wrap=OFF style='{style}'>a long single line that must not wrap\nsecond</textarea>\
+             <textarea id=d cols=20 rows=3 style='{style};display:block'>block one\nblock two\nblock three</textarea>\
+             </form></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let layout = lay_graphical(&html, 800.0, &HashMap::new());
+        let runs = |id: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            let bounds = layout.boxes[&node];
+            let runs: Vec<(f32, f32, String)> = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    crate::render::Primitive::GlyphRun {
+                        node: run_node,
+                        origin,
+                        shaped,
+                        ..
+                    } if *run_node == node => Some((
+                        origin.x - bounds.left as f32,
+                        origin.y - bounds.top as f32,
+                        shaped.text.trim_end().to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            runs
+        };
+        let texts = |id: &str| runs(id).into_iter().map(|run| run.2).collect::<Vec<_>>();
+        let tops = |id: &str| runs(id).into_iter().map(|run| run.1).collect::<Vec<_>>();
+        assert_eq!(texts("a"), ["line one", "line two", "line three"]);
+        assert_eq!(tops("a"), [5.0, 20.0, 35.0], "content top, then 15px lines");
+        assert!(runs("a").iter().all(|run| run.0 == 5.0));
+        assert_eq!(
+            texts("b"),
+            [
+                "a long single line",
+                "that must soft wrap",
+                "inside the box"
+            ]
+        );
+        assert_eq!(
+            texts("c"),
+            ["a long single line that must not wrap", "second"]
+        );
+        assert_eq!(texts("d"), ["block one", "block two", "block three"]);
+        assert_eq!(tops("d"), [5.0, 20.0, 35.0]);
+        // A blockified textarea is still `rows` lines tall.
+        let d = layout.boxes[&dom.get_by_id("d").unwrap()];
+        assert!(
+            (d.height - (3.0 * 15.0 + 10.0)).abs() < 0.01,
+            "{}",
+            d.height
+        );
+        // Overflowing lines clip at the scrollport (the padding box), as in
+        // Gecko and Blink, not at the content edge.
+        let a_box = layout.boxes[&dom.get_by_id("a").unwrap()];
+        let clip = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { node, clip, .. }
+                    if *node == dom.get_by_id("a").unwrap() =>
+                {
+                    *clip
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                clip.x - a_box.left as f32,
+                clip.y - a_box.top as f32,
+                clip.height
+            ),
+            (1.0, 1.0, a_box.height as f32 - 2.0)
+        );
+        let a = dom.get_by_id("a").unwrap();
+        assert_eq!(
+            dom.cssom_resolved_value(a, "white-space").as_deref(),
+            Some("pre-wrap")
+        );
+        assert_eq!(
+            dom.cssom_resolved_value(a, "overflow-wrap").as_deref(),
+            Some("break-word")
+        );
+        assert_eq!(
+            dom.cssom_resolved_value(dom.get_by_id("c").unwrap(), "white-space")
+                .as_deref(),
+            Some("pre")
+        );
     }
 
     #[test]
