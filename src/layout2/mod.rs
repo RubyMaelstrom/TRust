@@ -6084,6 +6084,47 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn list_markers_are_not_text_transformed_by_their_items() {
+        // CSS Lists 3 #marker-properties: the UA style sheet gives ::marker
+        // `text-transform: none`, which an author ::marker rule may override.
+        // Blink and Gecko both keep this inside marker `a.`.
+        let text = |rule: &str| {
+            let html = format!(
+                r#"<style>{rule}</style><ol style="list-style:lower-alpha inside;text-transform:uppercase"><li>item</li></ol>"#
+            );
+            let painted: String = lay_graphical(&html, 400., &HashMap::new())
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                        Some(shaped.text.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let cells: String = lay(&html, 80)
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .map(|item| item.text.clone())
+                .collect();
+            (painted, cells)
+        };
+        let (painted, cells) = text("");
+        assert!(
+            painted.contains("a.") && painted.contains("ITEM"),
+            "{painted}"
+        );
+        assert!(cells.contains("a.") && cells.contains("ITEM"), "{cells}");
+        let (painted, cells) = text("li::marker{text-transform:uppercase}");
+        assert!(
+            painted.contains("A.") && cells.contains("A."),
+            "{painted} {cells}"
+        );
+    }
+
+    #[test]
     fn details_closed_shows_only_summary() {
         let out = lay(
             r#"<body style="margin:0"><details><summary>more</summary><p>secret</p></details></body>"#,
