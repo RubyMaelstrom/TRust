@@ -264,6 +264,7 @@ mod tests {
                     MediaEnvironment {
                         viewport: (800., 600.),
                         density,
+                        quirks: false,
                     },
                     &mut layers,
                 );
@@ -312,6 +313,7 @@ mod tests {
                     MediaEnvironment {
                         viewport: (800., 600.),
                         density: 1.,
+                        quirks: false,
                     },
                     &mut layers,
                 );

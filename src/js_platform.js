@@ -4842,7 +4842,7 @@
         return state;
     }
     function declarationParse(state, raw) {
-        const pairs = cssOp(state.descriptors ? "descriptors" : "parse", raw);
+        const pairs = cssOp(state.descriptors ? "descriptors" : "parse", raw, !state.descriptors && state.quirks() ? "quirks" : "");
         return state.descriptors ? pairs.filter((p) => !p[2] && state.descriptors.includes(p[0]) && (state.descriptors !== counterDescriptors || cssOp("counter-descriptor", p[0], p[1]))) : pairs;
     }
     function declarationText(style, internal = false) {
@@ -4906,7 +4906,7 @@
                 if (!state.descriptors.includes(name)) return;
                 pairs = cssOp("descriptors", name + ":" + value);
                 if (pairs.length !== 1 || pairs[0][2] || priority || (state.descriptors === counterDescriptors && !cssOp("counter-descriptor", name, value))) return;
-            } else pairs = cssOp("expand", name, value);
+            } else pairs = cssOp(state.quirks() ? "expand-quirks" : "expand", name, value);
             if (!pairs.length) return;
             let changed = false;
             for (const [k, v] of pairs) {
@@ -4937,9 +4937,11 @@
         }
         get [Symbol.toStringTag]() { return "CSSStyleDeclaration"; }
     }
-    function declarationFor(read, write, parent = null, descriptors = null) {
+    // `quirks` reports whether the block's Document is in quirks mode, where
+    // CSS Values 4 #deprecated-quirky-length lets `el.style.left = 90` mean 90px.
+    function declarationFor(read, write, parent = null, descriptors = null, quirks = () => false) {
         const target = new CSSStyleDeclaration(declarationState);
-        const state = { read, write, parent, descriptors, raw: undefined, pairs: [] };
+        const state = { read, write, parent, descriptors, quirks, raw: undefined, pairs: [] };
         const proxy = new Proxy(target, {
             get(t, p, receiver) {
                 if (p in t || typeof p !== "string") return Reflect.get(t, p, receiver);
@@ -4965,7 +4967,8 @@
         return proxy;
     }
     function styleFor(el) {
-        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(el.__id), JSON.stringify(pairs)); });
+        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(el.__id), JSON.stringify(pairs)); },
+            null, null, () => __dom_document_quirks(el.ownerDocument.__id));
     }
     g.CSSStyleDeclaration = CSSStyleDeclaration;
     g.CSSStyleProperties = CSSStyleDeclaration;
@@ -10303,8 +10306,14 @@
     // and feature-detection code (css3test's Supports.atrule/descriptorvalue,
     // CSS-in-JS libraries) read real rules. Distinct classes so
     // `constructor.name`/`instanceof` answer correctly.
-    function parseCss(text) {
-        try { return JSON.parse(__css_parse(String(text || ""))); } catch (e) { return []; }
+    function parseCss(text, quirks = false) {
+        try { return JSON.parse(__css_parse(String(text || ""), !!quirks)); } catch (e) { return []; }
+    }
+    // A sheet parses in its Document's mode: the owner node's, or a
+    // constructed sheet's constructor document.
+    function sheetQuirks(sheet) {
+        const document = sheet?.ownerNode ? sheet.ownerNode.ownerDocument : sheet?.__constructorDocumentObject;
+        return !!document && __dom_document_quirks(document.__id);
     }
     // Split stylesheet text into its top-level rules (string/comment/brace
     // aware), so a CSSStyleSheet can model insertRule/deleteRule by index and
@@ -10333,7 +10342,7 @@
     // updates its sheet in the canonical arena without changing DOM text.
     function ruleStyle(rule, pairs, descriptors = null) {
         let text = (pairs || []).map(([k, v, p]) => k + ":" + v + (p ? " !important" : "") + ";").join(" ");
-        return declarationFor(() => text, (value) => { text = value; rule.__changed(); }, rule, descriptors);
+        return declarationFor(() => text, (value) => { text = value; rule.__changed(); }, rule, descriptors, () => sheetQuirks(rule.__sheet));
     }
     function cssSplitList(text) {
         const parts = []; let start = 0, depth = 0, quote = null;
@@ -10414,8 +10423,8 @@
         rule.__parent = parent; rule.__sheet = sheet;
         for (const child of rule.__children || []) attachCssRule(child, rule, sheet);
     }
-    function singleCssRule(text, nested=false) {
-        const chunks = splitCssRules(text), parsed = parseCss(text);
+    function singleCssRule(text, nested=false, quirks=false) {
+        const chunks = splitCssRules(text), parsed = parseCss(text, quirks);
         if (chunks.length !== 1 || parsed.length !== 1) throw new DOMException("Expected one valid CSS rule", "SyntaxError");
         const j = parsed[0];
         if (j.t === "style" && !cssOp("selector",j.sel,nested ? "nested" : "")) throw new DOMException("Invalid selector", "SyntaxError");
@@ -10426,7 +10435,7 @@
         if (index > list.length) throw new DOMException("Rule index out of range", "IndexSizeError");
         let ancestor=owner, nestedSelector=false;
         while(ancestor instanceof CSSRule){if(ancestor instanceof CSSStyleRule){nestedSelector=true;break;}ancestor=ancestor.parentRule;}
-        const rule = singleCssRule(text,nestedSelector);
+        const rule = singleCssRule(text,nestedSelector,sheetQuirks(owner instanceof CSSRule ? owner.__sheet : owner));
         const nested = owner instanceof CSSRule;
         if (nested && (rule.type === 3 || rule.type === 10)) throw new DOMException("Rule is not allowed in a group", "HierarchyRequestError");
         const trial = list.slice(); trial.splice(index, 0, rule);
@@ -10524,7 +10533,7 @@
         set name(v) { this.__name = domString(v); this.__changed(); }
         get cssRules() { return this.__list; }
         appendRule(text) {
-            text = domString(text); const parsed = parseCss("@keyframes x { " + text + " }");
+            text = domString(text); const parsed = parseCss("@keyframes x { " + text + " }", sheetQuirks(this.__sheet));
             const j = parsed[0]?.r; if (!j || j.length !== 1 || keyframeKey(j[0].key) === null) return;
             const rule = buildRule(j[0]); this.__children.push(rule); attachCssRule(rule, this, this.__sheet); this.__changed();
         }
@@ -10634,7 +10643,7 @@
         get rules() { return this.cssRules; }
         __replace(text) {
             for (const rule of this.__children) attachCssRule(rule, null, null);
-            this.__children.splice(0, this.__children.length, ...buildRules(parseCss(text)).filter((r) => r.type !== 3));
+            this.__children.splice(0, this.__children.length, ...buildRules(parseCss(text, sheetQuirks(this))).filter((r) => r.type !== 3));
             for (const rule of this.__children) attachCssRule(rule, null, this);
             this.__changed();
         }
@@ -10679,7 +10688,7 @@
             let mediaAttr=owner.getAttribute("media")||"";
             sheet.__media.__read=()=>{const value=owner.getAttribute("media")||"";if(value!==mediaAttr){mediaAttr=value;sheet.__media.__set(value);}};
         }
-        sheet.__children.push(...buildRules(parseCss(text)));
+        sheet.__children.push(...buildRules(parseCss(text, sheetQuirks(sheet))));
         for (const rule of sheet.__children) attachCssRule(rule, null, sheet);
         if (owner?.localName === "link") {
             try {

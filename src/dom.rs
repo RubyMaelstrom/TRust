@@ -2695,6 +2695,12 @@ impl Dom {
         self.nodes.get(id).map(|node| node.owner_document)
     }
 
+    /// Whether `id`'s node document is in quirks mode (DOM #concept-document-quirks).
+    pub(crate) fn in_quirks_mode(&self, id: NodeId) -> bool {
+        self.owner_document(id)
+            .is_some_and(|document| self.document_mode(document) == QuirksMode::Quirks)
+    }
+
     /// DOM creation establishes provenance before publishing a wrapper or invoking a custom
     /// constructor. Unlike adoption, a fresh node cannot invalidate any existing tree/style.
     pub(crate) fn initialize_node_document(&mut self, id: NodeId, document: NodeId) {
@@ -5129,9 +5135,10 @@ impl Dom {
             let declarations = match self.cssom_inline.get(&id) {
                 Some(declarations) => declarations,
                 None => {
+                    let quirks = self.in_quirks_mode(id);
                     parsed = split_top_level(style, ';')
                         .into_iter()
-                        .filter_map(parse_decl)
+                        .filter_map(|decl| parse_decl_in(decl, quirks))
                         .collect::<Vec<_>>();
                     &parsed
                 }
@@ -6268,6 +6275,7 @@ impl Dom {
         let media = MediaEnvironment {
             viewport: self.viewport_px,
             density: self.device_pixel_ratio,
+            quirks: false,
         };
         // Cascade layers are scoped like the rules themselves ("scoped to
         // their origin and context" — css-cascade-5): one registry per tree
@@ -6337,7 +6345,10 @@ impl Dom {
                 index.properties.entry(document).or_default(),
                 font_faces.entry(scope).or_default(),
                 base.as_ref(),
-                media,
+                MediaEnvironment {
+                    quirks: self.in_quirks_mode(id),
+                    ..media
+                },
                 layer_regs.entry(scope).or_default(),
             );
             if let Some(base) = base {
@@ -6381,7 +6392,10 @@ impl Dom {
                     index.properties.entry(document).or_default(),
                     font_faces.entry(*scope).or_default(),
                     base.as_ref(),
-                    media,
+                    MediaEnvironment {
+                        quirks: self.in_quirks_mode(*scope),
+                        ..media
+                    },
                     layer_regs.entry(*scope).or_default(),
                 );
                 if let Some(base) = base {
@@ -13738,7 +13752,8 @@ fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&s
 /// shorthand (`border`, `border-<side>`, `outline`). Order-independent, but a
 /// component may appear once, and any other token makes the whole value
 /// invalid (CSS Syntax 3: `border: px solid red` is dropped, not solid red).
-/// A unitless number stays a width, for the HTML quirks-mode length quirk.
+/// A nonzero number is not a <line-width>, even in quirks mode: CSS Values 4
+/// #deprecated-quirky-length excludes the shorthands.
 fn parse_line_shorthand<'v>(
     value: &'v str,
     styles: &[&str],
@@ -13750,6 +13765,8 @@ fn parse_line_shorthand<'v>(
         let lower = tok.to_ascii_lowercase();
         let slot = if styles.contains(&lower.as_str()) {
             &mut style
+        } else if is_bare_nonzero_css_number(tok) {
+            return (None, None, None);
         } else if matches!(lower.as_str(), "thin" | "medium" | "thick")
             || tok.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
             || ["calc(", "min(", "max(", "clamp("]
@@ -14733,6 +14750,12 @@ impl RuleBuckets {
 /// here changes the resource identity on case-sensitive servers (for example
 /// `/images/HeartDot.png`). Preserve those tokens while normalizing the rest.
 fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
+    parse_decl_in(decl, false)
+}
+
+/// `parse_decl` for a sheet or style attribute of a document in `quirks`
+/// mode, which also accepts CSS Values 4 #deprecated-quirky-length.
+fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     let uncommented = strip_css_comments(decl);
     let decl = uncommented.as_ref();
     let mut input = cssparser::ParserInput::new(decl);
@@ -14810,6 +14833,11 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     // override a valid stylesheet height. Keep this inexpensive grammar guard
     // at the declaration boundary, where both inline and sheet declarations
     // get the same fallback/cascade behavior.
+    let value = if quirks && accepts_quirky_length(&k) {
+        quirky_lengths_as_px(value)
+    } else {
+        value
+    };
     if property_rejects_unitless_nonzero_length(&k)
         && split_top_level_ws(&value)
             .into_iter()
@@ -14953,6 +14981,71 @@ fn property_rejects_unitless_nonzero_length(property: &str) -> bool {
             | "box-shadow"
             | "text-shadow"
     )
+}
+
+/// CSS Values 4 #deprecated-quirky-length: in quirks mode a <number-token>
+/// is a `px` length in exactly these properties, not in shorthands that
+/// include them (`border`, `inset`, `background`) or inside functions.
+fn accepts_quirky_length(property: &str) -> bool {
+    matches!(
+        property,
+        "background-position"
+            | "border-spacing"
+            | "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width"
+            | "border-width"
+            | "bottom"
+            | "font-size"
+            | "height"
+            | "left"
+            | "letter-spacing"
+            | "margin-right"
+            | "margin-left"
+            | "margin-top"
+            | "margin-bottom"
+            | "margin"
+            | "max-height"
+            | "max-width"
+            | "min-height"
+            | "min-width"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "padding"
+            | "right"
+            | "text-indent"
+            | "top"
+            | "vertical-align"
+            | "width"
+            | "word-spacing"
+    )
+}
+
+/// Gives each top-level nonzero number of a quirky-length value its `px`
+/// unit, which is also how browsers serialize it (`top: 105` → `105px`).
+fn quirky_lengths_as_px(value: String) -> String {
+    let tokens = split_top_level_ws(&value);
+    if !tokens.iter().any(|token| is_bare_nonzero_css_number(token)) {
+        return value;
+    }
+    tokens
+        .into_iter()
+        .map(|token| {
+            if !is_bare_nonzero_css_number(token) {
+                return token.to_string();
+            }
+            let separator = |c: char| c == ',' || c == '/';
+            let number = token.trim_start_matches(separator);
+            let prefix = &token[..token.len() - number.len()];
+            let number = number.trim_end_matches(separator);
+            let suffix = &token[prefix.len() + number.len()..];
+            format!("{prefix}{number}px{suffix}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_bare_nonzero_css_number(value: &str) -> bool {
@@ -15250,6 +15343,9 @@ fn qualify_layer(prefix: &str, name: &str) -> String {
 struct MediaEnvironment {
     viewport: (f32, f32),
     density: f32,
+    /// The sheet's Document is in quirks mode, so declarations also accept
+    /// CSS Values 4 #deprecated-quirky-length.
+    quirks: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15349,7 +15445,7 @@ fn parse_sheet(
                     .trim()
                     .to_string();
                 let (block, tail) = take_block(&after[brace_off..]);
-                keyframes.insert(name, parse_keyframes_rule(block));
+                keyframes.insert(name, parse_keyframes_rule(block, media.quirks));
                 rest = tail;
                 continue;
             }
@@ -15683,7 +15779,7 @@ fn parse_style_rule(
     layer: &[u32],
 ) {
     let (decl_text, nested) = split_block(block);
-    let decls = collect_decls(&decl_text);
+    let decls = collect_decls(&decl_text, media.quirks);
     if !decls.is_empty()
         && let Some(SelectorList(complexes, _)) = SelectorList::parse(resolved.trim())
     {
@@ -15743,10 +15839,10 @@ fn parse_style_rule(
 
 /// Parse a declaration block's text into tracked `(prop, (important, value))`
 /// pairs (later wins; never demote `!important`); shorthands are expanded.
-fn collect_decls(decl_text: &str) -> Vec<(String, (bool, String))> {
+fn collect_decls(decl_text: &str, quirks: bool) -> Vec<(String, (bool, String))> {
     let mut decls: Vec<(String, (bool, String))> = Vec::new();
     for decl in split_top_level(decl_text, ';') {
-        let Some((k, v, important)) = parse_decl(decl) else {
+        let Some((k, v, important)) = parse_decl_in(decl, quirks) else {
             continue;
         };
         for (pk, pv) in expand_box_shorthand(&k, &v) {
@@ -16331,7 +16427,7 @@ fn media_px(value: &str) -> Option<f32> {
 /// Parse the supported declarations of an `@keyframes` rule. CSS Animations
 /// 1 §3 conceptually builds an independent sorted keyframe set per property;
 /// repeated selectors cascade in source order and `!important` is invalid.
-fn parse_keyframes_rule(block: &str) -> KeyframesRule {
+fn parse_keyframes_rule(block: &str, quirks: bool) -> KeyframesRule {
     let mut rule = KeyframesRule::default();
     let mut rest = block;
     while let Some(brace) = rest.find('{') {
@@ -16346,7 +16442,7 @@ fn parse_keyframes_rule(block: &str) -> KeyframesRule {
             continue;
         }
         for decl in split_top_level(decls, ';') {
-            let Some((property, value, important)) = parse_decl(decl) else {
+            let Some((property, value, important)) = parse_decl_in(decl, quirks) else {
                 continue;
             };
             if important || !matches!(property.as_str(), "opacity" | "top" | "transform") {
@@ -16556,15 +16652,16 @@ pub fn selector_parses(sel: &str) -> bool {
     !sel.is_empty() && SelectorList::parse(sel).is_some()
 }
 
-/// Parse a stylesheet into the CSSOM rule tree as compact JSON.
-pub fn parse_cssom_json(css: &str) -> String {
+/// Parse a stylesheet into the CSSOM rule tree as compact JSON. `quirks`:
+/// the sheet's Document is in quirks mode (see `parse_decl_in`).
+pub fn parse_cssom_json(css: &str, quirks: bool) -> String {
     let css = strip_css_comments(css);
-    cssom_rules_json(css.as_ref())
+    cssom_rules_json(css.as_ref(), quirks)
 }
 
 /// One JSON array of rules from a chunk of stylesheet text (recurses for
 /// grouping at-rules like `@media`).
-fn cssom_rules_json(css: &str) -> String {
+fn cssom_rules_json(css: &str, quirks: bool) -> String {
     let mut out = String::from("[");
     let mut rest = css;
     let mut first = true;
@@ -16574,7 +16671,7 @@ fn cssom_rules_json(css: &str) -> String {
             break;
         }
         if let Some(after) = rest.strip_prefix('@') {
-            let (json, tail) = at_rule_json(after);
+            let (json, tail) = at_rule_json(after, quirks);
             rest = tail;
             if let Some(j) = json {
                 push_item(&mut out, &mut first, &j);
@@ -16600,8 +16697,8 @@ fn cssom_rules_json(css: &str) -> String {
         let item = format!(
             "{{\"t\":\"style\",\"sel\":{},\"d\":{},\"r\":{}}}",
             json_string(&sel),
-            decls_json(&decls),
-            cssom_rules_json(&nested)
+            decls_json(&decls, quirks),
+            cssom_rules_json(&nested, quirks)
         );
         push_item(&mut out, &mut first, &item);
     }
@@ -16611,7 +16708,7 @@ fn cssom_rules_json(css: &str) -> String {
 
 /// An at-rule body (text after the `@`). Returns its JSON (None = unknown,
 /// dropped) and the tail after its `;` or closing `}`.
-fn at_rule_json(after: &str) -> (Option<String>, &str) {
+fn at_rule_json(after: &str, quirks: bool) -> (Option<String>, &str) {
     if let Some((rule, tail)) = properties::consume_rule(after) {
         return (rule.map(|rule| rule.json().to_string()), tail);
     }
@@ -16640,16 +16737,16 @@ fn at_rule_json(after: &str) -> (Option<String>, &str) {
     let b = brace.unwrap();
     let prelude = after[name_end..b].trim().to_string();
     let (body, tail) = take_block(&after[b..]);
-    (block_at_rule_json(name, &prelude, body), tail)
+    (block_at_rule_json(name, &prelude, body, quirks), tail)
 }
 
-fn block_at_rule_json(name: &str, prelude: &str, body: &str) -> Option<String> {
+fn block_at_rule_json(name: &str, prelude: &str, body: &str, quirks: bool) -> Option<String> {
     let grouping = |t: &str| {
         Some(format!(
             "{{\"t\":\"{}\",\"q\":{},\"r\":{}}}",
             t,
             json_string(prelude),
-            cssom_rules_json(body)
+            cssom_rules_json(body, quirks)
         ))
     };
     match name {
@@ -16662,21 +16759,21 @@ fn block_at_rule_json(name: &str, prelude: &str, body: &str) -> Option<String> {
         "keyframes" => Some(format!(
             "{{\"t\":\"keyframes\",\"name\":{},\"r\":{}}}",
             json_string(prelude),
-            keyframes_rules_json(body)
+            keyframes_rules_json(body, quirks)
         )),
         "font-face" => Some(format!(
             "{{\"t\":\"font-face\",\"d\":{}}}",
-            decls_json(body)
+            decls_json(body, false)
         )),
         "page" => Some(format!(
             "{{\"t\":\"page\",\"sel\":{},\"d\":{}}}",
             json_string(prelude),
-            decls_json(body)
+            decls_json(body, quirks)
         )),
         "counter-style" => Some(format!(
             "{{\"t\":\"counter-style\",\"name\":{},\"d\":{}}}",
             json_string(prelude),
-            decls_json(body)
+            decls_json(body, false)
         )),
         "property" => {
             properties::PropertyRule::parse(prelude, body).map(|rule| rule.json().to_string())
@@ -16710,7 +16807,7 @@ fn statement_at_rule_json(name: &str, prelude: &str) -> Option<String> {
 
 /// `@keyframes` body: a list of keyframe rules whose "selector" is the
 /// keyText (`0%`/`from`/`to`).
-fn keyframes_rules_json(body: &str) -> String {
+fn keyframes_rules_json(body: &str, quirks: bool) -> String {
     let mut out = String::from("[");
     let mut rest = body;
     let mut first = true;
@@ -16726,7 +16823,7 @@ fn keyframes_rules_json(body: &str) -> String {
         let item = format!(
             "{{\"t\":\"keyframe\",\"key\":{},\"d\":{}}}",
             json_string(&key),
-            decls_json(block)
+            decls_json(block, quirks)
         );
         push_item(&mut out, &mut first, &item);
     }
@@ -16737,11 +16834,11 @@ fn keyframes_rules_json(body: &str) -> String {
 /// A declaration block → JSON array of `[name, value]` pairs (raw, NOT
 /// filtered by `is_tracked` — CSSOM reports what was written). Naive
 /// `;`-split, matching `parse_sheet`.
-fn decls_json(block: &str) -> String {
+fn decls_json(block: &str, quirks: bool) -> String {
     let mut out = String::from("[");
     let mut first = true;
     for decl in split_top_level(block, ';') {
-        let Some((k, v, important)) = parse_decl(decl) else {
+        let Some((k, v, important)) = parse_decl_in(decl, quirks) else {
             continue;
         };
         let item = format!("[{},{},{}]", json_string(&k), json_string(&v), important);
@@ -17346,6 +17443,7 @@ mod tests {
              @media (min-width: 1px) { p { display: block } } \
              @font-face { font-family: Z } \
              @bogusrule q { z: 1 }",
+            false,
         );
         assert!(json.contains(r#""t":"style""#), "{json}");
         assert!(json.contains(r#""sel":"a.x""#), "{json}");
@@ -18564,7 +18662,8 @@ mod tests {
     fn invalid_border_shorthands_are_dropped_whole() {
         // CSS Syntax 3 / Backgrounds 3 #border-shorthands: an unknown token or
         // a repeated component invalidates the declaration, which then leaves
-        // earlier declarations in effect.
+        // earlier declarations in effect. A unitless width is invalid even in
+        // this quirks-mode document (CSS Values 4 #deprecated-quirky-length).
         let dom = Dom::parse_document(
             "<style>p{border:1px dotted blue}\
              #a{border:px solid red} #b{border:2px solid solid red}\
@@ -18576,7 +18675,7 @@ mod tests {
             let node = dom.get_by_id(id).unwrap();
             dom.computed_value(node, name)
         };
-        for id in ["a", "b"] {
+        for id in ["a", "b", "d"] {
             assert_eq!(
                 value(id, "border-top-style").as_deref(),
                 Some("dotted"),
@@ -18585,7 +18684,6 @@ mod tests {
         }
         assert_eq!(value("c", "border-top-style").as_deref(), Some("solid"));
         assert!(value("c", "border-top-width").is_some_and(|w| w.contains("calc") || w == "2px"));
-        assert_eq!(value("d", "border-top-style").as_deref(), Some("dashed"));
         assert_eq!(value("e", "outline-style").as_deref(), Some("auto"));
     }
 
@@ -20159,7 +20257,7 @@ mod tests {
         // accepting the number as px froze TRust's outer page frame at the
         // actor's early viewport measurement and clipped the lower document.
         let dom = Dom::parse_document(
-            r#"<style>#frame{height:100%;margin-left:7px}</style><body>
+            r#"<!doctype html><style>#frame{height:100%;margin-left:7px}</style><body>
                <iframe id=frame style="height:518;margin:2 3px;width:0"></iframe>
                </body>"#,
         );
@@ -20179,6 +20277,56 @@ mod tests {
             Some("0"),
             "unitless zero remains a valid length"
         );
+    }
+
+    #[test]
+    fn quirks_mode_numbers_are_pixel_lengths_in_the_quirky_properties() {
+        // CSS Values 4 #deprecated-quirky-length: a quirks-mode document's
+        // sheets and style attributes accept a number as a `px` length, but
+        // only in the listed properties, never in the shorthands that
+        // include them or inside functions. Hand-written pages without a
+        // doctype position images with `style="top:105; left:90"`.
+        let source = r#"<style>
+              #a { top: 20; left: 30; width: 100; height: 40; margin: 5 10 }
+              #a { inset: 1 2 3 4; border: 7 solid; background-position: 10 20, 3 4 }
+            </style><body>
+            <div id=a style="right: 90; border-width: 6; font-size: 12.5"></div>"#;
+        let quirks = Dom::parse_document(source);
+        let a = quirks.get_by_id("a").unwrap();
+        for (property, value) in [
+            ("top", "20px"),
+            ("left", "30px"),
+            ("width", "100px"),
+            ("height", "40px"),
+            ("margin-top", "5px"),
+            ("margin-right", "10px"),
+            ("right", "90px"),
+            ("border-top-width", "6px"),
+            ("font-size", "12.5px"),
+            ("background-position", "10px 20px, 3px 4px"),
+        ] {
+            assert_eq!(
+                quirks.computed_value_resolved(a, property).as_deref(),
+                Some(value),
+                "{property}"
+            );
+        }
+        for property in ["bottom", "border-top-style"] {
+            assert_eq!(
+                quirks.computed_value_resolved(a, property),
+                None,
+                "{property} came only from a shorthand"
+            );
+        }
+        let standards = Dom::parse_document(&format!("<!doctype html>{source}"));
+        let a = standards.get_by_id("a").unwrap();
+        for property in ["top", "width", "margin-top", "right", "font-size"] {
+            assert_eq!(
+                standards.computed_value_resolved(a, property),
+                None,
+                "{property} in no-quirks mode"
+            );
+        }
     }
 
     #[test]
