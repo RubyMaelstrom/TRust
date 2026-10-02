@@ -6080,7 +6080,7 @@ pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
             continue;
         };
         if name.trim().eq_ignore_ascii_case("font-family") {
-            family = Some(unquote_css_url(value));
+            family = font_family_name(value);
         } else if name.trim().eq_ignore_ascii_case("src") {
             sources.clear();
             for source in crate::dom::split_top_level(value, ',') {
@@ -6102,6 +6102,47 @@ pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
         }
     }
     None
+}
+
+/// CSS Fonts 4 #family-name-syntax: `<string> | <custom-ident>+`, whose
+/// unquoted form cannot begin with a generic family or CSS-wide keyword
+/// (`font-family: Cursive` names no face; only `"Cursive"` does).
+fn font_family_name(value: &str) -> Option<String> {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    if let Ok(name) = parser.try_parse(|p| p.expect_string().map(|name| name.to_string())) {
+        return parser.is_exhausted().then_some(name);
+    }
+    let mut words: Vec<String> = Vec::new();
+    while let Ok(word) = parser.try_parse(|p| p.expect_ident().map(|word| word.to_string())) {
+        words.push(word);
+    }
+    let first = words.first()?;
+    let reserved = [
+        "serif",
+        "sans-serif",
+        "cursive",
+        "fantasy",
+        "monospace",
+        "system-ui",
+        "emoji",
+        "math",
+        "fangsong",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+        "initial",
+        "inherit",
+        "unset",
+        "revert",
+        "revert-layer",
+        "default",
+    ];
+    if !parser.is_exhausted() || reserved.iter().any(|word| first.eq_ignore_ascii_case(word)) {
+        return None;
+    }
+    Some(words.join(" "))
 }
 
 fn css_block_end(css: &str, open: usize) -> Option<usize> {
@@ -9143,6 +9184,21 @@ mod tests {
         assert_eq!(
             faces[0].sources,
             vec!["site.eot?#iefix", "site.woff2", "site.ttf"]
+        );
+
+        // CSS Fonts 4 #family-name-syntax: unquoted names are identifier
+        // sequences that cannot start with a generic or CSS-wide keyword.
+        let families = |css: &str| {
+            stylesheet_font_faces(css)
+                .into_iter()
+                .map(|face| face.family)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            families(
+                "@font-face{font-family:Comic   Sans;src:url(a.ttf)}                 @font-face{font-family:Cursive;src:url(b.ttf)}                 @font-face{font-family:'Cursive';src:url(c.ttf)}                 @font-face{font-family:inherit;src:url(d.ttf)}                 @font-face{font-family:My Font 2;src:url(e.ttf)}                 @font-face{font-family:Sans Serif;src:url(f.ttf)}"
+            ),
+            ["Comic Sans", "Cursive", "Sans Serif"]
         );
     }
 
