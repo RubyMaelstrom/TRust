@@ -1756,30 +1756,31 @@ impl Flow<'_> {
         y_border: Option<f32>,
         bt: f32,
     ) -> Frag {
-        fn first_line_y(frags: &[Frag]) -> Option<f32> {
-            let mut best: Option<f32> = None;
+        /// The top and baseline of the first line box.
+        fn first_line(frags: &[Frag]) -> Option<(f32, f32)> {
+            let mut best: Option<(f32, f32)> = None;
             for f in frags {
-                let y = match &f.kind {
-                    FragKind::Line(_) => Some(f.y),
-                    FragKind::Block | FragKind::TableCell(_) => first_line_y(&f.children),
+                let line = match &f.kind {
+                    FragKind::Line(line) => Some((f.y, line.baseline)),
+                    FragKind::Block | FragKind::TableCell(_) => first_line(&f.children),
                     FragKind::Oof(..) | FragKind::Fixed(_) => None,
                 };
-                if let Some(y) = y {
-                    best = Some(best.map_or(y, |b: f32| b.min(y)));
+                if let Some(line) = line
+                    && best.is_none_or(|best| line.0 < best.0)
+                {
+                    best = Some(line);
                 }
             }
             best
         }
-        let y = first_line_y(children)
-            .or(y_border.map(|yb| yb + bt))
-            .unwrap_or(0.0);
+        let first = first_line(children);
         let (pieces, w, h, baseline) = if let Some(source) = marker_image {
             // CSS Lists 3 §3.2 represents a list-style-image marker as an
-            // anonymous inline replaced element followed by one U+0020. With
-            // no intrinsic dimensions available yet, CSS Images 3's default
-            // object size is one em square; the image decode pass can trigger
-            // a later layout with its natural dimensions.
-            let size = inl.font_size.max(0.0);
+            // anonymous inline replaced element followed by one U+0020. Until
+            // the image has natural dimensions it is one em square; the image
+            // decode pass triggers a later layout with them.
+            let (width, height) =
+                super::inline::marker_image_size(self.dom, self.images, source, inl.font_size);
             let image = Piece::boxed(
                 InlineItem {
                     text: String::new(),
@@ -1796,12 +1797,12 @@ impl Flow<'_> {
                     pixelated: false,
                     invisible: inl.invisible,
                 },
-                size,
-                size,
+                width,
+                height,
                 0.0,
                 0.0,
-                size,
-                size,
+                width,
+                height,
             );
             let space = crate::text::shape(" ", &inl.text_style());
             let mut space_piece = Piece::shaped(
@@ -1822,12 +1823,12 @@ impl Flow<'_> {
                 },
                 space.clone(),
             );
-            space_piece.x = size;
+            space_piece.x = width;
             (
                 vec![image, space_piece],
-                size + space.advance,
-                size.max(space.line_height),
-                size,
+                width + space.advance,
+                height.max(space.line_height),
+                height,
             )
         } else {
             let marker = marker.unwrap_or_default();
@@ -1854,6 +1855,14 @@ impl Flow<'_> {
                 shaped,
             );
             (vec![piece], w, h, baseline)
+        };
+        // The marker shares the first line's baseline, so a small image
+        // marker sits on it as in Gecko and Blink. A marker taller than the
+        // line's ascent stays at the line's top rather than rising above it,
+        // which keeps it on that line in a character grid.
+        let y = match first {
+            Some((top, line_baseline)) => top + (line_baseline - baseline).max(0.0),
+            None => y_border.map_or(0.0, |yb| yb + bt),
         };
         let x = (content_x - w).max(0.0);
         Frag {

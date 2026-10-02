@@ -897,15 +897,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// its own, but it inherits the list item's paint context and participates
     /// in the same line-breaking stream as the following content.
     pub fn marker_image(&mut self, source: &str, ctx: &InlineStyle) {
-        let size = ctx.font_size.max(0.0);
+        let (width, height) = marker_image_size(self.dom, self.images, source, ctx.font_size);
         self.place_atom(
             AtomGeometry {
-                box_width: size,
-                box_height: size,
+                box_width: width,
+                box_height: height,
                 paint_x: 0.0,
                 paint_y: 0.0,
-                paint_width: size,
-                paint_height: size,
+                paint_width: width,
+                paint_height: height,
             },
             InlineItem {
                 text: String::new(),
@@ -2594,6 +2594,21 @@ pub(super) fn block_ellipsis(
 /// CSS Text §7.3 justification in CSS pixels. Collapsed spaces are retained
 /// as explicit gaps between pieces, so expansion changes geometry without
 /// manufacturing extra U+0020 characters or reshaping glyph runs.
+/// CSS Lists 3 #marker-image: the default sizing algorithm with no
+/// specified size, so the image's natural size, else a default object size
+/// of 1em square (also while the image is still loading).
+pub(super) fn marker_image_size(
+    dom: &Dom,
+    images: &ImageSizes,
+    source: &str,
+    em: f32,
+) -> (f32, f32) {
+    let em = em.max(0.0);
+    super::memo::image_size(dom, images, source)
+        .filter(|&&(w, h)| w > 0 && h > 0 && w != u32::MAX && h != u32::MAX)
+        .map_or((em, em), |&(w, h)| (w as f32, h as f32))
+}
+
 /// Distribute `extra` over the line's justification opportunities (the
 /// spaces before pieces), moving text and atomic inlines alike. Returns the
 /// shift of each atomic inline box, whose placement was recorded earlier.
