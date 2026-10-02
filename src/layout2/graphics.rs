@@ -1619,7 +1619,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
     if let Some(style) = style.filter(|_| fragment.w > 0.0 && fragment.h > 0.0) {
         let radii = border_radii(builder.dom, style, rect);
         let shape = rounded_shape(rect, radii);
-        paint_box_shadows(builder.dom, style, &shape, builder);
+        paint_box_shadows(builder, style, rect, radii, fragment.border, false);
         let is_root = builder.document_root == Some(fragment.node);
         let is_canvas_body = builder.canvas_background_source == Some(fragment.node)
             || nested_canvas_background_source(builder.dom, fragment.node) == Some(fragment.node);
@@ -1653,6 +1653,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 builder.commands.push(DisplayCommand::PopLayer);
             }
         }
+        paint_box_shadows(builder, style, rect, radii, fragment.border, true);
         // Each iframe owns a child navigable with its own document canvas.
         // Paint that canvas below the child document, inside the iframe's
         // scrollport, rather than on the nested BODY's finite CSS box. CSS
@@ -2227,7 +2228,8 @@ fn paint_atomic_control_box(
     };
     let radii = border_radii(builder.dom, PaintStyle::Element(node), rect);
     let shape = rounded_shape(rect, radii);
-    paint_box_shadows(builder.dom, PaintStyle::Element(node), &shape, builder);
+    let style = PaintStyle::Element(node);
+    paint_box_shadows(builder, style, rect, radii, control.border, false);
     paint_native_control_surface(&control, radii, builder);
     if let Some(color) = background_color(builder.dom, node)
         && !color.is_transparent()
@@ -2238,6 +2240,7 @@ fn paint_atomic_control_box(
         });
     }
     paint_background_images(&control, shape, builder, None);
+    paint_box_shadows(builder, style, rect, radii, control.border, true);
     paint_borders(&control, radii, builder);
     paint_number_spin_buttons(&control, builder);
     if builder.dom.point_hit_testable(node) {
@@ -3816,32 +3819,8 @@ fn paint_inline_box_decorations(
             .flatten()
             .is_some_and(|clip| builder.push_hard_clip(clip));
         let shape = rounded_shape(rect, radii);
-        if run.starts && run.ends {
-            paint_box_shadows(builder.dom, style, &shape, builder);
-        } else {
-            // #box-decoration-break `slice`: shadows belong to the unbroken
-            // box, so a fragment casts none from the edges where it is cut.
-            const REACH: f32 = 1.0e5;
-            let left = if run.starts { rect.x } else { rect.x - REACH };
-            let right = rect.x + rect.width + if run.ends { 0.0 } else { REACH };
-            let unbroken = CssRect::new(left, rect.y, right - left, rect.height);
-            let clip_left = if run.starts { left - REACH } else { rect.x };
-            let clip_right = if run.ends {
-                right + REACH
-            } else {
-                rect.x + rect.width
-            };
-            let pushed = builder.push_hard_clip(CssRect::new(
-                clip_left,
-                rect.y - REACH,
-                clip_right - clip_left,
-                rect.height + 2.0 * REACH,
-            ));
-            paint_box_shadows(builder.dom, style, &rounded_shape(unbroken, radii), builder);
-            if pushed {
-                builder.pop_hard_clip();
-            }
-        }
+        let slice = (run.starts, run.ends);
+        paint_sliced_box_shadows(builder, style, rect, radii, border, slice, false);
         let isolated = begin_background_isolation(builder, style);
         if let Some(color) = background_color_for_style(builder.dom, style)
             && !color.is_transparent()
@@ -3867,6 +3846,7 @@ fn paint_inline_box_decorations(
         if isolated {
             builder.commands.push(DisplayCommand::PopLayer);
         }
+        paint_sliced_box_shadows(builder, style, rect, radii, border, slice, true);
         paint_borders(&decoration, radii, builder);
         if clipped {
             builder.pop_hard_clip();
@@ -4086,17 +4066,83 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
     paint_dotted_sides(builder, edges);
 }
 
-fn paint_box_shadows(dom: &Dom, style: PaintStyle, shape: &PaintShape, builder: &mut Builder<'_>) {
-    let Some(value) = style.value(dom, "box-shadow") else {
+/// Paint one inline box fragment's outer or inner shadows.
+/// CSS Backgrounds 3 #box-decoration-break `slice`: shadows belong to the
+/// unbroken box, so a fragment casts none from the edges where it is cut.
+fn paint_sliced_box_shadows(
+    builder: &mut Builder<'_>,
+    style: PaintStyle,
+    rect: CssRect,
+    radii: CornerRadii,
+    border: [f32; 4],
+    (starts, ends): (bool, bool),
+    inset: bool,
+) {
+    if starts && ends {
+        paint_box_shadows(builder, style, rect, radii, border, inset);
+        return;
+    }
+    const REACH: f32 = 1.0e5;
+    let left = if starts { rect.x } else { rect.x - REACH };
+    let right = rect.x + rect.width + if ends { 0.0 } else { REACH };
+    let unbroken = CssRect::new(left, rect.y, right - left, rect.height);
+    let clip_left = if starts { left - REACH } else { rect.x };
+    let clip_right = if ends {
+        right + REACH
+    } else {
+        rect.x + rect.width
+    };
+    let pushed = builder.push_hard_clip(CssRect::new(
+        clip_left,
+        rect.y - REACH,
+        clip_right - clip_left,
+        rect.height + 2.0 * REACH,
+    ));
+    paint_box_shadows(builder, style, unbroken, radii, border, inset);
+    if pushed {
+        builder.pop_hard_clip();
+    }
+}
+
+/// CSS Backgrounds 3 #shadow-layers: outer box-shadows are drawn immediately
+/// below the element's background and inner shadows immediately above it,
+/// below the borders, so callers paint each kind at its own step. Per
+/// #shadow-shape an outer shadow is cast by the border box (`rect`) and an
+/// inner shadow inside the padding box, whose corners follow the inner
+/// border edge.
+fn paint_box_shadows(
+    builder: &mut Builder<'_>,
+    style: PaintStyle,
+    rect: CssRect,
+    radii: CornerRadii,
+    border: [f32; 4],
+    inset: bool,
+) {
+    let Some(value) = style.value(builder.dom, "box-shadow") else {
         return;
     };
-    let lengths = LengthBasis::of(dom, style.node(), builder.viewport());
+    let lengths = LengthBasis::of(builder.dom, style.node(), builder.viewport());
+    let border_shape = rounded_shape(rect, radii);
+    let shape = if inset {
+        let [top, right, bottom, left] = border;
+        let padding = CssRect::new(
+            rect.x + left,
+            rect.y + top,
+            (rect.width - left - right).max(0.0),
+            (rect.height - top - bottom).max(0.0),
+        );
+        background_clip_shape(padding, &border_shape, rect)
+    } else {
+        border_shape
+    };
     for shadow in split_top_level(&value, ',') {
         if shadow.trim().eq_ignore_ascii_case("none") {
             continue;
         }
         let tokens = split_ws(shadow);
-        let inset = tokens.iter().any(|t| t.eq_ignore_ascii_case("inset"));
+        if tokens.iter().any(|t| t.eq_ignore_ascii_case("inset")) != inset {
+            continue;
+        }
         let color = tokens
             .iter()
             .find_map(|token| PaintColor::parse_css(token))
@@ -6822,6 +6868,46 @@ mod tests {
             "the first fragment continues on the next line"
         );
         assert!(red(30..60) > 50, "the last fragment ends the box");
+    }
+
+    #[test]
+    fn inner_shadows_paint_inside_the_padding_box_above_the_background() {
+        // CSS Backgrounds 3 #shadow-shape: an inner shadow is cast as if
+        // everything outside the padding edge were opaque, is drawn inside
+        // the padding edge only, and a spread contracts its perimeter.
+        // #shadow-layers draws it immediately above the background, below
+        // the borders. Expected pixels were measured in Gecko and Blink.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} div{width:100px;height:100px;margin-bottom:10px}\
+             .s{background:#c7b6ce;box-shadow:inset 0 10px 0 0 #b99077}</style>\
+             <div class=s></div><div class=s style='border-radius:20px'></div>\
+             <div style='box-shadow:inset 0 0 0 10px #000'></div>\
+             <div style='width:80px;height:80px;border:10px solid #0f0;box-shadow:inset 0 0 0 10px #000'></div>\
+             <div style='box-shadow:inset 0 10px 10px #000'></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| frame.pixels[(y * 800 + x) * 4..][..3].to_vec();
+        for top in [0, 110] {
+            assert_eq!(
+                pixel(50, top + 5),
+                [185, 144, 119],
+                "shadow over the background"
+            );
+            assert_eq!(pixel(50, top + 15), [199, 182, 206], "background below it");
+        }
+        assert_eq!(pixel(5, 270), [0, 0, 0], "spread inside the padding edge");
+        assert_eq!(pixel(50, 225), [0, 0, 0]);
+        assert_eq!(pixel(50, 270), [255, 255, 255]);
+        assert_eq!(pixel(5, 380), [0, 255, 0], "the border stays on top");
+        assert_eq!(pixel(15, 380), [0, 0, 0]);
+        assert_eq!(pixel(25, 380), [255, 255, 255]);
+        // Gecko and Blink: about 7, then 138 on the shifted edge, then white.
+        let blurred = [441, 450, 470].map(|y| pixel(50, y)[0]);
+        assert!(
+            blurred[0] < 40 && (100..170).contains(&blurred[1]) && blurred[2] > 250,
+            "a blurred shadow fades out below the top edge: {blurred:?}"
+        );
     }
 
     #[test]
