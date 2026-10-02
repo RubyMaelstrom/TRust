@@ -3796,7 +3796,9 @@ fn paint_inline_box_decorations(
             paint,
             clip: fragment.clip,
             kind: FragKind::Block,
-            children: Vec::new(),
+            children: text_clip_line(builder.dom, style, fragment, line, run.node)
+                .into_iter()
+                .collect(),
         };
         let mut radii = border_radii(builder.dom, style, rect);
         if !run.starts {
@@ -3853,6 +3855,67 @@ fn paint_inline_box_decorations(
         }
         builder.pop_scroll_ancestors(scroll_depth);
     }
+}
+
+/// CSS Backgrounds 4 #valdef-background-clip-text: a text-clipped background
+/// is masked by the text of the element and its in-flow descendants. For an
+/// inline box that is its pieces on this line, which `background_layer_shape`
+/// finds as a line child of the box's decoration fragment.
+fn text_clip_line(
+    dom: &Dom,
+    style: PaintStyle,
+    fragment: &Frag,
+    line: &super::flow::LineFrag,
+    node: super::inline::InlineBoxKey,
+) -> Option<Frag> {
+    let clips = style.value(dom, "background-clip")?;
+    if !split_top_level(&clips, ',')
+        .iter()
+        .any(|clip| clip.trim().eq_ignore_ascii_case("text"))
+    {
+        return None;
+    }
+    let pieces = line
+        .pieces
+        .iter()
+        .filter(|piece| {
+            piece
+                .boxes
+                .as_ref()
+                .is_some_and(|boxes| boxes.chain.contains(&node))
+        })
+        .cloned()
+        .collect();
+    Some(Frag {
+        flow: fragment.flow,
+        node: fragment.node,
+        x: fragment.x,
+        y: fragment.y,
+        w: fragment.w,
+        h: fragment.h,
+        border: [0.0; 4],
+        css_size: None,
+        content_size: None,
+        content_offset: [0.0; 2],
+        paint: Default::default(),
+        clip: fragment.clip,
+        kind: FragKind::Line(std::sync::Arc::new(super::flow::LineFrag {
+            sideways: line.sideways,
+            atom_boxes: Vec::new(),
+            band: line.band,
+            alignment_offset: line.alignment_offset,
+            justification: line.justification,
+            pieces,
+            contains_atomic_inline: false,
+            width: line.width,
+            height: line.height,
+            baseline: line.baseline,
+            ascent: line.ascent,
+            descent: line.descent,
+            forced: line.forced,
+        })),
+        children: Vec::new(),
+    })
 }
 
 /// CSS Backgrounds and Borders §6: background first, then border. A uniform
@@ -8337,6 +8400,41 @@ mod tests {
                 (0..40).any(|y| (0..190).any(|x| at(x, y) != [255, 255, 255])),
                 "glyph background must remain visible with transparent text"
             );
+        }
+    }
+
+    #[test]
+    fn text_clipped_inline_backgrounds_paint_their_glyphs() {
+        // CSS Backgrounds 4 #valdef-background-clip-text: the background is
+        // clipped to the text of the element and its in-flow descendants,
+        // inline boxes included. Gecko and Blink fill an inline logo's
+        // glyphs with its background; following text is not in the mask.
+        for background in ["background:red", "background:linear-gradient(red,red)"] {
+            let (_, layout) = render_fixture(&format!(
+                "<style>body{{margin:0;background:white}} p{{margin:0;font:40px/50px monospace}}\
+                 #t{{{background};background-clip:text;color:transparent}} i{{color:transparent}}\
+                 </style><p><span id=t>HH<b>HH</b></span><i>HHHH</i></p>"
+            ));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let red = |columns: std::ops::Range<usize>| {
+                (0..50)
+                    .flat_map(|y| columns.clone().map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        let pixel = &frame.pixels[(y * 800 + x) * 4..][..3];
+                        pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60
+                    })
+                    .count()
+            };
+            let own = red(0..48);
+            assert!(own > 100, "{background}: the box's own glyphs ({own})");
+            assert!(
+                own < 48 * 50 / 2,
+                "{background}: glyphs, not a rectangle ({own})"
+            );
+            assert!(red(48..96) > 100, "{background}: a descendant's glyphs");
+            assert_eq!(red(100..200), 0, "{background}: text after the box");
         }
     }
 
