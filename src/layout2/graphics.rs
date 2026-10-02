@@ -3718,7 +3718,32 @@ fn paint_inline_box_decorations(
             .flatten()
             .is_some_and(|clip| builder.push_hard_clip(clip));
         let shape = rounded_shape(rect, radii);
-        paint_box_shadows(builder.dom, style, &shape, builder);
+        if run.starts && run.ends {
+            paint_box_shadows(builder.dom, style, &shape, builder);
+        } else {
+            // #box-decoration-break `slice`: shadows belong to the unbroken
+            // box, so a fragment casts none from the edges where it is cut.
+            const REACH: f32 = 1.0e5;
+            let left = if run.starts { rect.x } else { rect.x - REACH };
+            let right = rect.x + rect.width + if run.ends { 0.0 } else { REACH };
+            let unbroken = CssRect::new(left, rect.y, right - left, rect.height);
+            let clip_left = if run.starts { left - REACH } else { rect.x };
+            let clip_right = if run.ends {
+                right + REACH
+            } else {
+                rect.x + rect.width
+            };
+            let pushed = builder.push_hard_clip(CssRect::new(
+                clip_left,
+                rect.y - REACH,
+                clip_right - clip_left,
+                rect.height + 2.0 * REACH,
+            ));
+            paint_box_shadows(builder.dom, style, &rounded_shape(unbroken, radii), builder);
+            if pushed {
+                builder.pop_hard_clip();
+            }
+        }
         let isolated = begin_background_isolation(builder, style);
         if let Some(color) = background_color_for_style(builder.dom, style)
             && !color.is_transparent()
@@ -5605,6 +5630,50 @@ mod tests {
             "italic: {}",
             lean("font-style:italic")
         );
+    }
+
+    #[test]
+    fn outer_shadows_are_not_drawn_inside_the_box() {
+        // CSS Backgrounds 3 #shadow-shape: an outer box-shadow is clipped
+        // inside the border box, so a transparent box shows what is behind it.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} div{margin:20px;width:100px;height:50px;\
+             border-radius:8px;box-shadow:6px 6px 4px 10px rgb(255,0,0)}</style><div></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| &frame.pixels[(y * 800 + x) * 4..(y * 800 + x) * 4 + 3];
+        assert_eq!(pixel(70, 45), [255, 255, 255], "inside the box");
+        assert_eq!(pixel(125, 45)[..2], [255, 0], "the shadow outside it");
+    }
+
+    #[test]
+    fn a_wrapped_inline_box_casts_no_shadow_from_its_cut_edges() {
+        // CSS Backgrounds 3 #box-decoration-break `slice`: the shadow is that
+        // of the unbroken box, so the first line's fragment, which the box
+        // continues past, casts none from its end edge.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} p{margin:0;width:200px;font:20px/30px monospace}\
+             span{box-shadow:6px 0 0 rgb(255,0,0)}</style><p><span>aaaa bbbb cccc dddd eeee</span></p>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let red = |rows: std::ops::Range<usize>| {
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| rows.contains(&(i / 800)) && p[..3] == [255, 0, 0])
+                .count()
+        };
+        assert_eq!(
+            red(0..30),
+            0,
+            "the first fragment continues on the next line"
+        );
+        assert!(red(30..60) > 50, "the last fragment ends the box");
     }
 
     #[test]
