@@ -6754,7 +6754,8 @@ mod tests {
             }) => (center.x, center.y, start_radius, radius, aspect),
             other => panic!("{value}: {other:?}"),
         };
-        let close = |(a, b): ((f32, f32, f32, f32, f32), (f32, f32, f32, f32, f32))| {
+        type Radial = (f32, f32, f32, f32, f32);
+        let close = |(a, b): (Radial, Radial)| {
             let (a, b) = ([a.0, a.1, a.2, a.3, a.4], [b.0, b.1, b.2, b.3, b.4]);
             assert!(
                 a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1.0e-3),

@@ -1195,9 +1195,18 @@ fn interpolate_transform_steps(from: &[TransformStep], to: &[TransformStep], t: 
     interpolate_matrices(compose(&from), compose(&to), t)
 }
 
-/// CSS Transforms 1 #decomposing-a-2d-matrix: translation, scale, angle
-/// (radians) and the remaining 2x2 matrix, or `None` when singular.
-fn decompose_2d(matrix: Affine2d) -> Option<([f32; 2], [f32; 2], f32, [f32; 4])> {
+/// A 2D matrix decomposed by CSS Transforms 1 #decomposing-a-2d-matrix.
+struct Decomposed2d {
+    translate: [f32; 2],
+    scale: [f32; 2],
+    /// Radians.
+    angle: f32,
+    /// The remaining 2x2 matrix.
+    matrix: [f32; 4],
+}
+
+/// CSS Transforms 1 #decomposing-a-2d-matrix, or `None` when singular.
+fn decompose_2d(matrix: Affine2d) -> Option<Decomposed2d> {
     let [mut r0x, mut r0y, mut r1x, mut r1y, tx, ty] = matrix.0;
     let determinant = r0x * r1y - r0y * r1x;
     if !determinant.is_finite() || determinant.abs() < 1.0e-8 {
@@ -1228,7 +1237,12 @@ fn decompose_2d(matrix: Affine2d) -> Option<([f32; 2], [f32; 2], f32, [f32; 4])>
         r1x = -sn * m11 + cs * m21;
         r1y = -sn * m12 + cs * m22;
     }
-    Some(([tx, ty], scale, angle, [r0x, r0y, r1x, r1y]))
+    Some(Decomposed2d {
+        translate: [tx, ty],
+        scale,
+        angle,
+        matrix: [r0x, r0y, r1x, r1y],
+    })
 }
 
 /// #interpolation-of-decomposed-2d-matrix-values and
@@ -1237,8 +1251,18 @@ fn interpolate_matrices(from: Affine2d, to: Affine2d, t: f32) -> Affine2d {
     let (Some(a), Some(b)) = (decompose_2d(from), decompose_2d(to)) else {
         return if t < 0.5 { from } else { to };
     };
-    let (translate_a, mut scale_a, mut angle_a, m_a) = a;
-    let (translate_b, scale_b, mut angle_b, m_b) = b;
+    let Decomposed2d {
+        translate: translate_a,
+        scale: mut scale_a,
+        angle: mut angle_a,
+        matrix: m_a,
+    } = a;
+    let Decomposed2d {
+        translate: translate_b,
+        scale: scale_b,
+        angle: mut angle_b,
+        matrix: m_b,
+    } = b;
     use std::f32::consts::PI;
     if (scale_a[0] < 0. && scale_b[1] < 0.) || (scale_a[1] < 0. && scale_b[0] < 0.) {
         scale_a = [-scale_a[0], -scale_a[1]];
