@@ -169,6 +169,40 @@ impl Dom {
         {
             hint("color", color);
         }
+        // HTML Rendering #frames-and-framesets: a frameset is as large as the
+        // viewport (or the cell of its parent frameset) and splits itself
+        // into a grid by its cols and rows dimension lists, absolute, percent
+        // and relative (`*`) entries becoming px, % and fr tracks. Frames
+        // and nested framesets fill their rectangles.
+        if tag == "frameset" {
+            for (attribute, property) in [
+                ("cols", "grid-template-columns"),
+                ("rows", "grid-template-rows"),
+            ] {
+                let tracks = self.attr(id, attribute).map(frameset_tracks);
+                hint(
+                    property,
+                    tracks
+                        .filter(|tracks| !tracks.is_empty())
+                        .unwrap_or_else(|| "1fr".into()),
+                );
+            }
+        }
+        if matches!(tag, "frameset" | "frame") {
+            let nested = self
+                .node(id)
+                .parent
+                .is_some_and(|parent| self.tag_name(parent) == Some("frameset"));
+            hint("width", "100%".into());
+            hint("height", if nested { "100%" } else { "100vh" }.into());
+            hint("min-width", "0".into());
+            hint("min-height", "0".into());
+            if tag == "frame" {
+                for side in ["top", "right", "bottom", "left"] {
+                    hint(border_property(side, "width"), "0".into());
+                }
+            }
+        }
         // HTML Rendering #the-hr-element-2.
         if tag == "hr" {
             match self
@@ -291,6 +325,29 @@ fn dimension_value(input: &str) -> Option<String> {
         "px"
     };
     Some(format!("{value}{unit}"))
+}
+
+/// HTML #rules-for-parsing-a-list-of-dimensions, as grid tracks: a number
+/// with `%` is a percentage, with `*` a relative share (an empty or zero
+/// share counts as one), and otherwise an absolute length in CSS pixels.
+fn frameset_tracks(value: &str) -> String {
+    let mut tracks = Vec::new();
+    for entry in value.trim_end_matches(',').split(',') {
+        let entry = entry.trim();
+        let digits = entry
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(entry.len());
+        let number = entry[..digits].parse::<f64>().unwrap_or(0.0);
+        let rest = entry[digits..].trim_start();
+        tracks.push(if rest.starts_with('%') {
+            format!("{number}%")
+        } else if rest.starts_with('*') {
+            format!("{}fr", if number == 0.0 { 1.0 } else { number })
+        } else {
+            format!("{number}px")
+        });
+    }
+    tracks.join(" ")
 }
 
 /// HTML #rules-for-parsing-non-negative-integers.

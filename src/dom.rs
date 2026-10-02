@@ -11888,7 +11888,11 @@ fn ua_display(tag: &str) -> &'static str {
             "inline-block"
         }
         "head" | "title" | "meta" | "link" | "style" | "script" | "base" | "noscript"
-        | "template" | "source" | "track" | "datalist" => "none",
+        | "template" | "source" | "track" | "datalist" | "noframes" => "none",
+        // HTML Rendering #frames-and-framesets: a frameset's cols/rows grid
+        // (see `html_presentational_hints`); its frames fill their cells.
+        "frameset" => "grid",
+        "frame" => "block",
         _ => "inline",
     }
 }
