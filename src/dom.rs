@@ -7718,11 +7718,25 @@ impl Dom {
     /// Serialize a subtree to HTML (for the app to re-parse and lay
     /// out). `<script>` has done its job by now and `<noscript>` means
     /// "JS didn't run" — when this serializer is called, it did — so both
-    /// are dropped, as are doctypes and `<template>` (inert by
+    /// are dropped, as are the source doctypes and `<template>` (inert by
     /// definition). The cascaded `display` is baked onto each element so
     /// the re-parsed layout arena flows it the way the engine computed.
+    ///
+    /// A whole document starts with a doctype that makes the re-parse
+    /// enter the same document mode (HTML #the-initial-insertion-mode):
+    /// without one every relayout would run in quirks mode.
     pub fn serialize(&self, root: NodeId) -> String {
         let mut out = String::new();
+        if root == DOCUMENT {
+            out.push_str(match self.document_mode(DOCUMENT) {
+                QuirksMode::NoQuirks => "<!DOCTYPE html>",
+                QuirksMode::LimitedQuirks => {
+                    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \
+                     \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">"
+                }
+                QuirksMode::Quirks => "",
+            });
+        }
         self.serialize_node_inner(root, None, false, &mut out);
         out
     }
@@ -18536,6 +18550,23 @@ mod tests {
         );
         let p = dom.get_by_id("p").unwrap();
         assert_eq!(dom.computed_value(p, "color").as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn presentation_serialization_keeps_the_document_mode() {
+        for (doctype, mode) in [
+            ("<!DOCTYPE html>", QuirksMode::NoQuirks),
+            (
+                r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">"#,
+                QuirksMode::LimitedQuirks,
+            ),
+            ("", QuirksMode::Quirks),
+        ] {
+            let dom = Dom::parse_document(&format!("{doctype}<p class=A>x"));
+            assert_eq!(dom.document_mode(DOCUMENT), mode);
+            let reparsed = Dom::parse_document(&dom.serialize(DOCUMENT));
+            assert_eq!(reparsed.document_mode(DOCUMENT), mode, "{doctype}");
+        }
     }
 
     #[test]
