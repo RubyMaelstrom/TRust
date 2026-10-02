@@ -365,6 +365,39 @@ pub(crate) fn parse_ratio(value: &str) -> Option<f32> {
     (ratio.is_finite() && ratio > 0.0).then_some(ratio)
 }
 
+enum HtmlDimension {
+    Pixels(f32),
+    Percentage(f32),
+}
+
+/// HTML #rules-for-parsing-dimension-values: leading whitespace, digits with
+/// an optional fraction, then `%` for a percentage; anything after is
+/// ignored.
+fn html_dimension(input: &str) -> Option<HtmlDimension> {
+    let input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let digits = input
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(input.len());
+    let number = &input[..digits];
+    let number = match number.find('.') {
+        // A second '.' ends the number.
+        Some(dot) => match number[dot + 1..].find('.') {
+            Some(second) => &number[..dot + 1 + second],
+            None => number,
+        },
+        None => number,
+    };
+    if !number.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = number.trim_end_matches('.').parse::<f32>().ok()?;
+    Some(if input[number.len()..].starts_with('%') {
+        HtmlDimension::Percentage(value)
+    } else {
+        HtmlDimension::Pixels(value)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,37 +529,4 @@ mod tests {
         assert_eq!(parse_ratio("auto"), None);
         assert_eq!(parse_ratio("0/5"), None);
     }
-}
-
-enum HtmlDimension {
-    Pixels(f32),
-    Percentage(f32),
-}
-
-/// HTML #rules-for-parsing-dimension-values: leading whitespace, digits with
-/// an optional fraction, then `%` for a percentage; anything after is
-/// ignored.
-fn html_dimension(input: &str) -> Option<HtmlDimension> {
-    let input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let digits = input
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(input.len());
-    let number = &input[..digits];
-    let number = match number.find('.') {
-        // A second '.' ends the number.
-        Some(dot) => match number[dot + 1..].find('.') {
-            Some(second) => &number[..dot + 1 + second],
-            None => number,
-        },
-        None => number,
-    };
-    if !number.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    let value = number.trim_end_matches('.').parse::<f32>().ok()?;
-    Some(if input[number.len()..].starts_with('%') {
-        HtmlDimension::Percentage(value)
-    } else {
-        HtmlDimension::Pixels(value)
-    })
 }

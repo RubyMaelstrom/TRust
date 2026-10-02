@@ -3682,7 +3682,7 @@ fn paint_inline_box_decorations(
         let mut paint = fragment.paint.clone();
         paint.pseudo = pseudo.map(|which| (node, which));
         let decoration = Frag {
-            flow: fragment.flow.clone(),
+            flow: fragment.flow,
             node,
             x: rect.x,
             y: rect.y,
@@ -4309,16 +4309,16 @@ fn legacy_srgb(color: &color::DynamicColor) -> bool {
     }
 }
 
+/// Color stops and their color hints: (index of the stop a hint precedes,
+/// its position).
+type StopsAndHints = (Vec<GradientStop>, Vec<(usize, f32)>);
+
 /// CSS Images 3 #color-stop-syntax and #color-stop-fixup: parse color stops
 /// (with zero, one or two `<length-percentage>` positions, lengths taken
 /// along the `line`) and color hints, then default the first and last
 /// positions, make positions non-decreasing and space unpositioned stops
 /// evenly. Hints are returned as (index of the stop they precede, position).
-fn parse_stops(
-    parts: &[&str],
-    line: f32,
-    lengths: LengthBasis,
-) -> Option<(Vec<GradientStop>, Vec<(usize, f32)>)> {
+fn parse_stops(parts: &[&str], line: f32, lengths: LengthBasis) -> Option<StopsAndHints> {
     let position = |token: &str| {
         let px = lengths.resolve(token, line)?;
         Some(if line > 0.0 { px / line } else { 0.0 })
@@ -4435,7 +4435,7 @@ fn expand_color_hints(
                 }
             }
         }
-        out.push(stop.clone());
+        out.push(*stop);
     }
     out
 }
