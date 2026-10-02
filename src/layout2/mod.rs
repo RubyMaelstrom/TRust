@@ -4504,6 +4504,23 @@ mod tests {
     }
 
     #[test]
+    fn a_table_height_is_a_minimum() {
+        // CSS 2 §17.5.3: a table's 'height' is treated as a minimum; rows
+        // and captions that need more make it taller (Gecko and Blink: 319
+        // and 300), and the content below starts after them.
+        let html = r#"<!doctype html><body style="margin:0">
+            <table id=a height=100 cellspacing=0 cellpadding=0><tr><td>x</td></tr><tr><td><div style="height:300px;width:20px"></div></td></tr></table>
+            <table id=b style="height:100px" cellspacing=0 cellpadding=0><tr><td><div style="height:300px;width:20px"></div></td></tr></table>
+            <div id=after>after</div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!(rect("a").height > 300.0, "{}", rect("a").height);
+        assert_eq!(rect("b").height, 300.0);
+        assert_eq!(rect("after").top, rect("b").top + 300.0);
+    }
+
+    #[test]
     fn a_nested_table_contributes_at_least_its_minimum_width() {
         // CSS 2 §17.5.2.2 / CSS Tables 3: a table's used width is the
         // larger of its declared width (CSS or HTML attribute) and its
