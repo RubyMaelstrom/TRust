@@ -3814,6 +3814,51 @@ mod tests {
     }
 
     #[test]
+    fn long_control_values_do_not_widen_shrink_to_fit_ancestors() {
+        // CSS Sizing 3 #intrinsic-sizes: an auto-width text control keeps its
+        // cols-based width as its min-content contribution (only the sizing
+        // keywords are value-based), so a long textarea value cannot push a
+        // 1fr grid column past the container. #min-content-zero still lets a
+        // percentage-width control compress.
+        let html = |value: &str| {
+            format!(
+                r#"<body style="margin:0"><div style="display:grid;grid-template-columns:1fr 250px;width:600px">
+                <div id=main style="display:flex"><div style="flex:1"><span id=wrap style="display:inline-block">
+                <textarea readonly rows=2 cols=20 style="display:block">{value}</textarea></span></div></div>
+                <div id=side>side</div></div>
+                <div style="display:flex;width:100px"><div id=group style="display:flex">
+                <input id=pct style="width:100%;min-width:0"></div></div></body>"#
+            )
+        };
+        let short = Dom::parse_document(&html("short"));
+        let long_value = "&lt;a href=\"ginder.neocities.org\"&gt;&lt;img src=\"button link, please don't hotlink\" alt=\"Ginder Button\"&gt;&lt;/a&gt;";
+        let long = Dom::parse_document(&html(long_value));
+        let base = Url::parse("http://e.com/").unwrap();
+        let lay = |dom: &Dom| {
+            let (forms, controls) = crate::http::extract_forms_arena(dom, &base, None);
+            lay_out_graphical(
+                dom,
+                &base,
+                Viewport::new(800.0, 600.0),
+                &forms,
+                &controls,
+                &HashMap::new(),
+            )
+        };
+        let (short_layout, long_layout) = (lay(&short), lay(&long));
+        let width = |dom: &Dom, layout: &GraphicalLayout, id: &str| {
+            layout.boxes[&dom.get_by_id(id).unwrap()].width
+        };
+        assert!(
+            (width(&long, &long_layout, "wrap") - width(&short, &short_layout, "wrap")).abs()
+                < 0.01
+        );
+        assert!((width(&long, &long_layout, "main") - 350.0).abs() < 0.01);
+        assert!((width(&long, &long_layout, "side") - 250.0).abs() < 0.01);
+        assert!(width(&long, &long_layout, "group") <= 100.0);
+    }
+
+    #[test]
     fn grid_items_and_rows_honor_min_heights() {
         // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
         // §12.1/§11.8: an auto row stretches into the container's definite
