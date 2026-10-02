@@ -17,7 +17,7 @@
 use url::Url;
 
 use crate::doc::{Form, Link};
-use crate::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::layout2::{Emphasis, ImageSizes, ItemKind, NO_NODE, is_collapsible_space};
 
 use super::float::{FloatBox, FloatCtx, FloatPlace};
@@ -107,14 +107,18 @@ pub(crate) struct Piece {
 #[derive(Clone, Debug)]
 pub(crate) struct InlineBoxes {
     /// Enclosing decorated inline boxes, outermost first.
-    pub chain: std::sync::Arc<[NodeId]>,
+    pub chain: std::sync::Arc<[InlineBoxKey]>,
     /// Boxes beginning before this piece: (box, distance from the box's
     /// border-box start edge to the piece).
-    pub opens: Vec<(NodeId, f32)>,
+    pub opens: Vec<(InlineBoxKey, f32)>,
     /// Boxes ending after this piece: (box, distance from the piece's end to
     /// the box's border-box end edge).
-    pub closes: Vec<(NodeId, f32)>,
+    pub closes: Vec<(InlineBoxKey, f32)>,
 }
+
+/// A decorated inline box: an element's own, or one of the generated
+/// (`::before`/`::after`/`::first-letter`) boxes of an originating element.
+pub(crate) type InlineBoxKey = (NodeId, Option<PseudoEl>);
 
 /// Frontend-neutral inline paint and interaction payload. Canonical fragments
 /// never carry the terminal `Item`'s cell coordinates or dimensions; the
@@ -352,11 +356,11 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     pending_gap_px: f32,
     /// The decorated inline boxes currently open, outermost first, shared
     /// by the pieces placed inside them.
-    box_stack: Vec<NodeId>,
-    box_chain: Option<std::sync::Arc<[NodeId]>>,
+    box_stack: Vec<InlineBoxKey>,
+    box_chain: Option<std::sync::Arc<[InlineBoxKey]>>,
     /// Opened boxes awaiting their first piece: (box, the offset of the
     /// box's border-box start edge within `pending_gap_px`).
-    pending_opens: Vec<(NodeId, f32)>,
+    pending_opens: Vec<(InlineBoxKey, f32)>,
     // ---- floats (§9.5) — inert when `fc` is None ----
     /// The BFC's float context: queried per line (`band`) and appended to when
     /// an inline float is met (`place`). `None` = no floats (intrinsic probe,
@@ -677,21 +681,25 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 if *node != crate::layout2::NO_NODE {
                     self.marks.push((*node, self.lines.len()));
                 }
-                let decorated = *node != crate::layout2::NO_NODE
-                    && !self.measuring
-                    && inline_box_decorated(self.dom, *node, style);
-                if decorated {
+                let key = if *node == crate::layout2::NO_NODE {
+                    style.pseudo.map(|(origin, which)| (origin, Some(which)))
+                } else {
+                    Some((*node, None))
+                };
+                let decorated = key
+                    .filter(|&key| !self.measuring && inline_box_decorated(self.dom, key, style));
+                if let Some(key) = decorated {
                     self.pending_opens
-                        .push((*node, self.pending_gap_px + self.margin_px(style, LEFT)));
-                    self.box_stack.push(*node);
+                        .push((key, self.pending_gap_px + self.margin_px(style, LEFT)));
+                    self.box_stack.push(key);
                     self.box_chain = Some(self.box_stack.as_slice().into());
                 }
                 self.pending_gap_px += self.edge_px(style, LEFT);
                 for k in kids.iter() {
                     self.walk(k, &inner);
                 }
-                if decorated {
-                    self.close_box(*node, style);
+                if let Some(key) = decorated {
+                    self.close_box(key, style);
                 }
                 self.pending_gap_px += self.edge_px(style, RIGHT);
             }
@@ -1843,7 +1851,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Close a decorated inline box: its end edge follows the last piece
     /// placed inside it, past any edges owed since. A box that received no
     /// piece has no line fragment.
-    fn close_box(&mut self, node: NodeId, style: &BoxStyle) {
+    fn close_box(&mut self, node: InlineBoxKey, style: &BoxStyle) {
         self.pending_opens.retain(|&(open, _)| open != node);
         let end = self.pending_gap_px
             + style.border[RIGHT]
@@ -2455,19 +2463,18 @@ pub(crate) enum ControlWidthBasis {
 }
 
 /// Whether a non-replaced inline box paints a background, border or shadow.
-fn inline_box_decorated(dom: &Dom, node: NodeId, style: &BoxStyle) -> bool {
+fn inline_box_decorated(dom: &Dom, (node, pseudo): InlineBoxKey, style: &BoxStyle) -> bool {
+    let value = |property: &str| match pseudo {
+        None => dom.computed_value_resolved(node, property),
+        Some(which) => dom.pseudo_layout_value(node, which, property),
+    };
     style.border.iter().any(|width| *width > 0.0)
-        || dom
-            .computed_value_resolved(node, "background-color")
+        || value("background-color")
             .as_deref()
             .and_then(crate::render::PaintColor::parse_css)
             .is_some_and(|color| !color.is_transparent())
-        || dom
-            .computed_value_resolved(node, "background-image")
-            .is_some_and(|image| !image.trim().eq_ignore_ascii_case("none"))
-        || dom
-            .computed_value_resolved(node, "box-shadow")
-            .is_some_and(|shadow| !shadow.trim().eq_ignore_ascii_case("none"))
+        || value("background-image").is_some_and(|image| !image.trim().eq_ignore_ascii_case("none"))
+        || value("box-shadow").is_some_and(|shadow| !shadow.trim().eq_ignore_ascii_case("none"))
 }
 
 #[cfg(test)]
