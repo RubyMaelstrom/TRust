@@ -2013,18 +2013,25 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                             builder.push_marquee_content(node, DisplayCommand::PopClip);
                         }
                     }
-                    if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    let mut rect =
+                        CssRect::new(origin.x, origin.y, shaped.advance, shaped.line_height);
+                    // CSS Overflow 3 #overflow-control: a control's text is
+                    // clipped to its content box (a textarea's to its
+                    // scrollport), so text drawn nowhere must not take the
+                    // clicks of the content beside or below the control.
+                    let clipped_away = piece_rect.is_some() && {
+                        rect = intersect_css_rects(clip, rect).unwrap_or(rect);
+                        rect.width <= 0.0 || rect.height <= 0.0
+                    };
+                    if !clipped_away
+                        && (style_node == NO_NODE || builder.dom.point_hit_testable(style_node))
+                    {
                         builder.has_media_controls |=
                             matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
                         builder.push_marquee_content(
                             node,
                             DisplayCommand::HitRegion(HitRegion {
-                                rect: CssRect::new(
-                                    origin.x,
-                                    origin.y,
-                                    shaped.advance,
-                                    shaped.line_height,
-                                ),
+                                rect,
                                 node,
                                 actor: interaction_actor(builder.dom, node),
                                 link: piece.item.link.clone(),
