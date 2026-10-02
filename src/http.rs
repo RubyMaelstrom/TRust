@@ -5236,6 +5236,7 @@ async fn execute_js_with_presentation(
 
     // The parser, module loader, and page fetches share this resource cache.
     let cache = std::sync::Arc::new(PageCache::default());
+    let prefetched = prefetched_sheets.is_some();
     let mut sheets = prefetched_sheets.unwrap_or_default();
     let mut resource_timings = Vec::new();
     for (job, resolved, details) in results {
@@ -5299,6 +5300,9 @@ async fn execute_js_with_presentation(
                 }
             }
         }
+    }
+    if !prefetched {
+        sheets.extend(fetch_inline_style_imports(&html, &response.url).await);
     }
     install_stylesheet_fonts(&html, &sheets, &response.url).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
@@ -5422,9 +5426,47 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
     .await;
 }
 
+/// The sheets-list key prefix for a stylesheet imported by an inline
+/// `<style>` element, followed by the import's absolute URL. Such entries
+/// travel with the page's fetched sheets; the DOM splices them into the
+/// importing `<style>` (`splice_inline_imports`).
+pub(crate) const INLINE_IMPORT_KEY: &str = "\u{0}inline-import:";
+
+/// CSS Cascade 5 §2.2 for an inline `<style>`: replace each `@import` by the
+/// fetched sheet for its URL (resolved against `base`), under the import's
+/// conditions; an import that was not fetched contributes no rules. `None`
+/// when the sheet has no imports.
+pub(crate) fn splice_inline_imports<'a>(
+    css: &str,
+    base: Option<&Url>,
+    imported: impl Fn(&str) -> Option<&'a String>,
+) -> Option<String> {
+    let imports = stylesheet_imports(css);
+    if imports.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut cursor = 0usize;
+    for import in imports {
+        out.push_str(&css[cursor..import.start]);
+        cursor = import.end;
+        let url = match base {
+            Some(base) => base.join(&import.url).ok(),
+            None => Url::parse(&import.url).ok(),
+        };
+        if let Some(sheet) = url.and_then(|url| imported(url.as_str())) {
+            out.push_str(&wrap_import_condition(sheet.clone(), &import.condition));
+        }
+    }
+    out.push_str(&css[cursor..]);
+    Some(out)
+}
+
 /// Fetch every external stylesheet a page declares concurrently, returning
-/// `(href, css)` in document order. The request pool bounds simultaneous I/O;
-/// no arbitrary declaration-count cutoff is applied to the cascade.
+/// `(href, css)` in document order, followed by the sheets that inline
+/// `<style>` elements `@import` (keyed by `INLINE_IMPORT_KEY` and URL). The
+/// request pool bounds simultaneous I/O; no arbitrary declaration-count
+/// cutoff is applied to the cascade.
 async fn fetch_page_sheets(html: &str, page_url: &Url) -> Vec<(String, String)> {
     let base = base_with_doc_base(html, page_url);
     let jobs = crate::js::external_resources(html)
@@ -5467,16 +5509,70 @@ async fn fetch_page_sheets(html: &str, page_url: &Url) -> Vec<(String, String)> 
         ))
     })
     .collect::<Vec<_>>();
-    futures::stream::iter(fetched.into_iter().map(|(raw, url, css)| {
+    let mut sheets: Vec<(String, String)> =
+        futures::stream::iter(fetched.into_iter().map(|(raw, url, css)| {
+            let page_url = page_url.clone();
+            async move {
+                let expanded = expand_stylesheet_imports(css, url, page_url, Vec::new()).await;
+                (raw, expanded)
+            }
+        }))
+        .buffered(PREFETCH_CONCURRENCY)
+        .collect()
+        .await;
+    sheets.extend(fetch_inline_style_imports(html, page_url).await);
+    sheets
+}
+
+/// Fetch the sheets that a document's inline `<style>` elements `@import`,
+/// keyed for the sheets list by `INLINE_IMPORT_KEY` and absolute URL.
+async fn fetch_inline_style_imports(html: &str, page_url: &Url) -> Vec<(String, String)> {
+    let base = base_with_doc_base(html, page_url);
+    let urls = inline_style_import_urls(html, &base, page_url);
+    futures::stream::iter(urls.into_iter().map(|url| {
         let page_url = page_url.clone();
         async move {
-            let expanded = expand_stylesheet_imports(css, url, page_url, Vec::new()).await;
-            (raw, expanded)
+            let response = fetch(&Request::subresource(url.clone(), &page_url, "style", None))
+                .await
+                .ok()
+                .and_then(StylesheetResponseExt::filter_stylesheet)?;
+            let css = decode_body(&response.content_type, &response.body);
+            let key = format!("{INLINE_IMPORT_KEY}{url}");
+            Some((
+                key,
+                expand_stylesheet_imports(css, url, page_url, Vec::new()).await,
+            ))
         }
     }))
     .buffered(PREFETCH_CONCURRENCY)
-    .collect()
+    .collect::<Vec<_>>()
     .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The distinct `@import` URLs of a document's inline `<style>` sheets,
+/// resolved against the document base, in document order.
+fn inline_style_import_urls(html: &str, base: &Url, page_url: &Url) -> Vec<Url> {
+    if !html.to_ascii_lowercase().contains("@import") {
+        return Vec::new();
+    }
+    let mut urls: Vec<Url> = Vec::new();
+    for css in crate::dom::Dom::parse_document(html).inline_stylesheets() {
+        for import in stylesheet_imports(&css) {
+            if let Some(url) = base
+                .join(&import.url)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
+                .filter(|url| subresource_allowed(page_url, url))
+                && !urls.contains(&url)
+            {
+                urls.push(url);
+            }
+        }
+    }
+    urls
 }
 
 trait StylesheetResponseExt {
@@ -8242,6 +8338,44 @@ mod tests {
             resolve(&base, "file:///tmp/other.html#section"),
             Link::Http(url) if url.scheme() == "file" && url.fragment() == Some("section")
         ));
+    }
+
+    #[tokio::test]
+    async fn inline_style_imports_are_fetched_with_the_page_sheets() {
+        // CSS Cascade 5 §2.2: an inline <style>'s @import is fetched against
+        // the document base, its own imports expanded and URLs absolutized.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("css")).unwrap();
+        std::fs::write(
+            dir.path().join("css/fonts.css"),
+            "@import 'nested.css'; @font-face{font-family:F;src:url(f.ttf)}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("css/nested.css"), ".nested{color:red}").unwrap();
+        let page = Url::from_file_path(dir.path().join("index.html")).unwrap();
+        let sheets = fetch_page_sheets(
+            r#"<base href="css/"><style>@import url("fonts.css"); p{color:blue}</style>
+            <style>@IMPORT 'fonts.css';</style>"#,
+            &page,
+        )
+        .await;
+        let url = page.join("css/fonts.css").unwrap();
+        assert_eq!(sheets.len(), 1, "one fetch per distinct import");
+        assert_eq!(sheets[0].0, format!("{INLINE_IMPORT_KEY}{url}"));
+        assert!(sheets[0].1.contains(".nested"));
+        assert!(
+            sheets[0]
+                .1
+                .contains(page.join("css/f.ttf").unwrap().as_str())
+        );
+        let spliced = splice_inline_imports(
+            r#"@import url("fonts.css") screen; p{color:blue}"#,
+            Some(&page.join("css/").unwrap()),
+            |key| (key == url.as_str()).then_some(&sheets[0].1),
+        )
+        .unwrap();
+        assert!(spliced.starts_with("@media screen{"));
+        assert!(spliced.ends_with(" p{color:blue}"));
     }
 
     #[tokio::test]
