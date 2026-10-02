@@ -3843,7 +3843,7 @@ impl Dom {
             .into_iter()
             .enumerate()
             .filter_map(|(i, n)| {
-                let n = n.filter(|n| !n.is_empty() && n != "none")?;
+                let n = n.filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("none"))?;
                 let fill = if fills.is_empty() {
                     None
                 } else {
@@ -14521,7 +14521,12 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
         || k.starts_with("grid-")
         || matches!(
             k.as_str(),
-            "content"
+            // CSS Animations 1 #animation-name: <keyframes-name> is a
+            // case-sensitive <custom-ident> (or string); the animation
+            // parsers fold the shorthand's keywords themselves.
+            "animation"
+                | "animation-name"
+                | "content"
                 | "anchor-name"
                 | "container"
                 | "container-name"
@@ -21910,6 +21915,39 @@ mod tests {
             !dom.paint_suppressed(dom.get_by_id("l2").unwrap()),
             "longhand comma lists pair by index"
         );
+    }
+
+    #[test]
+    fn animation_names_keep_their_case() {
+        // CSS Animations 1 #animation-name: <keyframes-name> is a
+        // case-sensitive identifier, so `fadeOut` must find `@keyframes
+        // fadeOut` and not `@keyframes fadeout`.
+        let dom = Dom::parse_document(
+            "<style>@keyframes fadeOut{to{top:10px}}@keyframes fadeout{to{top:20px}}\
+             #a{animation:fadeOut 1s FORWARDS}#b{animation-name:fadeOut;animation-duration:1s}\
+             #c{animation:NONE}</style><div id=a></div><div id=b></div><div id=c></div>",
+        );
+        for id in ["a", "b"] {
+            let definitions = dom.css_animation_definitions(dom.get_by_id(id).unwrap());
+            assert_eq!(definitions.len(), 1, "{id}");
+            assert_eq!(definitions[0].name, "fadeOut");
+            assert_eq!(
+                definitions[0].keyframes[0].top.as_deref(),
+                Some("10px"),
+                "{id}"
+            );
+        }
+        assert_eq!(definitions_fill(&dom, "a"), "forwards");
+        assert!(
+            dom.css_animation_definitions(dom.get_by_id("c").unwrap())
+                .is_empty()
+        );
+    }
+
+    fn definitions_fill(dom: &Dom, id: &str) -> String {
+        dom.css_animation_definitions(dom.get_by_id(id).unwrap())[0]
+            .fill_mode
+            .clone()
     }
 
     #[test]
