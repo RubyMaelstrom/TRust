@@ -4935,16 +4935,20 @@ fn inline_block_baseline(dom: &Dom, fragment: &Frag) -> Option<f32> {
     if let FragKind::Line(line) = &fragment.kind {
         return Some(line.baseline);
     }
+    // CSS 2 §10.8.1 takes the last line box's baseline in normal flow: a
+    // relatively positioned descendant's offset is visual only (CSS
+    // Position 3 §3.4), so measure from where normal flow put it.
+    let flow_y = |child: &Frag| child.y - child.flow.offset_y - fragment.y;
     if let Some(line) = fragment
         .children
         .iter()
         .rev()
         .find(|child| matches!(child.kind, FragKind::Line(_)))
     {
-        return inline_block_baseline(dom, line).map(|baseline| line.y - fragment.y + baseline);
+        return inline_block_baseline(dom, line).map(|baseline| flow_y(line) + baseline);
     }
     fragment.children.iter().rev().find_map(|child| {
-        inline_block_baseline(dom, child).map(|baseline| child.y - fragment.y + baseline)
+        inline_block_baseline(dom, child).map(|baseline| flow_y(child) + baseline)
     })
 }
 
