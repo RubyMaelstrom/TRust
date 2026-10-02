@@ -5113,6 +5113,12 @@ impl Dom {
             // HTML Rendering #flow-content-3 and #phrasing-content-3.
             "white-space" if matches!(tag, "listing" | "plaintext" | "pre" | "xmp") => "pre",
             "white-space" if tag == "nobr" => "nowrap",
+            // HTML Rendering #form-controls: `textarea { white-space:
+            // pre-wrap }`. Gecko's and Blink's UA sheets also give it
+            // `overflow-wrap: break-word`, so an unbreakable word wraps
+            // inside the control instead of overflowing it.
+            "white-space" if tag == "textarea" => "pre-wrap",
+            "overflow-wrap" if tag == "textarea" => "break-word",
             // HTML Rendering #flow-content-3 and #phrasing-content-3; every
             // engine's UA stylesheet also makes textarea monospace.
             "font-family"
