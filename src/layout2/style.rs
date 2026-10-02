@@ -218,7 +218,7 @@ pub(crate) struct BoxStyle {
     /// CSS Compositing 1 #mix-blend-mode / #isolation: a non-normal blend
     /// mode or `isolation: isolate` forms a stacking context.
     pub compositing_group: bool,
-    pub color_filters: std::sync::Arc<[[f32; 20]]>,
+    pub filters: std::sync::Arc<[crate::render::CssFilter]>,
     pub filter_containing_block: bool,
     /// Used `opacity`, clamped to the CSS `<alpha-value>` range. Retaining the
     /// number (rather than the old terminal-only boolean) lets graphical paint
@@ -289,7 +289,7 @@ impl BoxStyle {
             has_transform: false,
             has_clip_path: false,
             compositing_group: false,
-            color_filters: Default::default(),
+            filters: Default::default(),
             filter_containing_block: false,
             opacity: 1.0,
             bg: false,
@@ -425,11 +425,7 @@ impl BoxStyle {
             has_transform,
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
-            color_filters: cv("filter")
-                .as_deref()
-                .and_then(super::filter::color_filters)
-                .unwrap_or_default()
-                .into(),
+            filters: filters_of(&cv, u, vp),
             filter_containing_block: !dom.is_document_element(id),
             opacity: dom.effective_opacity(id),
             bg: declares_background(dom, id),
@@ -594,11 +590,7 @@ impl BoxStyle {
                 .any(|prop| cv(prop).is_some_and(|value| !matches!(value.trim(), "" | "none"))),
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
             compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
-            color_filters: cv("filter")
-                .as_deref()
-                .and_then(super::filter::color_filters)
-                .unwrap_or_default()
-                .into(),
+            filters: filters_of(&cv, u, vp),
             filter_containing_block: true,
             opacity: cv("opacity")
                 .as_deref()
@@ -629,10 +621,30 @@ impl BoxStyle {
             || self.has_transform
             || self.has_clip_path
             || self.compositing_group
-            || !self.color_filters.is_empty()
+            || !self.filters.is_empty()
             || self.opacity < 1.0
             || (item && self.z_index.is_some())
     }
+}
+
+/// CSS Filter Effects 1 #FilterProperty, its lengths in px and its
+/// drop-shadow default color the element's color.
+fn filters_of(
+    cv: &dyn Fn(&str) -> Option<String>,
+    u: Units,
+    vp: Vp,
+) -> std::sync::Arc<[crate::render::CssFilter]> {
+    let Some(value) = cv("filter") else {
+        return Default::default();
+    };
+    let current = cv("color")
+        .as_deref()
+        .and_then(crate::render::PaintColor::parse_css)
+        .unwrap_or(crate::render::CANVAS_TEXT);
+    let length = |text: &str| Len::parse(text, u, vp)?.resolve(None);
+    super::filter::filters(&value, &length, current)
+        .unwrap_or_default()
+        .into()
 }
 
 fn compositing_group(blend: Option<String>, isolation: Option<String>) -> bool {

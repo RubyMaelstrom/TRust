@@ -2548,17 +2548,14 @@ fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
     let isolate = style
         .value(builder.dom, "isolation")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("isolate"));
-    if opacity < 1.0
-        || blend != BlendMode::Normal
-        || isolate
-        || !fragment.paint.color_filters.is_empty()
+    if opacity < 1.0 || blend != BlendMode::Normal || isolate || !fragment.paint.filters.is_empty()
     {
         builder
             .commands
             .push(DisplayCommand::PushLayer(CompositingLayer {
                 opacity,
                 blend,
-                color_filters: fragment.paint.color_filters.clone(),
+                filters: fragment.paint.filters.clone(),
             }));
         true
     } else {
@@ -2828,7 +2825,7 @@ fn paint_background_images_for_style(
                 .push(DisplayCommand::PushLayer(CompositingLayer {
                     opacity: 1.0,
                     blend,
-                    color_filters: std::sync::Arc::from([]),
+                    filters: std::sync::Arc::from([]),
                 }));
             blending = true;
         }
@@ -5187,7 +5184,7 @@ fn begin_background_isolation(builder: &mut Builder<'_>, style: PaintStyle) -> b
             .push(DisplayCommand::PushLayer(CompositingLayer {
                 opacity: 1.0,
                 blend: BlendMode::Normal,
-                color_filters: std::sync::Arc::from([]),
+                filters: std::sync::Arc::from([]),
             }));
     }
     blended

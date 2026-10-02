@@ -272,8 +272,24 @@ pub enum BlendMode {
 pub struct CompositingLayer {
     pub opacity: f32,
     pub blend: BlendMode,
-    /// Ordered straight-alpha sRGB color operations, before group opacity.
-    pub color_filters: Arc<[[f32; 20]]>,
+    /// Ordered CSS filter functions, applied before group opacity.
+    pub filters: Arc<[CssFilter]>,
+}
+
+/// One CSS Filter Effects 1 filter function, in the element's local CSS px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CssFilter {
+    /// A straight-alpha sRGB color matrix, clamped after it applies.
+    ColorMatrix([f32; 20]),
+    /// A Gaussian blur of this standard deviation.
+    Blur(f32),
+    /// The input's alpha, offset, blurred and colored, under the input.
+    DropShadow {
+        dx: f32,
+        dy: f32,
+        std_deviation: f32,
+        color: PaintColor,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1596,8 +1612,8 @@ fn bounded_scope_change(old: &DisplayCommand, new: &DisplayCommand) -> bool {
         (DisplayCommand::PushLayer(a), DisplayCommand::PushLayer(b)) => {
             a.blend == BlendMode::Normal
                 && b.blend == BlendMode::Normal
-                && a.color_filters.is_empty()
-                && b.color_filters.is_empty()
+                && a.filters.is_empty()
+                && b.filters.is_empty()
         }
         _ => false,
     }
@@ -2565,7 +2581,7 @@ impl Scene {
                         self.primitives.push(Primitive::PushLayer(CompositingLayer {
                             opacity,
                             blend: BlendMode::Normal,
-                            color_filters: Arc::from([]),
+                            filters: Arc::from([]),
                         }));
                     }
                     animation_layers.push(opacity.is_some());
@@ -4232,7 +4248,7 @@ mod tests {
             DisplayCommand::PushLayer(CompositingLayer {
                 opacity: 0.6,
                 blend: BlendMode::Multiply,
-                color_filters: Default::default(),
+                filters: Default::default(),
             }),
             DisplayCommand::FillRect {
                 rect: CssRect::new(40.0, 15.0, 3.0, 16.0),
@@ -4297,7 +4313,7 @@ mod tests {
             DisplayCommand::PushLayer(CompositingLayer {
                 opacity: 0.5,
                 blend: BlendMode::Normal,
-                color_filters: Default::default(),
+                filters: Default::default(),
             }),
             DisplayCommand::PushTransform(Affine2d::translate(0., 500.)),
             DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 30., 30.))),

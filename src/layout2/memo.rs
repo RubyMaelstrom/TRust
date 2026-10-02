@@ -141,7 +141,7 @@ pub(crate) fn box_style_bytes(s: &super::style::BoxStyle) -> usize {
         ])
         .map(len_bytes)
         .sum::<usize>()
-        + s.color_filters.len() * size_of::<[f32; 20]>()
+        + s.filters.len() * size_of::<crate::render::CssFilter>()
         + s.transform.as_ref().map_or(0, |t| t.retained_bytes())
 }
 

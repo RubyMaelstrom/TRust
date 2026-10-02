@@ -517,7 +517,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "container-type" => one_of("normal size inline-size"),
         "interactivity" => one_of("auto inert"),
         "isolation" => one_of("auto isolate"),
-        "filter" => crate::layout2::filter::color_filters(value).is_some(),
+        "filter" => crate::layout2::filter::valid(value),
         "clip-path" => value == "none" || crate::layout2::clip_path::supports(value),
         "z-index" => value == "auto" || value.parse::<i32>().is_ok(),
         "order" => value.parse::<i32>().is_ok(),

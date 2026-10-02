@@ -33,7 +33,7 @@ use super::vello_cpu::{
     gradient_extend, offset_shape, outside_shape_path, point_bounds, radial_aspect_transform,
     radial_gradient, rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path,
     simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend, vello_color,
-    vello_color_filter, vello_rect, vello_stops, vello_stroke,
+    vello_css_filter, vello_rect, vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
@@ -826,10 +826,10 @@ impl VelloHybridRenderer {
                         None,
                         None,
                     );
-                    for matrix in layer.color_filters.iter().rev() {
-                        target.push_layer(None, None, None, None, Some(vello_color_filter(matrix)));
+                    for filter in layer.filters.iter().rev() {
+                        target.push_layer(None, None, None, None, Some(vello_css_filter(filter)));
                     }
-                    layer_filters.push(layer.color_filters.len());
+                    layer_filters.push(layer.filters.len());
                 }
                 DisplayCommand::PopLayer => {
                     for _ in 0..layer_filters.pop().unwrap_or(0) {

@@ -17,9 +17,9 @@ use vello_cpu::peniko::{
 use vello_cpu::{ImageSource, Pixmap, RenderContext, Resources};
 
 use super::{
-    Affine2d, BlendMode, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle,
-    ImageSampling, LineCap, PaintBrush, PaintColor, PaintShape, PathElement, Primitive,
-    RasterBackend, RasterFrame, Scene, StrokeStyle, is_desktop_heart_image_handle,
+    Affine2d, BlendMode, CssFilter, CssRect, DecorationStyle, DisplayCommand, ImageFit,
+    ImageHandle, ImageSampling, LineCap, PaintBrush, PaintColor, PaintShape, PathElement,
+    Primitive, RasterBackend, RasterFrame, Scene, StrokeStyle, is_desktop_heart_image_handle,
 };
 use crate::core::{CssPoint, PhysicalSize};
 
@@ -282,16 +282,16 @@ impl VelloCpuRenderer {
                     );
                     // Nest in reverse so the first CSS function runs first.
                     // Each layer clamps separately before the next operation.
-                    for matrix in layer.color_filters.iter().rev() {
+                    for filter in layer.filters.iter().rev() {
                         self.context.push_layer(
                             None,
                             None,
                             None,
                             None,
-                            Some(vello_color_filter(matrix)),
+                            Some(vello_css_filter(filter)),
                         );
                     }
-                    layer_filters.push(layer.color_filters.len());
+                    layer_filters.push(layer.filters.len());
                 }
                 DisplayCommand::PopLayer => {
                     for _ in 0..layer_filters.pop().unwrap_or(0) {
@@ -959,10 +959,29 @@ pub(super) fn text_shadow_blur(
     })
 }
 
-pub(super) fn vello_color_filter(matrix: &[f32; 20]) -> vello_common::filter_effects::Filter {
-    vello_common::filter_effects::Filter::from_primitive(
-        vello_common::filter_effects::FilterPrimitive::ColorMatrix { matrix: *matrix },
-    )
+/// A CSS filter function as a filter layer: nested layers apply a list in
+/// order, the first function innermost.
+pub(super) fn vello_css_filter(filter: &CssFilter) -> vello_common::filter_effects::Filter {
+    use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
+    Filter::from_primitive(match *filter {
+        CssFilter::ColorMatrix(matrix) => FilterPrimitive::ColorMatrix { matrix },
+        CssFilter::Blur(std_deviation) => FilterPrimitive::GaussianBlur {
+            std_deviation,
+            edge_mode: EdgeMode::None,
+        },
+        CssFilter::DropShadow {
+            dx,
+            dy,
+            std_deviation,
+            color,
+        } => FilterPrimitive::DropShadow {
+            dx,
+            dy,
+            std_deviation,
+            color: vello_color(color),
+            edge_mode: EdgeMode::None,
+        },
+    })
 }
 
 pub(super) fn vello_affine(affine: Affine2d) -> Affine {
@@ -1490,7 +1509,7 @@ mod tests {
                 DisplayCommand::PushLayer(CompositingLayer {
                     opacity: 0.6,
                     blend: BlendMode::Multiply,
-                    color_filters: Arc::from([]),
+                    filters: Arc::from([]),
                 }),
                 DisplayCommand::PushTransform(Affine2d::translate(3., 2.)),
                 DisplayCommand::FillRect {
@@ -1540,7 +1559,7 @@ mod tests {
                 DisplayCommand::PushLayer(super::super::CompositingLayer {
                     opacity: 0.6,
                     blend: BlendMode::Multiply,
-                    color_filters: Default::default(),
+                    filters: Default::default(),
                 }),
                 DisplayCommand::PushTransform(Affine2d([0.9, 0.2, -0.1, 0.8, -3.5, 6.25])),
                 DisplayCommand::PushClip(PaintShape::Polygon {
