@@ -3638,7 +3638,7 @@ impl Flow<'_> {
                     url,
                     density,
                     dimension_source,
-                    alt: _,
+                    ..
                 } if !super::replaced::represents_alt_text(
                     self.dom,
                     atom.node,

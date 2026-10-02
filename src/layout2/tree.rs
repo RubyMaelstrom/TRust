@@ -47,6 +47,9 @@ pub(crate) enum AtomKind {
         density: f32,
         dimension_source: NodeId,
         alt: String,
+        /// The form control an `input` in the Image Button state submits,
+        /// as indices into the document's forms.
+        control: Option<(usize, usize)>,
     },
     /// CSS generated content's anonymous replaced image, sized by its natural
     /// dimensions rather than the originating element's dimensions.
@@ -611,6 +614,7 @@ impl Builder<'_> {
                 density: 1.0,
                 dimension_source: id,
                 alt: String::new(),
+                control: None,
             })
         } else if tag == "svg" {
             match self.dom.svg_image_data(id, Some(self.base)) {
@@ -619,6 +623,7 @@ impl Builder<'_> {
                     density: 1.0,
                     dimension_source: id,
                     alt,
+                    control: None,
                 }),
                 None => Replaced::Skip,
             }
@@ -815,6 +820,7 @@ impl Builder<'_> {
                 density: 1.0,
                 dimension_source: id,
                 alt: String::new(),
+                control: None,
             });
         }
         if tag == "img" {
@@ -831,6 +837,31 @@ impl Builder<'_> {
                     .map(str::trim)
                     .unwrap_or("")
                     .to_string(),
+                control: None,
+            });
+        }
+        // HTML Rendering #images-3 renders an input in the Image Button state
+        // like an img: a replaced element showing its `src` (#dimRendering
+        // maps its width and height), falling back to its alt text. The
+        // picture remains the form's submit control.
+        if tag == "input" && self.dom.input_type(id) == "image" {
+            return Replaced::Atom(AtomKind::Img {
+                url: self
+                    .dom
+                    .attr(id, "src")
+                    .map(str::trim)
+                    .filter(|src| !src.is_empty())
+                    .and_then(|src| self.base.join(src).ok())
+                    .map(|url| url.to_string()),
+                density: 1.0,
+                dimension_source: id,
+                alt: self
+                    .dom
+                    .attr(id, "alt")
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string(),
+                control: self.controls.get(&id).copied(),
             });
         }
         if matches!(tag, "video" | "audio") {
