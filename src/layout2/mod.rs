@@ -4379,6 +4379,20 @@ mod tests {
     }
 
     #[test]
+    fn relative_offsets_do_not_move_an_inline_block_baseline() {
+        // CSS 2 §10.8.1: an inline-block's baseline is its last line box's
+        // in normal flow; relative offsets are visual (CSS Position 3 §3.4).
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif"><div style="padding-top:60px">
+            <span id=a style="display:inline-block"><div style="position:relative;bottom:30px">up</div></span>
+            <span id=b style="display:inline-block">plain</span>
+            <span id=c style="display:inline-block"><p style="margin:0;position:relative;top:10px">down</p></span></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &HashMap::new());
+        let top = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].top;
+        assert_eq!([top("a"), top("b"), top("c")], [60.0; 3]);
+    }
+
+    #[test]
     fn nobr_and_xmp_take_their_ua_white_space() {
         // HTML Rendering #phrasing-content-3 `nobr { white-space: nowrap }`
         // and #flow-content-3 `xmp { white-space: pre }`.
