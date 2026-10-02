@@ -131,6 +131,34 @@ impl Dom {
         if let Some(height) = height {
             hint("height", height);
         }
+        // HTML Rendering #the-marquee-element-2: width/height map to the
+        // dimension properties, hspace/vspace to the margins, and an up/down
+        // marquee's natural height is 200px. Horizontal marquees scroll a
+        // single line of content, so it does not wrap (as in Gecko and Blink).
+        if tag == "marquee" {
+            let vertical = self.attr(id, "direction").is_some_and(|direction| {
+                direction.eq_ignore_ascii_case("up") || direction.eq_ignore_ascii_case("down")
+            });
+            if let Some(width) = self.attr(id, "width").and_then(dimension_value) {
+                hint("width", width);
+            }
+            match self.attr(id, "height").and_then(dimension_value) {
+                Some(height) => hint("height", height),
+                None if vertical => hint("height", "200px".into()),
+                None => {}
+            }
+            if let Some(space) = self.attr(id, "hspace").and_then(dimension_value) {
+                hint("margin-left", space.clone());
+                hint("margin-right", space);
+            }
+            if let Some(space) = self.attr(id, "vspace").and_then(dimension_value) {
+                hint("margin-top", space.clone());
+                hint("margin-bottom", space);
+            }
+            if !vertical {
+                hint("text-wrap-mode", "nowrap".into());
+            }
+        }
         if matches!(
             tag,
             "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "marquee"
@@ -977,6 +1005,39 @@ mod tests {
             dom.computed_value(link, "color").as_deref(),
             Some("#0000ff")
         );
+    }
+
+    #[test]
+    fn marquee_dimension_space_and_direction_attributes_are_hints() {
+        // HTML Rendering #the-marquee-element-2, measured against LibreWolf
+        // 153: dimensions and spacing map to CSS, an up/down marquee is
+        // 200px tall by default, and horizontal content stays on one line.
+        let dom = Dom::parse_document(
+            "<marquee id=a width=200 height=70% hspace=10 vspace=5>a</marquee>\
+             <marquee id=b direction=UP>b</marquee><marquee id=c direction=down height=50>c</marquee>\
+             <marquee id=d style='height:30px;white-space:normal' height=70>d</marquee>",
+        );
+        let value =
+            |id: &str, property: &str| dom.computed_value(dom.get_by_id(id).unwrap(), property);
+        for (id, property, expected) in [
+            ("a", "width", Some("200px")),
+            ("a", "height", Some("70%")),
+            ("a", "margin-left", Some("10px")),
+            ("a", "margin-right", Some("10px")),
+            ("a", "margin-top", Some("5px")),
+            ("a", "text-wrap-mode", Some("nowrap")),
+            ("b", "height", Some("200px")),
+            ("b", "text-wrap-mode", None),
+            ("c", "height", Some("50px")),
+            ("d", "height", Some("30px")),
+            ("d", "text-wrap-mode", Some("wrap")),
+        ] {
+            assert_eq!(value(id, property).as_deref(), expected, "{id} {property}");
+        }
+        let resolved =
+            |id: &str| dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "white-space");
+        assert_eq!(resolved("a").as_deref(), Some("nowrap"));
+        assert_eq!(resolved("b").as_deref(), Some("normal"));
     }
 
     #[test]

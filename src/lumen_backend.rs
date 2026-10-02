@@ -17152,12 +17152,12 @@ mod tests {
             [b.borderTopWidth, b.borderTopColor, b.color, b.backgroundColor, b.outlineColor,
              c.borderTopWidth, c.borderLeftWidth, c.borderTopColor, c.outlineWidth, c.backgroundColor,
              d.borderTopStyle, d.color, d.backgroundColor, d.textAlign, d.verticalAlign,
-             d.float, d.cursor, d.flexGrow, d.width].join('|');
+             d.float, d.cursor, d.flexGrow, d.width, d.whiteSpace].join('|');
         "#
             ),
             "2px|rgb(255, 0, 0)|rgb(10, 11, 12)|rgb(64, 191, 64)|rgb(10, 11, 12)|\
              3px|0px|rgb(0, 0, 0)|5px|rgba(0, 0, 0, 0.5)|\
-             none|rgb(0, 0, 0)|rgba(0, 0, 0, 0)|start|baseline|none|auto|0|auto"
+             none|rgb(0, 0, 0)|rgba(0, 0, 0, 0)|start|baseline|none|auto|0|auto|normal"
         );
     }
 
