@@ -4983,6 +4983,29 @@ mod tests {
     }
 
     #[test]
+    fn table_columns_interpolate_between_sizing_guesses() {
+        // CSS Tables 3 #width-distribution-algorithm: a constrained column
+        // keeps its specified width (its max-content) until the table is
+        // narrower than the min-content-specified guess; the excess goes to
+        // the auto column. #outer-max-content adds the cell's padding and
+        // border to its content-box width. Values match Blink.
+        let text = "All of the source code for my programs are completely available to view and \
+                    learn from. In a utilitarian world of fast solutions, I want to inspire people.";
+        let html = format!(
+            r#"<!doctype html><body style="margin:0;font:16px sans-serif">
+            <table style="width:600px" border=1><tr><td id=a style="width:150px">Latest Project: x</td>
+            <td id=b>{text}</td></tr></table>
+            <table style="width:600px" border=1><tr><td id=c style="width:150px">a</td><td id=d>short</td></tr></table>"#
+        );
+        let dom = Dom::parse_document(&html);
+        let layout = lay_graphical(&html, 800.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        for (id, expected) in [("a", 154.0), ("b", 438.0), ("c", 154.0), ("d", 438.0)] {
+            assert!((width(id) - expected).abs() < 0.5, "{id}: {}", width(id));
+        }
+    }
+
+    #[test]
     fn spanning_cells_give_their_columns_percentage_widths() {
         // CSS Tables 3 #computing-column-measures: a spanning cell's
         // percentage width is shared by its columns that have none, equally
