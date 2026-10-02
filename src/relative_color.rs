@@ -8,8 +8,12 @@
 //! `color(srgb …)`, the others to their own function. An omitted alpha is the
 //! origin's alpha; alpha is clamped. A `currentcolor` origin is not resolved
 //! (its computed value would have to stay relative), so it is rejected.
+//!
+//! `color-mix()` (CSS Color 5 #color-mix) likewise computes to its mixed
+//! absolute color (#serial-color-mix); a `currentcolor` argument is rejected
+//! for the same reason.
 
-use color::{ColorSpaceTag as Space, DynamicColor, Flags, Missing};
+use color::{ColorSpaceTag as Space, DynamicColor, Flags, HueDirection, Missing};
 use cssparser::{ParseError, Parser, ParserInput, Token};
 
 /// Nested relative origins and math nesting are bounded like other values.
@@ -104,18 +108,28 @@ fn color_function_form(space: &str) -> Option<Form> {
     })
 }
 
-/// Resolve a relative color. `None` means `text` is not a relative color at
-/// all; `Some(None)` means it is one but invalid (or uses `currentcolor`).
+/// Resolve a relative color or `color-mix()`. `None` means `text` is neither
+/// at all; `Some(None)` means it is one but invalid (or uses `currentcolor`).
 pub(crate) fn resolve(text: &str) -> Option<Option<String>> {
     // Paint and style parse many colors; skip tokenizing the ordinary ones.
-    if !text
-        .as_bytes()
-        .windows(4)
-        .any(|window| window.eq_ignore_ascii_case(b"from"))
-    {
+    let contains = |needle: &[u8]| {
+        text.as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    };
+    if !contains(b"from") && !contains(b"color-mix") {
         return None;
     }
     resolve_at(text, 0)
+}
+
+/// A `<color>` as an absolute color, resolving relative colors and
+/// `color-mix()`; `None` for anything else or an invalid color.
+pub(crate) fn parse(text: &str) -> Option<DynamicColor> {
+    match resolve(text) {
+        Some(resolved) => color::parse_color(&resolved?).ok(),
+        None => color::parse_color(text).ok(),
+    }
 }
 
 /// The kind of value a math function computed to.
@@ -150,6 +164,13 @@ fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
     let mut input = ParserInput::new(text.trim());
     let mut p = Parser::new(&mut input);
     let name = p.expect_function().ok()?.to_ascii_lowercase();
+    if name == "color-mix" {
+        if depth > MAX_DEPTH {
+            return Some(None);
+        }
+        let mixed = p.parse_nested_block(|p| mix_body(p, depth)).ok();
+        return Some(mixed.filter(|_| p.is_exhausted()));
+    }
     if name != "color" && function_form(&name).is_none() {
         return None;
     }
@@ -270,6 +291,172 @@ fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i
     } else {
         serialize(&format!("{name}("), color)
     })
+}
+
+/// CSS Color 5 #color-mix:
+/// `color-mix( <color-interpolation-method>? , [ <color> && <percentage [0,100]>? ]# )`,
+/// mixed as #color-mix-result calculates it and serialized in the form
+/// #serial-color-mix gives for the mixing color space.
+fn mix_body<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, String> {
+    // #color-mix-space: Oklab unless a method is given; polar hues default
+    // to the `shorter` interpolation method.
+    let (space, hue) = p
+        .try_parse(|p| {
+            let method = interpolation_method(p)?;
+            p.expect_comma()?;
+            Ok::<_, ParseError<'_, ()>>(method)
+        })
+        .unwrap_or((Space::Oklab, HueDirection::Shorter));
+    let items = p.parse_comma_separated(|p| {
+        let mut percentage = p.try_parse(|p| mix_percentage(p, depth)).ok();
+        let text = component_text(p)?;
+        let color = origin_color(&text, depth).ok_or_else(|| p.new_custom_error(()))?;
+        if percentage.is_none() {
+            percentage = p.try_parse(|p| mix_percentage(p, depth)).ok();
+        }
+        Ok((color, percentage))
+    })?;
+    // CSS Values 5 #normalize-mix-percentages, with forced normalization.
+    let specified = items
+        .iter()
+        .filter_map(|(_, percentage)| *percentage)
+        .sum::<f64>()
+        .min(100.);
+    let omitted = items
+        .iter()
+        .filter(|(_, percentage)| percentage.is_none())
+        .count();
+    let mut percentages: Vec<f64> = items
+        .iter()
+        .map(|(_, percentage)| percentage.unwrap_or((100. - specified) / omitted as f64))
+        .collect();
+    let total: f64 = percentages.iter().sum();
+    if total > 0. {
+        for percentage in &mut percentages {
+            *percentage *= 100. / total;
+        }
+    }
+    let leftover = (100. - total).max(0.);
+    // #color-mix-result: mix each item into the result of the ones before it,
+    // by its share of their combined percentage (half when that is zero).
+    let mut mixed = items[0].0.convert(space);
+    let mut weight = percentages[0];
+    for ((color, _), &percentage) in items.iter().zip(&percentages).skip(1) {
+        let combined = weight + percentage;
+        let progress = if combined > 0. {
+            percentage / combined
+        } else {
+            0.5
+        };
+        mixed = mixed.interpolate(*color, space, hue).eval(progress as f32);
+        weight = combined;
+    }
+    mixed.components[3] *= (1. - leftover / 100.) as f32;
+    if !mixed.components.iter().all(|value| value.is_finite()) {
+        return Err(p.new_custom_error(()));
+    }
+    Ok(match space {
+        // Without missing components an HSL or HWB mix serializes as sRGB.
+        Space::Hsl | Space::Hwb if mixed.flags.missing().is_empty() => {
+            serialize("color(srgb", mixed.convert(Space::Srgb))
+        }
+        Space::Hsl => serialize("hsl(", mixed),
+        Space::Hwb => serialize("hwb(", mixed),
+        Space::Lab => serialize("lab(", mixed),
+        Space::Lch => serialize("lch(", mixed),
+        Space::Oklab => serialize("oklab(", mixed),
+        Space::Oklch => serialize("oklch(", mixed),
+        _ => serialize(&format!("color({}", space_name(space)), mixed),
+    })
+}
+
+/// CSS Color 4 #color-interpolation-method:
+/// `in [ <rectangular-color-space> | <polar-color-space> <hue-interpolation-method>? ]`.
+fn interpolation_method<'i>(p: &mut Parser<'i, '_>) -> Res<'i, (Space, HueDirection)> {
+    p.expect_ident_matching("in")?;
+    let name = p.expect_ident_cloned()?.to_ascii_lowercase();
+    let space = [
+        Space::Srgb,
+        Space::LinearSrgb,
+        Space::DisplayP3,
+        Space::A98Rgb,
+        Space::ProphotoRgb,
+        Space::Rec2020,
+        Space::Lab,
+        Space::Oklab,
+        Space::XyzD50,
+        Space::XyzD65,
+        Space::Hsl,
+        Space::Hwb,
+        Space::Lch,
+        Space::Oklch,
+    ]
+    .into_iter()
+    .find(|&space| space_name(space) == name || (name == "xyz" && space == Space::XyzD65))
+    .ok_or_else(|| p.new_custom_error(()))?;
+    let mut hue = HueDirection::Shorter;
+    if matches!(space, Space::Hsl | Space::Hwb | Space::Lch | Space::Oklch)
+        && let Ok(direction) = p.try_parse(|p| {
+            let direction = match p.expect_ident()?.to_ascii_lowercase().as_str() {
+                "shorter" => HueDirection::Shorter,
+                "longer" => HueDirection::Longer,
+                "increasing" => HueDirection::Increasing,
+                "decreasing" => HueDirection::Decreasing,
+                _ => return Err(p.new_custom_error(())),
+            };
+            p.expect_ident_matching("hue")?;
+            Ok::<_, ParseError<'_, ()>>(direction)
+        })
+    {
+        hue = direction;
+    }
+    Ok((space, hue))
+}
+
+/// A mix item's `<percentage [0,100]>`; a math function's result is clamped
+/// to the range (CSS Values 4 #calc-range), a literal outside it is invalid.
+fn mix_percentage<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, f64> {
+    match p.next()?.clone() {
+        Token::Percentage { unit_value, .. } => {
+            let value = f64::from(unit_value) * 100.;
+            if (0. ..=100.).contains(&value) {
+                Ok(value)
+            } else {
+                Err(p.new_custom_error(()))
+            }
+        }
+        Token::Function(ref name) => {
+            let name = name.to_ascii_lowercase();
+            let typed = p.parse_nested_block(|p| math_function(p, &name, &[], depth + 1))?;
+            if typed.unit == Unit::Percent && typed.value.is_finite() {
+                Ok(typed.value.clamp(0., 100.))
+            } else {
+                Err(p.new_custom_error(()))
+            }
+        }
+        _ => Err(p.new_custom_error(())),
+    }
+}
+
+/// The CSS name of a color space, as `color()` and color-interpolation
+/// methods spell it.
+fn space_name(space: Space) -> &'static str {
+    match space {
+        Space::Srgb => "srgb",
+        Space::LinearSrgb => "srgb-linear",
+        Space::DisplayP3 => "display-p3",
+        Space::A98Rgb => "a98-rgb",
+        Space::ProphotoRgb => "prophoto-rgb",
+        Space::Rec2020 => "rec2020",
+        Space::Lab => "lab",
+        Space::Lch => "lch",
+        Space::Oklab => "oklab",
+        Space::Oklch => "oklch",
+        Space::Hsl => "hsl",
+        Space::Hwb => "hwb",
+        Space::XyzD50 => "xyz-d50",
+        _ => "xyz-d65",
+    }
 }
 
 fn serialize(prefix: &str, color: DynamicColor) -> String {
@@ -655,5 +842,74 @@ mod tests {
         close(&values, &[0.4, 0.2]);
         // Discourse's browser check.
         assert!(resolved("hsl(from white h s l)").is_some());
+    }
+
+    #[test]
+    fn color_mix_computes_its_mixed_color() {
+        // CSS Color 5 #color-mix-result and #serial-color-mix; expected values
+        // follow WPT css-color/parsing/color-computed-color-mix-function.
+        let (value, values) = components("color-mix(in sRGB, #fff 40%, transparent)");
+        assert!(value.starts_with("color(srgb "), "{value}");
+        close(&values, &[1., 1., 1., 0.4]);
+        close(
+            &components("color-mix(in hsl, hsl(120deg 10% 20%) 25%, hsl(30deg 30% 40%))").1,
+            &[0.4375, 0.415625, 0.2625, 1.],
+        );
+        close(
+            &components("color-mix(in hsl longer hue, hsl(40deg 50% 50%), hsl(60deg 50% 50%))").1,
+            &[0.25, 1. / 3., 0.75, 1.],
+        );
+        // Percentages summing below 100% scale up and multiply the alpha.
+        let (value, values) = components(
+            "color-mix(in oklch, oklch(0.1 0.2 30deg) 12.5%, oklch(0.5 0.6 70deg) 37.5%)",
+        );
+        assert!(value.starts_with("oklch("), "{value}");
+        close(&values, &[0.4, 0.5, 60., 0.5]);
+        // #color-mix-space: Oklab without an interpolation method.
+        assert_eq!(
+            resolved("color-mix(red, blue)"),
+            resolved("color-mix(in oklab, red, blue)")
+        );
+        assert!(
+            resolved("color-mix(red, blue)")
+                .unwrap()
+                .starts_with("oklab(")
+        );
+        // More than two colors, nesting, math and a 0% sum (CSS Values 5
+        // #normalize-mix-percentages leaves 100% for transparent).
+        close(
+            &components("color-mix(in srgb, red, lime, blue)").1,
+            &[1. / 3., 1. / 3., 1. / 3., 1.],
+        );
+        close(
+            &components("color-mix(in srgb, color-mix(in srgb, red, blue), white)").1,
+            &[0.75, 0.5, 0.75, 1.],
+        );
+        close(
+            &components("color-mix(in srgb, red calc(25% + 50%), blue)").1,
+            &[0.75, 0., 0.25, 1.],
+        );
+        close(
+            &components("color-mix(in srgb, red 0%, blue 0%)").1,
+            &[0.5, 0., 0.5, 0.],
+        );
+        close(
+            &components("rgb(from color-mix(in srgb, red, blue) r g b)").1,
+            &[0.5, 0., 0.5, 1.],
+        );
+        for invalid in [
+            "color-mix(in srgb, red -10%, blue)",
+            "color-mix(in srgb, red 150%, blue)",
+            "color-mix(in hsl hue, red, blue)",
+            "color-mix(in hsl shorter, red, blue)",
+            "color-mix(in srgb longer hue, red, blue)",
+            "color-mix(in srgb red, blue)",
+            "color-mix(in srgb, red blue)",
+            "color-mix(in srgb, red, blue, in srgb)",
+            "color-mix(in bogus, red, blue)",
+            "color-mix(in srgb, currentcolor, red)",
+        ] {
+            assert_eq!(resolve(invalid), Some(None), "{invalid}");
+        }
     }
 }

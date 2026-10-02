@@ -21452,6 +21452,30 @@ mod tests {
     }
 
     #[test]
+    fn color_mix_declarations_apply_and_paint() {
+        // CSS Color 5 #color-mix: previously dropped as invalid, which kept
+        // the earlier fallback declaration.
+        let dom = Dom::parse_document(
+            "<style>:root{--b:#e8f0fe} #x {color:white; color:color-mix(in srgb, blue 50%, transparent); \
+             background-color:#111110; background-color:color-mix(in sRGB, var(--b) 40%, transparent)}</style>\
+             <p id=x>Readable</p>",
+        );
+        let node = dom.get_by_id("x").unwrap();
+        let paint = |property| {
+            let value = dom.computed_value_resolved(node, property).unwrap();
+            crate::render::PaintColor::parse_css(&value)
+        };
+        assert_eq!(
+            paint("color"),
+            Some(crate::render::PaintColor::Rgba(0, 0, 255, 128))
+        );
+        assert_eq!(
+            paint("background-color"),
+            Some(crate::render::PaintColor::Rgba(232, 240, 254, 102))
+        );
+    }
+
+    #[test]
     fn relative_color_declarations_apply_and_paint() {
         // CSS Color 5 #relative-colors: previously dropped as invalid, which
         // kept the earlier fallback declaration.

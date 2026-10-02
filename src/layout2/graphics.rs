@@ -5582,7 +5582,9 @@ fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<Pa
             }
             parts.remove(0);
         }
-    } else if explicit_interpolation || color::parse_color(split_ws(parts[0]).first()?).is_err() {
+    } else if explicit_interpolation
+        || crate::relative_color::parse(split_ws(parts[0]).first()?).is_none()
+    {
         ending_shape = Some(radial_ending_shape(&header, rect, lengths)?);
         parts.remove(0);
     }
@@ -5900,7 +5902,7 @@ fn parse_stops_at(parts: &[&str], position: impl Fn(&str) -> Option<f32>) -> Opt
     for part in parts {
         let tokens = split_ws(part);
         match tokens.as_slice() {
-            [hint] if color::parse_color(hint).is_err() => {
+            [hint] if crate::relative_color::parse(hint).is_none() => {
                 // A hint sits between two color stops, never next to another.
                 if colors.is_empty() || hints.last().is_some_and(|(at, _)| *at == colors.len()) {
                     return None;
@@ -5908,7 +5910,9 @@ fn parse_stops_at(parts: &[&str], position: impl Fn(&str) -> Option<f32>) -> Opt
                 hints.push((colors.len(), position(hint)?));
             }
             [stop, positions @ ..] if positions.len() <= 2 => {
-                let stop = color::parse_color(stop).ok()?;
+                // CSS Images 3 #color-stop-syntax: any <color>, including
+                // relative colors and color-mix() (CSS Color 5).
+                let stop = crate::relative_color::parse(stop)?;
                 if positions.is_empty() {
                     colors.push((stop, None));
                 }
@@ -8740,6 +8744,28 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn gradient_color_stops_accept_color_mix() {
+        // CSS Images 3 #color-stop-syntax takes any <color>, including CSS
+        // Color 5 color-mix() (blog.google's article hero background).
+        let Some(PaintBrush::LinearGradient { stops, .. }) = parse_gradient(
+            "linear-gradient(0deg,color-mix(in sRGB,#fff 40%,transparent) 0%,\
+             color-mix(in srgb,#bbe2ff 40%,transparent) 100%)",
+            CssRect::new(0.0, 0.0, 100.0, 40.0),
+            LengthBasis::fixed(),
+        ) else {
+            panic!("color-mix() stops parse");
+        };
+        let rgba = |stop: &GradientStop| {
+            stop.color
+                .to_alpha_color::<color::Srgb>()
+                .to_rgba8()
+                .to_u8_array()
+        };
+        assert_eq!(rgba(&stops[0]), [255, 255, 255, 102]);
+        assert_eq!(rgba(&stops[stops.len() - 1]), [187, 226, 255, 102]);
     }
 
     #[test]
