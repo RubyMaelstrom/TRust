@@ -16278,6 +16278,41 @@ mod tests {
     }
 
     #[test]
+    fn scroll_into_view_follows_the_containing_block_chain() {
+        // CSSOM View #scroll-a-target-into-view; WPT css/cssom-view/
+        // scrollIntoView-fixed.html and scrollintoview-containingblock-chain.html.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0;height:3000px}
+            #bar{position:fixed;left:0;bottom:0;width:200px;height:40px}
+            #outer{height:100px;overflow:auto} #outer>div{height:500px}
+            #abs{position:absolute;top:300px;height:20px}
+            #flow{margin-top:2000px;height:20px}</style>
+            <div id=bar><button id=ok>OK</button></div>
+            <div id=outer><div><div id=abs></div></div></div><div id=flow></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            document.getElementById('ok').focus();
+            document.getElementById('bar').scrollIntoView({block:'center'});
+            if(scrollY!==0) return 'fixed scrolled the viewport: '+scrollY;
+            const outer=document.getElementById('outer');
+            document.getElementById('abs').scrollIntoView();
+            if(outer.scrollTop!==0) return 'absolute scrolled a non-containing scroller';
+            if(scrollY!==300) return 'absolute did not scroll the viewport: '+scrollY;
+            document.getElementById('flow').scrollIntoView();
+            if(scrollY!==2100) return 'flow: '+scrollY;
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
     fn client_rects_keep_viewport_fixed_descendants_stationary_while_scrolling() {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<!doctype html><style>body{margin:0;width:2000px;height:2000px}
