@@ -92,47 +92,7 @@ impl Flow<'_> {
             avail.max(min_sum)
         };
 
-        // Target per column: an explicit width (px, or % of the used table
-        // width) floored at its min; otherwise its max-content.
-        let table_used_w = used + spacing;
-        let mut target: Vec<f32> = (0..ncols)
-            .map(|c| {
-                let t = match col_w[c] {
-                    Some(ColSpec::Px(px)) => px,
-                    Some(ColSpec::Pct(p)) => p * table_used_w,
-                    None => col_max[c],
-                };
-                t.max(col_min[c]).max(1.0)
-            })
-            .collect();
-
-        let target_sum: f32 = target.iter().sum();
-        if target_sum < used {
-            // Grow: distribute slack to the auto (no explicit width) columns by
-            // their max-content; if none are auto, grow all proportionally.
-            let extra = used - target_sum;
-            let auto: Vec<usize> = (0..ncols).filter(|&c| col_w[c].is_none()).collect();
-            if !auto.is_empty() {
-                let weight: f32 = auto.iter().map(|&c| col_max[c].max(1.0)).sum();
-                grow_by_weight(&mut target, &auto, extra, |c| col_max[c].max(1.0), weight);
-            } else {
-                let snapshot: Vec<f32> = target.iter().map(|&w| w.max(1.0)).collect();
-                let all: Vec<usize> = (0..ncols).collect();
-                let weight: f32 = snapshot.iter().sum::<f32>().max(1.0);
-                grow_by_weight(&mut target, &all, extra, |c| snapshot[c], weight);
-            }
-        } else if target_sum > used {
-            // Shrink toward each column's min, proportional to the slack above
-            // it (exact in f32 — no integer-rounding residual to sweep up).
-            let over = target_sum - used;
-            let head: f32 = (0..ncols).map(|c| target[c] - col_min[c]).sum();
-            if head > 0.0 {
-                for c in 0..ncols {
-                    let slack_above = target[c] - col_min[c];
-                    target[c] -= (over * slack_above / head).min(slack_above);
-                }
-            }
-        }
+        let target = distribute_widths(&col_min, &col_max, &col_w, used);
         let table_w = target.iter().sum::<f32>() + spacing;
         TableCols {
             widths: target,
@@ -552,8 +512,11 @@ impl Flow<'_> {
         let mn = self.intrinsic_w(&cell.b, IMode::Min, inl) + bp;
         let mut mx = self.intrinsic_w(&cell.b, IMode::Max, inl) + bp;
         if let Some(ColSpec::Px(px)) = declared_track_width(self.dom, cell.b.node) {
-            let px = cap.map_or(px, |a| px.min(a));
-            mx = mn.max(px);
+            // CSS Tables 3 #outer-max-content: the declared width is the
+            // cell's box-sizing box; outer widths include padding and border.
+            let outer = if s.border_box { px } else { px + bp };
+            let outer = cap.map_or(outer, |a| outer.min(a));
+            mx = mn.max(outer);
         }
         (mn.max(1.0), mx.max(mn))
     }
@@ -678,6 +641,102 @@ impl Flow<'_> {
             }
         }
     }
+}
+
+/// CSS Tables 3 #width-distribution-algorithm: the used column widths for
+/// an assignable width `assignable` (the table's content width less border
+/// spacing). Four sizing-guesses — min-content, min-content-percentage,
+/// min-content-specified and max-content — are nondecreasing per column;
+/// the used widths interpolate linearly between the two consecutive guesses
+/// whose sums bound the assignable width, or start from the max-content
+/// guess and distribute the excess width to columns.
+fn distribute_widths(
+    min: &[f32],
+    max: &[f32],
+    specs: &[Option<ColSpec>],
+    assignable: f32,
+) -> Vec<f32> {
+    let ncols = min.len();
+    let percent = |c: usize| match specs[c] {
+        Some(ColSpec::Pct(p)) if p > 0.0 => Some(p),
+        _ => None,
+    };
+    let constrained = |c: usize| matches!(specs[c], Some(ColSpec::Px(_)));
+    let percent_width = |c: usize, p: f32| (p * assignable).max(min[c]);
+    let guesses: [Vec<f32>; 4] = [
+        min.to_vec(),
+        (0..ncols)
+            .map(|c| percent(c).map_or(min[c], |p| percent_width(c, p)))
+            .collect(),
+        (0..ncols)
+            .map(|c| match percent(c) {
+                Some(p) => percent_width(c, p),
+                None if constrained(c) => max[c].max(min[c]),
+                None => min[c],
+            })
+            .collect(),
+        (0..ncols)
+            .map(|c| percent(c).map_or(max[c].max(min[c]), |p| percent_width(c, p)))
+            .collect(),
+    ];
+    let sums: Vec<f32> = guesses.iter().map(|g| g.iter().sum()).collect();
+    if assignable <= sums[0] {
+        return guesses[0].iter().map(|w| w.max(1.0)).collect();
+    }
+    for i in 0..3 {
+        if assignable <= sums[i + 1] {
+            let span = sums[i + 1] - sums[i];
+            let t = if span > 0.0 {
+                (assignable - sums[i]) / span
+            } else {
+                1.0
+            };
+            return (0..ncols)
+                .map(|c| (guesses[i][c] + (guesses[i + 1][c] - guesses[i][c]) * t).max(1.0))
+                .collect();
+        }
+    }
+    // #distributing-width-to-columns: the excess over the max-content guess.
+    let mut widths = guesses[3].clone();
+    let excess = assignable - sums[3];
+    let unconstrained: Vec<usize> = (0..ncols)
+        .filter(|&c| percent(c).is_none() && !constrained(c))
+        .collect();
+    let with_content =
+        |cols: &[usize]| -> Vec<usize> { cols.iter().copied().filter(|&c| max[c] > 0.0).collect() };
+    let constrained_cols: Vec<usize> = (0..ncols)
+        .filter(|&c| percent(c).is_none() && constrained(c))
+        .collect();
+    let percent_cols: Vec<usize> = (0..ncols).filter(|&c| percent(c).is_some()).collect();
+    let all: Vec<usize> = (0..ncols).collect();
+    let by_max = |cols: &[usize]| cols.iter().map(|&c| max[c]).sum::<f32>();
+    if !with_content(&unconstrained).is_empty() {
+        let cols = with_content(&unconstrained);
+        grow_by_weight(&mut widths, &cols, excess, |c| max[c], by_max(&cols));
+    } else if !unconstrained.is_empty() {
+        grow_by_weight(
+            &mut widths,
+            &unconstrained,
+            excess,
+            |_| 1.0,
+            unconstrained.len() as f32,
+        );
+    } else if !with_content(&constrained_cols).is_empty() {
+        let cols = with_content(&constrained_cols);
+        grow_by_weight(&mut widths, &cols, excess, |c| max[c], by_max(&cols));
+    } else if !percent_cols.is_empty() {
+        let total: f32 = percent_cols.iter().filter_map(|&c| percent(c)).sum();
+        grow_by_weight(
+            &mut widths,
+            &percent_cols,
+            excess,
+            |c| percent(c).unwrap_or(0.0),
+            total,
+        );
+    } else {
+        grow_by_weight(&mut widths, &all, excess, |_| 1.0, ncols as f32);
+    }
+    widths.iter().map(|w| w.max(1.0)).collect()
 }
 
 /// Fixed table layout column widths (§17.5.2.1): declared column widths are
