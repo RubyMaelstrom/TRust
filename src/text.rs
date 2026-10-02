@@ -151,6 +151,16 @@ pub struct ShapedRun {
     pub synth_skew_degrees: Option<f32>,
 }
 
+impl ShapedRun {
+    /// The x-skew factor of a synthetic oblique in a renderer's Y-down glyph
+    /// space (Glifo applies the glyph transform after flipping font units):
+    /// negative, so the tops of glyphs lean forward.
+    pub fn synthetic_oblique_skew(&self) -> Option<f64> {
+        self.synth_skew_degrees
+            .map(|degrees| -f64::from(degrees).to_radians().tan())
+    }
+}
+
 /// Logical byte/cluster mapping retained for selection and hit testing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cluster {
@@ -1338,6 +1348,43 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloaded_regular_face_synthesizes_italic_and_bold() {
+        // CSS Fonts 4 #font-synthesis-style/-weight (initial `weight style`):
+        // a family with only an upright regular face is slanted for italic
+        // and emboldened for bold.
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fonts/dejavu/DejaVuSerif.ttf"
+        ))
+        .unwrap();
+        let fonts = FontSet::new(
+            vec![crate::font_system::PageFont {
+                family: "Web".into(),
+                bytes,
+            }],
+            None,
+            false,
+        );
+        let synthesis = |italic, weight| {
+            let shaped = shape(
+                "Hello",
+                &TextStyle {
+                    family: "Web".into(),
+                    font_set: Some(fonts.clone()),
+                    italic,
+                    weight,
+                    ..TextStyle::default()
+                },
+            );
+            assert_eq!(shaped.runs.len(), 1);
+            (shaped.runs[0].synth_skew_degrees, shaped.runs[0].synth_bold)
+        };
+        assert_eq!(synthesis(false, 400.), (None, false));
+        assert!(synthesis(true, 400.).0.is_some_and(|skew| skew > 0.));
+        assert!(synthesis(false, 700.).1);
+    }
 
     #[test]
     fn zero_font_size_retains_absolute_line_height_and_half_leading() {

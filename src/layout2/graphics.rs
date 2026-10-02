@@ -5568,6 +5568,46 @@ mod tests {
     }
 
     #[test]
+    fn a_family_without_an_italic_face_is_slanted() {
+        // CSS Fonts 4 #font-synthesis-style: with `font-synthesis-style:
+        // auto`, italic text in a family that has only an upright face is
+        // drawn obliquely. The stem of an "l" leans right toward its top.
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fonts/dejavu/DejaVuSerif.ttf"
+        ))
+        .unwrap();
+        let url: String = bytes.iter().map(|byte| format!("%{byte:02X}")).collect();
+        let lean = |style: &str| {
+            let (_, layout) = render_fixture(&format!(
+                "<style>@font-face{{font-family:Web;src:url(data:font/ttf,{url})}} \
+                 body{{margin:0;background:white}} p{{margin:0;font:100px/1 Web;{style}}}</style><p>l</p>"
+            ));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let centroid = |rows: std::ops::Range<usize>| {
+                let (mut sum, mut count) = (0.0, 0.0);
+                for (i, p) in frame.pixels.as_chunks::<4>().0.iter().enumerate() {
+                    if p[0] < 100 && rows.contains(&(i / 800)) {
+                        sum += (i % 800) as f32;
+                        count += 1.0;
+                    }
+                }
+                assert!(count > 0.0, "{style}: no ink in {rows:?}");
+                sum / count
+            };
+            centroid(20..40) - centroid(70..85)
+        };
+        assert!(lean("").abs() < 2.0, "upright: {}", lean(""));
+        assert!(
+            lean("font-style:italic") > 8.0,
+            "italic: {}",
+            lean("font-style:italic")
+        );
+    }
+
+    #[test]
     fn generated_inline_boxes_paint_their_backgrounds_and_borders() {
         // CSS Pseudo 4 #treelike: ::before/::after and ::first-letter boxes
         // are styleable inline boxes. A badge's white text is unreadable
