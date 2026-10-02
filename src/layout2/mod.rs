@@ -4536,10 +4536,28 @@ mod tests {
             assert_eq!(size(id), expected, "{id}");
         }
         // A float's auto width comes from its used height the same way.
-        assert_eq!(size("g").0, 30.0);
+        assert_eq!(size("g"), (30.0, 30.0));
         // The shrink-to-fit parent measures the transferred minimum.
         let parent = dom.parent_flat(dom.get_by_id("h").unwrap()).unwrap();
         assert_eq!(layout.boxes[&parent].width, 50.0);
+    }
+
+    #[test]
+    fn floats_obey_min_and_max_heights() {
+        // CSS 2 §10.7: min-height and max-height apply to floats, clamping a
+        // definite height and an automatic (content) one alike.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:16px/20px sans-serif">
+            <div id=a style="float:left;width:50px;height:80px;max-height:30px"></div>
+            <div id=b style="float:left;width:50px;height:20px;min-height:40px"></div>
+            <div id=c style="float:left;width:50px;min-height:40px"></div>
+            <div id=d style="float:left;width:50px;max-height:30px">one<br>two<br>three</div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        for (id, expected) in [("a", 30.0), ("b", 40.0), ("c", 40.0), ("d", 30.0)] {
+            assert_eq!(height(id), expected, "{id}");
+        }
     }
 
     #[test]
