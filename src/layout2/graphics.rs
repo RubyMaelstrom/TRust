@@ -1211,8 +1211,38 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
         .and_then(|value| Len::parse(value, units, viewport))
         .and_then(|value| value.resolve(Some(builder.viewport_h)))
         .unwrap_or(0.0);
+    // Opacity keyframes scale a group relative to the static opacity layer
+    // the element already paints with; missing 0%/100% keyframes take the
+    // underlying computed value (CSS Animations 1 §3.3).
+    let static_opacity = fragment.paint.opacity.clamp(0.0, 1.0);
+    let relative = |opacity: f32| {
+        if static_opacity > 0.0 {
+            opacity / static_opacity
+        } else {
+            opacity
+        }
+    };
+    let underlying_opacity = relative(
+        builder
+            .dom
+            .computed_value_resolved(fragment.node, "opacity")
+            .as_deref()
+            .and_then(parse_opacity)
+            .unwrap_or(1.0),
+    );
     let mut animations = Vec::new();
     for definition in definitions {
+        let mut opacity = definition
+            .keyframes
+            .iter()
+            .filter_map(|frame| {
+                Some(CssAnimationPoint {
+                    offset: frame.offset,
+                    value: CssPoint::new(relative(parse_opacity(frame.opacity.as_deref()?)?), 0.0),
+                })
+            })
+            .collect::<Vec<_>>();
+        complete_animation_track_with(&mut opacity, CssPoint::new(underlying_opacity, 0.0));
         let mut position = definition
             .keyframes
             .iter()
@@ -1247,7 +1277,7 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             .collect::<Vec<_>>();
         complete_animation_track(&mut position);
         complete_animation_track(&mut transform);
-        if position.is_empty() && transform.is_empty() {
+        if position.is_empty() && transform.is_empty() && opacity.is_empty() {
             continue;
         }
         animations.push(CssPaintAnimation {
@@ -1261,6 +1291,7 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             running: definition.running,
             position,
             transform,
+            opacity,
         });
     }
     (!animations.is_empty()).then_some(CssAnimationScope { animations })
@@ -1270,6 +1301,20 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
 /// underlying style. The graphical subset represents that style as a zero
 /// delta, so adding endpoints here also makes interpolation well-defined.
 fn complete_animation_track(track: &mut Vec<CssAnimationPoint>) {
+    complete_animation_track_with(track, CssPoint::default());
+}
+
+/// A CSS `<alpha-value>`: a number or percentage, clamped to [0, 1].
+fn parse_opacity(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let number = match value.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+        None => value.parse::<f32>().ok()?,
+    };
+    number.is_finite().then(|| number.clamp(0.0, 1.0))
+}
+
+fn complete_animation_track_with(track: &mut Vec<CssAnimationPoint>, underlying: CssPoint) {
     if track.is_empty() {
         return;
     }
@@ -1279,14 +1324,14 @@ fn complete_animation_track(track: &mut Vec<CssAnimationPoint>) {
             0,
             CssAnimationPoint {
                 offset: 0.0,
-                value: CssPoint::default(),
+                value: underlying,
             },
         );
     }
     if track.last().is_some_and(|point| point.offset < 1.0) {
         track.push(CssAnimationPoint {
             offset: 1.0,
-            value: CssPoint::default(),
+            value: underlying,
         });
     }
 }
