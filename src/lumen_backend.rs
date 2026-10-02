@@ -13101,7 +13101,10 @@ fn host_adopt_styles(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 
 fn host_css_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let css = host_arg_string(ctx, args, 0);
-    Ok(Value::from_string(crate::dom::parse_cssom_json(&css)))
+    let quirks = matches!(args.get(1), Some(Value::Bool(true)));
+    Ok(Value::from_string(crate::dom::parse_cssom_json(
+        &css, quirks,
+    )))
 }
 
 /// CSSOM #dom-window-getcomputedstyle / CSS Conditional 5 #container-lengths:
@@ -24424,6 +24427,51 @@ mod tests {
             string_value(&mut engine, "inputClickActivationResult"),
             "click:true:false,input:true:true:true,change:true:true|true|false|click:false:false|true|true|click:false:true,input,change|false|true|0|false"
         );
+    }
+
+    #[test]
+    fn quirks_mode_css_style_declarations_accept_quirky_lengths() {
+        // CSS Values 4 #deprecated-quirky-length: a quirks-mode Document's
+        // inline styles and sheets read a number as px in the listed
+        // properties, as old DHTML scripts expect (`el.style.left = x`).
+        // Shorthands, functions and CSS.supports() keep the ordinary grammar.
+        for quirks in [true, false] {
+            let source = format!(
+                "{}<style>#a {{ top: 20 }}</style><div id=a style='left: 30'></div>",
+                if quirks { "" } else { "<!doctype html>" }
+            );
+            let dom = Rc::new(RefCell::new(Dom::parse_document(&source)));
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            let expected = if quirks {
+                "200px|60px|5px 10px||30px|20px|20px|7px|false"
+            } else {
+                "||||||auto||false"
+            };
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const a = document.getElementById('a');
+                    a.style.left = 200;
+                    a.style.setProperty('width', '60');
+                    a.style.margin = '5 10';
+                    a.style.padding = 'calc(5)';
+                    a.style.inset = '1 2 3 4';
+                    const parsed = document.createElement('div');
+                    parsed.setAttribute('style', 'left: 30');
+                    const sheet = document.styleSheets[0];
+                    const rule = sheet.cssRules[0];
+                    sheet.insertRule('#b { right: 7 }', 1);
+                    return [a.style.left, a.style.width, a.style.margin, a.style.bottom,
+                        parsed.style.left, rule.style.top, getComputedStyle(a).top,
+                        sheet.cssRules[1].style.right, CSS.supports('top', '5')].join('|');
+                })()"#
+                ),
+                expected,
+                "quirks: {quirks}"
+            );
+        }
     }
 
     #[test]

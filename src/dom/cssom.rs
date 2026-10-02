@@ -328,6 +328,11 @@ pub(super) fn property_names(property: &str) -> Vec<String> {
 /// Parse with the same component and shorthand grammars used by the cascade.
 /// Each tuple is (longhand name, value, important flag).
 fn expanded(property: &str, value: &str) -> Vec<(String, String, bool)> {
+    expanded_in(property, value, false)
+}
+
+/// `expanded` for a declaration block whose Document is in quirks mode.
+fn expanded_in(property: &str, value: &str, quirks: bool) -> Vec<(String, String, bool)> {
     let value = strip_css_comments(value);
     let value = value.trim();
     if !valid_value(value)
@@ -337,7 +342,7 @@ fn expanded(property: &str, value: &str) -> Vec<(String, String, bool)> {
         return vec![];
     }
     let property = properties::identifier_text(property);
-    let Some((name, value, false)) = parse_decl(&format!("{property}:{value}")) else {
+    let Some((name, value, false)) = parse_decl_in(&format!("{property}:{value}"), quirks) else {
         return vec![];
     };
     let expanded = longhands(&name, &value);
@@ -625,13 +630,18 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
 }
 
 fn parse(text: &str) -> Vec<(String, String, bool)> {
+    parse_in(text, false)
+}
+
+/// `parse` for a declaration block whose Document is in quirks mode.
+fn parse_in(text: &str, quirks: bool) -> Vec<(String, String, bool)> {
     let text = strip_css_comments(text);
     let mut result: Vec<(String, String, bool)> = vec![];
     for decl in split_top_level(&text, ';') {
-        let Some((property, value, important)) = parse_decl(decl) else {
+        let Some((property, value, important)) = parse_decl_in(decl, quirks) else {
             continue;
         };
-        for (name, value, _) in expanded(&property, &value) {
+        for (name, value, _) in expanded_in(&property, &value, quirks) {
             if let Some(index) = result.iter().position(|(key, _, _)| *key == name) {
                 if !important && result[index].2 {
                     continue;
@@ -929,7 +939,9 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
     match op {
         "string" => json!(properties::string_text(text)),
         "identifier" => json!(properties::identifier_text(text)),
-        "parse" => json!(parse(text)),
+        // CSS Values 4 #deprecated-quirky-length applies to the declaration
+        // blocks of a quirks-mode Document's elements and sheets.
+        "parse" => json!(parse_in(text, extra == "quirks")),
         "serialize" | "source" => json!(serialize(
             &serde_json::from_str::<Declarations>(text).unwrap_or_default(),
             op == "source"
@@ -944,6 +956,7 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
                 .collect::<Vec<_>>()
         ),
         "expand" => json!(expanded(text, extra)),
+        "expand-quirks" => json!(expanded_in(text, extra, true)),
         "names" => json!(property_names(text)),
         "get" => json!(get(
             text,
