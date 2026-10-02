@@ -970,7 +970,15 @@ fn paint_in_spaces(
                 Some(canvas),
                 None,
             );
-            color.or(surface)
+            // The canvas surface is opaque Canvas (white without a dark
+            // scheme); a translucent root background color is drawn over it.
+            match color {
+                Some(color) if !is_opaque(color) => Some(source_over(
+                    color,
+                    surface.unwrap_or(PaintColor::Rgba(255, 255, 255, 255)),
+                )),
+                color => color.or(surface),
+            }
         }
     } else {
         None
@@ -6375,6 +6383,20 @@ fn isolated_group() -> DisplayCommand {
     })
 }
 
+/// `top` composited over an opaque `bottom` (CSS Compositing 1 #simplealphacompositing).
+fn source_over(top: PaintColor, bottom: PaintColor) -> PaintColor {
+    match (top, bottom) {
+        (PaintColor::Rgba(r, g, b, a), PaintColor::Rgba(br, bg, bb, _)) => {
+            let alpha = f32::from(a) / 255.0;
+            let mix = |top: u8, bottom: u8| {
+                (f32::from(top) * alpha + f32::from(bottom) * (1.0 - alpha)).round() as u8
+            };
+            PaintColor::Rgba(mix(r, br), mix(g, bg), mix(b, bb), 255)
+        }
+        (top, _) => top,
+    }
+}
+
 fn is_opaque(color: PaintColor) -> bool {
     !matches!(color, PaintColor::Rgba(_, _, _, alpha) if alpha < 255)
 }
@@ -8690,6 +8712,28 @@ mod tests {
         assert_eq!(at(45, 50), [0, 255, 0]);
         assert_eq!(at(170, 50), [255, 255, 255], "nothing outside the frame");
         assert_eq!(at(10, 50), [255, 255, 255]);
+    }
+
+    #[test]
+    fn a_translucent_root_background_covers_the_opaque_canvas() {
+        // CSS Color Adjust 1 #color-scheme-effect: the canvas surface is the
+        // opaque Canvas color, and the root's propagated background is
+        // drawn over it (Blink: rgb(167,139,131) for #73473aa1 over white).
+        let dom = Dom::parse_document(
+            "<!doctype html><body style='margin:0;background-color:#73473aa1'></body>",
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://page.test/").unwrap(),
+            crate::layout2::Viewport::new(40., 30.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            layout.paint.background,
+            Some(PaintColor::Rgba(167, 139, 131, 255))
+        );
     }
 
     #[test]
