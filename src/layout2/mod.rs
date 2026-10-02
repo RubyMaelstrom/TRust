@@ -4499,6 +4499,50 @@ mod tests {
     }
 
     #[test]
+    fn aspect_ratio_transfers_min_and_max_heights_to_auto_widths() {
+        // CSS Sizing 4 #aspect-ratio-automatic sizes an auto width like a
+        // replaced element's (CSS 2 §10.3.2 from the used, min/max-clamped
+        // height), and #aspect-ratio-size-transfers carries definite
+        // min/max heights through the ratio to an indefinite min/max width:
+        // a transferred maximum also caps the automatic minimum
+        // (#aspect-ratio-minimum). Chromium gives every size below.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:13px/16px sans-serif">
+            <p><span id=a style="display:inline-block;height:80px;max-height:40px;aspect-ratio:1"></span></p>
+            <p><span id=b style="display:inline-block;height:20px;min-height:40px;aspect-ratio:2"></span></p>
+            <p><span id=c style="display:inline-block;min-height:50px;aspect-ratio:1"></span></p>
+            <p><span id=d style="display:inline-block;max-height:20px;aspect-ratio:1">some wide text here</span></p>
+            <div id=e style="aspect-ratio:2;max-height:50px">block</div>
+            <div id=f style="aspect-ratio:2;height:100px;max-height:50px">block</div>
+            <div><span id=g style="float:left;height:80px;max-height:30px;aspect-ratio:1"></span></div>
+            <div style="clear:both;float:left"><span id=h style="display:inline-block;min-height:50px;aspect-ratio:1"></span></div>
+            <p style="clear:both"><span id=i style="display:inline-block;height:20px;min-height:40px;min-width:10px;aspect-ratio:2"></span></p>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let size = |id: &str| {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (rect.width, rect.height)
+        };
+        for (id, expected) in [
+            ("a", (40.0, 40.0)),
+            ("b", (80.0, 40.0)),
+            ("c", (50.0, 50.0)),
+            ("d", (20.0, 20.0)),
+            ("e", (100.0, 50.0)),
+            ("f", (100.0, 50.0)),
+            ("h", (50.0, 50.0)),
+            ("i", (80.0, 40.0)),
+        ] {
+            assert_eq!(size(id), expected, "{id}");
+        }
+        // A float's auto width comes from its used height the same way.
+        assert_eq!(size("g").0, 30.0);
+        // The shrink-to-fit parent measures the transferred minimum.
+        let parent = dom.parent_flat(dom.get_by_id("h").unwrap()).unwrap();
+        assert_eq!(layout.boxes[&parent].width, 50.0);
+    }
+
+    #[test]
     fn image_dimension_attributes_accept_percentages() {
         // HTML #maps-to-the-dimension-property: width="25%" is 25% of the
         // containing block; a percentage height against an auto-height
