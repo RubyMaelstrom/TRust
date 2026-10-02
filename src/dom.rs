@@ -11460,11 +11460,42 @@ fn sprite_has_symbol(abs_url: &str, frag: &str) -> bool {
 /// Preserve symbol attributes and geometry without baking inherited paint
 /// from the source document. SVG 2 #UseStyleInheritance inherits from each
 /// <use> host, not the source symbol's ancestors.
+///
+/// SVG 2 #UseElement: the referenced element may be any element, notably a
+/// nested `svg` viewport (blog.google's sheet defines icons that way), a
+/// `symbol`, or another container or graphics element; those are the ones a
+/// `use` renders. The sheet's own root is not a reusable definition.
 fn build_sprite_symbols(text: &str) -> FxHashMap<String, String> {
     let dom = Dom::parse_document(text);
+    let root = dom
+        .descendants(DOCUMENT)
+        .into_iter()
+        .find(|&node| dom.tag_name(node) == Some("svg"));
     let mut out = FxHashMap::default();
     for sym in dom.descendants(DOCUMENT) {
-        if dom.tag_name(sym) != Some("symbol") {
+        if Some(sym) == root
+            || !matches!(
+                dom.tag_name(sym),
+                Some(
+                    "symbol"
+                        | "svg"
+                        | "g"
+                        | "a"
+                        | "switch"
+                        | "path"
+                        | "rect"
+                        | "circle"
+                        | "ellipse"
+                        | "line"
+                        | "polyline"
+                        | "polygon"
+                        | "text"
+                        | "image"
+                        | "use"
+                        | "foreignObject"
+                )
+            )
+        {
             continue;
         }
         let Some(frag) = dom.attr(sym, "id").filter(|s| !s.is_empty()) else {
@@ -19484,6 +19515,38 @@ mod tests {
             !dom.descendants(DOCUMENT)
                 .any(|n| matches!(dom.tag_name(n), Some("svg" | "use")))
         );
+    }
+
+    #[test]
+    fn external_sprite_use_may_reference_a_nested_svg_or_group() {
+        // SVG 2 #UseElement: the referenced element may be any element, not
+        // only a symbol; blog.google's sheet defines icons as nested svgs.
+        let base = url::Url::parse("https://sprite-nested.test/").unwrap();
+        prime_sprite_sheet(
+            "https://sprite-nested.test/sheet.svg",
+            r#"<svg xmlns="http://www.w3.org/2000/svg" id="sheet">
+                 <svg id="expand_more" width="24" height="24" viewBox="0 0 24 24"><path d="M2 2h20v20H2z"/></svg>
+                 <g id="group"><path d="M4 4h16v16H4z"/></g>
+               </svg>"#,
+        );
+        for fragment in ["expand_more", "group"] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<body><svg width="24" height="24" viewBox="0 0 24 24"><use href="/sheet.svg#{fragment}"/></svg></body>"#
+            ));
+            dom.rewrite_inline_svgs(Some(&base));
+            let img = dom
+                .descendants(DOCUMENT)
+                .find(|&n| dom.tag_name(n) == Some("img"))
+                .unwrap_or_else(|| panic!("#{fragment} becomes an <img>"));
+            let bytes = crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap();
+            let (raster, _) = crate::img::decode(&bytes).expect("the icon rasterizes");
+            assert_eq!(raster.to_rgba8().get_pixel(12, 12).0[3], 255, "#{fragment}");
+        }
+        // The sheet's root is not a reusable definition.
+        assert!(!sprite_has_symbol(
+            "https://sprite-nested.test/sheet.svg",
+            "sheet"
+        ));
     }
 
     #[test]
