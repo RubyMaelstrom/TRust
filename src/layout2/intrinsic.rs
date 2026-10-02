@@ -259,9 +259,12 @@ impl Flow<'_> {
         let side = |l: &Len| l.resolve(Some(0.0)).unwrap_or(0.0);
         // An iframe is replaced too: its nested document's content is not its
         // intrinsic size (HTML Rendering §15.4.1's 300×150 default object
-        // size is, once a cyclic percentage behaves as auto).
-        let frame =
-            b.node != NO_NODE && matches!(self.dom.tag_name(b.node), Some("iframe" | "frame"));
+        // size is, once a cyclic percentage behaves as auto). So are a
+        // replaced embed and object (#embedded-content-rendering-rules).
+        let frame = b.node != NO_NODE
+            && (matches!(self.dom.tag_name(b.node), Some("iframe" | "frame"))
+                || super::tree::embedded_representation(self.dom, b.node)
+                    == Some(super::tree::Embedded::Replaced));
         // CSS Sizing 3 #min-content-zero: non-button-like inputs, select,
         // textarea, progress and meter compress like replaced elements.
         let compressible_control = |atom: &super::tree::Atom| {

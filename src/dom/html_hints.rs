@@ -36,10 +36,11 @@ impl Dom {
             return;
         }
         let tag = self.tag_name(id).unwrap_or("");
-        // HTML #dimRendering maps iframe dimensions to CSS hints, including
-        // percentages. Keep these in the cascade so both the live box tree
-        // and presentation snapshots use them, and author `auto` can win.
-        if tag == "iframe" {
+        // HTML #dimRendering maps embed, iframe and object dimensions to CSS
+        // hints, including percentages. Keep these in the cascade so both the
+        // live box tree and presentation snapshots use them, and author
+        // `auto` can win.
+        if matches!(tag, "embed" | "iframe" | "object") {
             for property in ["width", "height"] {
                 if let Some(value) = self.attr(id, property).and_then(dimension_value) {
                     hint(property, value);
