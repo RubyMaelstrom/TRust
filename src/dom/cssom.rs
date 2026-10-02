@@ -528,8 +528,8 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "isolation" => one_of("auto isolate"),
         "filter" => crate::layout2::filter::valid(value),
         "clip-path" => value == "none" || crate::layout2::clip_path::supports(value),
-        "z-index" => value == "auto" || value.parse::<i32>().is_ok(),
-        "order" => value.parse::<i32>().is_ok(),
+        "z-index" => value == "auto" || crate::dom::css_integer(value).is_some(),
+        "order" => crate::dom::css_integer(value).is_some(),
         "column-count" => value == "auto" || value.parse::<u32>().is_ok_and(|n| n > 0),
         "flex-grow" | "flex-shrink" => value.parse::<f32>().is_ok_and(|n| n.is_finite() && n >= 0.),
         "opacity" | "fill-opacity" | "stroke-opacity" | "stop-opacity" => value

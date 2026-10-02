@@ -12104,6 +12104,22 @@ enum WideKeyword {
     Revert,
 }
 
+/// A CSS `<integer>` (an optional sign and digits). CSS Values 4
+/// #numeric-ranges clamps a value beyond the supported range to the closest
+/// one, so `z-index: 5000000000` is the largest z-index rather than invalid.
+pub(crate) fn css_integer(value: &str) -> Option<i32> {
+    let value = value.trim();
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(match value.parse::<i64>() {
+        Ok(number) => number.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        Err(_) if value.starts_with('-') => i32::MIN,
+        Err(_) => i32::MAX,
+    })
+}
+
 fn wide_keyword(v: &str) -> Option<WideKeyword> {
     let t = v.trim();
     // Fast bail on the first letter — this runs on every cascaded read.
@@ -22668,6 +22684,17 @@ mod tests {
             dom.serialize(c).contains("min-width:16rem"),
             "undefined --cell uses the fallback"
         );
+    }
+
+    #[test]
+    fn css_integers_clamp_to_the_supported_range() {
+        // CSS Values 4 #numeric-ranges.
+        assert_eq!(css_integer("5000000000"), Some(i32::MAX));
+        assert_eq!(css_integer("-99999999999999999999999"), Some(i32::MIN));
+        assert_eq!(css_integer(" +7 "), Some(7));
+        assert_eq!(css_integer("1.5"), None);
+        assert_eq!(css_integer("1e3"), None);
+        assert_eq!(css_integer("auto"), None);
     }
 
     #[test]

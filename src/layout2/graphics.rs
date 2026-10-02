@@ -8091,6 +8091,24 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_range_z_index_clamps_instead_of_dropping() {
+        // CSS Values 4 #numeric-ranges: `z-index: 5000000000` is the largest
+        // supported z-index, so the box paints above a later z-index:10 box.
+        let html = r#"<body style="margin:0">
+            <div style="position:absolute;width:50px;height:50px;background:#ff0000;z-index:5000000000"></div>
+            <div style="position:absolute;width:50px;height:50px;background:#0000ff;z-index:10"></div></body>"#;
+        let (_, layout) = render_fixture_with_images(html, &Default::default());
+        let fill = |color: PaintColor| {
+            layout.paint.primitives.iter().position(|command| {
+                matches!(command, DisplayCommand::Fill { brush: PaintBrush::Solid(c), .. } if *c == color)
+            })
+        };
+        let red = fill(PaintColor::Rgba(255, 0, 0, 255)).expect("red");
+        let blue = fill(PaintColor::Rgba(0, 0, 255, 255)).expect("blue");
+        assert!(red > blue, "red {red} must paint after blue {blue}");
+    }
+
+    #[test]
     fn background_position_longhands_place_each_axis() {
         // CSS Backgrounds 4 #background-position-longhands: background-position-y
         // bottom-aligns the image while the shorthand's x component stays.

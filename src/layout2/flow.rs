@@ -3973,7 +3973,7 @@ impl Flow<'_> {
         }
         self.dom
             .computed_value_resolved(node, "order")
-            .and_then(|v| v.trim().parse::<i32>().ok())
+            .and_then(|v| crate::dom::css_integer(&v))
             .unwrap_or(0)
     }
 
