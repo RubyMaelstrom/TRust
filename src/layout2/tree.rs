@@ -1936,9 +1936,11 @@ pub(super) fn declared_track_width(dom: &Dom, id: NodeId) -> Option<ColSpec> {
     if id == crate::layout2::NO_NODE {
         return None;
     }
+    // HTML Rendering #tables-2 maps the width attribute to 'width' with the
+    // rules for parsing non-zero dimension values (`width="450px;"` is 450).
     let raw = dom
         .computed_style(id, "width")
-        .or_else(|| dom.attr(id, "width").map(|s| s.trim().to_string()))?;
+        .or_else(|| dom.nonzero_dimension_attr(id, "width"))?;
     let raw = raw.trim();
     if raw.eq_ignore_ascii_case("auto") || raw.is_empty() {
         return None;

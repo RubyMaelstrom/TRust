@@ -35,6 +35,13 @@ impl Dom {
         })
     }
 
+    /// An attribute that maps to a dimension property ignoring zero, parsed
+    /// by HTML's rules for parsing non-zero dimension values: `"450px;"`
+    /// is 450 pixels and `"80%"` a percentage (as `450px`/`80%`).
+    pub(crate) fn nonzero_dimension_attr(&self, id: NodeId, name: &str) -> Option<String> {
+        self.attr(id, name).and_then(nonzero_dimension_value)
+    }
+
     pub(super) fn html_presentational_hints(
         &self,
         id: NodeId,
