@@ -14112,6 +14112,9 @@ fn valid_background_image(token: &str) -> bool {
         "cross-fade(",
         "radial-gradient(",
         "repeating-radial-gradient(",
+        // CSS Images 4 #gradients: <gradient> includes the conic forms.
+        "conic-gradient(",
+        "repeating-conic-gradient(",
     ]
     .iter()
     .any(|name| lower.starts_with(name))
@@ -22134,6 +22137,35 @@ mod tests {
             dom.computed_value_resolved(x, "background-repeat")
                 .as_deref(),
             Some("no-repeat")
+        );
+    }
+
+    #[test]
+    fn background_shorthand_accepts_conic_gradients() {
+        // CSS Backgrounds 3 #background: every <bg-layer> takes a <bg-image>,
+        // and CSS Images 4 #gradients makes conic-gradient() and
+        // repeating-conic-gradient() images like the linear and radial forms.
+        let dom = Dom::parse_document(
+            "<div id=x style='background:repeating-conic-gradient(from 45deg, #421d2c 0% 25%, \
+             #2d1b1b 0% 50%) 0 0 / 50px 50px, conic-gradient(red, blue) #2d1b1b'></div>",
+        );
+        let x = dom.get_by_id("x").unwrap();
+        let images = dom
+            .computed_value_resolved(x, "background-image")
+            .unwrap_or_default();
+        assert!(
+            images.starts_with("repeating-conic-gradient(from 45deg")
+                && images.contains("conic-gradient(red, blue)"),
+            "{images}"
+        );
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-size").as_deref(),
+            Some("50px 50px, auto auto")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-color")
+                .as_deref(),
+            Some("#2d1b1b")
         );
     }
 

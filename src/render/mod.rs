@@ -219,6 +219,19 @@ pub enum PaintBrush {
         interpolation: GradientInterpolation,
         repeat: bool,
     },
+    /// The stops run clockwise around `center` from `start_angle` to
+    /// `end_angle` (radians), measured from the gradient's 0deg ray: up,
+    /// turned clockwise by `rotation` (CSS Images 4 #conic-gradients).
+    /// Outside that range they are padded, or tiled around when `repeat`.
+    ConicGradient {
+        center: CssPoint,
+        rotation: f32,
+        start_angle: f32,
+        end_angle: f32,
+        stops: Vec<GradientStop>,
+        interpolation: GradientInterpolation,
+        repeat: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,7 +477,9 @@ impl PaintShape {
 impl PaintBrush {
     fn retained_bytes(&self) -> usize {
         match self {
-            PaintBrush::LinearGradient { stops, .. } | PaintBrush::RadialGradient { stops, .. } => {
+            PaintBrush::LinearGradient { stops, .. }
+            | PaintBrush::RadialGradient { stops, .. }
+            | PaintBrush::ConicGradient { stops, .. } => {
                 stops.capacity() * std::mem::size_of::<GradientStop>()
             }
             PaintBrush::Solid(_) => 0,

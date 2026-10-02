@@ -29,12 +29,12 @@ use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureVi
 use winit::window::Window;
 
 use super::vello_cpu::{
-    ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, decoration_strokes,
-    erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring, offset_shape,
-    outside_shape_path, point_bounds, radial_aspect_transform, radial_gradient, rect_is_visible,
-    rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect, text_shadow_blur,
-    vello_affine, vello_blend, vello_color, vello_css_filter, vello_rect, vello_stops,
-    vello_stroke,
+    ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, conic_transform,
+    decoration_strokes, erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring,
+    offset_shape, outside_shape_path, point_bounds, radial_aspect_transform, radial_gradient,
+    rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
+    text_shadow_blur, vello_affine, vello_blend, vello_color, vello_css_filter, vello_rect,
+    vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
@@ -1501,6 +1501,29 @@ fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
                     .with_interpolation_cs(interpolation.space)
                     .with_hue_direction(interpolation.hue)
                     .with_stops(stops.as_slice()),
+            );
+        }
+        PaintBrush::ConicGradient {
+            center,
+            rotation,
+            start_angle,
+            end_angle,
+            stops,
+            interpolation,
+            repeat,
+        } => {
+            let stops = vello_stops(stops);
+            target.set_paint_transform(conic_transform(*center, *rotation));
+            target.set_paint(
+                vello_common::peniko::Gradient::new_sweep(
+                    (f64::from(center.x), f64::from(center.y)),
+                    *start_angle,
+                    *end_angle,
+                )
+                .with_extend(gradient_extend(*repeat))
+                .with_interpolation_cs(interpolation.space)
+                .with_hue_direction(interpolation.hue)
+                .with_stops(stops.as_slice()),
             );
         }
     }
