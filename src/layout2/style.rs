@@ -468,15 +468,7 @@ impl BoxStyle {
             .map(str::trim)
         {
             None | Some("none" | "hidden") => 0.0,
-            _ => match cv(&format!("border-{side}-width"))
-                .as_deref()
-                .map(str::trim)
-            {
-                None | Some("medium") => 3.0,
-                Some("thin") => 1.0,
-                Some("thick") => 5.0,
-                Some(width) => css_length_px(width, u).unwrap_or(3.0).max(0.0),
-            },
+            _ => line_width(dom, cv(&format!("border-{side}-width")).as_deref(), u),
         };
         let position = match cv("position").as_deref().map(str::trim) {
             Some("relative") => Pos::Relative,
@@ -735,16 +727,24 @@ fn border_side(dom: &Dom, id: NodeId, side: &str, u: Units) -> f32 {
         Some("none") | Some("hidden") | None => return 0.0,
         _ => {}
     }
-    match dom
-        .computed_value_resolved(id, &format!("border-{side}-width"))
-        .as_deref()
-        .map(str::trim)
-    {
+    line_width(
+        dom,
+        dom.computed_value_resolved(id, &format!("border-{side}-width"))
+            .as_deref(),
+        u,
+    )
+}
+
+/// A computed `<line-width>` in CSS px, snapped as a line width (CSS
+/// Backgrounds 3 #border-width, CSS UI 4 #outline-width).
+fn line_width(dom: &Dom, value: Option<&str>, u: Units) -> f32 {
+    let px = match value.map(str::trim) {
         None | Some("medium") => 3.0,
         Some("thin") => 1.0,
         Some("thick") => 5.0,
-        Some(w) => css_length_px(w, u).unwrap_or(3.0).max(0.0),
-    }
+        Some(width) => css_length_px(width, u).unwrap_or(3.0).max(0.0),
+    };
+    super::snap_line_width(px, dom.device_pixel_ratio())
 }
 
 pub(crate) fn outline_of(dom: &Dom, id: NodeId, u: Units) -> Outline {
@@ -767,16 +767,11 @@ pub(crate) fn outline_of(dom: &Dom, id: NodeId, u: Units) -> Outline {
         Some("auto") => OutlineStyle::Auto,
         _ => OutlineStyle::None,
     };
-    let width = match dom
-        .computed_value_resolved(id, "outline-width")
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("medium") => 3.0,
-        Some("thin") => 1.0,
-        Some("thick") => 5.0,
-        Some(w) => css_length_px(w, u).unwrap_or(3.0).max(0.0),
-    };
+    let width = line_width(
+        dom,
+        dom.computed_value_resolved(id, "outline-width").as_deref(),
+        u,
+    );
     let offset = dom
         .computed_value_resolved(id, "outline-offset")
         .as_deref()

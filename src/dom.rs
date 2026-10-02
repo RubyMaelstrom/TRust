@@ -4736,15 +4736,20 @@ impl Dom {
         value
     }
 
-    /// A `<line-width>` computed value: its keyword's or length's px.
+    /// A `<line-width>` computed value: its keyword's or length's px,
+    /// snapped as a line width (CSS Values 4 #snap-a-length-as-a-line-width).
     fn cssom_line_width(&self, id: NodeId, width: &str) -> String {
-        match width.trim().to_ascii_lowercase().as_str() {
-            "thin" => "1px".into(),
-            "medium" => "3px".into(),
-            "thick" => "5px".into(),
-            other => crate::layout2::absolute_css_length(self, id, other)
-                .map_or_else(|| width.to_string(), |px| format!("{px}px")),
-        }
+        let px = match width.trim().to_ascii_lowercase().as_str() {
+            "thin" => 1.0,
+            "medium" => 3.0,
+            "thick" => 5.0,
+            other => match crate::layout2::absolute_css_length(self, id, other) {
+                Some(px) => px,
+                None => return width.to_string(),
+            },
+        };
+        let px = crate::layout2::snap_line_width(px, self.device_pixel_ratio);
+        format!("{px}px")
     }
 
     /// The resolved value of color property `name` whose computed value is
