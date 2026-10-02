@@ -3827,7 +3827,9 @@ mod tests {
         let body = r#"<body style="margin:0;font:16px sans-serif">
             <div id=a style="width:100px"><img width=20 height=20><br><a href=#><img width=20 height=20></a><br></div>
             <div id=b>x<br><br>y</div><div id=e>x</div>
-            <div id=d style="font-size:40px;line-height:48px"><span style="font-size:10px;line-height:13px">small</span></div>"#;
+            <div id=d style="font-size:40px;line-height:48px"><span style="font-size:10px;line-height:13px">small</span></div>
+            <div id=f style="line-height:30px"><img width=20 height=20> <img width=20 height=20></div>
+            <div id=g style="line-height:30px"> <img width=20 height=20> </div>"#;
         for (doctype, images, small) in [
             ("", 40.0, 13.0),
             (
@@ -3847,6 +3849,17 @@ mod tests {
                 height("a")
             );
             assert_eq!(height("d"), small, "{doctype}");
+            // #the-line-height-calculation-quirk: an uncollapsed space
+            // between images is text; collapsed edge spaces are not.
+            assert_eq!(height("f"), 30.0, "{doctype}");
+            assert_eq!(
+                height("g"),
+                if doctype == "<!DOCTYPE html>" {
+                    30.0
+                } else {
+                    20.0
+                }
+            );
             assert_eq!(
                 height("b"),
                 3.0 * height("e"),

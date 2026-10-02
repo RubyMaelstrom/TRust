@@ -2164,12 +2164,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
         self.pen += shift;
         let no_strut = crate::text::ShapedText::default();
+        // Quirks #the-line-height-calculation-quirk: whitespace that
+        // survives collapsing, such as a space between two images (held as
+        // the next piece's `space_before`), is text too.
         let strut = if let Some(root) = self.quirky_strut_root
             && !pieces.is_empty()
-            && !pieces
-                .iter()
-                .any(|piece| piece.text_style.is_some() && piece.item.style_node == root)
-        {
+            && !pieces.iter().enumerate().any(|(index, piece)| {
+                (piece.text_style.is_some() && piece.item.style_node == root)
+                    || (index > 0 && piece.space_before)
+            }) {
             &no_strut
         } else {
             &self.strut
