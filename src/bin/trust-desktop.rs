@@ -8932,11 +8932,11 @@ mod tests {
                         color: PaintColor::Rgba(20, 150, 80, 255),
                     },
                     DisplayCommand::PopClip,
-                    DisplayCommand::PushLayer(trust::render::CompositingLayer {
-                        opacity: 0.75,
-                        blend: trust::render::BlendMode::Multiply,
-                        filters: Default::default(),
-                    }),
+                    DisplayCommand::PushLayer(trust::render::CompositingLayer::new(
+                        0.75,
+                        trust::render::BlendMode::Multiply,
+                        Default::default(),
+                    )),
                     DisplayCommand::FillRect {
                         rect: CssRect::new(42.0, 16.0, 1.0, 19.0),
                         color: PaintColor::Rgba(20, 30, 40, 255),
