@@ -3576,7 +3576,7 @@ fn paint_inline_box_decorations(
     anonymous_line: bool,
 ) {
     struct Run {
-        node: NodeId,
+        node: super::inline::InlineBoxKey,
         left: f32,
         right: f32,
         top: f32,
@@ -3634,8 +3634,18 @@ fn paint_inline_box_decorations(
         }
     }
     for run in runs {
-        let style = PaintStyle::Element(run.node);
-        if builder.dom.visibility_hidden(run.node) {
+        let (node, pseudo) = run.node;
+        let style = match pseudo {
+            None => PaintStyle::Element(node),
+            Some(which) => PaintStyle::Pseudo(node, which),
+        };
+        let hidden = match pseudo {
+            None => builder.dom.visibility_hidden(node),
+            Some(_) => style
+                .value(builder.dom, "visibility")
+                .is_some_and(|value| matches!(value.trim(), "hidden" | "collapse")),
+        };
+        if hidden {
             continue;
         }
         let (top, bottom) = if run.top.is_finite() {
@@ -3644,7 +3654,12 @@ fn paint_inline_box_decorations(
             let baseline = fragment.y + line.baseline;
             (baseline - line.ascent, baseline + line.descent)
         };
-        let box_style = super::style::BoxStyle::of(builder.dom, run.node, builder.viewport());
+        let box_style = match pseudo {
+            None => super::style::BoxStyle::of(builder.dom, node, builder.viewport()),
+            Some(which) => {
+                super::style::BoxStyle::of_pseudo(builder.dom, node, which, builder.viewport())
+            }
+        };
         let basis = Some(fragment.w);
         let pad = |side: usize| box_style.padding[side].resolve(basis).unwrap_or(0.0);
         let [bt, br, bb, bl] = box_style.border;
@@ -3664,9 +3679,11 @@ fn paint_inline_box_decorations(
         if rect.width <= 0.0 || rect.height <= 0.0 {
             continue;
         }
+        let mut paint = fragment.paint.clone();
+        paint.pseudo = pseudo.map(|which| (node, which));
         let decoration = Frag {
             flow: fragment.flow.clone(),
-            node: run.node,
+            node,
             x: rect.x,
             y: rect.y,
             w: rect.width,
@@ -3675,7 +3692,7 @@ fn paint_inline_box_decorations(
             css_size: None,
             content_size: None,
             content_offset: [border[3], border[0]],
-            paint: fragment.paint.clone(),
+            paint,
             clip: fragment.clip,
             kind: FragKind::Block,
             children: Vec::new(),
@@ -3690,14 +3707,14 @@ fn paint_inline_box_decorations(
             radii.corners[2] = (0.0, 0.0);
         }
         let scroll_depth = if fragment.paint.outside_marker {
-            builder.push_scroll_ancestors(run.node)
+            builder.push_scroll_ancestors(node)
         } else if anonymous_line {
-            builder.push_scroll_content_chain(run.node)
+            builder.push_scroll_content_chain(node)
         } else {
             0
         };
         let clipped = anonymous_line
-            .then(|| builder.ancestor_clip(run.node, fragment.clip))
+            .then(|| builder.ancestor_clip(node, fragment.clip))
             .flatten()
             .is_some_and(|clip| builder.push_hard_clip(clip));
         let shape = rounded_shape(rect, radii);
@@ -5548,6 +5565,45 @@ mod tests {
             images,
         );
         (dom, layout)
+    }
+
+    #[test]
+    fn generated_inline_boxes_paint_their_backgrounds_and_borders() {
+        // CSS Pseudo 4 #treelike: ::before/::after and ::first-letter boxes
+        // are styleable inline boxes. A badge's white text is unreadable
+        // without its background.
+        let count = |rule: &str, rgb: [u8; 3]| {
+            let (_, layout) = render_fixture(&format!(
+                "<style>body{{margin:0;background:white;font:20px sans-serif}} {rule}</style>\
+                 <p class=a>Headline text</p>"
+            ));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[..3] == rgb)
+                .count()
+        };
+        let red = [255, 0, 0];
+        assert!(
+            count(
+                ".a::before{content:'NEW';background:red;color:white;padding:0 4px}",
+                red
+            ) > 300
+        );
+        assert!(count(".a::after{content:'tag';border:3px solid red}", red) > 100);
+        assert!(count(".a::first-letter{background:red}", red) > 100);
+        assert_eq!(
+            count(
+                ".a::before{content:'NEW';background:red;visibility:hidden}",
+                red
+            ),
+            0
+        );
     }
 
     #[test]
