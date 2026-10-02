@@ -4373,6 +4373,18 @@ impl Dom {
         if let Some(physical) = self.logical_property(id, None, name) {
             return self.computed_value(id, &physical);
         }
+        // CSS Position 3 #position-property: absolute and fixed positioning
+        // make `float` compute to `none`.
+        if name == "float"
+            && matches!(
+                self.computed_value(id, "position")
+                    .as_deref()
+                    .map(str::trim),
+                Some("absolute" | "fixed")
+            )
+        {
+            return Some("none".into());
+        }
         if let Some(value) = self.transitions.value(id, name) {
             return Some(value);
         }

@@ -4379,6 +4379,25 @@ mod tests {
     }
 
     #[test]
+    fn a_block_level_static_position_ignores_floats() {
+        // CSS Position 3 #staticpos-rect: the hypothetical static box of a
+        // block-level element ignores floats as block boxes do (CSS 2
+        // §9.5), and absolute positioning makes `float` compute to none.
+        let html = r#"<!doctype html><body style="margin:0"><div style="float:left;width:200px;height:50px"></div>
+            <div id=f style="position:absolute;width:10px;height:10px"></div>
+            <div id=g style="position:absolute;float:left;top:150px;width:10px;height:10px"></div>
+            <span id=i style="position:absolute;width:10px;height:10px"></span>x</body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &HashMap::new());
+        let left = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].left;
+        assert_eq!(left("f"), 0.0);
+        assert_eq!(left("g"), 0.0);
+        assert_eq!(left("i"), 200.0, "an inline-level one stays on the line");
+        let g = dom.get_by_id("g").unwrap();
+        assert_eq!(dom.computed_value(g, "float").as_deref(), Some("none"));
+    }
+
+    #[test]
     fn relative_offsets_do_not_move_an_inline_block_baseline() {
         // CSS 2 §10.8.1: an inline-block's baseline is its last line box's
         // in normal flow; relative offsets are visual (CSS Position 3 §3.4).
