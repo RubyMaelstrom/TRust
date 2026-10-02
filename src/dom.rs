@@ -11172,12 +11172,12 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         "before" | "after" | "first-letter" | "slotted"
                     )
                 {
-                    if name == "backdrop" && arg.is_none() {
-                        // CSS Positioned Layout 4 §3.2 defines ::backdrop as a
-                        // valid pseudo-element. It has no ordinary DOM element
-                        // subject, but its presence must not invalidate a
-                        // strict selector list such as the common
-                        // `*,:before,:after,::backdrop` reset rule.
+                    if unrendered_pseudo_element(&name, arg.is_some()) {
+                        // Defined pseudo-elements we do not render (e.g. CSS
+                        // Positioned Layout 4 §3.2 ::backdrop) are still valid:
+                        // their presence must not invalidate a strict selector
+                        // list such as the common `*,:before,:after,::backdrop`
+                        // reset rule or `h1, p::first-line`.
                         compound.never = true;
                         compound.inert_pseudo_element = true;
                         continue;
@@ -11374,6 +11374,10 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                 } else if matches!(name.as_str(), "active" | "focus-visible" | "visited") {
                     compound.never = true;
                     compound.pseudos += 1;
+                } else if name == "first-line" && arg.is_none() {
+                    // CSS2's single-colon spelling of a pseudo-element.
+                    compound.never = true;
+                    compound.inert_pseudo_element = true;
                 } else {
                     return None;
                 }
@@ -11386,6 +11390,40 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
         }
     }
     Some(compound)
+}
+
+/// Pseudo-elements defined by CSS Pseudo 4, Shadow Parts, Highlight API,
+/// WebVTT and View Transitions that this engine parses but does not render.
+fn unrendered_pseudo_element(name: &str, functional: bool) -> bool {
+    if functional {
+        matches!(
+            name,
+            "part"
+                | "highlight"
+                | "cue"
+                | "picker"
+                | "view-transition-group"
+                | "view-transition-image-pair"
+                | "view-transition-old"
+                | "view-transition-new"
+        )
+    } else {
+        matches!(
+            name,
+            "backdrop"
+                | "first-line"
+                | "selection"
+                | "placeholder"
+                | "marker"
+                | "file-selector-button"
+                | "target-text"
+                | "spelling-error"
+                | "grammar-error"
+                | "cue"
+                | "details-content"
+                | "view-transition"
+        )
+    }
 }
 
 /// An identifier, `*`, or tag token, with CSS ident ESCAPES decoded
@@ -17283,6 +17321,28 @@ mod tests {
         let parsed = SelectorList::parse(":is(.image, #absent::-webkit-unknown)").unwrap();
         assert!(dom.matches(cover, &parsed));
         assert_eq!(parsed.0[0].specificity(), (0, 1, 0));
+    }
+
+    #[test]
+    fn defined_pseudo_elements_keep_selector_lists_valid() {
+        // Selectors 4 #invalid: only an unknown pseudo-element invalidates a
+        // selector list. Defined ones we do not render match nothing, while
+        // their list's other selectors still apply.
+        let dom = Dom::parse_document(
+            "<style>h1, p::selection, p:first-line, ::placeholder, li::marker, \
+             ::part(label), ::highlight(found), ::file-selector-button { color: red } \
+             h2, ::-moz-selection { color: red }</style><h1 id=a>a</h1><h2 id=b>b</h2><p id=c>c</p>",
+        );
+        let color = |id: &str| dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "color");
+        assert_eq!(color("a").as_deref(), Some("red"));
+        assert_ne!(
+            color("b").as_deref(),
+            Some("red"),
+            "an unknown pseudo-element"
+        );
+        assert_ne!(color("c").as_deref(), Some("red"));
+        assert!(selector_parses("p::first-line"));
+        assert!(!selector_parses("p::bogus"));
     }
 
     #[test]
