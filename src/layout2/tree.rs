@@ -708,15 +708,21 @@ impl Builder<'_> {
             Disp::Inline => {
                 let kids = self.children(id);
                 if kids.iter().any(Built::is_block) {
-                    // Block-in-inline: promote (see module docs).
-                    Built::Block(Arc::new(self.assemble(
-                        id,
-                        BoxStyle::of(self.dom, id, self.vp),
-                        kids,
-                        None,
-                        None,
-                        false,
-                    )))
+                    // Block-in-inline: promote (see module docs). The element
+                    // is still a non-replaced inline box, to which the sizing
+                    // properties do not apply (CSS 2 §§10.2, 10.4, 10.5, 10.7;
+                    // css-sizing-4 #aspect-ratio): its blocks keep the full
+                    // width, as with an object's fallback whose dimension
+                    // attributes map to width/height (HTML #dimRendering).
+                    let mut style = BoxStyle::of(self.dom, id, self.vp);
+                    style.width = super::value::Len::Auto;
+                    style.height = super::value::Len::Auto;
+                    style.min_width = super::value::Len::Auto;
+                    style.min_height = super::value::Len::Auto;
+                    style.max_width = super::value::Len::None;
+                    style.max_height = super::value::Len::None;
+                    style.aspect_ratio = None;
+                    Built::Block(Arc::new(self.assemble(id, style, kids, None, None, false)))
                 } else {
                     Built::Inline(Inline::Box {
                         node: id,
