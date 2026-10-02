@@ -386,8 +386,10 @@ pub(crate) fn resolve_flexible_lengths(inner_main: f32, items: &mut [FlexCalc]) 
 
 /// §9.5 justify-content distribution: `(leading offset, extra between each
 /// adjacent pair)` for `free` space over `n` items. Negative free space
-/// falls back per css-align: `space-between` packs to the start,
-/// `space-around`/`space-evenly` center.
+/// takes css-align-3 #distribution-values' fallbacks: `space-between` is
+/// `safe flex-start` and `space-around`/`space-evenly` are `safe center`,
+/// which overflow toward the end rather than past the start edge; plain
+/// `center` and `end` stay unsafe.
 pub(crate) fn justify_offsets(justify: Justify, free: f32, n: usize) -> (f32, f32) {
     if n == 0 {
         return (0.0, 0.0);
@@ -395,7 +397,7 @@ pub(crate) fn justify_offsets(justify: Justify, free: f32, n: usize) -> (f32, f3
     if free <= 0.0 {
         return match justify {
             Justify::End => (free, 0.0),
-            Justify::Center | Justify::Around | Justify::Evenly => (free / 2.0, 0.0),
+            Justify::Center => (free / 2.0, 0.0),
             _ => (0.0, 0.0),
         };
     }
@@ -438,6 +440,17 @@ pub(crate) fn align_content_offsets(align: AlignContent, free: f32, n: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributed_justification_falls_back_to_safe_alignment() {
+        // css-align-3: overflowing space-around/space-evenly items are safely
+        // centered, i.e. start-aligned; an explicit center stays unsafe.
+        assert_eq!(justify_offsets(Justify::Around, -40.0, 2), (0.0, 0.0));
+        assert_eq!(justify_offsets(Justify::Evenly, -40.0, 2), (0.0, 0.0));
+        assert_eq!(justify_offsets(Justify::Between, -40.0, 2), (0.0, 0.0));
+        assert_eq!(justify_offsets(Justify::Center, -40.0, 2), (-20.0, 0.0));
+        assert_eq!(justify_offsets(Justify::Around, 40.0, 2), (10.0, 20.0));
+    }
 
     fn calc(base: f32, min: f32, max: f32, grow: f32, shrink: f32) -> FlexCalc {
         FlexCalc::new(base, min, max, grow, shrink, 0.0)
@@ -517,8 +530,9 @@ mod tests {
         assert_eq!(justify_offsets(Justify::Between, 100.0, 3), (0.0, 50.0));
         assert_eq!(justify_offsets(Justify::Around, 100.0, 2), (25.0, 50.0));
         assert_eq!(justify_offsets(Justify::Evenly, 90.0, 2), (30.0, 30.0));
-        // Overflow fallbacks: between → start, around/evenly → center.
+        // Overflow fallbacks: between → safe flex-start, around/evenly →
+        // safe center (start-aligned when overflowing; LibreWolf agrees).
         assert_eq!(justify_offsets(Justify::Between, -40.0, 2), (0.0, 0.0));
-        assert_eq!(justify_offsets(Justify::Around, -40.0, 2), (-20.0, 0.0));
+        assert_eq!(justify_offsets(Justify::Around, -40.0, 2), (0.0, 0.0));
     }
 }
