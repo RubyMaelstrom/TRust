@@ -7599,11 +7599,18 @@ fn collect_image_urls_for_boxes(
             .flatten()
             .map(str::trim)
             .filter(|source| !source.is_empty());
+        // HTML #image-button-state-(type=image): the button's image.
+        let image_button = (dom.tag_name(id) == Some("input") && dom.input_type(id) == "image")
+            .then(|| dom.attr(id, "src"))
+            .flatten()
+            .map(str::trim)
+            .filter(|source| !source.is_empty());
         let Some(src) = selected
             .as_ref()
             .map(|selected| selected.source.as_str())
             .or(svg.as_deref())
             .or(poster)
+            .or(image_button)
         else {
             continue;
         };

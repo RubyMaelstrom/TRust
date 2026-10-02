@@ -426,6 +426,7 @@ impl Flow<'_> {
                 density,
                 dimension_source,
                 alt,
+                ..
             } => {
                 let natural = crate::responsive_image::density_corrected_size(
                     url.as_deref()

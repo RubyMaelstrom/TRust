@@ -4905,6 +4905,27 @@ mod tests {
     }
 
     #[test]
+    fn image_button_inputs_render_their_image() {
+        // HTML Rendering #images-3 renders an input in the Image Button state
+        // like an img: its width and height attributes size the replaced box
+        // (Gecko and Blink), rather than a "Submit" push button.
+        let html = r#"<!doctype html><body style="margin:0"><form>
+            <input id=i type=image src="go.png" width=35 height=24></form>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let input = dom.get_by_id("i").unwrap();
+        let rect = layout.boxes[&input];
+        assert_eq!((rect.width, rect.height), (35.0, 24.0));
+        // The picture still submits its form.
+        assert!(layout.paint.primitives.iter().any(|primitive| matches!(
+            primitive,
+            crate::render::DisplayCommand::HitRegion(region)
+                if region.node == input
+                    && matches!(region.link, Some(crate::doc::Link::Form { .. }))
+        )));
+    }
+
+    #[test]
     fn a_tables_width_attribute_uses_html_dimension_parsing() {
         // HTML Rendering #tables-2 maps the width attribute with the rules
         // for parsing non-zero dimension values, which read leading digits:

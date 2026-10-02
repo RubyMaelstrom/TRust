@@ -1729,12 +1729,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 density,
                 dimension_source,
                 alt,
+                control,
             } => self.image(
                 a.node,
                 *dimension_source,
                 url.as_deref(),
                 *density,
                 alt,
+                *control,
                 ctx,
                 can_wrap,
             ),
@@ -2061,6 +2063,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         url: Option<&str>,
         density: f32,
         alt: &str,
+        control: Option<(usize, usize)>,
         ctx: &InlineStyle,
         can_wrap: bool,
     ) {
@@ -2071,9 +2074,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // representation underneath becomes an unreachable link (X-style
         // players). Association is by the standardized poster URL and nearest
         // containing band, never by a class or host name.
-        let link = url
-            .and_then(|u| poster_media_target(self.dom, self.base, node, u))
-            .map(Link::Media)
+        let link = control
+            .map(|(form, field)| Link::Form { form, field })
+            .or_else(|| {
+                url.and_then(|u| poster_media_target(self.dom, self.base, node, u))
+                    .map(Link::Media)
+            })
             .or_else(|| ctx.link.clone());
         let natural = crate::responsive_image::density_corrected_size(
             url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
