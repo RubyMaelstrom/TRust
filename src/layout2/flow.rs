@@ -2148,9 +2148,12 @@ impl Flow<'_> {
     /// the 150px max-content fallback. (`tree::frame` has already supplied the
     /// same default when the computed value itself is `auto`.)
     fn iframe_auto_height(&self, b: &BoxNode, s: &BoxStyle, bt: f32, bb: f32) -> Option<f32> {
-        (b.node != NO_NODE && matches!(self.dom.tag_name(b.node), Some("iframe" | "frame")))
-            .then(|| self.height_px(&Len::px(150.0), s, bt, bb, Some(150.0)))
-            .flatten()
+        (b.node != NO_NODE
+            && (matches!(self.dom.tag_name(b.node), Some("iframe" | "frame"))
+                || super::tree::embedded_representation(self.dom, b.node)
+                    == Some(super::tree::Embedded::Replaced)))
+        .then(|| self.height_px(&Len::px(150.0), s, bt, bb, Some(150.0)))
+        .flatten()
     }
 
     /// Whether `node`'s own Document (a frame's, not the top-level page's)

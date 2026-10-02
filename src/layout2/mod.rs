@@ -4016,6 +4016,52 @@ mod tests {
     }
 
     #[test]
+    fn embed_and_resource_objects_are_replaced_boxes() {
+        // HTML Rendering #embedded-content-rendering-rules: embed, and an
+        // object that represents its resource, are replaced elements whose
+        // width/height attributes map to the dimension properties
+        // (#dimRendering), with the 300×150 default object size. A hidden
+        // 0×0 player still yields a strut-high line (CSS 2 §9.4.2). An embed
+        // with neither src nor type represents nothing; an object without
+        // data or with a plugin type shows its fallback content.
+        let html = r#"<!DOCTYPE html><body style="margin:8px;font:16px/20px sans-serif">
+            <style>p{margin:18px 0;height:20px}</style>
+            <p id=p1></p><embed id=hidden src="a.mp3" width=0 height=0>
+            <p id=p2></p><embed id=unsized src="a.mp3">
+            <p id=p3></p>
+            <div id=nothing><embed width=50 height=30></div>
+            <div id=player><object id=obj data="a.mp3" width=0 height=0></object></div>
+            <div id=sized><object id=page data="page.html" style="width:80px;height:40px;padding:5px">fallback</object></div>
+            <div id=flash><object data="x.swf" type="application/x-shockwave-flash"><embed id=inner src="x.swf" width=40 height=20></object></div>
+            <div id=nodata><object>no data</object></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let gap = |a: &str, b: &str| rect(b).top - (rect(a).top + rect(a).height);
+        assert_eq!(gap("p1", "p2"), 18.0 + 20.0 + 18.0, "the 0×0 embed's line");
+        assert_eq!((rect("hidden").width, rect("hidden").height), (0.0, 0.0));
+        assert_eq!(
+            (rect("unsized").width, rect("unsized").height),
+            (300.0, 150.0)
+        );
+        assert!(gap("p2", "p3") > 18.0 + 150.0 + 18.0, "{}", gap("p2", "p3"));
+        assert_eq!(rect("nothing").height, 0.0, "no src and no type: no box");
+        assert_eq!(rect("player").height, 20.0);
+        assert_eq!((rect("obj").width, rect("obj").height), (0.0, 0.0));
+        assert_eq!((rect("page").width, rect("page").height), (90.0, 50.0));
+        assert!(
+            !layout.paint.primitives.iter().any(|primitive| matches!(
+                primitive,
+                crate::render::Primitive::GlyphRun { shaped, .. } if shaped.text.contains("fallback")
+            )),
+            "a represented resource hides the fallback content"
+        );
+        // An unsupported plugin type falls back to the nested embed.
+        assert_eq!((rect("inner").width, rect("inner").height), (40.0, 20.0));
+        graphical_text(&layout, "no data");
+    }
+
+    #[test]
     fn quirks_percentage_heights_skip_auto_height_blocks() {
         // Quirks Mode #the-percentage-height-calculation-quirk: auto-height
         // block containers are skipped up to the body, which (with the root)

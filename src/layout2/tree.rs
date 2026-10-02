@@ -466,9 +466,77 @@ impl Built {
 /// `<svg>` was already rewritten to `<img data:…>` by `rewrite_inline_svgs`;
 /// what remains here has no terminal rendering.
 const SKIP: &[&str] = &[
-    "base", "head", "link", "math", "meta", "noscript", "object", "script", "style", "template",
-    "title", "wbr", "area", "map", "datalist",
+    "base", "head", "link", "math", "meta", "noscript", "script", "style", "template", "title",
+    "wbr", "area", "map", "datalist",
 ];
+
+/// How an `embed` or `object` element renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Embedded {
+    /// HTML #the-embed-element: it represents nothing; no box.
+    Nothing,
+    /// HTML Rendering #embedded-content-rendering-rules: a replaced element.
+    Replaced,
+    /// HTML #the-object-element "fallback": the object represents its
+    /// children and renders as an ordinary element.
+    Fallback,
+}
+
+/// HTML #the-embed-element / #the-object-element and HTML Rendering
+/// #embedded-content-rendering-rules, for a user agent without plugins
+/// that does not load these elements' resources. `None` for other elements.
+///
+/// An `embed` with a non-empty `src` is a replaced element; one with no
+/// `src` and no `type` represents nothing. Gecko and Blink agree on both.
+/// For `type` alone or an empty `src` (which never runs the setup steps
+/// or displays no plugin) Blink still draws a box and Gecko draws none;
+/// TRust follows Gecko, consistent with representing nothing.
+///
+/// An `object` with no `data`, or whose `type` is not one TRust can show,
+/// uses its fallback content. Otherwise it would represent its resource,
+/// as an image or a content navigable, so it is a replaced element.
+pub(crate) fn embedded_representation(dom: &Dom, id: NodeId) -> Option<Embedded> {
+    if dom.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
+        return None;
+    }
+    match dom.tag_name(id)? {
+        "embed" => Some(if dom.attr(id, "src").is_some_and(|src| !src.is_empty()) {
+            Embedded::Replaced
+        } else {
+            Embedded::Nothing
+        }),
+        "object" => Some(
+            if dom.attr(id, "data").is_some_and(|data| !data.is_empty())
+                && dom.attr(id, "type").is_none_or(object_type_supported)
+            {
+                Embedded::Replaced
+            } else {
+                Embedded::Fallback
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// HTML #the-object-element: "If the type attribute is present and its
+/// value is not a type that the user agent supports, then the user agent
+/// may jump to the step below labeled fallback". TRust has no plugins; it
+/// can present documents, text, images and media. An empty value is not a
+/// type and is ignored, as in Gecko and Blink.
+fn object_type_supported(value: &str) -> bool {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence.is_empty()
+        || ["image/", "text/", "audio/", "video/"]
+            .iter()
+            .any(|prefix| essence.starts_with(prefix))
+        || essence.ends_with("+xml")
+        || matches!(essence.as_str(), "application/xml" | "application/pdf")
+}
 
 struct Builder<'a> {
     dom: &'a Dom,
@@ -529,6 +597,18 @@ impl Builder<'_> {
         // dimension attributes supplies a size.
         if matches!(tag, "iframe" | "frame") {
             return self.frame(id, disp);
+        }
+        // HTML Rendering #embedded-content-rendering-rules: an `embed`, and an
+        // `object` representing its resource, are replaced elements too.
+        // TRust neither has plugins nor loads their resources, so the box is
+        // an empty one of the same default object size, its width/height
+        // attributes mapping to the dimension properties (#dimRendering).
+        // A hidden 0×0 music player is still an atomic inline on its own
+        // line (CSS 2 §9.4.2), not a phantom line.
+        match embedded_representation(self.dom, id) {
+            Some(Embedded::Nothing) => return Built::Skip,
+            Some(Embedded::Replaced) => return self.frame(id, disp),
+            Some(Embedded::Fallback) | None => {}
         }
         // Replaced elements are atomic regardless of their content model.
         if tag == "br" {
@@ -667,11 +747,11 @@ impl Builder<'_> {
         let root = self.dom.frame_root(id);
         let mut style = BoxStyle::of(self.dom, id, self.vp);
         let dimension = |name: &str, fallback: f32| {
-            // Iframe dimension attributes already participate in the cascade.
-            // An authored auto must use the default object size, not revive
-            // the lower-priority attribute. Legacy <frame> still uses its
-            // existing fallback path.
-            if self.dom.tag_name(id) == Some("iframe") {
+            // Iframe, embed and object dimension attributes already
+            // participate in the cascade. An authored auto must use the
+            // default object size, not revive the lower-priority attribute.
+            // Legacy <frame> still uses its existing fallback path.
+            if self.dom.tag_name(id) != Some("frame") {
                 return fallback;
             }
             self.dom
