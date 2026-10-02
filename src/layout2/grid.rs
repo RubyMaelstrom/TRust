@@ -1010,7 +1010,27 @@ fn size_tracks_constrained(
 ) {
     let n_live = tracks.iter().filter(|t| !t.collapsed).count();
     let gaps_total = gap * (n_live.saturating_sub(1)) as f32;
+    // Free space for flexible tracks excludes the gutters; percentages are
+    // of the grid container's whole content box (CSS Grid 1 §7.2.1).
     let track_avail = avail.map(|a| (a - gaps_total).max(0.0));
+
+    // CSS Grid 2 §7.2.1: a percentage track size against an indefinite
+    // size is treated as auto while sizing; the caller then resolves it
+    // against the resulting container size.
+    let declared: Option<Vec<TrackSize>> = avail.is_none().then(|| {
+        tracks
+            .iter_mut()
+            .map(|t| {
+                let declared = t.size.clone();
+                for function in [&mut t.size.min, &mut t.size.max] {
+                    if matches!(function, TrackFn::Fixed(l) if l.resolve(None).is_none()) {
+                        *function = TrackFn::Auto;
+                    }
+                }
+                declared
+            })
+            .collect()
+    });
 
     // §11.4 initialize.
     for t in tracks.iter_mut() {
@@ -1019,10 +1039,10 @@ fn size_tracks_constrained(
             t.limit = 0.0;
             continue;
         }
-        t.base = t.size.min.definite(track_avail).unwrap_or(0.0);
+        t.base = t.size.min.definite(avail).unwrap_or(0.0);
         t.limit = match &t.size.max {
             TrackFn::Fixed(l) => l
-                .resolve(track_avail)
+                .resolve(avail)
                 .map(|v| v.max(0.0))
                 .unwrap_or(f32::INFINITY),
             _ => f32::INFINITY,
@@ -1091,7 +1111,7 @@ fn size_tracks_constrained(
                         };
                     }
                     TrackFn::FitContent(l) => {
-                        let cap = l.resolve(track_avail).unwrap_or(f32::INFINITY);
+                        let cap = l.resolve(avail).unwrap_or(f32::INFINITY);
                         let v = if t.limit.is_infinite() {
                             c.max
                         } else {
@@ -1264,6 +1284,21 @@ fn size_tracks_constrained(
     if stretch && let Some(av) = avail {
         stretch_auto_tracks(tracks, av, gap);
     }
+    if let Some(declared) = declared {
+        for (track, size) in tracks.iter_mut().zip(declared) {
+            track.size = size;
+        }
+    }
+}
+
+/// Whether a track list holds a percentage that an indefinite size leaves
+/// unresolved (CSS Grid 2 §7.2.1).
+fn has_indefinite_percentage(tracks: &[Track]) -> bool {
+    tracks.iter().any(|t| {
+        [&t.size.min, &t.size.max]
+            .into_iter()
+            .any(|function| matches!(function, TrackFn::Fixed(l) if l.resolve(None).is_none()))
+    })
 }
 
 /// §11.8 Stretch auto Tracks: share the free space left in `avail` (this
@@ -2266,6 +2301,7 @@ impl Flow<'_> {
             })
             .collect();
         let ac = cv("align-content");
+        let mut resolved_row_height = None;
         if let Some(input) = &inherited {
             self.subgrid_rows
                 .borrow_mut()
@@ -2290,10 +2326,26 @@ impl Flow<'_> {
             if def_ch.is_none() && min_ch > 0.0 && dist_stretches(ac.as_deref()) {
                 stretch_auto_tracks(&mut rows, min_ch, gap_row);
             }
+            // CSS Grid 2 §7.2.1: percentage rows sized as auto above set the
+            // container's height, then resolve against it.
+            if def_ch.is_none() && has_indefinite_percentage(&rows) {
+                let live = rows.iter().filter(|t| !t.collapsed).count();
+                let height = (rows.iter().map(|t| t.base).sum::<f32>()
+                    + gap_row * live.saturating_sub(1) as f32)
+                    .max(min_ch);
+                size_tracks(
+                    &mut rows,
+                    &row_contribs,
+                    Some(height),
+                    gap_row,
+                    dist_stretches(ac.as_deref()),
+                );
+                resolved_row_height = Some(height);
+            }
             positions(
                 &rows,
                 gap_row,
-                def_ch,
+                def_ch.or(resolved_row_height),
                 if inherited.is_some() {
                     Justify::Start
                 } else {
@@ -2402,6 +2454,8 @@ impl Flow<'_> {
                 .last()
                 .zip(rows.last())
                 .map_or(0.0, |(y, t)| y + t.base)
+        } else if let Some(height) = resolved_row_height {
+            height
         } else {
             rows.iter().map(|t| t.base).sum::<f32>() + gap_row * live_rows.saturating_sub(1) as f32
         };
@@ -2464,6 +2518,35 @@ mod tests {
             &Default::default(),
         );
         (dom, layout)
+    }
+
+    #[test]
+    fn percentage_tracks_resolve_against_the_whole_content_box() {
+        // CSS Grid 1 §7.2.1: percentages are of the grid container's inner
+        // size, gutters included; with an indefinite height a percentage row
+        // sizes as auto, then resolves against the resulting height (Grid 2).
+        // Expected values measured in LibreWolf 153 and Chromium.
+        let (dom, layout) = measured_grid(
+            "<style>body{margin:0}div{min-height:0}</style>
+             <div style='display:grid;width:500px;grid-template-columns:45% 55%;gap:20px'><i id=a></i><i id=b></i></div>
+             <div id=g1 style='display:grid;grid-template-rows:100%'><i style='height:100px'></i></div>
+             <div id=g2 style='display:grid;grid-template-rows:50%'><i style='height:100px'></i><i id=r2 style='grid-area:1/1'></i></div>
+             <div id=g3 style='display:grid;grid-template-rows:50% 50%'><i style='height:100px'></i><i id=r3 style='height:100px'></i></div>
+             <div id=g4 style='display:grid;height:150px;grid-template-rows:100%;row-gap:10px'><i id=r4></i></div>",
+        );
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!((rect("a").left, rect("a").width), (0.0, 225.0));
+        assert_eq!((rect("b").left, rect("b").width), (245.0, 275.0));
+        assert_eq!(rect("g1").height, 100.0);
+        assert_eq!(
+            rect("g2").height,
+            100.0,
+            "the container keeps the auto-sized height"
+        );
+        assert_eq!(rect("r2").height, 50.0, "the row is 50% of it");
+        assert_eq!(rect("g3").height, 200.0);
+        assert_eq!(rect("r3").top - rect("g3").top, 100.0);
+        assert_eq!(rect("r4").height, 150.0);
     }
 
     #[test]
