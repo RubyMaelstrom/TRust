@@ -5213,7 +5213,7 @@ fn parse_conic_gradient(
     if explicit_interpolation || matches!(tokens.first(), Some(&("from" | "at"))) {
         let mut rest = &tokens[..];
         if let ["from", turn, more @ ..] = rest {
-            rotation = angle(turn)?;
+            rotation = conic_turns(turn).filter(|_| !turn.ends_with('%'))? * 2.0 * PI;
             rest = more;
         }
         if let ["at", more @ ..] = rest {
@@ -5231,16 +5231,7 @@ fn parse_conic_gradient(
     let local = CssRect::new(0.0, 0.0, rect.width, rect.height);
     let (x, y) = background_position(&position, local, (0.0, 0.0), lengths);
     let center = CssPoint::new(rect.x + x, rect.y + y);
-    let (stops, hints) = parse_stops_at(&parts, |token: &str| {
-        if let Some(percent) = token.strip_suffix('%') {
-            return percent
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .map(|value| value / 100.0);
-        }
-        angle(token).map(|radians| radians / (2.0 * PI))
-    })?;
+    let (stops, hints) = parse_stops_at(&parts, conic_turns)?;
     let interpolation =
         if !explicit_interpolation && stops.iter().all(|stop| legacy_srgb(&stop.color)) {
             GradientInterpolation {
@@ -5571,6 +5562,62 @@ fn gradient_direction(value: &str) -> Option<f32> {
 fn rotate(radians: f32) -> Affine2d {
     let (sin, cos) = radians.sin_cos();
     Affine2d([cos, sin, -sin, cos, 0.0, 0.0])
+}
+
+/// A conic gradient's `<angle-percentage>` as a fraction of a turn,
+/// including math functions such as `calc(var(--p) * 1%)` (CSS Images 4
+/// #conic-gradient-syntax). `from` takes only angles.
+fn conic_turns(token: &str) -> Option<f32> {
+    use crate::relative_color::{MathValue, math_value};
+    if let Some(percent) = token.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| value / 100.0);
+    }
+    if let Some(radians) = angle(token) {
+        return Some(radians / (2.0 * PI));
+    }
+    // Percentages are of a full turn, so a sum or comparison mixing them
+    // with angles evaluates once they are written as degrees.
+    let value = math_value(token).or_else(|| math_value(&percentages_as_degrees(token)))?;
+    match value {
+        MathValue::Percent(percent) => Some((percent / 100.0) as f32),
+        MathValue::Degrees(degrees) => Some((degrees / 360.0) as f32),
+        MathValue::Number(0.0) => Some(0.0),
+        MathValue::Number(_) => None,
+    }
+}
+
+/// `text` with each `<percentage>` token rewritten as the angle it is of a
+/// full turn (`25%` becomes `90deg`).
+fn percentages_as_degrees(text: &str) -> String {
+    use cssparser::{Parser, ParserInput, ToCss, Token};
+    fn rewrite<'i>(p: &mut Parser<'i, '_>, out: &mut String) {
+        while let Ok(token) = p.next_including_whitespace_and_comments() {
+            match token.clone() {
+                Token::Percentage { unit_value, .. } => {
+                    out.push_str(&format!("{}deg", unit_value * 360.0));
+                }
+                Token::Function(_) | Token::ParenthesisBlock => {
+                    token.to_css(out).ok();
+                    let _ = p.parse_nested_block(|p| {
+                        rewrite(p, out);
+                        Ok::<_, cssparser::ParseError<'_, ()>>(())
+                    });
+                    out.push(')');
+                }
+                other => {
+                    other.to_css(out).ok();
+                }
+            }
+        }
+    }
+    let mut input = ParserInput::new(text);
+    let mut out = String::new();
+    rewrite(&mut Parser::new(&mut input), &mut out);
+    out
 }
 
 fn angle(value: &str) -> Option<f32> {
@@ -8752,6 +8799,32 @@ mod tests {
                 (0..40).any(|y| (0..190).any(|x| at(x, y) != [255, 255, 255])),
                 "glyph background must remain visible with transparent text"
             );
+        }
+    }
+
+    #[test]
+    fn conic_gradient_positions_take_math_functions() {
+        // CSS Images 4 #conic-gradient-syntax: stop positions and `from` are
+        // <angle-percentage>/<angle> values, math functions included; a
+        // percentage there is of a full turn. Expected pixels from Blink.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} div{width:100px;height:100px}</style>\
+             <div style='--p:30;background:conic-gradient(red calc(var(--p)*1%), #ddd 0)'></div>\
+             <div style='background:conic-gradient(from calc(45deg + 45deg), red 25%, blue 0)'></div>\
+             <div style='background:conic-gradient(red min(25%, 90deg), blue 0)'></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| frame.pixels[(y * 800 + x) * 4..][..3].to_vec();
+        for (x, y, expected) in [
+            (70, 30, [255, 0, 0]),
+            (30, 70, [221, 221, 221]),
+            (70, 130, [0, 0, 255]),
+            (80, 180, [255, 0, 0]),
+            (70, 230, [255, 0, 0]),
+            (30, 270, [0, 0, 255]),
+        ] {
+            assert_eq!(pixel(x, y), expected, "({x}, {y})");
         }
     }
 

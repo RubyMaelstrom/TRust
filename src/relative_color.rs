@@ -118,6 +118,34 @@ pub(crate) fn resolve(text: &str) -> Option<Option<String>> {
     resolve_at(text, 0)
 }
 
+/// The kind of value a math function computed to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MathValue {
+    Number(f64),
+    Percent(f64),
+    Degrees(f64),
+}
+
+/// CSS Values 4 #math: evaluate a `calc()`, `min()`, `max()` or `clamp()`
+/// of numbers, percentages or angles (any `var()` already substituted).
+/// `None` for anything else, or for a sum mixing those types.
+pub(crate) fn math_value(text: &str) -> Option<MathValue> {
+    let mut input = ParserInput::new(text.trim());
+    let mut p = Parser::new(&mut input);
+    let name = p.expect_function().ok()?.to_ascii_lowercase();
+    let typed = p
+        .parse_nested_block(|p| math_function(p, &name, &[], 0))
+        .ok()?;
+    if !p.is_exhausted() || !typed.value.is_finite() {
+        return None;
+    }
+    Some(match typed.unit {
+        Unit::Number => MathValue::Number(typed.value),
+        Unit::Percent => MathValue::Percent(typed.value),
+        Unit::Angle => MathValue::Degrees(typed.value),
+    })
+}
+
 fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
     let mut input = ParserInput::new(text.trim());
     let mut p = Parser::new(&mut input);
