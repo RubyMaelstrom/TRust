@@ -257,6 +257,9 @@ pub struct Dom {
     adopted_styles: FxHashMap<NodeId, String>,
     /// Fetched `<link rel=stylesheet>` text, keyed by the link element.
     external_sheets: FxHashMap<NodeId, String>,
+    /// Sheets imported by inline `<style>` elements, by absolute URL; the
+    /// style index splices them in place of each `@import`.
+    inline_imports: FxHashMap<String, String>,
     /// CSSOM edits replace a sheet's rule list, without mutating its DOM text.
     cssom_sheets: FxHashMap<NodeId, cssom::Sheet>,
     cssom_sheet_versions: FxHashMap<NodeId, u64>,
@@ -643,6 +646,7 @@ impl Dom {
             style_epoch,
             adopted_styles,
             external_sheets,
+            inline_imports,
             cssom_sheets,
             cssom_sheet_versions,
             cssom_inline,
@@ -821,6 +825,10 @@ impl Dom {
         }
         for text in external_sheets.values() {
             bytes = bytes.saturating_add(text.capacity());
+        }
+        fixed_map!(inline_imports, (String, String));
+        for (url, text) in inline_imports {
+            bytes = bytes.saturating_add(url.capacity() + text.capacity());
         }
 
         match style_cache.try_borrow() {
@@ -1085,6 +1093,7 @@ impl Dom {
             style_epoch: 0,
             adopted_styles: FxHashMap::default(),
             external_sheets: FxHashMap::default(),
+            inline_imports: FxHashMap::default(),
             cssom_sheets: FxHashMap::default(),
             cssom_sheet_versions: FxHashMap::default(),
             cssom_inline: FxHashMap::default(),
@@ -6238,7 +6247,23 @@ impl Dom {
             let css: Cow<str> = match self.tag_name(id) {
                 Some("style") if self.style_sheet_applies(id) => match self.cssom_sheets.get(&id) {
                     Some(sheet) => Cow::Borrowed(&sheet.text),
-                    None => Cow::Owned(self.text_content(id)),
+                    None => {
+                        let text = self.text_content(id);
+                        // Imports resolve against the document base URL,
+                        // including `<base href>`, as they were fetched.
+                        let spliced = (!self.inline_imports.is_empty())
+                            .then(|| {
+                                let base = self
+                                    .doc_url
+                                    .as_ref()
+                                    .map(|page| self.resource_base_url(id, page));
+                                crate::http::splice_inline_imports(&text, base.as_ref(), |url| {
+                                    self.inline_imports.get(url)
+                                })
+                            })
+                            .flatten();
+                        Cow::Owned(spliced.unwrap_or(text))
+                    }
                 },
                 Some("link") if self.style_sheet_applies(id) => {
                     match self
@@ -6634,7 +6659,13 @@ impl Dom {
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(|h| (id, h.to_string())))
             .collect();
+        let mut imported = false;
         for (href, css) in sheets {
+            if let Some(url) = href.strip_prefix(crate::http::INLINE_IMPORT_KEY) {
+                self.inline_imports.insert(url.to_string(), css.clone());
+                imported = true;
+                continue;
+            }
             // A fetched URL can be linked from several independent shadow
             // scopes. Each link owns a sheet, even when prefetch deduplicates
             // the response body (HTML #rel-stylesheet).
@@ -6645,6 +6676,16 @@ impl Dom {
                 .collect();
             for id in hits {
                 self.external_sheets.insert(id, css.clone());
+                self.touch_style_at(id);
+            }
+        }
+        if imported {
+            let styles: Vec<NodeId> = self
+                .shadow_including_subtree(DOCUMENT)
+                .into_iter()
+                .filter(|&id| self.tag_name(id) == Some("style"))
+                .collect();
+            for id in styles {
                 self.touch_style_at(id);
             }
         }
@@ -18495,6 +18536,38 @@ mod tests {
         );
         let p = dom.get_by_id("p").unwrap();
         assert_eq!(dom.computed_value(p, "color").as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn inline_style_imports_splice_in_place() {
+        // CSS Cascade 5 §2.2: an inline sheet's @import is replaced by the
+        // imported rules at its position (so later rules win), under the
+        // import's media condition; an unfetched import contributes nothing.
+        let mut dom = Dom::parse_document(
+            "<base href=/css/><style>@import url(a.css);@import 'print.css' print;\
+             @import url(missing.css);.x{color:blue}</style><p class=x>a</p><p class=y>b</p>",
+        );
+        dom.set_doc_url(url::Url::parse("https://e.test/page.html").ok());
+        let key = |url: &str| format!("{}{url}", crate::http::INLINE_IMPORT_KEY);
+        dom.attach_external_sheets(&[
+            (
+                key("https://e.test/css/a.css"),
+                ".x{color:red}.y{color:green}".into(),
+            ),
+            (
+                key("https://e.test/css/print.css"),
+                ".y{color:purple}".into(),
+            ),
+        ]);
+        let color = |class: &str| {
+            let node = dom
+                .descendants(DOCUMENT)
+                .find(|&n| dom.attr(n, "class") == Some(class))
+                .unwrap();
+            dom.computed_value(node, "color")
+        };
+        assert_eq!(color("x").as_deref(), Some("blue"));
+        assert_eq!(color("y").as_deref(), Some("green"));
     }
 
     #[test]
