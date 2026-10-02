@@ -180,6 +180,10 @@ impl Flow<'_> {
             anchors: Vec<(NodeId, f32)>,
             /// The cell's spanned border-box width (px) — its CB for %.
             cell_w: f32,
+            /// The border-box height its content needs, which vertical
+            /// alignment distributes the rest of the row against (CSS 2.2
+            /// §17.5.3), even when its 'height' made the cell taller.
+            content_h: f32,
         }
         let mut laid: Vec<Laid> = Vec::with_capacity(tb.cells.len());
         for cell in &tb.cells {
@@ -210,6 +214,7 @@ impl Flow<'_> {
                 }
             });
             let natural = self.item_frag(&cell.b, content_w, cell_w, None, inl);
+            let content_h = natural.0.h;
             let (frag, anc) = match def_h {
                 Some(h) if natural.0.h - vertical_edges < h => {
                     self.item_frag(&cell.b, content_w, cell_w, Some(h), inl)
@@ -220,6 +225,7 @@ impl Flow<'_> {
                 frag,
                 anchors: anc,
                 cell_w,
+                content_h,
             });
         }
 
@@ -336,7 +342,7 @@ impl Flow<'_> {
             let end = (cell.row + cell.rowspan).min(nrows);
             let span_h = row_h[cell.row..end].iter().sum::<f32>()
                 + bs_y * (end.saturating_sub(cell.row + 1)) as f32;
-            let dy_valign = self.cell_valign_offset(cell.b.node, l.frag.h, span_h);
+            let dy_valign = self.cell_valign_offset(cell.b.node, l.content_h, span_h);
             // §9.4.3 relative offset / transform translation — a cell's CB for
             // percentages is its own box.
             let (rx, ry) =

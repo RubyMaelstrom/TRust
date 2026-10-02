@@ -3815,6 +3815,20 @@ mod tests {
     }
 
     #[test]
+    fn content_of_a_cell_taller_than_it_is_vertically_aligned() {
+        // CSS 2.2 §17.5.3/§17.5.4: a cell's 'height' makes the cell taller,
+        // and its content is aligned in the extra space (middle by default).
+        let html = r#"<body style="margin:0"><table cellspacing=0 cellpadding=0><tr>
+            <td height=100><div id=middle style="height:20px"></div></td>
+            <td height=100 valign=bottom><div id=bottom style="height:20px"></div></td>
+            <td height=100 valign=top><div id=top style="height:20px"></div></td></tr></table></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let y = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].top;
+        assert_eq!((y("top"), y("middle"), y("bottom")), (0.0, 40.0, 80.0));
+    }
+
+    #[test]
     fn absolutely_positioned_boxes_transfer_height_through_aspect_ratio() {
         // CSS Sizing 4 #aspect-ratio-automatic: auto width, definite height
         // and a preferred aspect ratio give a ratio-determined width, in the
