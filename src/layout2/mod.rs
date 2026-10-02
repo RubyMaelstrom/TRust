@@ -4644,6 +4644,23 @@ mod tests {
     }
 
     #[test]
+    fn metadata_elements_render_when_authors_display_them() {
+        // HTML Rendering #hidden-elements hides title, style and the other
+        // metadata elements with an ordinary UA display:none rule, so an
+        // author display value shows them (Gecko and Blink render a body
+        // <title> styled display:block as a heading).
+        let html = r#"<!doctype html><style>body{margin:0;font:20px/30px sans-serif}
+            title{display:block}</style><div><title id=t>ama directory</title></div>
+            <style id=s>.x{}</style><p id=p style="margin:0">after</p>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes.get(&dom.get_by_id(id).unwrap()).copied();
+        assert_eq!(rect("t").map(|r| (r.top, r.height)), Some((0.0, 30.0)));
+        assert!(rect("s").is_none_or(|r| r.height == 0.0));
+        assert_eq!(rect("p").map(|r| r.top), Some(30.0));
+    }
+
+    #[test]
     fn spanning_cells_distribute_widths_by_column_measures() {
         // CSS Tables 3 #computing-column-measures: a spanning cell's
         // min-content first fills its columns' min-to-max gaps in proportion

@@ -464,11 +464,14 @@ impl Built {
 
 /// Elements whose subtree never renders as page content. Renderable inline
 /// `<svg>` was already rewritten to `<img data:…>` by `rewrite_inline_svgs`;
-/// what remains here has no terminal rendering.
-const SKIP: &[&str] = &[
-    "base", "head", "link", "math", "meta", "noscript", "script", "style", "template", "title",
-    "wbr", "area", "map", "datalist",
-];
+/// what remains here has no terminal rendering. HTML Rendering
+/// #hidden-elements hides `head`, `title`, `style`, `script` and the other
+/// metadata elements with an ordinary UA `display: none` rule instead, so an
+/// author's `display` brings them back (`title { display: block }` shows a
+/// heading written as a body `<title>`, as in Gecko and Blink). A scripting
+/// UA hides `noscript` with `!important`; a template's contents are not its
+/// children.
+const SKIP: &[&str] = &["math", "noscript", "template", "wbr", "area", "map"];
 
 /// How an `embed` or `object` element renders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
