@@ -96,18 +96,19 @@ pub(crate) struct Piece {
     /// Blockified controls already have an outer fragment and use their child
     /// form piece only for the label.
     pub(crate) paint_control_box: bool,
-    /// The decorated non-replaced inline boxes containing this piece.
+    /// The non-replaced inline boxes containing this piece.
     pub(crate) boxes: Option<Box<InlineBoxes>>,
 }
 
-/// Paint geometry for the non-replaced inline boxes (with a background,
-/// border or shadow) that contain a piece. CSS Backgrounds 3
-/// #box-decoration-break (`slice`): a box's line fragment has its start edge
-/// only where the box begins and its end edge only where it ends.
+/// Line-fragment geometry for the non-replaced inline boxes that contain a
+/// piece: decorated boxes paint it, and CSSOM View reports an element's
+/// boxes. CSS Backgrounds 3 #box-decoration-break (`slice`): a box's line
+/// fragment has its start edge only where the box begins and its end edge
+/// only where it ends.
 #[derive(Clone, Debug)]
 pub(crate) struct InlineBoxes {
-    /// Enclosing decorated inline boxes, outermost first.
-    pub chain: std::sync::Arc<[InlineBoxKey]>,
+    /// Enclosing inline boxes, outermost first.
+    pub chain: std::sync::Arc<[InlineBoxEntry]>,
     /// Boxes beginning before this piece: (box, distance from the box's
     /// border-box start edge to the piece).
     pub opens: Vec<(InlineBoxKey, f32)>,
@@ -116,9 +117,21 @@ pub(crate) struct InlineBoxes {
     pub closes: Vec<(InlineBoxKey, f32)>,
 }
 
-/// A decorated inline box: an element's own, or one of the generated
+/// A non-replaced inline box: an element's own, or one of the generated
 /// (`::before`/`::after`/`::first-letter`) boxes of an originating element.
 pub(crate) type InlineBoxKey = (NodeId, Option<PseudoEl>);
+
+/// One inline box of a piece's chain. Every element box is tracked for
+/// CSSOM View geometry; generated boxes only when they paint.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineBoxEntry {
+    pub key: InlineBoxKey,
+    /// Whether the box paints a background, border or shadow.
+    pub decorated: bool,
+    /// Top and bottom padding plus border, which surround the box's content
+    /// area (CSS 2 #inline-non-replaced).
+    pub vertical_edges: [f32; 2],
+}
 
 /// What follows an inline item in its formatting context: the rest of its
 /// sibling list (in their context), then, past the end edge of the box that
@@ -398,10 +411,10 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// inline boxes), in px — folded into the next placement so an edge at a
     /// wrap point travels with the content it precedes.
     pending_gap_px: f32,
-    /// The decorated inline boxes currently open, outermost first, shared
-    /// by the pieces placed inside them.
-    box_stack: Vec<InlineBoxKey>,
-    box_chain: Option<std::sync::Arc<[InlineBoxKey]>>,
+    /// The tracked inline boxes currently open, outermost first, shared by
+    /// the pieces placed inside them.
+    box_stack: Vec<InlineBoxEntry>,
+    box_chain: Option<std::sync::Arc<[InlineBoxEntry]>>,
     /// Opened boxes awaiting their first piece: (box, the offset of the
     /// box's border-box start edge within `pending_gap_px`).
     pending_opens: Vec<(InlineBoxKey, f32)>,
@@ -819,12 +832,27 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 } else {
                     Some((*node, None))
                 };
-                let decorated = key
-                    .filter(|&key| !self.measuring && inline_box_decorated(self.dom, key, style));
-                if let Some(key) = decorated {
+                // Decorated boxes paint their line fragments; CSSOM View
+                // #dom-element-getclientrects also measures every element's
+                // non-replaced inline box. Intrinsic sizing needs neither.
+                let tracked = key.filter(|_| !self.measuring).and_then(|key| {
+                    let decorated = inline_box_decorated(self.dom, key, style);
+                    let edge = |side: usize| {
+                        style.border[side]
+                            + style.padding[side]
+                                .resolve(Some(self.cb_w_px))
+                                .unwrap_or(0.0)
+                    };
+                    (decorated || key.1.is_none()).then(|| InlineBoxEntry {
+                        key,
+                        decorated,
+                        vertical_edges: [edge(TOP), edge(BOTTOM)],
+                    })
+                });
+                if let Some(entry) = tracked {
                     self.pending_opens
-                        .push((key, self.pending_gap_px + self.margin_px(style, LEFT)));
-                    self.box_stack.push(key);
+                        .push((entry.key, self.pending_gap_px + self.margin_px(style, LEFT)));
+                    self.box_stack.push(entry);
                     self.box_chain = Some(self.box_stack.as_slice().into());
                 }
                 self.pending_gap_px += self.edge_px(style, LEFT);
@@ -838,8 +866,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     };
                     self.walk(k, &inner, &rest);
                 }
-                if let Some(key) = decorated {
-                    self.close_box(key, style);
+                if let Some(entry) = tracked {
+                    self.close_box(entry.key, style);
                 }
                 self.pending_gap_px += self.edge_px(style, RIGHT);
             }
@@ -2089,7 +2117,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 
     /// Give the piece just placed (after folding `gap`) its enclosing
-    /// decorated boxes and the start edges of the boxes it begins.
+    /// tracked boxes and the start edges of the boxes it begins.
     fn attach_boxes(&mut self, gap: f32) {
         let Some(chain) = self.box_chain.clone() else {
             return;
@@ -2108,7 +2136,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
     }
 
-    /// Close a decorated inline box: its end edge follows the last piece
+    /// Close a tracked inline box: its end edge follows the last piece
     /// placed inside it, past any edges owed since. A box that received no
     /// piece has no line fragment.
     fn close_box(&mut self, node: InlineBoxKey, style: &BoxStyle) {
@@ -2127,7 +2155,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         };
         if let Some(boxes) = last
             .and_then(|piece| piece.boxes.as_mut())
-            .filter(|boxes| boxes.chain.contains(&node))
+            .filter(|boxes| boxes.chain.iter().any(|entry| entry.key == node))
         {
             boxes.closes.push((node, end));
         }

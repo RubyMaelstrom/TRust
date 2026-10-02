@@ -6606,14 +6606,18 @@ b</xmp></body>"#;
                 "<style>body{{margin:0}}#line{{line-height:0}}
                  .box{{display:{display};width:80px;height:32px;font:16px/16px sans-serif}}
                  #a{{position:relative;left:8px;top:16px;transform:translate(50%,25%)}}
-                 </style><div id=line><span id=a class=box><span id=child>AAA</span></span><span id=b class=box>BBB</span></div><div id=after>After</div>"
+                 </style><div id=line><span id=a class=box><span id=child>AAA</span></span><span id=b class=box><span id=reference>BBB</span></span></div><div id=after>After</div>"
             );
             let (dom, boxes) = measure(&html, 80, 40);
             let a = rect(&dom, &boxes, "a");
             let child = rect(&dom, &boxes, "child");
             let b = rect(&dom, &boxes, "b");
             assert_eq!((a.left, a.top), (48.0, 24.0), "{display}: {a:?}");
-            assert_eq!((child.left, child.top), (48.0, 24.0));
+            // The inline child's border area is its content area, which a
+            // 16px line can be shorter than; it moves with its box.
+            let reference = rect(&dom, &boxes, "reference");
+            assert_eq!(child.left, 48.0);
+            assert_eq!(child.top - reference.top, 24.0);
             assert_eq!((b.left, b.top), (80.0, 0.0));
             assert_eq!(rect(&dom, &boxes, "after").top, 32.0);
         }
@@ -12077,17 +12081,69 @@ b</xmp></body>"#;
 
     #[test]
     fn geometry_inline_ancestor_aggregates_its_children_boxes() {
-        // An inline <a> wrapping a <span> generates no frag of its own; its box
-        // is the union of its descendants' pieces (composed-tree aggregation).
+        // An inline <a> wrapping a <span> generates no block frag of its own;
+        // its box spans its descendants' pieces. Vertically it is the content
+        // area (CSSOM View #dom-element-getclientrects), here the same font's
+        // as the span's.
         let (dom, boxes) = measure(
-            r#"<body style="margin:0"><p style="margin:0"><a id="lnk"><span>hello</span></a></p></body>"#,
+            r#"<body style="margin:0"><p style="margin:0"><a id="lnk"><span id="s">hello</span></a></p></body>"#,
             40,
             24,
         );
         let a = rect(&dom, &boxes, "lnk");
-        assert_eq!((a.left, a.top), (0.0, 0.0));
+        let span = rect(&dom, &boxes, "s");
+        assert_eq!(a.left, 0.0);
+        assert_eq!((a.top, a.height), (span.top, span.height));
         let shaped = crate::text::shape("hello", &crate::text::TextStyle::default());
         assert!((a.width - f64::from(shaped.advance)).abs() < 0.01);
+    }
+
+    #[test]
+    fn geometry_reports_an_inline_boxs_border_area() {
+        // CSSOM View #dom-element-getclientrects: a non-replaced inline box's
+        // fragments are its border areas, whose content area follows the font
+        // rather than line-height (CSS 2 #inline-non-replaced), with padding
+        // and border outside it. A descendant's padding stays outside its
+        // ancestor's box; a block the inline is split around stays inside.
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0;font:20px/60px monospace">
+               <div><span id=plain>link</span></div>
+               <div><a id=a style="border:5px solid;padding:10px 20px">link</a></div>
+               <div><span id=outer style="padding:2px 4px">x <b id=inner style="padding:9px">y</b> z</span></div>
+               <div style="width:100px;font:16px/20px monospace"><span id=wrap style="padding:0 6px">aaaa bbbb cccc</span></div>
+               <div><a id=split>t<div style="height:90px">d</div></a></div></body>"#,
+            100,
+            40,
+        );
+        let plain = rect(&dom, &boxes, "plain");
+        assert!(
+            plain.height > 18.0 && plain.height < 30.0,
+            "a 20px font's content area, not the 60px line: {plain:?}"
+        );
+        assert!(plain.top > 10.0, "half-leading above: {plain:?}");
+        let a = rect(&dom, &boxes, "a");
+        assert!((a.width - plain.width - 50.0).abs() < 0.01, "{a:?}");
+        assert!((a.height - plain.height - 30.0).abs() < 0.01, "{a:?}");
+        assert_eq!(a.left, 0.0, "the start border edge");
+        assert!((a.top - (plain.top + 60.0 - 15.0)).abs() < 0.01, "{a:?}");
+        let outer = rect(&dom, &boxes, "outer");
+        let inner = rect(&dom, &boxes, "inner");
+        assert!(
+            (outer.height - plain.height - 4.0).abs() < 0.01,
+            "{outer:?}"
+        );
+        assert!(
+            (inner.height - plain.height - 18.0).abs() < 0.01,
+            "{inner:?}"
+        );
+        let wrap = rect(&dom, &boxes, "wrap");
+        assert_eq!(wrap.left, 0.0, "{wrap:?}");
+        assert!(
+            wrap.height > 30.0 && wrap.height < 40.0,
+            "two 20px lines of 16px content areas: {wrap:?}"
+        );
+        let split = rect(&dom, &boxes, "split");
+        assert!(split.height >= 90.0, "{split:?}");
     }
 
     // ---- P7: incremental region patch (measure::region_buffer) -------------

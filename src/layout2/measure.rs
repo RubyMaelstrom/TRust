@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use crate::dom::{DOCUMENT, Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
 
-use super::flow::{Frag, FragKind, TopFrag};
+use super::flow::{Frag, FragKind, LineFrag, TopFrag};
 use crate::render::{Affine2d, CssRect};
 
 fn border_rect(frag: &Frag, transform: Affine2d) -> PxRect {
@@ -214,12 +214,14 @@ fn add(map: &mut HashMap<NodeId, Rect>, node: NodeId, r: Rect) {
 /// One box's own boxes: `own` = every directly-attributed box (block/replaced
 /// border boxes + inline pieces, the union base); `block` = only the border
 /// box a BLOCK-level fragment generates (the spec `getBoundingClientRect` for
-/// a non-scroll block, used to re-cap the composed union). `nodes` collects
-/// every element id touched (fixed-subtree membership).
+/// a non-scroll block, used to re-cap the composed union); `inline` = the
+/// bounding box of a non-replaced inline box's line fragments. `nodes`
+/// collects every element id touched (fixed-subtree membership).
 #[derive(Default)]
 struct Own {
     own: HashMap<NodeId, Rect>,
     block: HashMap<NodeId, Rect>,
+    inline: HashMap<NodeId, Rect>,
     css_size: HashMap<NodeId, [f32; 2]>,
     nodes: HashSet<NodeId>,
     frame_viewports: HashMap<NodeId, crate::render::CssRect>,
@@ -276,6 +278,14 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
             o.nodes.insert(p.item.node);
             add(&mut o.own, p.item.node, r.transformed(transform));
         }
+        if !line.sideways {
+            for (node, r) in inline_box_fragments(f, line) {
+                let r = r.transformed(transform);
+                o.nodes.insert(node);
+                add(&mut o.inline, node, r);
+                add(&mut o.own, node, r);
+            }
+        }
     }
     for c in &f.children {
         // Each nested Document has its own viewport. It does not inherit the
@@ -287,6 +297,113 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
         };
         walk(dom, c, o, parent, visual);
     }
+}
+
+/// CSSOM View #dom-element-getclientrects: each line fragment of an element's
+/// non-replaced inline box is its border area. That is the box's content area
+/// (CSS 2 #inline-non-replaced: from the font's ascent to its descent, never
+/// the line height) with its vertical padding and border, spanning the box's
+/// pieces on the line plus its start and end edges where the box begins and
+/// ends (CSS Backgrounds 3 #box-decoration-break `slice`). Decorated boxes
+/// paint the same geometry.
+fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
+    struct Run {
+        node: NodeId,
+        rect: Rect,
+        edges: [f32; 2],
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for piece in line.pieces.iter().chain(&line.atom_boxes) {
+        let Some(boxes) = &piece.boxes else {
+            continue;
+        };
+        let start = f.x + piece.x;
+        let end = start + piece.box_width;
+        let (top, bottom) =
+            piece
+                .shaped
+                .as_ref()
+                .map_or((f32::INFINITY, f32::NEG_INFINITY), |text| {
+                    let baseline = f.y + piece.y + text.baseline;
+                    (baseline - text.ascent, baseline + text.descent)
+                });
+        for entry in boxes.chain.iter().filter(|entry| entry.key.1.is_none()) {
+            let mut piece_rect = Rect {
+                x0: start,
+                y0: top,
+                x1: end,
+                y1: bottom,
+            };
+            if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == entry.key) {
+                piece_rect.x0 = start - distance;
+            }
+            if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == entry.key)
+            {
+                piece_rect.x1 = end + distance;
+            }
+            match runs.iter_mut().find(|run| run.node == entry.key.0) {
+                Some(run) => run.rect = Rect::union(run.rect, piece_rect),
+                None => runs.push(Run {
+                    node: entry.key.0,
+                    rect: piece_rect,
+                    edges: entry.vertical_edges,
+                }),
+            }
+        }
+    }
+    runs.into_iter()
+        .map(|Run { node, rect, edges }| {
+            // A box holding no text takes the line's own font metrics.
+            let (top, bottom) = if rect.y0.is_finite() {
+                (rect.y0, rect.y1)
+            } else {
+                let baseline = f.y + line.baseline;
+                (baseline - line.ascent, baseline + line.descent)
+            };
+            let rect = Rect {
+                x0: rect.x0,
+                y0: top - edges[0],
+                x1: rect.x1.max(rect.x0),
+                y1: bottom + edges[1],
+            };
+            (node, rect)
+        })
+        .collect()
+}
+
+/// CSS 2 #anonymous-block-level: an in-flow block-level box inside an inline
+/// box splits it, and CSSOM View engines report the inline's geometry around
+/// that block too. Union each such block into its inline ancestors (up to the
+/// enclosing block container), never an atomic inline, float or positioned
+/// box, whose geometry stays outside the inline box.
+fn blocks_in_inlines(dom: &Dom, own: &Own) -> HashMap<NodeId, Rect> {
+    let mut out = HashMap::new();
+    for (&node, &rect) in &own.block {
+        let Some(parent) = dom
+            .parent_composed(node)
+            .filter(|p| own.inline.contains_key(p))
+        else {
+            continue;
+        };
+        let in_flow_block = !dom
+            .effective_display(node)
+            .is_some_and(|display| display.starts_with("inline"))
+            && !dom
+                .computed_value(node, "position")
+                .is_some_and(|position| matches!(position.trim(), "absolute" | "fixed"))
+            && dom
+                .computed_value(node, "float")
+                .is_none_or(|float| float.trim() == "none");
+        if !in_flow_block {
+            continue;
+        }
+        let mut current = Some(parent);
+        while let Some(inline) = current.filter(|p| own.inline.contains_key(p)) {
+            add(&mut out, inline, rect);
+            current = dom.parent_composed(inline);
+        }
+    }
+    out
 }
 
 /// Bottom-up composed-tree union of `base`, restricted to nodes passing `keep`.
@@ -332,11 +449,13 @@ fn composed_union(
 fn select_into(
     dom: &Dom,
     content: &HashMap<NodeId, Rect>,
-    block: &HashMap<NodeId, Rect>,
-    css_size: &HashMap<NodeId, [f32; 2]>,
+    own: &Own,
     out: &mut HashMap<NodeId, PxRect>,
     scroll: &mut HashMap<NodeId, PxRect>,
 ) {
+    let block = &own.block;
+    let css_size = &own.css_size;
+    let split = blocks_in_inlines(dom, own);
     for (&node, &cbox) in content {
         // CSS Display 3 #box-tree and CSSOM View #dom-element-getclientrects:
         // a composed descendant extent does not establish an associated box.
@@ -347,9 +466,16 @@ fn select_into(
         if !block.contains_key(&node) && !dom.generates_principal_box(node) {
             continue;
         }
-        // Non-block elements (inline wrappers and shadow hosts without their
-        // own generated block) use the union of their generated pieces.
-        let c = block.get(&node).copied().unwrap_or(cbox);
+        // A non-replaced inline box reports its own line fragments (with any
+        // block it was split around); other non-block elements (shadow hosts
+        // without their own generated block, display:contents) use the union
+        // of their generated pieces.
+        let inline = own.inline.get(&node).map(|&rect| {
+            split
+                .get(&node)
+                .map_or(rect, |&blocks| Rect::union(rect, blocks))
+        });
+        let c = block.get(&node).copied().or(inline).unwrap_or(cbox);
         out.insert(
             node,
             PxRect {
@@ -474,25 +600,11 @@ fn project(
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
     let mut scroll: HashMap<NodeId, PxRect> = HashMap::new();
     let flow_content = composed_union(dom, &flow.own, |_| true);
-    select_into(
-        dom,
-        &flow_content,
-        &flow.block,
-        &flow.css_size,
-        &mut out,
-        &mut scroll,
-    );
+    select_into(dom, &flow_content, &flow, &mut out, &mut scroll);
     if !fx.own.is_empty() {
-        let fixed_nodes = fx.nodes;
+        let fixed_nodes = std::mem::take(&mut fx.nodes);
         let fx_content = composed_union(dom, &fx.own, |id| fixed_nodes.contains(&id));
-        select_into(
-            dom,
-            &fx_content,
-            &fx.block,
-            &fx.css_size,
-            &mut out,
-            &mut scroll,
-        );
+        select_into(dom, &fx_content, &fx, &mut out, &mut scroll);
     }
     // Scroll overflow follows containing blocks and local overflow clipping;
     // the composed union above remains solely the inline border-box fallback.
