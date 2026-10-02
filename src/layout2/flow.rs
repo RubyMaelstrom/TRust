@@ -1058,7 +1058,23 @@ impl Flow<'_> {
                             cur.y = content_top_of(yb).max(cur.y);
                         }
                         let log = cur.flush_log.len();
-                        for k in kids {
+                        for (index, k) in kids.iter().enumerate() {
+                            // CSS 2 §8.3.1: while this box's top is unresolved,
+                            // its top margin collapses with the first in-flow
+                            // child's through an empty anonymous block holding
+                            // only floats, so the box's content edge, where those
+                            // floats are placed, lies below that child's margin
+                            // too (as in Gecko and Blink).
+                            let lookahead = (y_border.is_none() && float_only_run(k))
+                                .then(|| {
+                                    kids[index + 1..].iter().find(|next| !float_only_run(next))
+                                })
+                                .flatten()
+                                .map(|next| self.margins_of(&next.style, h.content_w).0[TOP]);
+                            let strut = (cur.pos, cur.neg, cur.flush_log.len());
+                            if let Some(margin) = lookahead {
+                                cur.margin(margin);
+                            }
                             children.push(self.block(
                                 k,
                                 content_x,
@@ -1068,6 +1084,9 @@ impl Flow<'_> {
                                 &inl,
                                 cfc,
                             ));
+                            if lookahead.is_some() && cur.flush_log.len() == strut.2 {
+                                (cur.pos, cur.neg) = (strut.0, strut.1);
+                            }
                         }
                         if y_border.is_none() && cur.flush_log.len() > log {
                             // Top margin collapsed through to a descendant: our
@@ -5368,6 +5387,17 @@ struct InlineLaid<'t> {
     /// positioned in the content frame (absolute, like `float_frags`) — the
     /// caller appends them to its children.
     atom_frags: Vec<Frag>,
+}
+
+/// An anonymous block holding only floats, out-of-flow boxes and collapsible
+/// white space: it generates no line box and its margins collapse through.
+fn float_only_run(b: &BoxNode) -> bool {
+    b.node == NO_NODE
+        && matches!(&b.content, Content::Inlines(items) if !items.is_empty() && items.iter().all(|item| match item {
+            Inline::Float(_) | Inline::OutOfFlow(_) => true,
+            Inline::Text(text) => text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')),
+            _ => false,
+        }) && items.iter().any(|item| matches!(item, Inline::Float(_))))
 }
 
 /// Collect the floats an inline content list holds, in the exact order the IFC
