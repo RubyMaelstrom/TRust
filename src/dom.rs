@@ -11507,6 +11507,9 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
     // CSS Pseudo 4 #element-backed: every pseudo-class and pseudo-element is
     // syntactically allowed after an element-backed pseudo-element.
     let mut element_backed = false;
+    // View Transitions 1 #pseudo-root: the pseudo-element is a descendant
+    // in the ::view-transition pseudo-element tree.
+    let mut pseudo_tree = false;
     while let Some(&c) = chars.peek() {
         // Selectors 4 #grammar: `<pseudo-compound-selector> =
         // <pseudo-element-selector> <pseudo-class-selector>*`, so no type,
@@ -11595,7 +11598,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         );
                     if !pseudo_element {
                         let (matches, specificity) =
-                            pseudo_element_state_class(&name, arg.as_deref())?;
+                            pseudo_element_state_class(&name, arg.as_deref(), pseudo_tree)?;
                         compound.never |= !matches;
                         compound.pseudos += specificity;
                         continue;
@@ -11646,6 +11649,14 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         compound.never = true;
                         compound.inert_pseudo_element = true;
                         element_backed = matches!(name.as_str(), "part" | "details-content");
+                        pseudo_tree = arg.is_some()
+                            && matches!(
+                                name.as_str(),
+                                "view-transition-group"
+                                    | "view-transition-image-pair"
+                                    | "view-transition-old"
+                                    | "view-transition-new"
+                            );
                         continue;
                     }
                     if name.starts_with("-webkit-") && arg.is_none() {
@@ -11884,28 +11895,34 @@ fn take_pseudo_arg(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<O
 }
 
 /// One pseudo-class following a pseudo-element. Selectors 4
-/// #pseudo-element-states allows only the user action pseudo-classes
-/// (§10) and the logical combinations, which pass that restriction to their
-/// arguments (§4): `:not()` rejects the selector for a disallowed argument,
-/// while the forgiving `:is()`/`:where()` drop it. Any other combination is
-/// an invalid selector (`None`).
+/// #pseudo-element-states allows the user action pseudo-classes (§10) and
+/// the logical combinations, which pass that restriction to their arguments
+/// (§4): `:not()` rejects the selector for a disallowed argument, while the
+/// forgiving `:is()`/`:where()` drop it. Other specifications allow more for
+/// particular pseudo-elements: View Transitions 1 #pseudo-root defines
+/// `:only-child` for a descendant of a pseudo-element root (`pseudo_tree`).
+/// Any other combination is an invalid selector (`None`).
 ///
 /// Otherwise returns whether the pseudo-element can match and the
 /// pseudo-class specificity it adds. The engine does not track user action
 /// state on generated boxes, so a pseudo-element is never hovered, active
 /// or focused itself; testing the originating element instead would select
-/// the wrong box.
-fn pseudo_element_state_class(name: &str, arg: Option<&str>) -> Option<(bool, u32)> {
+/// the wrong box. Nor does it build pseudo-element trees.
+fn pseudo_element_state_class(
+    name: &str,
+    arg: Option<&str>,
+    pseudo_tree: bool,
+) -> Option<(bool, u32)> {
     let Some(arg) = arg else {
-        return matches!(
+        let allowed = matches!(
             name,
             "hover" | "active" | "focus" | "focus-visible" | "focus-within"
-        )
-        .then_some((false, 1));
+        ) || (pseudo_tree && name == "only-child");
+        return allowed.then_some((false, 1));
     };
     let arguments = split_top_level(arg, ',')
         .into_iter()
-        .map(|part| pseudo_element_state_compound(part.trim()));
+        .map(|part| pseudo_element_state_compound(part.trim(), pseudo_tree));
     let arguments: Vec<_> = match name {
         "not" => arguments.collect::<Option<_>>()?,
         "is" | "where" | "matches" => arguments.flatten().collect(),
@@ -11922,7 +11939,7 @@ fn pseudo_element_state_class(name: &str, arg: Option<&str>) -> Option<(bool, u3
 
 /// A compound argument of a logical combination after a pseudo-element: a
 /// sequence of allowed pseudo-classes, all of which must hold.
-fn pseudo_element_state_compound(text: &str) -> Option<(bool, u32)> {
+fn pseudo_element_state_compound(text: &str, pseudo_tree: bool) -> Option<(bool, u32)> {
     let mut chars = text.chars().peekable();
     let (mut matches, mut specificity) = (true, 0);
     chars.peek()?;
@@ -11932,7 +11949,7 @@ fn pseudo_element_state_compound(text: &str) -> Option<(bool, u32)> {
         }
         let name = take_name(&mut chars)?.to_ascii_lowercase();
         let arg = take_pseudo_arg(&mut chars)?;
-        let (m, s) = pseudo_element_state_class(&name, arg.as_deref())?;
+        let (m, s) = pseudo_element_state_class(&name, arg.as_deref(), pseudo_tree)?;
         matches &= m;
         specificity += s;
     }
@@ -18076,6 +18093,38 @@ mod tests {
             dom.pseudo_content(a8, PseudoEl::Before).as_deref(),
             Some("Y")
         );
+    }
+
+    #[test]
+    fn view_transition_tree_pseudo_elements_take_only_child() {
+        // Selectors 4 #pseudo-element-states lets other specifications allow
+        // more pseudo-classes after particular pseudo-elements: View
+        // Transitions 1 #pseudo-root defines :only-child for the descendants
+        // of the ::view-transition pseudo-element root. Nothing else is
+        // added, and :only-child stays invalid elsewhere.
+        for selector in [
+            "::view-transition-old(root):only-child",
+            "::view-transition-new(*):only-child",
+            "::view-transition-group(root):only-child",
+            "::view-transition-image-pair(root):only-child",
+            "html::view-transition-old(root):only-child",
+            "::view-transition-old(root):not(:only-child)",
+            "::view-transition-new(root):only-child:hover",
+        ] {
+            assert!(selector_parses(selector), "{selector}");
+        }
+        for selector in [
+            "::view-transition:only-child",
+            "::view-transition-old(root):first-child",
+            "::view-transition-old(root):nth-child(1)",
+            "::view-transition-old(root):not(:first-child)",
+            "::view-transition-old(root).x",
+            "::view-transition-old(root)::before",
+            "a::before:only-child",
+            "::backdrop:only-child",
+        ] {
+            assert!(!selector_parses(selector), "{selector}");
+        }
     }
 
     #[test]
