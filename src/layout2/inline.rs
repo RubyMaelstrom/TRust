@@ -544,6 +544,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// block (or no content), so a column of images stacks without baseline
     /// gaps. Holds the block's node in such documents.
     quirky_strut_root: Option<NodeId>,
+    /// Lay no more than this many line boxes: content past them cannot be
+    /// seen (a multiline control's scrollport, `textarea_line_budget`).
+    line_budget: Option<usize>,
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -623,6 +626,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             replaced_cb: None,
             strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
             quirky_strut_root: None,
+            line_budget: None,
         };
         ifc.begin_line();
         ifc
@@ -992,6 +996,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.text_followed(t, ctx, None);
     }
 
+    /// Whether the line budget is laid: what follows cannot be seen.
+    fn line_budget_spent(&self) -> bool {
+        self.line_budget
+            .is_some_and(|budget| self.lines.len() >= budget)
+    }
+
     /// `text` within the inline tree, where a word ending the run can be
     /// continued by the following items: CSS Text 3 #line-breaking provides
     /// no soft wrap opportunity at an inline box boundary itself, so
@@ -1015,6 +1025,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             for c in t.chars() {
                 if is_collapsible_space(c) {
                     if !word.is_empty() {
+                        if self.line_budget_spent() {
+                            return;
+                        }
                         self.word(&word, ctx, 0.0);
                         word.clear();
                     }
@@ -1040,6 +1053,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // next `tab-size` stop (CSS Text §3; a 0 tab renders no advance);
             // spaces are literal.
             for (i, seg) in t.split('\n').enumerate() {
+                if self.line_budget_spent() {
+                    return;
+                }
                 if i > 0 {
                     self.forced_break();
                 }
@@ -1252,9 +1268,35 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             && self.cap > 0.0
             && !self.pending_space
         {
+            let style = ctx.text_style();
+            // Under a line budget, break only as much of a long paragraph
+            // as the budget can lay; those are the lines the whole
+            // paragraph breaks into. One line holding it all takes the
+            // ordinary path below.
+            let budgeted = self.line_budget.map(|budget| {
+                crate::text::wrapped_lines_limited(
+                    t,
+                    &style,
+                    available,
+                    self.cap,
+                    self.break_style(ctx),
+                    budget.saturating_sub(self.lines.len()).max(1),
+                )
+            });
+            if let Some(lines) = budgeted.filter(|lines| {
+                lines.len() > 1 || lines.first().is_some_and(|line| line.text.len() < t.len())
+            }) {
+                for (index, shaped) in lines.into_iter().enumerate() {
+                    if index > 0 {
+                        self.soft_break();
+                    }
+                    let text = shaped.text.clone();
+                    self.place_shaped(&text, shaped, ctx, false, false);
+                }
+                return;
+            }
             // Preserve the bounded cache fast path for paragraphs which fit
             // on one line (including very wide intrinsic-size probes).
-            let style = ctx.text_style();
             let full = crate::text::shape(t, &style);
             if super::css_px_fits(
                 self.pen + self.pending_gap_px + full.advance,
@@ -1782,7 +1824,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // slack: glyphs of a line box shorter than its font (a negative
         // half-leading, CSS 2 §10.8.1) overflow it upwards into view.
         let visible = height.max(0.0) + padding[BOTTOM] + ctx.font_size.max(0.0);
-        let text = textarea_visible_prefix(text, ctx, visible);
+        let budget = textarea_line_budget(ctx, visible);
+        let text = budget.map_or(text, |budget| textarea_visible_prefix(text, ctx, budget));
         let indent = self
             .dom
             .computed_value_resolved(node, "text-indent")
@@ -1808,6 +1851,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         if let Some(align_last) = super::style::block_align_last(self.dom, node) {
             ifc.set_align_last(align_last);
         }
+        ifc.line_budget = budget;
         let mut root = ctx.clone();
         root.vertical_align = VerticalAlign::Baseline;
         ifc.run(&content, &root);
@@ -3130,27 +3174,33 @@ fn textarea_rows(dom: &Dom, node: NodeId) -> usize {
         .unwrap_or(2)
 }
 
-/// The prefix of a multiline control's text that can produce a line box
-/// starting less than `visible` CSS pixels below its content top.
+/// How many line boxes of a multiline control are laid: those that can
+/// start less than `visible` CSS pixels below its content top, plus one.
+/// No line box is shorter than the strut's line-height (CSS 2 §10.8.1), so
+/// line `n` starts at least `n` strut heights down. The extra line (also
+/// slack for the rounding of accumulated heights) is never visible, and
+/// keeps every visible line from being the last one laid, which `text-align:
+/// justify` and `text-align-last` treat differently (CSS Text 3 §7.1).
+fn textarea_line_budget(ctx: &InlineStyle, visible: f32) -> Option<usize> {
+    let line_height = crate::text::shape(" ", &ctx.text_style()).line_height;
+    (visible.is_finite() && line_height.is_finite() && line_height > 0.0)
+        .then(|| ((visible / line_height).ceil() as usize).saturating_add(1))
+}
+
+/// The prefix of a multiline control's text that can produce its first
+/// `budget` line boxes.
 ///
 /// Where newlines are preserved (CSS Text 3 §4.1.1: each one is a forced
 /// line break, `\r\n` and a lone `\r` normalized to it) every segment
-/// between them begins a line box of its own, and no line box is shorter
-/// than the strut's line-height (CSS 2 §10.8.1). Segment `n` therefore
-/// starts at least `n` strut heights down, and a forced break ends every
-/// line, bidi paragraph and shaping context before it, so the following
-/// segments cannot change an earlier one. Collapsed newlines join the
-/// whole value into one paragraph; it is laid in full.
-fn textarea_visible_prefix<'s>(text: &'s str, ctx: &InlineStyle, visible: f32) -> &'s str {
-    if !ctx.ws.preserves_newlines() || !visible.is_finite() {
+/// between them begins a line box of its own, and a forced break ends
+/// every line, bidi paragraph and shaping context before it, so the
+/// following segments cannot change an earlier one. Collapsed newlines
+/// join the whole value into one paragraph, which is not cut here.
+fn textarea_visible_prefix<'s>(text: &'s str, ctx: &InlineStyle, budget: usize) -> &'s str {
+    if !ctx.ws.preserves_newlines() {
         return text;
     }
-    let line_height = crate::text::shape(" ", &ctx.text_style()).line_height;
-    if !line_height.is_finite() || line_height <= 0.0 {
-        return text;
-    }
-    // One segment of slack for the rounding of accumulated line heights.
-    let segments = ((visible / line_height).ceil() as usize).saturating_add(1);
+    let segments = budget;
     let bytes = text.as_bytes();
     let mut seen = 0usize;
     for (index, &byte) in bytes.iter().enumerate() {
@@ -3334,27 +3384,53 @@ mod tests {
     fn textarea_visible_prefix_keeps_the_segments_that_can_reach_the_scrollport() {
         // CSS Text 3 §4.1.1: a preserved newline is a forced break, so each
         // segment starts a line box at least one strut (CSS 2 §10.8.1) below
-        // the previous one. 25px reaches the segments at 0, 10 and 20px; one
-        // more is rounding slack, and nothing after it is laid.
+        // the previous one. 25px reaches the lines at 0, 10 and 20px; one
+        // more is laid as slack, and nothing after it.
         let mut ctx = InlineStyle::root();
         ctx.line_height = crate::text::CssLineHeight::Length(10.0);
         ctx.ws = WhiteSpace::PreWrap;
+        assert_eq!(textarea_line_budget(&ctx, 25.0), Some(4));
+        assert_eq!(textarea_line_budget(&ctx, 15.0), Some(3));
+        assert_eq!(textarea_line_budget(&ctx, f32::INFINITY), None);
         let text: String = (0..100).map(|line| format!("{line}\n")).collect();
-        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), "0\n1\n2\n3");
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 4), "0\n1\n2\n3");
         // CR LF and a lone CR are newlines too (§4.1.1 segment breaks).
         assert_eq!(
-            textarea_visible_prefix("a\r\nb\rc\nd\ne", &ctx, 15.0),
+            textarea_visible_prefix("a\r\nb\rc\nd\ne", &ctx, 3),
             "a\r\nb\rc"
         );
         ctx.ws = WhiteSpace::PreLine;
-        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), "0\n1\n2\n3");
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 4), "0\n1\n2\n3");
         ctx.ws = WhiteSpace::Pre;
-        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), "0\n1\n2\n3");
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 4), "0\n1\n2\n3");
         // Collapsed newlines join the value into one paragraph.
         ctx.ws = WhiteSpace::Normal;
-        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), text);
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 4), text);
         // A short value is laid whole.
         ctx.ws = WhiteSpace::PreWrap;
-        assert_eq!(textarea_visible_prefix("a\nb", &ctx, 25.0), "a\nb");
+        assert_eq!(textarea_visible_prefix("a\nb", &ctx, 4), "a\nb");
+    }
+
+    #[test]
+    fn a_line_budget_breaks_only_the_lines_it_lays_of_a_long_paragraph() {
+        // The budgeted lines are the whole paragraph's first lines; breaking
+        // stops at a window short of its end.
+        let style = crate::text::TextStyle {
+            size: 13.0,
+            ..Default::default()
+        };
+        let breaks = crate::text::TextBreakStyle {
+            wrap: true,
+            ..Default::default()
+        };
+        let text: String = (0..20_000).map(|word| format!("w{word} ")).collect();
+        let all = crate::text::wrapped_lines(&text, &style, 90.0, 200.0, breaks);
+        let some = crate::text::wrapped_lines_limited(&text, &style, 90.0, 200.0, breaks, 6);
+        assert_eq!(some.len(), 6);
+        for (limited, whole) in some.iter().zip(&all) {
+            assert_eq!(limited.text, whole.text);
+        }
+        let short = crate::text::wrapped_lines_limited("a b c", &style, 90.0, 200.0, breaks, 6);
+        assert_eq!(short.len(), 1);
     }
 }
