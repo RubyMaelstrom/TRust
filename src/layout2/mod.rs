@@ -137,8 +137,10 @@ pub(crate) fn snap_line_width(px: f32, device_pixel_ratio: f32) -> f32 {
         return px;
     }
     // Arithmetic on em and calc() lengths leaves whole values a hair off.
+    // Only a non-zero whole value absorbs that noise: any width above zero,
+    // however small, must still grow to one device pixel below.
     let whole = device.round();
-    if (device - whole).abs() < 1e-3 {
+    if whole != 0.0 && (device - whole).abs() < 1e-3 {
         return whole / ratio;
     }
     if device.abs() < 1.0 {
@@ -10584,6 +10586,11 @@ b</xmp></body>"#;
             (0.3, 2.0, 0.5),
             (1.3, 1.5, 1.0 / 1.5),
             (2.9999998, 1.0, 3.0),
+            // A width this small is still above zero, so it grows to one
+            // device pixel rather than being taken as float noise around 0.
+            (0.0004, 1.0, 1.0),
+            (0.0004, 2.0, 0.5),
+            (-0.0004, 1.0, -1.0),
         ] {
             assert_eq!(snap_line_width(px, ratio), snapped, "{px} at {ratio}");
         }
@@ -10593,11 +10600,14 @@ b</xmp></body>"#;
             <div id="a" style="width:100px;height:40px;border:6.48px solid blue"></div>
             <div id="b" style="font-size:21.6px;width:100px;border:0.3em solid blue"></div>
             <div id="c" style="width:100px;height:40px;border:0.5px solid blue;
-                outline:2.7px solid red"></div></body>"#;
+                outline:2.7px solid red"></div>
+            <div id="d" style="width:100px;height:40px;border:0.0004px solid blue;
+                outline:0.0004px solid red"></div></body>"#;
         let (dom, boxes) = measure(html, 100, 24);
         assert_eq!(rect(&dom, &boxes, "a").width, 112.0);
         assert_eq!(rect(&dom, &boxes, "b").width, 112.0);
         assert_eq!(rect(&dom, &boxes, "c").width, 102.0);
+        assert_eq!(rect(&dom, &boxes, "d").width, 102.0);
         let value = |id: &str, name: &str| {
             dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), name)
                 .unwrap()
@@ -10606,6 +10616,8 @@ b</xmp></body>"#;
         assert_eq!(value("b", "border-left-width"), "6px");
         assert_eq!(value("c", "border-bottom-width"), "1px");
         assert_eq!(value("c", "outline-width"), "2px");
+        assert_eq!(value("d", "border-top-width"), "1px");
+        assert_eq!(value("d", "outline-width"), "1px");
     }
 
     #[test]
