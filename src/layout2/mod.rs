@@ -4539,6 +4539,35 @@ mod tests {
     }
 
     #[test]
+    fn spanning_cells_distribute_widths_by_column_measures() {
+        // CSS Tables 3 #computing-column-measures: a spanning cell's
+        // min-content first fills its columns' min-to-max gaps in proportion
+        // to them, then grows them in proportion to max-content, as does its
+        // max-content. Gecko and Blink agree on each width below. Equal
+        // shares made a 400px span widen a 200px image column to 245px.
+        let html = r#"<!doctype html><body style="margin:0">
+            <table border=0 cellspacing=0 cellpadding=0><tr><td colspan=2><div style="width:400px;height:10px"></div></td></tr>
+            <tr><td width=200 id=a><div style="width:200px;height:10px"></div></td><td width=200 id=b>aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq</td></tr></table>
+            <table border=0 cellspacing=0 cellpadding=0><tr><td colspan=2><div style="width:600px;height:10px"></div></td></tr>
+            <tr><td id=c><div style="width:100px;height:10px"></div></td><td id=d><div style="width:300px;height:10px"></div></td></tr></table>
+            <table border=0 cellspacing=0 cellpadding=0 style="width:10px"><tr><td colspan=2><div style="width:400px;height:10px"></div></td></tr>
+            <tr><td id=e><div style="width:100px;height:10px"></div></td><td id=f>aaaaaaaaaa bbbbbbbbbbb ccccccccc dddddddd eeeeeeeeee</td></tr></table></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1024.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        for (id, expected) in [
+            ("a", 200.0),
+            ("b", 200.0),
+            ("c", 150.0),
+            ("d", 450.0),
+            ("e", 100.0),
+            ("f", 300.0),
+        ] {
+            assert!((width(id) - expected).abs() < 0.5, "{id}: {}", width(id));
+        }
+    }
+
+    #[test]
     fn a_nested_table_contributes_at_least_its_minimum_width() {
         // CSS 2 §17.5.2.2 / CSS Tables 3: a table's used width is the
         // larger of its declared width (CSS or HTML attribute) and its
