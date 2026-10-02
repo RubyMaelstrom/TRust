@@ -530,18 +530,45 @@
             __dom_load_injected_stylesheet(node.__id);
             return;
         }
-        // Resource-hint links (`preload`/`prefetch`/`modulepreload`/`preconnect`/
+        // HTML #link-type-preload fetches the resource into the document's
+        // preload map and fires `load`, or `error` for a network error. Astro's
+        // ClientRouter preloads the destination page's stylesheets as
+        // `<link rel="preload" as="style">` and awaits `Promise.all` of their
+        // load/error events BEFORE the view-transition swap.
+        if (rels.indexOf("preload") >= 0) {
+            node.__cssStarted = true;
+            __dom_preload_link(node.__id);
+            return;
+        }
+        // Other resource hints (`prefetch`/`modulepreload`/`preconnect`/
         // `dns-prefetch`): we don't speculatively fetch (hints are optional), but
-        // the element MUST still fire `load` — a loader that `await`s the hint
-        // otherwise hangs forever. Astro's ClientRouter preloads the destination
-        // page's stylesheets as `<link rel="preload" as="style">` and awaits
-        // `Promise.all` of their load/error events BEFORE the view-transition
-        // swap; without this the swap never runs and every routed link goes dead.
-        if (rels.some((r) => r === "preload" || r === "prefetch" || r === "modulepreload"
+        // a loader that `await`s the hint's `load` otherwise hangs forever.
+        if (rels.some((r) => r === "prefetch" || r === "modulepreload"
                 || r === "preconnect" || r === "dns-prefetch")) {
             node.__cssStarted = true;
             // Async, like a real hint resolving — settles inside the same job drain.
             Promise.resolve().then(() => { try { node.dispatchEvent(new Event("load")); } catch (e) {} });
+        }
+    }
+    // HTML #link-type-stylesheet and #link-type-preload: a connected link is
+    // also fetched and processed when its external resource link is created
+    // (a `rel` change adding the keyword) and when its `href` (or a preload's
+    // `as`) changes. Deferred-CSS loaders preload a sheet and set
+    // `rel="stylesheet"` from the preload's `load` event.
+    function linkAttributeChanged(node, name, oldValue) {
+        const value = node.getAttribute(name);
+        if (value === oldValue || !node.isConnected) return;
+        const tokens = (text) => String(text || "").toLowerCase().split(/[\t\n\f\r ]+/);
+        const rels = tokens(node.getAttribute("rel"));
+        const before = name === "rel" ? tokens(oldValue) : rels;
+        const changed = (type) => rels.indexOf(type) >= 0 &&
+            (before.indexOf(type) < 0 || name === "href" || (name === "as" && type === "preload"));
+        if (changed("stylesheet") && node.getAttribute("href")) {
+            node.__cssStarted = true;
+            __dom_load_injected_stylesheet(node.__id);
+        } else if (changed("preload")) {
+            node.__cssStarted = true;
+            __dom_preload_link(node.__id);
         }
     }
 
@@ -5467,6 +5494,8 @@
             // restore force-async (HTML "prepare the script element").
             if (lower === "async" && this.localName === "script") this.__trustForceAsync = false;
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
+            const linkOld = (lower === "rel" || lower === "href" || lower === "as") &&
+                this.localName === "link" ? this.getAttribute(n) : undefined;
             __dom_set_attr(this.__id, n, v);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             // DOM §4.9.1: NamedNodeMap is a live collection. Refresh the
@@ -5486,6 +5515,7 @@
             if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
             if (this.localName === "img" && imageRelevantAttribute(lower)) updateImageData(this);
             if (lower === "src" && (this.localName === "video" || this.localName === "audio")) loadMediaElement(this);
+            if (linkOld !== undefined) linkAttributeChanged(this, lower, linkOld);
         }
         setAttributeNS(_, n, v) { this.setAttribute(n, v); }
         removeAttribute(n) {
