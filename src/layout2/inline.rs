@@ -1703,6 +1703,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                             &labels.visual,
                             ctx,
                             labels.geometry.paint_width,
+                            labels.geometry.paint_height,
                             Some(self.cb_w_px),
                         )
                     })
@@ -1752,19 +1753,36 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// and `text-indent` with every other block of text. Intrinsic probes
     /// skip this: the control's preferred size comes from `cols`/`rows`.
     ///
-    /// `padding_basis` resolves percentage padding for the scrollport: the
-    /// control's containing-block width, when known.
+    /// `width` and `height` are the control's content box; `padding_basis`
+    /// resolves percentage padding for the scrollport: the control's
+    /// containing-block width, when known.
+    ///
+    /// TRust paints a textarea at its initial scroll position and clips its
+    /// lines to the scrollport, so only lines starting above the scrollport's
+    /// bottom edge can be seen. The work is bounded by that: the value is
+    /// laid only as far as lines can reach the scrollport, and only those
+    /// lines are kept for paint and hit testing. A value far longer than the
+    /// control (a log, a pasted file) then costs what the control shows.
     fn textarea_lines(
         &self,
         node: NodeId,
         text: &str,
         ctx: &InlineStyle,
         width: f32,
+        height: f32,
         padding_basis: Option<f32>,
     ) -> Option<std::sync::Arc<ControlText>> {
         if self.measuring || text.is_empty() {
             return None;
         }
+        let padding = BoxStyle::of(self.dom, node, self.vp)
+            .padding
+            .map(|length| length.resolve(padding_basis).unwrap_or(0.0).max(0.0));
+        // The scrollport's bottom edge below the content top, plus an em of
+        // slack: glyphs of a line box shorter than its font (a negative
+        // half-leading, CSS 2 §10.8.1) overflow it upwards into view.
+        let visible = height.max(0.0) + padding[BOTTOM] + ctx.font_size.max(0.0);
+        let text = textarea_visible_prefix(text, ctx, visible);
         let indent = self
             .dom
             .computed_value_resolved(node, "text-indent")
@@ -1797,6 +1815,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let mut runs = Vec::new();
         let mut top = 0.0;
         for line in &lines {
+            if top >= visible {
+                break;
+            }
             for piece in &line.pieces {
                 if let Some(shaped) = piece.shaped.as_ref().filter(|s| !s.runs.is_empty()) {
                     runs.push(ControlLine {
@@ -1808,9 +1829,6 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             }
             top += line.height;
         }
-        let padding = BoxStyle::of(self.dom, node, self.vp)
-            .padding
-            .map(|length| length.resolve(padding_basis).unwrap_or(0.0).max(0.0));
         Some(std::sync::Arc::new(ControlText {
             lines: runs,
             scrollport: padding,
@@ -1900,7 +1918,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let lines = textarea
             // The outer fragment resolved this box's percentage padding;
             // the content-width IFC no longer knows that basis.
-            .then(|| self.textarea_lines(a.node, &labels.visual, ctx, width, None))
+            .then(|| self.textarea_lines(a.node, &labels.visual, ctx, width, height, None))
             .flatten();
         self.place_atom(
             AtomGeometry {
@@ -3112,6 +3130,41 @@ fn textarea_rows(dom: &Dom, node: NodeId) -> usize {
         .unwrap_or(2)
 }
 
+/// The prefix of a multiline control's text that can produce a line box
+/// starting less than `visible` CSS pixels below its content top.
+///
+/// Where newlines are preserved (CSS Text 3 §4.1.1: each one is a forced
+/// line break, `\r\n` and a lone `\r` normalized to it) every segment
+/// between them begins a line box of its own, and no line box is shorter
+/// than the strut's line-height (CSS 2 §10.8.1). Segment `n` therefore
+/// starts at least `n` strut heights down, and a forced break ends every
+/// line, bidi paragraph and shaping context before it, so the following
+/// segments cannot change an earlier one. Collapsed newlines join the
+/// whole value into one paragraph; it is laid in full.
+fn textarea_visible_prefix<'s>(text: &'s str, ctx: &InlineStyle, visible: f32) -> &'s str {
+    if !ctx.ws.preserves_newlines() || !visible.is_finite() {
+        return text;
+    }
+    let line_height = crate::text::shape(" ", &ctx.text_style()).line_height;
+    if !line_height.is_finite() || line_height <= 0.0 {
+        return text;
+    }
+    // One segment of slack for the rounding of accumulated line heights.
+    let segments = ((visible / line_height).ceil() as usize).saturating_add(1);
+    let bytes = text.as_bytes();
+    let mut seen = 0usize;
+    for (index, &byte) in bytes.iter().enumerate() {
+        let newline = byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
+        if newline {
+            seen += 1;
+            if seen == segments {
+                return &text[..index];
+            }
+        }
+    }
+    text
+}
+
 fn control_labels(
     dom: &Dom,
     node: NodeId,
@@ -3269,5 +3322,39 @@ fn control_labels(
         visual,
         terminal,
         geometry,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout2::WhiteSpace;
+
+    #[test]
+    fn textarea_visible_prefix_keeps_the_segments_that_can_reach_the_scrollport() {
+        // CSS Text 3 §4.1.1: a preserved newline is a forced break, so each
+        // segment starts a line box at least one strut (CSS 2 §10.8.1) below
+        // the previous one. 25px reaches the segments at 0, 10 and 20px; one
+        // more is rounding slack, and nothing after it is laid.
+        let mut ctx = InlineStyle::root();
+        ctx.line_height = crate::text::CssLineHeight::Length(10.0);
+        ctx.ws = WhiteSpace::PreWrap;
+        let text: String = (0..100).map(|line| format!("{line}\n")).collect();
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), "0\n1\n2\n3");
+        // CR LF and a lone CR are newlines too (§4.1.1 segment breaks).
+        assert_eq!(
+            textarea_visible_prefix("a\r\nb\rc\nd\ne", &ctx, 15.0),
+            "a\r\nb\rc"
+        );
+        ctx.ws = WhiteSpace::PreLine;
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), "0\n1\n2\n3");
+        ctx.ws = WhiteSpace::Pre;
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), "0\n1\n2\n3");
+        // Collapsed newlines join the value into one paragraph.
+        ctx.ws = WhiteSpace::Normal;
+        assert_eq!(textarea_visible_prefix(&text, &ctx, 25.0), text);
+        // A short value is laid whole.
+        ctx.ws = WhiteSpace::PreWrap;
+        assert_eq!(textarea_visible_prefix("a\nb", &ctx, 25.0), "a\nb");
     }
 }
