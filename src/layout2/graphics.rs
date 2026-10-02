@@ -3864,23 +3864,8 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     // #line-style permits UA-chosen band thickness and shading, but double
     // must have a gap and the 3D styles must preserve their opposite relief.
     let complex = |s: &str| matches!(s, "double" | "groove" | "ridge" | "inset" | "outset");
-    let inner = CssRect::new(
-        rect.x + left,
-        rect.y + top,
-        (rect.width - left - right).max(0.),
-        (rect.height - top - bottom).max(0.),
-    );
-    let corners = |r: CssRect| {
-        [
-            CssPoint::new(r.x, r.y),
-            CssPoint::new(r.x + r.width, r.y),
-            CssPoint::new(r.x + r.width, r.y + r.height),
-            CssPoint::new(r.x, r.y + r.height),
-        ]
-    };
-    let outside = corners(rect);
-    let inside = corners(inner);
     let owners = corner_owners(fragment.border, &styles);
+    let splits = corner_splits(rect, radii, fragment.border, &owners);
     for side in 0..4 {
         if fragment.border[side] <= 0. || !complex(&styles[side]) {
             continue;
@@ -3907,9 +3892,9 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
             ],
             _ => vec![(0., 1., border_shade(color, light))],
         };
-        builder.commands.push(DisplayCommand::PushClip(side_clip(
-            side, &outside, &inside, &owners,
-        )));
+        builder
+            .commands
+            .push(DisplayCommand::PushClip(side_clip(side, &splits)));
         for (start, end, color) in bands {
             builder.commands.push(DisplayCommand::Fill {
                 shape: border_ring(rect, radii, fragment.border, start, end),
@@ -3974,20 +3959,43 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         // CSS Backgrounds 3 #corner-transitions: adjoining sides meet
         // between the outer and inner corners, including transparent sides
         // and a zero-sized padding box (the usual CSS triangle).
-        builder.commands.push(DisplayCommand::PushClip(side_clip(
-            index, &outside, &inside, &owners,
-        )));
+        builder
+            .commands
+            .push(DisplayCommand::PushClip(side_clip(index, &splits)));
+        let ring = border_ring(rect, radii, fragment.border, 0., 1.);
         if styles[index] == "solid" {
             builder.commands.push(DisplayCommand::Fill {
-                shape: border_ring(rect, radii, fragment.border, 0., 1.),
+                shape: ring,
                 brush: PaintBrush::Solid(colors[index]),
             });
-        } else {
+        } else if radii.corners.iter().all(|&(x, y)| x <= 0. || y <= 0.) {
             builder.commands.push(DisplayCommand::Stroke {
                 shape: PaintShape::Path(vec![PathElement::MoveTo(start), PathElement::LineTo(end)]),
                 brush: PaintBrush::Solid(colors[index]),
                 style: stroke_for_border(width, &styles[index]),
             });
+        } else {
+            // #corner-shaping: every style follows the curve, so dash the
+            // ring's center line, kept within the ring where the adjoining
+            // side is thinner.
+            let half = fragment.border.map(|width| width / 2.);
+            let middle = CssRect::new(
+                rect.x + half[3],
+                rect.y + half[0],
+                (rect.width - half[1] - half[3]).max(0.),
+                (rect.height - half[0] - half[2]).max(0.),
+            );
+            builder.commands.push(DisplayCommand::PushClip(ring));
+            builder.commands.push(DisplayCommand::Stroke {
+                shape: PaintShape::Path(rounded_contour(
+                    middle,
+                    inset_radii(radii, rect, middle),
+                    false,
+                )),
+                brush: PaintBrush::Solid(colors[index]),
+                style: stroke_for_border(width, &styles[index]),
+            });
+            builder.commands.push(DisplayCommand::PopClip);
         }
         builder.commands.push(DisplayCommand::PopClip);
     }
@@ -4132,39 +4140,110 @@ fn corner_owners<S: AsRef<str>>(widths: [f32; 4], styles: &[S; 4]) -> [CornerOwn
     })
 }
 
-/// The part of the border area that `side` paints: its edge plus its share
-/// of both corners, as divided by `owners`.
-fn side_clip(
-    side: usize,
-    outside: &[CssPoint; 4],
-    inside: &[CssPoint; 4],
+/// The boundary between the two sides at each corner of `rect`, from its
+/// outer corner inward (CSS Backgrounds 3 #corner-transitions).
+///
+/// At a square corner the sides meet on the line to the inner corner. At a
+/// rounded corner, as in Gecko, that line continues to the nearer of the
+/// padding box's midlines, so that it crosses the whole curve: the crossing
+/// stays within the corner's transition region and moves monotonically with
+/// the ratio of the border widths, and a zero-width side leaves the whole
+/// region to the other. A side that owns the corner instead takes the whole
+/// region, bounded by the other side's edge.
+fn corner_splits(
+    rect: CssRect,
+    radii: CornerRadii,
+    widths: [f32; 4],
     owners: &[CornerOwner; 4],
-) -> PaintShape {
-    // The boundary between a corner's two sides, from its outer to its inner
-    // corner. A side that owns the corner pushes the boundary onto the other
-    // side's edge.
-    let split = |corner: usize| {
-        let (outer, inner) = (outside[corner], inside[corner]);
+) -> [Vec<CssPoint>; 4] {
+    let [top, right, bottom, left] = widths;
+    let inner = CssRect::new(
+        rect.x + left,
+        rect.y + top,
+        (rect.width - left - right).max(0.),
+        (rect.height - top - bottom).max(0.),
+    );
+    let middle = CssPoint::new(inner.x + inner.width / 2., inner.y + inner.height / 2.);
+    let (x0, y0, x1, y1) = (rect.x, rect.y, rect.x + rect.width, rect.y + rect.height);
+    // Outer corner, inner corner, and the side widths across x and y.
+    let corners = [
+        (
+            CssPoint::new(x0, y0),
+            CssPoint::new(inner.x, inner.y),
+            left,
+            top,
+        ),
+        (
+            CssPoint::new(x1, y0),
+            CssPoint::new(inner.x + inner.width, inner.y),
+            right,
+            top,
+        ),
+        (
+            CssPoint::new(x1, y1),
+            CssPoint::new(inner.x + inner.width, inner.y + inner.height),
+            right,
+            bottom,
+        ),
+        (
+            CssPoint::new(x0, y1),
+            CssPoint::new(inner.x, inner.y + inner.height),
+            left,
+            bottom,
+        ),
+    ];
+    std::array::from_fn(|corner| {
+        let (outer, square, width_x, width_y) = corners[corner];
+        let (rx, ry) = radii.corners[corner];
+        let rounded = rx > 0. && ry > 0.;
+        let (sx, sy) = [(1., 1.), (-1., 1.), (-1., -1.), (1., -1.)][corner];
+        // The far corner of the transition region: the inner curve's center.
+        let region = if rounded {
+            CssPoint::new(
+                outer.x + sx * rx.max(width_x),
+                outer.y + sy * ry.max(width_y),
+            )
+        } else {
+            square
+        };
+        let even = corner.is_multiple_of(2);
         // Corners 0 and 2 have a vertical incoming and a horizontal outgoing
         // side; corners 1 and 3 the reverse.
-        let along_vertical = CssPoint::new(outer.x, inner.y);
-        let along_horizontal = CssPoint::new(inner.x, outer.y);
-        let even = corner.is_multiple_of(2);
+        let along_vertical = CssPoint::new(outer.x, region.y);
+        let along_horizontal = CssPoint::new(region.x, outer.y);
         match owners[corner] {
-            CornerOwner::Split => vec![outer, inner],
-            CornerOwner::Outgoing if even => vec![outer, along_vertical, inner],
-            CornerOwner::Outgoing => vec![outer, along_horizontal, inner],
-            CornerOwner::Incoming if even => vec![outer, along_horizontal, inner],
-            CornerOwner::Incoming => vec![outer, along_vertical, inner],
+            CornerOwner::Split if rounded => vec![outer, toward_middle(outer, square, middle)],
+            CornerOwner::Split => vec![outer, square],
+            CornerOwner::Outgoing if even => vec![outer, along_vertical, region],
+            CornerOwner::Outgoing => vec![outer, along_horizontal, region],
+            CornerOwner::Incoming if even => vec![outer, along_horizontal, region],
+            CornerOwner::Incoming => vec![outer, along_vertical, region],
         }
-    };
+    })
+}
+
+/// Continue the line from `outer` through `inner` until it reaches the
+/// nearer of the vertical and horizontal lines through `middle`.
+fn toward_middle(outer: CssPoint, inner: CssPoint, middle: CssPoint) -> CssPoint {
+    let (dx, dy) = (inner.x - outer.x, inner.y - outer.y);
+    match (dx == 0., dy == 0.) {
+        (true, true) => middle,
+        (true, false) => CssPoint::new(inner.x, middle.y),
+        (false, true) => CssPoint::new(middle.x, inner.y),
+        (false, false) => {
+            let scale = ((middle.x - outer.x) / dx).min((middle.y - outer.y) / dy);
+            CssPoint::new(outer.x + dx * scale, outer.y + dy * scale)
+        }
+    }
+}
+
+/// The part of the border area that `side` paints: its edge plus its share
+/// of both corners, as divided by `splits`.
+fn side_clip(side: usize, splits: &[Vec<CssPoint>; 4]) -> PaintShape {
     let next = (side + 1) % 4;
-    let mut points = vec![outside[side]];
-    points.extend(split(next));
-    let mut back = split(side);
-    back.reverse();
-    back.pop();
-    points.extend(back);
+    let mut points = vec![splits[side][0]];
+    points.extend(splits[next].iter().copied());
+    points.extend(splits[side].iter().rev().take(splits[side].len() - 1));
     PaintShape::Polygon {
         points,
         evenodd: false,
@@ -6222,6 +6301,45 @@ mod tests {
         let dots = ink_runs((100..160).map(|y| (y, blue(23, y))));
         assert!(dots.len() >= 3, "{dots:?}");
         assert!((112..=114).contains(&dots[0].0), "{dots:?}");
+    }
+
+    #[test]
+    fn unequal_sides_follow_their_rounded_corners() {
+        // CSS Backgrounds 3 #corner-shaping: every style follows the curve,
+        // and #corner-transitions: a zero-width side leaves the whole corner
+        // to the other. The sides used to be clipped one border width deep
+        // into each corner, dropping the curve when the sides differed.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="position:absolute;left:20px;top:20px;width:300px;height:60px;
+                border-radius:0 50px 0 0;border:4px solid #000;border-bottom:none"></div>
+            <div style="position:absolute;left:20px;top:120px;width:140px;height:80px;
+                border-radius:30px;border:8px solid #000;border-bottom:none"></div>
+            <div style="position:absolute;left:420px;top:20px;width:140px;height:80px;
+                border-radius:40px;border:8px dashed #00f"></div>"#,
+        );
+        // Around the 50px corner, in the middle of the 4px ring.
+        for (x, y) in [(314, 38), (308, 34)] {
+            assert!(pixel(x, y)[0] < 60, "({x}, {y}) {:?}", pixel(x, y));
+        }
+        // Where the left side thins into the missing bottom side.
+        assert!(pixel(41, 206)[0] < 100, "{:?}", pixel(41, 206));
+        // A dashed side keeps to its curve: nothing in the cut-off corner
+        // (420..432, 20..32), and dashes along the arc.
+        for (x, y) in [(421, 21), (425, 25), (424, 22)] {
+            assert_eq!(pixel(x, y), [255, 255, 255], "({x}, {y})");
+        }
+        let arc = (0..=90)
+            .filter(|degrees| {
+                let angle = (*degrees as f32).to_radians();
+                let [r, _, b] = pixel(
+                    (460. - 36. * angle.cos()) as usize,
+                    (60. - 36. * angle.sin()) as usize,
+                );
+                b > 200 && r < 100
+            })
+            .count();
+        assert!(arc > 30, "{arc}");
     }
 
     #[test]
