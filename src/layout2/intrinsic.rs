@@ -134,6 +134,21 @@ impl Flow<'_> {
         if let Some((_, width, _)) = self.vertical_lines(b, None, None, &here) {
             return width;
         }
+        // HTML Rendering #the-marquee-element-2 slides a horizontal marquee's
+        // contents in from beyond its edge, so they are not expected to fit
+        // and the spec gives the box no content-based size. Gecko and Blink
+        // both give it a zero min-content width, whatever its display type,
+        // and size its max-content width from its contents. Without this a
+        // long strip of 88x31 buttons widened a flex row past its container.
+        // The engines disagree for up/down marquees (Gecko zero, Blink the
+        // contents' min-content); those keep the contents' width.
+        if mode == IMode::Min
+            && b.node != NO_NODE
+            && self.dom.tag_name(b.node) == Some("marquee")
+            && !self.dom.marquee_scrolls_vertically(b.node)
+        {
+            return 0.0;
+        }
         match &b.content {
             Content::Blocks(kids) => kids
                 .iter()

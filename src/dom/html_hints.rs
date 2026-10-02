@@ -27,6 +27,14 @@ impl Dom {
         .then_some(table)
     }
 
+    /// Whether a marquee's `direction` attribute is in the up or down state
+    /// (HTML #attr-marquee-direction; the default is left).
+    pub(crate) fn marquee_scrolls_vertically(&self, id: NodeId) -> bool {
+        self.attr(id, "direction").is_some_and(|direction| {
+            direction.eq_ignore_ascii_case("up") || direction.eq_ignore_ascii_case("down")
+        })
+    }
+
     pub(super) fn html_presentational_hints(
         &self,
         id: NodeId,
@@ -160,9 +168,7 @@ impl Dom {
         // marquee's natural height is 200px. Horizontal marquees scroll a
         // single line of content, so it does not wrap (as in Gecko and Blink).
         if tag == "marquee" {
-            let vertical = self.attr(id, "direction").is_some_and(|direction| {
-                direction.eq_ignore_ascii_case("up") || direction.eq_ignore_ascii_case("down")
-            });
+            let vertical = self.marquee_scrolls_vertically(id);
             if let Some(width) = self.attr(id, "width").and_then(dimension_value) {
                 hint("width", width);
             }
