@@ -5629,6 +5629,7 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
     let (u1, u2) = (sl, iw - sr);
     let (v1, v2) = (st, ih - sb);
     let node = style.node();
+    let ratio = builder.dom.device_pixel_ratio().max(f32::EPSILON);
     let draw = |builder: &mut Builder<'_>,
                 source: CssRect,
                 region: CssRect,
@@ -5649,10 +5650,31 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
                 .commands
                 .push(DisplayCommand::PushClip(PaintShape::Rect(region)));
         }
+        // Adjoining `round` and `repeat` tiles meet on device pixels, as in
+        // Gecko and Blink: two antialiased edges sharing a fractional pixel
+        // would let the background show through as a seam, though the tiles
+        // exactly fill the region. The region's own edges stay put.
+        let edges = |origin: f32, size: f32, mode: BorderImageRepeat, from: f32, to: f32| {
+            if !matches!(mode, BorderImageRepeat::Round | BorderImageRepeat::Repeat) {
+                return (origin, size);
+            }
+            let snap = |value: f32| {
+                if (value - from).abs() < 1e-3 || (value - to).abs() < 1e-3 {
+                    value
+                } else {
+                    (value * ratio).round() / ratio
+                }
+            };
+            let start = snap(origin);
+            (start, snap(origin + size) - start)
+        };
+        let (right, bottom) = (region.x + region.width, region.y + region.height);
         for &y in &ys {
+            let (top, height) = edges(y, tile_h, modes.1, region.y, bottom);
             for &x in &xs {
+                let (left, width) = edges(x, tile_w, modes.0, region.x, right);
                 builder.commands.push(DisplayCommand::Image {
-                    rect: CssRect::new(x, y, tile_w, tile_h),
+                    rect: CssRect::new(left, top, width, height),
                     handle,
                     source_rect: Some(source),
                     fit: ImageFit::Fill,
@@ -7197,6 +7219,43 @@ mod tests {
         assert!(!red_border(&layout.paint.primitives));
         let (_, pending) = render_fixture_with_images(html, &Default::default());
         assert!(red_border(&pending.paint.primitives));
+    }
+
+    #[test]
+    fn round_border_image_tiles_meet_on_whole_pixels() {
+        // CSS Backgrounds 3 #border-image-repeat: `round` rescales the tiles
+        // to fill the edge exactly, here three 33.33px tiles along a 100px
+        // edge. Each tile was drawn at its fractional position, so two
+        // antialiased edges shared a pixel and the page showed through.
+        let html = r#"<body style="margin:0"><div style="margin:20px;width:100px;height:30px;
+            border:15px solid transparent;border-image:url(https://example.test/c.png) 15 round">
+            </div></body>"#;
+        let images = [("https://example.test/c.png".to_string(), (69, 69))]
+            .into_iter()
+            .collect();
+        let (_, layout) = render_fixture_with_images(html, &images);
+        let mut tiles: Vec<CssRect> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Image { rect, .. }
+                    if rect.y == 20.0 && rect.x >= 35.0 && rect.x < 135.0 =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        tiles.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(tiles.len(), 3, "{tiles:?}");
+        let mut edge = 35.0;
+        for tile in &tiles {
+            assert_eq!(tile.x, edge, "{tiles:?}");
+            edge = tile.x + tile.width;
+            assert_eq!(edge, edge.round(), "{tiles:?}");
+        }
+        assert_eq!(edge, 135.0);
     }
 
     #[test]
