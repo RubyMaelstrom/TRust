@@ -5965,15 +5965,16 @@ b</xmp></body>"#;
         let html = r#"<body style="margin:0"><input name="q" value="text"
             style="width:80px;outline:2px solid #ff0000;outline-offset:2px"></body>"#;
         let graphics = lay_graphical(html, 320.0, &HashMap::new());
+        // A solid outline is the filled band between its outer edge and the
+        // border box grown by the offset.
         assert!(graphics.paint.primitives.iter().any(|primitive| matches!(
             primitive,
-            crate::render::DisplayCommand::Stroke {
+            crate::render::DisplayCommand::Fill {
+                shape: crate::render::PaintShape::Path(_),
                 brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
                     255, 0, 0, 255
                 )),
-                style,
-                ..
-            } if (style.width - 2.0).abs() < 0.01
+            }
         )));
         let terminal = lay_with_forms(html, 40, &HashMap::new());
         assert!(
