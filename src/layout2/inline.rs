@@ -157,6 +157,44 @@ pub(crate) struct InlineBoxEntry {
     /// Top and bottom padding plus border, which surround the box's content
     /// area (CSS 2 #inline-non-replaced).
     pub vertical_edges: [f32; 2],
+    /// The box's own font metrics: its first available font's ascent and
+    /// descent, and its baseline's offset within a layout box of the box's
+    /// own line-height (CSS 2 #leading).
+    pub ascent: f32,
+    pub descent: f32,
+    pub baseline: f32,
+    pub line_height: f32,
+    /// The box's own alignment on the line, which its baseline-aligned
+    /// contents share.
+    pub vertical_align: VerticalAlign,
+}
+
+impl InlineBoxEntry {
+    /// The top and bottom of the box's content area on a line whose top is
+    /// `line_top`, given the line box's height and baseline offset. CSS 2
+    /// #inline-non-replaced bases a non-replaced inline box's content area
+    /// on its own font, whatever the line holds: neither a descendant's
+    /// larger font nor an atomic inline stretches it. The box sits on the
+    /// line where an inline box of its own font and alignment would, placed
+    /// like a text piece is (CSS 2 #propdef-vertical-align).
+    pub(crate) fn content_area(
+        &self,
+        line_top: f32,
+        line_height: f32,
+        line_baseline: f32,
+    ) -> (f32, f32) {
+        let baseline = line_top
+            + match self.vertical_align {
+                VerticalAlign::Baseline => line_baseline,
+                VerticalAlign::Shift(rise) => line_baseline - rise,
+                VerticalAlign::Top => self.baseline,
+                VerticalAlign::Bottom => (line_height - self.line_height).max(0.0) + self.baseline,
+                VerticalAlign::Middle(half_x) => {
+                    line_baseline - half_x - self.line_height / 2.0 + self.baseline
+                }
+            };
+        (baseline - self.ascent, baseline + self.descent)
+    }
 }
 
 /// What follows an inline item in its formatting context: the rest of its
@@ -889,10 +927,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                                 .resolve(Some(self.cb_w_px))
                                 .unwrap_or(0.0)
                     };
-                    (decorated || key.1.is_none()).then(|| InlineBoxEntry {
-                        key,
-                        decorated,
-                        vertical_edges: [edge(TOP), edge(BOTTOM)],
+                    (decorated || key.1.is_none()).then(|| {
+                        // The box's own strut, like the block container's
+                        // (CSS 2 #inline-non-replaced, #leading).
+                        let strut = crate::text::shape(" ", &inner.text_style());
+                        InlineBoxEntry {
+                            key,
+                            decorated,
+                            vertical_edges: [edge(TOP), edge(BOTTOM)],
+                            ascent: strut.ascent,
+                            descent: strut.descent,
+                            baseline: strut.baseline,
+                            line_height: strut.line_height,
+                            vertical_align: inner.vertical_align,
+                        }
                     })
                 });
                 if let Some(entry) = tracked {

@@ -12573,6 +12573,68 @@ b</xmp></body>"#;
         assert!(split.height >= 90.0, "{split:?}");
     }
 
+    #[test]
+    fn geometry_bases_an_inline_boxs_content_area_on_its_own_font() {
+        // CSS 2 #inline-non-replaced and #inline-box-height: an inline box's
+        // content area follows its own font; a descendant's larger font or
+        // an atomic inline on its line does not stretch it. Its baseline is
+        // the one its baseline-aligned contents sit on.
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0;font:16px/60px monospace">
+               <p style="margin:0">x<a id=m style="font-size:10px">y<span id=big style="font-size:32px">Z</span></a></p>
+               <p style="margin:0"><a id=l><img id=img src="i.png" width=88 height=80></a></p>
+               <p style="margin:0"><span id=ib><span id=blk style="display:inline-block;width:40px;height:90px"></span></span></p>
+               <p style="margin:0"><span id=sup style="vertical-align:super;font-size:10px">a<span id=raised style="font-size:32px">B</span></span></p></body>"#,
+            100,
+            60,
+        );
+        let metrics = |size: f32| {
+            let strut = crate::text::shape(
+                " ",
+                &crate::text::TextStyle {
+                    family: "monospace".into(),
+                    size,
+                    ..Default::default()
+                },
+            );
+            (f64::from(strut.ascent), f64::from(strut.descent))
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 0.01;
+        let (small_ascent, small_descent) = metrics(10.0);
+        let (base_ascent, base_descent) = metrics(16.0);
+        let (big_ascent, _) = metrics(32.0);
+        for (outer, inner) in [("m", "big"), ("sup", "raised")] {
+            let outer_rect = rect(&dom, &boxes, outer);
+            let inner_rect = rect(&dom, &boxes, inner);
+            assert!(
+                close(outer_rect.height, small_ascent + small_descent),
+                "#{outer} is a 10px font's content area: {outer_rect:?} around {inner_rect:?}"
+            );
+            assert!(
+                close(outer_rect.top + small_ascent, inner_rect.top + big_ascent),
+                "#{outer} shares #{inner}'s baseline: {outer_rect:?} {inner_rect:?}"
+            );
+        }
+        // An atom's bottom margin edge sits on the baseline (CSS 2
+        // #propdef-vertical-align); the inline box around it keeps its own
+        // font's content area there.
+        for (inline, atom) in [("l", "img"), ("ib", "blk")] {
+            let inline_rect = rect(&dom, &boxes, inline);
+            let atom_rect = rect(&dom, &boxes, atom);
+            assert!(
+                close(inline_rect.height, base_ascent + base_descent),
+                "#{inline} is a 16px font's content area: {inline_rect:?} around {atom_rect:?}"
+            );
+            assert!(
+                close(
+                    inline_rect.top + base_ascent,
+                    atom_rect.top + atom_rect.height
+                ),
+                "#{inline} sits on #{atom}'s baseline: {inline_rect:?} {atom_rect:?}"
+            );
+        }
+    }
+
     // ---- P7: incremental region patch (measure::region_buffer) -------------
 
     #[test]

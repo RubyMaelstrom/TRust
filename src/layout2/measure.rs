@@ -21,6 +21,7 @@ use crate::dom::{DOCUMENT, Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind, LineFrag, TopFrag};
+use super::inline::InlineBoxEntry;
 use crate::render::{Affine2d, CssRect};
 
 fn border_rect(frag: &Frag, transform: Affine2d) -> PxRect {
@@ -301,16 +302,17 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
 
 /// CSSOM View #dom-element-getclientrects: each line fragment of an element's
 /// non-replaced inline box is its border area. That is the box's content area
-/// (CSS 2 #inline-non-replaced: from the font's ascent to its descent, never
-/// the line height) with its vertical padding and border, spanning the box's
-/// pieces on the line plus its start and end edges where the box begins and
-/// ends (CSS Backgrounds 3 #box-decoration-break `slice`). Decorated boxes
-/// paint the same geometry.
+/// (CSS 2 #inline-non-replaced: from its own font's ascent to its descent,
+/// never the line height nor a descendant's font or atomic inline) with its
+/// vertical padding and border, spanning the box's pieces on the line plus
+/// its start and end edges where the box begins and ends (CSS Backgrounds 3
+/// #box-decoration-break `slice`). Decorated boxes paint the same geometry.
 fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
     struct Run {
         node: NodeId,
-        rect: Rect,
-        edges: [f32; 2],
+        x0: f32,
+        x1: f32,
+        entry: InlineBoxEntry,
     }
     let mut runs: Vec<Run> = Vec::new();
     for piece in line.pieces.iter().chain(&line.atom_boxes) {
@@ -319,54 +321,40 @@ fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
         };
         let start = f.x + piece.x;
         let end = start + piece.box_width;
-        let (top, bottom) =
-            piece
-                .shaped
-                .as_ref()
-                .map_or((f32::INFINITY, f32::NEG_INFINITY), |text| {
-                    let baseline = f.y + piece.y + text.baseline;
-                    (baseline - text.ascent, baseline + text.descent)
-                });
         for entry in boxes.chain.iter().filter(|entry| entry.key.1.is_none()) {
-            let mut piece_rect = Rect {
-                x0: start,
-                y0: top,
-                x1: end,
-                y1: bottom,
-            };
+            let (mut x0, mut x1) = (start, end);
             if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == entry.key) {
-                piece_rect.x0 = start - distance;
+                x0 = start - distance;
             }
             if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == entry.key)
             {
-                piece_rect.x1 = end + distance;
+                x1 = end + distance;
             }
             match runs.iter_mut().find(|run| run.node == entry.key.0) {
-                Some(run) => run.rect = Rect::union(run.rect, piece_rect),
+                Some(run) => {
+                    run.x0 = run.x0.min(x0);
+                    run.x1 = run.x1.max(x1);
+                }
                 None => runs.push(Run {
                     node: entry.key.0,
-                    rect: piece_rect,
-                    edges: entry.vertical_edges,
+                    x0,
+                    x1,
+                    entry: *entry,
                 }),
             }
         }
     }
     runs.into_iter()
-        .map(|Run { node, rect, edges }| {
-            // A box holding no text takes the line's own font metrics.
-            let (top, bottom) = if rect.y0.is_finite() {
-                (rect.y0, rect.y1)
-            } else {
-                let baseline = f.y + line.baseline;
-                (baseline - line.ascent, baseline + line.descent)
-            };
+        .map(|run| {
+            let (top, bottom) = run.entry.content_area(f.y, line.height, line.baseline);
+            let [above, below] = run.entry.vertical_edges;
             let rect = Rect {
-                x0: rect.x0,
-                y0: top - edges[0],
-                x1: rect.x1.max(rect.x0),
-                y1: bottom + edges[1],
+                x0: run.x0,
+                y0: top - above,
+                x1: run.x1.max(run.x0),
+                y1: bottom + below,
             };
-            (node, rect)
+            (run.node, rect)
         })
         .collect()
 }
