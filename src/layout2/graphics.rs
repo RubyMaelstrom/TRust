@@ -5984,7 +5984,7 @@ mod tests {
     #[test]
     fn zero_font_size_keeps_line_height_around_middle_aligned_inline_blocks() {
         let (dom, layout) = render_fixture(
-            "<style>body{margin:0} #bar{font-size:0;line-height:34px;background:#a47618} #dot{display:inline-block;width:18px;height:18px;vertical-align:middle;background:#56390a}</style><div id=bar><span id=dot></span></div><div id=after>Next</div>",
+            "<!doctype html><style>body{margin:0} #bar{font-size:0;line-height:34px;background:#a47618} #dot{display:inline-block;width:18px;height:18px;vertical-align:middle;background:#56390a}</style><div id=bar><span id=dot></span></div><div id=after>Next</div>",
         );
         let get = |id| layout.boxes.get(&dom.get_by_id(id).unwrap()).unwrap();
         assert_eq!(get("bar").height, 34.);
