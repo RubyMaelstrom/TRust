@@ -262,11 +262,25 @@ impl Flow<'_> {
         // size is, once a cyclic percentage behaves as auto).
         let frame =
             b.node != NO_NODE && matches!(self.dom.tag_name(b.node), Some("iframe" | "frame"));
+        // CSS Sizing 3 #min-content-zero: non-button-like inputs, select,
+        // textarea, progress and meter compress like replaced elements.
+        let compressible_control = |atom: &super::tree::Atom| {
+            matches!(&atom.kind, AtomKind::Control { .. })
+                && match self.dom.tag_name(atom.node) {
+                    Some("input") => !matches!(
+                        self.dom.input_type(atom.node).as_str(),
+                        "button" | "reset" | "submit" | "color" | "image"
+                    ),
+                    Some(tag) => matches!(tag, "select" | "textarea" | "progress" | "meter"),
+                    None => false,
+                }
+        };
         let compressible_min = mode == IMode::Min
             && (frame
                 || matches!(
                     &b.content,
-                    Content::Atomic(atom) if matches!(&atom.kind, AtomKind::Img { .. })
+                    Content::Atomic(atom)
+                        if matches!(&atom.kind, AtomKind::Img { .. }) || compressible_control(atom)
                 ));
         let preferred_basis = compressible_min.then_some(0.0);
         let bp = s.border[super::style::LEFT]
@@ -349,7 +363,22 @@ impl Flow<'_> {
                 let Some(f) = self.forms.get(*form).and_then(|f| f.fields.get(*field)) else {
                     return 0.0;
                 };
-                if mode == IMode::Min {
+                // CSS Sizing 3 #intrinsic-sizes: the min-content/max-content
+                // keywords (and field-sizing:content) size a text control to
+                // its value, but an auto width is the control's preferred
+                // `cols`/`size` width under every constraint, as in Gecko and
+                // Blink: a long value never widens a shrink-to-fit parent.
+                let content_sized = ["width", "field-sizing"].iter().any(|property| {
+                    self.dom
+                        .computed_value_resolved(atom.node, property)
+                        .is_some_and(|value| {
+                            matches!(
+                                value.trim(),
+                                "min-content" | "fit-content" | "max-content" | "content"
+                            )
+                        })
+                });
+                if mode == IMode::Min && content_sized {
                     super::inline::control_intrinsic_width_for_mode(
                         self.dom, atom.node, f, inl, self.vp, true,
                     )
