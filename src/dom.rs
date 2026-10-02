@@ -8058,18 +8058,46 @@ impl Dom {
         copy
     }
 
-    /// Parse an HTML snippet in the context of `parent`'s tag and return
-    /// the new nodes (already transplanted into this arena, detached).
+    /// Parse an HTML snippet in the context of an HTML element named
+    /// `context_tag` and return the new nodes (already transplanted into
+    /// this arena, detached).
     pub fn parse_fragment_into(&mut self, context_tag: &str, html: &str) -> Vec<NodeId> {
+        let context = QualName::new(None, ns!(html), context_tag.to_ascii_lowercase().into());
+        self.parse_fragment_with(context, Vec::new(), html)
+    }
+
+    /// HTML #html-fragment-parsing-algorithm with `context` as the fragment
+    /// context element, whose namespace and attributes matter as well as its
+    /// local name: as the adjusted current node, an SVG or MathML context
+    /// makes the fragment's start tags foreign elements (HTML
+    /// #tree-construction), and an `annotation-xml` context's `encoding`
+    /// makes it an HTML integration point. A missing or non-element context
+    /// (a DocumentFragment or ShadowRoot parent) parses in an HTML flow
+    /// content context.
+    pub fn parse_fragment_in(&mut self, context: Option<NodeId>, html: &str) -> Vec<NodeId> {
+        match context.map(|id| &self.nodes[id].data) {
+            Some(NodeData::Element { name, attrs, .. }) => {
+                let (name, attrs) = (name.clone(), attrs.clone());
+                self.parse_fragment_with(name, attrs, html)
+            }
+            _ => self.parse_fragment_into("div", html),
+        }
+    }
+
+    fn parse_fragment_with(
+        &mut self,
+        context: QualName,
+        context_attrs: Vec<Attribute>,
+        html: &str,
+    ) -> Vec<NodeId> {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
             // HTML #dom-element-innerhtml / fragment parsing defaults to
             // disallowing declarative roots, unlike navigation parsing.
             allow_declarative_shadow_roots: false,
         };
-        let context = QualName::new(None, ns!(html), context_tag.to_ascii_lowercase().into());
         let frag: Dom =
-            html5ever::parse_fragment(sink, ParseOpts::default(), context, Vec::new(), false)
+            html5ever::parse_fragment(sink, ParseOpts::default(), context, context_attrs, false)
                 .one(StrTendril::from(html));
         // The fragment's children land under <html> under the document.
         let html_el = frag

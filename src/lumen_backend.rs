@@ -12910,11 +12910,10 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(id) = host_arg_node(&dom, args, 0) {
-        let context_tag = dom.tag_name(id).unwrap_or("div").to_owned();
         let target = dom.content_target(id);
         // HTML's innerHTML setter parses first, then DOM's replace-all
         // operation removes the old children and inserts the parsed fragment.
-        let nodes = dom.parse_fragment_into(&context_tag, &html);
+        let nodes = dom.parse_fragment_in(Some(id), &html);
         dom.replace_all_children(target, nodes);
     }
     Ok(Value::Undefined)
@@ -12937,16 +12936,14 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     let Some(id) = host_arg_node(&dom, args, 0) else {
         return Ok(Value::Undefined);
     };
-    let context_tag = match position.as_str() {
-        "beforebegin" | "afterend" => dom
-            .node(id)
-            .parent
-            .and_then(|parent| dom.tag_name(parent))
-            .unwrap_or("div")
-            .to_owned(),
-        _ => dom.tag_name(id).unwrap_or("div").to_owned(),
+    // HTML #dom-element-insertadjacenthtml (and the outerHTML setter, which
+    // inserts before the element): the context is the parent or the element
+    // itself, namespace included, so SVG and MathML parse as foreign content.
+    let context = match position.as_str() {
+        "beforebegin" | "afterend" => dom.node(id).parent,
+        _ => Some(id),
     };
-    let nodes = dom.parse_fragment_into(&context_tag, &html);
+    let nodes = dom.parse_fragment_in(context, &html);
     match position.as_str() {
         "afterbegin" => {
             let first = dom.node(id).first_child;
@@ -29755,6 +29752,48 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "rangeResult"),
             "r1,1-r1,1 r1,1-r1,1 r1,4-r1,4 r2,0-r2,0 r2,0-r2,0 r3,1-r3,1"
+        );
+    }
+
+    #[test]
+    fn fragment_parsing_uses_the_context_elements_namespace() {
+        // HTML #html-fragment-parsing-algorithm: the context element, not
+        // just its local name, is the adjusted current node. Inside SVG the
+        // markup is foreign content (with SVG's case-adjusted names), an
+        // HTML integration point (foreignObject, or annotation-xml whose
+        // encoding attribute is text/html) and a MathML text integration
+        // point (mi) parse HTML. insertAdjacentHTML, the outerHTML setter and
+        // innerHTML all parse this way.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            body.innerHTML = '<svg><g><circle id=c1 r=1 /></g><g><circle id=c2 r=1 /></g>' +
+                '<g id=g3></g><foreignObject><span id=fs>x</span></foreignObject></svg>' +
+                '<math><mi id=mi>x</mi><annotation-xml encoding="text/html"><span id=as>a</span>' +
+                '</annotation-xml></math>';
+            const name = (id) => {
+                const element = document.getElementById(id);
+                return element ? element.namespaceURI.split("/").pop() + ":" + element.localName : "missing";
+            };
+            document.getElementById("c1").outerHTML = "<rect id=r1></rect><linearGradient id=lg></linearGradient>";
+            document.getElementById("c2").insertAdjacentHTML("afterend", "<rect id=r2></rect>");
+            document.getElementById("g3").innerHTML = "<rect id=r3></rect>";
+            document.getElementById("fs").outerHTML = "<p id=fp>p</p>";
+            document.getElementById("mi").insertAdjacentHTML("beforeend", "<mn id=mn>1</mn>");
+            document.getElementById("as").outerHTML = "<div id=ad>d</div><svg id=asv></svg>";
+            globalThis.namespaceResult = ["r1", "lg", "r2", "r3", "fp", "mn", "ad", "asv"]
+                .map(name).join(" ");
+            "#,
+            "fragment parsing context namespace",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "namespaceResult"),
+            "svg:rect svg:linearGradient svg:rect svg:rect xhtml:p xhtml:mn xhtml:div svg:svg"
         );
     }
 
