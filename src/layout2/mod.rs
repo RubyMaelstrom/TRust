@@ -4614,6 +4614,36 @@ mod tests {
     }
 
     #[test]
+    fn multicol_moves_whole_blocks_into_balanced_columns() {
+        // CSS Multi-column 1 #cf balances columns using the content's break
+        // opportunities (CSS Fragmentation 3 #possible-breaks). Blocks that
+        // fit in a column move whole, keeping their boxes, and each column
+        // starts at its first block's top. Matches Gecko and Blink.
+        let html = r#"<!doctype html><style>body{margin:0}
+            .m{column-count:2;column-gap:20px;width:420px}
+            .m div{height:30px;border-top:3px solid teal;background:pink}</style>
+            <div class=m id=m><div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></div>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        for (id, x, y) in [
+            ("a", 0.0, 0.0),
+            ("b", 0.0, 33.0),
+            ("c", 0.0, 66.0),
+            ("d", 220.0, 0.0),
+            ("e", 220.0, 33.0),
+        ] {
+            let r = rect(id);
+            assert_eq!(
+                (r.left, r.top, r.width, r.height),
+                (x, y, 200.0, 33.0),
+                "{id}"
+            );
+        }
+        assert_eq!(rect("m").height, 99.0);
+    }
+
+    #[test]
     fn spanning_cells_distribute_widths_by_column_measures() {
         // CSS Tables 3 #computing-column-measures: a spanning cell's
         // min-content first fills its columns' min-to-max gaps in proportion
