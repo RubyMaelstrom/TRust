@@ -4799,6 +4799,23 @@ mod tests {
     }
 
     #[test]
+    fn a_line_too_short_beside_floats_moves_below_them() {
+        // CSS 2 §9.5: a line box shortened by floats so far that none of its
+        // content fits moves down until some fits or no floats remain. "All"
+        // fits a 25px gap between two floats; "good? Great!" does not, so its
+        // line starts below them (Gecko and Blink), instead of overflowing
+        // the gap one word per line.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <div style="width:500px"><div style="height:60px;width:200px;float:left"></div>
+            <div style="height:60px;width:275px;float:right"></div>
+            <p id=p style="margin:0">All good? Great!</p></div>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let p = layout.boxes[&dom.get_by_id("p").unwrap()];
+        assert_eq!((p.top, p.height), (0.0, 80.0));
+    }
+
+    #[test]
     fn a_word_continued_by_punctuation_in_another_element_does_not_wrap() {
         // CSS Text 3 #line-breaking: an inline box boundary is no break
         // opportunity, and UAX #14 LB13 forbids one before a full stop. A

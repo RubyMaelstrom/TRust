@@ -428,6 +428,9 @@ pub(crate) struct LineOut {
     /// against — every line can differ beside floats). Justification at
     pub left: f32,
     pub right: f32,
+    /// Space above this line box where it moved down past floats too close
+    /// for any of its content (CSS 2 §9.5).
+    pub gap_before: f32,
 }
 
 /// The inline formatting context builder. Feed it the IFC's inline content,
@@ -504,6 +507,8 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// Running px height of the line boxes already flushed — the current line's
     /// top y is `content_top_y + laid_h`.
     laid_h: f32,
+    /// Vertical space owed above the next line box (`LineOut::gap_before`).
+    line_gap: f32,
     /// Index of the next `Inline::Float` to meet (into `float_boxes`).
     float_next: usize,
     /// Resolved placements (margin-box top-left px), returned by `finish`.
@@ -611,6 +616,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             content_left_x,
             content_top_y,
             laid_h: 0.0,
+            line_gap: 0.0,
             float_next: 0,
             placements: Vec::new(),
             atom_boxes,
@@ -673,6 +679,32 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.pen = self.line_start;
         self.pending_space = false;
         self.preserved_break = false;
+    }
+
+    /// CSS 2 §9.5: an empty line box shortened by floats so far that its next
+    /// content does not fit moves down to the nearest float bottom, until
+    /// some content fits or no float shortens it. Returns whether it moved.
+    fn move_line_below_floats(&mut self) -> bool {
+        if !self.cur.is_empty()
+            || self.pen > self.line_start
+            || (self.line_left <= 0.0 && self.line_right >= self.cap)
+        {
+            return false;
+        }
+        let y = self.content_top_y + self.laid_h;
+        let probe_h = 1.2 * crate::dom::FONT_SIZE_INITIAL;
+        let Some(bottom) = self
+            .fc
+            .as_deref()
+            .and_then(|fc| fc.next_bottom(y, probe_h))
+            .filter(|&bottom| bottom > y)
+        else {
+            return false;
+        };
+        self.laid_h += bottom - y;
+        self.line_gap += bottom - y;
+        self.begin_line();
+        true
     }
 
     /// Place the k-th inline float met (§9.5.1): pull it aside into the float
@@ -1436,6 +1468,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             } else {
                 crate::text::first_line_end(rest, &ctx.text_style(), avail, break_style)
             };
+            if break_style.wrap
+                && !emergency_wrap
+                && (cut == 0 || (cut == rest.len() && !fits(full.advance)))
+                && self.move_line_below_floats()
+            {
+                spaced = false;
+                continue;
+            }
             // The run's last segment and the content continuing it share one
             // line: when only the segment fits, wrap before it.
             if continuation > 0.0
@@ -2265,6 +2305,26 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let space = self.pending_space && self.pen > self.line_start;
         let space_width = if space { space_advance.max(0.0) } else { 0.0 };
         let gap = self.take_gap();
+        if can_wrap
+            && !super::css_px_fits(
+                self.pen + space_width + gap + geometry.box_width,
+                self.line_right,
+            )
+            && self.move_line_below_floats()
+        {
+            self.pending_gap_px = gap;
+            self.place_atom(
+                geometry,
+                item,
+                shaped,
+                atom_box,
+                paint_control_box,
+                vertical_align,
+                space_advance,
+                can_wrap,
+            );
+            return;
+        }
         // CSS Text 3 #white-space-property / #atomic-compat-wrap: the
         // opportunities around atomic inlines are soft breaks. `nowrap`
         // and `pre` must overflow horizontally instead of making new lines.
@@ -2587,6 +2647,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             width,
             left: self.line_left,
             right: self.line_right,
+            gap_before: std::mem::take(&mut self.line_gap),
         };
         // Center/right shift now, within this line's (float-shortened) band;
         // justification waits for `finish`, where "last line" is known.

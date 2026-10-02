@@ -1836,7 +1836,7 @@ impl Flow<'_> {
             let max = max_lines.iter().map(|line| line.width).fold(0., f32::max);
             probe(max.min(cap), block_align(self.dom, inl.node))
         };
-        let block = lines.iter().map(|line| line.height).sum();
+        let block = lines.iter().map(|line| line.gap_before + line.height).sum();
         let inline =
             height.unwrap_or_else(|| lines.iter().map(|line| line.width).fold(0., f32::max));
         Some((lines, block, inline))
@@ -1875,6 +1875,7 @@ impl Flow<'_> {
 
     fn emit_lines(&self, lines: Vec<LineOut>, x: f32, cur: &mut Cursor, out: &mut Vec<Frag>) {
         for line in lines {
+            cur.y += line.gap_before;
             let hpx = line.height;
             let line_frag = LineFrag {
                 sideways: false,
@@ -4988,6 +4989,7 @@ impl Flow<'_> {
         {
             let mut y = content_top_y;
             for l in &lines {
+                y += l.gap_before;
                 line_tops.push(y);
                 y += l.height;
             }
