@@ -2727,13 +2727,37 @@ fn paint_background_images_for_style(
         .value(builder.dom, "background-blend-mode")
         .unwrap_or_else(|| "normal".into());
     let blend_layers = split_top_level(&blend_value, ',');
-    let viewport = CssRect::new(0.0, 0.0, builder.viewport_w, builder.viewport_h);
+    // CSS Backgrounds 3 #background-attachment: `fixed` is relative to the
+    // viewport of the element's own document, which for a frame's document
+    // is the frame's scrollport. (A serialized presentation arena has the
+    // frame's `data-trust-frame` wrapper in its place.)
+    let dom = builder.dom;
+    let owner = dom.frame_owner(style.node()).or_else(|| {
+        std::iter::successors(dom.node(style.node()).parent, |&node| dom.node(node).parent)
+            .find(|&node| dom.attr(node, "data-trust-frame").is_some())
+    });
+    let frame = owner.and_then(|frame| {
+        builder
+            .scroll_containers
+            .iter()
+            .find(|container| container.node == frame)
+            .map(|container| (frame, container.viewport))
+    });
+    let viewport = frame.map_or(
+        CssRect::new(0.0, 0.0, builder.viewport_w, builder.viewport_h),
+        |(_, viewport)| viewport,
+    );
     // A fixed canvas layer's commands move to the viewport-pinned underlay
     // once that layer is done (every path below ends its iteration), after
-    // closing the layer's blend group.
+    // closing the layer's blend group. A frame's canvas instead paints such
+    // a layer outside the frame's scroll, re-entering it afterwards.
     let mut fixed_start: Option<usize> = None;
+    let mut rescroll: Option<NodeId> = None;
     let mut blending = false;
-    let pin_fixed = |builder: &mut Builder<'_>, start: &mut Option<usize>, blending: &mut bool| {
+    let pin_fixed = |builder: &mut Builder<'_>,
+                     start: &mut Option<usize>,
+                     rescroll: &mut Option<NodeId>,
+                     blending: &mut bool| {
         if std::mem::take(blending) {
             builder.commands.push(DisplayCommand::PopLayer);
         }
@@ -2741,11 +2765,14 @@ fn paint_background_images_for_style(
             let commands = builder.commands.split_off(start);
             builder.fixed_under.extend(commands);
         }
+        if let Some(frame) = rescroll.take() {
+            builder.commands.push(DisplayCommand::BeginScroll(frame));
+        }
     };
     // CSS Backgrounds paints the first listed layer closest to the viewer, so
     // emit in reverse order after the background color.
     for (index, layer) in images.iter().enumerate().rev() {
-        pin_fixed(builder, &mut fixed_start, &mut blending);
+        pin_fixed(builder, &mut fixed_start, &mut rescroll, &mut blending);
         let layer = layer.trim();
         if layer.eq_ignore_ascii_case("none") || layer.is_empty() {
             continue;
@@ -2758,7 +2785,13 @@ fn paint_background_images_for_style(
             .trim()
             .eq_ignore_ascii_case("fixed");
         let canvas = if fixed && canvas.is_some() {
-            fixed_start = Some(builder.commands.len());
+            match frame {
+                Some((frame, _)) => {
+                    builder.commands.push(DisplayCommand::EndScroll);
+                    rescroll = Some(frame);
+                }
+                None => fixed_start = Some(builder.commands.len()),
+            }
             Some(viewport)
         } else {
             canvas
@@ -2968,7 +3001,7 @@ fn paint_background_images_for_style(
             builder.commands.push(DisplayCommand::PopClip);
         }
     }
-    pin_fixed(builder, &mut fixed_start, &mut blending);
+    pin_fixed(builder, &mut fixed_start, &mut rescroll, &mut blending);
 }
 
 /// What one background layer paints into each of its tiles.
@@ -6564,6 +6597,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_fixed_frame_canvas_background_uses_the_frame_viewport() {
+        // CSS Backgrounds 3 #background-attachment: `fixed` is relative to
+        // the viewport of the element's document, here the iframe's, and the
+        // frame's canvas paints only within it.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><iframe id=f style="position:absolute;left:30px;top:0;
+                width:100px;height:100px;border:0"></iframe></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<body style="margin:0;background:black linear-gradient(to right,red 50%,lime 50%)
+                0 0/20px 20px fixed"><div style="height:300px"></div></body>"#,
+            "https://frame.test/",
+        )
+        .unwrap();
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://page.test/").unwrap(),
+            crate::layout2::Viewport::new(200., 120.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let pixels = crate::render::headless::render_paint(&layout.paint, CssSize::new(200., 120.))
+            .unwrap()
+            .pixels;
+        let at = |x: usize, y: usize| &pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 3];
+        assert_eq!(at(35, 50), [255, 0, 0], "tiles start at the frame's edge");
+        assert_eq!(at(45, 50), [0, 255, 0]);
+        assert_eq!(at(170, 50), [255, 255, 255], "nothing outside the frame");
+        assert_eq!(at(10, 50), [255, 255, 255]);
     }
 
     #[test]
