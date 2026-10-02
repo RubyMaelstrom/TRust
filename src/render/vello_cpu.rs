@@ -317,7 +317,52 @@ impl VelloCpuRenderer {
                     offset,
                     blur_radius,
                     spread,
-                    inset,
+                    inset: true,
+                } => {
+                    // `shape` is the padding box, which clips the shadow.
+                    if !shape_is_visible(
+                        shape,
+                        *logical_transforms.last().unwrap(),
+                        clips.bounds(),
+                        0.0,
+                    ) {
+                        continue;
+                    }
+                    apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
+                    let hole = inset_shadow_hole(shape, *offset, *spread);
+                    let std_dev = blur_radius.max(0.0) / 2.0;
+                    let padding = shape_path(shape);
+                    self.context.set_paint(vello_color(*color));
+                    if let Some((rect, radius)) =
+                        simple_rounded_rect(&hole).filter(|_| std_dev > 0.0)
+                    {
+                        self.context
+                            .push_layer(Some(&padding), None, None, None, None);
+                        self.context.fill_path(&padding);
+                        self.context
+                            .push_layer(None, Some(erase_blend()), None, None, None);
+                        self.context.set_paint(BLACK);
+                        self.context
+                            .fill_blurred_rounded_rect(&rect, radius, std_dev, false);
+                        self.context.pop_layer();
+                        self.context.pop_layer();
+                    } else {
+                        // Vello CPU's direct blur primitive currently accepts
+                        // rounded rectangles, not arbitrary paths.
+                        self.context.push_clip_path(&padding);
+                        self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
+                        self.context.fill_path(&inset_shadow_ring(shape, &hole));
+                        self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+                        self.context.pop_clip_path();
+                    }
+                }
+                DisplayCommand::Shadow {
+                    shape,
+                    color,
+                    offset,
+                    blur_radius,
+                    spread,
+                    inset: false,
                 } => {
                     let expansion = spread.max(0.0) + blur_radius.max(0.0) * 2.0;
                     let shifted = offset_shape(shape, offset.x, offset.y, *spread);
@@ -331,33 +376,23 @@ impl VelloCpuRenderer {
                     }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.set_paint(vello_color(*color));
-                    if !*inset {
-                        self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
-                        self.context
-                            .push_clip_path(&outside_shape_path(shape, &shifted, expansion));
-                        self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
-                    }
+                    self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
+                    self.context
+                        .push_clip_path(&outside_shape_path(shape, &shifted, expansion));
+                    self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
                     if let Some((rect, radius)) = simple_rounded_rect(&shifted) {
-                        if *inset {
-                            self.context.push_clip_path(&shape_path(shape));
-                        }
                         self.context.fill_blurred_rounded_rect(
                             &rect,
                             radius,
                             blur_radius.max(0.0) / 2.0,
-                            *inset,
+                            false,
                         );
-                        if *inset {
-                            self.context.pop_clip_path();
-                        }
                     } else {
                         // Vello CPU's direct blur primitive currently accepts
                         // rounded rectangles, not arbitrary paths.
                         self.context.fill_path(&shape_path(&shifted));
                     }
-                    if !*inset {
-                        self.context.pop_clip_path();
-                    }
+                    self.context.pop_clip_path();
                 }
                 DisplayCommand::HitRegion(_) => {}
                 Primitive::FillRect { rect, color } => {
@@ -1384,6 +1419,30 @@ pub(super) fn outside_shape_path(shape: &PaintShape, shadow: &PaintShape, reach:
     ));
     path.extend(shape_path(shape));
     path
+}
+
+/// CSS Backgrounds 3 #shadow-shape: an inner shadow is cast as if everything
+/// outside the padding edge (`shape`) were opaque. Its perimeter is the
+/// padding box shifted by the offset and contracted by the spread, flooring
+/// its size and corner radii at zero.
+pub(super) fn inset_shadow_hole(shape: &PaintShape, offset: CssPoint, spread: f32) -> PaintShape {
+    offset_shape(shape, offset.x, offset.y, -spread)
+}
+
+/// The unblurred inner shadow: the padding box minus the shadow perimeter,
+/// filled with the even-odd rule inside a clip to the padding box.
+pub(super) fn inset_shadow_ring(shape: &PaintShape, hole: &PaintShape) -> BezPath {
+    let mut path = shape_path(shape);
+    path.extend(shape_path(hole));
+    path
+}
+
+/// Vello's inverted blurred rectangle rasterizes only the perimeter's blur
+/// extent, though its paint is opaque everywhere outside it. A blurred inner
+/// shadow instead fills the padding box and erases the blurred perimeter
+/// from that layer with this mode.
+pub(super) fn erase_blend() -> vello_cpu::peniko::BlendMode {
+    vello_cpu::peniko::BlendMode::new(Mix::Normal, Compose::DestOut)
 }
 
 pub(super) fn shape_bounds(shape: &PaintShape) -> Option<CssRect> {

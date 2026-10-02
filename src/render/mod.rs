@@ -1044,6 +1044,8 @@ pub enum DisplayCommand {
     EndMarquee,
     /// A renderer may use a native blur/filter, or fall back to an expanded
     /// translucent shape. The geometry and CSS semantics remain TRust-owned.
+    /// `shape` is the border box of an outer shadow and the padding box of
+    /// an inset one (CSS Backgrounds 3 #shadow-shape).
     Shadow {
         shape: PaintShape,
         color: PaintColor,

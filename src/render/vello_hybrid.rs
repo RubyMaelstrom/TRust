@@ -30,10 +30,11 @@ use winit::window::Window;
 
 use super::vello_cpu::{
     ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, decoration_strokes,
-    gradient_extend, offset_shape, outside_shape_path, point_bounds, radial_aspect_transform,
-    radial_gradient, rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path,
-    simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend, vello_color,
-    vello_css_filter, vello_rect, vello_stops, vello_stroke,
+    erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring, offset_shape,
+    outside_shape_path, point_bounds, radial_aspect_transform, radial_gradient, rect_is_visible,
+    rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect, text_shadow_blur,
+    vello_affine, vello_blend, vello_color, vello_css_filter, vello_rect, vello_stops,
+    vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
@@ -853,7 +854,47 @@ impl VelloHybridRenderer {
                     offset,
                     blur_radius,
                     spread,
-                    inset,
+                    inset: true,
+                } => {
+                    // Mirrors the CPU reference: `shape` is the padding box.
+                    if !shape_is_visible(
+                        shape,
+                        *logical_transforms.last().unwrap(),
+                        clips.bounds(),
+                        0.0,
+                    ) {
+                        continue;
+                    }
+                    apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
+                    let hole = inset_shadow_hole(shape, *offset, *spread);
+                    let std_dev = blur_radius.max(0.0) / 2.0;
+                    let padding = shape_path(shape);
+                    target.set_paint(vello_color(*color));
+                    if let Some((rect, radius)) =
+                        simple_rounded_rect(&hole).filter(|_| std_dev > 0.0)
+                    {
+                        target.push_layer(Some(&padding), None, None, None, None);
+                        target.fill_path(&padding);
+                        target.push_layer(None, Some(erase_blend()), None, None, None);
+                        target.set_paint(vello_common::color::palette::css::BLACK);
+                        target.fill_blurred_rounded_rect(&rect, radius, std_dev, false);
+                        target.pop_layer();
+                        target.pop_layer();
+                    } else {
+                        target.push_clip_path(&padding);
+                        target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
+                        target.fill_path(&inset_shadow_ring(shape, &hole));
+                        target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+                        target.pop_clip_path();
+                    }
+                }
+                DisplayCommand::Shadow {
+                    shape,
+                    color,
+                    offset,
+                    blur_radius,
+                    spread,
+                    inset: false,
                 } => {
                     let expansion = spread.max(0.0) + blur_radius.max(0.0) * 2.0;
                     let shifted = offset_shape(shape, offset.x, offset.y, *spread);
@@ -867,33 +908,23 @@ impl VelloHybridRenderer {
                     }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     target.set_paint(vello_color(*color));
-                    if !*inset {
-                        target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
-                        target.push_clip_path(&outside_shape_path(shape, &shifted, expansion));
-                        target.set_fill_rule(vello_common::peniko::Fill::NonZero);
-                    }
+                    target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
+                    target.push_clip_path(&outside_shape_path(shape, &shifted, expansion));
+                    target.set_fill_rule(vello_common::peniko::Fill::NonZero);
                     if let Some((rect, radius)) = simple_rounded_rect(&shifted) {
-                        if *inset {
-                            target.push_clip_path(&shape_path(shape));
-                        }
                         target.fill_blurred_rounded_rect(
                             &rect,
                             radius,
                             blur_radius.max(0.0) / 2.0,
-                            *inset,
+                            false,
                         );
-                        if *inset {
-                            target.pop_clip_path();
-                        }
                     } else {
                         // Both current Vello backends expose direct blur only
                         // for rounded rectangles; arbitrary shadows retain the
                         // same unblurred fallback as the CPU reference.
                         target.fill_path(&shape_path(&shifted));
                     }
-                    if !*inset {
-                        target.pop_clip_path();
-                    }
+                    target.pop_clip_path();
                 }
                 DisplayCommand::HitRegion(_) => {}
                 Primitive::FillRect { rect, color } => {
