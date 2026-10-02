@@ -2292,11 +2292,15 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
             .dom
             .computed_value_resolved(node, "background-image")
             .is_some();
+    // An authored border color or width also replaces the native edge, as in
+    // Gecko and Blink: `border-color: transparent` hides a button's border.
     let border_declared = ["top", "right", "bottom", "left"].into_iter().any(|side| {
-        builder
-            .dom
-            .computed_value_resolved(node, &format!("border-{side}-style"))
-            .is_some()
+        ["style", "width", "color"].into_iter().any(|part| {
+            builder
+                .dom
+                .computed_value_resolved(node, &format!("border-{side}-{part}"))
+                .is_some()
+        })
     });
     let foreground = text_color(builder.dom, node, false);
     let light_foreground = paint_color_is_light(foreground);
@@ -5709,6 +5713,31 @@ mod tests {
             "italic: {}",
             lean("font-style:italic")
         );
+    }
+
+    #[test]
+    fn an_authored_border_color_replaces_a_buttons_native_edge() {
+        // CSS UI 4 #appearance-switching, as Gecko and Blink apply it: any
+        // authored border property drops the native edge, so a transparent
+        // border color leaves an image button borderless.
+        let ink = |style: &str| {
+            let (_, layout) = render_fixture(&format!(
+                "<style>body{{margin:0;background:white}}</style>\
+                 <button style='width:60px;height:40px;background-color:transparent;{style}'></button>"
+            ));
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[0] < 200)
+                .count()
+        };
+        assert!(ink("") > 50, "the native edge");
+        assert_eq!(ink("border-color:transparent"), 0);
     }
 
     #[test]
