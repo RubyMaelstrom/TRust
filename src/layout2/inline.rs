@@ -729,7 +729,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 self.oofs.push(OofMark {
                     b,
                     line: self.lines.len(),
-                    x_px: self.pen + self.pending_gap_px,
+                    // A block-level box's margin box ignores floats (CSS 2
+                    // §9.5), so its hypothetical box starts at the content
+                    // edge even beside a float (CSS Position 3 #staticpos-rect).
+                    x_px: if inline_level {
+                        self.pen + self.pending_gap_px
+                    } else {
+                        0.0
+                    },
                     ctx: ctx.clone(),
                     aligned: !inline_level,
                 })
