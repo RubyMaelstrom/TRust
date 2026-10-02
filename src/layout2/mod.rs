@@ -1925,7 +1925,10 @@ mod tests {
         assert_eq!(scope.animations.len(), 2);
         assert_eq!(scope.animations[0].position[0].value.y, 0.0);
         assert_eq!(scope.animations[0].position[1].value.y, 660.0);
-        assert_eq!(scope.animations[1].transform[1].value.x, 80.0);
+        assert_eq!(
+            scope.animations[1].transform[1].steps,
+            [crate::render::TransformStep::Translate(80.0, 0.0)]
+        );
         assert!(layout.paint.has_css_animations());
     }
 

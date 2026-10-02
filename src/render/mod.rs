@@ -471,8 +471,19 @@ impl DisplayCommand {
                                 * std::mem::size_of::<CssAnimationPoint>(),
                         )
                         .saturating_add(
-                            (animation.transform.capacity() + animation.opacity.capacity())
-                                * std::mem::size_of::<CssAnimationPoint>(),
+                            animation.opacity.capacity() * std::mem::size_of::<CssAnimationPoint>(),
+                        )
+                        .saturating_add(
+                            animation.transform.capacity()
+                                * std::mem::size_of::<CssTransformFrame>()
+                                + animation
+                                    .transform
+                                    .iter()
+                                    .map(|frame| {
+                                        frame.steps.capacity()
+                                            * std::mem::size_of::<TransformStep>()
+                                    })
+                                    .sum::<usize>(),
                         );
                 }
                 bytes
@@ -1067,8 +1078,13 @@ pub struct CssPaintAnimation {
     pub running: bool,
     /// Translation contributed by an animated inset such as `top`.
     pub position: Vec<CssAnimationPoint>,
-    /// Translation contributed by a supported `transform` keyframe.
-    pub transform: Vec<CssAnimationPoint>,
+    /// `transform` keyframes, which replace the element's static transform
+    /// about `transform_origin` while the animation applies.
+    pub transform: Vec<CssTransformFrame>,
+    pub transform_origin: CssPoint,
+    /// The element's static transform matrix, which the paint inside the
+    /// animation scope already applies.
+    pub static_transform: Affine2d,
     /// Group opacity relative to the element's static opacity layer, in
     /// each point's `x`.
     pub opacity: Vec<CssAnimationPoint>,
@@ -1078,6 +1094,173 @@ pub struct CssPaintAnimation {
 pub struct CssAnimationPoint {
     pub offset: f32,
     pub value: CssPoint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CssTransformFrame {
+    pub offset: f32,
+    pub steps: Vec<TransformStep>,
+}
+
+/// One transform function resolved to CSS px and radians, interpolable per
+/// CSS Transforms 1 #interpolation-of-transforms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformStep {
+    Translate(f32, f32),
+    Rotate(f32),
+    Scale(f32, f32),
+    Skew(f32, f32),
+    Matrix(Affine2d),
+}
+
+impl TransformStep {
+    fn matrix(self) -> Affine2d {
+        match self {
+            Self::Translate(x, y) => Affine2d::translate(x, y),
+            Self::Rotate(angle) => {
+                let (sin, cos) = angle.sin_cos();
+                Affine2d([cos, sin, -sin, cos, 0., 0.])
+            }
+            Self::Scale(x, y) => Affine2d::scale(x, y),
+            Self::Skew(x, y) => Affine2d([1., y.tan(), x.tan(), 1., 0., 0.]),
+            Self::Matrix(matrix) => matrix,
+        }
+    }
+
+    /// The identity transform function of the same type (#none-transform).
+    fn identity(self) -> Self {
+        match self {
+            Self::Translate(..) => Self::Translate(0., 0.),
+            Self::Rotate(_) => Self::Rotate(0.),
+            Self::Scale(..) => Self::Scale(1., 1.),
+            Self::Skew(..) => Self::Skew(0., 0.),
+            Self::Matrix(_) => Self::Matrix(Affine2d::IDENTITY),
+        }
+    }
+
+    /// Numeric interpolation of two functions of one type.
+    fn interpolate(self, other: Self, t: f32) -> Option<Affine2d> {
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        Some(match (self, other) {
+            (Self::Translate(x0, y0), Self::Translate(x1, y1)) => {
+                Self::Translate(mix(x0, x1), mix(y0, y1)).matrix()
+            }
+            (Self::Rotate(a0), Self::Rotate(a1)) => Self::Rotate(mix(a0, a1)).matrix(),
+            (Self::Scale(x0, y0), Self::Scale(x1, y1)) => {
+                Self::Scale(mix(x0, x1), mix(y0, y1)).matrix()
+            }
+            (Self::Skew(x0, y0), Self::Skew(x1, y1)) => {
+                Self::Skew(mix(x0, x1), mix(y0, y1)).matrix()
+            }
+            (Self::Matrix(a), Self::Matrix(b)) => interpolate_matrices(a, b, t),
+            _ => return None,
+        })
+    }
+}
+
+/// CSS Transforms 1 #interpolation-of-transforms: a `none` list takes the
+/// other's identity functions; lists of the same function types interpolate
+/// function by function, and other pairs as decomposed matrices.
+fn interpolate_transform_steps(from: &[TransformStep], to: &[TransformStep], t: f32) -> Affine2d {
+    let identity = |steps: &[TransformStep]| steps.iter().map(|step| step.identity()).collect();
+    let (from, to): (Vec<_>, Vec<_>) = match (from.is_empty(), to.is_empty()) {
+        (true, false) => (identity(to), to.to_vec()),
+        (false, true) => (from.to_vec(), identity(from)),
+        _ => (from.to_vec(), to.to_vec()),
+    };
+    if from.len() == to.len()
+        && let Some(steps) = from
+            .iter()
+            .zip(&to)
+            .map(|(a, b)| a.interpolate(*b, t))
+            .collect::<Option<Vec<_>>>()
+    {
+        return steps
+            .into_iter()
+            .fold(Affine2d::IDENTITY, |matrix, step| matrix.then(step));
+    }
+    let compose = |steps: &[TransformStep]| {
+        steps.iter().fold(Affine2d::IDENTITY, |matrix, step| {
+            matrix.then(step.matrix())
+        })
+    };
+    interpolate_matrices(compose(&from), compose(&to), t)
+}
+
+/// CSS Transforms 1 #decomposing-a-2d-matrix: translation, scale, angle
+/// (radians) and the remaining 2x2 matrix, or `None` when singular.
+fn decompose_2d(matrix: Affine2d) -> Option<([f32; 2], [f32; 2], f32, [f32; 4])> {
+    let [mut r0x, mut r0y, mut r1x, mut r1y, tx, ty] = matrix.0;
+    let determinant = r0x * r1y - r0y * r1x;
+    if !determinant.is_finite() || determinant.abs() < 1.0e-8 {
+        return None;
+    }
+    let mut scale = [r0x.hypot(r0y), r1x.hypot(r1y)];
+    if determinant < 0. {
+        if r0x < r1y {
+            scale[0] = -scale[0];
+        } else {
+            scale[1] = -scale[1];
+        }
+    }
+    if scale[0] != 0. {
+        r0x /= scale[0];
+        r0y /= scale[0];
+    }
+    if scale[1] != 0. {
+        r1x /= scale[1];
+        r1y /= scale[1];
+    }
+    let angle = r0y.atan2(r0x);
+    if angle != 0. {
+        let (sn, cs) = (-r0y, r0x);
+        let (m11, m12, m21, m22) = (r0x, r0y, r1x, r1y);
+        r0x = cs * m11 + sn * m21;
+        r0y = cs * m12 + sn * m22;
+        r1x = -sn * m11 + cs * m21;
+        r1y = -sn * m12 + cs * m22;
+    }
+    Some(([tx, ty], scale, angle, [r0x, r0y, r1x, r1y]))
+}
+
+/// #interpolation-of-decomposed-2d-matrix-values and
+/// #recomposing-to-a-2d-matrix; a singular endpoint animates discretely.
+fn interpolate_matrices(from: Affine2d, to: Affine2d, t: f32) -> Affine2d {
+    let (Some(a), Some(b)) = (decompose_2d(from), decompose_2d(to)) else {
+        return if t < 0.5 { from } else { to };
+    };
+    let (translate_a, mut scale_a, mut angle_a, m_a) = a;
+    let (translate_b, scale_b, mut angle_b, m_b) = b;
+    use std::f32::consts::PI;
+    if (scale_a[0] < 0. && scale_b[1] < 0.) || (scale_a[1] < 0. && scale_b[0] < 0.) {
+        scale_a = [-scale_a[0], -scale_a[1]];
+        angle_a += if angle_a < 0. { PI } else { -PI };
+    }
+    if angle_a == 0. {
+        angle_a = 2. * PI;
+    }
+    if angle_b == 0. {
+        angle_b = 2. * PI;
+    }
+    if (angle_a - angle_b).abs() > PI {
+        if angle_a > angle_b {
+            angle_a -= 2. * PI;
+        } else {
+            angle_b -= 2. * PI;
+        }
+    }
+    let mix = |x: f32, y: f32| x + (y - x) * t;
+    let m = std::array::from_fn::<f32, 4, _>(|i| mix(m_a[i], m_b[i]));
+    Affine2d::translate(
+        mix(translate_a[0], translate_b[0]),
+        mix(translate_a[1], translate_b[1]),
+    )
+    .then(TransformStep::Rotate(mix(angle_a, angle_b)).matrix())
+    .then(Affine2d([m[0], m[1], m[2], m[3], 0., 0.]))
+    .then(Affine2d::scale(
+        mix(scale_a[0], scale_b[0]),
+        mix(scale_a[1], scale_b[1]),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2340,11 +2523,10 @@ impl Scene {
                 }
                 Primitive::EndFixed => self.primitives.push(Primitive::PopTransform),
                 Primitive::BeginCssAnimation(scope) => {
-                    let translation = sample_css_animation_scope(scope, elapsed_seconds);
                     self.primitives
-                        .push(Primitive::PushTransform(Affine2d::translate(
-                            translation.x,
-                            translation.y,
+                        .push(Primitive::PushTransform(sample_css_animation_scope(
+                            scope,
+                            elapsed_seconds,
                         )));
                     let opacity = sample_css_animation_opacity(scope, elapsed_seconds);
                     if let Some(opacity) = opacity {
@@ -2511,10 +2693,11 @@ fn sample_marquee_scope(scope: &MarqueeScope, elapsed_seconds: f32) -> CssPoint 
     }
 }
 
-fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -> CssPoint {
-    // CSS Animations 1 §4.2: later animations override earlier animations
-    // that affect the same property. `top` and `transform` remain independent
-    // tracks and their translations compose for paint.
+/// The transform a CSS animation scope applies around the element's paint.
+/// CSS Animations 1 §4.2: later animations override earlier animations that
+/// affect the same property. An animated `top` translates; an animated
+/// `transform` replaces the static transform the paint already applies.
+fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -> Affine2d {
     let mut position = None;
     let mut transform = None;
     for animation in &scope.animations {
@@ -2529,16 +2712,51 @@ fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -
             ));
         }
         if !animation.transform.is_empty() {
-            transform = Some(sample_css_animation_track(
-                &animation.transform,
-                progress,
-                &animation.timing_function,
-            ));
+            let animated =
+                sample_transform_track(&animation.transform, progress, &animation.timing_function);
+            let origin = animation.transform_origin;
+            let animated = Affine2d::translate(origin.x, origin.y)
+                .then(animated)
+                .then(Affine2d::translate(-origin.x, -origin.y));
+            transform = Some(
+                animation
+                    .static_transform
+                    .inverse()
+                    .map_or(animated, |inverse| animated.then(inverse)),
+            );
         }
     }
     let position = position.unwrap_or_default();
-    let transform = transform.unwrap_or_default();
-    CssPoint::new(position.x + transform.x, position.y + transform.y)
+    Affine2d::translate(position.x, position.y).then(transform.unwrap_or(Affine2d::IDENTITY))
+}
+
+/// The transform list's matrix at `progress`, each keyframe interval eased
+/// by the animation's timing function.
+fn sample_transform_track(
+    track: &[CssTransformFrame],
+    progress: f32,
+    timing_function: &str,
+) -> Affine2d {
+    let compose =
+        |frame: &CssTransformFrame| interpolate_transform_steps(&frame.steps, &frame.steps, 0.);
+    let (Some(first), Some(last)) = (track.first(), track.last()) else {
+        return Affine2d::IDENTITY;
+    };
+    if progress <= first.offset {
+        return compose(first);
+    }
+    if progress >= last.offset {
+        return compose(last);
+    }
+    let Some(window) = track
+        .windows(2)
+        .find(|window| progress >= window[0].offset && progress <= window[1].offset)
+    else {
+        return compose(last);
+    };
+    let span = (window[1].offset - window[0].offset).max(f32::EPSILON);
+    let t = css_timing_progress(timing_function, (progress - window[0].offset) / span);
+    interpolate_transform_steps(&window[0].steps, &window[1].steps, t)
 }
 
 /// The group opacity of a scope's last active opacity animation (CSS
@@ -4087,6 +4305,92 @@ mod tests {
     }
 
     #[test]
+    fn transform_lists_interpolate_by_function_or_decomposed_matrix() {
+        // CSS Transforms 1 #interpolation-of-transforms.
+        let close = |a: Affine2d, b: Affine2d| {
+            assert!(
+                a.0.iter().zip(b.0).all(|(x, y)| (x - y).abs() < 1.0e-4),
+                "{a:?} != {b:?}"
+            );
+        };
+        let turn = std::f32::consts::TAU;
+        // Function-wise: a full turn keeps its three quarter-turn steps.
+        close(
+            interpolate_transform_steps(
+                &[TransformStep::Rotate(0.)],
+                &[TransformStep::Rotate(turn)],
+                0.25,
+            ),
+            TransformStep::Rotate(turn / 4.).matrix(),
+        );
+        // `none` interpolates against the identity of the other's functions.
+        close(
+            interpolate_transform_steps(
+                &[],
+                &[
+                    TransformStep::Translate(40., 0.),
+                    TransformStep::Scale(3., 3.),
+                ],
+                0.5,
+            ),
+            Affine2d::translate(20., 0.).then(Affine2d::scale(2., 2.)),
+        );
+        // Mismatched lists: decomposed matrices (a quarter turn halves).
+        close(
+            interpolate_transform_steps(
+                &[TransformStep::Translate(0., 0.)],
+                &[
+                    TransformStep::Rotate(turn / 4.),
+                    TransformStep::Translate(0., 0.),
+                ],
+                0.5,
+            ),
+            TransformStep::Rotate(turn / 8.).matrix(),
+        );
+    }
+
+    #[test]
+    fn animated_transforms_replace_the_static_transform_about_the_origin() {
+        // CSS Animations 1 §4.2: the animated value replaces the static
+        // `transform: translateX(100px)` the paint already applies.
+        let static_transform = Affine2d::translate(100., 0.);
+        let scope = CssAnimationScope {
+            animations: vec![CssPaintAnimation {
+                name: "spin".into(),
+                duration_seconds: 4.0,
+                delay_seconds: 0.0,
+                iteration_count: None,
+                direction: "normal".into(),
+                fill_mode: "none".into(),
+                timing_function: "linear".into(),
+                running: true,
+                opacity: Vec::new(),
+                position: Vec::new(),
+                transform: vec![
+                    CssTransformFrame {
+                        offset: 0.0,
+                        steps: vec![TransformStep::Rotate(0.)],
+                    },
+                    CssTransformFrame {
+                        offset: 1.0,
+                        steps: vec![TransformStep::Rotate(std::f32::consts::TAU)],
+                    },
+                ],
+                transform_origin: CssPoint::new(50., 50.),
+                static_transform,
+            }],
+        };
+        // A quarter of the way: 90 degrees about (50, 50), and no
+        // translateX, so (100, 50) maps to (50, 100).
+        let applied = sample_css_animation_scope(&scope, 1.0).then(static_transform);
+        let point = applied.map_point(CssPoint::new(100., 50.));
+        assert!(
+            (point.x - 50.).abs() < 1.0e-3 && (point.y - 100.).abs() < 1.0e-3,
+            "{point:?}"
+        );
+    }
+
+    #[test]
     fn css_animation_tracks_sample_timing_direction_and_composition() {
         let scope = CssAnimationScope {
             animations: vec![
@@ -4111,6 +4415,8 @@ mod tests {
                         },
                     ],
                     transform: Vec::new(),
+                    transform_origin: CssPoint::default(),
+                    static_transform: Affine2d::IDENTITY,
                 },
                 CssPaintAnimation {
                     name: "shake".into(),
@@ -4124,27 +4430,29 @@ mod tests {
                     opacity: Vec::new(),
                     position: Vec::new(),
                     transform: vec![
-                        CssAnimationPoint {
+                        CssTransformFrame {
                             offset: 0.0,
-                            value: CssPoint::new(0.0, 0.0),
+                            steps: vec![TransformStep::Translate(0.0, 0.0)],
                         },
-                        CssAnimationPoint {
+                        CssTransformFrame {
                             offset: 1.0,
-                            value: CssPoint::new(80.0, 0.0),
+                            steps: vec![TransformStep::Translate(80.0, 0.0)],
                         },
                     ],
+                    transform_origin: CssPoint::default(),
+                    static_transform: Affine2d::IDENTITY,
                 },
             ],
         };
         assert_eq!(
             sample_css_animation_scope(&scope, 2.0),
-            CssPoint::new(40.0, 132.0)
+            Affine2d::translate(40.0, 132.0)
         );
         // Second alternate iteration runs backwards: 5s is 75% directed
         // progress, while the independent fall track is halfway through.
         assert_eq!(
             sample_css_animation_scope(&scope, 5.0),
-            CssPoint::new(60.0, 330.0)
+            Affine2d::translate(60.0, 330.0)
         );
     }
 

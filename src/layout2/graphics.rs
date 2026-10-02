@@ -14,11 +14,11 @@ use crate::core::{CssPoint, CssSize};
 use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::render::{
     Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
-    CssPaintAnimation, CssRect, DecorationStyle, DisplayCommand, GradientInterpolation,
-    GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest, ImageSampling, LineCap,
-    MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint, PaintBrush, PaintColor, PaintLine,
-    PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint,
-    TextShadowPaint, TopLayerEntry,
+    CssPaintAnimation, CssRect, CssTransformFrame, DecorationStyle, DisplayCommand,
+    GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest,
+    ImageSampling, LineCap, MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint, PaintBrush,
+    PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle,
+    TextDecorationPaint, TextShadowPaint, TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -1230,6 +1230,19 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             .and_then(parse_opacity)
             .unwrap_or(1.0),
     );
+    // CSS Animations 1 §3.3: missing transform keyframes take the static
+    // transform, which the animation replaces while it applies.
+    let (reference, transform_origin) = super::transform::animation_origin(
+        |property| builder.dom.computed_value_resolved(fragment.node, property),
+        units,
+        viewport,
+        fragment,
+    );
+    let underlying_transform = builder
+        .dom
+        .computed_value_resolved(fragment.node, "transform")
+        .and_then(|value| super::transform::animation_steps(&value, units, viewport, reference))
+        .unwrap_or_default();
     let mut animations = Vec::new();
     for definition in definitions {
         let mut opacity = definition
@@ -1262,21 +1275,36 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             .keyframes
             .iter()
             .filter_map(|frame| {
-                let value = animation_transform_translation(
-                    frame.transform.as_deref()?,
-                    fragment.w,
-                    fragment.h,
-                    units,
-                    viewport,
-                )?;
-                Some(CssAnimationPoint {
+                Some(CssTransformFrame {
                     offset: frame.offset,
-                    value,
+                    steps: super::transform::animation_steps(
+                        frame.transform.as_deref()?,
+                        units,
+                        viewport,
+                        reference,
+                    )?,
                 })
             })
             .collect::<Vec<_>>();
         complete_animation_track(&mut position);
-        complete_animation_track(&mut transform);
+        if !transform.is_empty() {
+            transform.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+            if transform.first().is_some_and(|frame| frame.offset > 0.0) {
+                transform.insert(
+                    0,
+                    CssTransformFrame {
+                        offset: 0.0,
+                        steps: underlying_transform.clone(),
+                    },
+                );
+            }
+            if transform.last().is_some_and(|frame| frame.offset < 1.0) {
+                transform.push(CssTransformFrame {
+                    offset: 1.0,
+                    steps: underlying_transform.clone(),
+                });
+            }
+        }
         if position.is_empty() && transform.is_empty() && opacity.is_empty() {
             continue;
         }
@@ -1291,6 +1319,8 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             running: definition.running,
             position,
             transform,
+            transform_origin,
+            static_transform: super::transform::matrix(fragment),
             opacity,
         });
     }
@@ -1334,49 +1364,6 @@ fn complete_animation_track_with(track: &mut Vec<CssAnimationPoint>, underlying:
             value: underlying,
         });
     }
-}
-
-fn animation_transform_translation(
-    value: &str,
-    width: f32,
-    height: f32,
-    units: Units,
-    viewport: Vp,
-) -> Option<CssPoint> {
-    if value.trim().eq_ignore_ascii_case("none") {
-        return Some(CssPoint::default());
-    }
-    let mut result = CssPoint::default();
-    for (name, args) in transform_functions(value)? {
-        match name.as_str() {
-            "translate" => {
-                result.x += transform_length_in(args.first()?, width, units, viewport)?;
-                result.y += transform_length_in(
-                    args.get(1).map_or("0", String::as_str),
-                    height,
-                    units,
-                    viewport,
-                )?;
-            }
-            "translatex" => result.x += transform_length_in(args.first()?, width, units, viewport)?,
-            "translatey" => {
-                result.y += transform_length_in(args.first()?, height, units, viewport)?
-            }
-            "translate3d" => {
-                result.x += transform_length_in(args.first()?, width, units, viewport)?;
-                result.y += transform_length_in(args.get(1)?, height, units, viewport)?;
-            }
-            "matrix" if args.len() == 6 => {
-                result.x += args.get(4)?.parse::<f32>().ok()?;
-                result.y += args.get(5)?.parse::<f32>().ok()?;
-            }
-            // A transform animation whose matrix component cannot yet be
-            // represented by a translation is left to the static underlying
-            // transform rather than being approximated incorrectly.
-            _ => return None,
-        }
-    }
-    Some(result)
 }
 
 enum PositionedChild<'f> {
@@ -4483,41 +4470,6 @@ fn gradient_direction(value: &str) -> Option<f32> {
     })
 }
 
-fn transform_functions(value: &str) -> Option<Vec<(String, Vec<String>)>> {
-    let mut result = Vec::new();
-    let mut rest = value.trim();
-    while !rest.is_empty() {
-        let open = rest.find('(')?;
-        let name = rest[..open].trim().to_ascii_lowercase();
-        let mut depth = 0;
-        let close = rest[open..].char_indices().find_map(|(i, ch)| {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(open + i);
-                    }
-                }
-                _ => {}
-            }
-            None
-        })?;
-        let body = &rest[open + 1..close];
-        let args: Vec<String> = if body.contains(',') {
-            split_top_level(body, ',')
-                .into_iter()
-                .map(|v| v.trim().into())
-                .collect()
-        } else {
-            split_ws(body).into_iter().map(String::from).collect()
-        };
-        result.push((name, args));
-        rest = rest[close + 1..].trim_start();
-    }
-    Some(result)
-}
-
 #[cfg(test)]
 fn rotate(radians: f32) -> Affine2d {
     let (sin, cos) = radians.sin_cos();
@@ -4537,13 +4489,6 @@ fn angle(value: &str) -> Option<f32> {
     } else {
         None
     }
-}
-
-/// Resolve the `<length-percentage>` grammar used by CSS transform
-/// translations. In particular, math functions remain one component value
-/// and resolve percentages against the transform reference box.
-fn transform_length_in(value: &str, basis: f32, units: Units, viewport: Vp) -> Option<f32> {
-    Len::parse(value, units, viewport)?.resolve(Some(basis))
 }
 
 fn resolve_image_source(base: &Url, source: &str) -> String {
