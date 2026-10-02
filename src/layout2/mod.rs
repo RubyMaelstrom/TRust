@@ -5281,6 +5281,55 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn replaced_images_honor_border_box_sizing_and_intrinsic_limits() {
+        // css-sizing-3 #box-sizing: border-box lengths and percentages of
+        // the sizing properties size the border box, the content box being
+        // the rest, on inline, block-level and absolutely positioned images
+        // alike. #sizing-values: an intrinsic keyword in min/max-width is
+        // the image's natural (ratio-derived) content width. Gecko and Blink
+        // agree on every box below (216x270 image in a 250px block).
+        let images: ImageSizes = [("http://e.com/p.png".to_string(), (216, 270))].into();
+        let html = r#"<!DOCTYPE html><body style="margin:0;line-height:0">
+            <style>div{width:250px} .pad{box-sizing:border-box;padding:0 16px}</style>
+            <div><img id=a class=pad src=p.png style="width:200px"></div>
+            <div><img id=b src=p.png style="width:100%;max-width:fit-content"></div>
+            <div><img id=c class=pad src=p.png width=216 height=270
+                style="height:auto;max-width:fit-content;width:100%"></div>
+            <div><img id=d class=pad src=p.png style="display:block;width:200px"></div>
+            <div><img id=e class=pad src=p.png style="display:block;width:100%"></div>
+            <div><img id=f src=p.png style="box-sizing:border-box;padding:16px 0;height:200px"></div>
+            <div><img id=g src=p.png style="box-sizing:border-box;border:8px solid;width:200px"></div>
+            <div><img id=h src=p.png style="width:100px;min-width:fit-content"></div>
+            <div><img id=i class=pad src=p.png style="display:block;max-width:150px"></div>
+            <div style="position:relative;height:300px">
+                <img id=j class=pad src=p.png style="position:absolute;width:200px"></div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &images);
+        // Block-level boxes are border boxes; an inline image's piece is its
+        // content box, its edges riding the line beside it.
+        let check = |id: &str, (width, height): (f64, f64), why: &str| {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            assert!(
+                (rect.width - width).abs() < 0.01 && (rect.height - height).abs() < 0.01,
+                "{id}: {}x{} for {width}x{height} {why}",
+                rect.width,
+                rect.height
+            );
+        };
+        check("a", (168.0, 210.0), "a 200px border box");
+        check("b", (216.0, 270.0), "fit-content is the natural width");
+        check("c", (216.0, 270.0), "a 248px border box");
+        check("d", (200.0, 210.0), "");
+        check("e", (250.0, 272.5), "");
+        check("f", (134.4, 168.0), "a 200px-high border box");
+        check("g", (184.0, 230.0), "a 200x246 border box");
+        check("h", (216.0, 270.0), "");
+        check("i", (150.0, 147.5), "");
+        check("j", (200.0, 210.0), "");
+    }
+
+    #[test]
     fn undecoded_image_with_aspect_ratio_reserves_box() {
         let out = lay(
             r#"<body style="margin:0"><img src="i.png" style="width:160px;aspect-ratio:2/1" alt="x"></body>"#,

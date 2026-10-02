@@ -100,18 +100,41 @@ pub(crate) fn size(
     // undeclared axis and an explicitly-auto axis. On 9to5linux article hero
     // images that turned width=1400 height=800 + max-width:100%;height:auto
     // into a width-clamped but still 800px-tall box.
+    // css-sizing-3 #box-sizing: under `border-box`, the <length-percentage>
+    // values of the sizing properties (presentational hints included) apply
+    // to the border box; the content box is that less the padding and
+    // border, floored at zero. Every caller treats the result as the
+    // content box, which receives the edges outside it.
+    let (edges_w, edges_h) =
+        if dom.computed_value_resolved(node, "box-sizing").as_deref() == Some("border-box") {
+            let style = super::style::BoxStyle::of(dom, node, vp);
+            // CSS Box 4 #padding-physical: percentages refer to the containing
+            // block's inline size, in both axes.
+            let padding = |side: usize| style.padding[side].resolve(cb_w).unwrap_or(0.0).max(0.0);
+            use super::style::{BOTTOM, LEFT, RIGHT, TOP};
+            (
+                style.border[LEFT] + style.border[RIGHT] + padding(LEFT) + padding(RIGHT),
+                style.border[TOP] + style.border[BOTTOM] + padding(TOP) + padding(BOTTOM),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+    let content_w = |value: f32| (value - edges_w).max(0.0);
+    let content_h = |value: f32| (value - edges_h).max(0.0);
     let css_w = css("width", cb_w);
     let css_h = css("height", cb_h);
     let spec_w = if dom.author_declares(node, "width") {
         css_w
     } else {
         attr("width", cb_w)
-    };
+    }
+    .map(content_w);
     let spec_h = if dom.author_declares(node, "height") {
         css_h
     } else {
         attr("height", cb_h)
-    };
+    }
+    .map(content_h);
     // CSS 2.2 §10.3.2/§10.6.2: a replaced element with an intrinsic
     // ratio but NO intrinsic width or height (an SVG referenced with only a
     // `viewBox`), sized auto/auto, takes its width from the block constraint
@@ -163,58 +186,69 @@ pub(crate) fn size(
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
     // own last resort for a ratio-less axis.
-    let (w0, h0) = match (spec_w, spec_h) {
-        (Some(w), Some(h)) => (w, h),
-        (Some(w), None) => {
-            let h = match (ratio, natural) {
-                (Some(r), _) if r > 0.0 => w / r,
-                (None, Some((_, nh))) => nh,
-                _ => (w / 2.0).min(150.0),
-            };
-            (w, h)
-        }
-        (None, Some(h)) => {
-            let w = match (ratio, natural) {
-                (Some(r), _) => h * r,
-                (None, Some((nw, _))) => nw,
-                _ => (h * 2.0).min(300.0),
-            };
-            (w, h)
-        }
-        (None, None) => match (ratio_only, natural, ratio) {
-            // Rule 3: block-constraint width from the containing block; the
-            // height follows the ratio.
-            (Some(r), _, _) => {
-                let w = cb_w.unwrap_or(300.0).max(0.0);
-                (w, w / r)
+    let auto_size = |spec_w: Option<f32>, spec_h: Option<f32>| -> Option<(f32, f32)> {
+        Some(match (spec_w, spec_h) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => {
+                let h = match (ratio, natural) {
+                    (Some(r), _) if r > 0.0 => w / r,
+                    (None, Some((_, nh))) => nh,
+                    _ => (w / 2.0).min(150.0),
+                };
+                (w, h)
             }
-            (None, Some(n), _) => n,
-            (None, None, Some(r)) if r > 0.0 => (300.0, 300.0 / r),
-            (None, None, _) => return None, // fallback-content representation
-        },
+            (None, Some(h)) => {
+                let w = match (ratio, natural) {
+                    (Some(r), _) => h * r,
+                    (None, Some((nw, _))) => nw,
+                    _ => (h * 2.0).min(300.0),
+                };
+                (w, h)
+            }
+            (None, None) => match (ratio_only, natural, ratio) {
+                // Rule 3: block-constraint width from the containing block; the
+                // height follows the ratio.
+                (Some(r), _, _) => {
+                    let w = cb_w.unwrap_or(300.0).max(0.0);
+                    (w, w / r)
+                }
+                (None, Some(n), _) => n,
+                (None, None, Some(r)) if r > 0.0 => (300.0, 300.0 / r),
+                (None, None, _) => return None, // fallback-content representation
+            },
+        })
     };
+    let (w0, h0) = auto_size(spec_w, spec_h)?;
 
     // §10.4 min/max. Ratio-preserving table when BOTH dimensions were auto
     // and a ratio exists; a specified axis clamps plainly and re-derives the
     // auto one through the ratio.
-    let min_w = css("min-width", cb_w).unwrap_or(0.0);
-    let max_w = match dom
-        .computed_value_resolved(node, "max-width")
-        .and_then(|v| Len::parse(&v, u, vp))
-    {
-        Some(Len::None) | None => f32::INFINITY,
-        Some(l) => l.resolve(cb_w).unwrap_or(f32::INFINITY),
-    }
-    .max(min_w);
-    let min_h = css("min-height", cb_h).unwrap_or(0.0);
-    let max_h = match dom
-        .computed_value_resolved(node, "max-height")
-        .and_then(|v| Len::parse(&v, u, vp))
-    {
-        Some(Len::None) | None => f32::INFINITY,
-        Some(l) => l.resolve(cb_h).unwrap_or(f32::INFINITY),
-    }
-    .max(min_h);
+    //
+    // css-sizing-3 #sizing-values: `min-content`, `max-content` and
+    // `fit-content` (with or without a limit) in a min/max property are
+    // the box's intrinsic sizes. A replaced element's min- and max-content
+    // inline sizes are both its auto width given the other axis (CSS 2
+    // §10.3.2; css-sizing-3 #intrinsic-sizes), so every keyword clamps to
+    // that width; the block-axis keywords are the automatic height. These
+    // are content-box sizes: box-sizing applies to lengths only.
+    let limit =
+        |prop: &str, basis: Option<f32>, content: &dyn Fn(f32) -> f32, auto: Option<f32>| match dom
+            .computed_value_resolved(node, prop)
+            .and_then(|v| Len::parse(&v, u, vp))?
+        {
+            Len::MinContent | Len::MaxContent | Len::FitContent | Len::FitContentLimit(_) => auto,
+            length => length.resolve(basis).filter(|&v| v >= 0.0).map(content),
+        };
+    let auto_w = || auto_size(None, spec_h).map(|(w, _)| w);
+    let auto_h = || auto_size(spec_w, None).map(|(_, h)| h);
+    let min_w = limit("min-width", cb_w, &content_w, auto_w()).unwrap_or(0.0);
+    let max_w = limit("max-width", cb_w, &content_w, auto_w())
+        .unwrap_or(f32::INFINITY)
+        .max(min_w);
+    let min_h = limit("min-height", cb_h, &content_h, auto_h()).unwrap_or(0.0);
+    let max_h = limit("max-height", cb_h, &content_h, auto_h())
+        .unwrap_or(f32::INFINITY)
+        .max(min_h);
 
     let (box_w, box_h) = match (spec_w, spec_h, ratio) {
         (None, None, Some(r)) if r > 0.0 => constrain_ratio(w0, h0, min_w, max_w, min_h, max_h),
