@@ -4614,6 +4614,28 @@ mod tests {
     }
 
     #[test]
+    fn a_word_continued_by_punctuation_in_another_element_does_not_wrap() {
+        // CSS Text 3 #line-breaking: an inline box boundary is no break
+        // opportunity, and UAX #14 LB13 forbids one before a full stop. A
+        // word continued by an element starting with "." overflows a narrow
+        // box with it, as in Gecko and Blink, instead of wrapping alone.
+        let html = r#"<!doctype html><style>body{margin:0;font:20px/30px sans-serif}
+            div{width:60px}</style>
+            <div id=a>abcdefg<i>.xyz</i></div>
+            <div id=b>abcdefg<i style="margin-left:-5px">.xyz</i></div>
+            <div id=c>abc<span style="font-size:10px">.xyz</span></div>
+            <div id=d>abcdefg <i>.xyz</i></div>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        for id in ["a", "b"] {
+            assert_eq!(height(id), 30.0, "{id}");
+        }
+        assert!(height("c") < 45.0, "one line: {}", height("c"));
+        assert_eq!(height("d"), 60.0, "a space still lets it wrap");
+    }
+
+    #[test]
     fn multicol_moves_whole_blocks_into_balanced_columns() {
         // CSS Multi-column 1 #cf balances columns using the content's break
         // opportunities (CSS Fragmentation 3 #possible-breaks). Blocks that
