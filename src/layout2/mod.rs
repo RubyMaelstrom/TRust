@@ -3832,6 +3832,32 @@ mod tests {
     }
 
     #[test]
+    fn image_dimension_attributes_accept_percentages() {
+        // HTML #maps-to-the-dimension-property: width="25%" is 25% of the
+        // containing block; a percentage height against an auto-height
+        // block behaves as auto (the natural ratio then applies), and only
+        // pixel pairs form an aspect ratio. Measured against LibreWolf 153.
+        let html = r#"<!DOCTYPE html><body style="margin:0"><div style="width:400px">
+            <img id=a src="http://e.com/r.png" width="25%"><br>
+            <img id=b src="http://e.com/r.png" width="50%" height="10"><br>
+            <img id=c src="http://e.com/r.png" width=" 30.5px"><br>
+            <img id=d src="http://e.com/r.png" width="60" height="60%"></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let images: ImageSizes = [("http://e.com/r.png".to_string(), (40, 20))]
+            .into_iter()
+            .collect();
+        let layout = lay_graphical(html, 600.0, &images);
+        let size = |id: &str| {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (rect.width, rect.height)
+        };
+        assert_eq!(size("a"), (100.0, 50.0));
+        assert_eq!(size("b"), (200.0, 10.0));
+        assert_eq!(size("c"), (30.5, 15.25));
+        assert_eq!(size("d"), (60.0, 30.0));
+    }
+
+    #[test]
     fn textareas_are_monospace_and_rows_lines_tall() {
         // HTML Rendering #the-textarea-element-2: the effective height is
         // `rows` lines (default 2); engines' UA sheets make it monospace.

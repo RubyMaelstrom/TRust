@@ -76,10 +76,14 @@ pub(crate) fn size(
     };
     // The HTML width/height attributes are presentational hints for the
     // specified size (and, as a pair, the modern pre-decode ratio source).
-    let attr = |name: &str| {
-        dom.attr(dimension_source, name)
-            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
-            .filter(|&v| v > 0.0)
+    // HTML #maps-to-the-dimension-property: a percentage is of the
+    // containing block, and behaves as auto against an indefinite one.
+    let attr = |name: &str, basis: Option<f32>| match dom
+        .attr(dimension_source, name)
+        .and_then(html_dimension)?
+    {
+        HtmlDimension::Pixels(px) => (px > 0.0).then_some(px),
+        HtmlDimension::Percentage(percent) => basis.map(|basis| basis * percent / 100.0),
     };
     // HTML Rendering §14.3.3 maps width/height attributes to presentational
     // hints for the corresponding CSS properties and to `aspect-ratio`.
@@ -98,12 +102,12 @@ pub(crate) fn size(
     let spec_w = if dom.author_declares(node, "width") {
         css_w
     } else {
-        attr("width")
+        attr("width", cb_w)
     };
     let spec_h = if dom.author_declares(node, "height") {
         css_h
     } else {
-        attr("height")
+        attr("height", cb_h)
     };
     // CSS 2.2 §10.3.2/§10.6.2: a replaced element with an intrinsic
     // ratio but NO intrinsic width or height (an SVG referenced with only a
@@ -293,10 +297,11 @@ pub(crate) fn ratio_of(
     dimension_source: NodeId,
     natural: Option<(f32, f32)>,
 ) -> Option<f32> {
-    let attr = |name: &str| {
-        dom.attr(dimension_source, name)
-            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
-            .filter(|&v| v > 0.0)
+    // HTML #map-to-the-aspect-ratio-property-(using-dimension-rules): only
+    // two pixel dimensions form a ratio.
+    let attr = |name: &str| match dom.attr(dimension_source, name).and_then(html_dimension) {
+        Some(HtmlDimension::Pixels(px)) if px > 0.0 => Some(px),
+        _ => None,
     };
     natural
         .map(|(w, h)| w / h.max(1.0))
@@ -491,4 +496,37 @@ mod tests {
         assert_eq!(parse_ratio("auto"), None);
         assert_eq!(parse_ratio("0/5"), None);
     }
+}
+
+enum HtmlDimension {
+    Pixels(f32),
+    Percentage(f32),
+}
+
+/// HTML #rules-for-parsing-dimension-values: leading whitespace, digits with
+/// an optional fraction, then `%` for a percentage; anything after is
+/// ignored.
+fn html_dimension(input: &str) -> Option<HtmlDimension> {
+    let input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let digits = input
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(input.len());
+    let number = &input[..digits];
+    let number = match number.find('.') {
+        // A second '.' ends the number.
+        Some(dot) => match number[dot + 1..].find('.') {
+            Some(second) => &number[..dot + 1 + second],
+            None => number,
+        },
+        None => number,
+    };
+    if !number.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = number.trim_end_matches('.').parse::<f32>().ok()?;
+    Some(if input[number.len()..].starts_with('%') {
+        HtmlDimension::Percentage(value)
+    } else {
+        HtmlDimension::Pixels(value)
+    })
 }
