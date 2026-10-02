@@ -1132,7 +1132,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     .next()
                     .is_some_and(|start| !breaks_between(end, start))
             });
-        self.place_wrapped(word, ctx, !continues, true, continuation);
+        self.place_wrapped(word, ctx, !continues, continues, true, continuation);
         self.word_end = word.chars().next_back();
     }
 
@@ -1236,7 +1236,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 )
             };
             for part in t.split_inclusive(separator) {
-                self.place_wrapped(part, ctx, self.preserved_break, true, 0.0);
+                self.place_wrapped(part, ctx, self.preserved_break, false, true, 0.0);
                 self.preserved_break = part.chars().next_back().is_some_and(separator);
             }
             return;
@@ -1274,7 +1274,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             }
             return;
         }
-        self.place_wrapped(t, ctx, false, true, 0.0);
+        self.place_wrapped(t, ctx, false, false, true, 0.0);
     }
 
     fn break_style(&self, ctx: &InlineStyle) -> crate::text::TextBreakStyle {
@@ -1301,11 +1301,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Break a styled run at Unicode cluster boundaries. This is deliberately
     /// an inline-composition loop rather than a second text layout engine:
     /// Parley chooses every break and measures every produced piece.
+    /// `glued`: no soft wrap opportunity precedes `rest` (it continues the
+    /// previous word), so the line may break only inside or after it.
     fn place_wrapped(
         &mut self,
         mut rest: &str,
         ctx: &InlineStyle,
         may_wrap: bool,
+        glued: bool,
         mut spaced: bool,
         continuation: f32,
     ) {
@@ -1429,10 +1432,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 spaced = false;
                 continue;
             }
+            // CSS Text 3 #line-breaking: a word with no opportunity before
+            // it overflows with the content it continues ("oll" + an
+            // element starting ".neocities") rather than wrapping alone.
             if ctx.ws.wraps()
                 && !fits(full.advance)
                 && self.pen > self.line_start
-                && (may_wrap || cut == 0)
+                && (may_wrap || (cut == 0 && !glued))
             {
                 self.soft_break();
                 // Collapsible leading whitespace is discarded at the break;
