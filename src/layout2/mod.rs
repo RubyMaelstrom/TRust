@@ -4521,6 +4521,22 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_cell_width_is_no_minimum() {
+        // CSS Tables 3 #outer-min-content: a cell's declared width is its
+        // preference, not its minimum, so an 800px table whose cells declare
+        // 20 + 780px and hold a 435px block shrinks the declared ones
+        // (Gecko and Blink: 800, the middle column 354).
+        let html = r#"<body style="margin:0"><table id=t width=800 border=0 cellspacing=0 cellpadding=0><tr><td width=20>a</td>
+            <td width=780 id=b><div style="width:300px;height:10px"></div></td><td id=c><div style="width:435px;height:10px"></div></td></tr></table></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1024.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(rect("t").width, 800.0);
+        assert_eq!(rect("c").width, 435.0);
+        assert!((rect("b").width - 354.0).abs() < 3.0, "{}", rect("b").width);
+    }
+
+    #[test]
     fn a_nested_table_contributes_at_least_its_minimum_width() {
         // CSS 2 §17.5.2.2 / CSS Tables 3: a table's used width is the
         // larger of its declared width (CSS or HTML attribute) and its

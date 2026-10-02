@@ -507,11 +507,12 @@ impl Flow<'_> {
 
     /// A cell's min-content and max-content OUTER (border-box) widths (px):
     /// its content intrinsic widths plus its own border and padding (margins
-    /// don't apply to table cells — §17.5.1). A declared width raises the
-    /// minimum (§17.5.2.2 step 1 — "if W is greater than MCW, W is the
-    /// minimum") and, as in browsers, replaces the max-content preference;
-    /// it is clamped to `cap` when set (the band) so one huge declared cell
-    /// can't dominate the layout. `pct_basis` resolves percentage padding.
+    /// don't apply to table cells — §17.5.1). CSS Tables 3 #outer-min-content:
+    /// a declared width is no minimum (unlike CSS 2's informative §17.5.2.2),
+    /// so a table narrower than its cells' declared widths shrinks them to
+    /// their content, as Gecko and Blink do; it replaces the max-content
+    /// preference, clamped to `cap` when set (the band) so one huge declared
+    /// cell can't dominate the layout. `pct_basis` resolves percentage padding.
     fn cell_min_max(
         &self,
         cell: &super::tree::TableCell,
@@ -524,12 +525,11 @@ impl Flow<'_> {
             + s.border[RIGHT]
             + self.pad(s, LEFT, pct_basis)
             + self.pad(s, RIGHT, pct_basis);
-        let mut mn = self.intrinsic_w(&cell.b, IMode::Min, inl) + bp;
+        let mn = self.intrinsic_w(&cell.b, IMode::Min, inl) + bp;
         let mut mx = self.intrinsic_w(&cell.b, IMode::Max, inl) + bp;
         if let Some(ColSpec::Px(px)) = declared_track_width(self.dom, cell.b.node) {
             let px = cap.map_or(px, |a| px.min(a));
-            mn = mn.max(px);
-            mx = mn;
+            mx = mn.max(px);
         }
         (mn.max(1.0), mx.max(mn))
     }
