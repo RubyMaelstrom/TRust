@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vello_cpu::color::palette::css::{
     BLACK, BLUE, CYAN, DARK_GRAY, GRAY, LIGHT_GRAY, WHITE, YELLOW,
 };
-use vello_cpu::kurbo::{Affine, BezPath, Cap, Diagonal2, Rect, Stroke};
+use vello_cpu::kurbo::{Affine, BezPath, Cap, Circle, Diagonal2, Rect, Shape as _, Stroke};
 use vello_cpu::peniko::{
     ColorStop, Compose, Gradient, ImageBrush, ImageQuality, ImageSampler, Mix,
 };
@@ -815,21 +815,26 @@ fn paint_decorations(
     decoration: &super::TextDecorationPaint,
 ) {
     for (stroke, path) in decoration_strokes(origin, shaped, decoration) {
-        context.set_stroke(stroke);
-        context.stroke_path(&path);
+        if let Some(stroke) = stroke {
+            context.set_stroke(stroke);
+            context.stroke_path(&path);
+        } else {
+            context.fill_path(&path);
+        }
     }
 }
 
-/// The strokes of a glyph run's underline and line-through (CSS Text
+/// The ink of a glyph run's underline and line-through (CSS Text
 /// Decoration 4): an authored `text-decoration-thickness`, else one
 /// eighteenth of the line height; an underline sits `text-underline-offset`
 /// below the alphabetic baseline (by default, one thickness). `wavy` is a
-/// smooth wave of period six thicknesses.
+/// smooth wave of period six thicknesses. Each path is stroked, or filled
+/// when it has no stroke.
 pub(super) fn decoration_strokes(
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
     decoration: &super::TextDecorationPaint,
-) -> Vec<(Stroke, BezPath)> {
+) -> Vec<(Option<Stroke>, BezPath)> {
     let style = decoration.style;
     let thickness = decoration
         .thickness
@@ -838,20 +843,16 @@ pub(super) fn decoration_strokes(
     let (left, right) = (f64::from(origin.x), f64::from(origin.x + shaped.advance));
     let mut strokes = Vec::new();
     let mut line = |y: f32| {
+        if style == DecorationStyle::Dotted {
+            strokes.push((None, decoration_dots(left, right, f64::from(y), thickness)));
+            return;
+        }
         let mut stroke = Stroke::new(f64::from(thickness));
-        match style {
-            DecorationStyle::Dotted => {
-                stroke = stroke
-                    .with_caps(Cap::Round)
-                    .with_dashes(0.0, [0.0, f64::from(thickness * 2.0)]);
-            }
-            DecorationStyle::Dashed => {
-                stroke = stroke.with_dashes(
-                    0.0,
-                    [f64::from(thickness * 3.0), f64::from(thickness * 2.0)],
-                );
-            }
-            _ => {}
+        if style == DecorationStyle::Dashed {
+            stroke = stroke.with_dashes(
+                0.0,
+                [f64::from(thickness * 3.0), f64::from(thickness * 2.0)],
+            );
         }
         let y = f64::from(y);
         let mut path = BezPath::new();
@@ -876,13 +877,13 @@ pub(super) fn decoration_strokes(
             path.move_to((left, y));
             path.line_to((right, y));
         }
-        strokes.push((stroke.clone(), path));
+        strokes.push((Some(stroke.clone()), path));
         if style == DecorationStyle::Double {
             let second_y = y + f64::from(thickness * 2.0);
             let mut second = BezPath::new();
             second.move_to((left, second_y));
             second.line_to((right, second_y));
-            strokes.push((stroke, second));
+            strokes.push((Some(stroke), second));
         }
     };
     if shaped.underline {
@@ -893,6 +894,30 @@ pub(super) fn decoration_strokes(
         line(origin.y + shaped.baseline - shaped.ascent * 0.32);
     }
     strokes
+}
+
+/// A `dotted` decoration line from `left` to `right` centered on `y`: dots
+/// one thickness across, one thickness apart, starting at `left`. As for
+/// dotted borders, dots at most two pixels across are squares on whole CSS
+/// pixels, since so small a circle only rasterizes as a blur.
+fn decoration_dots(left: f64, right: f64, y: f64, thickness: f32) -> BezPath {
+    let width = f64::from(thickness);
+    let radius = width / 2.0;
+    let thin = thickness <= 2.0;
+    let mut path = BezPath::new();
+    let start = if thin { left.round() } else { left };
+    let mut x = start;
+    let mut count = 0usize;
+    while x + width <= right + 1e-3 && count < 1 << 16 {
+        if thin {
+            path.extend(Rect::new(x, y - radius, x + width, y + radius).path_elements(0.1));
+        } else {
+            path.extend(Circle::new((x + radius, y), radius).path_elements(0.1));
+        }
+        x = start + width * 2.0 * (count + 1) as f64;
+        count += 1;
+    }
+    path
 }
 
 pub(super) fn vello_stops(stops: &[super::GradientStop]) -> Vec<ColorStop> {
@@ -1819,7 +1844,7 @@ mod tests {
             &decoration(DecorationStyle::Solid, Some(3.0), Some(2.0)),
         );
         assert_eq!(strokes.len(), 1);
-        assert_eq!(strokes[0].0.width, 3.0);
+        assert_eq!(strokes[0].0.as_ref().map(|stroke| stroke.width), Some(3.0));
         let bounds = strokes[0].1.bounding_box();
         let center = f64::from(origin.y + shaped.baseline) + 2.0 + 1.5;
         assert!((bounds.y0 - center).abs() < 0.01 && (bounds.y1 - center).abs() < 0.01);
@@ -1836,6 +1861,59 @@ mod tests {
             &decoration(DecorationStyle::Double, None, None),
         );
         assert_eq!(double.len(), 2);
+        // CSS Text Decoration 4 #text-decoration-style: `dotted` is a row of
+        // dots one thickness across and apart, filled rather than stroked.
+        let dotted = decoration_strokes(
+            origin,
+            &shaped,
+            &decoration(DecorationStyle::Dotted, Some(3.0), Some(0.0)),
+        );
+        assert_eq!(dotted.len(), 1);
+        assert!(dotted[0].0.is_none());
+        let dots = dotted[0]
+            .1
+            .elements()
+            .iter()
+            .filter(|element| matches!(element, vello_cpu::kurbo::PathEl::MoveTo(_)))
+            .count();
+        assert_eq!(dots, ((shaped.advance + 3.0) / 6.0).floor() as usize);
+        let bounds = dotted[0].1.bounding_box();
+        assert!((bounds.height() - 3.0).abs() < 0.01, "{bounds:?}");
+    }
+
+    #[test]
+    fn dotted_decorations_paint_every_dot() {
+        // Each dot of a dotted underline used to be a zero-length dash with
+        // round caps, which the stroker drops, so only stray dots remained.
+        let mut context = RenderContext::new(200, 20);
+        context.set_paint(vello_color(PaintColor::Rgba(0, 0, 255, 255)));
+        let mut shaped = crate::text::shape(
+            " ",
+            &crate::text::TextStyle {
+                size: 10.0,
+                ..Default::default()
+            },
+        );
+        shaped.underline = true;
+        shaped.advance = 180.0;
+        let decoration = crate::render::TextDecorationPaint {
+            color: PaintColor::Rgba(0, 0, 255, 255),
+            style: DecorationStyle::Dotted,
+            thickness: Some(4.0),
+            underline_offset: Some(0.0),
+        };
+        paint_decorations(&mut context, CssPoint::new(10.0, 0.0), &shaped, &decoration);
+        let mut pixmap = Pixmap::new(200, 20);
+        context.flush();
+        context.render(&mut pixmap, &mut Resources::new());
+        let row = (shaped.baseline + 2.0) as usize;
+        let data = pixmap.data();
+        let blue = |x: usize| data[row * 200 + x].b > 128;
+        // Dots 4px across every 8px from x = 10: one centered on 12 + 8k.
+        for dot in 0..22 {
+            assert!(blue(12 + dot * 8), "dot {dot}");
+            assert!(!blue(16 + dot * 8), "gap {dot}");
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::render::{
     Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
     CssPaintAnimation, CssRect, CssTransformFrame, DecorationStyle, DisplayCommand,
     GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest,
-    ImageSampling, LineCap, MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint, PaintBrush,
+    ImageSampling, MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint, PaintBrush,
     PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle,
     TextDecorationPaint, TextShadowPaint, TopLayerEntry,
 };
@@ -2461,16 +2461,32 @@ fn paint_outline_box(
             }
         })
         .unwrap_or_else(|| text_color_for_style(builder.dom, source));
+    if outline.style == OutlineStyle::Dotted {
+        // CSS UI 4 #outline-style: the border styles keep their meaning.
+        let half = width / 2.;
+        paint_dotted_sides(
+            builder,
+            BorderEdges {
+                rect: CssRect::new(
+                    rect.x - half,
+                    rect.y - half,
+                    rect.width + width,
+                    rect.height + width,
+                ),
+                radii: CornerRadii {
+                    corners: radii.corners.map(|(x, y)| (x + half, y + half)),
+                },
+                widths: [width; 4],
+                styles: ["dotted"; 4],
+                colors: [color; 4],
+            },
+        );
+        return;
+    }
     builder.commands.push(DisplayCommand::Stroke {
         shape: rounded_shape(rect, radii),
         brush: PaintBrush::Solid(color),
         style: match outline.style {
-            OutlineStyle::Dotted => {
-                let mut style = StrokeStyle::solid(width);
-                style.dash = vec![0.0, width * 2.0];
-                style.cap = LineCap::Round;
-                style
-            }
             OutlineStyle::Dashed => {
                 let mut style = StrokeStyle::solid(width);
                 style.dash = vec![width * 3.0, width * 2.0];
@@ -3864,6 +3880,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     };
     let outside = corners(rect);
     let inside = corners(inner);
+    let owners = corner_owners(fragment.border, &styles);
     for side in 0..4 {
         if fragment.border[side] <= 0. || !complex(&styles[side]) {
             continue;
@@ -3890,13 +3907,9 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
             ],
             _ => vec![(0., 1., border_shade(color, light))],
         };
-        let next = (side + 1) % 4;
-        builder
-            .commands
-            .push(DisplayCommand::PushClip(PaintShape::Polygon {
-                points: vec![outside[side], outside[next], inside[next], inside[side]],
-                evenodd: false,
-            }));
+        builder.commands.push(DisplayCommand::PushClip(side_clip(
+            side, &outside, &inside, &owners,
+        )));
         for (start, end, color) in bands {
             builder.commands.push(DisplayCommand::Fill {
                 shape: border_ring(rect, radii, fragment.border, start, end),
@@ -3910,7 +3923,10 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         && (top - left).abs() < 0.01
         && styles.iter().all(|s| s == &styles[0])
         && colors.iter().all(|c| *c == colors[0]);
-    if uniform && top > 0.0 && styles[0] != "none" && styles[0] != "hidden" && !complex(&styles[0])
+    if uniform
+        && top > 0.0
+        && !matches!(styles[0].as_str(), "none" | "hidden" | "dotted")
+        && !complex(&styles[0])
     {
         let inset = top / 2.0;
         let inner = CssRect::new(
@@ -3950,7 +3966,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     ];
     for (index, (width, start, end)) in sides.into_iter().enumerate() {
         if width <= 0.0
-            || matches!(styles[index].as_str(), "none" | "hidden")
+            || matches!(styles[index].as_str(), "none" | "hidden" | "dotted")
             || complex(&styles[index])
         {
             continue;
@@ -3958,13 +3974,9 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         // CSS Backgrounds 3 #corner-transitions: adjoining sides meet
         // between the outer and inner corners, including transparent sides
         // and a zero-sized padding box (the usual CSS triangle).
-        let next = (index + 1) % 4;
-        builder
-            .commands
-            .push(DisplayCommand::PushClip(PaintShape::Polygon {
-                points: vec![outside[index], outside[next], inside[next], inside[index]],
-                evenodd: false,
-            }));
+        builder.commands.push(DisplayCommand::PushClip(side_clip(
+            index, &outside, &inside, &owners,
+        )));
         if styles[index] == "solid" {
             builder.commands.push(DisplayCommand::Fill {
                 shape: border_ring(rect, radii, fragment.border, 0., 1.),
@@ -3979,6 +3991,16 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         }
         builder.commands.push(DisplayCommand::PopClip);
     }
+    paint_dotted_sides(
+        builder,
+        BorderEdges {
+            rect,
+            radii,
+            widths: fragment.border,
+            styles: styles.each_ref().map(String::as_str),
+            colors,
+        },
+    );
 }
 
 fn paint_box_shadows(dom: &Dom, style: PaintStyle, shape: &PaintShape, builder: &mut Builder<'_>) {
@@ -4068,15 +4090,424 @@ fn text_shadows(dom: &Dom, node: NodeId, current_color: PaintColor) -> Vec<TextS
 
 fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
     let mut stroke = StrokeStyle::solid(width);
-    match style {
-        "dotted" => {
-            stroke.dash = vec![0.0, width * 2.0];
-            stroke.cap = LineCap::Round;
-        }
-        "dashed" => stroke.dash = vec![width * 3.0, width * 2.0],
-        _ => {}
+    if style == "dashed" {
+        stroke.dash = vec![width * 3.0, width * 2.0];
     }
     stroke
+}
+
+/// Which adjoining side paints a corner's transition region (CSS
+/// Backgrounds 3 #corner-transitions). Corner `c` joins the incoming side
+/// `(c + 3) % 4` to the outgoing side `c`, in top/right/bottom/left order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CornerOwner {
+    /// The sides meet on the line from the outer to the inner corner.
+    Split,
+    Incoming,
+    Outgoing,
+}
+
+fn visible_border(width: f32, style: &str) -> bool {
+    width > 0. && !matches!(style, "none" | "hidden")
+}
+
+/// Like Gecko, a `dotted` side never paints part of a dot in a corner it
+/// shares with another style: that side takes the whole corner, and the
+/// thicker of two dotted sides draws their corner.
+fn corner_owners<S: AsRef<str>>(widths: [f32; 4], styles: &[S; 4]) -> [CornerOwner; 4] {
+    std::array::from_fn(|corner| {
+        let (incoming, outgoing) = ((corner + 3) % 4, corner);
+        let visible = |side: usize| visible_border(widths[side], styles[side].as_ref());
+        let dotted = |side: usize| visible(side) && styles[side].as_ref() == "dotted";
+        match (dotted(incoming), dotted(outgoing)) {
+            (true, true) if (widths[incoming] - widths[outgoing]).abs() < 0.01 => {
+                CornerOwner::Split
+            }
+            (true, true) if widths[incoming] > widths[outgoing] => CornerOwner::Incoming,
+            (true, true) => CornerOwner::Outgoing,
+            (true, false) if visible(outgoing) => CornerOwner::Outgoing,
+            (false, true) if visible(incoming) => CornerOwner::Incoming,
+            _ => CornerOwner::Split,
+        }
+    })
+}
+
+/// The part of the border area that `side` paints: its edge plus its share
+/// of both corners, as divided by `owners`.
+fn side_clip(
+    side: usize,
+    outside: &[CssPoint; 4],
+    inside: &[CssPoint; 4],
+    owners: &[CornerOwner; 4],
+) -> PaintShape {
+    // The boundary between a corner's two sides, from its outer to its inner
+    // corner. A side that owns the corner pushes the boundary onto the other
+    // side's edge.
+    let split = |corner: usize| {
+        let (outer, inner) = (outside[corner], inside[corner]);
+        // Corners 0 and 2 have a vertical incoming and a horizontal outgoing
+        // side; corners 1 and 3 the reverse.
+        let along_vertical = CssPoint::new(outer.x, inner.y);
+        let along_horizontal = CssPoint::new(inner.x, outer.y);
+        let even = corner.is_multiple_of(2);
+        match owners[corner] {
+            CornerOwner::Split => vec![outer, inner],
+            CornerOwner::Outgoing if even => vec![outer, along_vertical, inner],
+            CornerOwner::Outgoing => vec![outer, along_horizontal, inner],
+            CornerOwner::Incoming if even => vec![outer, along_horizontal, inner],
+            CornerOwner::Incoming => vec![outer, along_vertical, inner],
+        }
+    };
+    let next = (side + 1) % 4;
+    let mut points = vec![outside[side]];
+    points.extend(split(next));
+    let mut back = split(side);
+    back.reverse();
+    back.pop();
+    points.extend(back);
+    PaintShape::Polygon {
+        points,
+        evenodd: false,
+    }
+}
+
+/// A box's border edges in top/right/bottom/left order.
+struct BorderEdges<'a> {
+    /// The border box.
+    rect: CssRect,
+    /// Outer border radii.
+    radii: CornerRadii,
+    widths: [f32; 4],
+    styles: [&'a str; 4],
+    colors: [PaintColor; 4],
+}
+
+/// How a dotted side's run of dots ends at one corner.
+#[derive(Clone, Copy)]
+enum DotEnd {
+    /// The corner is shared with an equally thick dotted side: both runs end
+    /// with a dot on the middle of the corner's center curve.
+    Shared,
+    /// The run ends `inset` along the side from the outer corner, with a dot
+    /// there when `filled` and otherwise one gap from it.
+    Edge { inset: f32, filled: bool },
+}
+
+/// CSS Backgrounds 3 #border-style: `dotted` is "a series of round dots".
+/// The spacing is the UA's, and spacing "that makes the corners symmetrical"
+/// is encouraged, so like Gecko each side divides its run into an even
+/// number of dot-sized steps that alternate dot and gap, and two equally
+/// thick dotted sides meet on one dot centered on their corner's curve. Dots
+/// at most two device pixels across are squares on the pixel grid, as in
+/// Gecko and Blink, since so small a circle only rasterizes as a blur.
+fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
+    let BorderEdges {
+        rect,
+        radii,
+        widths,
+        styles,
+        colors,
+    } = edges;
+    let dotted =
+        |side: usize| visible_border(widths[side], styles[side]) && styles[side] == "dotted";
+    if !(0..4).any(dotted) {
+        return;
+    }
+    let owners = corner_owners(widths, &styles);
+    let ratio = builder.dom.device_pixel_ratio().max(f32::EPSILON);
+    // Outer corners and the directions into the box from each.
+    let outer = [
+        CssPoint::new(rect.x, rect.y),
+        CssPoint::new(rect.x + rect.width, rect.y),
+        CssPoint::new(rect.x + rect.width, rect.y + rect.height),
+        CssPoint::new(rect.x, rect.y + rect.height),
+    ];
+    let inward = [(1., 1.), (-1., 1.), (-1., -1.), (1., -1.)];
+    // A side runs clockwise from corner `side` to corner `side + 1`.
+    let direction = [(1., 0.), (0., 1.), (-1., 0.), (0., -1.)];
+    for side in (0..4).filter(|&side| dotted(side)) {
+        let width = widths[side];
+        let horizontal = side.is_multiple_of(2);
+        let ends = [side, (side + 1) % 4].map(|corner| {
+            let other = if corner == side {
+                (side + 3) % 4
+            } else {
+                corner
+            };
+            let along = if horizontal {
+                radii.corners[corner].0
+            } else {
+                radii.corners[corner].1
+            };
+            let ours = match owners[corner] {
+                CornerOwner::Split => true,
+                CornerOwner::Incoming => corner != side,
+                CornerOwner::Outgoing => corner == side,
+            };
+            if owners[corner] == CornerOwner::Split && dotted(other) {
+                DotEnd::Shared
+            } else if ours || !visible_border(widths[other], styles[other]) {
+                DotEnd::Edge {
+                    inset: along.max(width / 2.),
+                    filled: true,
+                }
+            } else {
+                DotEnd::Edge {
+                    inset: along.max(widths[other]) + width / 2.,
+                    filled: false,
+                }
+            }
+        });
+        // The centerline of this side from its start anchor to its end.
+        let (dx, dy) = direction[side];
+        let mut run = Vec::new();
+        for (position, corner) in [side, (side + 1) % 4].into_iter().enumerate() {
+            let at_start = position == 0;
+            let origin = outer[corner];
+            let (sx, sy) = inward[corner];
+            match ends[position] {
+                DotEnd::Shared => {
+                    // The quarter ellipse halfway through the border, from
+                    // the vertical side (0) to the horizontal side (90°).
+                    let (rx, ry) = radii.corners[corner];
+                    let (ex, ey) = (rx.max(width / 2.), ry.max(width / 2.));
+                    let (ax, ay) = (ex - width / 2., ey - width / 2.);
+                    let center = CssPoint::new(origin.x + sx * ex, origin.y + sy * ey);
+                    let point = |angle: f32| {
+                        CssPoint::new(
+                            center.x - sx * ax * angle.cos(),
+                            center.y - sy * ay * angle.sin(),
+                        )
+                    };
+                    let steps = if ax > 0. || ay > 0. { 8 } else { 0 };
+                    // From the middle of the curve to this side's end of it,
+                    // or back.
+                    let far = if horizontal { FRAC_PI_2 } else { 0. };
+                    let middle = FRAC_PI_2 / 2.;
+                    let angles = (0..=steps).map(|step| {
+                        let t = if steps == 0 {
+                            0.
+                        } else {
+                            step as f32 / steps as f32
+                        };
+                        if at_start {
+                            middle + (far - middle) * t
+                        } else {
+                            far + (middle - far) * t
+                        }
+                    });
+                    run.extend(angles.map(point));
+                }
+                DotEnd::Edge { inset, .. } => {
+                    let offset = if at_start { inset } else { -inset };
+                    let (across_x, across_y) = if horizontal {
+                        (0., sy * width / 2.)
+                    } else {
+                        (sx * width / 2., 0.)
+                    };
+                    run.push(CssPoint::new(
+                        origin.x + dx * offset + across_x,
+                        origin.y + dy * offset + across_y,
+                    ));
+                }
+            }
+        }
+        let filled = ends.map(|end| match end {
+            DotEnd::Shared => true,
+            DotEnd::Edge { filled, .. } => filled,
+        });
+        let thin = width * ratio <= 2.0 + 1e-3;
+        let mut centers = dot_centers(&run, width, filled[0], filled[1], thin);
+        // A dot on a shared corner belongs to both sides. The side leaving
+        // the corner draws it when their colors agree; otherwise each side
+        // draws its half, divided along the line from the outer corner.
+        let mut halves = Vec::new();
+        for (position, corner) in [side, (side + 1) % 4].into_iter().enumerate() {
+            if !matches!(ends[position], DotEnd::Shared) {
+                continue;
+            }
+            let anchor = if position == 0 {
+                run[0]
+            } else {
+                run[run.len() - 1]
+            };
+            let index = if position == 0 {
+                0
+            } else {
+                centers.len().saturating_sub(1)
+            };
+            let Some(&center) = centers.get(index) else {
+                continue;
+            };
+            if (center.x - anchor.x).abs() > 0.01 || (center.y - anchor.y).abs() > 0.01 {
+                continue;
+            }
+            let other = if position == 0 {
+                (side + 3) % 4
+            } else {
+                (side + 1) % 4
+            };
+            if colors[other] == colors[side] {
+                if position == 1 {
+                    centers.remove(index);
+                }
+                continue;
+            }
+            centers.remove(index);
+            // Away from the corner along this side, and along the corner's
+            // diagonal through the dot.
+            let origin = outer[corner];
+            let (diagonal_x, diagonal_y) = (anchor.x - origin.x, anchor.y - origin.y);
+            let distance = diagonal_x.hypot(diagonal_y).max(f32::EPSILON);
+            let reach = 4. * (distance + width);
+            let sign = if position == 0 { 1. } else { -1. };
+            halves.push((
+                center,
+                PaintShape::Polygon {
+                    points: vec![
+                        origin,
+                        CssPoint::new(origin.x + dx * sign * reach, origin.y + dy * sign * reach),
+                        CssPoint::new(
+                            origin.x + diagonal_x / distance * reach,
+                            origin.y + diagonal_y / distance * reach,
+                        ),
+                    ],
+                    evenodd: false,
+                },
+            ));
+        }
+        let mut path = Vec::new();
+        for center in centers {
+            push_dot(&mut path, center, width, thin, ratio);
+        }
+        let brush = PaintBrush::Solid(colors[side]);
+        if !path.is_empty() {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: PaintShape::Path(path),
+                brush: brush.clone(),
+            });
+        }
+        for (center, clip) in halves {
+            let mut path = Vec::new();
+            push_dot(&mut path, center, width, thin, ratio);
+            builder.commands.push(DisplayCommand::PushClip(clip));
+            builder.commands.push(DisplayCommand::Fill {
+                shape: PaintShape::Path(path),
+                brush: brush.clone(),
+            });
+            builder.commands.push(DisplayCommand::PopClip);
+        }
+    }
+}
+
+/// Dot centers along the polyline `run`, which is divided into an even
+/// number of steps of about `width` (odd when exactly one end is unfilled)
+/// that alternate dot and gap. Thin steps are never shorter than `width`, so
+/// that every dot and gap keeps a whole pixel on the grid.
+fn dot_centers(
+    run: &[CssPoint],
+    width: f32,
+    start_filled: bool,
+    end_filled: bool,
+    thin: bool,
+) -> Vec<CssPoint> {
+    if run.is_empty() || width <= 0. {
+        return Vec::new();
+    }
+    let mut lengths = vec![0f32];
+    for pair in run.windows(2) {
+        let step = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+        lengths.push(lengths[lengths.len() - 1] + step);
+    }
+    let total = lengths[lengths.len() - 1];
+    let at = |distance: f32| {
+        let index = lengths
+            .windows(2)
+            .position(|pair| distance <= pair[1])
+            .unwrap_or(lengths.len().saturating_sub(2));
+        let (Some(&from), Some(&to)) = (run.get(index), run.get(index + 1)) else {
+            return run[0];
+        };
+        let span = lengths[index + 1] - lengths[index];
+        let t = if span > 0. {
+            ((distance - lengths[index]) / span).clamp(0., 1.)
+        } else {
+            0.
+        };
+        CssPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+    };
+    if total < width {
+        // Too short for two dots: one in the middle, if neither end is a gap.
+        return if start_filled && end_filled {
+            vec![at(total / 2.)]
+        } else {
+            Vec::new()
+        };
+    }
+    let steps = total / width;
+    let mut steps = if thin { steps.floor() } else { steps.round() }.clamp(1., 65536.) as usize;
+    if steps.is_multiple_of(2) != (start_filled == end_filled) {
+        steps = if thin && steps > 1 {
+            steps - 1
+        } else {
+            steps + 1
+        };
+    }
+    let step = total / steps as f32;
+    (0..=steps)
+        .filter(|index| index.is_multiple_of(2) == start_filled)
+        .map(|index| at(index as f32 * step))
+        .collect()
+}
+
+/// One dot of `width` across: a circle, or a square on the device-pixel grid
+/// when thin.
+fn push_dot(path: &mut Vec<PathElement>, center: CssPoint, width: f32, thin: bool, ratio: f32) {
+    let radius = width / 2.;
+    let point = CssPoint::new;
+    if thin {
+        // The device pixels whose centers the dot covers, at least one.
+        let snap = |middle: f32| {
+            let start = ((middle - radius) * ratio - 0.5).ceil();
+            let end = ((middle + radius) * ratio - 0.5).ceil().max(start + 1.);
+            (start / ratio, end / ratio)
+        };
+        let ((x0, x1), (y0, y1)) = (snap(center.x), snap(center.y));
+        path.extend([
+            PathElement::MoveTo(point(x0, y0)),
+            PathElement::LineTo(point(x1, y0)),
+            PathElement::LineTo(point(x1, y1)),
+            PathElement::LineTo(point(x0, y1)),
+            PathElement::Close,
+        ]);
+        return;
+    }
+    let k = 0.5522848 * radius;
+    let (x, y) = (center.x, center.y);
+    path.extend([
+        PathElement::MoveTo(point(x + radius, y)),
+        PathElement::CurveTo(
+            point(x + radius, y + k),
+            point(x + k, y + radius),
+            point(x, y + radius),
+        ),
+        PathElement::CurveTo(
+            point(x - k, y + radius),
+            point(x - radius, y + k),
+            point(x - radius, y),
+        ),
+        PathElement::CurveTo(
+            point(x - radius, y - k),
+            point(x - k, y - radius),
+            point(x, y - radius),
+        ),
+        PathElement::CurveTo(
+            point(x + k, y - radius),
+            point(x + radius, y - k),
+            point(x + radius, y),
+        ),
+        PathElement::Close,
+    ]);
 }
 
 fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
@@ -5683,6 +6114,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The pixels of a fixture rendered at 800x600, as RGB triples.
+    fn render_pixels(html: &str) -> impl Fn(usize, usize) -> [u8; 3] {
+        let (_, layout) = render_fixture(html);
+        let pixels = crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+            .unwrap()
+            .pixels;
+        move |x, y| {
+            let at = (y * 800 + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2]]
+        }
+    }
+
+    /// The runs of pixels matching `ink` along a row or column, as
+    /// half-open ranges.
+    fn ink_runs(points: impl Iterator<Item = (usize, bool)>) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut open = None;
+        for (position, inked) in points {
+            match (inked, open) {
+                (true, None) => open = Some(position),
+                (false, Some(start)) => {
+                    runs.push((start, position));
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = open {
+            runs.push((start, usize::MAX));
+        }
+        runs
+    }
+
+    #[test]
+    fn dotted_borders_paint_a_dot_every_two_widths() {
+        // CSS Backgrounds 3 #border-style: dotted is "a series of round
+        // dots". Each dot used to be a zero-length dash with round caps,
+        // which the stroker drops, so only a few stray dots survived.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="margin:10px;width:300px;height:20px;border-bottom:4px dotted #00f"></div>
+            <div style="margin:10px;width:300px;height:20px;border-bottom:2px dotted #00f"></div>
+            <div style="margin:10px;width:100px;height:40px;border:1px dotted #00f"></div>"#,
+        );
+        let blue = |x: usize, y: usize| {
+            let [r, _, b] = pixel(x, y);
+            b > 200 && r < 160
+        };
+        // 4px round dots from x = 12 to 308, 8px apart.
+        let dots = ink_runs((0..330).map(|x| (x, blue(x, 32))));
+        assert_eq!(dots.len(), 38, "{dots:?}");
+        for (index, (start, end)) in dots.iter().enumerate() {
+            let center = (start + end) as f32 / 2.;
+            assert!((center - (12. + 8. * index as f32)).abs() <= 1., "{dots:?}");
+        }
+        // 2px dots are whole-pixel squares with whole-pixel gaps.
+        let dots = ink_runs((0..330).map(|x| (x, blue(x, 65))));
+        assert!((74..=76).contains(&dots.len()), "{dots:?}");
+        assert_eq!((dots[0].0, dots[dots.len() - 1].1), (10, 310));
+        for pair in dots.windows(2) {
+            assert_eq!(pair[0].1 - pair[0].0, 2, "{dots:?}");
+            assert!((2..=3).contains(&(pair[1].0 - pair[0].1)), "{dots:?}");
+        }
+        // A 1px box alternates pixels along every side, a dot in each corner.
+        let top = ink_runs((0..130).map(|x| (x, blue(x, 76))));
+        let left = ink_runs((70..130).map(|y| (y, blue(10, y))));
+        assert_eq!((top[0].0, top[top.len() - 1].1), (10, 112), "{top:?}");
+        assert_eq!((left[0].0, left[left.len() - 1].1), (76, 118), "{left:?}");
+        for runs in [&top, &left] {
+            for pair in runs.windows(2) {
+                assert_eq!(pair[0].1 - pair[0].0, 1, "{runs:?}");
+                assert!((1..=2).contains(&(pair[1].0 - pair[0].1)), "{runs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dotted_outlines_and_mixed_corners_keep_their_dots() {
+        // CSS UI 4 #outline-style: outline styles mean what border styles
+        // do. Where a dotted side meets another style, the other side takes
+        // the whole corner, as in Gecko, instead of leaving half of it bare.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="position:absolute;left:20px;top:20px;width:200px;height:40px;
+                outline:3px dotted #00f"></div>
+            <div style="position:absolute;left:20px;top:100px;width:200px;height:40px;
+                border:6px solid #f00;border-left:6px dotted #00f"></div>"#,
+        );
+        let blue = |x: usize, y: usize| {
+            let [r, _, b] = pixel(x, y);
+            b > 200 && r < 160
+        };
+        // The outline's top edge spans x = 17..223 at y = 17..20.
+        let dots = ink_runs((0..240).map(|x| (x, blue(x, 18))));
+        assert!((33..=35).contains(&dots.len()), "{dots:?}");
+        for pair in dots.windows(2) {
+            assert!(pair[1].0 - pair[0].0 <= 7, "{dots:?}");
+        }
+        // The top-left corner square (20..26, 100..106) is all red.
+        for (x, y) in [(21, 101), (24, 104), (21, 105), (25, 101)] {
+            assert_eq!(pixel(x, y), [255, 0, 0], "({x}, {y})");
+        }
+        // The dotted left side starts one gap below the corner square.
+        let dots = ink_runs((100..160).map(|y| (y, blue(23, y))));
+        assert!(dots.len() >= 3, "{dots:?}");
+        assert!((112..=114).contains(&dots[0].0), "{dots:?}");
     }
 
     #[test]
