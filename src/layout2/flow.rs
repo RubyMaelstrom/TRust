@@ -4273,6 +4273,15 @@ impl Flow<'_> {
         if self.dom.effective_display(b.node).as_deref() == Some("flow-root") {
             return true;
         }
+        // CSS Overflow 3 #overflow-propagation: a body whose overflow went to
+        // the viewport has a used overflow of `visible`.
+        if self.dom.tag_name(b.node) == Some("body")
+            && let Some(root) = self.dom.node(b.node).parent
+            && self.dom.tag_name(root) == Some("html")
+            && super::overflow::viewport_overflow_source_for(self.dom, root) == Some(b.node)
+        {
+            return false;
+        }
         // CSS Overflow 3 §3.1: visible/clip are the non-formatting-context
         // values. In particular, unlike hidden, `overflow:clip` does *not*
         // establish an independent formatting context.

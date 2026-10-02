@@ -4075,6 +4075,25 @@ mod tests {
     }
 
     #[test]
+    fn a_body_whose_overflow_went_to_the_viewport_collapses_margins() {
+        // CSS Overflow 3 #overflow-propagation: the body's used overflow is
+        // then `visible`, so it is no formatting context and its margin
+        // collapses with its first child's. Not so once html has overflow.
+        for (html_style, p_top) in [("", 16.0), ("html{overflow:auto}", 24.0)] {
+            let html = format!(
+                "<!doctype html><style>{html_style}body{{overflow-x:hidden}}</style><p id=p>x</p>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 400.0, &HashMap::new());
+            assert_eq!(
+                layout.boxes[&dom.get_by_id("p").unwrap()].top,
+                p_top,
+                "{html_style}"
+            );
+        }
+    }
+
+    #[test]
     fn a_serialized_frameset_keeps_its_frames() {
         // A static page reflows from its presentation snapshot, where frames
         // are `<div>` wrappers. The HTML parser drops a `<div>` inside a
