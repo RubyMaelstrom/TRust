@@ -2031,6 +2031,17 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 let content_clip = radii
                     .filter(|r| r.corners.iter().any(|&(x, y)| x > 0. && y > 0.))
                     .map(|r| rounded_shape(content, inset_radii(r, border, content)));
+                let natural_size_known = piece
+                    .item
+                    .graphical_image
+                    .as_ref()
+                    .or(piece.item.image.as_ref())
+                    .is_some_and(|source| {
+                        [source.clone(), resolve_image_source(builder.base, source)]
+                            .iter()
+                            .filter_map(|source| builder.images.get(source))
+                            .any(|&(w, h)| w > 0 && h > 0 && (w, h) != (u32::MAX, u32::MAX))
+                    });
                 if let Some(handle) = handle {
                     builder.push_clipped_marquee_content(
                         node,
@@ -2038,8 +2049,14 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                             rect,
                             handle,
                             source_rect: None,
+                            // Layout already resolved object-fit into the
+                            // paint rectangle (css-images-3 §5.5: `fill`
+                            // stretches). Only an image whose natural size
+                            // layout did not know keeps its aspect ratio.
                             fit: if piece.item.crop {
                                 ImageFit::Cover
+                            } else if natural_size_known {
+                                ImageFit::Fill
                             } else {
                                 ImageFit::Contain
                             },
@@ -5519,6 +5536,33 @@ mod tests {
                     .expect("background image tile");
                 assert_eq!((rect.width, rect.height), expected, "{source}: {size}");
             }
+        }
+    }
+
+    #[test]
+    fn stretched_images_paint_with_fill_unless_their_size_is_unknown() {
+        // css-images-3 §5.5: the initial object-fit, fill, stretches the
+        // image over a box whose ratio differs; layout already resolved it.
+        // An image still loading keeps its ratio inside the provisional box.
+        let html = r#"<body style="margin:0"><img src="https://example.test/r.png" width=200 height=10></body>"#;
+        for (known, expected) in [(true, ImageFit::Fill), (false, ImageFit::Contain)] {
+            let images = if known {
+                [("https://example.test/r.png".to_string(), (40, 20))]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            };
+            let (_, layout) = render_fixture_with_images(html, &images);
+            let fit = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    DisplayCommand::Image { fit, .. } => Some(*fit),
+                    _ => None,
+                });
+            assert_eq!(fit, Some(expected), "known={known}");
         }
     }
 
