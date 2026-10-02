@@ -16,9 +16,9 @@ use crate::render::{
     Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
     CssPaintAnimation, CssRect, CssTransformFrame, DecorationStyle, DisplayCommand,
     GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest,
-    ImageSampling, MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint, PaintBrush,
-    PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle,
-    TextDecorationPaint, TextShadowPaint, TopLayerEntry,
+    ImageSampling, LineJoin, MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint,
+    PaintBrush, PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint,
+    StrokeStyle, TextDecorationPaint, TextShadowPaint, TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -2440,17 +2440,21 @@ fn paint_outline_box(
         return;
     }
     let width = outline.width;
-    let grow = outline.offset + width / 2.0;
-    let rect = CssRect::new(
-        border_box.x - grow,
-        border_box.y - grow,
-        border_box.width + grow * 2.0,
-        border_box.height + grow * 2.0,
+    let outset = outline.offset + width;
+    let outer = CssRect::new(
+        border_box.x - outset,
+        border_box.y - outset,
+        (border_box.width + outset * 2.0).max(0.0),
+        (border_box.height + outset * 2.0).max(0.0),
     );
-    let base_radii = border_radii(builder.dom, source, border_box);
-    let radii = CornerRadii {
-        corners: base_radii.corners.map(|(x, y)| (x + grow, y + grow)),
-    };
+    // CSS UI 4 #outline-props: the outline follows the border-radius
+    // curve, grown by the outset-adjusted border radius, so a square corner
+    // stays square.
+    let outer_radii = outset_radii(
+        border_radii(builder.dom, source, border_box),
+        border_box,
+        outset,
+    );
     let color = source
         .value(builder.dom, "outline-color")
         .and_then(|value| {
@@ -2463,19 +2467,11 @@ fn paint_outline_box(
         .unwrap_or_else(|| text_color_for_style(builder.dom, source));
     if outline.style == OutlineStyle::Dotted {
         // CSS UI 4 #outline-style: the border styles keep their meaning.
-        let half = width / 2.;
         paint_dotted_sides(
             builder,
             BorderEdges {
-                rect: CssRect::new(
-                    rect.x - half,
-                    rect.y - half,
-                    rect.width + width,
-                    rect.height + width,
-                ),
-                radii: CornerRadii {
-                    corners: radii.corners.map(|(x, y)| (x + half, y + half)),
-                },
+                rect: outer,
+                radii: outer_radii,
                 widths: [width; 4],
                 styles: ["dotted"; 4],
                 colors: [color; 4],
@@ -2483,18 +2479,50 @@ fn paint_outline_box(
         );
         return;
     }
+    let half = width / 2.0;
+    let center = CssRect::new(
+        outer.x + half,
+        outer.y + half,
+        (outer.width - width).max(0.0),
+        (outer.height - width).max(0.0),
+    );
     builder.commands.push(DisplayCommand::Stroke {
-        shape: rounded_shape(rect, radii),
+        shape: rounded_shape(center, inset_radii(outer_radii, outer, center)),
         brush: PaintBrush::Solid(color),
-        style: match outline.style {
-            OutlineStyle::Dashed => {
-                let mut style = StrokeStyle::solid(width);
-                style.dash = vec![width * 3.0, width * 2.0];
-                style
-            }
-            _ => StrokeStyle::solid(width),
-        },
+        style: stroke_for_border(
+            width,
+            if outline.style == OutlineStyle::Dashed {
+                "dashed"
+            } else {
+                "solid"
+            },
+        ),
     });
+}
+
+/// CSS Backgrounds 3 #outset-adjusted-border-radius: the radii of `edge`
+/// expanded by `outset`, which grow less where a corner is small for its
+/// box, and stay zero (square) where they are zero.
+fn outset_radii(radii: CornerRadii, edge: CssRect, outset: f32) -> CornerRadii {
+    CornerRadii {
+        corners: radii.corners.map(|(x, y)| {
+            if outset <= 0. {
+                return ((x + outset).max(0.), (y + outset).max(0.));
+            }
+            let ratio = |radius: f32, length: f32| {
+                if length > 0. { radius / length } else { 0. }
+            };
+            let coverage = 2. * ratio(x, edge.width).min(ratio(y, edge.height));
+            let adjust = |radius: f32| {
+                if radius > outset || coverage > 1. {
+                    return radius + outset;
+                }
+                let ratio = radius / outset;
+                radius + outset * (1. - (1. - ratio).powi(3) * (1. - coverage.powi(3)))
+            };
+            (adjust(x), adjust(y))
+        }),
+    }
 }
 
 /// The resident page actor serializes its own node identity into presentation
@@ -3837,9 +3865,10 @@ fn paint_inline_box_decorations(
     }
 }
 
-/// CSS Backgrounds and Borders §6: background first, then border. Uniform
-/// rounded borders use one true stroked rounded path; non-uniform sides retain
-/// each side's own color/style and CSS-pixel width.
+/// CSS Backgrounds and Borders §6: background first, then border. A uniform
+/// solid border is one filled ring and a uniform dashed one one stroked
+/// path; non-uniform sides retain each side's own color/style and CSS-pixel
+/// width.
 fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>) {
     let Some(style) = PaintStyle::of(fragment) else {
         return;
@@ -3913,15 +3942,26 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         && !matches!(styles[0].as_str(), "none" | "hidden" | "dotted")
         && !complex(&styles[0])
     {
+        // CSS Backgrounds 3 #corner-shaping: the outer edge follows the
+        // border radii and the padding edge those radii less the border
+        // width, so a solid border is exactly that ring, and a dashed one is
+        // dashed along the ring's center line.
+        if styles[0] == "solid" {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: border_ring(rect, radii, fragment.border, 0., 1.),
+                brush: PaintBrush::Solid(colors[0]),
+            });
+            return;
+        }
         let inset = top / 2.0;
-        let inner = CssRect::new(
+        let center = CssRect::new(
             rect.x + inset,
             rect.y + inset,
             (rect.width - top).max(0.0),
             (rect.height - top).max(0.0),
         );
         builder.commands.push(DisplayCommand::Stroke {
-            shape: rounded_shape(inner, radii),
+            shape: rounded_shape(center, inset_radii(radii, rect, center)),
             brush: PaintBrush::Solid(colors[0]),
             style: stroke_for_border(top, &styles[0]),
         });
@@ -4096,8 +4136,12 @@ fn text_shadows(dom: &Dom, node: NodeId, current_color: PaintColor) -> Vec<TextS
         .collect()
 }
 
+/// A border or outline stroke along the center of its band. Corners join
+/// mitered, so that square corners stay square (CSS Backgrounds 3
+/// #corner-shaping).
 fn stroke_for_border(width: f32, style: &str) -> StrokeStyle {
     let mut stroke = StrokeStyle::solid(width);
+    stroke.join = LineJoin::Miter;
     if style == "dashed" {
         stroke.dash = vec![width * 3.0, width * 2.0];
     }
@@ -6340,6 +6384,43 @@ mod tests {
             })
             .count();
         assert!(arc > 30, "{arc}");
+    }
+
+    #[test]
+    fn square_corners_stay_square_and_round_ones_keep_their_radii() {
+        // CSS Backgrounds 3 #corner-shaping: a zero radius is a square
+        // corner, and the padding edge's radius is the outer radius less the
+        // border width. Uniform borders and outlines were stroked with round
+        // joins (notching square corners), outlines grew a zero radius, and
+        // a rounded border's stroke used the outer radius on its center line.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="position:absolute;left:40px;top:40px;width:100px;height:60px;
+                background:red;border:16px solid #00f"></div>
+            <div style="position:absolute;left:240px;top:40px;width:100px;height:60px;
+                background:red;outline:16px solid #00f"></div>
+            <div style="position:absolute;left:20px;top:200px;width:100px;height:60px;
+                background:red;border:10px solid #00f;border-radius:30px"></div>
+            <div style="position:absolute;left:240px;top:200px;width:100px;height:60px;
+                background:red;border-radius:20px;outline:6px solid #00f;outline-offset:4px"></div>"#,
+        );
+        for (x, y) in [(40, 40), (41, 41), (171, 40), (171, 131), (40, 131)] {
+            assert_eq!(pixel(x, y), [0, 0, 255], "border ({x}, {y})");
+        }
+        for (x, y) in [(224, 24), (226, 26), (355, 24), (355, 115), (224, 115)] {
+            assert_eq!(pixel(x, y), [0, 0, 255], "outline ({x}, {y})");
+        }
+        // The 30px corner's outer curve and its 20px padding curve, both
+        // centered on (50, 230).
+        assert_eq!(pixel(29, 209), [0, 0, 255]);
+        assert_eq!(pixel(37, 217), [255, 0, 0]);
+        // The outline's outer radius is 20 + 10 and its inner one 24, both
+        // centered on (260, 220).
+        assert_eq!(pixel(233, 193), [255, 255, 255]);
+        assert_eq!(pixel(240, 200), [0, 0, 255]);
+        assert_eq!(pixel(244, 204), [255, 255, 255]);
+        assert_eq!(pixel(232, 220), [0, 0, 255]);
+        assert_eq!(pixel(260, 191), [0, 0, 255]);
     }
 
     #[test]

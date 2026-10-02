@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vello_cpu::color::palette::css::{
     BLACK, BLUE, CYAN, DARK_GRAY, GRAY, LIGHT_GRAY, WHITE, YELLOW,
 };
-use vello_cpu::kurbo::{Affine, BezPath, Cap, Circle, Diagonal2, Rect, Shape as _, Stroke};
+use vello_cpu::kurbo::{Affine, BezPath, Cap, Circle, Diagonal2, Join, Rect, Shape as _, Stroke};
 use vello_cpu::peniko::{
     ColorStop, Compose, Gradient, ImageBrush, ImageQuality, ImageSampler, Mix,
 };
@@ -18,7 +18,7 @@ use vello_cpu::{ImageSource, Pixmap, RenderContext, Resources};
 
 use super::{
     Affine2d, BlendMode, CssFilter, CssRect, DecorationStyle, DisplayCommand, ImageFit,
-    ImageHandle, ImageSampling, LineCap, PaintBrush, PaintColor, PaintShape, PathElement,
+    ImageHandle, ImageSampling, LineCap, LineJoin, PaintBrush, PaintColor, PaintShape, PathElement,
     Primitive, RasterBackend, RasterFrame, Scene, StrokeStyle, is_desktop_heart_image_handle,
 };
 use crate::core::{CssPoint, PhysicalSize};
@@ -936,8 +936,14 @@ pub(super) fn vello_stroke(style: &StrokeStyle) -> Stroke {
         LineCap::Round => Cap::Round,
         LineCap::Square => Cap::Square,
     };
+    let join = match style.join {
+        LineJoin::Miter => Join::Miter,
+        LineJoin::Round => Join::Round,
+        LineJoin::Bevel => Join::Bevel,
+    };
     Stroke::new(f64::from(style.width.max(0.0)))
         .with_caps(cap)
+        .with_join(join)
         .with_dashes(
             f64::from(style.dash_offset),
             style.dash.iter().map(|value| f64::from(*value)),
