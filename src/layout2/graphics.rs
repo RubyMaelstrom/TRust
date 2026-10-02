@@ -2016,14 +2016,18 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     piece.paint_width,
                     piece.paint_height,
                 );
+                let ratio = builder.dom.device_pixel_ratio();
                 // CSS Backgrounds 3 §4.2/§4.3: replaced pixels clip to the
                 // curved CONTENT edge, independent of overflow. Object-fit's
                 // painted rectangle may be smaller than this content box.
-                let content = CssRect::new(
-                    fragment.x + piece.x,
-                    fragment.y + piece.y,
-                    piece.box_width,
-                    piece.box_height,
+                let content = snap_to_device_pixels(
+                    CssRect::new(
+                        fragment.x + piece.x,
+                        fragment.y + piece.y,
+                        piece.box_width,
+                        piece.box_height,
+                    ),
+                    ratio,
                 );
                 let border = builder
                     .replaced_border_boxes
@@ -2050,7 +2054,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     builder.push_clipped_marquee_content(
                         node,
                         DisplayCommand::Image {
-                            rect,
+                            rect: snap_to_device_pixels(rect, ratio),
                             handle,
                             source_rect: None,
                             // Layout already resolved object-fit into the
@@ -3095,6 +3099,25 @@ fn paint_background_images_for_style(
         }
     }
     pin_fixed(builder, &mut fixed_start, &mut rescroll, &mut blending);
+}
+
+/// Round a replaced element's content edges to device pixels, as Gecko and
+/// Blink do. CSS leaves pixel snapping undefined (css-images-3
+/// #the-image-rendering only governs scaling), but without it an image at
+/// its natural size and a fractional offset, such as one centered in an
+/// odd-width column, is resampled across pixel boundaries and blurs.
+fn snap_to_device_pixels(rect: CssRect, ratio: f32) -> CssRect {
+    if !(ratio.is_finite() && ratio > 0.0) {
+        return rect;
+    }
+    let snap = |value: f32| (value * ratio).round() / ratio;
+    let (left, top) = (snap(rect.x), snap(rect.y));
+    CssRect::new(
+        left,
+        top,
+        snap(rect.x + rect.width) - left,
+        snap(rect.y + rect.height) - top,
+    )
 }
 
 /// What one background layer paints into each of its tiles.
@@ -7467,6 +7490,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn natural_size_images_paint_on_device_pixels() {
+        // CSS leaves pixel snapping undefined (css-images-3
+        // #the-image-rendering covers only scaling); Gecko and Blink round
+        // replaced content to device pixels. One-pixel stripes at a half-pixel
+        // offset, set directly or centered in an odd-width flex column, stay
+        // crisp at x=11 and x=5 instead of being resampled to gray.
+        let stripes = image::RgbaImage::from_fn(8, 8, |x, _| {
+            image::Rgba(if x % 2 == 0 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            })
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(stripes)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let url: String = png.iter().map(|byte| format!("%{byte:02X}")).collect();
+        let frame = crate::render::headless::render_html(
+            &format!(
+                "<!doctype html><style>body{{margin:0;background:#fff}} img{{display:block}}</style>\
+                 <div style='margin:10.5px 0 0 10.5px'><img src='data:image/png,{url}'></div>\
+                 <div style='display:flex;flex-direction:column;align-items:center;width:17px;\
+                 margin-top:10px'><img src='data:image/png,{url}'></div>"
+            ),
+            &Url::parse("https://example.test/").unwrap(),
+            CssSize::new(100., 100.),
+        )
+        .unwrap();
+        let row = |y: usize, x: std::ops::Range<usize>| {
+            x.map(|x| frame.pixels[(y * 100 + x) * 4])
+                .collect::<Vec<_>>()
+        };
+        let crisp = [255, 0, 255, 0, 255, 0, 255, 0, 255, 255];
+        assert_eq!(row(14, 10..20), crisp, "offset by 10.5px");
+        assert_eq!(row(10, 10..20), [255; 10], "rows also snap");
+        assert_eq!(row(32, 4..14), crisp, "centered in a 17px column");
     }
 
     #[test]

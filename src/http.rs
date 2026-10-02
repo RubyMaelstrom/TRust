@@ -18236,8 +18236,10 @@ customElements.define('lit-counter', LitCounter);
                     _ => None,
                 })
                 .expect("generated SVG image");
+            // The painted rectangle's edges snap to device pixels, so a
+            // 12.5px height centered at y=18.75 paints 12px tall.
             assert!(
-                (image.width - expected.0).abs() < 0.01 && (image.height - expected.1).abs() < 0.01,
+                (image.width - expected.0).abs() <= 0.5 && (image.height - expected.1).abs() <= 0.5,
                 "{dimensions}: {image:?}"
             );
         }
