@@ -1417,7 +1417,7 @@ impl Flow<'_> {
         let y_final;
         match spec_h {
             Some(h0) => {
-                let hc = h0.clamp(min_h, max_h.max(min_h));
+                let mut hc = h0.clamp(min_h, max_h.max(min_h));
                 let yb = match y_border {
                     Some(yb) => yb,
                     None if hc == 0.0 && bt == 0.0 && bb == 0.0 => {
@@ -1439,6 +1439,11 @@ impl Flow<'_> {
                     }
                     None => cur.flush(),
                 };
+                // CSS 2 §17.5.3: a table's height is only a minimum; it is
+                // as tall as its rows and captions need.
+                if matches!(b.content, Content::Table(_)) {
+                    hc = hc.max(cur.y - content_top_of(yb));
+                }
                 // Children's trailing margins stay inside a definite-height
                 // box (no collapse-through; nothing paints in them).
                 cur.pos = 0.0;
