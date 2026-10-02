@@ -323,6 +323,9 @@ pub(super) fn property_names(property: &str) -> Vec<String> {
     if property.starts_with("--") {
         return vec![property.into()];
     }
+    // WHATWG Compatibility #css-simple-aliases: a legacy name alias is a
+    // supported property that names its standard property's longhands.
+    let property = legacy_name_alias(&property.to_ascii_lowercase()).unwrap_or(property);
     let names: Vec<_> = longhands(property, "initial")
         .into_iter()
         .map(|(name, _)| name)
@@ -720,6 +723,7 @@ fn get(property: &str, declarations: &[(String, String, bool)]) -> String {
                 .join(", ")
         }
         "background" => background_value(&v),
+        "mask" => mask_value(&v),
         "white-space" => match v.as_slice() {
             ["collapse", "wrap"] => "normal".into(),
             ["collapse", "nowrap"] => "nowrap".into(),
@@ -832,11 +836,74 @@ fn background_value(values: &[&str]) -> String {
         .join(", ")
 }
 
+/// CSS Masking 1 #the-mask: each `<mask-layer>` in grammar order, omitting
+/// initial components. One box serializes when mask-origin and mask-clip
+/// agree (or mask-clip is `no-clip` over the initial origin, which `no-clip`
+/// alone restores). Unequal list lengths cannot round-trip.
+fn mask_value(values: &[&str]) -> String {
+    let lists: Vec<Vec<&str>> = values
+        .iter()
+        .map(|v| {
+            split_top_level_commas(v)
+                .into_iter()
+                .map(str::trim)
+                .collect()
+        })
+        .collect();
+    let [image, position, size, repeat, origin, clip, composite, mode] = lists.as_slice() else {
+        return String::new();
+    };
+    let count = image.len();
+    if count == 0 || lists.iter().any(|list| list.len() != count) {
+        return String::new();
+    }
+    (0..count)
+        .map(|i| {
+            let mut parts = Vec::new();
+            if image[i] != "none" {
+                parts.push(image[i].to_string());
+            }
+            let sized = !matches!(size[i], "auto" | "auto auto");
+            if position[i] != "0% 0%" || sized {
+                parts.push(position[i].to_string());
+                if sized {
+                    parts.push(format!("/ {}", size[i]));
+                }
+            }
+            if repeat[i] != "repeat" {
+                parts.push(repeat[i].to_string());
+            }
+            match (origin[i], clip[i]) {
+                ("border-box", "border-box") => {}
+                ("border-box", "no-clip") => parts.push("no-clip".into()),
+                (origin, clip) if origin == clip => parts.push(origin.into()),
+                (origin, clip) => {
+                    parts.push(origin.into());
+                    parts.push(clip.into());
+                }
+            }
+            if composite[i] != "add" {
+                parts.push(composite[i].to_string());
+            }
+            if mode[i] != "match-source" {
+                parts.push(mode[i].to_string());
+            }
+            if parts.is_empty() {
+                "none".to_string()
+            } else {
+                parts.join(" ")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// CSSOM #serialize-a-css-declaration-block. Internal transport preserves
 /// pending-substitution values; public serialization never exposes them.
 fn serialize(declarations: &Declarations, internal: bool) -> String {
     const SHORTHANDS: &[&str] = &[
         "background",
+        "mask",
         "border",
         "border-width",
         "border-style",
@@ -1150,5 +1217,56 @@ mod tests {
         assert!(!serialize(&pending, false).contains('\0'));
         assert!(!supports("background", "not-a-color"));
         assert!(property_names("not-a-property").is_empty());
+    }
+
+    #[test]
+    fn mask_shorthand_cssom_round_trips_layers() {
+        // CSS Masking 1 #the-mask and WHATWG Compatibility
+        // #css-simple-aliases (`-webkit-mask` is a legacy name alias).
+        for value in [
+            "none",
+            "url(dots.png) center / cover no-repeat",
+            "linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0) exclude",
+            "url(m.svg) left 4px top / 10px 20px repeat-x padding-box no-clip luminance",
+        ] {
+            assert!(supports("mask", value), "{value}");
+            assert!(supports("-webkit-mask", value), "{value}");
+            let declarations = expanded("mask", value);
+            assert_eq!(declarations.len(), 8);
+            let serialized = get("mask", &declarations);
+            assert!(!serialized.is_empty(), "{value}");
+            assert_eq!(expanded("mask", &serialized), declarations, "{serialized}");
+        }
+        assert_eq!(
+            get(
+                "mask",
+                &parse("-webkit-mask:url(a.png) no-repeat center / contain")
+            ),
+            "url(a.png) center / contain no-repeat"
+        );
+        for (property, value) in [
+            ("mask", "url(a.png) url(b.png)"),
+            ("mask", "no-clip no-clip"),
+            ("mask", "border-box padding-box no-clip"),
+            ("mask", "xor"),
+            ("mask-composite", "source-over"),
+            ("-webkit-mask-composite", "xor"),
+            ("mask-mode", "auto"),
+            ("mask-origin", "no-clip"),
+            ("mask-image", "red"),
+            ("mask-size", "cover 10px"),
+            ("mask-position", "5 5"),
+        ] {
+            assert!(!supports(property, value), "{property}: {value}");
+        }
+        for (property, value) in [
+            ("-webkit-mask-image", "url(a.png), none"),
+            ("mask-clip", "no-clip, content-box"),
+            ("mask-repeat", "space round"),
+            ("-webkit-mask-size", "50% auto, contain"),
+            ("mask-position", "right 10% bottom"),
+        ] {
+            assert!(supports(property, value), "{property}: {value}");
+        }
     }
 }

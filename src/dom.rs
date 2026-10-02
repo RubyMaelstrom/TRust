@@ -12494,6 +12494,17 @@ const PROPS: &[PropDef] = &[
     // positioned boxes and clips the complete border box and descendants.
     prop("clip", false, true),
     prop("clip-path", false, true),
+    // CSS Masking 1 #positioned-masks: the mask layer longhands. The `mask`
+    // shorthand and the `-webkit-mask-*` legacy name aliases (WHATWG
+    // Compatibility #css-simple-aliases) expand into these.
+    prop("mask-image", false, true),
+    prop("mask-mode", false, true),
+    prop("mask-repeat", false, true),
+    prop("mask-position", false, true),
+    prop("mask-clip", false, true),
+    prop("mask-origin", false, true),
+    prop("mask-size", false, true),
+    prop("mask-composite", false, true),
     // CSS Scroll Snap 1: a scroll container only card-SNAPS when it declares
     // `scroll-snap-type` (mandatory/proximity); otherwise it scrolls freely.
     // `scroll-snap-align` (on the items) is the snap-position alignment.
@@ -12719,6 +12730,13 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "background-attachment" => Some("scroll"),
         "background-clip" => Some("border-box"),
         "background-origin" => Some("padding-box"),
+        // CSS Masking 1 #positioned-masks property definition tables.
+        "mask-mode" => Some("match-source"),
+        "mask-repeat" => Some("repeat"),
+        "mask-position" => Some("0% 0%"),
+        "mask-clip" | "mask-origin" => Some("border-box"),
+        "mask-size" => Some("auto"),
+        "mask-composite" => Some("add"),
         "font-family" => Some("sans-serif"),
         "font-style"
         | "font-variant"
@@ -14141,6 +14159,9 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if prop == "background" {
         return expand_background(value);
     }
+    if prop == "mask" {
+        return expand_mask(value);
+    }
     // CSS Backgrounds 4 #background-position-longhands: background-position
     // is the shorthand of background-position-x and -y, so a later
     // declaration of either orders correctly against it in the cascade.
@@ -14546,6 +14567,235 @@ fn parse_background_layer(layer: &str, final_layer: bool) -> Option<BackgroundLa
         }
     }
     Some(parsed)
+}
+
+/// CSS Masking 1 #the-mask: the longhands of `mask`, in the order the
+/// shorthand expansion lists them. (It also resets `mask-border`, which
+/// TRust does not implement.)
+const MASK_LONGHANDS: [&str; 8] = [
+    "mask-image",
+    "mask-position",
+    "mask-size",
+    "mask-repeat",
+    "mask-origin",
+    "mask-clip",
+    "mask-composite",
+    "mask-mode",
+];
+
+/// `mask: <mask-layer>#` → its longhands (CSS Masking 1 #the-mask). As with
+/// `background`, one invalid layer invalidates the declaration, and each
+/// layer's omitted components reset to their initial values.
+fn expand_mask(value: &str) -> Vec<(String, String)> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    if wide_keyword(v).is_some() {
+        return MASK_LONGHANDS
+            .iter()
+            .map(|name| (name.to_string(), v.to_string()))
+            .collect();
+    }
+    let mut columns: [Vec<String>; 8] = Default::default();
+    for layer in split_top_level_commas(v) {
+        let Some(parsed) = parse_mask_layer(layer.trim()) else {
+            return Vec::new();
+        };
+        for (column, value) in columns.iter_mut().zip(parsed) {
+            column.push(value);
+        }
+    }
+    MASK_LONGHANDS
+        .iter()
+        .zip(columns)
+        .map(|(name, values)| (name.to_string(), values.join(", ")))
+        .collect()
+}
+
+/// CSS Masking 1 #the-mask-origin: `<coord-box>`.
+fn mask_coord_box(token: &str) -> bool {
+    matches!(
+        token,
+        "content-box" | "padding-box" | "border-box" | "fill-box" | "stroke-box" | "view-box"
+    )
+}
+
+/// One `<mask-layer>` = `<mask-reference> || <position> [ / <bg-size> ]? ||
+/// <repeat-style> || <geometry-box> || [ <geometry-box> | no-clip ] ||
+/// <compositing-operator> || <masking-mode>`, as values for
+/// [`MASK_LONGHANDS`]. One box sets both mask-origin and mask-clip; with a
+/// second box or `no-clip`, the second component sets mask-clip.
+fn parse_mask_layer(layer: &str) -> Option<[String; 8]> {
+    let (before, size) = match split_top_level_slash(layer) {
+        Some((before, size)) => (before, Some(size)),
+        None => (layer, None),
+    };
+    let mut image: Option<String> = None;
+    let mut position: Vec<&str> = Vec::new();
+    let mut sizes: Vec<&str> = Vec::new();
+    let mut repeat: Vec<String> = Vec::new();
+    let mut boxes: Vec<String> = Vec::new();
+    let (mut no_clip, mut composite, mut mode) = (false, None, None);
+    let mut tokens: Vec<(&str, bool)> = split_top_level_ws(before)
+        .into_iter()
+        .map(|token| (token, false))
+        .collect();
+    if let Some(size) = size {
+        // The slash closes `<position>`; a size needs a position before it.
+        if tokens.is_empty() || split_top_level_slash(size).is_some() {
+            return None;
+        }
+        let after = split_top_level_ws(size);
+        let count = after
+            .iter()
+            .take(2)
+            .take_while(|token| background_size_token(&token.to_ascii_lowercase()))
+            .count();
+        sizes.extend_from_slice(&after[..count]);
+        if !valid_bg_size(&sizes.join(" ")) {
+            return None;
+        }
+        tokens.extend(after[count..].iter().map(|token| (*token, true)));
+    }
+    for (token, after_size) in tokens {
+        let lower = token.to_ascii_lowercase();
+        if lower == "none" || bg_image_token(&lower) {
+            if image.is_some() || !(lower == "none" || valid_background_image(token)) {
+                return None;
+            }
+            image = Some(if lower == "none" { lower } else { token.into() });
+        } else if matches!(lower.as_str(), "repeat-x" | "repeat-y") {
+            if !repeat.is_empty() {
+                return None;
+            }
+            repeat.push(lower);
+        } else if matches!(lower.as_str(), "repeat" | "space" | "round" | "no-repeat") {
+            // `<repeat-style>`: repeat-x | repeat-y | <repetition>{1,2}.
+            if repeat.len() == 2
+                || repeat
+                    .iter()
+                    .any(|r| matches!(r.as_str(), "repeat-x" | "repeat-y"))
+            {
+                return None;
+            }
+            repeat.push(lower);
+        } else if mask_coord_box(&lower) {
+            if boxes.len() == 2 {
+                return None;
+            }
+            boxes.push(lower);
+        } else if lower == "no-clip" {
+            if std::mem::replace(&mut no_clip, true) {
+                return None;
+            }
+        } else if matches!(lower.as_str(), "add" | "subtract" | "intersect" | "exclude") {
+            if composite.replace(lower).is_some() {
+                return None;
+            }
+        } else if matches!(lower.as_str(), "alpha" | "luminance" | "match-source") {
+            if mode.replace(lower).is_some() {
+                return None;
+            }
+        } else if !after_size && background_position_token(&lower) {
+            if position.len() == 4 || is_bare_nonzero_css_number(token) {
+                return None;
+            }
+            position.push(token);
+        } else {
+            return None;
+        }
+    }
+    let position = if position.is_empty() {
+        String::from("0% 0%")
+    } else {
+        let position = position.join(" ");
+        bg_position_layer_axes(&position)?;
+        position
+    };
+    let (origin, clip) = match (boxes.as_slice(), no_clip) {
+        ([], false) => ("border-box".into(), "border-box".into()),
+        ([], true) => ("border-box".into(), "no-clip".into()),
+        ([one], false) => (one.clone(), one.clone()),
+        ([one], true) => (one.clone(), "no-clip".into()),
+        ([origin, clip], false) => (origin.clone(), clip.clone()),
+        _ => return None,
+    };
+    Some([
+        image.unwrap_or_else(|| "none".into()),
+        position,
+        if sizes.is_empty() {
+            "auto".into()
+        } else {
+            sizes.join(" ")
+        },
+        if repeat.is_empty() {
+            "repeat".into()
+        } else {
+            repeat.join(" ")
+        },
+        origin,
+        clip,
+        composite.unwrap_or_else(|| "add".into()),
+        mode.unwrap_or_else(|| "match-source".into()),
+    ])
+}
+
+/// `<bg-size>` (CSS Backgrounds 3 #background-size), used by mask-size.
+fn valid_bg_size(value: &str) -> bool {
+    let tokens = split_top_level_ws(value);
+    let keyword = |token: &str| {
+        let lower = token.to_ascii_lowercase();
+        matches!(lower.as_str(), "cover" | "contain")
+    };
+    match tokens.as_slice() {
+        [one] if keyword(one) => true,
+        [] => false,
+        tokens if tokens.len() <= 2 => tokens.iter().all(|token| {
+            let lower = token.to_ascii_lowercase();
+            !keyword(token)
+                && !lower.starts_with('-')
+                && !is_bare_nonzero_css_number(token)
+                && background_size_token(&lower)
+        }),
+        _ => false,
+    }
+}
+
+/// The per-layer grammars of the CSS Masking 1 #positioned-masks longhands.
+/// Each is a comma-separated list with one value per mask layer; an invalid
+/// list invalidates the declaration, so an earlier valid one keeps applying.
+fn valid_mask_longhand(property: &str, value: &str) -> bool {
+    let layers = split_top_level_commas(value);
+    if layers.iter().any(|layer| layer.trim().is_empty()) {
+        return false;
+    }
+    layers.into_iter().all(|layer| {
+        let layer = layer.trim();
+        let lower = layer.to_ascii_lowercase();
+        let one = |words: &[&str]| words.contains(&lower.as_str());
+        match property {
+            "mask-image" => lower == "none" || valid_background_image(layer),
+            "mask-mode" => one(&["alpha", "luminance", "match-source"]),
+            "mask-composite" => one(&["add", "subtract", "intersect", "exclude"]),
+            "mask-origin" => mask_coord_box(&lower),
+            "mask-clip" => lower == "no-clip" || mask_coord_box(&lower),
+            "mask-size" => valid_bg_size(layer),
+            "mask-repeat" => {
+                one(&["repeat-x", "repeat-y"])
+                    || (1..=2).contains(&split_top_level_ws(&lower).len())
+                        && split_top_level_ws(&lower)
+                            .iter()
+                            .all(|t| matches!(*t, "repeat" | "space" | "round" | "no-repeat"))
+            }
+            "mask-position" => {
+                split_top_level_ws(&lower).iter().all(|token| {
+                    background_position_token(token) && !is_bare_nonzero_css_number(token)
+                }) && bg_position_layer_axes(layer).is_some()
+            }
+            _ => true,
+        }
+    })
 }
 
 fn background_position_token(token: &str) -> bool {
@@ -15891,6 +16141,13 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     // CSS Conditional 3 #support-definition: an unsupported color value is
     // also invalid in ordinary declarations, preserving earlier fallbacks.
     if is_color_property(&k) && !supports_color_value(&value) {
+        return None;
+    }
+    if MASK_LONGHANDS.contains(&k.as_str())
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && !valid_mask_longhand(&k, &value)
+    {
         return None;
     }
     if k == "-webkit-text-stroke-width"
@@ -19886,6 +20143,69 @@ mod tests {
         // An alias cascades as its standard name: the later declaration wins.
         assert_eq!(value("b", "box-shadow").as_deref(), Some("none"));
         assert_eq!(value("b", "box-sizing").as_deref(), Some("border-box"));
+    }
+
+    #[test]
+    fn mask_longhands_shorthand_and_webkit_aliases_cascade() {
+        // CSS Masking 1 #positioned-masks and #the-mask; WHATWG Compatibility
+        // #css-simple-aliases makes -webkit-mask-* parse as mask-*.
+        let dom = Dom::parse_document(
+            "<style>\
+             #a{-webkit-mask-image:url(Dots.PNG);-webkit-mask-size:cover;\
+               -webkit-mask-repeat:no-repeat;-webkit-mask-position:center}\
+             #b{mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);\
+               -webkit-mask-composite:xor;mask-composite:exclude}\
+             #c{-webkit-mask:url(m.svg) left 4px top / 10px 20px repeat-x padding-box no-clip luminance subtract}\
+             #d{mask-image:url(ok.png);mask-image:-webkit-linear-gradient(top,red,blue);\
+               mask-mode:alpha;mask-mode:bogus;mask-clip:no-clip;mask-origin:no-clip}\
+             #e{mask-repeat:space;mask:url(a.png);mask:url(b.png) url(c.png)}\
+             #f{mask-size:10px;mask-size:7;mask-position:5 5}\
+             </style><p id=a>a</p><p id=b>b</p><p id=c>c</p><p id=d>d</p><p id=e>e</p><p id=f>f</p>",
+        );
+        let value = |id: &str, name: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.computed_value(node, name)
+        };
+        assert_eq!(value("a", "mask-image").as_deref(), Some("url(Dots.PNG)"));
+        assert_eq!(value("a", "mask-size").as_deref(), Some("cover"));
+        assert_eq!(value("a", "mask-repeat").as_deref(), Some("no-repeat"));
+        assert_eq!(value("a", "mask-position").as_deref(), Some("center"));
+        assert_eq!(
+            value("b", "mask-image").as_deref(),
+            Some("linear-gradient(#fff 0 0), linear-gradient(#fff 0 0)")
+        );
+        assert_eq!(
+            value("b", "mask-origin").as_deref(),
+            Some("content-box, border-box")
+        );
+        assert_eq!(
+            value("b", "mask-clip").as_deref(),
+            Some("content-box, border-box")
+        );
+        // `xor` is a -webkit-mask-composite keyword, not a <compositing-operator>.
+        assert_eq!(value("b", "mask-composite").as_deref(), Some("exclude"));
+        assert_eq!(
+            value("b", "mask-mode").as_deref(),
+            Some("match-source, match-source")
+        );
+        assert_eq!(value("c", "mask-image").as_deref(), Some("url(m.svg)"));
+        assert_eq!(value("c", "mask-position").as_deref(), Some("left 4px top"));
+        assert_eq!(value("c", "mask-size").as_deref(), Some("10px 20px"));
+        assert_eq!(value("c", "mask-repeat").as_deref(), Some("repeat-x"));
+        assert_eq!(value("c", "mask-origin").as_deref(), Some("padding-box"));
+        assert_eq!(value("c", "mask-clip").as_deref(), Some("no-clip"));
+        assert_eq!(value("c", "mask-mode").as_deref(), Some("luminance"));
+        assert_eq!(value("c", "mask-composite").as_deref(), Some("subtract"));
+        // Invalid values leave the earlier valid declaration in force.
+        assert_eq!(value("d", "mask-image").as_deref(), Some("url(ok.png)"));
+        assert_eq!(value("d", "mask-mode").as_deref(), Some("alpha"));
+        assert_eq!(value("d", "mask-clip").as_deref(), Some("no-clip"));
+        assert_eq!(value("d", "mask-origin"), None);
+        // The shorthand resets every longhand of each layer.
+        assert_eq!(value("e", "mask-image").as_deref(), Some("url(a.png)"));
+        assert_eq!(value("e", "mask-repeat").as_deref(), Some("repeat"));
+        assert_eq!(value("f", "mask-size").as_deref(), Some("10px"));
+        assert_eq!(value("f", "mask-position"), None);
     }
 
     #[test]
