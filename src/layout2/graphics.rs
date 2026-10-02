@@ -3742,6 +3742,9 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     let Some(style) = PaintStyle::of(fragment) else {
         return;
     };
+    if paint_border_image(fragment, style, builder) {
+        return;
+    }
     let [top, right, bottom, left] = fragment.border;
     if [top, right, bottom, left].iter().all(|v| *v <= 0.0) {
         return;
@@ -4642,6 +4645,349 @@ fn decoration_origin(dom: &Dom, mut node: NodeId) -> Option<NodeId> {
     None
 }
 
+/// How a border-image region repeats along one axis
+/// (CSS Backgrounds 3 #border-image-repeat).
+#[derive(Clone, Copy, PartialEq)]
+enum BorderImageRepeat {
+    Stretch,
+    Repeat,
+    Round,
+    Space,
+}
+
+/// The tile origins and used tile size along one axis of a border-image
+/// region of `length` starting at `start`, for a scaled tile `tile`.
+fn border_image_tiles(
+    start: f32,
+    length: f32,
+    tile: f32,
+    mode: BorderImageRepeat,
+) -> (Vec<f32>, f32) {
+    if length <= 0.0 {
+        return (Vec::new(), 0.0);
+    }
+    if mode == BorderImageRepeat::Stretch || !tile.is_finite() || tile <= 0.0 {
+        return (vec![start], length);
+    }
+    match mode {
+        BorderImageRepeat::Round => {
+            let count = (length / tile).round().max(1.0);
+            let tile = length / count;
+            (
+                (0..count as usize)
+                    .map(|i| start + i as f32 * tile)
+                    .collect(),
+                tile,
+            )
+        }
+        BorderImageRepeat::Space => {
+            let count = (length / tile).floor();
+            if count < 1.0 {
+                return (Vec::new(), tile);
+            }
+            let gap = (length - count * tile) / (count + 1.0);
+            (
+                (0..count as usize)
+                    .map(|i| start + gap + i as f32 * (tile + gap))
+                    .collect(),
+                tile,
+            )
+        }
+        _ => {
+            // `repeat`: centered in the region, partial tiles at both ends.
+            let first = start + (length - tile) / 2.0;
+            let first = first - ((first - start) / tile).ceil() * tile;
+            let mut origins = Vec::new();
+            let mut position = first;
+            while position < start + length && origins.len() < 4096 {
+                origins.push(position);
+                position += tile;
+            }
+            (origins, tile)
+        }
+    }
+}
+
+/// CSS Backgrounds 3 #border-images: slice the image into nine regions and
+/// draw them over the border image area (the border box grown by
+/// border-image-outset), corners scaled, edges and the optional `fill`
+/// middle stretched or tiled per border-image-repeat. Returns whether the
+/// image replaced the border styles; an image that is not available yet
+/// leaves them in place.
+fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<'_>) -> bool {
+    let Some(source) = style
+        .value(builder.dom, "border-image-source")
+        .as_deref()
+        .and_then(css_url)
+    else {
+        return false;
+    };
+    let source = resolve_image_source(builder.base, &source);
+    let handle = builder.image(source.clone());
+    let Some((iw, ih)) = builder
+        .images
+        .get(&source)
+        .copied()
+        .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX)
+        .map(|(w, h)| (w as f32, h as f32))
+    else {
+        return false;
+    };
+    let lengths = LengthBasis::of(builder.dom, style.node(), builder.viewport());
+    let value = |name: &str, initial: &str| {
+        style
+            .value(builder.dom, name)
+            .unwrap_or_else(|| initial.into())
+    };
+    // Box-shorthand expansion of 1-4 values into top, right, bottom, left.
+    fn sides<T: Copy>(values: &[T]) -> Option<[T; 4]> {
+        Some(match values {
+            [a] => [*a, *a, *a, *a],
+            [a, b] => [*a, *b, *a, *b],
+            [a, b, c] => [*a, *b, *c, *b],
+            [a, b, c, d] => [*a, *b, *c, *d],
+            _ => return None,
+        })
+    }
+    let slice_value = value("border-image-slice", "100%");
+    let fill = slice_value
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("fill"));
+    let slice_tokens: Vec<&str> = slice_value
+        .split_whitespace()
+        .filter(|token| !token.eq_ignore_ascii_case("fill"))
+        .collect();
+    let Some(slices) = sides(&slice_tokens) else {
+        return false;
+    };
+    let image_size = [ih, iw, ih, iw];
+    let slices: [f32; 4] = std::array::from_fn(|side| {
+        let token = slices[side];
+        let px = match token.strip_suffix('%') {
+            Some(percent) => percent
+                .parse::<f32>()
+                .ok()
+                .map(|p| p / 100.0 * image_size[side]),
+            None => token.parse::<f32>().ok(),
+        };
+        px.unwrap_or(0.0).clamp(0.0, image_size[side])
+    });
+    let outset_value = value("border-image-outset", "0");
+    let outset_tokens: Vec<&str> = outset_value.split_whitespace().collect();
+    let outsets: [f32; 4] = match sides(&outset_tokens) {
+        Some(tokens) => std::array::from_fn(|side| {
+            let token = tokens[side];
+            match token.parse::<f32>() {
+                Ok(number) => number * fragment.border[side],
+                Err(_) => lengths.resolve(token, 0.0).unwrap_or(0.0),
+            }
+            .max(0.0)
+        }),
+        None => [0.0; 4],
+    };
+    let area = CssRect::new(
+        fragment.x - outsets[3],
+        fragment.y - outsets[0],
+        fragment.w + outsets[1] + outsets[3],
+        fragment.h + outsets[0] + outsets[2],
+    );
+    let width_value = value("border-image-width", "1");
+    let width_tokens: Vec<&str> = width_value.split_whitespace().collect();
+    let Some(width_tokens) = sides(&width_tokens) else {
+        return false;
+    };
+    let mut widths: [f32; 4] = std::array::from_fn(|side| {
+        let token = width_tokens[side];
+        let basis = if side % 2 == 0 {
+            area.height
+        } else {
+            area.width
+        };
+        if token.eq_ignore_ascii_case("auto") {
+            slices[side]
+        } else if let Ok(number) = token.parse::<f32>() {
+            number * fragment.border[side]
+        } else {
+            lengths.resolve(token, basis).unwrap_or(0.0)
+        }
+        .max(0.0)
+    });
+    // #border-image-width: overlapping opposite widths scale down together.
+    let factor = [
+        area.height / (widths[0] + widths[2]),
+        area.width / (widths[1] + widths[3]),
+    ]
+    .into_iter()
+    .filter(|f| f.is_finite())
+    .fold(1.0f32, f32::min);
+    if factor < 1.0 {
+        for width in &mut widths {
+            *width *= factor;
+        }
+    }
+    let repeat_value = value("border-image-repeat", "stretch");
+    let modes: Vec<BorderImageRepeat> = repeat_value
+        .split_whitespace()
+        .map(|token| match token.to_ascii_lowercase().as_str() {
+            "repeat" => BorderImageRepeat::Repeat,
+            "round" => BorderImageRepeat::Round,
+            "space" => BorderImageRepeat::Space,
+            _ => BorderImageRepeat::Stretch,
+        })
+        .collect();
+    let horizontal = modes.first().copied().unwrap_or(BorderImageRepeat::Stretch);
+    let vertical = modes.get(1).copied().unwrap_or(horizontal);
+    let sampling = if matches!(
+        builder
+            .dom
+            .computed_value_resolved(style.node(), "image-rendering")
+            .as_deref(),
+        Some("pixelated" | "crisp-edges" | "-moz-crisp-edges")
+    ) {
+        ImageSampling::Nearest
+    } else {
+        ImageSampling::Smooth
+    };
+    let [wt, wr, wb, wl] = widths;
+    let [st, sr, sb, sl] = slices;
+    let (x0, x1, x2) = (area.x, area.x + wl, area.x + area.width - wr);
+    let (y0, y1, y2) = (area.y, area.y + wt, area.y + area.height - wb);
+    let (u1, u2) = (sl, iw - sr);
+    let (v1, v2) = (st, ih - sb);
+    let node = style.node();
+    let draw = |builder: &mut Builder<'_>,
+                source: CssRect,
+                region: CssRect,
+                tile: (f32, f32),
+                modes: (BorderImageRepeat, BorderImageRepeat)| {
+        if source.width <= 0.0
+            || source.height <= 0.0
+            || region.width <= 0.0
+            || region.height <= 0.0
+        {
+            return;
+        }
+        let (xs, tile_w) = border_image_tiles(region.x, region.width, tile.0, modes.0);
+        let (ys, tile_h) = border_image_tiles(region.y, region.height, tile.1, modes.1);
+        let clipped = modes.0 == BorderImageRepeat::Repeat || modes.1 == BorderImageRepeat::Repeat;
+        if clipped {
+            builder
+                .commands
+                .push(DisplayCommand::PushClip(PaintShape::Rect(region)));
+        }
+        for &y in &ys {
+            for &x in &xs {
+                builder.commands.push(DisplayCommand::Image {
+                    rect: CssRect::new(x, y, tile_w, tile_h),
+                    handle,
+                    source_rect: Some(source),
+                    fit: ImageFit::Fill,
+                    sampling,
+                    clip: None,
+                    node,
+                    link: None,
+                });
+            }
+        }
+        if clipped {
+            builder.commands.push(DisplayCommand::PopClip);
+        }
+    };
+    let stretch = (BorderImageRepeat::Stretch, BorderImageRepeat::Stretch);
+    // Corners.
+    draw(
+        builder,
+        CssRect::new(0.0, 0.0, sl, st),
+        CssRect::new(x0, y0, wl, wt),
+        (wl, wt),
+        stretch,
+    );
+    draw(
+        builder,
+        CssRect::new(u2, 0.0, sr, st),
+        CssRect::new(x2, y0, wr, wt),
+        (wr, wt),
+        stretch,
+    );
+    draw(
+        builder,
+        CssRect::new(u2, v2, sr, sb),
+        CssRect::new(x2, y2, wr, wb),
+        (wr, wb),
+        stretch,
+    );
+    draw(
+        builder,
+        CssRect::new(0.0, v2, sl, sb),
+        CssRect::new(x0, y2, wl, wb),
+        (wl, wb),
+        stretch,
+    );
+    // Edges: scaled to the edge thickness, then tiled along the edge.
+    let (mid_w, mid_h) = (u2 - u1, v2 - v1);
+    let scaled = |thickness: f32, slice: f32, length: f32| {
+        if slice > 0.0 {
+            length * thickness / slice
+        } else {
+            0.0
+        }
+    };
+    draw(
+        builder,
+        CssRect::new(u1, 0.0, mid_w, st),
+        CssRect::new(x1, y0, x2 - x1, wt),
+        (scaled(wt, st, mid_w), wt),
+        (horizontal, BorderImageRepeat::Stretch),
+    );
+    draw(
+        builder,
+        CssRect::new(u1, v2, mid_w, sb),
+        CssRect::new(x1, y2, x2 - x1, wb),
+        (scaled(wb, sb, mid_w), wb),
+        (horizontal, BorderImageRepeat::Stretch),
+    );
+    draw(
+        builder,
+        CssRect::new(0.0, v1, sl, mid_h),
+        CssRect::new(x0, y1, wl, y2 - y1),
+        (wl, scaled(wl, sl, mid_h)),
+        (BorderImageRepeat::Stretch, vertical),
+    );
+    draw(
+        builder,
+        CssRect::new(u2, v1, sr, mid_h),
+        CssRect::new(x2, y1, wr, y2 - y1),
+        (wr, scaled(wr, sr, mid_h)),
+        (BorderImageRepeat::Stretch, vertical),
+    );
+    if fill {
+        // The middle scales like the top (else bottom) and left (else right)
+        // edges.
+        let across = if st > 0.0 {
+            wt / st
+        } else if sb > 0.0 {
+            wb / sb
+        } else {
+            1.0
+        };
+        let down = if sl > 0.0 {
+            wl / sl
+        } else if sr > 0.0 {
+            wr / sr
+        } else {
+            1.0
+        };
+        draw(
+            builder,
+            CssRect::new(u1, v1, mid_w, mid_h),
+            CssRect::new(x1, y1, x2 - x1, y2 - y1),
+            (mid_w * across, mid_h * down),
+            (horizontal, vertical),
+        );
+    }
+    true
+}
+
 /// CSS Compositing 1 #isolation-blending: an element's background layers
 /// blend only with each other and its background color, never with the
 /// content behind the element, so blended backgrounds paint as an isolated
@@ -5537,6 +5883,56 @@ mod tests {
                 assert_eq!((rect.width, rect.height), expected, "{source}: {size}");
             }
         }
+    }
+
+    #[test]
+    fn border_images_slice_into_regions_and_tile_their_edges() {
+        // CSS Backgrounds 3 #border-images: a 30px image sliced at 10 draws
+        // four corners and four edges into a 10px border (no middle without
+        // `fill`); `round` fits whole 10px tiles along the 100px edges. An
+        // image that is not available leaves the border styles in place.
+        let html = r#"<body style="margin:0"><div id=b style="width:100px;height:40px;border:10px solid red;border-image:url(https://example.test/b.png) 10 round"></div></body>"#;
+        let images = [("https://example.test/b.png".to_string(), (30, 30))]
+            .into_iter()
+            .collect();
+        let (_, layout) = render_fixture_with_images(html, &images);
+        let crops: Vec<(CssRect, CssRect)> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Image {
+                    rect,
+                    source_rect: Some(source),
+                    fit: ImageFit::Fill,
+                    ..
+                } => Some((*rect, *source)),
+                _ => None,
+            })
+            .collect();
+        let corners = crops
+            .iter()
+            .filter(|(rect, _)| rect.width == 10.0 && rect.height == 10.0);
+        // Corners and 10px round tiles share the 10x10 size: 4 + 10 + 10 + 4 + 4.
+        assert_eq!(corners.count(), 32, "{crops:?}");
+        assert!(
+            crops
+                .iter()
+                .all(|(_, source)| source.width == 10.0 && source.height == 10.0)
+        );
+        let red_border = |commands: &[DisplayCommand]| {
+            commands.iter().any(|command| {
+                matches!(
+                    command,
+                    DisplayCommand::Fill { brush: PaintBrush::Solid(color), .. }
+                        | DisplayCommand::Stroke { brush: PaintBrush::Solid(color), .. }
+                        if *color == PaintColor::Rgba(255, 0, 0, 255)
+                )
+            })
+        };
+        assert!(!red_border(&layout.paint.primitives));
+        let (_, pending) = render_fixture_with_images(html, &Default::default());
+        assert!(red_border(&pending.paint.primitives));
     }
 
     #[test]

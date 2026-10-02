@@ -973,6 +973,7 @@ impl VelloHybridRenderer {
                 Primitive::Image {
                     rect,
                     handle,
+                    source_rect,
                     fit,
                     sampling,
                     clip,
@@ -992,6 +993,7 @@ impl VelloHybridRenderer {
                         encoder,
                         *handle,
                         *rect,
+                        *source_rect,
                         *fit,
                         *sampling,
                         transforms.last().unwrap().as_coeffs(),
@@ -1013,6 +1015,7 @@ impl VelloHybridRenderer {
         encoder: &mut wgpu::CommandEncoder,
         handle: ImageHandle,
         rect: CssRect,
+        source_rect: Option<CssRect>,
         fit: ImageFit,
         sampling: ImageSampling,
         transform: [f64; 6],
@@ -1181,10 +1184,27 @@ impl VelloHybridRenderer {
             ImageFit::ScaleDown => Some(1.0f32.min(sx.min(sy))),
         };
         let (scale_x, scale_y) = scale.map_or((sx, sy), |scale| (scale, scale));
-        let drawn_width = iw * scale_x;
-        let drawn_height = ih * scale_y;
-        let x = rect.x + (rect.width - drawn_width) / 2.0;
-        let y = rect.y + (rect.height - drawn_height) / 2.0;
+        let mut drawn_width = iw * scale_x;
+        let mut drawn_height = ih * scale_y;
+        let mut x = rect.x + (rect.width - drawn_width) / 2.0;
+        let mut y = rect.y + (rect.height - drawn_height) / 2.0;
+        let mut painted = Rect::new(
+            f64::from(x),
+            f64::from(y),
+            f64::from(x + drawn_width),
+            f64::from(y + drawn_height),
+        );
+        // A source crop (in natural image pixels) is stretched over `rect`:
+        // border-image slices and sprite regions.
+        if let Some(source) = source_rect.filter(|source| source.width > 0.0 && source.height > 0.0)
+        {
+            let (sx, sy) = (rect.width / source.width, rect.height / source.height);
+            drawn_width = iw * sx;
+            drawn_height = ih * sy;
+            x = rect.x - source.x * sx;
+            y = rect.y - source.y * sy;
+            painted = vello_rect(rect);
+        }
         let sampler = ImageSampler::new().with_quality(match sampling {
             ImageSampling::Nearest => ImageQuality::Low,
             ImageSampling::Smooth => ImageQuality::Medium,
@@ -1203,12 +1223,7 @@ impl VelloHybridRenderer {
         if fit == ImageFit::Cover {
             target.push_clip_path(&rect_path(rect));
         }
-        target.fill_rect(&Rect::new(
-            f64::from(x),
-            f64::from(y),
-            f64::from(x + drawn_width),
-            f64::from(y + drawn_height),
-        ));
+        target.fill_rect(&painted);
         if fit == ImageFit::Cover {
             target.pop_clip_path();
         }
