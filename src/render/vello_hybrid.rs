@@ -1518,8 +1518,12 @@ fn paint_decorations(
     decoration: &crate::render::TextDecorationPaint,
 ) {
     for (stroke, path) in decoration_strokes(origin, shaped, decoration) {
-        target.set_stroke(stroke);
-        target.stroke_path(&path);
+        if let Some(stroke) = stroke {
+            target.set_stroke(stroke);
+            target.stroke_path(&path);
+        } else {
+            target.fill_path(&path);
+        }
     }
 }
 
