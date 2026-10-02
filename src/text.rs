@@ -1278,6 +1278,37 @@ pub(crate) fn wrapped_lines(
     TEXT.with_borrow_mut(|system| system.wrapped_lines(text, style, first_width, width, breaks))
 }
 
+/// The first `max_lines` of [`wrapped_lines`], breaking only as much of a
+/// long paragraph as they need: a prefix window that breaks into more
+/// lines than that holds them exactly, as the greedy breaker settles a line
+/// within the text before the next one starts. Windows double from 8 KiB
+/// until one does, or the whole paragraph is broken.
+pub(crate) fn wrapped_lines_limited(
+    text: &str,
+    style: &TextStyle,
+    first_width: f32,
+    width: f32,
+    breaks: TextBreakStyle,
+    max_lines: usize,
+) -> Vec<ShapedText> {
+    let mut window = 1 << 13;
+    while window < text.len() {
+        let mut end = window;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut lines = wrapped_lines(&text[..end], style, first_width, width, breaks);
+        if lines.len() > max_lines {
+            lines.truncate(max_lines);
+            return lines;
+        }
+        window *= 2;
+    }
+    let mut lines = wrapped_lines(text, style, first_width, width, breaks);
+    lines.truncate(max_lines);
+    lines
+}
+
 /// CSS min-/max-content bounds for a single styled text run.
 pub fn content_widths(text: &str, style: &TextStyle, breaks: TextBreakStyle) -> (f32, f32) {
     TEXT.with_borrow_mut(|system| system.content_widths(text, style, breaks))
