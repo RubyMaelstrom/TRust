@@ -3366,6 +3366,45 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_image_takes_its_natural_size() {
+        // CSS Lists 3 #marker-image: the default sizing algorithm with no
+        // specified size, so a 7x8 image stays 7x8; 1em square without one.
+        let html = r#"<body style="margin:0;font-size:20px"><ul style="list-style-image:url(dot.gif)"><li>a</li></ul>
+            <ul style="list-style-image:url(pending.gif)"><li>b</li></ul></body>"#;
+        let images = HashMap::from([("http://e.com/dot.gif".to_string(), (7u32, 8u32))]);
+        let layout = lay_graphical(html, 320.0, &images);
+        let images: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::Primitive::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        let sizes: Vec<_> = images
+            .iter()
+            .map(|rect| (rect.width, rect.height))
+            .collect();
+        assert_eq!(sizes, [(7.0, 8.0), (20.0, 20.0)]);
+        // It sits on the first line's baseline.
+        let baseline = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                    if shaped.text.contains('a') =>
+                {
+                    Some(origin.y + shaped.baseline)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!((images[0].y + images[0].height - baseline).abs() < 0.5);
+    }
+
+    #[test]
     fn list_style_image_creates_an_image_marker() {
         let svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='4' height='4'/%3E%3C/svg%3E";
         let html = format!(
