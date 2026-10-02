@@ -4109,7 +4109,7 @@ fn paint_sliced_box_shadows(
 /// below the borders, so callers paint each kind at its own step. Per
 /// #shadow-shape an outer shadow is cast by the border box (`rect`) and an
 /// inner shadow inside the padding box, whose corners follow the inner
-/// border edge.
+/// border edge. The first shadow is on top, so emit the list back to front.
 fn paint_box_shadows(
     builder: &mut Builder<'_>,
     style: PaintStyle,
@@ -4135,7 +4135,7 @@ fn paint_box_shadows(
     } else {
         border_shape
     };
-    for shadow in split_top_level(&value, ',') {
+    for shadow in split_top_level(&value, ',').into_iter().rev() {
         if shadow.trim().eq_ignore_ascii_case("none") {
             continue;
         }
@@ -6839,6 +6839,24 @@ mod tests {
         let pixel = |x: usize, y: usize| &frame.pixels[(y * 800 + x) * 4..(y * 800 + x) * 4 + 3];
         assert_eq!(pixel(70, 45), [255, 255, 255], "inside the box");
         assert_eq!(pixel(125, 45)[..2], [255, 0], "the shadow outside it");
+    }
+
+    #[test]
+    fn the_first_box_shadow_is_on_top() {
+        // CSS Backgrounds 3 #shadow-layers: shadows are applied front to
+        // back, the first on top, for outer and inner shadows alike.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} div{width:100px;height:100px;margin-bottom:20px}\
+             </style><div style='box-shadow:5px 5px 0 red,10px 10px 0 blue'></div>\
+             <div style='box-shadow:inset 0 10px 0 red,inset 0 20px 0 blue'></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| frame.pixels[(y * 800 + x) * 4..][..3].to_vec();
+        assert_eq!(pixel(102, 50), [255, 0, 0], "outer overlap");
+        assert_eq!(pixel(108, 50), [0, 0, 255]);
+        assert_eq!(pixel(50, 125), [255, 0, 0], "inner overlap");
+        assert_eq!(pixel(50, 135), [0, 0, 255]);
     }
 
     #[test]
