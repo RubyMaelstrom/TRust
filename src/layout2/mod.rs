@@ -2323,6 +2323,74 @@ mod tests {
     }
 
     #[test]
+    fn inline_flex_and_grid_containers_align_by_their_first_baseline() {
+        // CSS Inline 3 #baseline-source: inline flex and grid containers use
+        // their first baseline set (CSS Flexbox 1 #flex-baselines, CSS Grid 1
+        // #grid-baselines), not the bottom margin edge an inline-block
+        // without lines falls back to. A 48px blog.google CTA button grew
+        // its line box to 56px when its baseline sat on its bottom edge.
+        let base = Url::parse("https://example.test/").unwrap();
+        let geometry = |content: &str| {
+            let dom = Dom::parse_document(&format!(
+                "<body style='margin:0;font:18px/26px monospace'><div id=line>{content}outside</div>"
+            ));
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(500., 300.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let line = layout.boxes[&dom.get_by_id("line").unwrap()];
+            let container = layout.boxes[&dom.get_by_id("box").unwrap()];
+            let outside = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|p| match p {
+                    crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                        if shaped.text == "outside" =>
+                    {
+                        Some(f64::from(origin.y + shaped.baseline))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            (line.height, outside - container.top)
+        };
+        // A centred label's text line supplies the baseline.
+        let (height, baseline) = geometry(
+            "<span id=box style='display:inline-flex;align-items:center;height:48px'>\
+             <span style='font:16px/24px monospace'>Newsletter</span></span>",
+        );
+        assert!((height - 48.).abs() < 0.01, "{height}");
+        assert!(baseline > 12. && baseline < 36., "{baseline}");
+        // Without lines, the first item's border-box bottom synthesizes it,
+        // as does the startmost item of a column flexbox.
+        for (content, expected) in [
+            (
+                "<span id=box style='display:inline-flex;padding:5px;height:60px;align-items:center'>\
+                 <i style='display:block;width:20px;height:30px'></i></span>",
+                50.,
+            ),
+            (
+                "<span id=box style='display:inline-flex;flex-direction:column;padding:5px'>\
+                 <i style='display:block;width:20px;height:30px'></i><span>b</span></span>",
+                35.,
+            ),
+            (
+                "<span id=box style='display:inline-grid;padding:5px'>\
+                 <i style='display:block;width:20px;height:30px'></i></span>",
+                35.,
+            ),
+        ] {
+            let (_, baseline) = geometry(content);
+            assert!((baseline - expected).abs() < 0.01, "{baseline} {content}");
+        }
+    }
+
+    #[test]
     fn css_inline_nowrap_intrinsic_width_preserves_control_sizes() {
         // CSS 2 §10.3.7 + CSS Text nowrap: an intrinsic probe takes legal
         // breaks; it must not squeeze controls to the probe's available width.

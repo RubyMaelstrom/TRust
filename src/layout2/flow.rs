@@ -4896,11 +4896,18 @@ impl Flow<'_> {
         let y = value("overflow-y").unwrap_or_else(|| y.into());
         let scrollable = |axis: &str| matches!(axis, "hidden" | "auto" | "scroll" | "overlay");
         let scrolls_block = scrollable(&y) || (y == "visible" && scrollable(&x));
-        let baseline = ((matches!(ab.content, Content::Blocks(_) | Content::Inlines(_))
-            || matches!(&ab.content, Content::Atomic(atom) if matches!(atom.kind, AtomKind::Control { .. })))
-            && !scrolls_block)
-            .then(|| inline_block_baseline(self.dom, &frag).map(|baseline| m[TOP] + baseline))
-            .flatten();
+        let baseline = if matches!(ab.content, Content::Flex(_) | Content::Grid(_)) {
+            // CSS Inline 3 #baseline-source: `auto` aligns an inline flex
+            // or grid container by its first baseline set.
+            self.container_first_baseline(ab, &frag)
+                .map(|baseline| m[TOP] + baseline)
+        } else {
+            ((matches!(ab.content, Content::Blocks(_) | Content::Inlines(_))
+                || matches!(&ab.content, Content::Atomic(atom) if matches!(atom.kind, AtomKind::Control { .. })))
+                && !scrolls_block)
+                .then(|| inline_block_baseline(self.dom, &frag).map(|baseline| m[TOP] + baseline))
+                .flatten()
+        };
         // CSS Transforms 1 #transform-rendering and CSS Position 3
         // #relpos-insets: visual offsets move the atomic inline's fragment,
         // descendants, and anchors, but not its margin-box space on the line.
@@ -5376,6 +5383,58 @@ struct PrelaidAtom {
     baseline: Option<f32>,
     frag: Frag,
     anchors: Vec<(NodeId, f32)>,
+}
+
+impl Flow<'_> {
+    /// The first baseline set of a flex container (CSS Flexbox 1
+    /// #flex-baselines) or grid container (CSS Grid 1 #grid-baselines),
+    /// measured in normal flow from its border-box top: the shared baseline
+    /// of the items that participate in baseline alignment, else that of the
+    /// first item with a baseline set, else one synthesized from the first
+    /// item's border-box end edge. Only the startmost item counts in a column
+    /// flexbox, whose inline axis is its cross axis. Without in-flow items
+    /// the container has none, and its alignment context synthesizes one.
+    fn container_first_baseline(&self, ab: &BoxNode, frag: &Frag) -> Option<f32> {
+        let flow_y = |child: &Frag| child.y - child.flow.offset_y - frag.y;
+        let items: Vec<&Frag> = frag
+            .children
+            .iter()
+            .filter(|child| {
+                !child.paint.float && !matches!(child.kind, FragKind::Oof(..) | FragKind::Fixed(_))
+            })
+            .collect();
+        let first = *items.first()?;
+        let synthesized = |item: &Frag| flow_y(item) + first_baseline(item).unwrap_or(item.h);
+        let value = |property| {
+            (ab.node != NO_NODE)
+                .then(|| self.dom.computed_value_resolved(ab.node, property))
+                .flatten()
+                .unwrap_or_default()
+        };
+        let column = matches!(ab.content, Content::Flex(_))
+            && ab.node != NO_NODE
+            && !container_style(
+                self.dom,
+                ab.node,
+                crate::layout2::Units::of(self.dom, ab.node),
+                self.vp,
+            )
+            .row;
+        if column {
+            return Some(synthesized(first));
+        }
+        let container_align = align_item_from(&value("align-items"), AlignItem::Stretch);
+        items
+            .iter()
+            .find(|item| self.item_align(item.node, container_align) == AlignItem::Baseline)
+            .map(|item| synthesized(item))
+            .or_else(|| {
+                items
+                    .iter()
+                    .find_map(|item| first_baseline(item).map(|baseline| flow_y(item) + baseline))
+            })
+            .or_else(|| Some(synthesized(first)))
+    }
 }
 
 /// Last line in normal-flow tree order. Atomic inline fragments are appended
