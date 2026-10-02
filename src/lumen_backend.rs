@@ -29714,6 +29714,51 @@ mod tests {
     }
 
     #[test]
+    fn outer_html_setter_updates_live_ranges_in_replace_order() {
+        // DOM #concept-node-replace removes the element (#concept-node-remove
+        // moves boundaries inside it to its index and pulls later offsets
+        // down), then inserts the parsed nodes before its next sibling
+        // (#concept-node-insert pushes offsets past that index up).
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            body.innerHTML = '<div id=r1><i>x</i><span>a</span><i>y</i></div>' +
+                '<div id=r2><span>abc</span><i>y</i></div><div id=r3><i>x</i><span>a</span></div>';
+            const [r1, r2, r3] = ["r1", "r2", "r3"].map((id) => document.getElementById(id));
+            const at = (node, offset) => {
+                const range = document.createRange();
+                range.setStart(node, offset); range.setEnd(node, offset);
+                return range;
+            };
+            const show = (range) => (range.startContainer.id || range.startContainer.nodeName) + "," +
+                range.startOffset + "-" + (range.endContainer.id || range.endContainer.nodeName) + "," +
+                range.endOffset;
+            const ranges = [at(r1, 1), at(r1, 2), at(r1, 3)];
+            r1.children[1].outerHTML = "<b>1</b><b>2</b>";
+            const text = r2.firstChild.firstChild;
+            const inside = document.createRange();
+            inside.setStart(text, 1); inside.setEnd(text, 2);
+            const around = document.createRange();
+            around.setStart(r2, 0); around.setEnd(r2, 1);
+            r2.firstChild.outerHTML = "<b>1</b><b>2</b>";
+            const tail = at(r3, 2);
+            r3.lastChild.outerHTML = "";
+            globalThis.rangeResult = [...ranges, inside, around, tail].map(show).join(" ");
+            "#,
+            "outerHTML ranges",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "rangeResult"),
+            "r1,1-r1,1 r1,1-r1,1 r1,4-r1,4 r2,0-r2,0 r2,0-r2,0 r3,1-r3,1"
+        );
+    }
+
+    #[test]
     fn inner_html_descendants_are_queryable_synchronously_after_insertion() {
         // HTML §13.3 appends text in script-data/raw-text parents literally
         // during fragment serialization; normal text is escaped. DOM §4.2.6
