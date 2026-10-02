@@ -5,7 +5,7 @@
 //! framebuffer, DPI, winit, Ratatui, or terminal-cell types.
 
 use std::collections::{HashMap, HashSet};
-use std::f32::consts::{FRAC_PI_2, PI};
+use std::f32::consts::{FRAC_PI_2, PI, SQRT_2};
 use std::str::FromStr as _;
 
 use url::Url;
@@ -2993,31 +2993,15 @@ impl LayerTile {
             },
             Self::Gradient(brush) => {
                 let shift = |point: CssPoint| CssPoint::new(point.x + rect.x, point.y + rect.y);
-                let brush = match brush.clone() {
-                    PaintBrush::LinearGradient {
-                        start,
-                        end,
-                        stops,
-                        interpolation,
-                    } => PaintBrush::LinearGradient {
-                        start: shift(start),
-                        end: shift(end),
-                        stops,
-                        interpolation,
-                    },
-                    PaintBrush::RadialGradient {
-                        center,
-                        radius,
-                        stops,
-                        interpolation,
-                    } => PaintBrush::RadialGradient {
-                        center: shift(center),
-                        radius,
-                        stops,
-                        interpolation,
-                    },
-                    solid => solid,
-                };
+                let mut brush = brush.clone();
+                match &mut brush {
+                    PaintBrush::LinearGradient { start, end, .. } => {
+                        *start = shift(*start);
+                        *end = shift(*end);
+                    }
+                    PaintBrush::RadialGradient { center, .. } => *center = shift(*center),
+                    PaintBrush::Solid(_) => {}
+                }
                 DisplayCommand::Fill {
                     shape: PaintShape::Rect(rect),
                     brush,
@@ -4248,6 +4232,7 @@ fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<Pa
     }
     let mut angle = PI;
     let (header, interpolation, explicit_interpolation) = gradient_interpolation(parts[0])?;
+    let mut ending_shape = None;
     if !radial {
         if let Some(parsed) = gradient_direction(&header) {
             angle = parsed;
@@ -4259,15 +4244,20 @@ fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<Pa
             parts.remove(0);
         }
     } else if explicit_interpolation || color::parse_color(split_ws(parts[0]).first()?).is_err() {
-        // Shape/size/position retain the existing default geometry path.
+        ending_shape = Some(radial_ending_shape(&header, rect, lengths)?);
         parts.remove(0);
     }
+    let (center, radius_x, radius_y) = match ending_shape {
+        Some(shape) => shape,
+        None if radial => radial_ending_shape("", rect, lengths)?,
+        None => (CssPoint::default(), 0.0, 0.0),
+    };
     // CSS Images 3 #color-stop-syntax: positions are fractions of the
     // gradient line (linear) or ray (radial).
     let dx = angle.sin();
     let dy = -angle.cos();
     let line = if radial {
-        rect.width.hypot(rect.height) / 2.0
+        radius_x
     } else {
         rect.width * dx.abs() + rect.height * dy.abs()
     };
@@ -4285,29 +4275,173 @@ fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<Pa
             interpolation
         };
     let mut stops = expand_color_hints(stops, &hints, interpolation);
-    if repeating && stops.last().is_some_and(|stop| stop.offset > 0.0) {
-        let end = stops.last().unwrap().offset;
-        for stop in &mut stops {
-            stop.offset /= end;
+    // CSS Images 3 #repeating-gradients: the stops repeat with the period
+    // from the first to the last stop; a zero period paints their average.
+    let (mut from, mut to) = (0.0, 1.0);
+    if repeating {
+        let (first, last) = (stops.first()?.offset, stops.last()?.offset);
+        if last - first <= f32::EPSILON || !(last - first).is_finite() {
+            return Some(PaintBrush::Solid(average_stop_color(&stops)));
         }
+        for stop in &mut stops {
+            stop.offset = (stop.offset - first) / (last - first);
+        }
+        (from, to) = (first, last);
     }
     if radial {
         Some(PaintBrush::RadialGradient {
-            center: CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
-            radius: rect.width.hypot(rect.height) / 2.0,
+            center,
+            start_radius: radius_x * from,
+            radius: radius_x * to,
+            aspect: if radius_x > 0.0 {
+                radius_y / radius_x
+            } else {
+                1.0
+            },
             stops,
             interpolation,
+            repeat: repeating,
         })
     } else {
         let center = CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
         let half = line / 2.0;
+        let start = CssPoint::new(center.x - dx * half, center.y - dy * half);
+        let along = |fraction: f32| {
+            CssPoint::new(
+                start.x + dx * line * fraction,
+                start.y + dy * line * fraction,
+            )
+        };
         Some(PaintBrush::LinearGradient {
-            start: CssPoint::new(center.x - dx * half, center.y - dy * half),
-            end: CssPoint::new(center.x + dx * half, center.y + dy * half),
+            start: along(from),
+            end: along(to),
             stops,
             interpolation,
+            repeat: repeating,
         })
     }
+}
+
+/// CSS Images 3 #radial-gradient-syntax: the center and horizontal and
+/// vertical radii of `[<radial-shape> || <radial-size>]? [at <position>]?`
+/// within `rect`, defaulting to an ellipse at the center reaching its
+/// farthest corner (#radial-size).
+fn radial_ending_shape(
+    header: &str,
+    rect: CssRect,
+    lengths: LengthBasis,
+) -> Option<(CssPoint, f32, f32)> {
+    let lower = header.trim().to_ascii_lowercase();
+    let tokens = split_ws(&lower);
+    let at = tokens.iter().position(|token| *token == "at");
+    let (shape_tokens, position) = match at {
+        Some(index) => (&tokens[..index], Some(tokens[index + 1..].join(" "))),
+        None => (&tokens[..], None),
+    };
+    if position.as_deref() == Some("") {
+        return None;
+    }
+    let local = CssRect::new(0.0, 0.0, rect.width, rect.height);
+    let (x, y) = background_position(
+        position.as_deref().unwrap_or("center"),
+        local,
+        (0.0, 0.0),
+        lengths,
+    );
+    let center = CssPoint::new(rect.x + x, rect.y + y);
+    let mut shape = None;
+    let mut extent = None;
+    let mut sizes = Vec::new();
+    for token in shape_tokens {
+        match *token {
+            "circle" | "ellipse" if shape.is_none() => shape = Some(*token),
+            "closest-side" | "closest-corner" | "farthest-side" | "farthest-corner"
+                if extent.is_none() && sizes.is_empty() =>
+            {
+                extent = Some(*token)
+            }
+            other if extent.is_none() && sizes.len() < 2 => sizes.push(other),
+            _ => return None,
+        }
+    }
+    let circle = match (shape, sizes.len()) {
+        (Some("circle"), 0 | 1) | (None, 1) => true,
+        (Some("ellipse") | None, 0 | 2) => false,
+        _ => return None,
+    };
+    let (left, right) = (x, rect.width - x);
+    let (top, bottom) = (y, rect.height - y);
+    let closest = (left.abs().min(right.abs()), top.abs().min(bottom.abs()));
+    let farthest = (left.abs().max(right.abs()), top.abs().max(bottom.abs()));
+    let (radius_x, radius_y) = if let [size] = sizes.as_slice() {
+        // A circle's single size is a length, never a percentage.
+        if size.ends_with('%') {
+            return None;
+        }
+        let radius = lengths.resolve(size, 0.0)?;
+        (radius, radius)
+    } else if let [width, height] = sizes.as_slice() {
+        (
+            lengths.resolve(width, rect.width)?,
+            lengths.resolve(height, rect.height)?,
+        )
+    } else {
+        let extent = extent.unwrap_or("farthest-corner");
+        match (circle, extent) {
+            (true, "closest-side") => (closest.0.min(closest.1), closest.0.min(closest.1)),
+            (true, "farthest-side") => (farthest.0.max(farthest.1), farthest.0.max(farthest.1)),
+            (true, "closest-corner") => (closest.0.hypot(closest.1), closest.0.hypot(closest.1)),
+            (true, _) => (farthest.0.hypot(farthest.1), farthest.0.hypot(farthest.1)),
+            (false, "closest-side") => closest,
+            (false, "farthest-side") => farthest,
+            (false, "closest-corner") => (closest.0 * SQRT_2, closest.1 * SQRT_2),
+            (false, _) => (farthest.0 * SQRT_2, farthest.1 * SQRT_2),
+        }
+    };
+    (radius_x >= 0.0 && radius_y >= 0.0).then_some((center, radius_x, radius_y))
+}
+
+/// The average color of a gradient's stops spaced evenly (CSS Images 3
+/// #repeating-gradients' zero-length case).
+fn average_stop_color(stops: &[GradientStop]) -> PaintColor {
+    let colors: Vec<[f32; 4]> = stops
+        .iter()
+        .map(|stop| {
+            let color = stop.color.to_alpha_color::<color::Srgb>().components;
+            [
+                color[0] * color[3],
+                color[1] * color[3],
+                color[2] * color[3],
+                color[3],
+            ]
+        })
+        .collect();
+    let segments = colors.len().saturating_sub(1).max(1) as f32;
+    let mut sum = [0.0f32; 4];
+    for pair in colors.windows(2) {
+        for channel in 0..4 {
+            sum[channel] += (pair[0][channel] + pair[1][channel]) / 2.0;
+        }
+    }
+    if colors.len() == 1 {
+        sum = colors[0];
+    }
+    let alpha = sum[3] / segments;
+    let unpremultiply = |channel: f32| {
+        if alpha > 0.0 {
+            (channel / segments / alpha * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        } else {
+            0
+        }
+    };
+    PaintColor::Rgba(
+        unpremultiply(sum[0]),
+        unpremultiply(sum[1]),
+        unpremultiply(sum[2]),
+        (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// Whether `color` was written as a hex, named, `rgb()`, `hsl()` or `hwb()`
@@ -6578,6 +6712,85 @@ mod tests {
     }
 
     #[test]
+    fn radial_gradients_take_their_shape_size_and_position() {
+        // CSS Images 3 #radial-gradient-syntax, in a 150x100 box.
+        let rect = CssRect::new(0., 0., 150., 100.);
+        let radial = |value: &str| match parse_gradient(value, rect, LengthBasis::fixed()) {
+            Some(PaintBrush::RadialGradient {
+                center,
+                start_radius,
+                radius,
+                aspect,
+                ..
+            }) => (center.x, center.y, start_radius, radius, aspect),
+            other => panic!("{value}: {other:?}"),
+        };
+        let close = |(a, b): ((f32, f32, f32, f32, f32), (f32, f32, f32, f32, f32))| {
+            let (a, b) = ([a.0, a.1, a.2, a.3, a.4], [b.0, b.1, b.2, b.3, b.4]);
+            assert!(
+                a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1.0e-3),
+                "{a:?} != {b:?}"
+            );
+        };
+        let sqrt2 = std::f32::consts::SQRT_2;
+        // Default: an ellipse at the center reaching the farthest corner.
+        close((
+            radial("radial-gradient(red,blue)"),
+            (75., 50., 0., 75. * sqrt2, 50. / 75.),
+        ));
+        close((
+            radial("radial-gradient(circle at top left,red,blue)"),
+            (0., 0., 0., 150f32.hypot(100.), 1.),
+        ));
+        close((
+            radial("radial-gradient(ellipse closest-side,red,blue)"),
+            (75., 50., 0., 75., 50. / 75.),
+        ));
+        close((
+            radial("radial-gradient(circle closest-side at 30% 40%,red,blue)"),
+            (45., 40., 0., 40., 1.),
+        ));
+        close((
+            radial("radial-gradient(40px 20px at 75px 50px,red,blue)"),
+            (75., 50., 0., 40., 0.5),
+        ));
+        assert!(
+            parse_gradient(
+                "radial-gradient(circle 10%,red,blue)",
+                rect,
+                LengthBasis::fixed()
+            )
+            .is_none()
+        );
+        // CSS Images 3 #repeating-gradients: the stops' span is the period.
+        close((
+            radial("repeating-radial-gradient(circle at 0 0,blue 5px,white 10px,blue 15px)"),
+            (0., 0., 5., 15., 1.),
+        ));
+        let Some(PaintBrush::LinearGradient {
+            start, end, repeat, ..
+        }) = parse_gradient(
+            "repeating-linear-gradient(0deg,black 0 2px,yellow 2px 4px)",
+            rect,
+            LengthBasis::fixed(),
+        )
+        else {
+            panic!()
+        };
+        assert!(repeat);
+        assert_eq!((start.y - end.y, start.x, end.x), (4., 75., 75.));
+        // A zero period paints the stops' average color.
+        assert_eq!(
+            parse_gradient(
+                "repeating-linear-gradient(red 5px,blue 5px)",
+                rect,
+                LengthBasis::fixed()
+            ),
+            Some(PaintBrush::Solid(PaintColor::Rgba(128, 0, 128, 255)))
+        );
+    }
+
+    #[test]
     fn gradient_interpolation_syntax_preserves_color_space_hue_and_alpha() {
         use color::{ColorSpaceTag as Space, HueDirection as Hue};
         let rect = CssRect::new(0., 0., 100., 100.);
@@ -6588,6 +6801,7 @@ mod tests {
                 start,
                 end,
                 stops,
+                ..
             } = brush
             else {
                 panic!()

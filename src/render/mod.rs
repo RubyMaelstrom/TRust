@@ -199,17 +199,25 @@ impl Default for GradientInterpolation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaintBrush {
     Solid(PaintColor),
+    /// The stops run from `start` to `end`, padded beyond them, or tiled
+    /// along the line when `repeat` (CSS Images 3 #repeating-gradients).
     LinearGradient {
         start: CssPoint,
         end: CssPoint,
         stops: Vec<GradientStop>,
         interpolation: GradientInterpolation,
+        repeat: bool,
     },
+    /// The stops run from `start_radius` to `radius` along the horizontal
+    /// ray; `aspect` scales the vertical radii of the elliptical shape.
     RadialGradient {
         center: CssPoint,
+        start_radius: f32,
         radius: f32,
+        aspect: f32,
         stops: Vec<GradientStop>,
         interpolation: GradientInterpolation,
+        repeat: bool,
     },
 }
 

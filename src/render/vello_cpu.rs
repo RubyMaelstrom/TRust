@@ -520,13 +520,16 @@ impl VelloCpuRenderer {
                 end,
                 stops,
                 interpolation,
+                repeat,
             } => {
                 let stops = vello_stops(stops);
+                self.context.reset_paint_transform();
                 self.context.set_paint(
                     Gradient::new_linear(
                         (f64::from(start.x), f64::from(start.y)),
                         (f64::from(end.x), f64::from(end.y)),
                     )
+                    .with_extend(gradient_extend(*repeat))
                     .with_interpolation_cs(interpolation.space)
                     .with_hue_direction(interpolation.hue)
                     .with_stops(stops.as_slice()),
@@ -534,13 +537,19 @@ impl VelloCpuRenderer {
             }
             PaintBrush::RadialGradient {
                 center,
+                start_radius,
                 radius,
+                aspect,
                 stops,
                 interpolation,
+                repeat,
             } => {
                 let stops = vello_stops(stops);
+                self.context
+                    .set_paint_transform(radial_aspect_transform(*center, *aspect));
                 self.context.set_paint(
-                    Gradient::new_radial((f64::from(center.x), f64::from(center.y)), *radius)
+                    radial_gradient(*center, *start_radius, *radius)
+                        .with_extend(gradient_extend(*repeat))
                         .with_interpolation_cs(interpolation.space)
                         .with_hue_direction(interpolation.hue)
                         .with_stops(stops.as_slice()),
@@ -986,6 +995,32 @@ pub(super) fn vello_rect(rect: CssRect) -> Rect {
 
 pub(super) fn rect_path(rect: CssRect) -> BezPath {
     shape_path(&PaintShape::Rect(rect))
+}
+
+pub(super) fn gradient_extend(repeat: bool) -> vello_cpu::peniko::Extend {
+    if repeat {
+        vello_cpu::peniko::Extend::Repeat
+    } else {
+        vello_cpu::peniko::Extend::Pad
+    }
+}
+
+/// A circular gradient between two radii about one center.
+pub(super) fn radial_gradient(center: CssPoint, start: f32, end: f32) -> Gradient {
+    let center = (f64::from(center.x), f64::from(center.y));
+    Gradient::new_two_point_radial(center, start.max(0.0), center, end.max(f32::EPSILON))
+}
+
+/// Scales a circular gradient's paint vertically about its center into the
+/// elliptical ending shape.
+pub(super) fn radial_aspect_transform(center: CssPoint, aspect: f32) -> Affine {
+    if (aspect - 1.0).abs() < f32::EPSILON || !aspect.is_finite() || aspect <= 0.0 {
+        return Affine::IDENTITY;
+    }
+    let (x, y) = (f64::from(center.x), f64::from(center.y));
+    Affine::translate((x, y))
+        * Affine::scale_non_uniform(1.0, f64::from(aspect))
+        * Affine::translate((-x, -y))
 }
 
 pub(super) fn shape_fill(shape: &PaintShape) -> vello_cpu::peniko::Fill {
