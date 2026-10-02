@@ -2858,10 +2858,12 @@ fn paint_background_images_for_style(
             }
             let tile = match handle {
                 Some(handle) => LayerTile::Image(handle),
-                None => match parse_gradient(layer, CssRect::new(0.0, 0.0, tile_w, tile_h)) {
-                    Some(brush) => LayerTile::Gradient(brush),
-                    None => continue,
-                },
+                None => {
+                    match parse_gradient(layer, CssRect::new(0.0, 0.0, tile_w, tile_h), lengths) {
+                        Some(brush) => LayerTile::Gradient(brush),
+                        None => continue,
+                    }
+                }
             };
             // Most gradients are one tile covering the whole painting area:
             // fill the clip shape directly, as a single command.
@@ -4178,7 +4180,7 @@ fn gradient_interpolation(value: &str) -> Option<(String, GradientInterpolation,
     Some((direction, GradientInterpolation { space, hue }, true))
 }
 
-fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
+fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<PaintBrush> {
     let lower = value.to_ascii_lowercase();
     let (radial, repeating, body) = if lower.starts_with("linear-gradient(") {
         (false, false, function_body(value)?)
@@ -4211,7 +4213,16 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
         // Shape/size/position retain the existing default geometry path.
         parts.remove(0);
     }
-    let mut stops = parse_stops(&parts)?;
+    // CSS Images 3 #color-stop-syntax: positions are fractions of the
+    // gradient line (linear) or ray (radial).
+    let dx = angle.sin();
+    let dy = -angle.cos();
+    let line = if radial {
+        rect.width.hypot(rect.height) / 2.0
+    } else {
+        rect.width * dx.abs() + rect.height * dy.abs()
+    };
+    let (stops, hints) = parse_stops(&parts, line, lengths)?;
     // CSS Color 4 #interpolation: without a <color-interpolation-method>,
     // stops written only in legacy sRGB syntax still interpolate in
     // gamma-encoded sRGB, for Web compatibility; any other stop selects Oklab.
@@ -4224,6 +4235,7 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
         } else {
             interpolation
         };
+    let mut stops = expand_color_hints(stops, &hints, interpolation);
     if repeating && stops.last().is_some_and(|stop| stop.offset > 0.0) {
         let end = stops.last().unwrap().offset;
         for stop in &mut stops {
@@ -4239,9 +4251,7 @@ fn parse_gradient(value: &str, rect: CssRect) -> Option<PaintBrush> {
         })
     } else {
         let center = CssPoint::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-        let dx = angle.sin();
-        let dy = -angle.cos();
-        let half = (rect.width * dx.abs() + rect.height * dy.abs()) / 2.0;
+        let half = line / 2.0;
         Some(PaintBrush::LinearGradient {
             start: CssPoint::new(center.x - dx * half, center.y - dy * half),
             end: CssPoint::new(center.x + dx * half, center.y + dy * half),
@@ -4262,23 +4272,135 @@ fn legacy_srgb(color: &color::DynamicColor) -> bool {
     }
 }
 
-fn parse_stops(parts: &[&str]) -> Option<Vec<GradientStop>> {
-    let mut stops = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
+/// CSS Images 3 #color-stop-syntax and #color-stop-fixup: parse color stops
+/// (with zero, one or two `<length-percentage>` positions, lengths taken
+/// along the `line`) and color hints, then default the first and last
+/// positions, make positions non-decreasing and space unpositioned stops
+/// evenly. Hints are returned as (index of the stop they precede, position).
+fn parse_stops(
+    parts: &[&str],
+    line: f32,
+    lengths: LengthBasis,
+) -> Option<(Vec<GradientStop>, Vec<(usize, f32)>)> {
+    let position = |token: &str| {
+        let px = lengths.resolve(token, line)?;
+        Some(if line > 0.0 { px / line } else { 0.0 })
+    };
+    let mut colors: Vec<(color::DynamicColor, Option<f32>)> = Vec::new();
+    let mut hints: Vec<(usize, f32)> = Vec::new();
+    for part in parts {
         let tokens = split_ws(part);
-        let color = color::parse_color(tokens.first()?).ok()?;
-        let offset = tokens
-            .get(1)
-            .and_then(|v| v.strip_suffix('%'))
-            .and_then(|v| v.parse::<f32>().ok())
-            .map(|v| v / 100.0)
-            .unwrap_or_else(|| index as f32 / (parts.len() - 1).max(1) as f32);
-        stops.push(GradientStop {
-            offset: offset.clamp(0.0, 1.0),
-            color,
-        });
+        match tokens.as_slice() {
+            [hint] if color::parse_color(hint).is_err() => {
+                // A hint sits between two color stops, never next to another.
+                if colors.is_empty() || hints.last().is_some_and(|(at, _)| *at == colors.len()) {
+                    return None;
+                }
+                hints.push((colors.len(), position(hint)?));
+            }
+            [stop, positions @ ..] if positions.len() <= 2 => {
+                let stop = color::parse_color(stop).ok()?;
+                if positions.is_empty() {
+                    colors.push((stop, None));
+                }
+                for value in positions {
+                    colors.push((stop, Some(position(value)?)));
+                }
+            }
+            _ => return None,
+        }
     }
-    Some(stops)
+    if colors.len() < 2 || hints.last().is_some_and(|(at, _)| *at == colors.len()) {
+        return None;
+    }
+    let last = colors.len() - 1;
+    colors[0].1.get_or_insert(0.0);
+    colors[last].1.get_or_insert(1.0);
+    let mut floor = f32::NEG_INFINITY;
+    for (_, offset) in &mut colors {
+        if let Some(offset) = offset {
+            *offset = offset.max(floor);
+            floor = *offset;
+        }
+    }
+    let mut index = 0;
+    while index < colors.len() {
+        if colors[index].1.is_some() {
+            index += 1;
+            continue;
+        }
+        let start = index - 1;
+        let end = (index..colors.len())
+            .find(|&next| colors[next].1.is_some())
+            .unwrap_or(last);
+        let (from, to) = (colors[start].1.unwrap(), colors[end].1.unwrap());
+        for (step, missing) in (index..end).enumerate() {
+            colors[missing].1 = Some(from + (to - from) * (step + 1) as f32 / (end - start) as f32);
+        }
+        index = end;
+    }
+    let stops = colors
+        .into_iter()
+        .map(|(color, offset)| GradientStop {
+            offset: offset.unwrap_or(0.0),
+            color,
+        })
+        .collect::<Vec<_>>();
+    let hints = hints
+        .into_iter()
+        .map(|(at, hint)| {
+            let (from, to) = (stops[at - 1].offset, stops[at].offset);
+            (at, hint.clamp(from, to))
+        })
+        .collect();
+    Some((stops, hints))
+}
+
+/// CSS Images 3 #coloring-gradient-line: between two stops, a color hint at
+/// fraction `H` of the way makes the mix at fraction `P` equal
+/// `P^(log 0.5 / log H)`. Approximate that curve with intermediate stops
+/// interpolated in the gradient's own color space. The renderer clamps
+/// offsets to [0, 1] and pads outside them.
+fn expand_color_hints(
+    stops: Vec<GradientStop>,
+    hints: &[(usize, f32)],
+    interpolation: GradientInterpolation,
+) -> Vec<GradientStop> {
+    const STEPS: usize = 16;
+    let mut out = Vec::with_capacity(stops.len() + hints.len() * STEPS);
+    for (index, stop) in stops.iter().enumerate() {
+        if let Some(&(_, hint)) = hints.iter().find(|(at, _)| *at == index) {
+            let previous = &stops[index - 1];
+            let span = stop.offset - previous.offset;
+            let fraction = if span > 0.0 {
+                (hint - previous.offset) / span
+            } else {
+                0.5
+            };
+            if (fraction - 0.5).abs() > f32::EPSILON {
+                let mix =
+                    previous
+                        .color
+                        .interpolate(stop.color, interpolation.space, interpolation.hue);
+                for step in 1..STEPS {
+                    let along = step as f32 / STEPS as f32;
+                    let weight = if fraction <= 0.0 {
+                        1.0
+                    } else if fraction >= 1.0 {
+                        0.0
+                    } else {
+                        along.powf(0.5f32.ln() / fraction.ln())
+                    };
+                    out.push(GradientStop {
+                        offset: previous.offset + span * along,
+                        color: mix.eval(weight),
+                    });
+                }
+            }
+        }
+        out.push(stop.clone());
+    }
+    out
 }
 
 fn gradient_direction(value: &str) -> Option<f32> {
@@ -5451,6 +5573,67 @@ mod tests {
     }
 
     #[test]
+    fn gradient_color_stops_follow_the_fixup_rules() {
+        // CSS Images 3 #color-stop-syntax / #color-stop-fixup: lengths are
+        // fractions of the 100px gradient line, positions never decrease,
+        // unpositioned stops are spaced evenly, a stop may carry two
+        // positions, and a color hint adds a curved transition.
+        let offsets = |value: &str| {
+            let Some(PaintBrush::LinearGradient { stops, .. }) = parse_gradient(
+                value,
+                CssRect::new(0.0, 0.0, 100.0, 40.0),
+                LengthBasis::fixed(),
+            ) else {
+                panic!("{value}")
+            };
+            stops
+                .iter()
+                .map(|stop| (stop.offset * 100.0).round())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            offsets("linear-gradient(90deg,red 1px,blue 1px)"),
+            [1.0, 1.0]
+        );
+        assert_eq!(
+            offsets("linear-gradient(90deg,red 40%,blue 10%)"),
+            [40.0, 40.0]
+        );
+        assert_eq!(
+            offsets("linear-gradient(90deg,red,lime,blue 50px,white,black)"),
+            [0.0, 25.0, 50.0, 75.0, 100.0]
+        );
+        assert_eq!(
+            offsets("linear-gradient(90deg,red 20px 40px,blue)"),
+            [20.0, 40.0, 100.0]
+        );
+        let hinted = offsets("linear-gradient(90deg,black,20%,white)");
+        assert_eq!(hinted.len(), 17);
+        assert_eq!((hinted[0], hinted[16]), (0.0, 100.0));
+        // A midpoint hint is the ordinary linear transition.
+        assert_eq!(
+            offsets("linear-gradient(90deg,black,50%,white)"),
+            [0.0, 100.0]
+        );
+        for invalid in [
+            "linear-gradient(red,10%)",
+            "linear-gradient(10%,red,blue)",
+            "linear-gradient(red,10%,20%,blue)",
+            "linear-gradient(red 1px 2px 3px,blue)",
+        ] {
+            assert!(
+                parse_gradient(
+                    invalid,
+                    CssRect::new(0.0, 0.0, 10.0, 10.0),
+                    LengthBasis::fixed()
+                )
+                .is_none(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn unloaded_background_images_draw_nothing_but_are_requested() {
         // CSS Backgrounds 3 #background-image: an image that is still loading
         // or failed to download counts as a layer but draws nothing; the
@@ -5764,7 +5947,7 @@ mod tests {
         use color::{ColorSpaceTag as Space, HueDirection as Hue};
         let rect = CssRect::new(0., 0., 100., 100.);
         for header in ["to bottom in oklab", "in oklab to bottom", "in oklab"] {
-            let brush = parse_gradient(&format!("linear-gradient({header},rgba(22,22,22,.9) 0%,rgba(22,22,22,.5) 40%,transparent 97%)"),rect).unwrap();
+            let brush = parse_gradient(&format!("linear-gradient({header},rgba(22,22,22,.9) 0%,rgba(22,22,22,.5) 40%,transparent 97%)"),rect,LengthBasis::fixed()).unwrap();
             let PaintBrush::LinearGradient {
                 interpolation,
                 start,
@@ -5789,6 +5972,7 @@ mod tests {
         } = parse_gradient(
             "linear-gradient(in oklch longer hue to right,oklch(.6 .4 20),oklch(.7 none 310 / .5))",
             rect,
+            LengthBasis::fixed(),
         )
         .unwrap()
         else {
@@ -5808,7 +5992,12 @@ mod tests {
             "in oklch longer",
         ] {
             assert!(
-                parse_gradient(&format!("linear-gradient({invalid},red,blue)"), rect).is_none(),
+                parse_gradient(
+                    &format!("linear-gradient({invalid},red,blue)"),
+                    rect,
+                    LengthBasis::fixed()
+                )
+                .is_none(),
                 "{invalid}"
             );
         }
