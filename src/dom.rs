@@ -12376,6 +12376,9 @@ const PROPS: &[PropDef] = &[
     prop("background-image", false, true),
     prop("background-repeat", false, true),
     prop("background-position", false, true),
+    // CSS Backgrounds 4 #background-position-longhands.
+    prop("background-position-x", false, true),
+    prop("background-position-y", false, true),
     prop("background-size", false, true),
     prop("background-origin", false, true),
     prop("background-clip", false, true),
@@ -12576,6 +12579,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         | "border-image-source" => Some("none"),
         "background-repeat" => Some("repeat"),
         "background-position" => Some("0% 0%"),
+        "background-position-x" | "background-position-y" => Some("0%"),
         "background-size" => Some("auto"),
         "background-attachment" => Some("scroll"),
         "background-clip" => Some("border-box"),
@@ -14002,6 +14006,20 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if prop == "background" {
         return expand_background(value);
     }
+    // CSS Backgrounds 4 #background-position-longhands: background-position
+    // is the shorthand of background-position-x and -y, so a later
+    // declaration of either orders correctly against it in the cascade.
+    if prop == "background-position" {
+        let mut out = vec![(prop.to_string(), value.to_string())];
+        if wide_keyword(value).is_some() {
+            for name in ["background-position-x", "background-position-y"] {
+                out.push((name.to_string(), value.to_string()));
+            }
+        } else if !value.contains("var(") {
+            out.extend(background_position_axes(value));
+        }
+        return out;
+    }
     // `list-style: <position> || <image> || <type>` (CSS Lists 3 §3.6).
     // Every omitted component resets to its initial value; in particular an
     // image from an earlier declaration must not survive a later shorthand.
@@ -14061,6 +14079,96 @@ fn pending_shorthand(value: &str) -> Option<(&str, &str)> {
 /// image or component invalidates the entire declaration, so an earlier valid
 /// fallback keeps winning in the cascade. For each valid layer omitted
 /// components are reset to their initial values before explicit values apply.
+/// CSS Backgrounds 4 #background-position-longhands: the horizontal and
+/// vertical components of each `<bg-position>` layer, as
+/// `background-position-x` and `-y` declarations. Each component is an edge
+/// keyword with an optional offset, a bare offset, or `center`. Nothing when
+/// a layer does not parse.
+fn background_position_axes(value: &str) -> Vec<(String, String)> {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for layer in split_top_level_commas(value) {
+        let Some((x, y)) = bg_position_layer_axes(layer.trim()) else {
+            return Vec::new();
+        };
+        xs.push(x);
+        ys.push(y);
+    }
+    if xs.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ("background-position-x".to_string(), xs.join(", ")),
+        ("background-position-y".to_string(), ys.join(", ")),
+    ]
+}
+
+/// One `<bg-position>` (CSS Backgrounds 3 #background-position) split into
+/// its horizontal and vertical parts.
+pub(crate) fn bg_position_layer_axes(layer: &str) -> Option<(String, String)> {
+    let tokens: Vec<&str> = layer.split_whitespace().collect();
+    let lower: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let horizontal = |t: &str| matches!(t, "left" | "right");
+    let vertical = |t: &str| matches!(t, "top" | "bottom");
+    let keyword = |t: &str| horizontal(t) || vertical(t) || t == "center";
+    match lower.as_slice() {
+        [] => None,
+        [one] if vertical(one) => Some(("center".into(), tokens[0].into())),
+        [_] => Some((tokens[0].into(), "center".into())),
+        [a, b] if keyword(a) && keyword(b) && (vertical(a) || horizontal(b)) => {
+            Some((tokens[1].into(), tokens[0].into()))
+        }
+        [a, b] if !vertical(a) && !horizontal(b) => Some((tokens[0].into(), tokens[1].into())),
+        [_, _] => None,
+        _ => {
+            // Three or four values: edge keywords, each with an optional
+            // offset; `center` takes whichever axis remains.
+            let (mut x, mut y, mut centers) = (None, None, 0);
+            let mut index = 0;
+            while index < tokens.len() {
+                if !keyword(&lower[index]) {
+                    return None;
+                }
+                let offset = tokens
+                    .get(index + 1)
+                    .filter(|_| !keyword(&lower[index + 1]));
+                let part = match offset {
+                    Some(offset) => format!("{} {offset}", tokens[index]),
+                    None => tokens[index].to_string(),
+                };
+                let edge = lower[index].as_str();
+                index += 1 + usize::from(offset.is_some());
+                let axis = if horizontal(edge) {
+                    &mut x
+                } else if vertical(edge) {
+                    &mut y
+                } else if offset.is_none() {
+                    centers += 1;
+                    continue;
+                } else {
+                    return None;
+                };
+                if axis.replace(part).is_some() {
+                    return None;
+                }
+            }
+            for _ in 0..centers {
+                if x.is_none() {
+                    x = Some("center".into());
+                } else if y.is_none() {
+                    y = Some("center".into());
+                } else {
+                    return None;
+                }
+            }
+            Some((
+                x.unwrap_or_else(|| "center".into()),
+                y.unwrap_or_else(|| "center".into()),
+            ))
+        }
+    }
+}
+
 fn expand_background(value: &str) -> Vec<(String, String)> {
     let v = value.trim();
     if v.is_empty() {
@@ -14080,6 +14188,8 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
             "background-image",
             "background-repeat",
             "background-position",
+            "background-position-x",
+            "background-position-y",
             "background-size",
             "background-origin",
             "background-clip",
@@ -14099,6 +14209,8 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
             "background-image",
             "background-repeat",
             "background-position",
+            "background-position-x",
+            "background-position-y",
             "background-size",
             "background-origin",
             "background-clip",
@@ -14161,6 +14273,7 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
         color.unwrap_or("transparent").to_string(),
     ));
     out.push(("background-image".to_string(), images.join(", ")));
+    out.extend(background_position_axes(&positions.join(", ")));
     out.extend([
         ("background-repeat".to_string(), repeats.join(", ")),
         ("background-position".to_string(), positions.join(", ")),
@@ -22554,6 +22667,42 @@ mod tests {
         assert!(
             dom.serialize(c).contains("min-width:16rem"),
             "undefined --cell uses the fallback"
+        );
+    }
+
+    #[test]
+    fn background_position_is_the_shorthand_of_its_axes() {
+        // CSS Backgrounds 4 #background-position-longhands: a later longhand
+        // overrides one axis of an earlier shorthand, and a later shorthand
+        // resets both; `background` sets them too.
+        let dom = Dom::parse_document(
+            "<style>#a{background-position:center}#a{background-position-y:bottom}\
+             #b{background-position-y:bottom}#b{background-position:right 10px top}\
+             #c{background:url(x.png) no-repeat left 5% bottom, url(y.png) 10px}</style>\
+             <div id=a></div><div id=b></div><div id=c></div>",
+        );
+        let value =
+            |id: &str, property: &str| dom.computed_value(dom.get_by_id(id).unwrap(), property);
+        assert_eq!(
+            value("a", "background-position-x").as_deref(),
+            Some("center")
+        );
+        assert_eq!(
+            value("a", "background-position-y").as_deref(),
+            Some("bottom")
+        );
+        assert_eq!(
+            value("b", "background-position-x").as_deref(),
+            Some("right 10px")
+        );
+        assert_eq!(value("b", "background-position-y").as_deref(), Some("top"));
+        assert_eq!(
+            value("c", "background-position-x").as_deref(),
+            Some("left 5%, 10px")
+        );
+        assert_eq!(
+            value("c", "background-position-y").as_deref(),
+            Some("bottom, center")
         );
     }
 
