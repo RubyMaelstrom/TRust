@@ -3875,6 +3875,28 @@ mod tests {
     }
 
     #[test]
+    fn framesets_split_the_viewport_by_cols_and_rows() {
+        // HTML Rendering #frames-and-framesets: absolute, percentage and
+        // relative (`*`) dimensions split the viewport row by row; a nested
+        // frameset splits its own rectangle and noframes is not rendered.
+        let html = r#"<frameset cols="100,*" rows="50%,*"><frame id=a><frame id=b>
+            <frameset id=n rows="1*,3*"><frame id=c><frame id=d></frameset>
+            <noframes id=no>no frames</noframes></frameset>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| {
+            let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (r.left, r.top, r.width, r.height)
+        };
+        assert_eq!(rect("a"), (0.0, 0.0, 100.0, 300.0));
+        assert_eq!(rect("b"), (100.0, 0.0, 700.0, 300.0));
+        assert_eq!(rect("n"), (0.0, 300.0, 100.0, 300.0));
+        assert_eq!(rect("c"), (0.0, 300.0, 100.0, 75.0));
+        assert_eq!(rect("d"), (0.0, 375.0, 100.0, 225.0));
+        assert!(!layout.boxes.contains_key(&dom.get_by_id("no").unwrap()));
+    }
+
+    #[test]
     fn textareas_are_monospace_and_rows_lines_tall() {
         // HTML Rendering #the-textarea-element-2: the effective height is
         // `rows` lines (default 2); engines' UA sheets make it monospace.
