@@ -4354,6 +4354,63 @@ mod tests {
     }
 
     #[test]
+    fn inline_blocks_and_floats_transfer_height_through_aspect_ratio() {
+        // CSS Sizing 4 #aspect-ratio-automatic: an auto-width inline-block or
+        // float with a definite height and a preferred ratio sizes like a
+        // replaced element with that ratio (CSS 2 §10.3.10/§10.3.6 → §10.3.2),
+        // in the box-sizing box, then min/max apply; a shrink-to-fit parent
+        // measures the same width. Generated ::before icons are the common
+        // case. Gecko and Blink agree on every width.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:16px/20px sans-serif">
+            <style>.ib{display:inline-block;height:15px;aspect-ratio:1/1}
+            #c::before{display:inline-block;height:15px;aspect-ratio:1/1;content:"";
+                background:blue}</style>
+            <p>a<span class=ib id=a></span>b</p>
+            <p>c<span class=ib id=b style="aspect-ratio:2/1"></span>d</p>
+            <p id=c>e</p>
+            <p><span id=d style="float:left;height:15px;aspect-ratio:1/1"></span>f</p>
+            <div id=w style="float:left;clear:left"><span class=ib></span></div>
+            <div style="float:left;clear:left"><span class=ib id=bb
+                style="padding:0 5px;box-sizing:border-box;aspect-ratio:2/1"></span></div>
+            <div style="float:left;clear:left"><span class=ib id=mx style="max-width:8px"></span></div>
+            <div style="float:left;clear:left"><span class=ib id=txt style="height:5px">wide text</span></div>
+            <div id=blk style="clear:left;height:50px;aspect-ratio:2/1;margin:auto"></div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        for (id, expected) in [
+            ("a", 15.0),
+            ("b", 30.0),
+            ("d", 15.0),
+            ("w", 15.0),
+            ("bb", 30.0),
+            ("mx", 8.0),
+            // A block-level box is sized the same way (CSS 2 §10.3.4 →
+            // §10.3.2), its auto margins then centering it.
+            ("blk", 100.0),
+        ] {
+            assert!((width(id) - expected).abs() < 0.01, "{id}: {}", width(id));
+        }
+        assert_eq!(layout.boxes[&dom.get_by_id("blk").unwrap()].left, 350.0);
+        // #aspect-ratio-minimum: content wider than the ratio still fits.
+        assert!(width("txt") > 30.0, "{}", width("txt"));
+        // The generated square paints 15px wide on the line.
+        let blue = crate::render::headless::render_paint(
+            &layout.paint,
+            crate::core::CssSize::new(800.0, 600.0),
+        )
+        .unwrap()
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] < 30 && p[1] < 30 && p[2] > 200)
+        .count();
+        assert_eq!(blue, 15 * 15);
+    }
+
+    #[test]
     fn image_dimension_attributes_accept_percentages() {
         // HTML #maps-to-the-dimension-property: width="25%" is 25% of the
         // containing block; a percentage height against an auto-height

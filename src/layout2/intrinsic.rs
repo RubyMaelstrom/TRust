@@ -297,9 +297,20 @@ impl Flow<'_> {
                 v.max(0.0)
             }
         };
+        // css-sizing-4 #aspect-ratio-automatic: an auto width with a ratio and
+        // a definite height is that height through the ratio, contributing
+        // at least the box's min-content width (#aspect-ratio-minimum).
+        let ratio_width = || {
+            let bt = s.border[super::style::TOP] + side(&s.padding[super::style::TOP]).max(0.0);
+            let bb =
+                s.border[super::style::BOTTOM] + side(&s.padding[super::style::BOTTOM]).max(0.0);
+            self.ratio_auto_width(b, bp, bt, bb, None)
+                .map(|w| w.max(self.ratio_auto_minimum(b, inl)))
+        };
         let content = self
             .intrinsic_width_value(&s.width, b, preferred_basis, inl)
             .or_else(|| s.width.resolve(preferred_basis).map(to_content))
+            .or_else(ratio_width)
             .unwrap_or_else(|| {
                 if frame {
                     FRAME_DEFAULT_WIDTH
