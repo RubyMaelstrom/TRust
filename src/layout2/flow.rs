@@ -1262,13 +1262,23 @@ impl Flow<'_> {
                             // is its CSS `width` (already resolved into `h.content_w`),
                             // else the HTML `width` attribute (HTML §15.3.13 — not a
                             // CSS property, so `BoxStyle` never saw it), else auto.
+                            // HTML Rendering #tables-2 makes a table `box-sizing:
+                            // border-box`, so the attribute width includes the
+                            // table's own border and padding, as a CSS width does.
+                            let content = |width: f32| {
+                                if s.border_box {
+                                    (width - h.bp_l - h.bp_r).max(1.0)
+                                } else {
+                                    width.max(1.0)
+                                }
+                            };
                             let (avail_w, width_auto) = if s.width.resolve(Some(cb_w)).is_some() {
                                 (h.content_w, false)
                             } else {
                                 match super::tree::declared_track_width(self.dom, b.node) {
-                                    Some(super::tree::ColSpec::Px(px)) => (px.max(1.0), false),
+                                    Some(super::tree::ColSpec::Px(px)) => (content(px), false),
                                     Some(super::tree::ColSpec::Pct(p)) => {
-                                        ((p * cb_w).max(1.0), false)
+                                        (content(p * cb_w), false)
                                     }
                                     None => (h.content_w, true),
                                 }
