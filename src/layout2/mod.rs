@@ -425,6 +425,25 @@ pub(crate) fn rich_editor_presentation(
         let parent = if f.node == NO_NODE { parent } else { f.node };
         f.children.iter().find_map(|f| first_line(f, parent))
     }
+    /// The content-box origin and width of a form control's laid piece.
+    fn control_content(f: &Frag, node: NodeId) -> Option<(crate::core::CssPoint, f32)> {
+        if let FragKind::Line(line) = &f.kind
+            && !line.sideways
+            && let Some(piece) = line
+                .pieces
+                .iter()
+                .find(|piece| piece.item.node == node && matches!(piece.item.kind, ItemKind::Form))
+        {
+            return Some((
+                crate::core::CssPoint::new(
+                    f.x + piece.x + piece.paint_x,
+                    f.y + piece.y + piece.paint_y,
+                ),
+                piece.paint_width,
+            ));
+        }
+        f.children.iter().find_map(|f| control_content(f, node))
+    }
     let native_input = dom.tag_name(node) == Some("input")
         && matches!(
             dom.input_type(node).as_str(),
@@ -494,25 +513,30 @@ pub(crate) fn rich_editor_presentation(
         let inset = |side: usize| {
             box_style.border[side] + box_style.padding[side].resolve(Some(basis)).unwrap_or(0.0)
         };
-        let width = (bounds.width as f32 - inset(style::LEFT) - inset(style::RIGHT)).max(0.0);
-        // An empty textarea without a placeholder has no glyph run. Its
-        // insertion point still starts at the used content-box edge.
-        let origin = layout
-            .paint
-            .primitives
-            .iter()
-            .find_map(|command| match command {
-                crate::render::DisplayCommand::GlyphRun {
-                    node: id, origin, ..
-                } if *id == node => Some(*origin),
-                _ => None,
-            })
-            .unwrap_or_else(|| {
+        // HTML Rendering #the-textarea-element-2: the value starts at the
+        // content-box top. The editor lays its own lines from there, so the
+        // origin is that corner even when the painted value begins with a
+        // blank line (which paints no glyph run) or with an aligned or
+        // indented line. The laid control piece holds the used content box.
+        let laid = layout.paint_cache.as_ref().and_then(|cache| {
+            control_content(&cache.root, node)
+                .or_else(|| cache.fixed.iter().find_map(|f| control_content(f, node)))
+                .or_else(|| {
+                    cache
+                        .top_layer
+                        .iter()
+                        .find_map(|f| control_content(&f.fragment, node))
+                })
+        });
+        let (origin, width) = laid.unwrap_or_else(|| {
+            (
                 crate::core::CssPoint::new(
                     bounds.left as f32 + inset(style::LEFT),
                     bounds.top as f32 + inset(style::TOP),
-                )
-            });
+                ),
+                (bounds.width as f32 - inset(style::LEFT) - inset(style::RIGHT)).max(0.0),
+            )
+        });
         let style =
             style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), base).text_style();
         let color = dom
@@ -4964,6 +4988,40 @@ b</xmp></body>"#;
             dom.cssom_resolved_value(dom.get_by_id("c").unwrap(), "white-space")
                 .as_deref(),
             Some("pre")
+        );
+    }
+
+    #[test]
+    fn textarea_editing_origin_is_the_content_box_whatever_its_first_line() {
+        // HTML Rendering #the-textarea-element-2: the value starts at the top
+        // of the content box. A leading blank line paints no glyph run, and
+        // centred or indented text starts away from the content edge, but the
+        // editor lays its own text from the content box's top-left corner.
+        let style = "font:12px/15px monospace;padding:4px;border:1px solid;margin:0";
+        let html = format!(
+            "<body style=margin:0><form>\
+             <textarea id=a cols=20 rows=3 style='{style}'>\n\nthird line text</textarea>\
+             <textarea id=b cols=20 rows=3 style='{style};display:block'>\n\nblock</textarea>\
+             <textarea id=c cols=20 rows=3 style='{style};text-align:center;text-indent:9px'>mid</textarea>\
+             </form></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_graphical(&html, 800.0, &HashMap::new());
+        for id in ["a", "b", "c"] {
+            let node = dom.get_by_id(id).unwrap();
+            let bounds = layout.boxes[&node];
+            let presentation = rich_editor_presentation(&dom, &base, &layout, node).unwrap();
+            assert_eq!(
+                (presentation.origin.x, presentation.origin.y),
+                (5.0, 5.0),
+                "{id} at {bounds:?}"
+            );
+            assert_eq!(presentation.width, bounds.width as f32 - 10.0, "{id}");
+        }
+        assert_eq!(
+            dom.text_content(dom.get_by_id("a").unwrap()),
+            "\nthird line text"
         );
     }
 
