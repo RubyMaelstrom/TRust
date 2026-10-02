@@ -4553,9 +4553,16 @@ impl Dom {
     }
 
     fn computed_value_unschemed(&self, id: NodeId, name: &str) -> Option<String> {
-        let value = self
-            .computed_value(id, name)
-            .map(|v| self.resolve_vars_owned(id, v))?;
+        let value = self.computed_value(id, name)?;
+        // CSS Variables 1 #invalid-at-computed-value-time: a declaration whose
+        // var() substitution fails computes as if it were `unset`, so an
+        // undefined `color: var(--x)` inherits rather than becoming empty.
+        let value = if needs_var_substitution(&value) {
+            self.substitute_vars(id, &value, &mut Vec::new())
+                .unwrap_or_else(|| "unset".to_owned())
+        } else {
+            self.resolve_vars_owned(id, value)
+        };
         let inherited = || prop_index(name).is_some_and(|index| PROPS[index].inherited);
         match resolved_wide_keyword(&value) {
             Some(WideKeyword::Initial) => None,
@@ -22548,6 +22555,26 @@ mod tests {
             dom.serialize(c).contains("min-width:16rem"),
             "undefined --cell uses the fallback"
         );
+    }
+
+    #[test]
+    fn an_unresolvable_var_computes_as_unset() {
+        // CSS Variables 1 #invalid-at-computed-value-time: a declaration whose
+        // var() references an undefined property without a fallback computes
+        // as `unset`, inheriting an inherited property (`color`) and taking a
+        // non-inherited property's initial value.
+        let dom = Dom::parse_document(
+            "<body><div id=p style=\"color: rgb(1, 2, 3); background-color: rgb(4, 5, 6)\">\
+             <span id=c style=\"color: var(--nope); background-color: var(--nope)\">x</span>\
+             </div></body>",
+        );
+        let (p, c) = (dom.get_by_id("p").unwrap(), dom.get_by_id("c").unwrap());
+        assert_eq!(
+            dom.computed_value_resolved(c, "color"),
+            dom.computed_value_resolved(p, "color")
+        );
+        assert!(dom.computed_value_resolved(p, "color").is_some());
+        assert_eq!(dom.computed_value_resolved(c, "background-color"), None);
     }
 
     #[test]
