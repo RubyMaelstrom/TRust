@@ -3638,6 +3638,55 @@ mod tests {
     }
 
     #[test]
+    fn flex_grid_and_positioned_list_items_keep_outside_markers() {
+        // CSS Display 3 #blockify keeps a flex or grid item's `list-item`
+        // display, so it still generates a marker, which CSS Lists 3
+        // #list-style-position-outside places outside its principal box on
+        // its first line, as Blink and Gecko do.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <ul style="display:flex;margin:0;padding-left:40px"><li id=a>a</li><li id=b style="margin-left:40px">b</li></ul>
+            <ul style="display:grid;margin:0;padding-left:40px"><li id=c><p style="margin:0">c</p></li></ul>
+            <ul style="position:relative;height:20px;margin:0"><li id=d style="position:absolute;left:60px">d</li></ul>
+            <ul style="display:flex;margin:0"><li id=e style="padding-left:30px">e</li></ul></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &HashMap::new());
+        let bullets: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { origin, shaped, .. }
+                    if shaped.text.starts_with('•') =>
+                {
+                    Some((f64::from(origin.x + shaped.advance), f64::from(origin.y)))
+                }
+                _ => None,
+            })
+            .collect();
+        for id in ["a", "b", "c", "d", "e"] {
+            let item = layout.boxes[&dom.get_by_id(id).unwrap()];
+            let content_left = item.left + if id == "e" { 30.0 } else { 0.0 };
+            assert!(
+                bullets.iter().any(|&(right, y)| {
+                    right <= content_left + 0.5
+                        && right > content_left - 20.0
+                        && y >= item.top - 0.5
+                        && y < item.top + item.height
+                }),
+                "{id}: {item:?} {bullets:?}"
+            );
+        }
+        let terminal = lay(html, 80);
+        let bullets = terminal
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .filter(|item| item.text.contains('•'))
+            .count();
+        assert_eq!(bullets, 5);
+    }
+
+    #[test]
     fn a_marker_image_takes_its_natural_size() {
         // CSS Lists 3 #marker-image: the default sizing algorithm with no
         // specified size, so a 7x8 image stays 7x8; 1em square without one.
