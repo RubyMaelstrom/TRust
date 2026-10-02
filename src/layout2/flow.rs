@@ -1469,8 +1469,8 @@ impl Flow<'_> {
 
         // ---- the ::marker (outside position) ----
         if let Some(marker) = marker {
-            let marker =
-                self.marker_frag(marker, content_x, &children, y_border, bt, own_marker_line);
+            let x = (content_x - marker.w).max(0.0);
+            let marker = self.marker_frag(marker, x, &children, y_border, bt, own_marker_line);
             // CSS Lists 3 §3.1 defines ::marker as the list item's first
             // child, before ::before and principal content. Preserve that
             // painting order too. At the terminal boundary a sub-cell marker
@@ -2035,13 +2035,13 @@ impl Flow<'_> {
         }
     }
 
-    /// The outside `::marker` of a list item: right-aligned against the
-    /// content edge, on the first line box (CSS Lists — the marker sits in
+    /// The outside `::marker` of a list item at `x`: right-aligned against
+    /// the content edge, on the first line box (CSS Lists — the marker sits in
     /// the gutter the UA list padding provides).
     fn marker_frag(
         &self,
         marker: MarkerLine,
-        content_x: f32,
+        x: f32,
         children: &[Frag],
         y_border: Option<f32>,
         bt: f32,
@@ -2070,7 +2070,6 @@ impl Flow<'_> {
                 y_border.map_or(0.0, |yb| yb + bt)
             }
         };
-        let x = (content_x - w).max(0.0);
         Frag {
             flow: Default::default(),
             node: NO_NODE,
@@ -3580,6 +3579,22 @@ impl Flow<'_> {
         // and cannot intrude from the ancestor context (§9.4.1).
         let mut own_fc = FloatCtx::new();
         let mut children: Vec<Frag> = Vec::new();
+        // CSS Lists 3 #list-style-position-outside: a list item that is a
+        // flex or grid item (CSS Display 3 #blockify keeps `list-item`) or
+        // out of flow still has its outside marker, which joins its first
+        // line box as in `block_compute`. The independent formatting context
+        // keeps any enclosing item's pending marker out.
+        let outer_marker_line = self.marker_line.take();
+        let flow_content = match &b.content {
+            Content::Blocks(_) => true,
+            Content::Inlines(_) => !self.vertical_text(b),
+            _ => false,
+        };
+        let marker = (!b.marker_inside && (b.marker.is_some() || b.marker_image.is_some()))
+            .then(|| self.marker_line_box(b.marker.as_deref(), b.marker_image.as_deref(), &inl));
+        if flow_content {
+            self.marker_line.set(marker.as_ref().map(|m| m.baseline));
+        }
         match &b.content {
             Content::Blocks(kids) => {
                 for k in kids {
@@ -3786,6 +3801,19 @@ impl Flow<'_> {
                 }
             }
         }
+        // As in `block_compute`: content with no line box gives the marker a
+        // line box of its own at the content top.
+        let mut own_marker_line = None;
+        if flow_content
+            && let Some(ascent) = self.marker_line.take()
+            && first_line(&children).is_none()
+            && let Some(marker) = &marker
+        {
+            let line_ascent = ascent.max(marker.baseline);
+            own_marker_line = Some(line_ascent - marker.baseline);
+            cur.y = cur.y.max(bt + line_ascent + marker.h - marker.baseline);
+        }
+        self.marker_line.set(outer_marker_line);
         if let Some(max_lines) = s.line_clamp
             && let Some(bottom) =
                 super::clamp::apply(&mut children, max_lines, bt, self.dom, self.base, &inl)
@@ -3793,6 +3821,13 @@ impl Flow<'_> {
             cur.y = bottom;
             cur.pos = 0.0;
             cur.neg = 0.0;
+        }
+        // The marker hangs outside the item's content box, before its first
+        // child in painting order.
+        if let Some(marker) = marker {
+            let x = bp_l - marker.w;
+            let marker = self.marker_frag(marker, x, &children, Some(0.0), bt, own_marker_line);
+            children.insert(0, marker);
         }
         let mut content_h = (cur.flush() - bt).max(0.0);
         // Contain floats (§9.5): an auto-height item box grows to the lowest
