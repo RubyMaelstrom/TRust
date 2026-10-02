@@ -21,6 +21,7 @@ pub(crate) mod architecture_diagnostics;
 pub(crate) mod arena;
 mod child_collections;
 mod class_tokens;
+pub(crate) mod color_scheme;
 mod computed_cache;
 mod container_queries;
 mod counter_styles;
@@ -284,6 +285,7 @@ pub struct Dom {
     /// removes local subjects and their inheriting descendants.
     computed_cache: RefCell<ComputedCache>,
     style_sharing: RefCell<style_sharing::State>,
+    page_color_schemes: color_scheme::PageSupport,
     /// Memoized inherited custom-property values for the style-value revision.
     /// CSS Custom Properties §2 makes every unregistered `--*`
     /// property inherited; a deep application tree otherwise re-walks the
@@ -677,6 +679,7 @@ impl Dom {
             container_dependencies,
             computed_cache,
             style_sharing,
+            page_color_schemes,
             custom_prop_cache,
             generated_cache,
             matched_cache,
@@ -915,6 +918,13 @@ impl Dom {
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
         }
+        match page_color_schemes.retained_bytes() {
+            Some(retained) => {
+                bytes = bytes.saturating_add(retained);
+                opaque = true;
+            }
+            None => unavailable = unavailable.saturating_add(1),
+        }
         bytes = bytes.saturating_add(
             cssom_inline.capacity() * std::mem::size_of::<(NodeId, cssom::Declarations)>(),
         );
@@ -1145,6 +1155,7 @@ impl Dom {
             container_dependencies: RefCell::new(container_queries::Dependencies::default()),
             computed_cache: RefCell::new(((u64::MAX, u64::MAX), computed_cache::Values::default())),
             style_sharing: RefCell::new(style_sharing::State::default()),
+            page_color_schemes: color_scheme::PageSupport::default(),
             custom_prop_cache: RefCell::new(((u64::MAX, u64::MAX), FxHashMap::default())),
             generated_cache: RefCell::new(None),
             matched_cache: RefCell::new(NodeCache::default()),
@@ -1914,6 +1925,19 @@ impl Dom {
     /// is sound). This is the ONLY writer of `style_epoch`, which keeps the
     /// "style epoch never advances without the main epoch" invariant.
     #[track_caller]
+    /// Whether changing attribute `name` of `id` can change HTML
+    /// #meta-color-scheme's result: the name or content of a meta that is,
+    /// or by name would be, a color-scheme meta.
+    fn color_scheme_meta_attribute(&self, id: NodeId, name: &str) -> bool {
+        self.tag_name(id) == Some("meta")
+            && (name.eq_ignore_ascii_case("name") || name.eq_ignore_ascii_case("content"))
+            && (self.is_color_scheme_meta(id)
+                || self
+                    .attr(id, "name")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("color-scheme"))
+                || name.eq_ignore_ascii_case("name"))
+    }
+
     fn touch_style(&mut self) {
         self.style_epoch = self.style_epoch.wrapping_add(1);
         self.touch();
@@ -1979,12 +2003,15 @@ impl Dom {
     }
 
     /// Whether `root`'s composed subtree (inclusive) contains a `<style>` or
-    /// `<link>` element. Early-exits on the first hit; a childless node is a
-    /// single tag check.
+    /// `<link>` element, or a `<meta name=color-scheme>` (HTML
+    /// #meta-color-scheme re-runs on insertion and removal). Early-exits on
+    /// the first hit; a childless node is a single tag check.
     fn subtree_has_style(&self, root: NodeId) -> bool {
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            if matches!(self.tag_name(id), Some("style" | "link")) {
+            if matches!(self.tag_name(id), Some("style" | "link"))
+                || (self.tag_name(id) == Some("meta") && self.is_color_scheme_meta(id))
+            {
                 return true;
             }
             self.push_composed_children(id, &mut stack);
@@ -3465,6 +3492,7 @@ impl Dom {
         // An attribute change on a sheet-bearing element can change the
         // sheet set (`<link rel/href/disabled>`; conservatively any).
         let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
+        let scheme_meta = self.color_scheme_meta_attribute(id, name);
         if let NodeData::Element {
             name: qname, attrs, ..
         } = &mut self.nodes[id].data
@@ -3498,6 +3526,8 @@ impl Dom {
             if sheet_el {
                 self.note_cssom_sheet_attribute(id, invalidated_attribute);
                 self.touch_style_at(id);
+            } else if scheme_meta || self.color_scheme_meta_attribute(id, invalidated_attribute) {
+                self.touch_style_at(id);
             }
             self.touch_attr_with_old_class(id, invalidated_attribute, old_class.as_deref());
             self.input_attribute_changed(id, invalidated_attribute, old_input_type);
@@ -3525,6 +3555,7 @@ impl Dom {
         let html_document =
             self.document_content_type(self.nodes[id].owner_document) == "text/html";
         let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
+        let scheme_meta = self.color_scheme_meta_attribute(id, name);
         if let NodeData::Element {
             name: qname, attrs, ..
         } = &mut self.nodes[id].data
@@ -3544,6 +3575,8 @@ impl Dom {
             if attrs.len() != before {
                 if sheet_el {
                     self.note_cssom_sheet_attribute(id, name);
+                    self.touch_style_at(id);
+                } else if scheme_meta {
                     self.touch_style_at(id);
                 }
                 self.touch_attr_with_old_class(id, name, old_class.as_deref());
@@ -4489,6 +4522,26 @@ impl Dom {
                 format!("{x} {y}")
             });
         }
+        let value = self.computed_value_unschemed(id, name);
+        if !color_scheme::holds_colors(name) {
+            return value;
+        }
+        // CSS Color 4 #css-system-colors and CSS Color 5 #light-dark compute
+        // to colors of the element's color scheme, including `color`'s
+        // initial CanvasText.
+        match value {
+            Some(value) => {
+                Some(color_scheme::resolve(&value, self.color_scheme(id)).unwrap_or(value))
+            }
+            None if name == "color" && self.color_scheme(id) == color_scheme::ColorScheme::Dark => {
+                color_scheme::system_color("canvastext", color_scheme::ColorScheme::Dark)
+                    .map(String::from)
+            }
+            None => None,
+        }
+    }
+
+    fn computed_value_unschemed(&self, id: NodeId, name: &str) -> Option<String> {
         let value = self
             .computed_value(id, name)
             .map(|v| self.resolve_vars_owned(id, v))?;
@@ -11959,6 +12012,8 @@ const PROPS: &[PropDef] = &[
     // getComputedStyle (overlay-positioning libraries use it to mirror start/
     // end alignment), even though layout2 does not yet reorder bidi boxes.
     prop("direction", true, true),
+    // CSS Color Adjust 1 #color-scheme-prop.
+    prop("color-scheme", true, true),
     prop("font-size", true, true),
     prop("font-family", true, true),
     prop("font-weight", true, true),
@@ -12281,6 +12336,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         | "line-break" => Some("normal"),
         "font-stretch" => Some("100%"),
         "text-align" => Some("start"),
+        "color-scheme" => Some("normal"),
         "vertical-align" => Some("baseline"),
         "text-overflow" => Some("clip"),
         "object-fit" => Some("fill"),
@@ -16649,7 +16705,7 @@ fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
         "max-aspect-ratio" => ratio().is_some_and(|(a, r)| a <= r),
         "hover" | "any-hover" => value == "hover",
         "pointer" | "any-pointer" => value == "fine",
-        "prefers-color-scheme" => value == "dark",
+        "prefers-color-scheme" => value == color_scheme::PREFERRED.keyword(),
         "prefers-reduced-motion" => value == "reduce",
         "prefers-contrast" => value == "no-preference",
         "forced-colors" => value == "none",
