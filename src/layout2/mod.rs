@@ -4992,6 +4992,69 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn textarea_paints_only_the_lines_that_reach_its_scrollport() {
+        // HTML Rendering #the-textarea-element-2 / CSS Overflow 3: a long
+        // value scrolls inside the control's scrollport, which TRust paints
+        // at its initial position. Lines below the scrollport are neither
+        // laid nor painted, so a long value costs what the control shows,
+        // and the visible lines are those of the whole value.
+        let style = "font:12px/15px monospace;padding:4px;border:1px solid;margin:0";
+        let value: String = (0..4000).map(|line| format!("line {line}\n")).collect();
+        let words = "word ".repeat(4000);
+        let html = format!(
+            "<body style=margin:0><form>\
+             <textarea id=a cols=20 rows=3 style='{style}'>{value}</textarea>\
+             <textarea id=b cols=20 rows=3 style='{style};display:block'>{value}</textarea>\
+             <textarea id=c cols=20 rows=3 style='{style};white-space:normal'>{value}</textarea>\
+             <textarea id=d cols=20 rows=3 style='{style}'>{words}</textarea>\
+             </form></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let layout = lay_graphical(&html, 800.0, &HashMap::new());
+        let runs = |id: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            let bounds = layout.boxes[&node];
+            layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    crate::render::Primitive::GlyphRun {
+                        node: run_node,
+                        origin,
+                        shaped,
+                        ..
+                    } if *run_node == node => Some((
+                        origin.y - bounds.top as f32,
+                        shaped.text.trim_end().to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for id in ["a", "b"] {
+            let runs = runs(id);
+            let texts: Vec<_> = runs.iter().map(|run| run.1.as_str()).collect();
+            // 45px of content and 4px of padding show four lines; the next
+            // one starts within an em of slack for overflowing glyphs.
+            assert_eq!(
+                texts,
+                ["line 0", "line 1", "line 2", "line 3", "line 4"],
+                "{id}"
+            );
+            assert_eq!(runs[3].0, 50.0, "{id}");
+        }
+        // Collapsed newlines make one wrapped paragraph; its painted lines
+        // are bounded the same way.
+        let c = runs("c");
+        assert_eq!(c[0].1, "line 0 line 1 line 2");
+        assert_eq!(c.len(), 5);
+        let d = runs("d");
+        assert_eq!(d[0].1, "word word word word");
+        assert_eq!(d.len(), 5);
+    }
+
+    #[test]
     fn textarea_editing_origin_is_the_content_box_whatever_its_first_line() {
         // HTML Rendering #the-textarea-element-2: the value starts at the top
         // of the content box. A leading blank line paints no glyph run, and
