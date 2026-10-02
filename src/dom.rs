@@ -11759,6 +11759,11 @@ const PROPS: &[PropDef] = &[
     prop("table-layout", false, true),
     // CSS 2.2 §17.6: inherited table border model and two-axis spacing.
     prop("border-spacing", true, true),
+    prop("border-image-source", false, true),
+    prop("border-image-slice", false, true),
+    prop("border-image-width", false, true),
+    prop("border-image-outset", false, true),
+    prop("border-image-repeat", false, true),
     prop("border-collapse", true, true),
     prop("caption-side", true, true),
     prop("border-top-width", false, true),
@@ -12241,6 +12246,119 @@ fn logical_pair(prop: &str) -> Option<(&'static str, &'static str)> {
 
 /// Expand a `margin`/`padding`/`border*`/`list-style` shorthand into the
 /// longhands we track; pass anything else through unchanged.
+const BORDER_IMAGE_LONGHANDS: [(&str, &str); 5] = [
+    ("border-image-source", "none"),
+    ("border-image-slice", "100%"),
+    ("border-image-width", "1"),
+    ("border-image-outset", "0"),
+    ("border-image-repeat", "stretch"),
+];
+
+/// Expand a `border-image` shorthand value, or `None` when it is invalid.
+fn parse_border_image(value: &str) -> Option<Vec<(String, String)>> {
+    // Separate top-level slashes into their own tokens.
+    let mut spaced = String::with_capacity(value.len() + 8);
+    let mut depth = 0usize;
+    for c in value.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => {
+                spaced.push_str(" / ");
+                continue;
+            }
+            _ => {}
+        }
+        spaced.push(c);
+    }
+    let tokens = split_top_level(&spaced, ' ')
+        .into_iter()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let numeric = |token: &str| token.starts_with(|c: char| c.is_ascii_digit() || c == '.');
+    let (mut source, mut repeat) = (None::<String>, Vec::<&str>::new());
+    let (mut slice, mut width, mut outset) =
+        (Vec::<&str>::new(), Vec::<&str>::new(), Vec::<&str>::new());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let lower = token.to_ascii_lowercase();
+        if matches!(lower.as_str(), "stretch" | "repeat" | "round" | "space") {
+            if !repeat.is_empty()
+                && index > 0
+                && !matches!(
+                    tokens[index - 1].to_ascii_lowercase().as_str(),
+                    "stretch" | "repeat" | "round" | "space"
+                )
+            {
+                return None;
+            }
+            repeat.push(token);
+            index += 1;
+        } else if lower == "none" || lower.contains('(') {
+            if source.is_some() {
+                return None;
+            }
+            source = Some(token.to_string());
+            index += 1;
+        } else if numeric(token) || lower == "fill" {
+            if !slice.is_empty() {
+                return None;
+            }
+            while index < tokens.len()
+                && (numeric(tokens[index]) || tokens[index].eq_ignore_ascii_case("fill"))
+            {
+                slice.push(tokens[index]);
+                index += 1;
+            }
+            if tokens.get(index) == Some(&"/") {
+                index += 1;
+                while index < tokens.len()
+                    && (numeric(tokens[index]) || tokens[index].eq_ignore_ascii_case("auto"))
+                {
+                    width.push(tokens[index]);
+                    index += 1;
+                }
+                if tokens.get(index) == Some(&"/") {
+                    index += 1;
+                    while index < tokens.len() && numeric(tokens[index]) {
+                        outset.push(tokens[index]);
+                        index += 1;
+                    }
+                    if outset.is_empty() {
+                        return None;
+                    }
+                } else if width.is_empty() {
+                    return None;
+                }
+            }
+        } else {
+            return None;
+        }
+    }
+    if repeat.len() > 2 || (source.is_none() && slice.is_empty() && repeat.is_empty()) {
+        return None;
+    }
+    let join = |parts: &[&str], initial: &str| {
+        if parts.is_empty() {
+            initial.to_string()
+        } else {
+            parts.join(" ")
+        }
+    };
+    Some(vec![
+        (
+            "border-image-source".into(),
+            source.unwrap_or_else(|| "none".into()),
+        ),
+        ("border-image-slice".into(), join(&slice, "100%")),
+        ("border-image-width".into(), join(&width, "1")),
+        ("border-image-outset".into(), join(&outset, "0")),
+        ("border-image-repeat".into(), join(&repeat, "stretch")),
+    ])
+}
+
 fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // CSS Values 5 §9.5 (formerly Variables 1 §3): a var() can expand
     // into multiple components, so no longhand can be parsed in advance.
@@ -12607,21 +12725,43 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // `border: 2px` has no visible style and computes a 0 used width, per
     // CSS 2.1 §8.5.4); a value where NOTHING parses (`border: var(--b)`)
     // keeps the old pass-through-nothing behavior rather than nuking.
+    // CSS Backgrounds 3 #propdef-border-image: `source || slice [/ width
+    // [/ outset]?]? || repeat`, every omitted longhand reset to its initial.
+    if prop == "border-image" {
+        if wide_keyword(value).is_some() {
+            return BORDER_IMAGE_LONGHANDS
+                .iter()
+                .map(|(name, _)| (name.to_string(), value.into()))
+                .collect();
+        }
+        return parse_border_image(value).unwrap_or_default();
+    }
     if prop == "border" {
         let sides: &[&str] = &["top", "right", "bottom", "left"];
+        // #propdef-border: the shorthand also resets border-image.
+        let image = |value: Option<&str>| -> Vec<(String, String)> {
+            BORDER_IMAGE_LONGHANDS
+                .iter()
+                .map(|(name, initial)| (name.to_string(), value.unwrap_or(initial).to_string()))
+                .collect()
+        };
         if wide_keyword(value).is_some() {
-            return border_longhands(sides, Some(value), Some(value), Some(value));
+            let mut out = border_longhands(sides, Some(value), Some(value), Some(value));
+            out.extend(image(Some(value)));
+            return out;
         }
         let (w, s, c) = parse_border_shorthand(value);
         if w.is_none() && s.is_none() && c.is_none() {
             return Vec::new();
         }
-        return border_longhands(
+        let mut out = border_longhands(
             sides,
             Some(w.unwrap_or("medium")),
             Some(s.unwrap_or("none")),
             Some(c.unwrap_or("currentcolor")),
         );
+        out.extend(image(None));
+        return out;
     }
     if let Some(side) = prop
         .strip_prefix("border-")
@@ -22077,6 +22217,32 @@ mod tests {
             !dom.paint_suppressed(dom.get_by_id("l2").unwrap()),
             "longhand comma lists pair by index"
         );
+    }
+
+    #[test]
+    fn border_image_shorthand_expands_and_border_resets_it() {
+        let dom = Dom::parse_document(
+            "<style>#a{border-image:url(b.png) 26 round}\
+             #b{border-image:url(b.png) 10% fill / 2 / 4px 1 repeat stretch}\
+             #c{border-image:url(b.png) 26 round;border:1px solid}\
+             #d{border-image:url(b.png) / 3}</style><p id=a></p><p id=b></p><p id=c></p><p id=d></p>",
+        );
+        let value = |id: &str, property: &str| {
+            dom.computed_value(dom.get_by_id(id).unwrap(), property)
+                .unwrap_or_default()
+        };
+        assert_eq!(value("a", "border-image-source"), "url(b.png)");
+        assert_eq!(value("a", "border-image-slice"), "26");
+        assert_eq!(value("a", "border-image-repeat"), "round");
+        assert_eq!(value("a", "border-image-width"), "1");
+        assert_eq!(value("b", "border-image-slice"), "10% fill");
+        assert_eq!(value("b", "border-image-width"), "2");
+        assert_eq!(value("b", "border-image-outset"), "4px 1");
+        assert_eq!(value("b", "border-image-repeat"), "repeat stretch");
+        // #propdef-border: the border shorthand resets border-image.
+        assert_eq!(value("c", "border-image-source"), "none");
+        // A slash without a slice is invalid; the declaration is dropped.
+        assert_eq!(value("d", "border-image-source"), "");
     }
 
     #[test]

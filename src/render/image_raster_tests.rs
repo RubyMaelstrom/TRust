@@ -148,3 +148,73 @@ fn repeated_svg_sizes_survive_scrolling_hybrid() {
     };
     check_repeated_svg(|scene| renderer.render_rgba(scene).unwrap());
 }
+
+/// A source crop in natural image pixels is stretched over the command's
+/// rectangle (border-image slices draw this way).
+fn check_source_crop(mut render: impl FnMut(&Scene) -> super::vello_cpu::OwnedRgbaFrame) {
+    let mut scene = Scene {
+        viewport: ViewportMetrics::from_physical(PhysicalSize::new(40, 20), ScaleFactor::new(1.)),
+        primitives: Vec::new(),
+        controls: Vec::new(),
+        content_viewport: CssRect::new(0., 0., 40., 20.),
+        image_store: Default::default(),
+        canvas_images: Default::default(),
+        page_scroll_containers: Vec::new(),
+        page_size: CssSize::new(40., 20.),
+    };
+    let handle = ImageHandle(7);
+    // 4x2 image: left half red, right half blue.
+    let mut rgba = Vec::new();
+    for _ in 0..2 {
+        for x in 0..4 {
+            rgba.extend_from_slice(if x < 2 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 0, 255, 255]
+            });
+        }
+    }
+    scene.image_store.insert(
+        handle,
+        ImageResource {
+            svg_source: None,
+            width: 4,
+            height: 2,
+            rgba: Arc::from(rgba),
+            has_alpha: false,
+        },
+    );
+    for (x, crop) in [(0., 2.), (20., 0.)] {
+        scene.primitives.push(DisplayCommand::Image {
+            rect: CssRect::new(x, 0., 20., 20.),
+            handle,
+            source_rect: Some(CssRect::new(crop, 0., 2., 2.)),
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 0,
+            link: None,
+        });
+    }
+    let frame = render(&scene);
+    let pixel = |x: usize, y: usize| frame.pixels[(y * 40 + x) * 4..(y * 40 + x) * 4 + 4].to_vec();
+    for y in [1, 10, 18] {
+        assert_eq!(pixel(10, y), [0, 0, 255, 255]);
+        assert_eq!(pixel(30, y), [255, 0, 0, 255]);
+    }
+}
+
+#[test]
+fn source_crops_stretch_over_the_rectangle_cpu() {
+    let mut renderer = VelloCpuRenderer::new();
+    check_source_crop(|scene| renderer.render_rgba(scene).unwrap());
+}
+
+#[test]
+fn source_crops_stretch_over_the_rectangle_hybrid() {
+    let Ok(mut renderer) = futures::executor::block_on(VelloHybridRenderer::new_headless()) else {
+        eprintln!("Source crop regression not exercised: no Hybrid adapter");
+        return;
+    };
+    check_source_crop(|scene| renderer.render_rgba(scene).unwrap());
+}
