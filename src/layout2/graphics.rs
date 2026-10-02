@@ -4136,11 +4136,28 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
             (rect.width - top).max(0.0),
             (rect.height - top).max(0.0),
         );
+        // A rounded corner whose radius is at most half the width leaves
+        // the center line's corner square, and its mitered stroke would
+        // cover the rounded outer corner, so keep the stroke within the
+        // border area's ring. Larger radii already put the stroke's edges
+        // on the curves, and a second antialiased edge would thin them.
+        let clipped = radii
+            .corners
+            .iter()
+            .any(|&(x, y)| x > 0. && y > 0. && x.min(y) <= inset);
+        if clipped {
+            builder.commands.push(DisplayCommand::PushClip(border_ring(
+                rect, radii, widths, 0., 1.,
+            )));
+        }
         builder.commands.push(DisplayCommand::Stroke {
             shape: rounded_shape(center, inset_radii(radii, rect, center)),
             brush: PaintBrush::Solid(colors[0]),
             style: stroke_for_border(top, styles[0]),
         });
+        if clipped {
+            builder.commands.push(DisplayCommand::PopClip);
+        }
         return;
     }
     let sides = [
@@ -6922,6 +6939,32 @@ mod tests {
         assert_eq!(pixel(244, 204), [255, 255, 255]);
         assert_eq!(pixel(232, 220), [0, 0, 255]);
         assert_eq!(pixel(260, 191), [0, 0, 255]);
+    }
+
+    #[test]
+    fn uniform_dashed_borders_keep_radii_under_half_their_width() {
+        // CSS Backgrounds 3 #corner-shaping: every style follows the curve
+        // of the border. With a radius of at most half the width the dash
+        // stroke's center line has a square corner, whose mitered join
+        // painted the rounded-off outer corner.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="position:absolute;left:40px;top:40px;width:80px;height:50px;
+                border:12px dashed #00f;border-radius:4px"></div>
+            <div style="position:absolute;left:240px;top:40px;width:80px;height:50px;
+                border:12px dashed #00f;border-radius:6px"></div>"#,
+        );
+        for left in [40, 240] {
+            let (right, bottom) = (left + 103, 113);
+            for (x, y) in [(left, 40), (right, 40), (right, bottom), (left, bottom)] {
+                assert_eq!(pixel(x, y), [255, 255, 255], "({x}, {y})");
+            }
+            // The dash over the top-left corner still fills the ring up to
+            // its curve.
+            for (x, y) in [(left + 3, 41), (left + 1, 44), (left + 11, 51)] {
+                assert_eq!(pixel(x, y), [0, 0, 255], "({x}, {y})");
+            }
+        }
     }
 
     #[test]
