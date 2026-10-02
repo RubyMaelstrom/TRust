@@ -4676,8 +4676,28 @@ impl Flow<'_> {
                 })
                 .clamp(min_w, max_w),
         };
-        let def_h = self.height_px(&s.height, s, bt, bb, cb_h);
+        // CSS 2 §10.7: min/max-height apply to floats too. `item_frag` lays
+        // an imposed content height, so enforce them here, as for atomic
+        // inlines: clamp a definite height, else re-lay an automatic one
+        // whose laid height falls outside them.
+        let min_h = self
+            .height_px(&s.min_height, s, bt, bb, cb_h)
+            .unwrap_or(0.0);
+        let max_h = self
+            .height_px(&s.max_height, s, bt, bb, cb_h)
+            .unwrap_or(f32::INFINITY)
+            .max(min_h);
+        let def_h = self
+            .height_px(&s.height, s, bt, bb, cb_h)
+            .map(|height| height.clamp(min_h, max_h));
         let (mut frag, mut anchors) = self.item_frag(fb, content_w, cb_w, def_h, parent_inl);
+        if def_h.is_none() {
+            let natural = (frag.h - bt - bb).max(0.0);
+            let clamped = natural.clamp(min_h, max_h);
+            if (clamped - natural).abs() > 0.01 {
+                (frag, anchors) = self.item_frag(fb, content_w, cb_w, Some(clamped), parent_inl);
+            }
+        }
         // CSS Positioned Layout 3 §2/§3.3: `position:relative` lays the
         // box out in its ordinary formatting context first, then shifts it as
         // a purely visual effect. A float therefore keeps its unshifted margin
