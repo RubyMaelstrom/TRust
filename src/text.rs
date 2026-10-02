@@ -1259,6 +1259,9 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
     let range = line.text_range();
     let line_text = &text[range.clone()];
     let metrics = line.metrics();
+    // Glyphs sit on the same CSS baseline the layout aligns, including a
+    // negative half-leading that Parley's clamped line top omits.
+    let baseline = css_baseline(metrics);
     let mut runs = Vec::new();
     let mut clusters: Vec<Cluster> = Vec::new();
     let graphemes: Vec<Range<usize>> = line_text
@@ -1316,7 +1319,7 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
                 .map(|glyph| ShapedGlyph {
                     id: glyph.id,
                     x: glyph.x,
-                    y: glyph.y - metrics.block_min_coord,
+                    y: glyph.y - metrics.baseline + baseline,
                     advance: glyph.advance,
                 })
                 .collect(),
@@ -1337,7 +1340,7 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
         descent: metrics.descent,
         leading: metrics.leading,
         line_height: metrics.line_height,
-        baseline: css_baseline(&metrics),
+        baseline,
         underline: false,
         strikethrough: false,
         runs,
@@ -1384,6 +1387,37 @@ mod tests {
         assert_eq!(synthesis(false, 400.), (None, false));
         assert!(synthesis(true, 400.).0.is_some_and(|skew| skew > 0.));
         assert!(synthesis(false, 700.).1);
+    }
+
+    #[test]
+    fn glyphs_sit_on_the_baseline_with_negative_half_leading() {
+        // CSS 2.2 §10.8.1: a line-height below the content area gives a
+        // negative half-leading; the glyphs still sit on the baseline the
+        // line aligns (a large initial with `line-height: 1` must not drop).
+        for line_height in [
+            CssLineHeight::Normal,
+            CssLineHeight::Length(60.),
+            CssLineHeight::Length(20.),
+            CssLineHeight::Number(0.5),
+        ] {
+            let shaped = shape(
+                "Oh",
+                &TextStyle {
+                    family: "serif".into(),
+                    size: 40.,
+                    line_height,
+                    ..TextStyle::default()
+                },
+            );
+            for glyph in shaped.runs.iter().flat_map(|run| &run.glyphs) {
+                assert!(
+                    (glyph.y - shaped.baseline).abs() < 0.01,
+                    "{line_height:?}: glyph at {} on baseline {}",
+                    glyph.y,
+                    shaped.baseline
+                );
+            }
+        }
     }
 
     #[test]
