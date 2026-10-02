@@ -4233,7 +4233,7 @@ impl Flow<'_> {
         } else {
             abs_clip
         };
-        let child_fixed_clip = if f.paint.cb_fixed {
+        let child_fixed_clip = if f.paint.cb_fixed || frame_viewport {
             content_clip
         } else {
             fixed_clip
@@ -4260,7 +4260,12 @@ impl Flow<'_> {
         } else {
             abs_cb
         };
-        let child_fixed = if f.paint.cb_fixed {
+        // CSS Position 3 #fixed-cb: a fixed box's containing block is its
+        // document's viewport, which for a child navigable is the frame's
+        // content box, not the top-level viewport.
+        let child_fixed = if frame_viewport {
+            Some(child_abs)
+        } else if f.paint.cb_fixed {
             Some(pad)
         } else {
             fixed_cb

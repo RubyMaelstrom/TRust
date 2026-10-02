@@ -6762,6 +6762,35 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn fixed_boxes_in_a_frame_use_the_frames_viewport() {
+        // CSS Position 3 #fixed-cb: a fixed box's containing block is its
+        // document's viewport; for a child navigable that is the iframe's
+        // content box, not the top-level viewport.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div style="padding:30px 0 0 50px">
+               <iframe id=f style="width:120px;height:80px;border:0"></iframe></div></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<body style="margin:0"><div id=fx style="position:fixed;top:0;left:0;width:100%;height:100%">log</div></body>"#,
+            "https://frame.test/log",
+        )
+        .unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fixed = layout.boxes[&dom.get_by_id("fx").unwrap()];
+        assert_eq!((fixed.width, fixed.height), (120.0, 80.0), "{fixed:?}");
+    }
+
+    #[test]
     fn iframe_keeps_replaced_viewport_size_and_clips_nested_document() {
         // HTML Rendering §15.2/§15.4.1: a child navigable is sized to the
         // iframe content box and the iframe remains a replaced element. Its
