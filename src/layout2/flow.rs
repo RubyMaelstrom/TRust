@@ -947,7 +947,10 @@ impl Flow<'_> {
         // through the ratio. A specified ratio uses the box selected by
         // `box-sizing`; layout stores content dimensions, so convert a
         // border-box result back to the content box before height layout.
-        let ratio_h = (authored_h.is_none() && s.height.is_auto())
+        // A percentage height against an indefinite containing block height
+        // behaves as auto (CSS 2 §10.5), so it takes the ratio too.
+        let ratio_h = authored_h
+            .is_none()
             .then(|| {
                 s.aspect_ratio.map(|ratio| {
                     if s.border_box {

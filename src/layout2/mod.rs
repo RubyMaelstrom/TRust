@@ -4561,6 +4561,43 @@ mod tests {
     }
 
     #[test]
+    fn percentage_heights_transfer_through_aspect_ratio_into_shrink_to_fit_parents() {
+        // css-sizing-4 #aspect-ratio-size-transfers (its first example): a
+        // percentage height that resolves against a shrink-to-fit parent's
+        // definite height sizes the child's auto width through its ratio,
+        // in the parent's intrinsic size contribution and final layout
+        // alike. Against an auto-height parent it behaves as auto (CSS 2
+        // §10.5), so the ratio then gives the height from the width.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:13px/16px sans-serif">
+            <p><span id=a style="display:inline-block;height:60px"><span style="display:block;height:50%;aspect-ratio:2"></span></span>|</p>
+            <div id=b style="float:left;height:100px"><div style="height:100%;aspect-ratio:1">content</div></div>
+            <div id=c style="float:left;clear:left"><div id=ci style="height:100%;aspect-ratio:1">content</div></div>
+            <div id=d style="float:left;clear:left;height:80px;max-height:40px"><div style="height:100%;aspect-ratio:1"></div></div>
+            <div id=e style="float:left;clear:left;height:60px;box-sizing:border-box;padding:10px"><div style="height:50%;aspect-ratio:2"></div></div>
+            <p style="clear:both"><span id=f style="display:inline-block;height:40px"><span style="display:inline-block;height:100%;aspect-ratio:1"></span></span>|</p>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let size = |id: &str| {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (rect.width, rect.height)
+        };
+        for (id, expected) in [
+            ("a", (60.0, 60.0)),
+            ("b", (100.0, 100.0)),
+            ("d", (40.0, 40.0)),
+            ("e", (60.0, 60.0)),
+            ("f", (40.0, 40.0)),
+        ] {
+            assert_eq!(size(id), expected, "{id}");
+        }
+        let (width, height) = size("c");
+        assert!(width > 30.0 && width < 80.0, "{width}");
+        assert_eq!(height, width, "the content width through the ratio");
+        assert_eq!(size("ci"), (width, width));
+    }
+
+    #[test]
     fn image_dimension_attributes_accept_percentages() {
         // HTML #maps-to-the-dimension-property: width="25%" is 25% of the
         // containing block; a percentage height against an auto-height

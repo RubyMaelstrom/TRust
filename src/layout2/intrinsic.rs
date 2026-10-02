@@ -149,10 +149,11 @@ impl Flow<'_> {
         {
             return 0.0;
         }
+        let basis = self.intrinsic_height_basis(b);
         match &b.content {
             Content::Blocks(kids) => kids
                 .iter()
-                .map(|k| self.contribution(k, mode, &here))
+                .map(|k| self.contribution(k, mode, &here, basis))
                 .fold(0.0f32, f32::max),
             Content::Inlines(inls) => {
                 let cap = match mode {
@@ -169,7 +170,7 @@ impl Flow<'_> {
                 let atom_sizes: Vec<AtomBoxSize> = atoms
                     .iter()
                     .map(|(ab, actx)| {
-                        let w = self.contribution(ab, mode, actx);
+                        let w = self.contribution(ab, mode, actx, basis);
                         AtomBoxSize {
                             width: w.max(0.0),
                             height: actx.text_style().size.max(1.0),
@@ -221,7 +222,7 @@ impl Flow<'_> {
                             Some(super::float::Side::Right) => has.right = true,
                             None => {}
                         }
-                        *shelves.last_mut().unwrap() += self.contribution(fb, mode, fctx);
+                        *shelves.last_mut().unwrap() += self.contribution(fb, mode, fctx, basis);
                     }
                     // Inline content flows beside the first shelf's floats.
                     let first = shelves[0] + inline_w;
@@ -229,7 +230,7 @@ impl Flow<'_> {
                 } else {
                     floats
                         .iter()
-                        .map(|(fb, fctx)| self.contribution(fb, mode, fctx))
+                        .map(|(fb, fctx)| self.contribution(fb, mode, fctx, basis))
                         .fold(inline_w, f32::max)
                 }
             }
@@ -239,7 +240,9 @@ impl Flow<'_> {
                 let u = Units::of(self.dom, b.node);
                 let fs = super::flex::container_style(self.dom, b.node, u, self.vp);
                 let gap = fs.gap_main.resolve(None).unwrap_or(0.0).max(0.0);
-                let contributions = items.iter().map(|it| self.contribution(it, mode, &here));
+                let contributions = items
+                    .iter()
+                    .map(|it| self.contribution(it, mode, &here, basis));
                 if fs.row {
                     // §9.9.1 shape: a row container's max-content is the sum
                     // of its items' max-content contributions; its
@@ -260,11 +263,45 @@ impl Flow<'_> {
         }
     }
 
+    /// The definite content height a box's children resolve percentage
+    /// heights against while it is measured (CSS 2 §10.5): its own height
+    /// when that is a length, clamped by its min/max lengths. A percentage
+    /// height would tie the per-element measurement to its context, so it
+    /// stays indefinite here, as does an automatic height.
+    fn intrinsic_height_basis(&self, b: &BoxNode) -> Option<f32> {
+        let s = &b.style;
+        let side = |l: &Len| l.resolve(Some(0.0)).unwrap_or(0.0).max(0.0);
+        let edges = s.border[super::style::TOP]
+            + s.border[super::style::BOTTOM]
+            + side(&s.padding[super::style::TOP])
+            + side(&s.padding[super::style::BOTTOM]);
+        let content = |l: &Len| {
+            l.resolve(None).map(|v| {
+                if s.border_box {
+                    (v - edges).max(0.0)
+                } else {
+                    v.max(0.0)
+                }
+            })
+        };
+        let min = content(&s.min_height).unwrap_or(0.0);
+        let max = content(&s.max_height).unwrap_or(f32::INFINITY).max(min);
+        content(&s.height).map(|height| height.clamp(min, max))
+    }
+
     /// A block-level child's margin-box contribution to its parent's
     /// intrinsic width: its definite (non-percentage) width — else its own
     /// intrinsic width — clamped by non-percentage min/max, plus borders,
-    /// padding, and margins (css-sizing-3 §5.2.1).
-    pub(crate) fn contribution(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
+    /// padding, and margins (css-sizing-3 §5.2.1). `cb_h` is the parent's
+    /// definite content height, against which the child's percentage
+    /// heights resolve for a size transferred through its aspect ratio.
+    pub(crate) fn contribution(
+        &self,
+        b: &BoxNode,
+        mode: IMode,
+        inl: &InlineStyle,
+        cb_h: Option<f32>,
+    ) -> f32 {
         let s = &b.style;
         // Cyclic percentages in min sizes, margins, and padding resolve
         // against zero for every intrinsic contribution. A compressible
@@ -321,7 +358,7 @@ impl Flow<'_> {
             let bt = s.border[super::style::TOP] + side(&s.padding[super::style::TOP]).max(0.0);
             let bb =
                 s.border[super::style::BOTTOM] + side(&s.padding[super::style::BOTTOM]).max(0.0);
-            self.ratio_auto_width(b, bp, bt, bb, None)
+            self.ratio_auto_width(b, bp, bt, bb, cb_h)
         };
         let ratio_width = || {
             ratio.and_then(|ratio| {
