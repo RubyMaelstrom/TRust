@@ -4379,6 +4379,20 @@ mod tests {
     }
 
     #[test]
+    fn a_float_that_does_not_fit_goes_below_the_line_box() {
+        // CSS 2 §9.5: a float with no room beside the current line moves
+        // below it, so below the baseline-aligned line box (here the strut's
+        // descent under a 30px inline-block), not the tallest piece.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/24px sans-serif"><div style="width:400px">
+            <span id=a style="display:inline-block;width:400px;height:30px"></span><div id=f style="float:left;width:100px;height:10px"></div></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 500.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let gap = rect("f").top - (rect("a").top + rect("a").height);
+        assert!((6.0..8.0).contains(&gap), "{gap}");
+    }
+
+    #[test]
     fn a_block_level_static_position_ignores_floats() {
         // CSS Position 3 #staticpos-rect: the hypothetical static box of a
         // block-level element ignores floats as block boxes do (CSS 2
