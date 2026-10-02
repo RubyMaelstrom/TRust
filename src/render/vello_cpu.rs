@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vello_cpu::color::palette::css::{
     BLACK, BLUE, CYAN, DARK_GRAY, GRAY, LIGHT_GRAY, WHITE, YELLOW,
 };
-use vello_cpu::kurbo::{Affine, BezPath, Cap, Circle, Diagonal2, Join, Rect, Shape as _, Stroke};
+use vello_cpu::kurbo::{Affine, BezPath, Cap, Circle, Join, Rect, Shape as _, Stroke};
 use vello_cpu::peniko::{
     ColorStop, Compose, Gradient, ImageBrush, ImageQuality, ImageSampler, Mix,
 };
@@ -844,21 +844,39 @@ fn paint_glyphs(
                 y: origin.y + glyph.y,
             })
             .collect();
-        let mut glyphs_builder = context
+        let skew = run.synthetic_oblique_skew();
+        let bold = run.synth_bold.then(|| glyphs.clone());
+        let mut fill = context
             .glyph_run(resources, run.font.data())
             .font_size(run.font_size)
             .hinting_mode(TEXT_HINTING_MODE)
             .normalized_coords(&run.normalized_coords);
-        if run.synth_bold {
-            let amount = f64::from(run.font_size) * 0.025;
-            glyphs_builder = glyphs_builder
-                .font_embolden(glifo::FontEmbolden::new(Diagonal2::new(amount, amount)));
+        if let Some(skew) = skew {
+            fill = fill.glyph_transform(Affine::skew(skew, 0.0));
         }
-        if let Some(skew) = run.synthetic_oblique_skew() {
-            glyphs_builder = glyphs_builder.glyph_transform(Affine::skew(skew, 0.0));
+        fill.fill_glyphs(glyphs.into_iter());
+        if let Some(glyphs) = bold {
+            context.set_stroke(synthetic_bold_stroke(run.font_size));
+            let mut stroke = context
+                .glyph_run(resources, run.font.data())
+                .font_size(run.font_size)
+                .hinting_mode(TEXT_HINTING_MODE)
+                .normalized_coords(&run.normalized_coords);
+            if let Some(skew) = skew {
+                stroke = stroke.glyph_transform(Affine::skew(skew, 0.0));
+            }
+            stroke.stroke_glyphs(glyphs.into_iter());
         }
-        glyphs_builder.fill_glyphs(glyphs.into_iter());
     }
+}
+
+/// Synthetic bold (CSS Fonts 4 #font-synthesis-weight) as a fill plus an
+/// outline stroke, as Skia draws it. Expanding the outline itself instead
+/// threw long spikes off sharp corners of some CFF outlines.
+pub(super) fn synthetic_bold_stroke(font_size: f32) -> Stroke {
+    Stroke::new(f64::from(font_size) * 0.05)
+        .with_join(vello_cpu::kurbo::Join::Miter)
+        .with_miter_limit(4.0)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

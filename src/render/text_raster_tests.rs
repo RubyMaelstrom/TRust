@@ -27,6 +27,10 @@ fn glyph_id() -> u32 {
 }
 
 fn glyph_scene(scale: f64) -> Scene {
+    glyph_scene_with(scale, false)
+}
+
+fn glyph_scene_with(scale: f64, synth_bold: bool) -> Scene {
     let size = crate::theme::TERMINAL_FONT_SIZE_CSS_PX;
     let advance = size * 0.6;
     let shaped = ShapedText {
@@ -49,7 +53,7 @@ fn glyph_scene(scale: f64) -> Scene {
             }],
             text_range: 0..1,
             rtl: false,
-            synth_bold: false,
+            synth_bold,
             synth_skew_degrees: None,
         }],
         ..Default::default()
@@ -92,6 +96,47 @@ fn ink_height(frame: &OwnedRgbaFrame) -> usize {
         .map(|(y, _)| y);
     let first = rows.next().expect("the glyph must contain visible ink");
     rows.next_back().unwrap_or(first) - first + 1
+}
+
+/// The columns and rows holding visible ink: (left, top, right, bottom).
+fn ink_bounds(frame: &OwnedRgbaFrame) -> (usize, usize, usize, usize) {
+    let width = frame.size.width as usize;
+    let mut bounds = (usize::MAX, usize::MAX, 0, 0);
+    for (index, pixel) in frame.pixels.as_chunks::<4>().0.iter().enumerate() {
+        if pixel[3] > 32 {
+            let (x, y) = (index % width, index / width);
+            bounds = (
+                bounds.0.min(x),
+                bounds.1.min(y),
+                bounds.2.max(x),
+                bounds.3.max(y),
+            );
+        }
+    }
+    bounds
+}
+
+#[test]
+fn synthetic_bold_thickens_glyphs_by_its_stroke_on_both_backends() {
+    // CSS Fonts 4 #font-synthesis-weight: synthetic bold is drawn as a fill
+    // plus a stroke of the outline (as in Skia), which widens each stem by
+    // the stroke and never reaches beyond half of it.
+    let mut frames = vec![{
+        let mut cpu = VelloCpuRenderer::new();
+        [false, true].map(|bold| cpu.render_rgba(&glyph_scene_with(1.0, bold)).unwrap())
+    }];
+    if let Ok(mut hybrid) = futures::executor::block_on(VelloHybridRenderer::new_headless()) {
+        frames.push(
+            [false, true].map(|bold| hybrid.render_rgba(&glyph_scene_with(1.0, bold)).unwrap()),
+        );
+    }
+    let half = (f64::from(crate::theme::TERMINAL_FONT_SIZE_CSS_PX) * 0.025).ceil() as usize + 1;
+    for [regular, bold] in frames {
+        let (r, b) = (ink_bounds(&regular), ink_bounds(&bold));
+        assert!(b.2 - b.0 > r.2 - r.0, "wider: {r:?} {b:?}");
+        assert!(r.0 - b.0 <= half && b.2 - r.2 <= half, "{r:?} {b:?}");
+        assert!(r.1 - b.1 <= half && b.3 - r.3 <= half, "{r:?} {b:?}");
+    }
 }
 
 #[test]

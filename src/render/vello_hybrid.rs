@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vello_common::color::PremulRgba8;
-use vello_common::kurbo::{Affine, BezPath, Diagonal2, Rect};
+use vello_common::kurbo::{Affine, BezPath, Rect};
 use vello_common::paint::ImageSource;
 use vello_common::peniko::{ImageBrush, ImageQuality, ImageSampler};
 use vello_hybrid::{Pixmap, RenderSize, RenderTargetConfig, Resources, TextureBindings};
@@ -1543,25 +1543,35 @@ fn paint_glyphs(
                     .map_or(default, |[r, g, b]| PaintColor::Rgba(r, g, b, 255)),
             ));
         }
-        let glyphs = run.glyphs.iter().map(|glyph| glifo::Glyph {
-            id: glyph.id,
-            x: origin.x + glyph.x,
-            y: origin.y + glyph.y,
-        });
-        let mut builder = target
+        let glyphs = || {
+            run.glyphs.iter().map(|glyph| glifo::Glyph {
+                id: glyph.id,
+                x: origin.x + glyph.x,
+                y: origin.y + glyph.y,
+            })
+        };
+        let skew = run.synthetic_oblique_skew();
+        let mut fill = target
             .glyph_run(resources, run.font.data())
             .font_size(run.font_size)
             .hinting_mode(super::vello_cpu::TEXT_HINTING_MODE)
             .normalized_coords(&run.normalized_coords);
+        if let Some(skew) = skew {
+            fill = fill.glyph_transform(Affine::skew(skew, 0.0));
+        }
+        fill.fill_glyphs(glyphs());
         if run.synth_bold {
-            let amount = f64::from(run.font_size) * 0.025;
-            builder =
-                builder.font_embolden(glifo::FontEmbolden::new(Diagonal2::new(amount, amount)));
+            target.set_stroke(super::vello_cpu::synthetic_bold_stroke(run.font_size));
+            let mut stroke = target
+                .glyph_run(resources, run.font.data())
+                .font_size(run.font_size)
+                .hinting_mode(super::vello_cpu::TEXT_HINTING_MODE)
+                .normalized_coords(&run.normalized_coords);
+            if let Some(skew) = skew {
+                stroke = stroke.glyph_transform(Affine::skew(skew, 0.0));
+            }
+            stroke.stroke_glyphs(glyphs());
         }
-        if let Some(skew) = run.synthetic_oblique_skew() {
-            builder = builder.glyph_transform(Affine::skew(skew, 0.0));
-        }
-        builder.fill_glyphs(glyphs);
     }
 }
 
