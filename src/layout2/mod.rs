@@ -4075,6 +4075,34 @@ mod tests {
     }
 
     #[test]
+    fn text_align_last_aligns_the_last_and_forced_lines() {
+        // CSS Text 3 #text-align-last-property: it aligns the last line and
+        // lines before a forced break; `auto` follows text-align, except
+        // that justified text ends start-aligned.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <div style="width:400px;text-align-last:justify"><span id=a style="display:inline-block;width:40px;height:10px"></span>
+            <span id=b style="display:inline-block;width:40px;height:10px"></span></div>
+            <div style="width:300px;text-align:center;text-align-last:right"><span id=c>alpha</span><br><span id=d>beta</span></div>
+            <div style="width:300px;text-align:justify"><span id=e>x</span></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 500.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(rect("a").left, 0.0);
+        assert_eq!(
+            rect("b").left + rect("b").width,
+            400.0,
+            "justified to the end"
+        );
+        assert_eq!(
+            rect("c").left + rect("c").width,
+            300.0,
+            "before a forced break"
+        );
+        assert_eq!(rect("d").left + rect("d").width, 300.0, "the last line");
+        assert_eq!(rect("e").left, 0.0);
+    }
+
+    #[test]
     fn nobr_and_xmp_take_their_ua_white_space() {
         // HTML Rendering #phrasing-content-3 `nobr { white-space: nowrap }`
         // and #flow-content-3 `xmp { white-space: pre }`.

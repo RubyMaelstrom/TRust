@@ -4568,6 +4568,9 @@ impl Flow<'_> {
             }),
             &atom_sizes,
         );
+        if let Some(align_last) = super::style::block_align_last(self.dom, inl.node) {
+            ifc.set_align_last(align_last);
+        }
         if let Some(source) = marker_image {
             let mut mctx = inl.clone();
             mctx.kind = crate::layout2::ItemKind::Image;
