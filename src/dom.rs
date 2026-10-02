@@ -546,14 +546,15 @@ impl<T> NodeCache<T> {
 }
 
 /// One element's author-cascade winners, per target box: the element itself
-/// plus its `::before`/`::after` generated boxes (their rules ride the same
-/// matched list, bucketed by the rule's pseudo target). An absent key = no
-/// author declaration for that property (the cascade's `None`).
+/// plus its `::before`/`::after`/`::first-letter` boxes (their rules ride the
+/// same matched list, bucketed by the rule's pseudo target). An absent key =
+/// no author declaration for that property (the cascade's `None`).
 #[derive(Clone, Default)]
 struct CascadedMaps {
     elem: FxHashMap<String, String>,
     before: FxHashMap<String, String>,
     after: FxHashMap<String, String>,
+    first_letter: FxHashMap<String, String>,
     custom_bases: FxHashMap<(Option<PseudoEl>, String), std::rc::Rc<url::Url>>,
 }
 
@@ -562,6 +563,16 @@ impl CascadedMaps {
         match which {
             PseudoEl::Before => &self.before,
             PseudoEl::After => &self.after,
+            PseudoEl::FirstLetter => &self.first_letter,
+        }
+    }
+
+    fn target_mut(&mut self, pseudo: Option<PseudoEl>) -> &mut FxHashMap<String, String> {
+        match pseudo {
+            None => &mut self.elem,
+            Some(PseudoEl::Before) => &mut self.before,
+            Some(PseudoEl::After) => &mut self.after,
+            Some(PseudoEl::FirstLetter) => &mut self.first_letter,
         }
     }
 }
@@ -971,7 +982,12 @@ impl Dom {
                         continue;
                     }
                     bytes = bytes.saturating_add(std::mem::size_of::<CascadedMaps>());
-                    for map in [&value.elem, &value.before, &value.after] {
+                    for map in [
+                        &value.elem,
+                        &value.before,
+                        &value.after,
+                        &value.first_letter,
+                    ] {
                         fixed_map!(map, (String, String));
                         for (name, value) in map {
                             bytes = bytes
@@ -5118,6 +5134,7 @@ impl Dom {
         let mut elem = Winners::default();
         let mut before = Winners::default();
         let mut after = Winners::default();
+        let mut first_letter = Winners::default();
         let mut conditional_pseudos = Vec::new();
         // HTML rendering hints have their own origin below every author
         // layer. `revert` discards them, while `revert-layer` can reveal them
@@ -5181,6 +5198,7 @@ impl Dom {
                     None => &mut elem,
                     Some(PseudoEl::Before) => &mut before,
                     Some(PseudoEl::After) => &mut after,
+                    Some(PseudoEl::FirstLetter) => &mut first_letter,
                 };
                 for (pk, (imp, v)) in &r.decls {
                     consider_into(
@@ -5315,6 +5333,7 @@ impl Dom {
                         .collect(),
                     before: Default::default(),
                     after: Default::default(),
+                    first_letter: Default::default(),
                     custom_bases: Default::default(),
                 }),
             );
@@ -5322,10 +5341,10 @@ impl Dom {
                 if !r.containers.iter().all(|q| q.matches(self, id, true)) {
                     continue;
                 }
-                let target = if rule_pseudo(r) == Some(PseudoEl::Before) {
-                    &mut before
-                } else {
-                    &mut after
+                let target = match rule_pseudo(r) {
+                    Some(PseudoEl::Before) => &mut before,
+                    Some(PseudoEl::FirstLetter) => &mut first_letter,
+                    _ => &mut after,
                 };
                 for (pk, (imp, value)) in &r.decls {
                     consider_into(
@@ -5355,12 +5374,14 @@ impl Dom {
             elem: strip(&elem),
             before: strip(&before),
             after: strip(&after),
+            first_letter: strip(&first_letter),
             custom_bases: Default::default(),
         };
         for (pseudo, winners) in [
             (None, &elem),
             (Some(PseudoEl::Before), &before),
             (Some(PseudoEl::After), &after),
+            (Some(PseudoEl::FirstLetter), &first_letter),
         ] {
             for (name, winner) in winners.iter().filter(|(name, _)| name.starts_with("--")) {
                 if let Some((key, _)) = winner.resolve_with_key(|_| false)
@@ -5381,6 +5402,7 @@ impl Dom {
                 (None, &elem),
                 (Some(PseudoEl::Before), &before),
                 (Some(PseudoEl::After), &after),
+                (Some(PseudoEl::FirstLetter), &first_letter),
             ] {
                 let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
                 for pass in 0..=custom_count + 1 {
@@ -5420,11 +5442,7 @@ impl Dom {
                             }
                         }
                         let value = selected.map_or("revert", |(_, value)| value);
-                        let target = match pseudo {
-                            None => &mut maps.elem,
-                            Some(PseudoEl::Before) => &mut maps.before,
-                            Some(PseudoEl::After) => &mut maps.after,
-                        };
+                        let target = maps.target_mut(pseudo);
                         if target.get(property).is_none_or(|old| old != value) {
                             target.insert(property.clone(), value.to_owned());
                             changed = true;
@@ -5460,12 +5478,8 @@ impl Dom {
                                     .trim()
                                     .eq_ignore_ascii_case("revert-layer")
                             });
-                            match pseudo {
-                                None => &mut maps.elem,
-                                Some(PseudoEl::Before) => &mut maps.before,
-                                Some(PseudoEl::After) => &mut maps.after,
-                            }
-                            .insert(property.clone(), value.to_owned());
+                            maps.target_mut(pseudo)
+                                .insert(property.clone(), value.to_owned());
                         }
                         break;
                     }
@@ -5475,7 +5489,7 @@ impl Dom {
         // CSS Logical 1 #box: compute axes before pairing declarations.
         // Keep every layer candidate, including a physical fallback below a
         // logical revert-layer. Source order includes declaration order.
-        if [&elem, &before, &after]
+        if [&elem, &before, &after, &first_letter]
             .iter()
             .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
         {
@@ -5488,6 +5502,7 @@ impl Dom {
                 (None, &mut elem),
                 (Some(PseudoEl::Before), &mut before),
                 (Some(PseudoEl::After), &mut after),
+                (Some(PseudoEl::FirstLetter), &mut first_letter),
             ] {
                 let logical: Vec<_> = winners
                     .keys()
@@ -5528,12 +5543,7 @@ impl Dom {
                         }
                     }
                     physical.push(target);
-                    match pseudo {
-                        None => &mut maps.elem,
-                        Some(PseudoEl::Before) => &mut maps.before,
-                        Some(PseudoEl::After) => &mut maps.after,
-                    }
-                    .remove(&name);
+                    maps.target_mut(pseudo).remove(&name);
                 }
                 for name in physical {
                     let value = winners[&name]
@@ -5554,12 +5564,7 @@ impl Dom {
                                 .eq_ignore_ascii_case("revert-layer")
                         })
                         .to_owned();
-                    match pseudo {
-                        None => &mut maps.elem,
-                        Some(PseudoEl::Before) => &mut maps.before,
-                        Some(PseudoEl::After) => &mut maps.after,
-                    }
-                    .insert(name, value);
+                    maps.target_mut(pseudo).insert(name, value);
                 }
                 self.cascaded_cache.borrow_mut().put(
                     id,
@@ -5815,6 +5820,9 @@ impl Dom {
         let attr = match which {
             PseudoEl::Before => "data-trust-before-items",
             PseudoEl::After => "data-trust-after-items",
+            // CSS Pseudo 4 #first-letter-pattern: the letter is the
+            // element's own text; `content` does not apply.
+            PseudoEl::FirstLetter => return None,
         };
         if let Some(baked) = self.attr(id, attr)
             && let Ok(items) = serde_json::from_str(baked)
@@ -5824,6 +5832,7 @@ impl Dom {
         let attr = match which {
             PseudoEl::Before => "data-trust-before",
             PseudoEl::After => "data-trust-after",
+            PseudoEl::FirstLetter => return None,
         };
         if let Some(text) = self.attr(id, attr) {
             return Some(vec![GeneratedContent::Text(text.to_string())]);
@@ -5901,6 +5910,15 @@ impl Dom {
         self.cascaded_maps(id).pseudo(which).get(prop).cloned()
     }
 
+    /// Whether `::first-letter` declarations apply to `id`, from the cascade
+    /// or (in a stylesheet-free snapshot) from their baked attribute.
+    pub(crate) fn has_first_letter_style(&self, id: NodeId) -> bool {
+        self.attr(id, PseudoEl::FirstLetter.baked_style_attr())
+            .is_some()
+            || (self.style_index().has_first_letter
+                && !self.cascaded_maps(id).first_letter.is_empty())
+    }
+
     /// The layout-facing computed value on a generated `::before`/`::after`
     /// box. Tree-abiding pseudo-elements inherit from their originating
     /// element (CSS Pseudo 4 §4), while non-inherited properties take their
@@ -5954,10 +5972,7 @@ impl Dom {
         which: PseudoEl,
         prop: &str,
     ) -> Option<String> {
-        let attr = match which {
-            PseudoEl::Before => "data-trust-before-style",
-            PseudoEl::After => "data-trust-after-style",
-        };
+        let attr = which.baked_style_attr();
         let mut found = None;
         for decl in split_top_level(self.attr(id, attr)?, ';') {
             let Some((name, value, _important)) = parse_decl(decl) else {
@@ -6420,6 +6435,9 @@ impl Dom {
             .iter()
             .copied()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
+        index.has_first_letter = unique.iter().any(|r| {
+            r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::FirstLetter)
+        });
         index.has_revert_layer = unique.iter().copied().any(|r| {
             r.decls
                 .iter()
@@ -9007,16 +9025,23 @@ impl Dom {
                 // collapse the box and its absolutely positioned children.
                 let pseudo_style = self.baked_pseudo_style(id, which);
                 if !pseudo_style.is_empty() {
-                    let style_attr = match which {
-                        PseudoEl::Before => "data-trust-before-style",
-                        PseudoEl::After => "data-trust-after-style",
-                    };
+                    let style_attr = which.baked_style_attr();
                     out.push(' ');
                     out.push_str(style_attr);
                     out.push_str("=\"");
                     out.push_str(&escape_attr(&pseudo_style));
                     out.push('"');
                 }
+            }
+        }
+        if self.style_index().has_first_letter {
+            let first_letter = self.baked_pseudo_style(id, PseudoEl::FirstLetter);
+            if !first_letter.is_empty() {
+                out.push(' ');
+                out.push_str(PseudoEl::FirstLetter.baked_style_attr());
+                out.push_str("=\"");
+                out.push_str(&escape_attr(&first_letter));
+                out.push('"');
             }
         }
         // Bake the clearfix signal for the same reason: the layout re-parses
@@ -10187,13 +10212,26 @@ enum Combinator {
     SubsequentSibling,
 }
 
-/// The `::before` / `::after` generated-content pseudo-elements (CSS2
-/// `:before`/`:after` legacy spelling too). The only pseudo-elements we
-/// act on; others parse but never match.
+/// The `::before` / `::after` generated-content pseudo-elements and the
+/// `::first-letter` typographic pseudo-element (CSS2 single-colon legacy
+/// spellings too). The only pseudo-elements we act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PseudoEl {
     Before,
     After,
+    FirstLetter,
+}
+
+impl PseudoEl {
+    /// The attribute carrying the pseudo's declarations into a
+    /// stylesheet-free presentation snapshot.
+    fn baked_style_attr(self) -> &'static str {
+        match self {
+            PseudoEl::Before => "data-trust-before-style",
+            PseudoEl::After => "data-trust-after-style",
+            PseudoEl::FirstLetter => "data-trust-first-letter-style",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -11128,7 +11166,12 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                 // evaluate their own extensions (such as :visible).
                 // https://drafts.csswg.org/selectors-4/#invalid
                 // https://dom.spec.whatwg.org/#scope-match-a-selectors-string
-                if double_colon && !matches!(name.as_str(), "before" | "after" | "slotted") {
+                if double_colon
+                    && !matches!(
+                        name.as_str(),
+                        "before" | "after" | "first-letter" | "slotted"
+                    )
+                {
                     if name == "backdrop" && arg.is_none() {
                         // CSS Positioned Layout 4 §3.2 defines ::backdrop as a
                         // valid pseudo-element. It has no ordinary DOM element
@@ -11233,15 +11276,17 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     }
                     compound.slotted = Some(Box::new(inner));
                     compound.pseudos += 1;
-                } else if name == "before" || name == "after" {
+                } else if matches!(name.as_str(), "before" | "after" | "first-letter") {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
                     // targets the element's ::before/::after box. Counted in
                     // `spec()` via `pseudo` (the TYPE bucket), not `pseudos`.
-                    compound.pseudo = Some(if name == "before" {
-                        PseudoEl::Before
-                    } else {
-                        PseudoEl::After
+                    // ::first-letter likewise targets a box inside the element
+                    // (CSS2 also spells all three with one colon).
+                    compound.pseudo = Some(match name.as_str() {
+                        "before" => PseudoEl::Before,
+                        "after" => PseudoEl::After,
+                        _ => PseudoEl::FirstLetter,
                     });
                 } else if name == "scope" {
                     // Matches the query root (set by `query`); inert in the
@@ -14048,6 +14093,9 @@ struct StyleIndex {
     /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
     /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
+    /// Whether any rule targets `::first-letter`, so box construction looks
+    /// for first-letter text only on pages that style it.
+    has_first_letter: bool,
     /// One probe per `:hover`-bearing compound of every rule whose
     /// applicability depends on the hover chain AND whose declarations can
     /// change the RENDER (a `PROPS`-tracked property, generated `content`, or
@@ -14300,6 +14348,7 @@ impl StyleIndex {
             properties,
             rule_bases,
             has_opacity,
+            has_first_letter,
             hover_probes,
             hover_buckets,
             cursor_buckets,
@@ -14307,6 +14356,7 @@ impl StyleIndex {
         } = self;
         let _ = (
             has_opacity,
+            has_first_letter,
             has_container_queries,
             has_revert_layer,
             boxless_content_may_escape,
@@ -20276,6 +20326,35 @@ mod tests {
             dom.computed_value_resolved(frame, "width").as_deref(),
             Some("0"),
             "unitless zero remains a valid length"
+        );
+    }
+
+    #[test]
+    fn presentation_snapshots_keep_first_letter_declarations() {
+        // The stylesheet-free snapshot carries ::first-letter declarations
+        // like those of ::before/::after.
+        let dom = Dom::parse_document(
+            "<style>p:first-letter{color:red;font-size:2em}</style><p id=p>Hi</p><p id=q>x</p>",
+        );
+        let p = dom.get_by_id("p").unwrap();
+        assert_eq!(
+            dom.pseudo_layout_value(p, PseudoEl::FirstLetter, "color")
+                .as_deref(),
+            Some("red")
+        );
+        let snapshot =
+            Dom::parse_document(&dom.serialize_live(DOCUMENT, &std::collections::HashSet::new()));
+        let p = snapshot.get_by_id("p").unwrap();
+        assert!(snapshot.has_first_letter_style(p));
+        assert_eq!(
+            snapshot
+                .pseudo_layout_value(p, PseudoEl::FirstLetter, "font-size")
+                .as_deref(),
+            Some("2em")
+        );
+        assert!(
+            dom.has_first_letter_style(dom.get_by_id("q").unwrap())
+                && !dom.has_first_letter_style(DOCUMENT)
         );
     }
 

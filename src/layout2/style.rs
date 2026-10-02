@@ -449,8 +449,23 @@ impl BoxStyle {
     /// from either the live cascade or the declarations baked into a serialized
     /// live snapshot.
     pub fn of_pseudo(dom: &Dom, id: NodeId, which: PseudoEl, vp: Vp) -> BoxStyle {
-        let u = Units::of(dom, id);
         let cv = |prop: &str| dom.pseudo_layout_value(id, which, prop);
+        // CSS Values 4 #font-relative-lengths: `em` on the pseudo's own box
+        // is its own font size, which it resolves against the originating
+        // element's (as `with_pseudo` does for its text).
+        let mut u = Units::of(dom, id);
+        if dom.pseudo_style(id, which, "font-size").is_some()
+            || dom.baked_pseudo_value(id, which, "font-size").is_some()
+        {
+            let fs = cv("font-size")
+                .as_deref()
+                .and_then(|value| {
+                    crate::dom::font_size_px_at(value, u.fs, u.root, dom.viewport_px())
+                })
+                .unwrap_or(u.fs);
+            u.ch *= fs / u.fs.max(f32::EPSILON);
+            u.fs = fs;
+        }
         let len = |prop: &str, default: Len| Len::parse_or(cv(prop).as_deref(), u, vp, default);
         let border = |side: &str| match cv(&format!("border-{side}-style"))
             .as_deref()

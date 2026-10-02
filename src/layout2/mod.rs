@@ -47,6 +47,7 @@ mod diagnostics;
 #[cfg(test)]
 mod engine_bench;
 pub(crate) mod filter;
+mod first_letter;
 mod flex;
 mod float;
 mod flow;
