@@ -4799,6 +4799,37 @@ mod tests {
     }
 
     #[test]
+    fn leading_floats_sit_below_a_margin_collapsing_through_their_parent() {
+        // CSS 2 §8.3.1: a parent's top margin collapses with its first in-flow
+        // child's through the empty anonymous block holding preceding floats,
+        // so the parent's content edge, and those floats, lie below the
+        // child's margin. A border or a formatting-context root separates
+        // them, as does earlier content. Values match Blink.
+        let html = r#"<!doctype html><style>body{margin:0;font:16px/20px sans-serif}
+            .f{float:left;width:50px;height:30px}p{margin:16px 0}section{width:400px;margin-bottom:60px}</style>
+            <section id=s1><div class=f id=f1></div><p id=p1>plain parent</p></section>
+            <section id=s2 style="border-top:2px solid"><div class=f id=f2></div><p id=p2>bordered</p></section>
+            <section id=s3 style="overflow:hidden"><div class=f id=f3></div><p id=p3>bfc</p></section>
+            <section id=s4><p>first</p><div class=f id=f4></div><p id=p4>after content</p></section>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let top = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].top;
+        for (section, float, paragraph, expected) in [
+            ("s1", "f1", "p1", (16.0, 0.0, 0.0)),
+            ("s2", "f2", "p2", (96.0, 2.0, 18.0)),
+            ("s3", "f3", "p3", (194.0, 0.0, 16.0)),
+            ("s4", "f4", "p4", (306.0, 36.0, 36.0)),
+        ] {
+            let base = top(section);
+            assert_eq!(
+                (base, top(float) - base, top(paragraph) - base),
+                expected,
+                "{section}"
+            );
+        }
+    }
+
+    #[test]
     fn a_line_too_short_beside_floats_moves_below_them() {
         // CSS 2 §9.5: a line box shortened by floats so far that none of its
         // content fits moves down until some fits or no floats remain. "All"
