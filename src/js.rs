@@ -154,6 +154,10 @@ pub struct PageEnv {
     pub net: Option<tokio::runtime::Handle>,
     pub storage: Option<WebStorage>,
     pub blobs: BlobMap,
+    /// A frame document of this page has scripts. Nested documents run
+    /// their own scripts (HTML #the-iframe-element), which only the live
+    /// actor can do, so the page stays live even without scripts of its own.
+    pub(crate) scripted_frames: bool,
 }
 
 impl PageEnv {
@@ -174,6 +178,7 @@ impl PageEnv {
             net: None,
             storage: None,
             blobs: Default::default(),
+            scripted_frames: false,
         }
     }
 }

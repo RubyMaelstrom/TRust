@@ -5149,6 +5149,7 @@ async fn execute_js_with_presentation(
     // (#the-summary-element, form controls) and Selectors 4 §9.1 hover state
     // need the canonical live DOM even when there are no author scripts.
     let mut prefetched_sheets = None;
+    let mut scripted_frames = false;
     if !html.to_ascii_lowercase().contains("<script") {
         let sheets = fetch_page_sheets(&html, &response.url).await;
         let needs_live_dom = {
@@ -5156,9 +5157,32 @@ async fn execute_js_with_presentation(
             probe.attach_external_sheets(&sheets);
             crate::js::needs_live_dom(&probe)
         };
-        if !needs_live_dom {
-            return css_only_with_sheets(response, viewport, cell_px, device_pixel_ratio, sheets)
-                .await;
+        // HTML #the-iframe-element: each nested document runs its own
+        // scripts (webring widgets, counters) even when the parent has none.
+        // Only the live actor executes them, so a scripted frame document
+        // promotes the page; otherwise the fetched frames are reused.
+        let lower = html.to_ascii_lowercase();
+        let frames = if !needs_live_dom && (lower.contains("<iframe") || lower.contains("<frame")) {
+            let base = base_with_doc_base(&html, &response.url);
+            Some(prefetch_frame_documents(&html, &base, &response.url).await)
+        } else {
+            None
+        };
+        scripted_frames = frames.as_ref().is_some_and(|frames| {
+            frames
+                .values()
+                .any(|(_, markup)| markup.to_ascii_lowercase().contains("<script"))
+        });
+        if !needs_live_dom && !scripted_frames {
+            return css_only_with_sheets(
+                response,
+                viewport,
+                cell_px,
+                device_pixel_ratio,
+                sheets,
+                frames,
+            )
+            .await;
         }
         // The actor needs the fetched sheets, and re-fetching them here would
         // add latency precisely on a first-paint interaction path. Leave the
@@ -5324,6 +5348,7 @@ async fn execute_js_with_presentation(
         net: Some(tokio::runtime::Handle::current()),
         storage: Some(storage),
         blobs,
+        scripted_frames,
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`
@@ -6217,7 +6242,15 @@ async fn css_only_for_device(
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
     let sheets = fetch_page_sheets(&html, &response.url).await;
-    css_only_with_sheets(response, viewport, cell_px, device_pixel_ratio, sheets).await
+    css_only_with_sheets(
+        response,
+        viewport,
+        cell_px,
+        device_pixel_ratio,
+        sheets,
+        None,
+    )
+    .await
 }
 
 /// Complete the script-less CSS path after its stylesheet fetches are already
@@ -6230,6 +6263,7 @@ async fn css_only_with_sheets(
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
     sheets: Vec<(String, String)>,
+    frames: Option<HashMap<String, (Url, String)>>,
 ) -> Response {
     let html = decode_body(&response.content_type, &response.body);
     install_stylesheet_fonts(&html, &sheets, &response.url).await;
@@ -6238,7 +6272,10 @@ async fn css_only_with_sheets(
     // The frame documents are fetched up front into a url→content map (Dom is
     // not `Send`, so it must never cross an `.await`), then installed into the
     // real arena synchronously.
-    let frames = prefetch_frame_documents(&html, &base, &response.url).await;
+    let frames = match frames {
+        Some(frames) => frames,
+        None => prefetch_frame_documents(&html, &base, &response.url).await,
+    };
     // A nested document owns its stylesheets (HTML #the-iframe-element): fetch
     // each frame's `<link rel=stylesheet>` against that frame's own URL. The
     // installed frame tree carries absolutized hrefs, so key them absolutely.
@@ -10849,6 +10886,50 @@ mod tests {
             });
         assert_eq!(color, Some(crate::render::PaintColor::Rgba(1, 2, 3, 255)));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn scriptless_pages_with_scripted_frames_keep_the_page_actor() {
+        // HTML #the-iframe-element: a nested document runs its own scripts
+        // (webring widgets) even when its parent has none, and only the live
+        // actor runs scripts. A script-free frame keeps the CSS-only path.
+        for (inner, live) in [
+            (
+                "<div id=a>x</div><script>document.title='ran'</script>",
+                true,
+            ),
+            ("<div id=a>x</div>", false),
+        ] {
+            let encoded = crate::img::base64_encode(inner.as_bytes());
+            let html =
+                format!("<p>parent</p><iframe src=\"data:text/html;base64,{encoded}\"></iframe>");
+            let response = Response {
+                url: parse_url("https://example.test/frames").unwrap(),
+                status: 200,
+                content_type: "text/html".into(),
+                headers: Vec::new(),
+                body: html.into_bytes(),
+                rendered: None,
+                js: None,
+                blobs: None,
+                live: None,
+                declarative_refresh: None,
+                challenge: None,
+                from_post: false,
+                timing: None,
+            };
+            let response = execute_js_with_presentation(
+                response,
+                (80, 24),
+                (8, 16),
+                1.,
+                (0, 0),
+                Default::default(),
+                false,
+            )
+            .await;
+            assert_eq!(response.live.is_some(), live, "{inner}");
+        }
     }
 
     #[tokio::test]
