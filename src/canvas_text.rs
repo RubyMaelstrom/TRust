@@ -227,9 +227,8 @@ impl PreparedText {
                     vello_cpu::kurbo::Diagonal2::new(amount, amount),
                 ));
             }
-            if let Some(degrees) = run.synth_skew_degrees {
-                builder = builder
-                    .glyph_transform(Affine::skew(f64::from(degrees).to_radians().tan(), 0.));
+            if let Some(skew) = run.synthetic_oblique_skew() {
+                builder = builder.glyph_transform(Affine::skew(skew, 0.));
             }
             builder.fill_glyphs(run.glyphs.iter().map(|glyph| glifo::Glyph {
                 id: glyph.id,
@@ -409,8 +408,8 @@ pub(crate) fn stroke_run(
             vello_cpu::kurbo::Diagonal2::new(amount, amount),
         ));
     }
-    if let Some(degrees) = run.synth_skew_degrees {
-        builder = builder.glyph_transform(Affine::skew(f64::from(degrees).to_radians().tan(), 0.));
+    if let Some(skew) = run.synthetic_oblique_skew() {
+        builder = builder.glyph_transform(Affine::skew(skew, 0.));
     }
     builder.stroke_glyphs(run.glyphs.iter().map(|glyph| glifo::Glyph {
         id: glyph.id,

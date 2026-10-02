@@ -1489,9 +1489,8 @@ fn paint_glyphs(
             builder =
                 builder.font_embolden(glifo::FontEmbolden::new(Diagonal2::new(amount, amount)));
         }
-        if let Some(degrees) = run.synth_skew_degrees {
-            builder =
-                builder.glyph_transform(Affine::skew(f64::from(degrees).to_radians().tan(), 0.0));
+        if let Some(skew) = run.synthetic_oblique_skew() {
+            builder = builder.glyph_transform(Affine::skew(skew, 0.0));
         }
         builder.fill_glyphs(glyphs);
     }
