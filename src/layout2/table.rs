@@ -455,21 +455,42 @@ impl Flow<'_> {
                 mx
             });
         }
-        // Spanning cells widen the spanned columns so the span fits (§17.5.2.2
-        // step 3 — widen all spanned columns by ~the same amount).
-        for cell in &tb.cells {
-            if cell.colspan <= 1 {
-                continue;
+        // CSS Tables 3 #computing-column-measures: cells spanning N columns
+        // update the measures based on cells of span up to N-1, in order of
+        // increasing span.
+        let mut spans: Vec<usize> = tb
+            .cells
+            .iter()
+            .map(|cell| {
+                (cell.col + cell.colspan)
+                    .min(ncols)
+                    .saturating_sub(cell.col)
+            })
+            .filter(|&span| span > 1)
+            .collect();
+        spans.sort_unstable();
+        spans.dedup();
+        for n in spans {
+            let (base_min, base_max) = (col_min.clone(), col_max.clone());
+            for cell in &tb.cells {
+                let end = (cell.col + cell.colspan).min(ncols);
+                if end.saturating_sub(cell.col) != n {
+                    continue;
+                }
+                let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
+                let columns = cell.col..end;
+                let contributions = span_contributions(
+                    &base_min[columns.clone()],
+                    &base_max[columns.clone()],
+                    mn,
+                    mx,
+                    bs * (n - 1) as f32,
+                );
+                for (c, (min, max)) in columns.zip(contributions) {
+                    col_min[c] = col_min[c].max(min);
+                    col_max[c] = col_max[c].max(max);
+                }
             }
-            let end = (cell.col + cell.colspan).min(ncols);
-            let span = end.saturating_sub(cell.col);
-            if span == 0 {
-                continue;
-            }
-            let (mn, mx) = self.cell_min_max(cell, cap, pct_basis, inl);
-            let inner_bs = bs * (span - 1) as f32;
-            distribute_deficit(&mut col_min[cell.col..end], (mn - inner_bs).max(0.0));
-            distribute_deficit(&mut col_max[cell.col..end], (mx - inner_bs).max(0.0));
         }
         // A declared px column width is its preference, never below its
         // min-content.
@@ -690,22 +711,46 @@ fn fixed_columns(col_w: &[Option<ColSpec>], ncols: usize, content: f32) -> Vec<f
     widths
 }
 
-/// Raise the widths in `slice` so their sum is at least `need`, adding the
-/// deficit in equal parts (CSS 2.1 §17.5.2.2 step 3 — widen all spanned
-/// columns by ~the same amount).
-fn distribute_deficit(slice: &mut [f32], need: f32) {
-    let n = slice.len();
-    if n == 0 {
-        return;
-    }
-    let have: f32 = slice.iter().sum();
-    if need <= have {
-        return;
-    }
-    let extra = (need - have) / n as f32;
-    for w in slice.iter_mut() {
-        *w += extra;
-    }
+/// CSS Tables 3 #computing-column-measures: a spanning cell's min- and
+/// max-content contributions to each column it spans, given those columns'
+/// measures based on cells of smaller span. Min-content beyond the columns'
+/// min-content sum first fills each column's gap up to its max-content, in
+/// proportion to that gap; anything beyond their max-content sum, and any
+/// max-content excess, grows them in proportion to their max-content. With
+/// no max-content to weigh by, the columns share it equally.
+fn span_contributions(
+    min: &[f32],
+    max: &[f32],
+    cell_min: f32,
+    cell_max: f32,
+    inner_spacing: f32,
+) -> Vec<(f32, f32)> {
+    let base_min: f32 = min.iter().sum();
+    let base_max: f32 = max.iter().sum();
+    let gap = base_max - base_min;
+    let fill = (cell_min - base_min - inner_spacing).clamp(0.0, gap.max(0.0));
+    let min_excess = (cell_min - base_max - inner_spacing).max(0.0);
+    let max_excess = (cell_max - base_max - inner_spacing).max(0.0);
+    let share = |c: usize| {
+        if base_max > 0.0 {
+            max[c] / base_max
+        } else {
+            1.0 / min.len() as f32
+        }
+    };
+    (0..min.len())
+        .map(|c| {
+            let slack = if gap > 0.0 {
+                (max[c] - min[c]) / gap
+            } else {
+                0.0
+            };
+            (
+                min[c] + slack * fill + share(c) * min_excess,
+                max[c] + share(c) * max_excess,
+            )
+        })
+        .collect()
 }
 
 /// Grow the listed `cols` of `target` by `extra` px total, in proportion to
