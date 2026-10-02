@@ -12012,6 +12012,8 @@ const PROPS: &[PropDef] = &[
     // getComputedStyle (overlay-positioning libraries use it to mirror start/
     // end alignment), even though layout2 does not yet reorder bidi boxes.
     prop("direction", true, true),
+    // CSS Text 3 #text-align-last-property.
+    prop("text-align-last", true, true),
     // CSS Color Adjust 1 #color-scheme-prop.
     prop("color-scheme", true, true),
     prop("font-size", true, true),
@@ -12337,6 +12339,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "font-stretch" => Some("100%"),
         "text-align" => Some("start"),
         "color-scheme" => Some("normal"),
+        "text-align-last" => Some("auto"),
         "vertical-align" => Some("baseline"),
         "text-overflow" => Some("clip"),
         "object-fit" => Some("fill"),

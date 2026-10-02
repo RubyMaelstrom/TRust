@@ -366,6 +366,11 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// (§10.5: a percentage against an indefinite height is auto).
     cb_h_px: Option<f32>,
     align: Align2,
+    /// CSS Text 3 #text-align-last-property: the alignment of the last line
+    /// and of lines ending in a forced break.
+    align_last: Align2,
+    /// Set while `finish` flushes the final line.
+    finishing: bool,
     lines: Vec<LineOut>,
     cur: Vec<Piece>,
     /// Every inline ELEMENT entered, with the index of the line it entered
@@ -485,6 +490,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             cb_w_px: content_w_px,
             cb_h_px,
             align,
+            align_last: if align == Align2::Justify {
+                Align2::Left
+            } else {
+                align
+            },
+            finishing: false,
             lines: Vec::new(),
             cur: Vec::new(),
             marks: Vec::new(),
@@ -1303,6 +1314,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // as explicit gaps because their advances are expanded per line.
         if !self.measuring
             && self.align != Align2::Justify
+            && self.align_last != Align2::Justify
             && gap == 0.0
             && self.pending_opens.is_empty()
             && let Some(last) = self.cur.last_mut()
@@ -2080,13 +2092,28 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.flush_line(true);
     }
 
+    /// CSS Text 3 #text-align-last-property, for a block whose
+    /// `text-align-last` is not `auto`.
+    pub fn set_align_last(&mut self, align_last: Align2) {
+        self.align_last = align_last;
+    }
+
+    /// The alignment of the line being flushed.
+    fn line_align(&self, forced: bool) -> Align2 {
+        if forced || self.finishing {
+            self.align_last
+        } else {
+            self.align
+        }
+    }
+
     /// CSS 2.2 §10.3.7: a static position is that of the hypothetical box
     /// on its line, so it moves with the line's center/right alignment —
     /// including a line with no in-flow content.
-    fn align_oof_marks(&mut self, width: f32) {
+    fn align_oof_marks(&mut self, width: f32, align: Align2) {
         let line = self.lines.len();
         let free = (self.line_right - self.line_left - width).max(0.0);
-        let off = match self.align {
+        let off = match align {
             Align2::Center => free / 2.0,
             Align2::Right => free,
             Align2::Left | Align2::Justify => 0.0,
@@ -2103,8 +2130,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
 
     fn flush_line(&mut self, forced: bool) {
         let mut pieces = std::mem::take(&mut self.cur);
+        let align = self.line_align(forced);
         if pieces.is_empty() && !forced {
-            self.align_oof_marks(0.0);
+            self.align_oof_marks(0.0, align);
             self.pen = self.line_start;
             self.pending_space = false;
             return;
@@ -2211,10 +2239,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         };
         // Center/right shift now, within this line's (float-shortened) band;
         // justification waits for `finish`, where "last line" is known.
-        self.align_oof_marks(self.pen - self.line_left);
+        self.align_oof_marks(self.pen - self.line_left, align);
         let free = (self.line_right - self.pen).max(0.0);
         if free > 0.0 {
-            let off = match self.align {
+            let off = match align {
                 Align2::Center => free / 2.0,
                 Align2::Right => free,
                 Align2::Left | Align2::Justify => 0.0,
@@ -2274,17 +2302,31 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // Include the trailing margin/border/padding even without a following
         // text run to consume it (e.g. an image in an anonymous table cell).
         self.pen += self.take_gap();
+        self.finishing = true;
         self.flush_line(false);
-        if self.align == Align2::Justify {
+        if self.align == Align2::Justify || self.align_last == Align2::Justify {
             let n = self.lines.len();
             for (i, line) in self.lines.iter_mut().enumerate() {
-                if i + 1 == n || line.forced {
+                let align = if i + 1 == n || line.forced {
+                    self.align_last
+                } else {
+                    self.align
+                };
+                if align != Align2::Justify {
                     continue;
                 }
                 let cap = (line.right - line.left).max(0.0);
                 if line.width < cap {
                     let extra = cap - line.width;
-                    justify(line, extra);
+                    for (node, shift) in justify(line, extra) {
+                        if let Some(place) = self
+                            .atom_places
+                            .iter_mut()
+                            .find(|place| place.line == i && place.node == node)
+                        {
+                            place.x += shift;
+                        }
+                    }
                 }
             }
         }
@@ -2549,28 +2591,58 @@ pub(super) fn block_ellipsis(
 /// CSS Text §7.3 justification in CSS pixels. Collapsed spaces are retained
 /// as explicit gaps between pieces, so expansion changes geometry without
 /// manufacturing extra U+0020 characters or reshaping glyph runs.
-fn justify(line: &mut LineOut, extra: f32) {
-    let slots: Vec<usize> = line
+/// Distribute `extra` over the line's justification opportunities (the
+/// spaces before pieces), moving text and atomic inlines alike. Returns the
+/// shift of each atomic inline box, whose placement was recorded earlier.
+fn justify(line: &mut LineOut, extra: f32) -> Vec<(NodeId, f32)> {
+    // Atomic inline boxes are held apart from the pieces: merge both in
+    // visual order.
+    let mut order: Vec<(f32, bool, usize)> = line
         .pieces
         .iter()
         .enumerate()
-        .filter_map(|(index, piece)| piece.space_before.then_some(index))
+        .map(|(index, piece)| (piece.x, false, index))
+        .chain(
+            line.atom_boxes
+                .iter()
+                .enumerate()
+                .map(|(index, piece)| (piece.x, true, index)),
+        )
         .collect();
-    if slots.is_empty() {
-        return;
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let slots = order
+        .iter()
+        .filter(|&&(_, atom, index)| {
+            if atom {
+                line.atom_boxes[index].space_before
+            } else {
+                line.pieces[index].space_before
+            }
+        })
+        .count();
+    if slots == 0 {
+        return Vec::new();
     }
-    let per_slot = extra / slots.len() as f32;
-    let mut slot = slots.into_iter().peekable();
+    let per_slot = extra / slots as f32;
     let mut shift = 0.0;
-    for (index, piece) in line.pieces.iter_mut().enumerate() {
-        if slot.peek() == Some(&index) {
+    let mut moved = Vec::new();
+    for (_, atom, index) in order {
+        let piece = if atom {
+            &mut line.atom_boxes[index]
+        } else {
+            &mut line.pieces[index]
+        };
+        if piece.space_before {
             shift += per_slot;
-            slot.next();
         }
         piece.x += shift;
+        if atom {
+            moved.push((piece.item.node, shift));
+        }
     }
     line.width += extra;
     line.justification = extra;
+    moved
 }
 
 /// The playable URL of a media element and the chosen `<source>` node (for

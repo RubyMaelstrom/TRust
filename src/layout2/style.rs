@@ -990,6 +990,19 @@ pub(crate) fn legacy_descendant_align(dom: &Dom, id: NodeId) -> Option<Align2> {
     None
 }
 
+/// CSS Text 3 #text-align-last-property: the used alignment of `id`'s last
+/// line, or `None` for `auto` (which follows `text-align`).
+pub(crate) fn block_align_last(dom: &Dom, id: NodeId) -> Option<Align2> {
+    if id == NO_NODE {
+        return None;
+    }
+    let value = dom.computed_value_resolved(id, "text-align-last")?;
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    align_from_css(&value)
+}
+
 fn align_from_css(value: &str) -> Option<Align2> {
     match value.trim().to_ascii_lowercase().as_str() {
         "left" | "start" | "-webkit-left" | "-moz-left" => Some(Align2::Left),
