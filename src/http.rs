@@ -7587,12 +7587,16 @@ fn collect_image_urls_for_boxes(
         if dom.tag_name(id).is_none() || boxes.is_some_and(|boxes| !boxes.contains_key(&id)) {
             continue;
         }
+        // CSS Values 4 #style-resource-base-url: a frame's embedded sheets
+        // and style attributes resolve against the frame Document's base.
+        let style_base = std::cell::OnceCell::new();
+        let style_base = || style_base.get_or_init(|| dom.style_resource_base(id, base));
         for property in ["background-image", "list-style-image", "cursor", "content"] {
             let Some(value) = dom.computed_value_resolved(id, property) else {
                 continue;
             };
             for source in css_image_sources(&value) {
-                let Some(url) = resolve_css_image_source(base, &source) else {
+                let Some(url) = resolve_css_image_source(style_base(), &source) else {
                     continue;
                 };
                 if dom.resource_cookies_restricted(id) {
@@ -7627,7 +7631,7 @@ fn collect_image_urls_for_boxes(
                 sources.extend(css_image_sources(&value));
             }
             for source in sources {
-                let Some(url) = resolve_css_image_source(base, &source) else {
+                let Some(url) = resolve_css_image_source(style_base(), &source) else {
                     continue;
                 };
                 if dom.resource_cookies_restricted(id) {

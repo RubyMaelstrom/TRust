@@ -7551,6 +7551,35 @@ impl Dom {
             .unwrap_or_else(|| fallback.clone())
     }
 
+    /// CSS Values 4 #style-resource-base-url: a `url()` from an embedded
+    /// sheet or a `style` attribute resolves against its Document's base
+    /// URL. Linked sheets are made absolute against their own URL when they
+    /// are fetched, so only an element of a nested (frame) Document needs a
+    /// base other than the top-level `document_base`.
+    pub(crate) fn style_resource_base<'a>(
+        &self,
+        id: NodeId,
+        document_base: &'a url::Url,
+    ) -> Cow<'a, url::Url> {
+        if self.frame_owner(id).is_some() {
+            return Cow::Owned(self.resource_base_url(id, document_base));
+        }
+        // A static snapshot flattens each frame Document into a wrapper that
+        // records that Document's base.
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if self.attr(node, "data-trust-frame-root").is_some()
+                && let Some(base) = self
+                    .attr(node, "data-trust-frame-base")
+                    .and_then(|base| url::Url::parse(base).ok())
+            {
+                return Cow::Owned(base);
+            }
+            current = self.parent_composed(node);
+        }
+        Cow::Borrowed(document_base)
+    }
+
     fn serialized_frame_wrapper_style(&self, id: NodeId) -> String {
         let display = match self.effective_display(id).as_deref() {
             Some("none") => "none",
@@ -7642,7 +7671,19 @@ impl Dom {
         // HTML elements cannot be nested in serialized HTML. Preserve the
         // child Document's root as a presentation-only box with its computed
         // styles; layout recognizes its independent formatting boundary.
-        out.push_str("<div data-trust-frame-root=\"\" style=\"");
+        out.push_str("<div data-trust-frame-root=\"\"");
+        // Its baked url() values still resolve against the child Document's
+        // base (`style_resource_base`), which the flattened copy would lose.
+        if let Some(frame) = self.frame_owner(root)
+            && let Some(document_base) = self.properties.document_bases.get(&frame)
+        {
+            out.push_str(" data-trust-frame-base=\"");
+            out.push_str(&escape_attr(
+                self.resource_base_url(root, document_base).as_str(),
+            ));
+            out.push('"');
+        }
+        out.push_str(" style=\"");
         let mut style = self.attr(root, "style").unwrap_or("").to_string();
         append_style(&mut style, &self.baked_element_style(root, true));
         out.push_str(&escape_attr(&style));

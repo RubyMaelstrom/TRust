@@ -544,7 +544,12 @@ impl Builder<'_> {
         // element instead of returning an in-flow atom early.
         let rep = if let Some(source) = self.dom.content_replacement_image(id) {
             Replaced::Atom(AtomKind::Img {
-                url: self.base.join(&source).ok().map(|u| u.to_string()),
+                url: self
+                    .dom
+                    .style_resource_base(id, self.base)
+                    .join(&source)
+                    .ok()
+                    .map(|u| u.to_string()),
                 density: 1.0,
                 dimension_source: id,
                 alt: String::new(),
@@ -1043,7 +1048,8 @@ impl Builder<'_> {
                 // used to fix this downstream, but the terminal decoded-image
                 // cache has no URL base and therefore could never find a
                 // relative marker image.
-                self.base
+                self.dom
+                    .style_resource_base(id, self.base)
                     .join(&source)
                     .map_or(source, |url| url.to_string())
             });
@@ -1159,7 +1165,12 @@ impl Builder<'_> {
                     (!text.is_empty()).then_some(Inline::Text(text))
                 }
                 crate::dom::GeneratedContent::Image(source) => {
-                    let url = self.base.join(&source).ok()?.to_string();
+                    let url = self
+                        .dom
+                        .style_resource_base(id, self.base)
+                        .join(&source)
+                        .ok()?
+                        .to_string();
                     Some(Inline::Atom(Atom {
                         node: crate::layout2::NO_NODE,
                         kind: AtomKind::GeneratedImage { url },

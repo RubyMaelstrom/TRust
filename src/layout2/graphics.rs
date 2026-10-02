@@ -2921,7 +2921,8 @@ fn paint_background_images_for_style(
             let (handle, (mut tile_w, mut tile_h)) = if gradient {
                 (None, gradient_size(size, positioning, lengths))
             } else if let Some(url) = css_url(layer) {
-                let source = resolve_image_source(builder.base, &url);
+                let base = builder.dom.style_resource_base(style.node(), builder.base);
+                let source = resolve_image_source(&base, &url);
                 let handle = builder.image(source.clone());
                 // CSS Backgrounds 3 #background-size: auto/auto with a natural
                 // ratio but neither natural dimension uses contain. SVG decoder
@@ -5749,7 +5750,8 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
     else {
         return false;
     };
-    let source = resolve_image_source(builder.base, &source);
+    let base = builder.dom.style_resource_base(style.node(), builder.base);
+    let source = resolve_image_source(&base, &source);
     let handle = builder.image(source.clone());
     let Some((iw, ih)) = builder
         .images
@@ -7933,6 +7935,76 @@ mod tests {
                     .map(|request| request.source.as_str())
                     .collect::<Vec<_>>(),
                 [source]
+            );
+        }
+    }
+
+    #[test]
+    fn frame_style_urls_resolve_against_the_frame_document() {
+        // CSS Values 4 #relative-urls and #style-resource-base-url: a url()
+        // from a frame's <style> sheet or style attribute resolves against
+        // the frame Document's base URL, not the embedding page's.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><iframe id=f style="width:300px;height:200px;border:0"></iframe>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<style>#s { background-image: url(b.png) } #g::before { content: url(gen.png) }</style>
+               <body style="margin:0">
+               <div id=s style="width:20px;height:20px"></div>
+               <div style="width:20px;height:20px;background-image:url('r.png')"></div>
+               <div style="width:20px;height:20px;border:4px solid;border-image:url(e.png) 1"></div>
+               <ul style="list-style-image:url(m.png)"><li>item</li></ul>
+               <div id=g></div></body>"#,
+            "https://frame.test/dir/page.html",
+        )
+        .unwrap();
+        let page = Url::parse("https://page.test/").unwrap();
+        // The static snapshot that re-renders a script-free page for a new
+        // environment flattens the frame and keeps only baked declarations.
+        let snapshot = Dom::parse_document(&dom.serialize(crate::dom::DOCUMENT));
+        for dom in [&dom, &snapshot] {
+            let layout = crate::layout2::lay_out_graphical(
+                dom,
+                &page,
+                crate::layout2::Viewport::new(400., 300.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let painted: Vec<_> = layout
+                .paint
+                .image_requests
+                .iter()
+                .map(|request| request.source.as_str())
+                .collect();
+            let collected = crate::http::collect_image_urls(
+                dom,
+                &page,
+                crate::layout2::Viewport::new(400., 300.),
+                1.0,
+            )
+            .all;
+            // Paint requests images as it draws them (a generated image only
+            // once it has natural dimensions); discovery fetches CSS images
+            // other than border images ahead of paint.
+            for image in ["b.png", "r.png", "e.png", "m.png"] {
+                let expected = format!("https://frame.test/dir/{image}");
+                assert!(
+                    painted.contains(&expected.as_str()),
+                    "{expected} in {painted:?}"
+                );
+            }
+            for image in ["b.png", "r.png", "m.png", "gen.png"] {
+                let expected = format!("https://frame.test/dir/{image}");
+                assert!(collected.contains(&expected), "{expected} in {collected:?}");
+            }
+            assert!(
+                !painted
+                    .iter()
+                    .any(|source| source.starts_with("https://page.test/")),
+                "{painted:?}"
             );
         }
     }
