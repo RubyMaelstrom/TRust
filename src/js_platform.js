@@ -6084,8 +6084,22 @@
             const block = (arg && typeof arg === "object" && arg.block) ? String(arg.block)
                 : (arg === false ? "end" : "start");
             const top = this.__rect().top, bottom = this.__rect().bottom;
+            // CSSOM View #scroll-a-target-into-view scrolls the scrolling boxes
+            // that contain the target, i.e. those on its containing block chain
+            // (WPT css/cssom-view/scrollintoview-containingblock-chain.html):
+            // an absolutely positioned box skips scrollers below its containing
+            // block, and no scroller of its own document moves a fixed-position
+            // box (scrollIntoView-fixed.html). Focusing a fixed cookie banner
+            // therefore must not scroll the page.
+            let position = __dom_computed(this.__id, "position");
             let a = this.parentNode;
             while (a && a.nodeType === 1) {
+                const flags = offsetStyle(a.__id);
+                const contains = position === "fixed" ? (flags & 4) !== 0
+                    : position !== "absolute" || (flags & 7) !== 0 ||
+                        a === this.ownerDocument.documentElement;
+                if (!contains) { a = a.parentNode; continue; }
+                position = __dom_computed(a.__id, "position");
                 // A real scroll container (content taller than its viewport): the
                 // element's offset within it is its rect minus the container's
                 // (both measured at scroll 0 in the inline flow), so that offset
