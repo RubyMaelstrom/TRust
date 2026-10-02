@@ -5926,6 +5926,97 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn marker_pseudo_elements_fill_and_style_list_markers() {
+        // CSS Lists 3 #content-property: ::marker `content` other than
+        // `normal` replaces the list-style marker, even under
+        // `list-style-type: none`, and `none` generates no marker.
+        // #marker-properties: its inherited text properties, such as color
+        // and font-size, style the marker text in both positions.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif;color:black">
+            <style>.s{list-style-type:none} .s li::marker{content:"\2606  "}
+            .r li::marker{color:rgb(200, 0, 0);font-size:32px}
+            .n li::marker{content:none} .i{list-style-position:inside}
+            .i li::marker{content:">> "} summary::marker{content:"+ ";color:rgb(0, 0, 200)}</style>
+            <ul class=s><li>star</li></ul><ol class=r><li>red</li></ol><ul class=n><li>none</li></ul>
+            <ul class=i><li>inside</li></ul><details><summary>sum</summary></details></body>"#;
+        let graphical = lay_graphical(html, 640., &HashMap::new());
+        let runs: Vec<_> = graphical
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, color, .. } => Some((
+                    shaped.text.clone(),
+                    *color,
+                    shaped.runs.first().map_or(0.0, |run| run.font_size),
+                )),
+                _ => None,
+            })
+            .collect();
+        let run = |text: &str| {
+            runs.iter()
+                .find(|run| run.0.starts_with(text))
+                .unwrap_or_else(|| panic!("{text}: {runs:?}"))
+        };
+        let black = crate::render::PaintColor::Rgba(0, 0, 0, 255);
+        assert_eq!(run("\u{2606} ").1, black);
+        let red = run("1. ");
+        assert_eq!(
+            (red.1, red.2),
+            (crate::render::PaintColor::Rgba(200, 0, 0, 255), 32.0)
+        );
+        assert_eq!(run("red").2, 16.0, "the item's own text keeps its style");
+        assert_eq!(run(">>").1, black);
+        assert_eq!(run("+").1, crate::render::PaintColor::Rgba(0, 0, 200, 255));
+        assert!(
+            !runs.iter().any(|run| run.0.contains(['•', '▸'])),
+            "{runs:?}"
+        );
+        let terminal = lay(html, 80);
+        let text: String = terminal
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .map(|item| item.text.as_str())
+            .collect();
+        for marker in ["\u{2606}", "1.", ">>", "+"] {
+            assert!(text.contains(marker), "{marker}: {text}");
+        }
+        assert!(!text.contains(['•', '▸']), "{text}");
+    }
+
+    #[test]
+    fn an_empty_marker_leaves_an_image_summary_one_line() {
+        // CSS Lists 3 #content-property: `summary::marker { content: "" }`
+        // empties the disclosure marker, so no triangle paints and a
+        // full-width image summary is one line, as in Blink and Gecko
+        // (linwood.neocities.org's signpost navigation).
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <style>summary::marker{content:""} img{width:100%}</style>
+            <details><summary id=s><img src="sign.png" alt="sign"></summary><p>x</p></details></body>"#;
+        let images = HashMap::from([("http://e.com/sign.png".to_string(), (300u32, 60u32))]);
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 300.0, &images);
+        let summary = layout.boxes[&dom.get_by_id("s").unwrap()];
+        assert!(
+            (60.0..80.0).contains(&summary.height),
+            "the image's line alone: {summary:?}"
+        );
+        assert!(!layout.paint.primitives.iter().any(|command| matches!(
+            command,
+            crate::render::DisplayCommand::GlyphRun { shaped, .. } if shaped.text.contains('▸')
+        )));
+        let terminal = lay_images(html, 80, &images);
+        assert!(
+            !terminal
+                .rows
+                .iter()
+                .flat_map(|row| &row.items)
+                .any(|item| item.text.contains('▸'))
+        );
+    }
+
+    #[test]
     fn details_closed_shows_only_summary() {
         let out = lay(
             r#"<body style="margin:0"><details><summary>more</summary><p>secret</p></details></body>"#,

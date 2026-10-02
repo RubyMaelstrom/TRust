@@ -554,15 +554,17 @@ impl<T> NodeCache<T> {
 }
 
 /// One element's author-cascade winners, per target box: the element itself
-/// plus its `::before`/`::after`/`::first-letter` boxes (their rules ride the
-/// same matched list, bucketed by the rule's pseudo target). An absent key =
-/// no author declaration for that property (the cascade's `None`).
+/// plus its `::before`/`::after`/`::first-letter`/`::marker` boxes (their
+/// rules ride the same matched list, bucketed by the rule's pseudo target).
+/// An absent key = no author declaration for that property (the cascade's
+/// `None`).
 #[derive(Clone, Default)]
 struct CascadedMaps {
     elem: FxHashMap<String, String>,
     before: FxHashMap<String, String>,
     after: FxHashMap<String, String>,
     first_letter: FxHashMap<String, String>,
+    marker: FxHashMap<String, String>,
     custom_bases: FxHashMap<(Option<PseudoEl>, String), std::rc::Rc<url::Url>>,
 }
 
@@ -572,6 +574,7 @@ impl CascadedMaps {
             PseudoEl::Before => &self.before,
             PseudoEl::After => &self.after,
             PseudoEl::FirstLetter => &self.first_letter,
+            PseudoEl::Marker => &self.marker,
         }
     }
 
@@ -581,6 +584,7 @@ impl CascadedMaps {
             Some(PseudoEl::Before) => &mut self.before,
             Some(PseudoEl::After) => &mut self.after,
             Some(PseudoEl::FirstLetter) => &mut self.first_letter,
+            Some(PseudoEl::Marker) => &mut self.marker,
         }
     }
 }
@@ -1019,6 +1023,7 @@ impl Dom {
                         &value.before,
                         &value.after,
                         &value.first_letter,
+                        &value.marker,
                     ] {
                         fixed_map!(map, (String, String));
                         for (name, value) in map {
@@ -5434,6 +5439,7 @@ impl Dom {
         let mut before = Winners::default();
         let mut after = Winners::default();
         let mut first_letter = Winners::default();
+        let mut marker = Winners::default();
         let mut conditional_pseudos = Vec::new();
         // HTML rendering hints have their own origin below every author
         // layer. `revert` discards them, while `revert-layer` can reveal them
@@ -5495,6 +5501,7 @@ impl Dom {
                     Some(PseudoEl::Before) => &mut before,
                     Some(PseudoEl::After) => &mut after,
                     Some(PseudoEl::FirstLetter) => &mut first_letter,
+                    Some(PseudoEl::Marker) => &mut marker,
                 };
                 for (pk, (imp, v)) in &r.decls {
                     consider_into(
@@ -5630,6 +5637,7 @@ impl Dom {
                     before: Default::default(),
                     after: Default::default(),
                     first_letter: Default::default(),
+                    marker: Default::default(),
                     custom_bases: Default::default(),
                 }),
             );
@@ -5640,6 +5648,7 @@ impl Dom {
                 let target = match rule_pseudo(r) {
                     Some(PseudoEl::Before) => &mut before,
                     Some(PseudoEl::FirstLetter) => &mut first_letter,
+                    Some(PseudoEl::Marker) => &mut marker,
                     _ => &mut after,
                 };
                 for (pk, (imp, value)) in &r.decls {
@@ -5671,6 +5680,7 @@ impl Dom {
             before: strip(&before),
             after: strip(&after),
             first_letter: strip(&first_letter),
+            marker: strip(&marker),
             custom_bases: Default::default(),
         };
         for (pseudo, winners) in [
@@ -5678,6 +5688,7 @@ impl Dom {
             (Some(PseudoEl::Before), &before),
             (Some(PseudoEl::After), &after),
             (Some(PseudoEl::FirstLetter), &first_letter),
+            (Some(PseudoEl::Marker), &marker),
         ] {
             for (name, winner) in winners.iter().filter(|(name, _)| name.starts_with("--")) {
                 if let Some((key, _)) = winner.resolve_with_key(|_| false)
@@ -5699,6 +5710,7 @@ impl Dom {
                 (Some(PseudoEl::Before), &before),
                 (Some(PseudoEl::After), &after),
                 (Some(PseudoEl::FirstLetter), &first_letter),
+                (Some(PseudoEl::Marker), &marker),
             ] {
                 let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
                 for pass in 0..=custom_count + 1 {
@@ -5785,7 +5797,7 @@ impl Dom {
         // CSS Logical 1 #box: compute axes before pairing declarations.
         // Keep every layer candidate, including a physical fallback below a
         // logical revert-layer. Source order includes declaration order.
-        if [&elem, &before, &after, &first_letter]
+        if [&elem, &before, &after, &first_letter, &marker]
             .iter()
             .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
         {
@@ -5799,6 +5811,7 @@ impl Dom {
                 (Some(PseudoEl::Before), &mut before),
                 (Some(PseudoEl::After), &mut after),
                 (Some(PseudoEl::FirstLetter), &mut first_letter),
+                (Some(PseudoEl::Marker), &mut marker),
             ] {
                 let logical: Vec<_> = winners
                     .keys()
@@ -6113,28 +6126,17 @@ impl Dom {
         id: NodeId,
         which: PseudoEl,
     ) -> Option<Vec<GeneratedContent>> {
-        let attr = match which {
-            PseudoEl::Before => "data-trust-before-items",
-            PseudoEl::After => "data-trust-after-items",
-            // CSS Pseudo 4 #first-letter-pattern: the letter is the
-            // element's own text; `content` does not apply.
-            PseudoEl::FirstLetter => return None,
-        };
-        if let Some(baked) = self.attr(id, attr)
+        let (text_attr, items_attr) = which.baked_content_attrs()?;
+        if let Some(baked) = self.attr(id, items_attr)
             && let Ok(items) = serde_json::from_str(baked)
         {
             return Some(items);
         }
-        let attr = match which {
-            PseudoEl::Before => "data-trust-before",
-            PseudoEl::After => "data-trust-after",
-            PseudoEl::FirstLetter => return None,
-        };
-        if let Some(text) = self.attr(id, attr) {
+        if let Some(text) = self.attr(id, text_attr) {
             return Some(vec![GeneratedContent::Text(text.to_string())]);
         }
         let raw = self.pseudo_style(id, which, "content").or_else(|| {
-            (self.tag_name(id) == Some("q")).then(|| {
+            (self.tag_name(id) == Some("q") && which != PseudoEl::Marker).then(|| {
                 if which == PseudoEl::Before {
                     "open-quote"
                 } else {
@@ -6143,7 +6145,11 @@ impl Dom {
                 .to_string()
             })
         })?;
-        if self.pseudo_style(id, which, "display").as_deref() == Some("none") {
+        // CSS Lists 3 #marker-properties: `display` does not apply to a
+        // marker box.
+        if which != PseudoEl::Marker
+            && self.pseudo_style(id, which, "display").as_deref() == Some("none")
+        {
             return None;
         }
         let resolved = self.resolve_pseudo_vars(id, which, &raw);
@@ -6155,7 +6161,7 @@ impl Dom {
         }
         self.generated_values()
             .content
-            .get(&(id, if which == PseudoEl::Before { 0 } else { 1 }))
+            .get(&(id, which.content_slot()))
             .cloned()
     }
 
@@ -6213,6 +6219,35 @@ impl Dom {
             .is_some()
             || (self.style_index().has_first_letter
                 && !self.cascaded_maps(id).first_letter.is_empty())
+    }
+
+    /// CSS Lists 3 #declaring-a-list-item: elements whose `display` includes
+    /// `list-item` generate `::marker` pseudo-elements; no others do.
+    fn is_list_item(&self, id: NodeId) -> bool {
+        self.effective_display(id)
+            .is_some_and(|display| display.split_whitespace().any(|v| v == "list-item"))
+    }
+
+    /// Whether `::marker` declarations apply to `id`, from the cascade or
+    /// (in a stylesheet-free snapshot) from their baked attribute.
+    pub(crate) fn has_marker_style(&self, id: NodeId) -> bool {
+        self.attr(id, PseudoEl::Marker.baked_style_attr()).is_some()
+            || (self.style_index().has_marker && !self.cascaded_maps(id).marker.is_empty())
+    }
+
+    /// CSS Lists 3 #content-property: the contents of list item `id`'s
+    /// marker box when `content` on its `::marker` is not `normal`, as for
+    /// `::before`; empty for `none`, which generates no marker box. `None`
+    /// leaves the marker to `list-style-image` and `list-style-type`.
+    pub(crate) fn marker_content(&self, id: NodeId) -> Option<Vec<GeneratedContent>> {
+        if !self.has_marker_style(id) || !self.is_list_item(id) {
+            return None;
+        }
+        if let Some(items) = self.pseudo_content_items(id, PseudoEl::Marker) {
+            return Some(items);
+        }
+        let content = self.pseudo_layout_value(id, PseudoEl::Marker, "content")?;
+        content.trim().eq_ignore_ascii_case("none").then(Vec::new)
     }
 
     /// The layout-facing computed value on a generated `::before`/`::after`
@@ -6780,6 +6815,9 @@ impl Dom {
         index.has_first_letter = unique.iter().any(|r| {
             r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::FirstLetter)
         });
+        index.has_marker = unique
+            .iter()
+            .any(|r| r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::Marker));
         index.has_revert_layer = unique.iter().copied().any(|r| {
             r.decls
                 .iter()
@@ -9497,6 +9535,52 @@ impl Dom {
                 out.push('"');
             }
         }
+        // CSS Lists 3 #marker-pseudo: a list item's ::marker declarations
+        // style its marker even without `content`, and resolved contents keep
+        // their counters, as for ::before/::after above. Other elements have
+        // no marker box.
+        if self.style_index().has_marker
+            && !self.cascaded_maps(id).marker.is_empty()
+            && self.is_list_item(id)
+        {
+            let (text_attr, items_attr) = PseudoEl::Marker
+                .baked_content_attrs()
+                .expect("markers take content");
+            if let Some(items) = self.pseudo_content_items(id, PseudoEl::Marker) {
+                let text: String = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        GeneratedContent::Text(text) => Some(text.as_str()),
+                        GeneratedContent::Image(_) => None,
+                    })
+                    .collect();
+                out.push(' ');
+                out.push_str(text_attr);
+                out.push_str("=\"");
+                out.push_str(&escape_attr(&text));
+                out.push('"');
+                if items
+                    .iter()
+                    .any(|item| matches!(item, GeneratedContent::Image(_)))
+                {
+                    out.push(' ');
+                    out.push_str(items_attr);
+                    out.push_str("=\"");
+                    out.push_str(&escape_attr(
+                        &serde_json::to_string(&items).expect("generated content serializes"),
+                    ));
+                    out.push('"');
+                }
+            }
+            let marker = self.baked_pseudo_style(id, PseudoEl::Marker);
+            if !marker.is_empty() {
+                out.push(' ');
+                out.push_str(PseudoEl::Marker.baked_style_attr());
+                out.push_str("=\"");
+                out.push_str(&escape_attr(&marker));
+                out.push('"');
+            }
+        }
         // Bake the clearfix signal for the same reason: the layout re-parses
         // this HTML with no `<style>`, so a `::after{clear:both}` rule (which
         // can't live in an inline `style`) would otherwise be lost and a float
@@ -10665,14 +10749,16 @@ enum Combinator {
     SubsequentSibling,
 }
 
-/// The `::before` / `::after` generated-content pseudo-elements and the
+/// The `::before` / `::after` generated-content pseudo-elements, the
 /// `::first-letter` typographic pseudo-element (CSS2 single-colon legacy
-/// spellings too). The only pseudo-elements we act on.
+/// spellings too) and a list item's `::marker` (CSS Pseudo 4
+/// #marker-pseudo). The only pseudo-elements we act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PseudoEl {
     Before,
     After,
     FirstLetter,
+    Marker,
 }
 
 impl PseudoEl {
@@ -10683,6 +10769,31 @@ impl PseudoEl {
             PseudoEl::Before => "data-trust-before-style",
             PseudoEl::After => "data-trust-after-style",
             PseudoEl::FirstLetter => "data-trust-first-letter-style",
+            PseudoEl::Marker => "data-trust-marker-style",
+        }
+    }
+
+    /// The attributes carrying the pseudo's resolved generated text, and
+    /// its items when they include images, into a stylesheet-free
+    /// presentation snapshot. `::first-letter` takes no `content` (CSS
+    /// Pseudo 4 #first-letter-pattern: the letter is the element's own text).
+    fn baked_content_attrs(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            PseudoEl::Before => Some(("data-trust-before", "data-trust-before-items")),
+            PseudoEl::After => Some(("data-trust-after", "data-trust-after-items")),
+            PseudoEl::Marker => Some(("data-trust-marker", "data-trust-marker-items")),
+            PseudoEl::FirstLetter => None,
+        }
+    }
+
+    /// The key of the pseudo's resolved generated content in
+    /// `generated::Generated::content`.
+    fn content_slot(self) -> u8 {
+        match self {
+            PseudoEl::Before => 0,
+            PseudoEl::After => 1,
+            PseudoEl::Marker => 2,
+            PseudoEl::FirstLetter => 3,
         }
     }
 }
@@ -11665,6 +11776,9 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         name.as_str(),
                         "before" | "after" | "first-letter" | "slotted"
                     )
+                    // A list item's ::marker is rendered; the marker of a
+                    // ::slotted() element stays inert like ::backdrop below.
+                    && !(name == "marker" && compound.slotted.is_none())
                 {
                     if unrendered_pseudo_element(&name, arg.is_some()) {
                         // Defined pseudo-elements we do not render (e.g. CSS
@@ -11779,16 +11893,21 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     }
                     compound.slotted = Some(Box::new(inner));
                     compound.pseudos += 1;
-                } else if matches!(name.as_str(), "before" | "after" | "first-letter") {
+                } else if matches!(name.as_str(), "before" | "after" | "first-letter")
+                    || (double_colon && name == "marker")
+                {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
                     // targets the element's ::before/::after box. Counted in
                     // `spec()` via `pseudo` (the TYPE bucket), not `pseudos`.
                     // ::first-letter likewise targets a box inside the element
-                    // (CSS2 also spells all three with one colon).
+                    // (CSS2 also spells all three with one colon), and
+                    // ::marker a list item's marker box (CSS Pseudo 4
+                    // #marker-pseudo; it has no single-colon spelling).
                     compound.pseudo = Some(match name.as_str() {
                         "before" => PseudoEl::Before,
                         "after" => PseudoEl::After,
+                        "marker" => PseudoEl::Marker,
                         _ => PseudoEl::FirstLetter,
                     });
                 } else if name == "scope" {
@@ -14951,6 +15070,9 @@ struct StyleIndex {
     /// Whether any rule targets `::first-letter`, so box construction looks
     /// for first-letter text only on pages that style it.
     has_first_letter: bool,
+    /// Whether any rule targets `::marker`, so list markers consult their
+    /// pseudo-element only on pages that style it.
+    has_marker: bool,
     /// One probe per `:hover`-bearing compound of every rule whose
     /// applicability depends on the hover chain AND whose declarations can
     /// change the RENDER (a `PROPS`-tracked property, generated `content`, or
@@ -15204,6 +15326,7 @@ impl StyleIndex {
             rule_bases,
             has_opacity,
             has_first_letter,
+            has_marker,
             hover_probes,
             hover_buckets,
             cursor_buckets,
@@ -15212,6 +15335,7 @@ impl StyleIndex {
         let _ = (
             has_opacity,
             has_first_letter,
+            has_marker,
             has_container_queries,
             has_revert_layer,
             boxless_content_may_escape,
@@ -21390,6 +21514,85 @@ mod tests {
             dom.has_first_letter_style(dom.get_by_id("q").unwrap())
                 && !dom.has_first_letter_style(DOCUMENT)
         );
+    }
+
+    #[test]
+    fn marker_pseudo_elements_cascade_and_generate_marker_contents() {
+        // CSS Pseudo 4 #marker-pseudo: ::marker rules style a list item's
+        // marker box, which inherits from the item (#treelike). CSS Lists 3
+        // #content-property: `content` other than `normal` fills the marker
+        // as for ::before, `none` suppresses it, and only list items have
+        // markers. ::marker has no single-colon spelling.
+        let dom = Dom::parse_document(
+            "<style>li { color: blue; font-size: 20px } ::marker { color: red } \
+             .s li::marker { content: '\\2606  ' } .n li::marker { content: none } \
+             .c li::marker { content: counter(list-item) ') ' } \
+             .d li::marker { content: counters(list-item, '.') ' ' } \
+             p::marker { content: 'x' } li:marker { color: green }</style>\
+             <ul class=s><li id=s>a</li></ul><ul class=n><li id=n>b</li></ul>\
+             <ol class=c start=5><li>c</li><li id=c>d</li></ol>\
+             <ol class=d><li>e<ol><li>f</li><li id=d>g</li></ol></li></ol>\
+             <ul><li id=plain>h</li></ul><p id=p>i</p><q id=q>j</q>",
+        );
+        let check = |dom: &Dom| {
+            let by = |id: &str| dom.get_by_id(id).unwrap();
+            let text = |id: &str| {
+                dom.marker_content(by(id)).map(|items| {
+                    items
+                        .into_iter()
+                        .map(|item| match item {
+                            GeneratedContent::Text(text) => text,
+                            GeneratedContent::Image(url) => url,
+                        })
+                        .collect::<String>()
+                })
+            };
+            // A hex escape consumes one following space.
+            assert_eq!(text("s").as_deref(), Some("\u{2606} "));
+            assert_eq!(text("n").as_deref(), Some(""));
+            assert_eq!(text("c").as_deref(), Some("6) "));
+            assert_eq!(text("d").as_deref(), Some("1.2 "));
+            assert_eq!(text("plain"), None, "`normal` keeps list-style-type");
+            assert_eq!(text("p"), None, "not a list item");
+            let plain = by("plain");
+            assert_eq!(
+                dom.pseudo_layout_value(plain, PseudoEl::Marker, "color")
+                    .as_deref(),
+                Some("red")
+            );
+            assert_eq!(
+                dom.pseudo_layout_value(plain, PseudoEl::Marker, "font-size")
+                    .as_deref(),
+                Some("20px"),
+                "inherited from the list item"
+            );
+            assert_eq!(
+                dom.computed_value_resolved(plain, "color").as_deref(),
+                Some("blue"),
+                "`li:marker` is no pseudo-element selector"
+            );
+            // HTML's quotation marks are ::before/::after content only.
+            assert_eq!(dom.pseudo_content(by("q"), PseudoEl::Marker), None);
+        };
+        check(&dom);
+        // The stylesheet-free snapshot keeps the resolved contents and the
+        // declarations of list items' markers only.
+        let snapshot =
+            Dom::parse_document(&dom.serialize_live(DOCUMENT, &std::collections::HashSet::new()));
+        check(&snapshot);
+        let p = snapshot.get_by_id("p").unwrap();
+        assert_eq!(snapshot.attr(p, PseudoEl::Marker.baked_style_attr()), None);
+        for selector in ["li::marker", "::marker", "summary::marker", "ul li::marker"] {
+            assert!(selector_parses(selector), "{selector}");
+        }
+        for selector in [
+            "li:marker",
+            "li::marker::before",
+            "li::marker.x",
+            "li::marker()",
+        ] {
+            assert!(!selector_parses(selector), "{selector}");
+        }
     }
 
     #[test]
