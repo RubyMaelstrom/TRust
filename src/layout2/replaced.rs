@@ -78,11 +78,14 @@ pub(crate) fn size(
     // specified size (and, as a pair, the modern pre-decode ratio source).
     // HTML #maps-to-the-dimension-property: a percentage is of the
     // containing block, and behaves as auto against an indefinite one.
+    // Unlike the "(ignoring zero)" mapping, this uses the rules for parsing
+    // dimension values, which accept zero: `width=0 height=0` is a definite
+    // 0×0 box (a hidden counter image), never the natural size.
     let attr = |name: &str, basis: Option<f32>| match dom
         .attr(dimension_source, name)
         .and_then(html_dimension)?
     {
-        HtmlDimension::Pixels(px) => (px > 0.0).then_some(px),
+        HtmlDimension::Pixels(px) => (px >= 0.0).then_some(px),
         HtmlDimension::Percentage(percent) => basis.map(|basis| basis * percent / 100.0),
     };
     // HTML Rendering §14.3.3 maps width/height attributes to presentational
@@ -492,6 +495,46 @@ mod tests {
         );
         assert_eq!((result.box_w, result.box_h), (240.0, 80.0));
         assert_eq!(reads, 1);
+    }
+
+    /// Used box of an `<img>` with the given attributes and a decoded natural
+    /// size, in a 480×240 containing block.
+    fn image_box(attributes: &str, natural: Option<(f32, f32)>) -> (f32, f32) {
+        let dom = Dom::parse_document(&format!("<!doctype html><img id='sized' {attributes}>"));
+        let node = dom.get_by_id("sized").unwrap();
+        let result = size(
+            &dom,
+            node,
+            ImageInput {
+                dimension_source: node,
+                natural,
+                url: None,
+            },
+            Some(480.0),
+            Some(240.0),
+            Vp {
+                w: 960.0,
+                h: 1024.0,
+            },
+        )
+        .unwrap();
+        (result.box_w, result.box_h)
+    }
+
+    #[test]
+    fn zero_dimension_attributes_are_definite_sizes() {
+        // HTML #dimRendering: img width/height map to the dimension
+        // properties with the rules for parsing dimension values, which
+        // accept zero (only the "ignoring zero" variant rejects it).
+        let natural = Some((30.0, 30.0));
+        assert_eq!(image_box("width=0 height=0", natural), (0.0, 0.0));
+        assert_eq!(image_box("width=40 height=0", natural), (40.0, 0.0));
+        assert_eq!(image_box("width=0 height=40", natural), (0.0, 40.0));
+        assert_eq!(image_box("width='0.0' height='0px'", natural), (0.0, 0.0));
+        // A single zero axis is still a specified size; the other axis
+        // follows the natural ratio from it.
+        assert_eq!(image_box("width=0", natural), (0.0, 0.0));
+        assert_eq!(image_box("width=40 height=40", natural), (40.0, 40.0));
     }
 
     #[test]
