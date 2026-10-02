@@ -94,6 +94,42 @@ pub(super) fn is_color(text: &str) -> bool {
     values::computed_color(text).is_some()
 }
 
+/// CSS Color 4 #resolving-color-values for CSSOM: sRGB-family colors as
+/// `rgb()`/`rgba()`, other spaces in their own notation. `None` for
+/// `currentcolor`, system colors and non-colors, which the caller resolves.
+pub(crate) fn resolved_color(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("currentcolor") || system_color(text) {
+        return None;
+    }
+    values::computed_color(text)
+}
+
+fn system_color(text: &str) -> bool {
+    matches!(
+        text.to_ascii_lowercase().as_str(),
+        "canvas"
+            | "canvastext"
+            | "field"
+            | "fieldtext"
+            | "buttonface"
+            | "buttontext"
+            | "buttonborder"
+            | "linktext"
+            | "visitedtext"
+            | "activetext"
+            | "graytext"
+            | "highlight"
+            | "highlighttext"
+            | "selecteditem"
+            | "selecteditemtext"
+            | "mark"
+            | "marktext"
+            | "accentcolor"
+            | "accentcolortext"
+    )
+}
+
 pub(super) fn ident(text: &str) -> Option<String> {
     let mut input = ParserInput::new(text);
     let mut parser = Parser::new(&mut input);

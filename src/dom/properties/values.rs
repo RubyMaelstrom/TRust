@@ -346,14 +346,23 @@ pub(super) fn computed_color(text: &str) -> Option<String> {
     let legacy = !text.trim_start().to_ascii_lowercase().starts_with("color(")
         && matches!(color.cs, Space::Srgb | Space::Hsl | Space::Hwb);
     if legacy {
+        // CSS Color 4 #serializing-sRGB-values, as browsers store them:
+        // 8-bit channels, and the shortest alpha that round-trips its byte.
         let color = color.convert(Space::Srgb);
         let [r, g, b, a] = color.components;
-        let channels = [r, g, b].map(|v| math::number(f64::from(v.clamp(0., 1.)) * 255.));
+        let channels = [r, g, b].map(|v| ((v.clamp(0., 1.) * 255.).round() as u8).to_string());
         let rgb = channels.join(", ");
-        return Some(if a >= 1. {
+        let alpha = (a.clamp(0., 1.) * 255.).round();
+        return Some(if alpha >= 255. {
             format!("rgb({rgb})")
         } else {
-            format!("rgba({rgb}, {})", math::number(f64::from(a.clamp(0., 1.))))
+            let two = (alpha / 255. * 100.).round() / 100.;
+            let alpha = if (two * 255.).round() == alpha {
+                two
+            } else {
+                (alpha / 255. * 1000.).round() / 1000.
+            };
+            format!("rgba({rgb}, {})", math::number(f64::from(alpha)))
         });
     }
     // Reify through the explicit color space, discarding named-color spelling
