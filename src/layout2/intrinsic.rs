@@ -314,13 +314,21 @@ impl Flow<'_> {
         };
         // css-sizing-4 #aspect-ratio-automatic: an auto width with a ratio and
         // a definite height is that height through the ratio, contributing
-        // at least the box's min-content width (#aspect-ratio-minimum).
-        let ratio_width = || {
+        // at least the box's min-content width (#aspect-ratio-minimum), and
+        // any auto width keeps the min/max heights transferred through the
+        // ratio (#aspect-ratio-size-transfers).
+        let ratio = {
             let bt = s.border[super::style::TOP] + side(&s.padding[super::style::TOP]).max(0.0);
             let bb =
                 s.border[super::style::BOTTOM] + side(&s.padding[super::style::BOTTOM]).max(0.0);
             self.ratio_auto_width(b, bp, bt, bb, None)
-                .map(|w| w.max(self.ratio_auto_minimum(b, inl)))
+        };
+        let ratio_width = || {
+            ratio.and_then(|ratio| {
+                ratio
+                    .preferred
+                    .map(|w| w.max(self.ratio_auto_minimum(b, inl).min(ratio.max)))
+            })
         };
         let content = self
             .intrinsic_width_value(&s.width, b, preferred_basis, inl)
@@ -333,6 +341,8 @@ impl Flow<'_> {
                     self.intrinsic_w(b, mode, inl)
                 }
             });
+        // Only an auto width has a ratio here.
+        let content = ratio.map_or(content, |ratio| ratio.constrain(content));
         // CSS Tables 3 #computing-the-table-width / CSS 2 §17.5.2.2: a table
         // is never narrower than its minimum content width (GRIDMIN),
         // whatever width it declares, in CSS or through HTML's `width`
