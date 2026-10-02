@@ -30,9 +30,9 @@ use winit::window::Window;
 
 use super::vello_cpu::{
     ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, decoration_strokes,
-    offset_shape, point_bounds, rect_is_visible, rect_path, shape_fill, shape_is_visible,
-    shape_path, simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend, vello_color,
-    vello_color_filter, vello_rect, vello_stops, vello_stroke,
+    offset_shape, outside_shape_path, point_bounds, rect_is_visible, rect_path, shape_fill,
+    shape_is_visible, shape_path, simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend,
+    vello_color, vello_color_filter, vello_rect, vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
@@ -864,6 +864,11 @@ impl VelloHybridRenderer {
                     }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     target.set_paint(vello_color(*color));
+                    if !*inset {
+                        target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
+                        target.push_clip_path(&outside_shape_path(shape, &shifted, expansion));
+                        target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+                    }
                     if let Some((rect, radius)) = simple_rounded_rect(&shifted) {
                         if *inset {
                             target.push_clip_path(&shape_path(shape));
@@ -882,6 +887,9 @@ impl VelloHybridRenderer {
                         // for rounded rectangles; arbitrary shadows retain the
                         // same unblurred fallback as the CPU reference.
                         target.fill_path(&shape_path(&shifted));
+                    }
+                    if !*inset {
+                        target.pop_clip_path();
                     }
                 }
                 DisplayCommand::HitRegion(_) => {}

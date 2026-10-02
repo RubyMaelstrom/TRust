@@ -329,6 +329,12 @@ impl VelloCpuRenderer {
                     }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.set_paint(vello_color(*color));
+                    if !*inset {
+                        self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
+                        self.context
+                            .push_clip_path(&outside_shape_path(shape, &shifted, expansion));
+                        self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+                    }
                     if let Some((rect, radius)) = simple_rounded_rect(&shifted) {
                         if *inset {
                             self.context.push_clip_path(&shape_path(shape));
@@ -346,6 +352,9 @@ impl VelloCpuRenderer {
                         // Vello CPU's direct blur primitive currently accepts
                         // rounded rectangles, not arbitrary paths.
                         self.context.fill_path(&shape_path(&shifted));
+                    }
+                    if !*inset {
+                        self.context.pop_clip_path();
                     }
                 }
                 DisplayCommand::HitRegion(_) => {}
@@ -1261,6 +1270,34 @@ pub(super) fn rect_is_visible(rect: CssRect, transform: Affine2d, clip: CssRect)
     rect.width > 0.0
         && rect.height > 0.0
         && intersect_rect(transformed_bounds(rect, transform), clip).is_some()
+}
+
+/// CSS Backgrounds 3 #shadow-shape: an outer shadow is drawn outside the
+/// border box only, as if the box were opaque. Clipping to this path with
+/// the even-odd rule leaves the box itself, and only it, unpainted.
+pub(super) fn outside_shape_path(shape: &PaintShape, shadow: &PaintShape, reach: f32) -> BezPath {
+    let bounds = [shape, shadow]
+        .into_iter()
+        .filter_map(shape_bounds)
+        .reduce(|a, b| {
+            let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+            CssRect::new(
+                x,
+                y,
+                (a.x + a.width).max(b.x + b.width) - x,
+                (a.y + a.height).max(b.y + b.height) - y,
+            )
+        })
+        .unwrap_or_default();
+    let margin = reach.max(0.0) * 2.0 + 2.0;
+    let mut path = rect_path(CssRect::new(
+        bounds.x - margin,
+        bounds.y - margin,
+        bounds.width + 2.0 * margin,
+        bounds.height + 2.0 * margin,
+    ));
+    path.extend(shape_path(shape));
+    path
 }
 
 pub(super) fn shape_bounds(shape: &PaintShape) -> Option<CssRect> {
