@@ -495,9 +495,12 @@ pub(crate) enum Embedded {
 /// or displays no plugin) Blink still draws a box and Gecko draws none;
 /// TRust follows Gecko, consistent with representing nothing.
 ///
-/// An `object` with no `data`, or whose `type` is not one TRust can show,
-/// uses its fallback content. Otherwise it would represent its resource,
-/// as an image or a content navigable, so it is a replaced element.
+/// An `object` represents its resource (an image or a content navigable)
+/// only once that resource is available; until then, and whenever it
+/// cannot be shown, the object "represents the element's children"
+/// (#the-object-element, the steps labeled fallback). TRust fetches no
+/// object resource, so it never reaches that state: an object always shows
+/// its fallback content, never a blank box in the resource's place.
 pub(crate) fn embedded_representation(dom: &Dom, id: NodeId) -> Option<Embedded> {
     if dom.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
         return None;
@@ -508,37 +511,9 @@ pub(crate) fn embedded_representation(dom: &Dom, id: NodeId) -> Option<Embedded>
         } else {
             Embedded::Nothing
         }),
-        "object" => Some(
-            if dom.attr(id, "data").is_some_and(|data| !data.is_empty())
-                && dom.attr(id, "type").is_none_or(object_type_supported)
-            {
-                Embedded::Replaced
-            } else {
-                Embedded::Fallback
-            },
-        ),
+        "object" => Some(Embedded::Fallback),
         _ => None,
     }
-}
-
-/// HTML #the-object-element: "If the type attribute is present and its
-/// value is not a type that the user agent supports, then the user agent
-/// may jump to the step below labeled fallback". TRust has no plugins; it
-/// can present documents, text, images and media. An empty value is not a
-/// type and is ignored, as in Gecko and Blink.
-fn object_type_supported(value: &str) -> bool {
-    let essence = value
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    essence.is_empty()
-        || ["image/", "text/", "audio/", "video/"]
-            .iter()
-            .any(|prefix| essence.starts_with(prefix))
-        || essence.ends_with("+xml")
-        || matches!(essence.as_str(), "application/xml" | "application/pdf")
 }
 
 struct Builder<'a> {
