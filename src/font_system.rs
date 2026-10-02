@@ -189,6 +189,149 @@ impl PageFont {
         };
         Some(Self { family, bytes })
     }
+
+    /// CSS Fonts 4 #unicode-range-desc: a face is used only for the code
+    /// points in its `unicode-range`, even where it has glyphs for others
+    /// (an emoji font's blank digits). Text shaping chooses faces by their
+    /// character maps, so keep only the in-range mappings. An empty list is
+    /// the initial range, all of Unicode; a font this cannot rewrite (a
+    /// collection) keeps its full map.
+    pub(crate) fn restrict_to(mut self, ranges: &[(u32, u32)]) -> Self {
+        if !ranges.is_empty()
+            && let Some(bytes) = restrict_cmap(&self.bytes, ranges)
+        {
+            self.bytes = bytes;
+        }
+        self
+    }
+}
+
+/// Rebuild an SFNT font with a `cmap` mapping only the code points within
+/// `ranges`: one format 12 subtable for the Unicode platforms, plus the
+/// font's format 14 variation sequences when present. Other tables are kept.
+fn restrict_cmap(font: &[u8], ranges: &[(u32, u32)]) -> Option<Vec<u8>> {
+    let be16 = |at: usize| {
+        font.get(at..at + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let be32 = |at: usize| {
+        font.get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if font.get(..4)? == b"ttcf" {
+        return None;
+    }
+    let face = ttf_parser::Face::parse(font, 0).ok()?;
+    let cmap = face.tables().cmap?;
+    let mut map = std::collections::BTreeMap::new();
+    for subtable in cmap.subtables {
+        if !subtable.is_unicode()
+            || matches!(
+                subtable.format,
+                ttf_parser::cmap::Format::UnicodeVariationSequences(_)
+            )
+        {
+            continue;
+        }
+        subtable.codepoints(|code_point| {
+            if ranges
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&code_point))
+                && let Some(glyph) = subtable.glyph_index(code_point)
+                && glyph.0 != 0
+            {
+                map.entry(code_point).or_insert(glyph.0);
+            }
+        });
+    }
+    let tables = usize::from(be16(4)?);
+    let record = |index: usize| 12 + 16 * index;
+    let cmap_index =
+        (0..tables).find(|&index| font.get(record(index)..record(index) + 4) == Some(b"cmap"))?;
+    let cmap_at = be32(record(cmap_index) + 8)? as usize;
+    // The format 14 subtable, copied as is.
+    let variations = (0..usize::from(be16(cmap_at + 2)?)).find_map(|index| {
+        let at = cmap_at + 4 + 8 * index;
+        (be16(at)? == 0 && be16(at + 2)? == 5).then_some(())?;
+        let subtable = cmap_at + be32(at + 4)? as usize;
+        (be16(subtable)? == 14).then_some(())?;
+        font.get(subtable..subtable + be32(subtable + 2)? as usize)
+    });
+    // Sequential map groups: consecutive code points to consecutive glyphs.
+    let mut groups: Vec<(u32, u32, u32)> = Vec::new();
+    for (&code_point, &glyph) in &map {
+        let glyph = u32::from(glyph);
+        match groups.last_mut() {
+            Some((start, end, start_glyph))
+                if *end + 1 == code_point && *start_glyph + (code_point - *start) == glyph =>
+            {
+                *end = code_point;
+            }
+            _ => groups.push((code_point, code_point, glyph)),
+        }
+    }
+    let mut format12 = Vec::with_capacity(16 + 12 * groups.len());
+    format12.extend_from_slice(&12u16.to_be_bytes());
+    format12.extend_from_slice(&0u16.to_be_bytes());
+    format12.extend_from_slice(&((16 + 12 * groups.len()) as u32).to_be_bytes());
+    format12.extend_from_slice(&0u32.to_be_bytes());
+    format12.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+    for (start, end, glyph) in &groups {
+        for value in [start, end, glyph] {
+            format12.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    let records: Vec<(u16, u16, bool)> = if variations.is_some() {
+        vec![(0, 4, false), (0, 5, true), (3, 10, false)]
+    } else {
+        vec![(0, 4, false), (3, 10, false)]
+    };
+    let header = 4 + 8 * records.len();
+    let mut table = Vec::new();
+    table.extend_from_slice(&0u16.to_be_bytes());
+    table.extend_from_slice(&(records.len() as u16).to_be_bytes());
+    for (platform, encoding, is_variations) in &records {
+        let offset = if *is_variations {
+            header + format12.len()
+        } else {
+            header
+        };
+        table.extend_from_slice(&platform.to_be_bytes());
+        table.extend_from_slice(&encoding.to_be_bytes());
+        table.extend_from_slice(&(offset as u32).to_be_bytes());
+    }
+    table.extend_from_slice(&format12);
+    if let Some(variations) = variations {
+        table.extend_from_slice(variations);
+    }
+    // Reassemble the font: the same table records, data 4-byte aligned.
+    let mut out = font.get(..record(tables))?.to_vec();
+    for index in 0..tables {
+        let at = record(index);
+        let data = if index == cmap_index {
+            &table[..]
+        } else {
+            let offset = be32(at + 8)? as usize;
+            font.get(offset..offset + be32(at + 12)? as usize)?
+        };
+        let offset = out.len() as u32;
+        let checksum = sfnt_checksum(data);
+        out[at + 4..at + 8].copy_from_slice(&checksum.to_be_bytes());
+        out[at + 8..at + 12].copy_from_slice(&offset.to_be_bytes());
+        out[at + 12..at + 16].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    Some(out)
+}
+
+/// The OpenType table checksum: the sum of its big-endian 32-bit words.
+fn sfnt_checksum(data: &[u8]) -> u32 {
+    data.chunks(4).fold(0u32, |sum, chunk| {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        sum.wrapping_add(u32::from_be_bytes(word))
+    })
 }
 
 struct SvgCatalog {
@@ -1768,6 +1911,33 @@ fn default_font_directories() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_range_limits_a_web_fonts_character_map() {
+        // CSS Fonts 4 #unicode-range-desc: a face serves only the code
+        // points in its range. Danbooru declares Twemoji for emoji ranges;
+        // used for every character, its blank digit glyphs hid the numbers.
+        let sans = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+        let font = PageFont::from_web_resource("Emoji".into(), sans.to_vec())
+            .unwrap()
+            .restrict_to(&[(0x41, 0x5A), (0x2603, 0x2603)]);
+        let face = ttf_parser::Face::parse(&font.bytes, 0).unwrap();
+        assert!(face.glyph_index('A').is_some());
+        assert!(face.glyph_index('Z').is_some());
+        assert!(face.glyph_index('\u{2603}').is_some());
+        assert!(face.glyph_index('a').is_none());
+        assert!(face.glyph_index('1').is_none());
+        // Glyph outlines and metrics are untouched.
+        let a = face.glyph_index('A').unwrap();
+        assert!(face.glyph_bounding_box(a).is_some());
+        assert!(face.glyph_hor_advance(a).is_some_and(|advance| advance > 0));
+        // No range keeps the whole map.
+        let all = PageFont::from_web_resource("All".into(), sans.to_vec())
+            .unwrap()
+            .restrict_to(&[]);
+        let face = ttf_parser::Face::parse(&all.bytes, 0).unwrap();
+        assert!(face.glyph_index('1').is_some());
+    }
 
     #[test]
     fn web_font_resource_rejects_unsupported_container_and_keeps_sfnt() {

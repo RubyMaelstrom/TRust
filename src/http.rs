@@ -6054,6 +6054,10 @@ fn css_unescape_url(raw: &str) -> String {
 pub(crate) struct CssFontFace {
     pub family: String,
     pub sources: Vec<String>,
+    /// CSS Fonts 4 #unicode-range-desc: the inclusive code point ranges the
+    /// face is used for; empty when the descriptor is absent or invalid
+    /// (the initial value, all of Unicode).
+    pub unicode_range: Vec<(u32, u32)>,
 }
 
 fn stylesheet_font_faces(css: &str) -> Vec<CssFontFace> {
@@ -6081,13 +6085,18 @@ fn stylesheet_font_faces(css: &str) -> Vec<CssFontFace> {
 pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
     let mut family = None;
     let mut sources = Vec::new();
+    let mut unicode_range = Vec::new();
     // CSS Syntax: semicolons inside strings/functions are component
     // values, not declaration separators (notably data: font URLs).
     for declaration in crate::dom::split_top_level(block, ';') {
         let Some((name, value)) = declaration.split_once(':') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("font-family") {
+        // A comment before a descriptor is not part of its name.
+        let name = name.rsplit("*/").next().unwrap_or(name);
+        if name.trim().eq_ignore_ascii_case("unicode-range") {
+            unicode_range = unicode_ranges(value).unwrap_or_default();
+        } else if name.trim().eq_ignore_ascii_case("font-family") {
             family = font_family_name(value);
         } else if name.trim().eq_ignore_ascii_case("src") {
             sources.clear();
@@ -6106,10 +6115,50 @@ pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
     {
         sources.retain(|url| !url.trim().is_empty());
         if !sources.is_empty() {
-            return Some(CssFontFace { family, sources });
+            return Some(CssFontFace {
+                family,
+                sources,
+                unicode_range,
+            });
         }
     }
     None
+}
+
+/// CSS Fonts 4 #unicode-range-desc: a comma-separated list of CSS Syntax 3
+/// `<urange>`s (`U+26`, `U+0-7F`, `U+4??`) as inclusive ranges. `None` when
+/// any is invalid, which makes the whole descriptor invalid.
+fn unicode_ranges(value: &str) -> Option<Vec<(u32, u32)>> {
+    let hex = |digits: &str| {
+        (!digits.is_empty() && digits.len() <= 6)
+            .then(|| u32::from_str_radix(digits, 16).ok())
+            .flatten()
+    };
+    let mut ranges = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        let rest = item
+            .strip_prefix("U+")
+            .or_else(|| item.strip_prefix("u+"))?;
+        let (start, end) = match rest.split_once('-') {
+            Some((start, end)) => (hex(start)?, hex(end)?),
+            None if rest.contains('?') => {
+                let digits = rest.trim_end_matches('?');
+                if digits.contains('?') || rest.len() > 6 {
+                    return None;
+                }
+                let wild = rest.len() - digits.len();
+                let base = if digits.is_empty() { 0 } else { hex(digits)? };
+                (base << (4 * wild), ((base + 1) << (4 * wild)) - 1)
+            }
+            None => (hex(rest)?, hex(rest)?),
+        };
+        if start > end || start > 0x10FFFF {
+            return None;
+        }
+        ranges.push((start, end.min(0x10FFFF)));
+    }
+    (!ranges.is_empty()).then_some(ranges)
 }
 
 /// CSS Fonts 4 #family-name-syntax: `<string> | <custom-ident>+`, whose
@@ -6185,11 +6234,18 @@ fn css_block_end(css: &str, open: usize) -> Option<usize> {
     None
 }
 
+/// A document `@font-face` rule with its usable sources made absolute.
+struct DocumentFontFace {
+    family: String,
+    sources: Vec<Url>,
+    unicode_range: Vec<(u32, u32)>,
+}
+
 fn document_font_faces(
     html: &str,
     sheets: &[(String, String)],
     page_url: &Url,
-) -> Vec<(String, Vec<Url>)> {
+) -> Vec<DocumentFontFace> {
     // CSS Fonts 4 §4.1 defines downloadable faces from the complete set of
     // sheets belonging to the document. Inline style URLs use the document
     // base URL; external-sheet URLs were made absolute against their own sheet
@@ -6211,49 +6267,61 @@ fn document_font_faces(
                             && subresource_allowed(page_url, url))
                 })
                 .collect::<Vec<_>>();
-            (!sources.is_empty()).then_some((face.family, sources))
+            (!sources.is_empty()).then_some(DocumentFontFace {
+                family: face.family,
+                sources,
+                unicode_range: face.unicode_range,
+            })
         })
         .collect()
 }
 
 async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_url: &Url) {
     let faces = document_font_faces(html, sheets, page_url);
-    let fonts = futures::stream::iter(faces.into_iter().map(|(family, sources)| async move {
-        // CSS Fonts 4 §4.3.3: try external references in specified order and
-        // proceed to the next item when loading or format decoding fails.
-        for url in sources {
-            // CSS Fonts #font-fetching-requirements / Fetch's data-URL
-            // processor: local data URLs are valid font sources, with no
-            // HTTP request or cross-origin response headers required.
-            if url.scheme() == "data" {
-                if let Some(font) = crate::img::decode_data_url(url.as_str()).and_then(|bytes| {
-                    crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
-                }) {
-                    return Some(font);
+    let fonts = futures::stream::iter(faces.into_iter().map(
+        |DocumentFontFace {
+             family,
+             sources,
+             unicode_range: ranges,
+         }| async move {
+            // CSS Fonts 4 §4.3.3: try external references in specified order and
+            // proceed to the next item when loading or format decoding fails.
+            for url in sources {
+                // CSS Fonts #font-fetching-requirements / Fetch's data-URL
+                // processor: local data URLs are valid font sources, with no
+                // HTTP request or cross-origin response headers required.
+                if url.scheme() == "data" {
+                    if let Some(font) =
+                        crate::img::decode_data_url(url.as_str()).and_then(|bytes| {
+                            crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
+                        })
+                    {
+                        return Some(font.restrict_to(&ranges));
+                    }
+                    continue;
                 }
-                continue;
+                let Ok(response) = fetch(&Request::subresource(
+                    url,
+                    page_url,
+                    "font",
+                    Some(CredentialsMode::SameOrigin),
+                ))
+                .await
+                else {
+                    continue;
+                };
+                if !(200..300).contains(&response.status) {
+                    continue;
+                }
+                if let Some(font) =
+                    crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
+                {
+                    return Some(font.restrict_to(&ranges));
+                }
             }
-            let Ok(response) = fetch(&Request::subresource(
-                url,
-                page_url,
-                "font",
-                Some(CredentialsMode::SameOrigin),
-            ))
-            .await
-            else {
-                continue;
-            };
-            if !(200..300).contains(&response.status) {
-                continue;
-            }
-            if let Some(font) =
-                crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
-            {
-                return Some(font);
-            }
-        }
-        None
-    }))
+            None
+        },
+    ))
     .buffered(PREFETCH_CONCURRENCY)
     .filter_map(|font| async move { font })
     .collect()
@@ -9140,6 +9208,23 @@ mod tests {
     }
 
     #[test]
+    fn font_faces_read_their_unicode_range() {
+        // CSS Fonts 4 #unicode-range-desc with CSS Syntax 3 <urange>s;
+        // an invalid item invalidates the descriptor (all of Unicode). A
+        // comment before a descriptor does not hide it.
+        let faces = stylesheet_font_faces(
+            "@font-face{font-family:Twemoji;/* only emoji */unicode-range:U+00A9, u+203C-2B55,U+1F???;\
+             src:url(t.woff2)}\
+             @font-face{font-family:Bad;unicode-range:U+0-7F,U+110000;src:url(b.woff2)}",
+        );
+        assert_eq!(
+            faces[0].unicode_range,
+            vec![(0xA9, 0xA9), (0x203C, 0x2B55), (0x1F000, 0x1FFFF)]
+        );
+        assert!(faces[1].unicode_range.is_empty());
+    }
+
+    #[test]
     fn stylesheet_url_resolution_obeys_css_token_boundaries() {
         let base = Url::parse("https://cdn.example.test/css/app.css").unwrap();
         let data = "data:image/svg+xml,%3Cg clip-path='url(%23a)'%3E";
@@ -9186,6 +9271,7 @@ mod tests {
             vec![CssFontFace {
                 family: "Site Icons".into(),
                 sources: vec!["https://cdn.test/icons.woff2".into()],
+                unicode_range: Vec::new(),
             }]
         );
 
@@ -9231,14 +9317,14 @@ mod tests {
         )];
         let faces = document_font_faces(html, &sheets, &page);
         assert_eq!(faces.len(), 2);
-        assert_eq!(faces[0].0, "Inline");
+        assert_eq!(faces[0].family, "Inline");
         assert_eq!(
-            faces[0].1[0].as_str(),
+            faces[0].sources[0].as_str(),
             "https://example.test/assets/fonts/inline.ttf"
         );
-        assert_eq!(faces[1].0, "External");
+        assert_eq!(faces[1].family, "External");
         assert_eq!(
-            faces[1].1[0].as_str(),
+            faces[1].sources[0].as_str(),
             "https://cdn.example.test/fonts/external.woff2"
         );
     }
@@ -9254,10 +9340,13 @@ mod tests {
             &page,
         );
         assert_eq!(faces.len(), 1);
-        assert_eq!(faces[0].1.len(), 2);
-        assert_eq!(faces[0].1[0].as_str(), "data:font/woff2;base64,d09GMg==");
+        assert_eq!(faces[0].sources.len(), 2);
         assert_eq!(
-            faces[0].1[1].as_str(),
+            faces[0].sources[0].as_str(),
+            "data:font/woff2;base64,d09GMg=="
+        );
+        assert_eq!(
+            faces[0].sources[1].as_str(),
             "https://example.test/fallback)with;punctuation.woff2"
         );
     }

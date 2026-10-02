@@ -6535,7 +6535,7 @@ impl Dom {
                 if let Some(font) = crate::img::decode_data_url(source).and_then(|bytes| {
                     crate::font_system::PageFont::from_web_resource(face.family.clone(), bytes)
                 }) {
-                    return Some(font);
+                    return Some(font.restrict_to(&face.unicode_range));
                 }
                 continue;
             }
@@ -6551,7 +6551,7 @@ impl Dom {
                         face.family.clone(),
                         bytes.to_vec(),
                     ) {
-                        return Some(font);
+                        return Some(font.restrict_to(&face.unicode_range));
                     }
                 }
                 Some(None) => {}
