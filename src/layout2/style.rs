@@ -419,7 +419,7 @@ impl BoxStyle {
                 Len::parse_or(cv("bottom").as_deref(), u, vp, Len::Auto),
                 Len::parse_or(cv("left").as_deref(), u, vp, Len::Auto),
             ],
-            z_index: cv("z-index").and_then(|v| v.trim().parse::<i32>().ok()),
+            z_index: cv("z-index").and_then(|v| crate::dom::css_integer(&v)),
             transform,
             child_viewport: matches!(tag, "iframe" | "frame"),
             has_transform,
@@ -574,7 +574,7 @@ impl BoxStyle {
                 len("bottom", Len::Auto),
                 len("left", Len::Auto),
             ],
-            z_index: cv("z-index").and_then(|value| value.trim().parse().ok()),
+            z_index: cv("z-index").and_then(|value| crate::dom::css_integer(&value)),
             transform: super::transform::Transform::parse(cv, u, vp),
             child_viewport: false,
             has_transform: ["transform", "translate", "rotate", "scale"]
