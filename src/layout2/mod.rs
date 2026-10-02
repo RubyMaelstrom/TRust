@@ -4090,6 +4090,35 @@ mod tests {
     }
 
     #[test]
+    fn inline_boxes_holding_blocks_take_no_sizing_properties() {
+        // CSS 2 §§10.2/10.5 (and min/max, css-sizing-4 aspect-ratio): the
+        // sizing properties do not apply to a non-replaced inline element,
+        // even one split around block-level children (§9.2.1.1). A fallback
+        // object's width/height attributes map to them (HTML #dimRendering),
+        // so a Flash player's "get Flash" notice keeps the full width, as in
+        // Chromium, instead of a 300×30 box; an author span likewise.
+        let html = r#"<!DOCTYPE html><body style="margin:0;font:16px/20px sans-serif">
+            <div style="width:500px"><object id=o width=300 height=30><param name=movie value=x.swf><div id=notice>Get Flash to see this player, and some more words to fill the line.</div></object></div>
+            <div style="width:500px"><span id=s style="width:100px;height:30px;max-width:80px;min-height:90px;aspect-ratio:1"><div id=child>a block child of a sized span</div></span></div>
+            <div style="width:500px"><object id=b width=300 height=30 style="display:block"><div>a block object keeps them</div></object></div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(
+            dom.computed_value(dom.get_by_id("o").unwrap(), "width")
+                .as_deref(),
+            Some("300px")
+        );
+        assert_eq!((rect("notice").width, rect("notice").height), (500.0, 40.0));
+        assert_eq!((rect("o").width, rect("o").height), (500.0, 40.0));
+        assert_eq!((rect("child").width, rect("child").height), (500.0, 20.0));
+        assert_eq!((rect("s").width, rect("s").height), (500.0, 20.0));
+        // An ordinary block-level fallback object takes its hints.
+        assert_eq!((rect("b").width, rect("b").height), (300.0, 30.0));
+    }
+
+    #[test]
     fn noembed_and_the_other_hidden_elements_have_no_box() {
         // HTML Rendering #hidden-elements: `area, base, basefont, datalist,
         // head, link, meta, noembed, noframes, param, rp, script, style,
