@@ -4964,11 +4964,12 @@ impl Flow<'_> {
     /// Lay a multi-column container's content (css-multicol-1): lay the content
     /// ONCE as ordinary block/inline flow at the column content width `col_w`,
     /// then BALANCE (`column-fill:balance`, the default with an indefinite
-    /// height) by slicing the laid line boxes into `n` equal-height columns at
-    /// line-box granularity and translating each column into place. Returns the
-    /// sliced fragments, the container's used content height, and the (column-
-    /// translated) anchors. `content_top` is the content-box top; column 0 sits
-    /// at `content_x`, column k at `content_x + k·(col_w + gap)`.
+    /// height): choose column starts among the content's break opportunities
+    /// for the least column height, and move each fragment into its column
+    /// (`place_in_columns`). Returns the placed fragments, the container's used
+    /// content height, and the (column-translated) anchors. `content_top` is
+    /// the content-box top; column 0 sits at `content_x`, column k at
+    /// `content_x + k·(col_w + gap)`.
     #[allow(clippy::too_many_arguments)]
     fn lay_multicol(
         &self,
@@ -5019,28 +5020,160 @@ impl Flow<'_> {
             // never reach here (`resolve_multicol` gates the caller).
             _ => {}
         }
-        let h_px = (cur.flush() - content_top).max(0.0);
+        let end = cur.flush().max(content_top);
         let mut anchors = std::mem::take(&mut cur.anchors);
 
-        // ---- balance: equal-height columns in canonical CSS pixels ----
-        let col_h_px = (h_px / n as f32).max(1.0);
-        // The per-fragment column offset, keyed on its top CSS-pixel position
-        // (§3.4: content fills the anonymous column boxes in order). A
-        // fragment at block offset `y` lands in the corresponding column and
-        // is translated right by its preceding gaps/widths.
-        let column_shift = |y: f32| -> (f32, f32) {
-            let k = (((y - content_top).max(0.0) / col_h_px).floor() as usize).min(n - 1);
-            (k as f32 * (col_w + gap_px), -(k as f32) * col_h_px)
-        };
+        // ---- balance (css-multicol-1 #cf): the shortest columns that the
+        // content's break opportunities allow ----
+        let mut breaks = Vec::new();
+        break_opportunities(self.dom, &single, &mut breaks);
+        breaks.retain(|&y| y > content_top + 0.01 && y < end - 0.01);
+        breaks.sort_by(f32::total_cmp);
+        breaks.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        let starts = balance_columns(&breaks, content_top, end, n);
+        let step = col_w + gap_px;
         for a in &mut anchors {
-            let (_, dy) = column_shift(a.1);
-            a.1 += dy;
+            let k = column_of(&starts, a.1);
+            a.1 += content_top - starts[k];
         }
+        let mut bottoms = vec![content_top; starts.len()];
         let mut out: Vec<Frag> = Vec::new();
         for f in single {
-            slice_columns(f, &column_shift, &mut out);
+            place_in_columns(f, &starts, step, content_top, &mut bottoms, &mut out);
         }
+        // CSS Fragmentation 3 #break-margins truncates margins at a column
+        // break; the last column keeps the content's own end.
+        let last = starts.len() - 1;
+        let col_h_px = bottoms[..last]
+            .iter()
+            .map(|bottom| bottom - content_top)
+            .fold(end - starts[last], f32::max)
+            .max(0.0);
         (out, col_h_px, anchors)
+    }
+}
+
+/// CSS Fragmentation 3 #possible-breaks in a multi-column flow laid as one
+/// tall column: before each in-flow block-level box after the first among
+/// its siblings (class A) and between line boxes (class B) where at least
+/// `orphans` lines stay before and `widows` lines after (both 2 initially).
+/// Table cells, floats, atomic inlines and out-of-flow boxes are not
+/// descended into.
+fn break_opportunities(dom: &Dom, frags: &[Frag], out: &mut Vec<f32>) {
+    const ORPHANS: usize = 2;
+    const WIDOWS: usize = 2;
+    let block = |f: &Frag| {
+        matches!(f.kind, FragKind::Block)
+            && !f.paint.float
+            && !f.paint.outside_marker
+            && (f.node == NO_NODE
+                || !dom
+                    .effective_display(f.node)
+                    .is_some_and(|display| display.starts_with("inline")))
+    };
+    let lines = frags
+        .iter()
+        .filter(|f| matches!(f.kind, FragKind::Line(_)) && !f.paint.outside_marker)
+        .count();
+    let (mut line, mut blocks) = (0, 0);
+    for f in frags {
+        if matches!(f.kind, FragKind::Line(_)) && !f.paint.outside_marker {
+            if line >= ORPHANS && lines - line >= WIDOWS {
+                out.push(f.y);
+            }
+            line += 1;
+        } else if block(f) {
+            if blocks > 0 {
+                out.push(f.y);
+            }
+            blocks += 1;
+            if !f
+                .children
+                .iter()
+                .any(|c| matches!(c.kind, FragKind::TableCell(_)))
+            {
+                break_opportunities(dom, &f.children, out);
+            }
+        }
+    }
+}
+
+/// CSS Multi-column 1 #cf (`column-fill: balance`): the start of each of at
+/// most `n` columns, in the single tall column's coordinates, for the least
+/// column height that fits the content into `n` columns breaking only at
+/// `breaks`. A piece taller than that height overflows its column.
+fn balance_columns(breaks: &[f32], top: f32, end: f32, n: usize) -> Vec<f32> {
+    let fill = |height: f32| -> Vec<f32> {
+        let mut starts = vec![top];
+        while starts.len() < n {
+            let start = starts[starts.len() - 1];
+            if end - start <= height + 0.01 {
+                break;
+            }
+            let next = breaks
+                .iter()
+                .copied()
+                .filter(|&b| b > start + 0.01 && b <= start + height + 0.01)
+                .last()
+                .or_else(|| breaks.iter().copied().find(|&b| b > start + 0.01));
+            match next {
+                Some(next) => starts.push(next),
+                None => break,
+            }
+        }
+        starts
+    };
+    let fits = |height: f32| end - fill(height)[..].last().copied().unwrap_or(top) <= height + 0.01;
+    let (mut lo, mut hi) = (((end - top) / n as f32).max(0.0), (end - top).max(0.0));
+    if fits(lo) {
+        return fill(lo);
+    }
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    fill(hi)
+}
+
+/// The column whose start is the last at or above `y`.
+fn column_of(starts: &[f32], y: f32) -> usize {
+    starts
+        .iter()
+        .rposition(|&start| start <= y + 0.01)
+        .unwrap_or(0)
+}
+
+/// Move one laid fragment into its column (css-multicol-1): a fragment
+/// that fits in the column its top falls in moves as a unit, keeping its
+/// own background and border; a block straddling a column start is split
+/// into its children (its own box decoration is not repeated per column).
+/// `bottoms` records each column's lowest placed edge.
+fn place_in_columns(
+    mut f: Frag,
+    starts: &[f32],
+    step: f32,
+    top: f32,
+    bottoms: &mut [f32],
+    out: &mut Vec<Frag>,
+) {
+    let k = column_of(starts, f.y);
+    let column_end = starts.get(k + 1).copied().unwrap_or(f32::INFINITY);
+    let splittable =
+        matches!(f.kind, FragKind::Block | FragKind::TableCell(_)) && !f.children.is_empty();
+    if f.y + f.h <= column_end + 0.01 || !splittable {
+        Flow::offset_frag(&mut f, k as f32 * step, top - starts[k]);
+        if !matches!(f.kind, FragKind::Oof(..) | FragKind::Fixed(_)) {
+            bottoms[k] = bottoms[k].max(f.y + f.h);
+        }
+        out.push(f);
+    } else {
+        for c in std::mem::take(&mut f.children) {
+            place_in_columns(c, starts, step, top, bottoms, out);
+        }
     }
 }
 
@@ -5115,27 +5248,6 @@ struct InlineLaid<'t> {
     /// positioned in the content frame (absolute, like `float_frags`) — the
     /// caller appends them to its children.
     atom_frags: Vec<Frag>,
-}
-
-/// Slice one laid fragment into multi-column position (css-multicol-1): a line
-/// box (or an out-of-flow / leaf block) is translated as a unit by the column
-/// its top edge falls in; a block with children is flattened and its lines
-/// sliced individually (v1 — a block straddling a column break is split at line
-/// granularity, and its own background/border isn't re-drawn per slice). `shift`
-/// maps a fragment's absolute top-y to its `(dx, dy)` column offset.
-fn slice_columns<F: Fn(f32) -> (f32, f32)>(mut f: Frag, shift: &F, out: &mut Vec<Frag>) {
-    match &f.kind {
-        FragKind::Block | FragKind::TableCell(_) if !f.children.is_empty() => {
-            for c in std::mem::take(&mut f.children) {
-                slice_columns(c, shift, out);
-            }
-        }
-        _ => {
-            let (dx, dy) = shift(f.y);
-            Flow::offset_frag(&mut f, dx, dy);
-            out.push(f);
-        }
-    }
 }
 
 /// Collect the floats an inline content list holds, in the exact order the IFC
