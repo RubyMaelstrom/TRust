@@ -1474,6 +1474,29 @@ impl InlineStyle {
         s.font_zero = s.font_size <= 0.;
         s
     }
+
+    /// The text of list item `self.node`'s marker box. CSS Lists 3
+    /// #marker-properties: properties set on its `::marker` inherit to that
+    /// text from the list item (CSS Pseudo 4 #treelike), but only inherited
+    /// text properties take effect there; others, such as `vertical-align`,
+    /// `opacity` and `text-decoration`, do not apply to the marker box.
+    pub fn marker(&self, dom: &Dom) -> std::borrow::Cow<'_, Self> {
+        if self.node == NO_NODE || !dom.has_marker_style(self.node) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut s = self.with_pseudo(dom, Some((self.node, PseudoEl::Marker)));
+        s.vertical_align = self.vertical_align;
+        s.emph.underline = self.emph.underline;
+        s.emph.strike = self.emph.strike;
+        s.opacity_chain = self.opacity_chain;
+        s.invisible = self.opacity_chain
+            || matches!(
+                dom.pseudo_layout_value(self.node, PseudoEl::Marker, "visibility")
+                    .as_deref(),
+                Some("hidden" | "collapse")
+            );
+        std::borrow::Cow::Owned(s)
+    }
 }
 
 /// The CSS Text 4 wrap longhand as a nowrap override for

@@ -211,7 +211,11 @@ fn events(dom: &Dom) -> Vec<Event> {
     let mut previous: FxHashMap<Option<usize>, usize> = FxHashMap::default();
     let mut stack = vec![(DOCUMENT, None, None)];
     while let Some((id, pseudo, parent)) = stack.pop() {
+        // CSS Lists 3 #marker-properties: `display` and the counter
+        // properties do not apply to a marker box, only its `content`.
+        let marker = pseudo == Some(PseudoEl::Marker);
         let display = match pseudo {
+            Some(_) if marker => None,
             Some(p) => dom.pseudo_layout_value(id, p, "display"),
             None => dom.effective_display(id),
         };
@@ -232,7 +236,7 @@ fn events(dom: &Dom) -> Vec<Event> {
         let tokens = pseudo.and_then(|which| {
             value("content")
                 .or_else(|| {
-                    (dom.tag_name(id) == Some("q")).then(|| {
+                    (dom.tag_name(id) == Some("q") && !marker).then(|| {
                         if which == PseudoEl::Before {
                             "open-quote"
                         } else {
@@ -254,7 +258,7 @@ fn events(dom: &Dom) -> Vec<Event> {
                 .as_deref()
                 .is_some_and(|s| s.split_whitespace().any(|v| v == "list-item"));
         let parse = |p| {
-            if boxed {
+            if boxed && !marker {
                 value(p)
                     .as_deref()
                     .and_then(|v| changes(v, p))
@@ -327,6 +331,11 @@ fn events(dom: &Dom) -> Vec<Event> {
                 ));
             }
             stack.push((id, Some(PseudoEl::Before), Some(index)));
+            // CSS Lists 3 #marker-pseudo: a list item's marker is its first
+            // child, before ::before.
+            if list_item {
+                stack.push((id, Some(PseudoEl::Marker), Some(index)));
+            }
         }
     }
     result
@@ -592,10 +601,7 @@ fn run(dom: &Dom, events: &[Event], starts: Option<&[i64]>) -> (Generated, Vec<i
                 if !text.is_empty() || items.is_empty() {
                     items.push(GeneratedContent::Text(text));
                 }
-                out.content.insert(
-                    (event.node, if p == PseudoEl::Before { 0 } else { 1 }),
-                    items,
-                );
+                out.content.insert((event.node, p.content_slot()), items);
             }
         }
         states.push(state);

@@ -1210,6 +1210,26 @@ impl Builder<'_> {
         if let Some(top) = self.lists.last_mut() {
             top.0 = top.0.saturating_add(top.1);
         }
+        let inside = matches!(
+            self.dom
+                .computed_value_resolved(id, "list-style-position")
+                .as_deref(),
+            Some("inside")
+        );
+        // CSS Lists 3 #content-property: `content` on the ::marker other than
+        // `normal` fills the marker box as for ::before (its images are not
+        // rendered yet), ahead of list-style-image and list-style-type (even
+        // `none`); `content: none` generates no marker box.
+        if let Some(items) = self.dom.marker_content(id) {
+            let text: String = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::dom::GeneratedContent::Text(text) => Some(text),
+                    crate::dom::GeneratedContent::Image(_) => None,
+                })
+                .collect();
+            return ((!text.is_empty()).then_some(text), None, inside);
+        }
         let image = self
             .dom
             .computed_value_resolved(id, "list-style-image")
@@ -1237,12 +1257,6 @@ impl Builder<'_> {
             .as_ref()
             .map(|_| " ".to_string())
             .unwrap_or_else(|| self.dom.css_list_marker(id, kind.trim()));
-        let inside = matches!(
-            self.dom
-                .computed_value_resolved(id, "list-style-position")
-                .as_deref(),
-            Some("inside")
-        );
         ((!text.is_empty()).then_some(text), image, inside)
     }
 

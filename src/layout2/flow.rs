@@ -1940,6 +1940,9 @@ impl Flow<'_> {
         marker_image: Option<&str>,
         inl: &InlineStyle,
     ) -> MarkerLine {
+        // CSS Lists 3 #marker-properties: the marker's own text style.
+        let marker_style = inl.marker(self.dom);
+        let inl: &InlineStyle = &marker_style;
         if let Some(source) = marker_image {
             // CSS Lists 3 §3.2 represents a list-style-image marker as an
             // anonymous inline replaced element followed by one U+0020. Until
@@ -1960,7 +1963,7 @@ impl Flow<'_> {
                     image: Some(source.to_string()),
                     emph: Emphasis::default(),
                     style_node: inl.node,
-                    pseudo: None,
+                    pseudo: inl.pseudo,
                     node: NO_NODE,
                     link: None,
                     crop: false,
@@ -1984,7 +1987,7 @@ impl Flow<'_> {
                     image: None,
                     emph: inl.emph,
                     style_node: inl.node,
-                    pseudo: None,
+                    pseudo: inl.pseudo,
                     node: NO_NODE,
                     link: None,
                     crop: false,
@@ -2014,7 +2017,7 @@ impl Flow<'_> {
                     image: None,
                     emph: inl.emph,
                     style_node: inl.node,
-                    pseudo: None,
+                    pseudo: inl.pseudo,
                     node: NO_NODE,
                     link: None,
                     crop: false,
@@ -4963,13 +4966,14 @@ impl Flow<'_> {
             ifc.set_align_last(align_last);
         }
         ifc.set_first_line_ascent(first_line_ascent);
+        // CSS Lists 3 #marker-properties: the marker's own text style.
         if let Some(source) = marker_image {
-            let mut mctx = inl.clone();
+            let mut mctx = inl.marker(self.dom).into_owned();
             mctx.kind = crate::layout2::ItemKind::Image;
             ifc.marker_image(source, &mctx);
         }
         if let Some(m) = marker {
-            let mut mctx = inl.clone();
+            let mut mctx = inl.marker(self.dom).into_owned();
             mctx.kind = crate::layout2::ItemKind::Text;
             ifc.text(m, &mctx);
         }
