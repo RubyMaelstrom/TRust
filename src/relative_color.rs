@@ -191,13 +191,13 @@ fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i
 
     let mut components = [0f32; 4];
     let mut result_missing = Missing::EMPTY;
-    for index in 0..3 {
+    for (index, component) in components.iter_mut().enumerate().take(3) {
         let channel = Channel::Component {
             hue: form.hue == Some(index),
             percent: form.percent[index],
         };
         match channel_value(p, &keywords, channel, depth)? {
-            Some(value) => components[index] = (value / form.scale) as f32,
+            Some(value) => *component = (value / form.scale) as f32,
             None => result_missing.insert(index),
         }
     }

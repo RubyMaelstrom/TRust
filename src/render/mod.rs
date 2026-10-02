@@ -2559,7 +2559,7 @@ fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32)
                 .x,
             )
         })
-        .last()
+        .next_back()
         .map(|opacity| opacity.clamp(0.0, 1.0))
 }
 
