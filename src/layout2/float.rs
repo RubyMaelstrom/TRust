@@ -139,6 +139,18 @@ impl FloatCtx {
         (left, right)
     }
 
+    /// CSS 2 §9.5: where a line box too short beside the floats overlapping
+    /// `[y, y+h)` moves next, the nearest of their bottoms; `None` when no
+    /// float overlaps it.
+    pub fn next_bottom(&self, y: f32, h: f32) -> Option<f32> {
+        self.lefts
+            .iter()
+            .chain(&self.rights)
+            .filter(|f| overlaps(f, y, h))
+            .map(|f| f.y1)
+            .reduce(f32::min)
+    }
+
     /// The horizontal exclusion band for an in-flow formatting-context root
     /// whose border box starts at `top`, plus the bottom of the floats that
     /// constrain it. Unlike [`Self::band`], this must consider a preceding
