@@ -2465,39 +2465,30 @@ fn paint_outline_box(
             }
         })
         .unwrap_or_else(|| text_color_for_style(builder.dom, source));
-    if outline.style == OutlineStyle::Dotted {
-        // CSS UI 4 #outline-style: the border styles keep their meaning.
-        paint_dotted_sides(
-            builder,
-            BorderEdges {
-                rect: outer,
-                radii: outer_radii,
-                widths: [width; 4],
-                styles: ["dotted"; 4],
-                colors: [color; 4],
-            },
-        );
-        return;
-    }
-    let half = width / 2.0;
-    let center = CssRect::new(
-        outer.x + half,
-        outer.y + half,
-        (outer.width - width).max(0.0),
-        (outer.height - width).max(0.0),
+    // CSS UI 4 #outline-style: the border styles keep their meaning. Like
+    // the box's border, the outline is a band around its edge, here of one
+    // width, style and color on every side.
+    let style = match outline.style {
+        OutlineStyle::Dashed => "dashed",
+        OutlineStyle::Dotted => "dotted",
+        OutlineStyle::Double => "double",
+        OutlineStyle::Groove => "groove",
+        OutlineStyle::Ridge => "ridge",
+        OutlineStyle::Inset => "inset",
+        OutlineStyle::Outset => "outset",
+        _ => "solid",
+    };
+    paint_border_edges(
+        builder,
+        BorderEdges {
+            rect: outer,
+            radii: outer_radii,
+            widths: [width; 4],
+            styles: [style; 4],
+            colors: [color; 4],
+        },
+        false,
     );
-    builder.commands.push(DisplayCommand::Stroke {
-        shape: rounded_shape(center, inset_radii(outer_radii, outer, center)),
-        brush: PaintBrush::Solid(color),
-        style: stroke_for_border(
-            width,
-            if outline.style == OutlineStyle::Dashed {
-                "dashed"
-            } else {
-                "solid"
-            },
-        ),
-    });
 }
 
 /// CSS Backgrounds 3 #outset-adjusted-border-radius: the radii of `edge`
@@ -3889,18 +3880,41 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         border_color(builder.dom, style, side)
             .unwrap_or_else(|| text_color_for_style(builder.dom, style))
     });
-    let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let collapse = style.value(builder.dom, "border-collapse").as_deref() == Some("collapse");
+    paint_border_edges(
+        builder,
+        BorderEdges {
+            rect: CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
+            radii,
+            widths: fragment.border,
+            styles: styles.each_ref().map(String::as_str),
+            colors,
+        },
+        collapse,
+    );
+}
+
+/// Paint the band of each of a box's border edges, or of its outline.
+fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collapse: bool) {
+    let BorderEdges {
+        rect,
+        radii,
+        widths,
+        styles,
+        colors,
+    } = edges;
+    let [top, right, bottom, left] = widths;
     // #line-style permits UA-chosen band thickness and shading, but double
     // must have a gap and the 3D styles must preserve their opposite relief.
     let complex = |s: &str| matches!(s, "double" | "groove" | "ridge" | "inset" | "outset");
-    let owners = corner_owners(fragment.border, &styles);
-    let splits = corner_splits(rect, radii, fragment.border, &owners);
+    let owners = corner_owners(widths, &styles);
+    let splits = corner_splits(rect, radii, widths, &owners);
     for side in 0..4 {
-        if fragment.border[side] <= 0. || !complex(&styles[side]) {
+        if widths[side] <= 0. || !complex(styles[side]) {
             continue;
         }
-        let mut kind = styles[side].as_str();
-        if style.value(builder.dom, "border-collapse").as_deref() == Some("collapse") {
+        let mut kind = styles[side];
+        if collapse {
             kind = match kind {
                 "inset" => "ridge",
                 "outset" => "groove",
@@ -3926,7 +3940,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
             .push(DisplayCommand::PushClip(side_clip(side, &splits)));
         for (start, end, color) in bands {
             builder.commands.push(DisplayCommand::Fill {
-                shape: border_ring(rect, radii, fragment.border, start, end),
+                shape: border_ring(rect, radii, widths, start, end),
                 brush: PaintBrush::Solid(color),
             });
         }
@@ -3939,8 +3953,8 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         && colors.iter().all(|c| *c == colors[0]);
     if uniform
         && top > 0.0
-        && !matches!(styles[0].as_str(), "none" | "hidden" | "dotted")
-        && !complex(&styles[0])
+        && !matches!(styles[0], "none" | "hidden" | "dotted")
+        && !complex(styles[0])
     {
         // CSS Backgrounds 3 #corner-shaping: the outer edge follows the
         // border radii and the padding edge those radii less the border
@@ -3948,7 +3962,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         // dashed along the ring's center line.
         if styles[0] == "solid" {
             builder.commands.push(DisplayCommand::Fill {
-                shape: border_ring(rect, radii, fragment.border, 0., 1.),
+                shape: border_ring(rect, radii, widths, 0., 1.),
                 brush: PaintBrush::Solid(colors[0]),
             });
             return;
@@ -3963,7 +3977,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         builder.commands.push(DisplayCommand::Stroke {
             shape: rounded_shape(center, inset_radii(radii, rect, center)),
             brush: PaintBrush::Solid(colors[0]),
-            style: stroke_for_border(top, &styles[0]),
+            style: stroke_for_border(top, styles[0]),
         });
         return;
     }
@@ -3991,8 +4005,8 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     ];
     for (index, (width, start, end)) in sides.into_iter().enumerate() {
         if width <= 0.0
-            || matches!(styles[index].as_str(), "none" | "hidden" | "dotted")
-            || complex(&styles[index])
+            || matches!(styles[index], "none" | "hidden" | "dotted")
+            || complex(styles[index])
         {
             continue;
         }
@@ -4002,7 +4016,7 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         builder
             .commands
             .push(DisplayCommand::PushClip(side_clip(index, &splits)));
-        let ring = border_ring(rect, radii, fragment.border, 0., 1.);
+        let ring = border_ring(rect, radii, widths, 0., 1.);
         if styles[index] == "solid" {
             builder.commands.push(DisplayCommand::Fill {
                 shape: ring,
@@ -4012,13 +4026,13 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
             builder.commands.push(DisplayCommand::Stroke {
                 shape: PaintShape::Path(vec![PathElement::MoveTo(start), PathElement::LineTo(end)]),
                 brush: PaintBrush::Solid(colors[index]),
-                style: stroke_for_border(width, &styles[index]),
+                style: stroke_for_border(width, styles[index]),
             });
         } else {
             // #corner-shaping: every style follows the curve, so dash the
             // ring's center line, kept within the ring where the adjoining
             // side is thinner.
-            let half = fragment.border.map(|width| width / 2.);
+            let half = widths.map(|width| width / 2.);
             let middle = CssRect::new(
                 rect.x + half[3],
                 rect.y + half[0],
@@ -4033,22 +4047,13 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
                     false,
                 )),
                 brush: PaintBrush::Solid(colors[index]),
-                style: stroke_for_border(width, &styles[index]),
+                style: stroke_for_border(width, styles[index]),
             });
             builder.commands.push(DisplayCommand::PopClip);
         }
         builder.commands.push(DisplayCommand::PopClip);
     }
-    paint_dotted_sides(
-        builder,
-        BorderEdges {
-            rect,
-            radii,
-            widths: fragment.border,
-            styles: styles.each_ref().map(String::as_str),
-            colors,
-        },
-    );
+    paint_dotted_sides(builder, edges);
 }
 
 fn paint_box_shadows(dom: &Dom, style: PaintStyle, shape: &PaintShape, builder: &mut Builder<'_>) {
@@ -4295,6 +4300,7 @@ fn side_clip(side: usize, splits: &[Vec<CssPoint>; 4]) -> PaintShape {
 }
 
 /// A box's border edges in top/right/bottom/left order.
+#[derive(Clone, Copy)]
 struct BorderEdges<'a> {
     /// The border box.
     rect: CssRect,
@@ -6421,6 +6427,39 @@ mod tests {
         assert_eq!(pixel(244, 204), [255, 255, 255]);
         assert_eq!(pixel(232, 220), [0, 0, 255]);
         assert_eq!(pixel(260, 191), [0, 0, 255]);
+    }
+
+    #[test]
+    fn outlines_draw_double_and_3d_styles_like_borders() {
+        // CSS UI 4 #outline-style: <outline-line-style> takes the border
+        // styles "with the same meaning". These used to be one solid stroke.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="position:absolute;left:40px;top:40px;width:100px;height:60px;
+                outline:8px ridge #50579c"></div>
+            <div style="position:absolute;left:200px;top:40px;width:100px;height:60px;
+                outline:8px groove #50579c"></div>
+            <div style="position:absolute;left:360px;top:40px;width:100px;height:60px;
+                outline:9px double #50579c"></div>
+            <div style="position:absolute;left:520px;top:40px;width:100px;height:60px;
+                outline:8px inset #50579c"></div>"#,
+        );
+        let (light, dark) = ([80, 87, 156], [53, 58, 104]);
+        // Ridge: light outside and dark inside on the top and left, the
+        // reverse on the bottom and right; groove the opposite.
+        assert_eq!((pixel(33, 70), pixel(38, 70)), (light, dark));
+        assert_eq!((pixel(70, 33), pixel(70, 38)), (light, dark));
+        assert_eq!((pixel(141, 70), pixel(146, 70)), (light, dark));
+        assert_eq!((pixel(70, 101), pixel(70, 106)), (light, dark));
+        assert_eq!((pixel(193, 70), pixel(198, 70)), (dark, light));
+        assert_eq!((pixel(301, 70), pixel(306, 70)), (dark, light));
+        // Double: two 3px lines with a 3px gap between.
+        assert_eq!(pixel(352, 70), light);
+        assert_eq!(pixel(355, 70), [255, 255, 255]);
+        assert_eq!(pixel(358, 70), light);
+        // Inset: dark top and left, light bottom and right.
+        assert_eq!((pixel(515, 70), pixel(624, 70)), (dark, light));
+        assert_eq!((pixel(570, 35), pixel(570, 104)), (dark, light));
     }
 
     #[test]
