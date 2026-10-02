@@ -5563,8 +5563,10 @@ fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<Pa
     } else {
         return None;
     };
+    // CSS Images 4 #color-stop-syntax: a single color stop (possibly with
+    // two positions) is a complete color stop list.
     let mut parts = split_top_level(body, ',');
-    if parts.len() < 2 {
+    if parts.is_empty() {
         return None;
     }
     let mut angle = PI;
@@ -5670,8 +5672,10 @@ fn parse_conic_gradient(
     rect: CssRect,
     lengths: LengthBasis,
 ) -> Option<PaintBrush> {
+    // CSS Images 4 #color-stop-syntax: a single color stop (possibly with
+    // two positions) is a complete color stop list.
     let mut parts = split_top_level(body, ',');
-    if parts.len() < 2 {
+    if parts.is_empty() {
         return None;
     }
     let (header, interpolation, explicit_interpolation) = gradient_interpolation(parts[0])?;
@@ -5915,8 +5919,13 @@ fn parse_stops_at(parts: &[&str], position: impl Fn(&str) -> Option<f32>) -> Opt
             _ => return None,
         }
     }
-    if colors.len() < 2 || hints.last().is_some_and(|(at, _)| *at == colors.len()) {
+    if colors.is_empty() || hints.last().is_some_and(|(at, _)| *at == colors.len()) {
         return None;
+    }
+    // CSS Images 4 #color-stop-fixup places a lone stop at its position or
+    // 0%; a gradient of one color is that solid color on both sides of it.
+    if colors.len() == 1 {
+        colors.push(colors[0]);
     }
     let last = colors.len() - 1;
     colors[0].1.get_or_insert(0.0);
@@ -8645,6 +8654,30 @@ mod tests {
                 "#{id}: {painted:?} {measured:?}"
             );
             assert!(measured.height < 24.0, "#{id}: {measured:?}");
+        }
+    }
+
+    #[test]
+    fn a_single_color_stop_paints_its_solid_color() {
+        // CSS Images 4 #color-stop-syntax: a color stop list may have one
+        // stop, and `<color> 0 0` is one stop with two positions. Mask
+        // compositing idioms paint `linear-gradient(#000 0 0)` layers.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white"><style>
+            div{position:absolute;top:0;width:40px;height:40px}</style>
+            <div style="left:0;background:linear-gradient(#00f 0 0)"></div>
+            <div style="left:50px;background:radial-gradient(red)"></div>
+            <div style="left:100px;background:conic-gradient(from 90deg,#0f0)"></div>
+            <div style="left:150px;background:repeating-linear-gradient(to right,#00f 5px)"></div>"#,
+        );
+        for (x, color) in [
+            (20, [0, 0, 255]),
+            (70, [255, 0, 0]),
+            (120, [0, 255, 0]),
+            (170, [0, 0, 255]),
+        ] {
+            assert_eq!(pixel(x, 2), color, "x={x}");
+            assert_eq!(pixel(x - 18, 38), color, "x={x}");
         }
     }
 
