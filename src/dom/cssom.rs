@@ -226,6 +226,15 @@ fn longhands(property: &str, value: &str) -> Vec<(String, String)> {
     expand_box_shorthand(property, value)
         .into_iter()
         .filter(|(name, _)| name != property || is_tracked(name))
+        // The cascade also splits background-position into its x and y
+        // longhands; CSSOM keeps the shorthand's own position value.
+        .filter(|(name, _)| {
+            name == property
+                || !matches!(
+                    name.as_str(),
+                    "background-position-x" | "background-position-y"
+                )
+        })
         .map(|(name, value)| {
             if !matches!(
                 name.as_str(),

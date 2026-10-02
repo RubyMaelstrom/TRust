@@ -2838,6 +2838,41 @@ fn paint_background_images_for_style(
         .unwrap_or_else(|| "auto auto".into());
     let repeat_layers = split_top_level(&repeat_value, ',');
     let position_layers = split_top_level(&position_value, ',');
+    // CSS Backgrounds 4 #background-position-longhands: background-position-x
+    // and -y, when set, give each layer's horizontal and vertical position.
+    let axis_x = style.value(builder.dom, "background-position-x");
+    let axis_y = style.value(builder.dom, "background-position-y");
+    let combined: Option<Vec<String>> = (axis_x.is_some() || axis_y.is_some()).then(|| {
+        let xs = axis_x
+            .as_deref()
+            .map(|value| split_top_level(value, ','))
+            .unwrap_or_default();
+        let ys = axis_y
+            .as_deref()
+            .map(|value| split_top_level(value, ','))
+            .unwrap_or_default();
+        let layers = xs.len().max(ys.len()).max(position_layers.len()).max(1);
+        (0..layers)
+            .map(|index| {
+                let base = position_layers
+                    .get(index % position_layers.len().max(1))
+                    .and_then(|layer| crate::dom::bg_position_layer_axes(layer.trim()));
+                let pick = |axis: &[&str], fallback: Option<&String>| {
+                    axis.get(index % axis.len().max(1))
+                        .map(|value| value.trim().to_string())
+                        .or_else(|| fallback.cloned())
+                        .unwrap_or_else(|| "0%".into())
+                };
+                let x = pick(&xs, base.as_ref().map(|axes| &axes.0));
+                let y = pick(&ys, base.as_ref().map(|axes| &axes.1));
+                format!("{} {}", position_edge(&x, false), position_edge(&y, true))
+            })
+            .collect()
+    });
+    let position_layers: Vec<&str> = match &combined {
+        Some(layers) => layers.iter().map(String::as_str).collect(),
+        None => position_layers,
+    };
     let size_layers = split_top_level(&size_value, ',');
     let attachment_value = style
         .value(builder.dom, "background-attachment")
@@ -3561,6 +3596,32 @@ fn edge_offset_position(
         resolve(x.unwrap_or(("center".into(), None)), area.width, image.0),
         resolve(y.unwrap_or(("center".into(), None)), area.height, image.1),
     ))
+}
+
+/// One background-position-x or -y value as an edge keyword with an
+/// optional offset (`center` stays), so the two axes combine into a valid
+/// `<bg-position>`: a bare offset is from the left or top edge, and the
+/// logical x-start/x-end/y-start/y-end edges map left-to-right, top-down.
+fn position_edge(value: &str, vertical: bool) -> String {
+    let mut tokens = value.split_whitespace();
+    let first = tokens.next().unwrap_or("0%");
+    let rest: Vec<&str> = tokens.collect();
+    let edge = match first.to_ascii_lowercase().as_str() {
+        "center" => return "center".into(),
+        "left" | "x-start" if !vertical => "left",
+        "right" | "x-end" if !vertical => "right",
+        "top" | "y-start" if vertical => "top",
+        "bottom" | "y-end" if vertical => "bottom",
+        _ => {
+            let start = if vertical { "top" } else { "left" };
+            return format!("{start} {value}");
+        }
+    };
+    if rest.is_empty() {
+        edge.to_string()
+    } else {
+        format!("{edge} {}", rest.join(" "))
+    }
 }
 
 fn background_position_component(
@@ -8027,6 +8088,27 @@ mod tests {
         assert!(!red_border(&layout.paint.primitives));
         let (_, pending) = render_fixture_with_images(html, &Default::default());
         assert!(red_border(&pending.paint.primitives));
+    }
+
+    #[test]
+    fn background_position_longhands_place_each_axis() {
+        // CSS Backgrounds 4 #background-position-longhands: background-position-y
+        // bottom-aligns the image while the shorthand's x component stays.
+        let html = r#"<body style="margin:0"><div style="width:200px;height:100px;background:url(https://example.test/i.png) no-repeat;background-position:right 10px top;background-position-y:bottom"></div></body>"#;
+        let images = [("https://example.test/i.png".to_string(), (20, 30))]
+            .into_iter()
+            .collect();
+        let (_, layout) = render_fixture_with_images(html, &images);
+        let rect = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("background image");
+        assert_eq!((rect.x, rect.y), (170.0, 70.0), "{rect:?}");
     }
 
     #[test]
