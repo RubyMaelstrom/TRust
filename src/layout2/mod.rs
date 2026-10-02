@@ -4379,6 +4379,23 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_table_contributes_at_least_its_minimum_width() {
+        // CSS 2 §17.5.2.2 / CSS Tables 3: a table's used width is the
+        // larger of its declared width (CSS or HTML attribute) and its
+        // minimum content width, and its cell must make room for that.
+        // LibreWolf and Chromium: 310 and 320.
+        let html = r#"<!doctype html><body style="margin:0">
+            <table id=a width=100 cellpadding=5 cellspacing=0 border=0><tr><td><table id=ai width=300 cellspacing=0 border=0><tr><td><div style="width:50px;height:5px"></div></td></tr></table></td></tr></table>
+            <table id=b style="width:100px" cellpadding=5 cellspacing=0 border=0><tr><td><table style="width:100px" cellpadding=5 cellspacing=0 border=0><tr><td><div style="width:300px;height:5px"></div></td></tr></table></td></tr></table></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        assert_eq!(width("ai"), 300.0);
+        assert_eq!(width("a"), 310.0);
+        assert_eq!(width("b"), 320.0);
+    }
+
+    #[test]
     fn a_float_that_does_not_fit_goes_below_the_line_box() {
         // CSS 2 §9.5: a float with no room beside the current line moves
         // below it, so below the baseline-aligned line box (here the strut's
