@@ -4075,6 +4075,22 @@ mod tests {
     }
 
     #[test]
+    fn nobr_and_xmp_take_their_ua_white_space() {
+        // HTML Rendering #phrasing-content-3 `nobr { white-space: nowrap }`
+        // and #flow-content-3 `xmp { white-space: pre }`.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <div id=n style="width:15px"><nobr><span style="display:inline-block;width:40px;height:10px"></span><span
+            style="display:inline-block;width:40px;height:10px"></span> words here</nobr></div>
+            <xmp id=x>a
+b</xmp></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &HashMap::new());
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        assert_eq!(height("n"), 20.0, "one unbroken line");
+        assert_eq!(height("x"), 40.0, "the newline is preserved");
+    }
+
+    #[test]
     fn a_body_whose_overflow_went_to_the_viewport_collapses_margins() {
         // CSS Overflow 3 #overflow-propagation: the body's used overflow is
         // then `visible`, so it is no formatting context and its margin
