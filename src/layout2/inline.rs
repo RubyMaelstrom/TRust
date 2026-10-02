@@ -232,7 +232,7 @@ impl Piece {
             paint_width: width,
             paint_height: height,
             ascent,
-            descent: (height - ascent).max(0.0),
+            descent: height - ascent,
             vertical_align: VerticalAlign::Baseline,
             item,
             shaped: Some(shaped),
@@ -1155,7 +1155,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             paint_width: w,
             paint_height: height,
             ascent,
-            descent: (height - ascent).max(0.0),
+            descent: height - ascent,
             vertical_align: ctx.vertical_align,
             item: InlineItem {
                 text: seg.to_string(),
@@ -1939,7 +1939,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             piece.box_height = shaped.line_height;
             piece.paint_height = shaped.line_height;
             piece.ascent = shaped.baseline;
-            piece.descent = (shaped.line_height - shaped.baseline).max(0.0);
+            piece.descent = shaped.line_height - shaped.baseline;
             piece.shaped = Some(shaped);
             shift += piece.box_width - old_width;
         }
@@ -1970,7 +1970,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 - half_x,
                 _ => p.descent,
             })
-            .fold((strut.line_height - strut.baseline).max(0.0), f32::max);
+            // CSS 2.2 §10.8.1: a line-height below the content area gives a
+            // negative half-leading, so these depths can be negative.
+            .fold(strut.line_height - strut.baseline, f32::max);
         let height = (ascent + descent)
             .max(strut.line_height)
             .max(edge_aligned_height);

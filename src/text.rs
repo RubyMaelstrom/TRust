@@ -618,7 +618,7 @@ impl TextEditor {
                     descent: metrics.descent,
                     leading: metrics.leading,
                     line_height: metrics.line_height,
-                    baseline: metrics.baseline - metrics.block_min_coord,
+                    baseline: css_baseline(&metrics),
                     ..Default::default()
                 })
             } else {
@@ -1211,6 +1211,28 @@ pub fn content_widths(text: &str, style: &TextStyle, breaks: TextBreakStyle) -> 
     TEXT.with_borrow_mut(|system| system.content_widths(text, style, breaks))
 }
 
+/// CSS 2.2 §10.8.1: the baseline sits the ascent plus one half-leading
+/// below the top of the line-height box, and that leading is negative when
+/// `line-height` is smaller than the content area. Parley keeps a negative
+/// half-leading in `baseline` but clamps it out of `block_min_coord` (its
+/// selection box); restore it, split as Parley splits it (the upper half
+/// floored when its metrics are pixel-quantized, which leaves the clamped
+/// content height integral).
+fn css_baseline(metrics: &parley::LineMetrics) -> f32 {
+    let clamped = metrics.baseline - metrics.block_min_coord;
+    let content = metrics.block_max_coord - metrics.block_min_coord;
+    let leading = metrics.line_height - content;
+    if leading >= 0.0 {
+        return clamped;
+    }
+    clamped
+        + if content.fract() == 0.0 {
+            (leading * 0.5).floor()
+        } else {
+            leading * 0.5
+        }
+}
+
 fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
     let Some(line) = layout.lines().next() else {
         return ShapedText {
@@ -1305,7 +1327,7 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
         descent: metrics.descent,
         leading: metrics.leading,
         line_height: metrics.line_height,
-        baseline: metrics.baseline - metrics.block_min_coord,
+        baseline: css_baseline(&metrics),
         underline: false,
         strikethrough: false,
         runs,
