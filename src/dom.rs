@@ -4884,6 +4884,26 @@ impl Dom {
             // WHATWG HTML Rendering §15.3.10: these widgets use border-box
             // sizing in the UA origin. An authored 30px button therefore
             // remains 30px including its padding and border.
+            // HTML Rendering #the-hr-element-2.
+            "color" if tag == "hr" => "gray",
+            "border-top-style"
+            | "border-right-style"
+            | "border-bottom-style"
+            | "border-left-style"
+                if tag == "hr" =>
+            {
+                "inset"
+            }
+            "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width"
+                if tag == "hr" =>
+            {
+                "1px"
+            }
+            "margin-left" | "margin-right" if tag == "hr" => "auto",
+            "overflow" if tag == "hr" => "hidden",
             // HTML Rendering #tables-2.
             "border-spacing" if tag == "table" => "2px",
             "box-sizing" if tag == "table" => "border-box",

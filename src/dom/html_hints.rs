@@ -169,6 +169,49 @@ impl Dom {
         {
             hint("color", color);
         }
+        // HTML Rendering #the-hr-element-2.
+        if tag == "hr" {
+            match self
+                .attr(id, "align")
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("left") => {
+                    hint("margin-left", "0".into());
+                    hint("margin-right", "auto".into());
+                }
+                Some("right") => {
+                    hint("margin-left", "auto".into());
+                    hint("margin-right", "0".into());
+                }
+                Some("center") => {
+                    hint("margin-left", "auto".into());
+                    hint("margin-right", "auto".into());
+                }
+                _ => {}
+            }
+            let solid = self.attr(id, "color").is_some() || self.attr(id, "noshade").is_some();
+            if solid {
+                for side in ["top", "right", "bottom", "left"] {
+                    hint(border_property(side, "style"), "solid".into());
+                }
+            }
+            if let Some(size) = self.attr(id, "size").and_then(non_negative_integer) {
+                if solid {
+                    let width = format!("{}px", f64::from(size) / 2.0);
+                    for side in ["top", "right", "bottom", "left"] {
+                        hint(border_property(side, "width"), width.clone());
+                    }
+                } else if size == 1 {
+                    hint("border-bottom-width", "0".into());
+                } else if size > 1 {
+                    hint("height", format!("{}px", size - 2));
+                }
+            }
+            if let Some(width) = self.attr(id, "width").and_then(dimension_value) {
+                hint("width", width);
+            }
+        }
         if tag == "font" {
             if let Some(size) = self.attr(id, "size").and_then(legacy_font_size) {
                 hint("font-size", size.to_string());
@@ -602,6 +645,32 @@ mod tests {
             ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "xxs"].map(px),
             [10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0, 9.0]
         );
+    }
+
+    #[test]
+    fn hr_elements_follow_the_html_rendering_rules() {
+        let dom = Dom::parse_document(
+            r#"<hr id=plain><hr id=dashed style="border-style:dashed;width:300px">
+            <hr id=noshade noshade size=6 width=50%><hr id=tall size=10 align=left>
+            <hr id=thin size=1 color=blue>"#,
+        );
+        let value = |id: &str, property: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), property)
+                .unwrap_or_default()
+        };
+        assert_eq!(value("plain", "color"), "gray");
+        assert_eq!(value("plain", "border-top-style"), "inset");
+        assert_eq!(value("plain", "border-left-width"), "1px");
+        assert_eq!(value("plain", "margin-left"), "auto");
+        // An authored style keeps the 1px UA width (not the initial medium).
+        assert_eq!(value("dashed", "border-bottom-width"), "1px");
+        assert_eq!(value("noshade", "border-top-style"), "solid");
+        assert_eq!(value("noshade", "border-top-width"), "3px");
+        assert_eq!(value("noshade", "width"), "50%");
+        assert_eq!(value("tall", "height"), "8px");
+        assert_eq!(value("tall", "margin-left"), "0");
+        assert_eq!(value("thin", "border-top-style"), "solid");
+        assert_eq!(value("thin", "border-top-width"), "0.5px");
     }
 
     #[test]
