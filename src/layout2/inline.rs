@@ -580,6 +580,62 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// line when its margin box fits the remaining space. Earlier inline boxes
     /// move to the other side of a left float; a right float shortens their band.
     /// https://www.w3.org/TR/CSS22/visuren.html#floats
+    /// The ascent and height of the line box holding `pieces` (CSS 2
+    /// §10.8): baseline-aligned pieces and the strut set the ascent and
+    /// descent; top/bottom-aligned pieces only the height.
+    fn line_extent(&self, pieces: &[Piece]) -> (f32, f32) {
+        let no_strut = crate::text::ShapedText::default();
+        // Quirks #the-line-height-calculation-quirk: whitespace that
+        // survives collapsing, such as a space between two images (held as
+        // the next piece's `space_before`), is text too.
+        let strut = if let Some(root) = self.quirky_strut_root
+            && !pieces.is_empty()
+            && !pieces.iter().enumerate().any(|(index, piece)| {
+                (piece.text_style.is_some() && piece.item.style_node == root)
+                    || (index > 0 && piece.space_before)
+            }) {
+            &no_strut
+        } else {
+            &self.strut
+        };
+        // CSS 2 #line-height: top/bottom-aligned boxes constrain the whole
+        // line's height, not its baseline ascent/descent. Counting a tall
+        // top-aligned slide as an ascent adds an unnecessary descender gap.
+        let edge_aligned_height = pieces
+            .iter()
+            .filter(|p| matches!(p.vertical_align, VerticalAlign::Top | VerticalAlign::Bottom))
+            .map(Piece::layout_height)
+            .fold(0.0, f32::max);
+        let ascent = pieces
+            .iter()
+            .map(|p| match p.vertical_align {
+                VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
+                VerticalAlign::Shift(rise) => p.ascent + rise,
+                VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 + half_x,
+                _ => p.ascent,
+            })
+            .fold(strut.baseline, f32::max);
+        let descent = pieces
+            .iter()
+            .map(|p| match p.vertical_align {
+                VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
+                VerticalAlign::Shift(rise) => p.descent - rise,
+                VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 - half_x,
+                _ => p.descent,
+            })
+            // CSS 2.2 §10.8.1: a line-height below the content area gives a
+            // negative half-leading, so these depths can be negative.
+            .fold(strut.line_height - strut.baseline, f32::max);
+        let ascent = match self.first_line_ascent {
+            Some(marker_ascent) if self.lines.is_empty() => ascent.max(marker_ascent),
+            _ => ascent,
+        };
+        let height = (ascent + descent)
+            .max(strut.line_height)
+            .max(edge_aligned_height);
+        (ascent, height)
+    }
+
     fn place_float(&mut self) {
         let idx = self.float_next;
         self.float_next += 1;
@@ -587,11 +643,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let line_y = self.content_top_y + self.laid_h;
         let cb_l = self.content_left_x;
         let cb_r = self.content_left_x + self.cb_w_px;
-        let line_height = self
-            .cur
-            .iter()
-            .map(Piece::layout_height)
-            .fold(self.strut.line_height, f32::max);
+        // The line box as it stands, aligned on its baseline: a float
+        // that does not fit beside it goes below it (CSS 2 §9.5).
+        let (_, line_height) = self.line_extent(&self.cur);
         let (Some(fc), Some(fb)) = (self.fc.as_deref_mut(), self.float_boxes.get(idx).copied())
         else {
             return;
@@ -2179,55 +2233,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shift += piece.box_width - old_width;
         }
         self.pen += shift;
-        let no_strut = crate::text::ShapedText::default();
-        // Quirks #the-line-height-calculation-quirk: whitespace that
-        // survives collapsing, such as a space between two images (held as
-        // the next piece's `space_before`), is text too.
-        let strut = if let Some(root) = self.quirky_strut_root
-            && !pieces.is_empty()
-            && !pieces.iter().enumerate().any(|(index, piece)| {
-                (piece.text_style.is_some() && piece.item.style_node == root)
-                    || (index > 0 && piece.space_before)
-            }) {
-            &no_strut
-        } else {
-            &self.strut
-        };
-        // CSS 2 #line-height: top/bottom-aligned boxes constrain the whole
-        // line's height, not its baseline ascent/descent. Counting a tall
-        // top-aligned slide as an ascent adds an unnecessary descender gap.
-        let edge_aligned_height = pieces
-            .iter()
-            .filter(|p| matches!(p.vertical_align, VerticalAlign::Top | VerticalAlign::Bottom))
-            .map(Piece::layout_height)
-            .fold(0.0, f32::max);
-        let ascent = pieces
-            .iter()
-            .map(|p| match p.vertical_align {
-                VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
-                VerticalAlign::Shift(rise) => p.ascent + rise,
-                VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 + half_x,
-                _ => p.ascent,
-            })
-            .fold(strut.baseline, f32::max);
-        let descent = pieces
-            .iter()
-            .map(|p| match p.vertical_align {
-                VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
-                VerticalAlign::Shift(rise) => p.descent - rise,
-                VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 - half_x,
-                _ => p.descent,
-            })
-            // CSS 2.2 §10.8.1: a line-height below the content area gives a
-            // negative half-leading, so these depths can be negative.
-            .fold(strut.line_height - strut.baseline, f32::max);
-        let ascent = match self.first_line_ascent {
-            Some(marker_ascent) if self.lines.is_empty() => ascent.max(marker_ascent),
-            _ => ascent,
-        };
-        let height = (ascent + descent)
-            .max(strut.line_height)
-            .max(edge_aligned_height);
+        let (ascent, height) = self.line_extent(&pieces);
         let descent = height - ascent;
         let baseline = ascent;
         for p in &mut pieces {
