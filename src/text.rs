@@ -951,6 +951,63 @@ impl TextSystem {
         if text.is_empty() || style.size <= 0.0 {
             return Vec::new();
         }
+        // Parley keeps a cluster's byte offset within its run in 16 bits, so
+        // in a run over 64 KiB the offsets wrap and a line's text range goes
+        // invalid. Break such a paragraph through windows well below that:
+        // lay a window, keep its complete lines, and lay again from the
+        // start of its last line, which may continue past the window. The
+        // greedy breaker settles each kept line within the window, so these
+        // are the paragraph's own lines. A window without a break opportunity
+        // (an unbreakable run of that length) becomes one line.
+        const WINDOW: usize = 1 << 15;
+        if text.len() <= usize::from(u16::MAX) {
+            return self
+                .wrapped_window(text, style, first_width, width, breaks)
+                .0;
+        }
+        let mut lines = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + WINDOW).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end < text.len()
+                && let Some(space) = text[start..end].rfind(char::is_whitespace)
+                && space > 0
+            {
+                end = start
+                    + space
+                    + text[start + space..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+            }
+            let line_width = if lines.is_empty() { first_width } else { width };
+            let (mut window, last_start) =
+                self.wrapped_window(&text[start..end], style, line_width, width, breaks);
+            if end == text.len() || window.len() < 2 {
+                lines.append(&mut window);
+                start = end;
+                continue;
+            }
+            window.pop();
+            lines.append(&mut window);
+            start += last_start;
+        }
+        lines
+    }
+
+    /// Break one paragraph (at most 64 KiB) into lines; also returns the
+    /// byte offset at which its last line starts.
+    fn wrapped_window(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        first_width: f32,
+        width: f32,
+        breaks: TextBreakStyle,
+    ) -> (Vec<ShapedText>, usize) {
         // Shape one paragraph, then advance a single greedy breaker. Rebuilding
         // the shrinking tail on every line makes long preserved text quadratic.
         // CSS Text 3 #word-break-shaping also requires joining forms to survive
@@ -965,7 +1022,11 @@ impl TextSystem {
             breaker.state_mut().set_line_max_advance(width.max(0.01));
         }
         breaker.finish();
-        layout
+        let last_start = layout
+            .lines()
+            .last()
+            .map_or(0, |line| line.text_range().start);
+        let lines = layout
             .lines()
             .map(|line| {
                 let mut shaped = retain_line(text, &line);
@@ -973,7 +1034,8 @@ impl TextSystem {
                 shaped.strikethrough = style.strikethrough;
                 shaped
             })
-            .collect()
+            .collect();
+        (lines, last_start)
     }
 
     fn content_widths_uncached(
@@ -1481,6 +1543,41 @@ mod tests {
                 direction: 0
             }
         );
+    }
+
+    #[test]
+    fn wrapped_lines_break_paragraphs_longer_than_a_parley_run() {
+        // Parley keeps a cluster's offset in its run in 16 bits. A preserved
+        // paragraph over 64 KiB (a pasted log line in a textarea) must still
+        // break into the lines the greedy breaker gives a shorter prefix,
+        // partitioning the text, instead of panicking on wrapped offsets.
+        let style = TextStyle {
+            size: 13.0,
+            ..TextStyle::default()
+        };
+        let breaks = TextBreakStyle {
+            wrap: true,
+            ..TextBreakStyle::default()
+        };
+        let text: String = (0..14_000).map(|word| format!("w{word} ")).collect();
+        assert!(text.len() > usize::from(u16::MAX));
+        let lines = wrapped_lines(&text, &style, 90.0, 200.0, breaks);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| shape(line.text.trim_end(), &style).advance <= 200.0 + 0.01)
+        );
+        let prefix = wrapped_lines(&text[..4_000], &style, 90.0, 200.0, breaks);
+        for (whole, short) in lines.iter().zip(&prefix[..prefix.len() - 1]) {
+            assert_eq!(whole.text, short.text);
+        }
     }
 
     #[test]
