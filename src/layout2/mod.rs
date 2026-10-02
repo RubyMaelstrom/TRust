@@ -5055,6 +5055,64 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn ua_white_space_rules_set_the_element_longhands_over_inheritance() {
+        // HTML Rendering #form-controls (`textarea { white-space: pre-wrap }`),
+        // #the-textarea-element-2 (`wrap=off` hints `white-space: pre`),
+        // #flow-content-3 (`pre { white-space: pre }`) and #phrasing-content-3
+        // (`nobr { white-space: nowrap }`) set the shorthand on the element
+        // itself, so its longhands (CSS Text 4 #white-space-property) are not
+        // inherited from a nowrap or preserving ancestor.
+        let style = "font:12px/15px monospace;padding:0;border:0;margin:0";
+        let html = format!(
+            "<body style=margin:0><form>\
+             <div style=white-space:nowrap><textarea id=a cols=10 rows=3 style='{style}'>long text that wraps</textarea></div>\
+             <table><tr><td style=white-space:nowrap><textarea id=b cols=10 rows=3 style='{style}'>long text that wraps</textarea></td></tr></table>\
+             <div style=white-space:nowrap><textarea id=c cols=10 rows=3 wrap=off style='{style}'>a  b\nc</textarea></div>\
+             <textarea id=d style='white-space:normal'>x</textarea>\
+             <textarea id=e wrap=off style='text-wrap-mode:wrap'>x</textarea>\
+             </form>\
+             <div style=white-space:pre-wrap><pre id=f>x</pre></div>\
+             <pre><nobr id=g>x</nobr></pre></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let resolved = |id: &str| {
+            dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), "white-space")
+                .unwrap()
+        };
+        for (id, expected) in [
+            ("a", "pre-wrap"),
+            ("b", "pre-wrap"),
+            ("c", "pre"),
+            ("d", "normal"),
+            ("e", "pre-wrap"),
+            ("f", "pre"),
+            ("g", "nowrap"),
+        ] {
+            assert_eq!(resolved(id), expected, "{id}");
+        }
+        let layout = lay_graphical(&html, 800.0, &HashMap::new());
+        let texts = |id: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    crate::render::Primitive::GlyphRun {
+                        node: run_node,
+                        shaped,
+                        ..
+                    } if *run_node == node => Some(shaped.text.trim_end().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts("a"), ["long text", "that wraps"]);
+        assert_eq!(texts("b"), ["long text", "that wraps"]);
+        assert_eq!(texts("c"), ["a  b", "c"]);
+    }
+
+    #[test]
     fn control_text_hit_regions_stay_inside_the_painted_control() {
         // CSS Overflow 3 #overflow-control: a textarea's overflowing lines
         // are clipped to its scrollport, and an input's long value to its
