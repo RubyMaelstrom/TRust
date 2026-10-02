@@ -605,6 +605,29 @@ mod tests {
     }
 
     #[test]
+    fn form_controls_do_not_inherit_the_font_size() {
+        // Gecko and Blink UA sheets: input/button/select 13.333px, textarea
+        // `font: medium monospace` (13px); author CSS still wins.
+        let dom = Dom::parse_document(
+            r#"<div style="font-size:20px"><input id=i><button id=b>x</button><select id=s></select>
+            <textarea id=t></textarea><input id=a style="font-size:1.5em"><button id=n style="font-size:inherit">y</button>
+            <button><span id=c>z</span></button></div>"#,
+        );
+        let px = |id: &str| dom.font_px(dom.get_by_id(id).unwrap());
+        for (id, expected) in [
+            ("i", 13.333333),
+            ("b", 13.333333),
+            ("s", 13.333333),
+            ("t", 13.0),
+            ("a", 30.0),
+            ("n", 20.0),
+            ("c", 13.333333),
+        ] {
+            assert!((px(id) - expected).abs() < 0.001, "{id}: {}", px(id));
+        }
+    }
+
+    #[test]
     fn monospace_elements_use_the_monospace_medium_size() {
         // HTML Rendering makes pre/code/kbd/samp/tt monospace; Gecko and
         // Blink size a keyword-derived font against a 13px monospace medium

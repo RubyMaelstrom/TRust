@@ -4665,6 +4665,8 @@ impl Dom {
         let v = if let Some(raw) = author {
             let decl = self.resolve_vars(id, &raw);
             font_size_px_at(&decl, parent_px, root_px, self.viewport_px).unwrap_or(parent_px)
+        } else if let Some(size) = self.ua_font_size(id) {
+            font_size_px_at(size, parent_px, root_px, self.viewport_px).unwrap_or(parent_px)
         } else {
             self.tag_name(id)
                 .and_then(ua_font_factor)
@@ -4679,6 +4681,20 @@ impl Dom {
             .borrow_mut()
             .put(id, self.style_value_epoch, v);
         v
+    }
+
+    /// Form controls do not inherit their font size: Gecko's and Blink's UA
+    /// sheets give input, button and select 13.333px (`font: -moz-field`,
+    /// `-webkit-small-control`) and textarea `font: medium monospace`.
+    fn ua_font_size(&self, id: NodeId) -> Option<&'static str> {
+        if self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
+            return None;
+        }
+        match self.tag_name(id)? {
+            "input" | "button" | "select" => Some("13.333333px"),
+            "textarea" => Some("medium"),
+            _ => None,
+        }
     }
 
     /// Gecko and Blink size a keyword-derived font against the medium size
@@ -4738,6 +4754,8 @@ impl Dom {
                         }
                     }
                 }
+            } else if let Some(size) = self.ua_font_size(current) {
+                return (size == "medium").then_some(("medium", factor));
             } else if let Some(scale) = self.tag_name(current).and_then(ua_font_factor) {
                 factor *= scale;
             }
