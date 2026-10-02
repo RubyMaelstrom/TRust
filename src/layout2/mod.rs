@@ -3815,6 +3815,44 @@ mod tests {
     }
 
     #[test]
+    fn quirks_mode_lines_without_text_in_the_block_ignore_its_line_height() {
+        // Quirks Mode #the-blocks-ignore-line-height-quirk, in quirks and
+        // limited-quirks documents: the block's strut sizes only lines with
+        // text directly in it, so images stack without baseline gaps and a
+        // small span sets its own line. Blank `<br>` lines remain. Heights
+        // measured in LibreWolf 153.
+        let body = r#"<body style="margin:0;font:16px sans-serif">
+            <div id=a style="width:100px"><img width=20 height=20><br><a href=#><img width=20 height=20></a><br></div>
+            <div id=b>x<br><br>y</div><div id=e>x</div>
+            <div id=d style="font-size:40px;line-height:48px"><span style="font-size:10px;line-height:13px">small</span></div>"#;
+        for (doctype, images, small) in [
+            ("", 40.0, 13.0),
+            (
+                r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">"#,
+                40.0,
+                13.0,
+            ),
+            ("<!DOCTYPE html>", 40.0 + 2.0 * 4.0, 48.0),
+        ] {
+            let html = format!("{doctype}{body}");
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+            assert!(
+                (height("a") - images).abs() < 3.0,
+                "{doctype}: {}",
+                height("a")
+            );
+            assert_eq!(height("d"), small, "{doctype}");
+            assert_eq!(
+                height("b"),
+                3.0 * height("e"),
+                "{doctype}: blank lines remain"
+            );
+        }
+    }
+
+    #[test]
     fn content_of_a_cell_taller_than_it_is_vertically_aligned() {
         // CSS 2.2 §17.5.3/§17.5.4: a cell's 'height' makes the cell taller,
         // and its content is aligned in the extra space (middle by default).

@@ -405,6 +405,11 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// The block container's inherited font/line-height strut. CSS Inline 3
     /// §5.1 requires it to participate even on an otherwise empty line.
     strut: crate::text::ShapedText,
+    /// Quirks Mode #the-blocks-ignore-line-height-quirk: in a (limited-)
+    /// quirks document the strut sizes only lines with text directly in the
+    /// block (or no content), so a column of images stacks without baseline
+    /// gaps. Holds the block's node in such documents.
+    quirky_strut_root: Option<NodeId>,
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -474,6 +479,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             measuring_min: false,
             position_inline_atoms: true,
             strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
+            quirky_strut_root: None,
         };
         ifc.begin_line();
         ifc
@@ -576,6 +582,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // a table cell's top/middle alignment must not align every descendant.
         root.vertical_align = VerticalAlign::Baseline;
         self.strut = crate::text::shape(" ", &root.text_style());
+        let document = self
+            .dom
+            .owner_document(root.node)
+            .filter(|_| root.node != NO_NODE)
+            .unwrap_or(crate::dom::DOCUMENT);
+        self.quirky_strut_root = (self.dom.document_mode(document)
+            != html5ever::tree_builder::QuirksMode::NoQuirks)
+            .then_some(root.node);
         for inl in content {
             self.walk(inl, &root);
         }
@@ -1952,7 +1966,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shift += piece.box_width - old_width;
         }
         self.pen += shift;
-        let strut = &self.strut;
+        let no_strut = crate::text::ShapedText::default();
+        let strut = if let Some(root) = self.quirky_strut_root
+            && !pieces.is_empty()
+            && !pieces
+                .iter()
+                .any(|piece| piece.text_style.is_some() && piece.item.style_node == root)
+        {
+            &no_strut
+        } else {
+            &self.strut
+        };
         // CSS 2 #line-height: top/bottom-aligned boxes constrain the whole
         // line's height, not its baseline ascent/descent. Counting a tall
         // top-aligned slide as an ascent adds an unnecessary descender gap.
