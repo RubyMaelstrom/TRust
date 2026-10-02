@@ -228,12 +228,20 @@ pub enum LineCap {
     Square,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineJoin {
+    Miter,
+    Round,
+    Bevel,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StrokeStyle {
     pub width: f32,
     pub dash: Vec<f32>,
     pub dash_offset: f32,
     pub cap: LineCap,
+    pub join: LineJoin,
 }
 
 impl StrokeStyle {
@@ -243,6 +251,7 @@ impl StrokeStyle {
             dash: Vec::new(),
             dash_offset: 0.0,
             cap: LineCap::Butt,
+            join: LineJoin::Round,
         }
     }
 }
