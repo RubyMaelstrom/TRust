@@ -4821,11 +4821,20 @@ impl Dom {
                 "underline"
             }
             "white-space" if tag == "pre" => "pre",
-            // HTML Rendering #flow-content-3 and #phrasing-content-3.
+            // HTML Rendering #flow-content-3 and #phrasing-content-3; every
+            // engine's UA stylesheet also makes textarea monospace.
             "font-family"
                 if matches!(
                     tag,
-                    "pre" | "listing" | "plaintext" | "xmp" | "code" | "kbd" | "samp" | "tt"
+                    "pre"
+                        | "listing"
+                        | "plaintext"
+                        | "xmp"
+                        | "code"
+                        | "kbd"
+                        | "samp"
+                        | "tt"
+                        | "textarea"
                 ) =>
             {
                 "monospace"

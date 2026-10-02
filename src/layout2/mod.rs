@@ -3814,6 +3814,25 @@ mod tests {
     }
 
     #[test]
+    fn textareas_are_monospace_and_rows_lines_tall() {
+        // HTML Rendering #the-textarea-element-2: the effective height is
+        // `rows` lines (default 2); engines' UA sheets make it monospace.
+        let html = r#"<body style="margin:0"><form><textarea id=two>x</textarea>
+            <textarea id=five rows=5>x</textarea><textarea id=zero rows=0>x</textarea></form></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        assert_eq!(dom.font_px(dom.get_by_id("two").unwrap()), 13.0);
+        assert!(
+            (height("five") / height("two") - 2.5).abs() < 0.01,
+            "{} {}",
+            height("five"),
+            height("two")
+        );
+        assert!((height("zero") - height("two")).abs() < 0.01);
+    }
+
+    #[test]
     fn long_control_values_do_not_widen_shrink_to_fit_ancestors() {
         // CSS Sizing 3 #intrinsic-sizes: an auto-width text control keeps its
         // cols-based width as its min-content contribution (only the sizing

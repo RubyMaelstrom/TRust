@@ -2624,7 +2624,12 @@ fn control_labels(
     box_width = box_width.min(cap).max(horizontal_edges);
     let content_width = (box_width - horizontal_edges).max(0.0);
     let specified_height = box_style.height.resolve(None);
-    let mut box_height = specified_height.map_or(shaped.line_height + vertical_edges, |height| {
+    // HTML Rendering #the-textarea-element-2: the textarea effective height
+    // is its character height (`rows`, default 2) in lines; its text starts
+    // at the top of the content box.
+    let rows = (f.kind == FieldKind::Textarea).then(|| attr_ch("rows").unwrap_or(2));
+    let natural_height = rows.map_or(shaped.line_height, |rows| shaped.line_height * rows as f32);
+    let mut box_height = specified_height.map_or(natural_height + vertical_edges, |height| {
         if box_style.border_box {
             height
         } else {
@@ -2649,7 +2654,11 @@ fn control_labels(
     let content_height = (box_height - vertical_edges).max(0.0);
     let paint_y = box_style.border[TOP]
         + padding[TOP]
-        + ((content_height - shaped.line_height).max(0.0) / 2.0);
+        + if rows.is_some() {
+            0.0
+        } else {
+            (content_height - shaped.line_height).max(0.0) / 2.0
+        };
     let geometry = AtomGeometry {
         box_width,
         box_height,
