@@ -635,11 +635,23 @@ impl Flow<'_> {
         match (ml_auto, mr_auto) {
             (true, false) => slack,      // margin-left:auto → right
             (true, true) => slack / 2.0, // margin:0 auto → center
-            _ => match super::style::block_align(self.dom, id) {
-                Align2::Center => slack / 2.0,
-                Align2::Right => slack,
-                _ => 0.0,
-            },
+            // HTML Rendering #tables-2 maps a table's own `align=center` to
+            // auto inline margins; otherwise only `<center>` and legacy
+            // `align` ancestors move it (#align-descendants). `text-align`
+            // positions inline content, never this block-level box.
+            _ => {
+                let own = self.dom.attr(id, "align").map(str::trim);
+                let align = if own.is_some_and(|v| v.eq_ignore_ascii_case("center")) {
+                    Some(Align2::Center)
+                } else {
+                    super::style::legacy_descendant_align(self.dom, id)
+                };
+                match align {
+                    Some(Align2::Center) => slack / 2.0,
+                    Some(Align2::Right) => slack,
+                    _ => 0.0,
+                }
+            }
         }
     }
 }

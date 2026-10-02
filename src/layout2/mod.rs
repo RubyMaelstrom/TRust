@@ -3856,6 +3856,62 @@ mod tests {
     }
 
     #[test]
+    fn quirks_mode_trims_cell_margins_and_resets_table_fonts() {
+        // HTML Rendering #margin-collapsing-quirks and #tables-2, in quirks
+        // mode only: a paragraph filling a cell loses its UA margins, the
+        // body's first heading its top margin; a table does not inherit the
+        // body's line-height or the alignment of a <center> around it.
+        let body = r#"<body style="margin:0;font:16px/30px sans-serif"><h1 id=h style="font-size:20px">H</h1>
+            <table cellspacing=0 cellpadding=0><tr><td id=a><p><span style="display:inline-block;height:50px;width:10px"></span></p></td>
+            <td id=b><p id=x>x</p><p>y</p></td></tr></table>
+            <center><table width=300 border=0 cellspacing=0 cellpadding=0><tr><td><span id=c>c</span></td></tr></table></center>
+            <table width=300 align=center cellspacing=0 cellpadding=0><tr><td><span id=d>d</span></td></tr></table>
+            <div style="text-align:right"><table width=300 cellspacing=0 cellpadding=0><tr><td><span id=e>e</span></td></tr></table></div>
+            <table width=300 cellspacing=0 cellpadding=0><tr><th width=150><span id=f>f</span></th><td width=150 align=center><span id=g>g</span></td></tr></table></body>"#;
+        for (doctype, quirks) in [("", true), ("<!doctype html>", false)] {
+            let html = format!("{doctype}{body}");
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 700.0, &HashMap::new());
+            let rect = |id: &str| &layout.boxes[&dom.get_by_id(id).unwrap()];
+            if quirks {
+                assert_eq!(rect("h").top, 0.0);
+                // Gecko and Blink: 54 (the strut's descent at 16px).
+                assert!(rect("a").height < 56.0, "p margins trimmed in a cell");
+                assert!(
+                    rect("x").height < 25.0,
+                    "line-height:normal inside the table"
+                );
+                assert!(rect("c").left < 210.0, "<center> does not center cell text");
+            } else {
+                assert!(rect("h").top > 10.0);
+                assert!(rect("a").height > 80.0);
+                assert_eq!(rect("x").height, 30.0);
+            }
+            assert!(
+                (200.0..210.0).contains(&rect("d").left),
+                "{doctype}: align=center centers the table, not its text: {}",
+                rect("d").left
+            );
+            // text-align aligns the table's text, not the table, and only
+            // outside quirks mode (Gecko and Blink agree).
+            let e = rect("e").left;
+            assert!(
+                if quirks {
+                    e < 10.0
+                } else {
+                    (280.0..300.0).contains(&e)
+                },
+                "{e}"
+            );
+            assert!(
+                (65.0..75.0).contains(&rect("f").left),
+                "th centers its text"
+            );
+            assert!((215.0..225.0).contains(&rect("g").left), "td align=center");
+        }
+    }
+
+    #[test]
     fn a_lone_br_is_an_empty_flex_or_grid_item() {
         // As in Gecko and Blink, a `<br>` with no text beside it becomes an
         // empty item: it takes no line in a column but does take a grid cell
@@ -9080,8 +9136,8 @@ mod tests {
         assert!(cell_at(&out, "Effect").1 > cell_at(&out, "Command").1);
         assert_eq!(
             cell_at(&out, "Command").1,
-            cell_at(&out, "website.com").1,
-            "the header column aligns with the body column"
+            cell_at(&out, "website.com").1 + 2,
+            "the header column aligns with the body column, th text centered"
         );
         assert!(cell_at(&out, "website.com").0 > cell_at(&out, "Command").0);
     }

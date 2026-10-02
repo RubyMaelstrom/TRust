@@ -4851,6 +4851,8 @@ impl Dom {
         match self.tag_name(id)? {
             "input" | "button" | "select" => Some("13.333333px"),
             "textarea" => Some("medium"),
+            // HTML Rendering #tables-2: quirks-mode tables reset the font.
+            "table" if self.in_quirks_mode(id) => Some("medium"),
             _ => None,
         }
     }
@@ -4974,6 +4976,40 @@ impl Dom {
     fn ua_default(&self, id: NodeId, name: &str) -> Option<String> {
         let tag = self.tag_name(id)?;
         let v = match name {
+            // HTML Rendering #tables-2: in quirks mode a table does not
+            // inherit these from its context.
+            "font-weight" | "font-style" | "font-variant" | "line-height" | "white-space"
+            | "text-align"
+                if tag == "table"
+                    && self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+                    && self.in_quirks_mode(id) =>
+            {
+                match name {
+                    "font-weight" => "400",
+                    "text-align" => "start",
+                    _ => "normal",
+                }
+            }
+            "text-align" if let Some(value) = self.ua_paragraph_align(id, tag) => value,
+            // HTML Rendering #tables-2: `caption { text-align: center }`.
+            "text-align"
+                if tag == "caption"
+                    && self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml") =>
+            {
+                "center"
+            }
+            // Ibid.: a th centers its text unless its parent's text-align
+            // differs from the initial value.
+            "text-align"
+                if tag == "th"
+                    && self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+                    && self
+                        .style_parent(id)
+                        .and_then(|parent| self.computed_value_resolved(parent, "text-align"))
+                        .is_none_or(|value| value == "start") =>
+            {
+                "center"
+            }
             // HTML #phrasing-content-3: a link has its own UA color, before
             // inheritance. Body text hints must not recolor links when the
             // document has no `link` hint; author declarations can override
@@ -5092,6 +5128,20 @@ impl Dom {
             self.input_type(id).as_str(),
             "radio" | "checkbox" | "reset" | "button" | "submit" | "color" | "search"
         )
+    }
+
+    /// HTML Rendering #tables-2's UA sheet aligns p and h1–h6 by their
+    /// `align` attribute (`p[align=left i] { text-align: left }` and so on).
+    fn ua_paragraph_align(&self, id: NodeId, tag: &str) -> Option<&'static str> {
+        if !matches!(tag, "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+            || self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml")
+        {
+            return None;
+        }
+        let align = self.attr(id, "align")?;
+        ["left", "right", "center", "justify"]
+            .into_iter()
+            .find(|value| align.eq_ignore_ascii_case(value))
     }
 
     /// The default bullet for a `<ul>` by nesting depth, matching browsers:
