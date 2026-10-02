@@ -304,6 +304,19 @@ impl Flow<'_> {
                     self.intrinsic_w(b, mode, inl)
                 }
             });
+        // CSS Tables 3 #computing-the-table-width / CSS 2 §17.5.2.2: a table
+        // is never narrower than its minimum content width (GRIDMIN),
+        // whatever width it declares, in CSS or through HTML's `width`
+        // attribute (#tables-2 maps it to the width property).
+        let content = match (
+            &b.content,
+            super::tree::declared_track_width(self.dom, b.node),
+        ) {
+            (Content::Table(_), Some(super::tree::ColSpec::Px(px))) => {
+                to_content(px).max(self.intrinsic_w(b, IMode::Min, inl))
+            }
+            _ => content,
+        };
         let min = self
             .intrinsic_width_value(&s.min_width, b, Some(0.), inl)
             .or_else(|| s.min_width.resolve(Some(0.0)).map(to_content))
