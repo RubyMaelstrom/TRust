@@ -2996,15 +2996,31 @@ fn paint_background_images_for_style(
             };
             let x_end = clip.x + clip.width;
             let y_end = clip.y + clip.height;
+            // Repeated tiles meet on device pixels, as in Gecko and Blink:
+            // two antialiased edges sharing a fractional pixel would let
+            // the content beneath show through as a seam.
+            let ratio = builder.dom.device_pixel_ratio();
+            let snap = |value: f32, repeat: bool| {
+                if repeat {
+                    (value * ratio).round() / ratio
+                } else {
+                    value
+                }
+            };
             let mut y = y0;
             let mut count = 0usize;
             while y < y_end && count < 4096 {
                 let mut x = x0;
                 let mut x_count = 0usize;
                 while x < x_end && x_count < 4096 {
-                    builder
-                        .commands
-                        .push(tile.command(CssRect::new(x, y, tile_w, tile_h), style.node()));
+                    let (left, top) = (snap(x, x_repeat), snap(y, y_repeat));
+                    let rect = CssRect::new(
+                        left,
+                        top,
+                        snap(x + tile_w, x_repeat) - left,
+                        snap(y + tile_h, y_repeat) - top,
+                    );
+                    builder.commands.push(tile.command(rect, style.node()));
                     if !x_repeat {
                         break;
                     }
@@ -6617,6 +6633,33 @@ mod tests {
                     scrolled,
                     "the newly visible link must be clickable"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_background_tiles_meet_without_seams() {
+        // Tiles 10.5px tall: their shared edges fall mid-pixel unless
+        // snapped, and the black background showed through each seam.
+        let dom = Dom::parse_document(
+            "<body style='margin:0'><div style='width:40px;height:60px;background:black \
+             linear-gradient(lime,lime) 0 0/10.5px 10.5px'></div>",
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &Url::parse("https://page.test/").unwrap(),
+            crate::layout2::Viewport::new(60., 60.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let pixels = crate::render::headless::render_paint(&layout.paint, CssSize::new(60., 60.))
+            .unwrap()
+            .pixels;
+        for y in 0..60 {
+            for x in 0..40 {
+                let pixel = &pixels[(y * 60 + x) * 4..][..3];
+                assert_eq!(pixel, [0, 255, 0], "({x}, {y})");
             }
         }
     }
