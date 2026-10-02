@@ -194,6 +194,11 @@ impl Flow<'_> {
                     &atom_sizes,
                 );
                 ifc.mark_measuring(mode == IMode::Min);
+                // An inside marker is inline content like any other (CSS
+                // Lists 3 #valdef-list-style-position-inside).
+                if b.marker_inside {
+                    ifc.inside_marker(b.marker.as_deref(), b.marker_image.as_deref(), &here);
+                }
                 ifc.run(inls, &here);
                 let (lines, _, _, _, _) = ifc.finish();
                 let inline_w = lines.iter().map(|l| l.width).fold(0.0, f32::max);

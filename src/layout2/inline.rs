@@ -1166,6 +1166,25 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         );
     }
 
+    /// CSS Lists 3 #valdef-list-style-position-inside: an inside marker is an
+    /// inline at the start of the list item's contents, its image before its
+    /// text, in the marker's own text style (#marker-properties). `inl` is
+    /// the item's.
+    pub fn inside_marker(&mut self, text: Option<&str>, image: Option<&str>, inl: &InlineStyle) {
+        if text.is_none() && image.is_none() {
+            return;
+        }
+        let mut ctx = inl.marker(self.dom).into_owned();
+        if let Some(source) = image {
+            ctx.kind = ItemKind::Image;
+            self.marker_image(source, &ctx);
+        }
+        if let Some(text) = text {
+            ctx.kind = ItemKind::Text;
+            self.text(text, &ctx);
+        }
+    }
+
     /// One word in a collapsing mode. Parley's Unicode line breaker supplies
     /// UAX #14 opportunities (including CJK and complex scripts); CSS remains
     /// responsible for the selected word/overflow break strengths.

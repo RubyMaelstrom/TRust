@@ -3687,6 +3687,24 @@ mod tests {
     }
 
     #[test]
+    fn inside_markers_take_part_in_intrinsic_widths() {
+        // CSS Lists 3 #valdef-list-style-position-inside: an inside marker
+        // is inline content of its list item, so it counts toward the item's
+        // min- and max-content widths; shrink-to-fit items keep it on their
+        // text's line, as in Blink and Gecko.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <ul style="display:flex;margin:0;list-style-position:inside"><li id=a>flex item</li></ul>
+            <ul style="margin:0;list-style-position:inside"><li id=b style="float:left">float item</li></ul>
+            <details id=c style="float:left;clear:left"><summary id=d>Caption</summary></details></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &HashMap::new());
+        for id in ["a", "b", "d"] {
+            let item = layout.boxes[&dom.get_by_id(id).unwrap()];
+            assert_eq!(item.height, 20.0, "{id}: {item:?}");
+        }
+    }
+
+    #[test]
     fn a_marker_image_takes_its_natural_size() {
         // CSS Lists 3 #marker-image: the default sizing algorithm with no
         // specified size, so a 7x8 image stays 7x8; 1em square without one.
