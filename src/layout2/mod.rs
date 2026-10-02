@@ -3858,6 +3858,23 @@ mod tests {
     }
 
     #[test]
+    fn line_heights_below_the_content_area_use_negative_leading() {
+        // CSS 2.2 §10.8.1: with line-height smaller than the font's ascent +
+        // descent, the half-leading is negative and each line box is still
+        // exactly line-height tall (LibreWolf: 26px and 2 x 10px).
+        let html = r#"<!DOCTYPE html><body style="margin:0">
+            <div id=one style="font:64px/26px sans-serif">abc</div>
+            <div id=two style="font:20px/10px sans-serif;width:60px">Xg Xg Xg Xg</div>
+            <div id=zero style="font:40px/0 sans-serif">Xg</div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        assert!((height("one") - 26.0).abs() < 0.01, "{}", height("one"));
+        assert!((height("two") - 20.0).abs() < 0.01, "{}", height("two"));
+        assert!(height("zero").abs() < 0.01, "{}", height("zero"));
+    }
+
+    #[test]
     fn textareas_are_monospace_and_rows_lines_tall() {
         // HTML Rendering #the-textarea-element-2: the effective height is
         // `rows` lines (default 2); engines' UA sheets make it monospace.
