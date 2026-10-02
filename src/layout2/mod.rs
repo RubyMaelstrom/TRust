@@ -3856,6 +3856,25 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_br_is_an_empty_flex_or_grid_item() {
+        // As in Gecko and Blink, a `<br>` with no text beside it becomes an
+        // empty item: it takes no line in a column but does take a grid cell
+        // and flex gaps. Next to text it breaks that text's anonymous item.
+        let html = r#"<!doctype html><body style="margin:0;line-height:19px">
+            <div style="display:flex;flex-direction:column"><div id=a style="height:20px"></div><br><br><div id=b style="height:20px"></div></div>
+            <div style="display:grid;grid-template-columns:50px 50px 50px"><div style="height:20px"></div><br><div id=c style="height:20px"></div></div>
+            <div style="display:flex;gap:10px"><div style="width:50px;height:20px"></div><br><div id=d style="width:50px;height:20px"></div></div>
+            <div id=e style="display:flex">text<br>more</div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| &layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(rect("b").top - rect("a").top, 20.0);
+        assert_eq!(rect("c").left, 100.0);
+        assert_eq!(rect("d").left, 70.0);
+        assert_eq!(rect("e").height, 38.0, "text<br>more keeps two lines");
+    }
+
+    #[test]
     fn words_continue_across_inline_box_boundaries() {
         // CSS Text 3 #line-breaking: an inline box boundary is not itself a
         // soft wrap opportunity. A word split across elements, or a link and
