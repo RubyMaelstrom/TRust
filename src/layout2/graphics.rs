@@ -947,19 +947,31 @@ fn paint_in_spaces(
             viewport_h.max(flow_bottom).max(root.max_bottom()).max(1.0),
         );
         let style_node = builder.canvas_background_source.unwrap_or(root.node);
-        paint_background_images_for_style(
-            root,
-            PaintStyle::Element(style_node),
-            PaintShape::Rect(canvas),
-            &mut builder,
-            Some(canvas),
-            None,
-        );
+        let style = PaintStyle::Element(style_node);
+        let color = background_color(dom, style_node).filter(|color| !color.is_transparent());
         // CSS Color Adjust 1 #color-scheme-effect: the root's color scheme
         // sets the canvas surface.
-        background_color(dom, style_node)
-            .filter(|color| !color.is_transparent())
-            .or_else(|| canvas_surface(dom, root.node))
+        let surface = canvas_surface(dom, root.node);
+        // CSS Compositing 1 #background-blend-mode: blended layers act as if
+        // rendered into an isolated group over the background color, whose
+        // initial backdrop is transparent black (#isolatedgroups). The canvas
+        // surface (CSS Backgrounds 3 §2.11.1) is behind that group and must
+        // not take part in the blend. Over an opaque background color the
+        // group's result is the same as blending onto the page background.
+        if background_blends(dom, style) && !color.is_some_and(is_opaque) {
+            paint_isolated_canvas_background(root, style, canvas, color, &mut builder);
+            surface
+        } else {
+            paint_background_images_for_style(
+                root,
+                style,
+                PaintShape::Rect(canvas),
+                &mut builder,
+                Some(canvas),
+                None,
+            );
+            color.or(surface)
+        }
     } else {
         None
     };
@@ -2671,6 +2683,10 @@ fn paint_nested_document_canvas(fragment: &Frag, builder: &mut Builder<'_>) {
         .push(DisplayCommand::PushClip(PaintShape::Rect(
             container.viewport,
         )));
+    // CSS Compositing 1 #background-blend-mode: blended layers blend only
+    // with each other and the canvas background color, never with the
+    // embedding document behind the frame.
+    let isolated = begin_background_isolation(builder, PaintStyle::Element(style_node));
     builder
         .commands
         .push(DisplayCommand::BeginScroll(container.node));
@@ -2699,6 +2715,9 @@ fn paint_nested_document_canvas(fragment: &Frag, builder: &mut Builder<'_>) {
         Some(canvas),
     );
     builder.commands.push(DisplayCommand::EndScroll);
+    if isolated {
+        builder.commands.push(DisplayCommand::PopLayer);
+    }
     builder.commands.push(DisplayCommand::PopClip);
 }
 
@@ -5789,23 +5808,116 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
 /// content behind the element, so blended backgrounds paint as an isolated
 /// group. Returns whether the group was opened.
 fn begin_background_isolation(builder: &mut Builder<'_>, style: PaintStyle) -> bool {
-    let blended = style
-        .value(builder.dom, "background-blend-mode")
+    let blended = background_blends(builder.dom, style);
+    if blended {
+        builder.commands.push(isolated_group());
+    }
+    blended
+}
+
+/// Whether any of the style's background layers uses a non-normal
+/// `background-blend-mode`.
+fn background_blends(dom: &Dom, style: PaintStyle) -> bool {
+    style
+        .value(dom, "background-blend-mode")
         .is_some_and(|modes| {
             split_top_level(&modes, ',')
                 .iter()
                 .any(|mode| blend_mode(mode) != BlendMode::Normal)
-        });
-    if blended {
-        builder
-            .commands
-            .push(DisplayCommand::PushLayer(CompositingLayer {
-                opacity: 1.0,
-                blend: BlendMode::Normal,
-                filters: std::sync::Arc::from([]),
-            }));
+        })
+}
+
+/// Open a CSS Compositing 1 #isolatedgroups group: normal blending, full
+/// opacity, and a transparent black initial backdrop.
+fn isolated_group() -> DisplayCommand {
+    DisplayCommand::PushLayer(CompositingLayer {
+        opacity: 1.0,
+        blend: BlendMode::Normal,
+        filters: std::sync::Arc::from([]),
+    })
+}
+
+fn is_opaque(color: PaintColor) -> bool {
+    !matches!(color, PaintColor::Rgba(_, _, _, alpha) if alpha < 255)
+}
+
+/// Whether a background layer that draws an image is `fixed`.
+fn has_fixed_background_layer(dom: &Dom, style: PaintStyle) -> bool {
+    let Some(images) = style.value(dom, "background-image") else {
+        return false;
+    };
+    let attachments = style
+        .value(dom, "background-attachment")
+        .unwrap_or_else(|| "scroll".into());
+    let attachments = split_top_level(&attachments, ',');
+    split_top_level(&images, ',')
+        .iter()
+        .enumerate()
+        .any(|(index, layer)| {
+            let layer = layer.trim();
+            !layer.is_empty()
+                && !layer.eq_ignore_ascii_case("none")
+                && layer_value(&attachments, index, "scroll")
+                    .trim()
+                    .eq_ignore_ascii_case("fixed")
+        })
+}
+
+/// Paint a blended root canvas background, which is not over an opaque
+/// background color, as an isolated group (CSS Compositing 1
+/// #background-blend-mode). The caller paints only the canvas surface below.
+///
+/// Fixed canvas layers live in the viewport-pinned underlay, which paints
+/// below the scrolling document, so the group cannot span both. The color
+/// and fixed layers then form the group in the underlay, and scrolling layers
+/// keep blending with that group's result. This is exact wherever the
+/// underlay is opaque; a second isolated group would instead never let the
+/// scrolling layers blend with the fixed ones.
+fn paint_isolated_canvas_background(
+    root: &Frag,
+    style: PaintStyle,
+    canvas: CssRect,
+    color: Option<PaintColor>,
+    builder: &mut Builder<'_>,
+) {
+    let fixed = has_fixed_background_layer(builder.dom, style);
+    let fixed_start = builder.fixed_under.len();
+    if !fixed {
+        builder.commands.push(isolated_group());
+        if let Some(color) = color {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: PaintShape::Rect(canvas),
+                brush: PaintBrush::Solid(color),
+            });
+        }
     }
-    blended
+    paint_background_images_for_style(
+        root,
+        style,
+        PaintShape::Rect(canvas),
+        builder,
+        Some(canvas),
+        None,
+    );
+    if !fixed {
+        builder.commands.push(DisplayCommand::PopLayer);
+        return;
+    }
+    let mut group = vec![isolated_group()];
+    if let Some(color) = color {
+        group.push(DisplayCommand::Fill {
+            shape: PaintShape::Rect(CssRect::new(
+                0.0,
+                0.0,
+                builder.viewport_w,
+                builder.viewport_h,
+            )),
+            brush: PaintBrush::Solid(color),
+        });
+    }
+    group.extend(builder.fixed_under.drain(fixed_start..));
+    group.push(DisplayCommand::PopLayer);
+    builder.fixed_under.extend(group);
 }
 
 /// CSS Compositing 1 #ltblendmodegt.
@@ -7641,6 +7753,92 @@ mod tests {
         assert_eq!(at(45, 50), [0, 255, 0]);
         assert_eq!(at(170, 50), [255, 255, 255], "nothing outside the frame");
         assert_eq!(at(10, 50), [255, 255, 255]);
+    }
+
+    #[test]
+    fn blended_canvas_backgrounds_are_isolated_from_the_canvas_surface() {
+        // CSS Compositing 1 #background-blend-mode and #isolatedgroups: the
+        // canvas background's layers blend inside an isolated group whose
+        // initial backdrop is transparent black, not with the white canvas
+        // surface (CSS Backgrounds 3 §2.11.1) or an embedding document.
+        // Overlay of 50% black over rgb(51,102,153) gives rgb(25,51,102) in
+        // Gecko and Blink; blending with white would leave white.
+        const LAYERS: &str = "background-image:linear-gradient(rgba(0,0,0,.5),rgba(0,0,0,.5)),\
+            linear-gradient(rgb(51,102,153),rgb(51,102,153));background-blend-mode:overlay";
+        let pixels = |html: &str, frame: Option<&str>| {
+            let mut dom = Dom::parse_document(html);
+            if let Some(markup) = frame {
+                let id = dom.get_by_id("f").unwrap();
+                dom.install_frame_document(id, markup, "https://frame.test/")
+                    .unwrap();
+            }
+            let layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://page.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 120.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(200., 120.))
+                .unwrap()
+                .pixels
+        };
+        let at = |pixels: &[u8], x: usize, y: usize| pixels[(y * 200 + x) * 4..][..3].to_vec();
+        let close = |actual: Vec<u8>, expected: [u8; 3], what: &str| {
+            assert!(
+                actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 1),
+                "{what}: {actual:?}"
+            );
+        };
+        for (html, what) in [
+            (
+                format!("<!doctype html><body style='height:20px;{LAYERS}'>"),
+                "propagated body",
+            ),
+            (
+                format!("<!doctype html><html style='{LAYERS}'><body style='height:20px'>"),
+                "root",
+            ),
+            (
+                format!(
+                    "<!doctype html><body style='height:20px;{LAYERS};background-attachment:fixed'>"
+                ),
+                "fixed layers",
+            ),
+        ] {
+            let page = pixels(&html, None);
+            close(at(&page, 50, 10), [25, 51, 102], what);
+            close(at(&page, 50, 100), [25, 51, 102], what);
+        }
+        // A translucent color is the group's bottom layer and is painted once.
+        let translucent = pixels(
+            "<!doctype html><body style='background:rgba(0,0,255,.5) \
+             linear-gradient(red,red);background-blend-mode:multiply'>",
+            None,
+        );
+        close(at(&translucent, 50, 50), [128, 0, 0], "translucent color");
+        // A fixed bottom layer over a translucent color: the scrolling top
+        // layer still blends with it (Chromium gives rgb(12,141,38)).
+        let mixed = pixels(
+            &format!(
+                "<!doctype html><body style='height:20px;background-color:rgba(0,255,0,.5);\
+                 {LAYERS};background-attachment:scroll,fixed'>"
+            ),
+            None,
+        );
+        close(
+            at(&mixed, 50, 50),
+            [13, 140, 38],
+            "fixed and scrolling layers",
+        );
+        let framed = pixels(
+            "<body style='margin:0;background:white'><iframe id=f \
+             style='border:0;width:100px;height:100px'></iframe>",
+            Some(&format!("<body style='{LAYERS}'>")),
+        );
+        close(at(&framed, 50, 50), [25, 51, 102], "iframe canvas");
+        close(at(&framed, 150, 50), [255, 255, 255], "outside the frame");
     }
 
     #[test]
