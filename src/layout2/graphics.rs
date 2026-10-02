@@ -13,12 +13,12 @@ use url::Url;
 use crate::core::{CssPoint, CssSize};
 use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::render::{
-    Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
-    CssPaintAnimation, CssRect, CssTransformFrame, DecorationStyle, DisplayCommand,
-    GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest,
-    ImageSampling, LineJoin, MarqueeBehavior, MarqueeDirection, MarqueeScope, PagePaint,
-    PaintBrush, PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint,
-    StrokeStyle, TextDecorationPaint, TextShadowPaint, TopLayerEntry,
+    Affine2d, BlendMode, CompositeOperator, CompositingLayer, CornerRadii, CssAnimationPoint,
+    CssAnimationScope, CssPaintAnimation, CssRect, CssTransformFrame, DecorationStyle,
+    DisplayCommand, GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle,
+    ImageRequest, ImageSampling, LineJoin, MarqueeBehavior, MarqueeDirection, MarqueeScope,
+    PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer,
+    StickyConstraint, StrokeStyle, TextDecorationPaint, TextShadowPaint, TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -1145,7 +1145,10 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
             .commands
             .push(DisplayCommand::PushClip(shape.clone()));
     }
-    let layered = push_layer(fragment, builder);
+    // CSS Masking 1 #placement: filter effects, clipping, masking and
+    // opacity apply to the group, in that order.
+    let mask = mask_paint(fragment, builder);
+    let layers = push_layer(fragment, builder, mask.as_ref().map(|mask| mask.bounds));
     paint_fragment(fragment, builder);
     let mut negative = Vec::new();
     let mut zero = Vec::new();
@@ -1175,7 +1178,24 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
     for child in positive {
         build_positioned(child, builder, true);
     }
-    if layered {
+    if layers.filtered {
+        builder.commands.push(DisplayCommand::PopLayer);
+    }
+    if let Some(mask) = mask {
+        // CSS Masking 1 #MaskValues: the group's alpha is multiplied by the
+        // mask layers' combined alpha; uncovered regions are transparent.
+        // The layers composite in their own isolated group
+        // (#the-mask-composite).
+        builder
+            .commands
+            .push(DisplayCommand::PushLayer(CompositingLayer {
+                compose: CompositeOperator::DestinationIn,
+                ..CompositingLayer::new(1.0, BlendMode::Normal, std::sync::Arc::from([]))
+            }));
+        builder.commands.extend(mask.commands);
+        builder.commands.push(DisplayCommand::PopLayer);
+    }
+    if layers.outer {
         builder.commands.push(DisplayCommand::PopLayer);
     }
     if shape_clip.is_some() {
@@ -2634,9 +2654,25 @@ fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     None
 }
 
-fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
+/// The compositing groups [`push_layer`] opened around a stacking context.
+#[derive(Clone, Copy, Default)]
+struct ContextLayers {
+    /// The group composited with the context's opacity and blend mode.
+    outer: bool,
+    /// A masked context's filters, in a group inside `outer`.
+    filtered: bool,
+}
+
+/// Open the stacking context's compositing groups. `mask` is the paint
+/// bound of a masked context's mask (`None` when a `no-clip` layer leaves
+/// it unbounded), whose group needs an isolated backdrop of its own.
+fn push_layer(
+    fragment: &Frag,
+    builder: &mut Builder<'_>,
+    mask: Option<Option<CssRect>>,
+) -> ContextLayers {
     let Some(style) = PaintStyle::of(fragment) else {
-        return false;
+        return ContextLayers::default();
     };
     let opacity = fragment.paint.opacity.clamp(0.0, 1.0);
     let blend = style
@@ -2649,6 +2685,32 @@ fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
     let isolate = style
         .value(builder.dom, "isolation")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("isolate"));
+    if let Some(clip) = mask {
+        // Filters apply before the mask, which applies before opacity, so a
+        // masked context's filters get their own group; the mask group then
+        // composites onto the filtered result. Painting outside the mask's
+        // painting areas is discarded either way, so bound the group there.
+        builder
+            .commands
+            .push(DisplayCommand::PushLayer(CompositingLayer {
+                clip,
+                ..CompositingLayer::new(opacity, blend, std::sync::Arc::from([]))
+            }));
+        let filtered = !fragment.paint.filters.is_empty();
+        if filtered {
+            builder
+                .commands
+                .push(DisplayCommand::PushLayer(CompositingLayer::new(
+                    1.0,
+                    BlendMode::Normal,
+                    fragment.paint.filters.clone(),
+                )));
+        }
+        return ContextLayers {
+            outer: true,
+            filtered,
+        };
+    }
     if opacity < 1.0 || blend != BlendMode::Normal || isolate || !fragment.paint.filters.is_empty()
     {
         builder
@@ -2658,10 +2720,211 @@ fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
                 blend,
                 fragment.paint.filters.clone(),
             )));
-        true
+        ContextLayers {
+            outer: true,
+            filtered: false,
+        }
     } else {
-        false
+        ContextLayers::default()
     }
+}
+
+/// A stacking context's mask (CSS Masking 1 #positioned-masks): its layer
+/// commands, bottom layer first, for a destination-in group.
+struct MaskPaint {
+    commands: Vec<DisplayCommand>,
+    /// The union of the painted layers' painting areas, outside which the
+    /// mask is transparent; `None` when a `no-clip` layer is unbounded.
+    bounds: Option<CssRect>,
+}
+
+/// CSS Masking 1 #MaskValues: luminanceToAlpha's coefficients (SVG 1.1
+/// #feColorMatrixElement) give a luminance mask's alpha from straight sRGB.
+const LUMINANCE_TO_ALPHA: [f32; 20] = [
+    0.0, 0.0, 0.0, 0.0, 0.0, //
+    0.0, 0.0, 0.0, 0.0, 0.0, //
+    0.0, 0.0, 0.0, 0.0, 0.0, //
+    0.2125, 0.7154, 0.0721, 0.0, 0.0,
+];
+
+/// Build the mask of a stacking context from its `mask-*` layers (CSS
+/// Masking 1 #layering). Each layer is sized, positioned, tiled and clipped
+/// like a background layer, but with the mask's own box defaults: both
+/// mask-origin and mask-clip are initially `border-box`.
+fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
+    let style = PaintStyle::of(fragment)?;
+    let dom = builder.dom;
+    let images = style.value(dom, "mask-image")?;
+    if !super::style::has_mask_image(&images) {
+        return None;
+    }
+    let images = split_top_level(&images, ',');
+    // #the-mask-image: a <url> may instead reference an SVG `mask` element
+    // (a <mask-source>, applied with the element's own geometry and its
+    // mask-type). TRust does not render those yet: leave the content
+    // unmasked rather than treat a supported reference as a failure.
+    if images.iter().any(|layer| {
+        css_url(layer.trim())
+            .and_then(|url| url.strip_prefix('#').map(str::to_string))
+            .and_then(|id| dom.get_by_id(&id))
+            .is_some_and(|node| dom.tag_name(node) == Some("mask"))
+    }) {
+        return None;
+    }
+    let list = |property: &str, initial: &str| {
+        style
+            .value(dom, property)
+            .unwrap_or_else(|| initial.to_string())
+    };
+    let (modes, composites) = (
+        list("mask-mode", "match-source"),
+        list("mask-composite", "add"),
+    );
+    let (origins, clips) = (
+        list("mask-origin", "border-box"),
+        list("mask-clip", "border-box"),
+    );
+    let (sizes, positions, repeats) = (
+        list("mask-size", "auto"),
+        list("mask-position", "0% 0%"),
+        list("mask-repeat", "repeat"),
+    );
+    let [modes, composites, origins, clips, sizes, positions, repeats] = [
+        &modes,
+        &composites,
+        &origins,
+        &clips,
+        &sizes,
+        &positions,
+        &repeats,
+    ]
+    .map(|value| split_top_level(value, ','));
+    let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let padding_box = padding_box_with_style(fragment);
+    let content_box = content_box_with_style(dom, fragment, padding_box, builder.viewport());
+    let border_shape = rounded_shape(border_box, border_radii(dom, style, border_box));
+    let lengths = LengthBasis::of(dom, style.node(), builder.viewport());
+    // #the-mask-clip / #the-mask-origin: a box-generating element uses
+    // content-box for fill-box and border-box for stroke-box and view-box.
+    let mask_box = |value: &str| match value.trim() {
+        "content-box" | "fill-box" => content_box,
+        "padding-box" => padding_box,
+        _ => border_box,
+    };
+    let start = builder.commands.len();
+    // `None` until a layer paints; then the union of painting areas, or
+    // `Some(None)` once an unclipped layer paints.
+    let mut bounds: Option<Option<CssRect>> = None;
+    let last = images.len() - 1;
+    for (index, image) in images.iter().enumerate().rev() {
+        // #the-mask-composite: the bottom layer has no layer below it to
+        // composite with, so its operator is ignored.
+        let compose = match layer_value(&composites, index, "add") {
+            _ if index == last => CompositeOperator::SourceOver,
+            "subtract" => CompositeOperator::SourceOut,
+            "intersect" => CompositeOperator::SourceIn,
+            "exclude" => CompositeOperator::Xor,
+            _ => CompositeOperator::SourceOver,
+        };
+        // #the-mask-mode: `match-source` is alpha for an <image>.
+        let luminance = layer_value(&modes, index, "match-source") == "luminance";
+        let grouped = compose != CompositeOperator::SourceOver || luminance;
+        let group_start = builder.commands.len();
+        if grouped {
+            builder
+                .commands
+                .push(DisplayCommand::PushLayer(CompositingLayer {
+                    compose,
+                    ..CompositingLayer::new(1.0, BlendMode::Normal, std::sync::Arc::from([]))
+                }));
+        }
+        let clip_value = layer_value(&clips, index, "border-box");
+        let unclipped = clip_value == "no-clip";
+        let clip = if unclipped {
+            subtree_bounds(fragment)
+        } else {
+            mask_box(clip_value)
+        };
+        let layer = ImageLayer {
+            image: image.trim(),
+            node: style.node(),
+            positioning: mask_box(layer_value(&origins, index, "border-box")),
+            clip,
+            clip_shape: if unclipped {
+                PaintShape::Rect(clip)
+            } else {
+                background_clip_shape(clip, &border_shape, border_box)
+            },
+            border_shape: &border_shape,
+            border_box,
+            size: layer_value(&sizes, index, "auto"),
+            position: layer_value(&positions, index, "0% 0%"),
+            repeat: layer_value(&repeats, index, "repeat"),
+            lengths,
+        };
+        let tiles = builder.commands.len();
+        let painted = paint_image_layer(builder, layer);
+        if painted && luminance {
+            // #MaskValues: the luminance of the straight color, multiplied
+            // by the alpha of the tiles just painted into this layer's group.
+            let tiles = builder.commands[tiles..].to_vec();
+            builder
+                .commands
+                .push(DisplayCommand::PushLayer(CompositingLayer {
+                    compose: CompositeOperator::DestinationIn,
+                    ..CompositingLayer::new(
+                        1.0,
+                        BlendMode::Normal,
+                        std::sync::Arc::from([crate::render::CssFilter::ColorMatrix(
+                            LUMINANCE_TO_ALPHA,
+                        )]),
+                    )
+                }));
+            builder.commands.extend(tiles);
+            builder.commands.push(DisplayCommand::PopLayer);
+        }
+        if grouped {
+            // An empty source still clears the layers below for the
+            // operators that keep only the source (intersect, subtract).
+            if !painted
+                && matches!(
+                    compose,
+                    CompositeOperator::SourceOver | CompositeOperator::Xor
+                )
+            {
+                builder.commands.truncate(group_start);
+            } else {
+                builder.commands.push(DisplayCommand::PopLayer);
+            }
+        }
+        if painted {
+            bounds = Some(match bounds {
+                None if unclipped => None,
+                None => Some(clip),
+                Some(Some(union)) if !unclipped => Some(crate::render::union_rect(union, clip)),
+                Some(_) => None,
+            });
+        }
+    }
+    let commands = builder.commands.split_off(start);
+    Some(MaskPaint {
+        commands,
+        // With no painted layer the mask is transparent black everywhere.
+        bounds: bounds.unwrap_or(Some(CssRect::new(border_box.x, border_box.y, 0.0, 0.0))),
+    })
+}
+
+/// The border boxes of `fragment` and its descendants: the area an
+/// unclipped (`no-clip`) mask layer must cover for the masked group.
+fn subtree_bounds(fragment: &Frag) -> CssRect {
+    let mut bounds = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    for child in &fragment.children {
+        let child = subtree_bounds(child);
+        if child.width.is_finite() && child.height.is_finite() {
+            bounds = crate::render::union_rect(bounds, child);
+        }
+    }
+    bounds
 }
 
 fn paint_transform(fragment: &Frag, _builder: &Builder<'_>) -> Option<Affine2d> {
@@ -2993,195 +3256,244 @@ fn paint_background_images_for_style(
                 builder.viewport(),
             )
         };
-        {
-            let origin = layer_value(&origin_layers, index, "padding-box");
-            let positioning = positioning_override
-                .unwrap_or_else(|| background_box(origin, border_box, padding_box, content_box));
-            let size = layer_value(&size_layers, index, "auto auto");
-            // A gradient is an image with no natural size or ratio: CSS
-            // Backgrounds 3 #background-size resolves its `auto` axes, and
-            // cover/contain, to the positioning area. It is then positioned,
-            // repeated and clipped exactly like any other image (§§2.4-2.6).
-            let gradient = is_gradient(layer);
-            let (handle, (mut tile_w, mut tile_h)) = if gradient {
-                (None, gradient_size(size, positioning, lengths))
-            } else if let Some(url) = css_url(layer) {
-                let base = builder.dom.style_resource_base(style.node(), builder.base);
-                let source = resolve_image_source(&base, &url);
-                let handle = builder.image(source.clone());
-                // CSS Backgrounds 3 #background-size: auto/auto with a natural
-                // ratio but neither natural dimension uses contain. SVG decoder
-                // fallback pixels are not intrinsic width/height. This also keeps
-                // the exact ratio for contain/cover and a single definite axis.
-                let ratio_only = crate::img::svg_url_ratio_only(&source)
-                    .or_else(|| crate::img::svg_ratio_only_get(&source))
-                    .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-                // CSS Backgrounds 3 #background-image and CSS Images 3
-                // #invalid-image: a loading image, or one that failed to load,
-                // still counts as a layer but draws nothing. Only decoded
-                // resources have an entry (pending ones carry a sentinel).
-                let Some(natural) = builder
-                    .images
-                    .get(&source)
-                    .copied()
-                    .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
-                    .map(|(w, h)| (w as f32, h as f32))
-                else {
-                    continue;
-                };
-                (
-                    Some(handle),
-                    background_size(size, natural, positioning, ratio_only, lengths),
-                )
-            } else {
-                continue;
-            };
-            let clip = canvas.unwrap_or_else(|| {
-                background_box(
-                    layer_value(&clip_layers, index, "border-box"),
-                    border_box,
-                    padding_box,
-                    content_box,
-                )
-            });
-            let repeat = parse_background_repeat(layer_value(&repeat_layers, index, "repeat"));
-            let position = layer_value(&position_layers, index, "0% 0%");
-            if !tile_w.is_finite() || !tile_h.is_finite() || tile_w <= 0.0 || tile_h <= 0.0 {
-                continue;
-            }
-            let (mut start_x, mut start_y) =
-                background_position(position, positioning, (tile_w, tile_h), lengths);
-            let mut repeat = repeat;
-            if matches!(repeat, BackgroundRepeat::Round) {
-                let nx = (positioning.width / tile_w).round().max(1.0);
-                let ny = (positioning.height / tile_h).round().max(1.0);
-                tile_w = positioning.width / nx;
-                tile_h = positioning.height / ny;
-                (start_x, start_y) =
-                    background_position(position, positioning, (tile_w, tile_h), lengths);
-                repeat = BackgroundRepeat::Repeat;
-            }
-            let tile = match handle {
-                Some(handle) => LayerTile::Image(handle),
-                None => {
-                    match parse_gradient(layer, CssRect::new(0.0, 0.0, tile_w, tile_h), lengths) {
-                        Some(brush) => LayerTile::Gradient(brush),
-                        None => continue,
-                    }
-                }
-            };
-            // Most gradients are one tile covering the whole painting area:
-            // fill the clip shape directly, as a single command.
-            let placed = CssRect::new(
-                positioning.x + start_x,
-                positioning.y + start_y,
-                tile_w,
-                tile_h,
-            );
-            if let LayerTile::Gradient(_) = tile
-                && !matches!(repeat, BackgroundRepeat::Space)
-                && placed.x <= clip.x
-                && placed.y <= clip.y
-                && placed.x + placed.width >= clip.x + clip.width
-                && placed.y + placed.height >= clip.y + clip.height
-                && let DisplayCommand::Fill { brush, .. } = tile.command(placed, style.node())
-            {
-                fill_background(builder, layer_shape, brush, &shape);
-                continue;
-            }
-            if matches!(repeat, BackgroundRepeat::Space) {
-                // `space` preserves the intrinsic tile size and distributes
-                // the remaining space between complete tiles. If only one
-                // tile fits on an axis, CSS falls back to no-repeat there.
-                let nx = (positioning.width / tile_w).floor() as usize;
-                let ny = (positioning.height / tile_h).floor() as usize;
-                builder.commands.push(DisplayCommand::PushClip(layer_shape));
-                paint_spaced_background(
-                    builder,
-                    clip,
-                    style.node(),
-                    &tile,
-                    positioning,
-                    (tile_w, tile_h),
-                    (start_x, start_y),
-                    nx,
-                    ny,
-                );
-                builder.commands.push(DisplayCommand::PopClip);
-                continue;
-            }
-            builder.commands.push(DisplayCommand::PushClip(layer_shape));
-            builder
-                .commands
-                .push(DisplayCommand::PushClip(background_clip_shape(
-                    clip, &shape, border_box,
-                )));
-            // CSS Backgrounds 3 §§2.4 and 2.6: size and position the image
-            // first, then repeat it as needed to cover the painting area.
-            let x_repeat = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX);
-            let y_repeat = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY);
-            if !x_repeat {
-                start_x += positioning.x;
-            }
-            if !y_repeat {
-                start_y += positioning.y;
-            }
-            let x0 = if x_repeat {
-                let absolute_start = positioning.x + start_x;
-                positioning.x + (absolute_start - positioning.x).rem_euclid(tile_w) - tile_w
-            } else {
-                start_x
-            };
-            let y0 = if y_repeat {
-                let absolute_start = positioning.y + start_y;
-                positioning.y + (absolute_start - positioning.y).rem_euclid(tile_h) - tile_h
-            } else {
-                start_y
-            };
-            let x_end = clip.x + clip.width;
-            let y_end = clip.y + clip.height;
-            // Repeated tiles meet on device pixels, as in Gecko and Blink:
-            // two antialiased edges sharing a fractional pixel would let
-            // the content beneath show through as a seam.
-            let ratio = builder.dom.device_pixel_ratio();
-            let snap = |value: f32, repeat: bool| {
-                if repeat {
-                    (value * ratio).round() / ratio
-                } else {
-                    value
-                }
-            };
-            let mut y = y0;
-            let mut count = 0usize;
-            while y < y_end && count < 4096 {
-                let mut x = x0;
-                let mut x_count = 0usize;
-                while x < x_end && x_count < 4096 {
-                    let (left, top) = (snap(x, x_repeat), snap(y, y_repeat));
-                    let rect = CssRect::new(
-                        left,
-                        top,
-                        snap(x + tile_w, x_repeat) - left,
-                        snap(y + tile_h, y_repeat) - top,
-                    );
-                    builder.commands.push(tile.command(rect, style.node()));
-                    if !x_repeat {
-                        break;
-                    }
-                    x += tile_w;
-                    x_count += 1;
-                }
-                if !y_repeat {
-                    break;
-                }
-                y += tile_h;
-                count += 1;
-            }
-            builder.commands.push(DisplayCommand::PopClip);
-            builder.commands.push(DisplayCommand::PopClip);
-        }
+        let origin = layer_value(&origin_layers, index, "padding-box");
+        let positioning = positioning_override
+            .unwrap_or_else(|| background_box(origin, border_box, padding_box, content_box));
+        let clip = canvas.unwrap_or_else(|| {
+            background_box(
+                layer_value(&clip_layers, index, "border-box"),
+                border_box,
+                padding_box,
+                content_box,
+            )
+        });
+        paint_image_layer(
+            builder,
+            ImageLayer {
+                image: layer,
+                node: style.node(),
+                positioning,
+                clip,
+                clip_shape: layer_shape,
+                border_shape: &shape,
+                border_box,
+                size: layer_value(&size_layers, index, "auto auto"),
+                position: layer_value(&position_layers, index, "0% 0%"),
+                repeat: layer_value(&repeat_layers, index, "repeat"),
+                lengths,
+            },
+        );
     }
     pin_fixed(builder, &mut fixed_start, &mut rescroll, &mut blending);
+}
+
+/// One image layer of a box: CSS Backgrounds 3 §§2.4-2.9 size, position and
+/// tile it within its positioning area and clip it to its painting area.
+/// CSS Masking 1 #positioned-masks reuses these definitions for mask layers.
+struct ImageLayer<'a> {
+    image: &'a str,
+    /// The style source: url() base and command identity.
+    node: NodeId,
+    positioning: CssRect,
+    /// The painting area, and its (possibly rounded or glyph) shape.
+    clip: CssRect,
+    clip_shape: PaintShape,
+    border_shape: &'a PaintShape,
+    border_box: CssRect,
+    size: &'a str,
+    position: &'a str,
+    repeat: &'a str,
+    lengths: LengthBasis,
+}
+
+/// Paint `layer`, returning whether it painted anything: an unloaded or
+/// failed image (CSS Images 3 #invalid-image) still counts as a layer but
+/// draws nothing.
+fn paint_image_layer(builder: &mut Builder<'_>, layer: ImageLayer<'_>) -> bool {
+    let ImageLayer {
+        image,
+        node,
+        positioning,
+        clip,
+        clip_shape,
+        border_shape,
+        border_box,
+        size,
+        position,
+        repeat,
+        lengths,
+    } = layer;
+    // A gradient is an image with no natural size or ratio: CSS
+    // Backgrounds 3 #background-size resolves its `auto` axes, and
+    // cover/contain, to the positioning area. It is then positioned,
+    // repeated and clipped exactly like any other image (§§2.4-2.6).
+    let gradient = is_gradient(image);
+    let (handle, (mut tile_w, mut tile_h)) = if gradient {
+        (None, gradient_size(size, positioning, lengths))
+    } else if let Some(url) = css_url(image) {
+        let base = builder.dom.style_resource_base(node, builder.base);
+        let source = resolve_image_source(&base, &url);
+        let handle = builder.image(source.clone());
+        // CSS Backgrounds 3 #background-size: auto/auto with a natural
+        // ratio but neither natural dimension uses contain. SVG decoder
+        // fallback pixels are not intrinsic width/height. This also keeps
+        // the exact ratio for contain/cover and a single definite axis.
+        let ratio_only = crate::img::svg_url_ratio_only(&source)
+            .or_else(|| crate::img::svg_ratio_only_get(&source))
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+        // CSS Backgrounds 3 #background-image and CSS Images 3
+        // #invalid-image: a loading image, or one that failed to load,
+        // still counts as a layer but draws nothing. Only decoded
+        // resources have an entry (pending ones carry a sentinel).
+        let Some(natural) = builder
+            .images
+            .get(&source)
+            .copied()
+            .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
+            .map(|(w, h)| (w as f32, h as f32))
+        else {
+            return false;
+        };
+        (
+            Some(handle),
+            background_size(size, natural, positioning, ratio_only, lengths),
+        )
+    } else {
+        return false;
+    };
+    let mut repeat = parse_background_repeat(repeat);
+    if !tile_w.is_finite() || !tile_h.is_finite() || tile_w <= 0.0 || tile_h <= 0.0 {
+        return false;
+    }
+    let (mut start_x, mut start_y) =
+        background_position(position, positioning, (tile_w, tile_h), lengths);
+    if matches!(repeat, BackgroundRepeat::Round) {
+        let nx = (positioning.width / tile_w).round().max(1.0);
+        let ny = (positioning.height / tile_h).round().max(1.0);
+        tile_w = positioning.width / nx;
+        tile_h = positioning.height / ny;
+        (start_x, start_y) = background_position(position, positioning, (tile_w, tile_h), lengths);
+        repeat = BackgroundRepeat::Repeat;
+    }
+    let tile = match handle {
+        Some(handle) => LayerTile::Image(handle),
+        None => match parse_gradient(image, CssRect::new(0.0, 0.0, tile_w, tile_h), lengths) {
+            Some(brush) => LayerTile::Gradient(brush),
+            None => return false,
+        },
+    };
+    // Most gradients are one tile covering the whole painting area:
+    // fill the clip shape directly, as a single command.
+    let placed = CssRect::new(
+        positioning.x + start_x,
+        positioning.y + start_y,
+        tile_w,
+        tile_h,
+    );
+    if let LayerTile::Gradient(_) = tile
+        && !matches!(repeat, BackgroundRepeat::Space)
+        && placed.x <= clip.x
+        && placed.y <= clip.y
+        && placed.x + placed.width >= clip.x + clip.width
+        && placed.y + placed.height >= clip.y + clip.height
+        && let DisplayCommand::Fill { brush, .. } = tile.command(placed, node)
+    {
+        fill_background(builder, clip_shape, brush, border_shape);
+        return true;
+    }
+    if matches!(repeat, BackgroundRepeat::Space) {
+        // `space` preserves the intrinsic tile size and distributes
+        // the remaining space between complete tiles. If only one
+        // tile fits on an axis, CSS falls back to no-repeat there.
+        let nx = (positioning.width / tile_w).floor() as usize;
+        let ny = (positioning.height / tile_h).floor() as usize;
+        builder.commands.push(DisplayCommand::PushClip(clip_shape));
+        paint_spaced_background(
+            builder,
+            clip,
+            node,
+            &tile,
+            positioning,
+            (tile_w, tile_h),
+            (start_x, start_y),
+            nx,
+            ny,
+        );
+        builder.commands.push(DisplayCommand::PopClip);
+        return true;
+    }
+    builder.commands.push(DisplayCommand::PushClip(clip_shape));
+    builder
+        .commands
+        .push(DisplayCommand::PushClip(background_clip_shape(
+            clip,
+            border_shape,
+            border_box,
+        )));
+    // CSS Backgrounds 3 §§2.4 and 2.6: size and position the image
+    // first, then repeat it as needed to cover the painting area.
+    let x_repeat = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX);
+    let y_repeat = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY);
+    if !x_repeat {
+        start_x += positioning.x;
+    }
+    if !y_repeat {
+        start_y += positioning.y;
+    }
+    let x0 = if x_repeat {
+        let absolute_start = positioning.x + start_x;
+        positioning.x + (absolute_start - positioning.x).rem_euclid(tile_w) - tile_w
+    } else {
+        start_x
+    };
+    let y0 = if y_repeat {
+        let absolute_start = positioning.y + start_y;
+        positioning.y + (absolute_start - positioning.y).rem_euclid(tile_h) - tile_h
+    } else {
+        start_y
+    };
+    let x_end = clip.x + clip.width;
+    let y_end = clip.y + clip.height;
+    // Repeated tiles meet on device pixels, as in Gecko and Blink:
+    // two antialiased edges sharing a fractional pixel would let
+    // the content beneath show through as a seam.
+    let ratio = builder.dom.device_pixel_ratio();
+    let snap = |value: f32, repeat: bool| {
+        if repeat {
+            (value * ratio).round() / ratio
+        } else {
+            value
+        }
+    };
+    let mut y = y0;
+    let mut count = 0usize;
+    while y < y_end && count < 4096 {
+        let mut x = x0;
+        let mut x_count = 0usize;
+        while x < x_end && x_count < 4096 {
+            let (left, top) = (snap(x, x_repeat), snap(y, y_repeat));
+            let rect = CssRect::new(
+                left,
+                top,
+                snap(x + tile_w, x_repeat) - left,
+                snap(y + tile_h, y_repeat) - top,
+            );
+            builder.commands.push(tile.command(rect, node));
+            if !x_repeat {
+                break;
+            }
+            x += tile_w;
+            x_count += 1;
+        }
+        if !y_repeat {
+            break;
+        }
+        y += tile_h;
+        count += 1;
+    }
+    builder.commands.push(DisplayCommand::PopClip);
+    builder.commands.push(DisplayCommand::PopClip);
+    true
 }
 
 /// Round a replaced element's content edges to device pixels, as Gecko and
@@ -8434,6 +8746,128 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [source]
             );
+        }
+    }
+
+    /// A 4x4 alpha mask: opaque top-left and bottom-right quadrants.
+    const QUAD_MASK: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAHUlEQVR42mNgYGD4D8UMDAwMDEwMaIARif0fqwoAklwDA/dBqfEAAAAASUVORK5CYII=";
+
+    #[test]
+    fn mask_layers_multiply_the_whole_stacking_context() {
+        // CSS Masking 1 #the-mask-image-rendering-model: the element and its
+        // descendants are masked as one group; #MaskValues: uncovered areas
+        // (here the overflowing child below the border box) are transparent.
+        let html = format!(
+            r#"<!doctype html><body style="margin:0;background:white"><style>
+            div{{position:absolute;width:100px;height:50px;background:red}}
+            .kid{{display:block;position:relative;left:20px;top:30px;width:20px;height:50px;background:blue}}
+            </style>
+            <div style="left:0;top:0;mask-image:linear-gradient(to right,#000 50%,transparent 50%)"><span class=kid></span></div>
+            <div style="left:150px;top:0;padding:10px;border:10px solid #0c0;width:60px;height:30px;
+              mask:linear-gradient(#000,#000) content-box,linear-gradient(#000,#000);
+              -webkit-mask-composite:xor;mask-composite:exclude"></div>
+            <div style="left:300px;top:0;mask-image:linear-gradient(to right,white 50%,black 50%);mask-mode:luminance"></div>
+            <div style="left:450px;top:0;width:80px;height:80px;-webkit-mask:url({QUAD_MASK}) 0 0/40px 40px no-repeat"></div>
+            <div style="left:0;top:100px;opacity:.5;mask-image:linear-gradient(#000,#000),linear-gradient(to right,#000 50%,transparent 50%);mask-composite:intersect"></div>"#
+        );
+        let images = [(QUAD_MASK.to_string(), (4, 4))].into_iter().collect();
+        let (_, layout) = render_fixture_with_images(&html, &images);
+        let pixels = crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+            .unwrap()
+            .pixels;
+        let pixel = |x: usize, y: usize| {
+            let at = (y * 800 + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2]]
+        };
+        let (red, blue, green, white) = ([255, 0, 0], [0, 0, 255], [0, 204, 0], [255; 3]);
+        assert_eq!(pixel(25, 25), red);
+        assert_eq!(pixel(75, 25), white);
+        assert_eq!(pixel(30, 45), blue);
+        assert_eq!(pixel(30, 70), white, "overflow outside mask-clip");
+        // exclude keeps the border and padding but not the content box.
+        assert_eq!(pixel(155, 25), green);
+        assert_eq!(pixel(165, 25), red);
+        assert_eq!(pixel(200, 25), white);
+        // A luminance mask takes white as opaque and black as transparent.
+        assert_eq!(pixel(325, 25), red);
+        assert_eq!(pixel(375, 25), white);
+        // A sized, unrepeated url() mask keeps its opaque quadrants only.
+        assert_eq!(pixel(460, 10), red);
+        assert_eq!(pixel(480, 10), white);
+        assert_eq!(pixel(460, 30), white);
+        assert_eq!(pixel(480, 30), red);
+        assert_eq!(pixel(500, 60), white);
+        // Opacity applies after the intersected mask.
+        let faded = pixel(25, 125);
+        assert!(
+            faded[0] == 255 && (120..=135).contains(&faded[1]),
+            "{faded:?}"
+        );
+        assert_eq!(pixel(75, 125), white);
+    }
+
+    #[test]
+    fn mask_images_are_requested_and_hide_content_until_loaded() {
+        // CSS Masking 1 #the-mask-image: a mask image that has not loaded
+        // (or failed to) is a transparent black layer. Masking does not
+        // clip hit testing, so the group bound is a layer clip, not PushClip.
+        let html = r#"<div id=m style="width:80px;height:60px;background:red;-webkit-mask-image:url(dots.png)">x</div>"#;
+        let source = "https://example.test/dots.png";
+        for (sizes, loaded) in [
+            (Default::default(), false),
+            ([(source.to_string(), (20, 10))].into_iter().collect(), true),
+        ] {
+            let (dom, layout) = render_fixture_with_images(html, &sizes);
+            let node = dom.get_by_id("m").unwrap();
+            assert_eq!(
+                layout
+                    .paint
+                    .image_requests
+                    .iter()
+                    .map(|request| request.source.as_str())
+                    .collect::<Vec<_>>(),
+                [source]
+            );
+            let commands = &layout.paint.primitives;
+            let outer = commands
+                .iter()
+                .position(|command| {
+                    matches!(command, DisplayCommand::PushLayer(layer) if layer.clip.is_some())
+                })
+                .expect("masked group");
+            let DisplayCommand::PushLayer(layer) = &commands[outer] else {
+                unreachable!()
+            };
+            let clip = layer.clip.unwrap();
+            let mask = commands
+                .iter()
+                .position(|command| {
+                    matches!(command, DisplayCommand::PushLayer(layer)
+                        if layer.compose == CompositeOperator::DestinationIn)
+                })
+                .expect("mask group");
+            assert!(outer < mask);
+            assert!(
+                commands[outer..mask]
+                    .iter()
+                    .any(|command| matches!(command, DisplayCommand::HitRegion(_)))
+            );
+            assert!(
+                !commands[outer..mask]
+                    .iter()
+                    .any(|command| matches!(command, DisplayCommand::PushClip(PaintShape::Rect(rect)) if *rect == clip))
+            );
+            let tile = commands[mask..].iter().find_map(|command| match command {
+                DisplayCommand::Image { node: n, rect, .. } if *n == node => Some(*rect),
+                _ => None,
+            });
+            if loaded {
+                assert_eq!(clip.width, 80.);
+                assert_eq!(tile.map(|rect| (rect.width, rect.height)), Some((20., 10.)));
+            } else {
+                assert_eq!(clip.width * clip.height, 0.);
+                assert_eq!(tile, None);
+            }
         }
     }
 

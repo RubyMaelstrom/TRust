@@ -1979,7 +1979,7 @@ fn intersect_css_rect(a: CssRect, b: CssRect) -> Option<CssRect> {
     (right > left && bottom > top).then(|| CssRect::new(left, top, right - left, bottom - top))
 }
 
-fn union_rect(a: CssRect, b: CssRect) -> CssRect {
+pub(crate) fn union_rect(a: CssRect, b: CssRect) -> CssRect {
     let left = a.x.min(b.x);
     let top = a.y.min(b.y);
     let right = (a.x + a.width).max(b.x + b.width);
