@@ -4577,6 +4577,37 @@ impl Dom {
                     .map_or(value.clone(), |n| format!("{}px", n * self.font_px(id))),
             );
         }
+        // CSS Text 4 #white-space-property: the shorthand of the
+        // white-space-collapse and text-wrap-mode longhands, combined as the
+        // layout combines them with a UA `white-space` default.
+        if name == "white-space" {
+            let (collapse, nowrap) = self
+                .computed_value_resolved(id, "white-space")
+                .as_deref()
+                .and_then(crate::layout2::WhiteSpace::components)
+                .unwrap_or(("collapse", false));
+            let collapse = self
+                .computed_value_resolved(id, "white-space-collapse")
+                .unwrap_or_else(|| collapse.into());
+            let nowrap = match self
+                .computed_value_resolved(id, "text-wrap-mode")
+                .as_deref()
+            {
+                Some("nowrap") => true,
+                Some("wrap") => false,
+                _ => nowrap,
+            };
+            return Some(match (collapse.as_str(), nowrap) {
+                ("collapse", false) => "normal".into(),
+                ("collapse", true) => "nowrap".into(),
+                ("preserve", true) => "pre".into(),
+                ("preserve", false) => "pre-wrap".into(),
+                ("preserve-breaks", false) => "pre-line".into(),
+                ("break-spaces", false) => "break-spaces".into(),
+                (collapse, true) => format!("{collapse} nowrap"),
+                (collapse, false) => collapse.to_string(),
+            });
+        }
         // CSS Backgrounds 3 #border-width: the computed width is an absolute
         // length, and zero when the side's style is none or hidden.
         if let Some(side) = name
