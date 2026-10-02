@@ -476,6 +476,10 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     pen: f32,
     line_start: f32,
     pending_space: bool,
+    /// Whether the pending space allows a soft wrap: CSS Text 3 #line-breaking
+    /// lets the box containing a space control the opportunity there, and
+    /// of a run of collapsible spaces the first is the one kept.
+    pending_space_wraps: bool,
     /// The last character of the text just placed in a collapsing mode,
     /// while no space or atomic inline has followed it: a following text run
     /// continues its word unless UAX #14 breaks between them.
@@ -605,6 +609,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
+            pending_space_wraps: false,
             word_end: None,
             preserved_break: false,
             pending_gap_px: 0.0,
@@ -1066,6 +1071,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     if c == '\n' && ctx.ws.preserves_newlines() {
                         self.forced_break();
                     } else {
+                        if !self.pending_space {
+                            self.pending_space_wraps = ctx.ws.wraps();
+                        }
                         self.pending_space = true;
                     }
                     self.word_end = None;
@@ -1428,6 +1436,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // CSS Text's break opportunities and emergency-wrap rules remain
             // authoritative in `first_line_end` for that overflow case.
             let break_style = self.break_style(ctx);
+            // CSS Text 3 #line-breaking: the kept space before this word lies
+            // in wrapping content, so a nowrap word may still move to the
+            // next line there (`web <nobr>[input]</nobr>`).
+            if !break_style.wrap
+                && spaced
+                && self.pending_space
+                && self.pending_space_wraps
+                && self.pen > self.line_start
+                && !fits(full.advance)
+            {
+                self.soft_break();
+                spaced = false;
+                continue;
+            }
             let emergency_wrap = matches!(
                 break_style.overflow_wrap,
                 crate::text::TextOverflowWrap::Anywhere | crate::text::TextOverflowWrap::BreakWord
@@ -2329,6 +2351,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     ) {
         let space = self.pending_space && self.pen > self.line_start;
         let space_width = if space { space_advance.max(0.0) } else { 0.0 };
+        // A space kept from wrapping content still offers a soft wrap
+        // before a nowrap atom.
+        let can_wrap = can_wrap || (space && self.pending_space_wraps);
         let gap = self.take_gap();
         if can_wrap
             && !super::css_px_fits(

@@ -6791,6 +6791,21 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn nowrap_content_may_wrap_at_a_preceding_normal_space() {
+        // CSS Text 3 #line-breaking: the box containing a space controls the
+        // soft wrap opportunity there. A space kept from normal text before
+        // `<nobr>` content still lets that content start the next line.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <div id=a style="width:150px">label text <nobr>unbreakable nowrap words</nobr></div>
+            <div id=b style="width:150px">label text <nobr><input size=12></nobr></div>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        assert_eq!(height("a"), 40.0);
+        assert!(height("b") > 30.0, "{}", height("b"));
+    }
+
+    #[test]
     fn iframe_keeps_replaced_viewport_size_and_clips_nested_document() {
         // HTML Rendering §15.2/§15.4.1: a child navigable is sized to the
         // iframe content box and the iframe remains a replaced element. Its
