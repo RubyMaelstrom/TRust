@@ -266,8 +266,19 @@ impl VelloCpuRenderer {
                             true
                         }
                     };
+                    // A layer's own paint clip bounds even destructive
+                    // operators: outside it the backdrop is untouched.
+                    let hidden = clips.bounds().width <= 0.
+                        || clips.bounds().height <= 0.
+                        || layer.clip.is_some_and(|clip| {
+                            !rect_is_visible(
+                                clip,
+                                *logical_transforms.last().unwrap(),
+                                clips.bounds(),
+                            )
+                        });
                     if cull
-                        && (clips.bounds().width <= 0. || clips.bounds().height <= 0.)
+                        && hidden
                         && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
                     {
                         skip_until = end + 1;

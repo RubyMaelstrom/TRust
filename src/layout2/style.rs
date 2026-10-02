@@ -215,6 +215,9 @@ pub(crate) struct BoxStyle {
     /// CSS Masking 1 §5: a clipping path forms a stacking context, but
     /// unlike a transform it does not establish a containing block.
     pub has_clip_path: bool,
+    /// CSS Masking 1 #the-mask-image: a mask layer image forms a stacking
+    /// context the way `opacity` below 1 does, without a containing block.
+    pub has_mask: bool,
     /// CSS Compositing 1 #mix-blend-mode / #isolation: a non-normal blend
     /// mode or `isolation: isolate` forms a stacking context.
     pub compositing_group: bool,
@@ -288,6 +291,7 @@ impl BoxStyle {
             child_viewport: false,
             has_transform: false,
             has_clip_path: false,
+            has_mask: false,
             compositing_group: false,
             filters: Default::default(),
             filter_containing_block: false,
@@ -424,6 +428,7 @@ impl BoxStyle {
             child_viewport: matches!(tag, "iframe" | "frame"),
             has_transform,
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
+            has_mask: cv("mask-image").is_some_and(|value| has_mask_image(&value)),
             compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
             filters: filters_of(&cv, u, vp),
             filter_containing_block: !dom.is_document_element(id),
@@ -581,6 +586,7 @@ impl BoxStyle {
                 .iter()
                 .any(|prop| cv(prop).is_some_and(|value| !matches!(value.trim(), "" | "none"))),
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
+            has_mask: cv("mask-image").is_some_and(|value| has_mask_image(&value)),
             compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
             filters: filters_of(&cv, u, vp),
             filter_containing_block: true,
@@ -612,6 +618,7 @@ impl BoxStyle {
             || matches!(self.position, Pos::Fixed | Pos::Sticky)
             || self.has_transform
             || self.has_clip_path
+            || self.has_mask
             || self.compositing_group
             || !self.filters.is_empty()
             || self.opacity < 1.0
@@ -637,6 +644,15 @@ fn filters_of(
     super::filter::filters(&value, &length, current)
         .unwrap_or_default()
         .into()
+}
+
+/// Whether a computed `mask-image` list has a layer other than `none`
+/// (CSS Masking 1 #the-mask-image).
+pub(super) fn has_mask_image(value: &str) -> bool {
+    crate::dom::split_top_level(value, ',').iter().any(|layer| {
+        let layer = layer.trim();
+        !layer.is_empty() && !layer.eq_ignore_ascii_case("none")
+    })
 }
 
 fn compositing_group(blend: Option<String>, isolation: Option<String>) -> bool {

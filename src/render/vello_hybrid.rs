@@ -815,8 +815,16 @@ impl VelloHybridRenderer {
                     }
                 }
                 DisplayCommand::PushLayer(layer) => {
-                    if (clips.bounds().width <= 0. || clips.bounds().height <= 0.)
-                        && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
+                    let hidden = clips.bounds().width <= 0.
+                        || clips.bounds().height <= 0.
+                        || layer.clip.is_some_and(|clip| {
+                            !rect_is_visible(
+                                clip,
+                                *logical_transforms.last().unwrap(),
+                                clips.bounds(),
+                            )
+                        });
+                    if hidden && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
                     {
                         skip_until = end + 1;
                         continue;
