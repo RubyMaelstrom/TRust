@@ -129,6 +129,20 @@ impl Dom {
                 }
             }
         }
+        // HTML Rendering #tables-2: `td[nowrap], th[nowrap] { white-space:
+        // nowrap }`, except that in quirks mode a cell whose width attribute
+        // is a length (not a percentage) is set back to normal.
+        if matches!(tag, "td" | "th") && self.attr(id, "nowrap").is_some() {
+            let sized = self
+                .attr(id, "width")
+                .and_then(nonzero_dimension_value)
+                .is_some_and(|width| width.ends_with("px"));
+            let normal = sized && self.in_quirks_mode(id);
+            hint(
+                "white-space",
+                if normal { "normal" } else { "nowrap" }.into(),
+            );
+        }
         // HTML Rendering #tables-2: table, row-group and row heights map to
         // the dimension property 'height'; cell heights ignore zero.
         let height = match tag {
@@ -787,6 +801,26 @@ mod tests {
         assert_eq!(value("tall", "margin-left"), "0");
         assert_eq!(value("thin", "border-top-style"), "solid");
         assert_eq!(value("thin", "border-top-width"), "0.5px");
+    }
+
+    #[test]
+    fn nowrap_cells_do_not_wrap_except_sized_ones_in_quirks_mode() {
+        // HTML Rendering #tables-2, as Gecko applies it (Blink ignores the
+        // quirk).
+        for (doctype, sized) in [("", "normal"), ("<!doctype html>", "nowrap")] {
+            let dom = Dom::parse_document(&format!(
+                "{doctype}<table><tr><td id=a nowrap>a</td><td id=b nowrap width=150>b</td>\
+                 <td id=c nowrap width=50%>c</td><td id=d>d</td></tr></table>"
+            ));
+            let value = |id: &str| {
+                dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "white-space")
+                    .unwrap_or_default()
+            };
+            assert_eq!(value("a"), "nowrap", "{doctype}");
+            assert_eq!(value("b"), sized, "{doctype}");
+            assert_eq!(value("c"), "nowrap", "{doctype}");
+            assert_ne!(value("d"), "nowrap", "{doctype}");
+        }
     }
 
     #[test]
