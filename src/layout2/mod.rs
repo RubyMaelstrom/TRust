@@ -4868,6 +4868,26 @@ mod tests {
     }
 
     #[test]
+    fn spanning_cells_give_their_columns_percentage_widths() {
+        // CSS Tables 3 #computing-column-measures: a spanning cell's
+        // percentage width is shared by its columns that have none, equally
+        // when they have no non-spanning content. Five `colspan=2 width=20%`
+        // cells are equal; a `colspan=4 width=40%` cell below is two of them
+        // (Blink: 157-159px and 318px in this 800px table).
+        let html = r#"<!doctype html><body style="margin:0;font:16px sans-serif">
+            <table id=t width=800><tr><td id=a colspan=2 width=20%>a</td><td id=b colspan=2 width=20%>b</td>
+            <td id=c colspan=2 width=20%>c</td><td id=d colspan=2 width=20%>d</td><td id=e colspan=2 width=20%>e</td></tr>
+            <tr><td colspan=3 width=30%>x</td><td id=y colspan=4 width=40%>y</td><td colspan=3 width=30%>z</td></tr></table>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1000.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        for id in ["a", "b", "c", "d", "e"] {
+            assert!((width(id) - 158.0).abs() < 2.5, "{id}: {}", width(id));
+        }
+        assert!((width("y") - 318.0).abs() < 2.5, "{}", width("y"));
+    }
+
+    #[test]
     fn spanning_cells_distribute_widths_by_column_measures() {
         // CSS Tables 3 #computing-column-measures: a spanning cell's
         // min-content first fills its columns' min-to-max gaps in proportion

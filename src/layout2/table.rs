@@ -470,6 +470,9 @@ impl Flow<'_> {
             .collect();
         spans.sort_unstable();
         spans.dedup();
+        if !tb.fixed_layout {
+            span_percentages(self.dom, tb, &spans, &col_max, &mut col_w);
+        }
         for n in spans {
             let (base_min, base_max) = (col_min.clone(), col_max.clone());
             for cell in &tb.cells {
@@ -709,6 +712,64 @@ fn fixed_columns(col_w: &[Option<ColSpec>], ncols: usize, content: f32) -> Vec<f
         *w = w.max(1.0);
     }
     widths
+}
+
+/// CSS Tables 3 #computing-column-measures, intrinsic percentage widths:
+/// for spans of increasing size, a spanning cell's percentage width less
+/// its columns' percentages goes to those of them without one, in
+/// proportion to their non-spanning max-content widths (`nonspan_max`),
+/// or equally when those are all zero. A column keeps the largest
+/// contribution. Every column's percentage is then limited to 100% less
+/// the columns before it. Columns with a length width keep it.
+fn span_percentages(
+    dom: &crate::dom::Dom,
+    tb: &TableBox,
+    spans: &[usize],
+    nonspan_max: &[f32],
+    col_w: &mut [Option<ColSpec>],
+) {
+    let ncols = col_w.len();
+    let percent = |spec: &Option<ColSpec>| match spec {
+        Some(ColSpec::Pct(p)) => *p,
+        _ => 0.0,
+    };
+    for &n in spans {
+        let mut contributions: Vec<f32> = vec![0.0; ncols];
+        for cell in &tb.cells {
+            let end = (cell.col + cell.colspan).min(ncols);
+            if end.saturating_sub(cell.col) != n {
+                continue;
+            }
+            let Some(ColSpec::Pct(cell_pct)) = declared_track_width(dom, cell.b.node) else {
+                continue;
+            };
+            let columns = cell.col..end;
+            let rest =
+                (cell_pct - columns.clone().map(|c| percent(&col_w[c])).sum::<f32>()).max(0.0);
+            let open: Vec<usize> = columns.filter(|&c| col_w[c].is_none()).collect();
+            let weight: f32 = open.iter().map(|&c| nonspan_max[c]).sum();
+            for &c in &open {
+                let share = if weight > 0.0 {
+                    nonspan_max[c] / weight
+                } else {
+                    1.0 / open.len() as f32
+                };
+                contributions[c] = contributions[c].max(rest * share);
+            }
+        }
+        for (spec, contribution) in col_w.iter_mut().zip(contributions) {
+            if spec.is_none() && contribution > 0.0 {
+                *spec = Some(ColSpec::Pct(contribution));
+            }
+        }
+    }
+    let mut total = 0.0f32;
+    for spec in col_w.iter_mut() {
+        if let Some(ColSpec::Pct(p)) = spec {
+            *p = p.min((1.0 - total).max(0.0));
+            total += *p;
+        }
+    }
 }
 
 /// CSS Tables 3 #computing-column-measures: a spanning cell's min- and
