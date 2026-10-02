@@ -3939,6 +3939,26 @@ mod tests {
     }
 
     #[test]
+    fn grid_item_percentage_heights_resolve_against_the_grid_area() {
+        // CSS Grid 1 §6.6: a percentage height is of the item's grid area,
+        // not the grid container; in an auto row it behaves as auto while
+        // the row is sized, then resolves against the sized row.
+        let html = r#"<!DOCTYPE html><body style="margin:0">
+            <div style="display:grid;grid-template-rows:100px 200px;height:400px;width:100px">
+            <div></div><div id=fixed style="height:50%"></div></div>
+            <div style="display:grid;grid-template-columns:50px 50px;width:100px">
+            <div id=auto style="height:50%">a</div><div style="height:100px"></div></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| {
+            let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (r.top, r.height)
+        };
+        assert_eq!(rect("fixed"), (100.0, 100.0));
+        assert_eq!(rect("auto"), (400.0, 50.0));
+    }
+
+    #[test]
     fn grid_items_and_rows_honor_min_heights() {
         // CSS 2.2 §10.7: a centered grid item keeps its min-height; CSS Grid
         // §12.1/§11.8: an auto row stretches into the container's definite

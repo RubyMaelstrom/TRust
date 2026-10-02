@@ -2021,6 +2021,9 @@ impl Flow<'_> {
             cross_auto: bool,
             /// Content-box min-/max-height clamps for a stretched height.
             clamp_h: (f32, f32),
+            /// The item's height is a percentage of its grid area, resolved
+            /// once the rows are sized.
+            area_percentage_h: bool,
             subgrid: Option<RowInput>,
             row_contributions: Option<Vec<Contrib>>,
         }
@@ -2087,7 +2090,12 @@ impl Flow<'_> {
                     .inputs
                     .insert(it.node, input.clone());
             }
-            let def_h = if subgrid.is_some() {
+            // CSS Grid 1 §6.6 and #algo-overview: a percentage height is of
+            // the item's grid area, which the row sizing below determines.
+            // Until then it behaves as auto for the item's contributions.
+            let area_percentage_h =
+                !matches!(s.height, Len::Auto) && s.height.resolve(None).is_none();
+            let def_h = if subgrid.is_some() || area_percentage_h {
                 None
             } else {
                 s.height.resolve(def_ch).map(|v| v.max(0.0))
@@ -2153,6 +2161,7 @@ impl Flow<'_> {
                 bp_cross,
                 cross_auto: subgrid.is_some() || matches!(s.height, Len::Auto),
                 clamp_h: (min_h, max_h),
+                area_percentage_h,
                 area_w,
                 frag,
                 anchors: anc,
@@ -2352,6 +2361,17 @@ impl Flow<'_> {
                 }
                 g.frag = frag;
                 g.anchors = anchors;
+            } else if g.area_percentage_h {
+                let s = &g.it.style;
+                let bt = s.border[TOP] + self.pad(s, TOP, g.area_w);
+                let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, g.area_w);
+                if let Some(height) = self.height_px(&s.height, s, bt, bb, Some(area_h)) {
+                    let height = height.clamp(g.clamp_h.0, g.clamp_h.1);
+                    let (frag, anchors) =
+                        self.item_frag(g.it, g.content_w, g.area_w, Some(height), inl);
+                    g.frag = frag;
+                    g.anchors = anchors;
+                }
             }
             let extra = area_h - (g.frag.h + g.m[TOP] + g.m[BOTTOM]);
             let shift = if g.align == AlignItem::Baseline && !g.auto[TOP] && !g.auto[BOTTOM] {
