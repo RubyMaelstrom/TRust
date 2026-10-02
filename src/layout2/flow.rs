@@ -23,8 +23,8 @@ use crate::dom::{Dom, NodeId};
 use crate::layout2::{Emphasis, ImageSizes, NO_NODE};
 
 use super::flex::{
-    AlignContent, AlignItem, FlexCalc, align_content_offsets, align_item_from, container_style,
-    item_flex, justify_offsets, resolve_flexible_lengths,
+    AlignContent, AlignItem, FlexCalc, Justify, align_content_offsets, align_item_from,
+    container_style, item_flex, justify_offsets, resolve_flexible_lengths,
 };
 use super::float::{FloatBox, FloatCtx, Side};
 use super::inline::{AtomBoxSize, FloatEnv, Ifc, InlineItem, LineOut, OofMark, Piece};
@@ -126,6 +126,18 @@ impl Clip {
     }
 }
 
+/// CSS Flexbox 1 #abspos-items: the static-position rectangle of an
+/// absolutely positioned child of a flex container is the container's
+/// content box, and the child aligns in it as if it were the sole flex item
+/// (CSS Position 3 #staticpos-rect). Each physical axis keeps the alignment
+/// that applies to it: justify-content on the main axis, the child's
+/// align-self on the cross axis, both flipped for reversed axes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FlexStatic {
+    pub x: Justify,
+    pub y: Justify,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum FragKind {
     Block,
@@ -138,8 +150,9 @@ pub(crate) enum FragKind {
     /// (§10.3.7/§10.6.4) in the fragment tree so every later translation
     /// moves it consistently; the positioned post-pass (`resolve_oof`)
     /// replaces it with the laid box. Carries the inline context the box
-    /// inherits (by DOM tree, not by containing block).
-    Oof(SharedBox, Box<InlineStyle>),
+    /// inherits (by DOM tree, not by containing block), and for a flex
+    /// container's child its alignment in the static-position rectangle.
+    Oof(SharedBox, Box<InlineStyle>, Option<FlexStatic>),
     /// Marker retained at the original tree position of a viewport-fixed box.
     /// The laid fragment lives in the flow's fixed list; graphical paint
     /// resolves this marker there so fixed positioning remains viewport-pinned
@@ -405,7 +418,7 @@ fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag {
         content_offset: [0.0; 2],
         paint: PaintFlags::default(),
         clip: None,
-        kind: FragKind::Oof(m.b.clone(), Box::new(m.ctx)),
+        kind: FragKind::Oof(m.b.clone(), Box::new(m.ctx), None),
         children: Vec::new(),
     }
 }
@@ -1630,8 +1643,9 @@ impl Flow<'_> {
 
     /// Placeholders for a flex/grid container's out-of-flow children. Their
     /// static-position rectangle is the container's content box (css-flexbox
-    /// §4.1 / css-grid §9.1; the "as if it were the sole item" alignment
-    /// refinement is documented as not done — the origin is used).
+    /// §4.1 / css-grid §9.1). A flex child aligns in it as the sole flex item
+    /// would (`FlexStatic`); a grid child keeps the rectangle's start corner
+    /// (its justify-self/align-self alignment is not done).
     fn container_oof(&self, b: &BoxNode, inl: &InlineStyle, x: f32, y: f32, out: &mut Vec<Frag>) {
         if b.oof.is_empty() {
             return;
@@ -1661,7 +1675,38 @@ impl Flow<'_> {
                 (self.order_of(frag.node), index * 2 + 1, frag)
             })
             .collect();
+        let flex = matches!(b.content, Content::Flex(_)).then(|| {
+            container_style(
+                self.dom,
+                b.node,
+                super::Units::of(self.dom, b.node),
+                self.vp,
+            )
+        });
         for (index, ob) in &b.oof {
+            let align = flex.as_ref().map(|fs| {
+                let flip = |justify| match justify {
+                    Justify::Start | Justify::Between => Justify::End,
+                    Justify::End => Justify::Start,
+                    other => other,
+                };
+                let main = if fs.reverse {
+                    flip(fs.justify)
+                } else {
+                    fs.justify
+                };
+                let cross = match self.item_align(ob.node, fs.align_items) {
+                    AlignItem::Center => Justify::Center,
+                    AlignItem::End => Justify::End,
+                    AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => Justify::Start,
+                };
+                let cross = if fs.wrap_reverse { flip(cross) } else { cross };
+                if fs.row {
+                    FlexStatic { x: main, y: cross }
+                } else {
+                    FlexStatic { x: cross, y: main }
+                }
+            });
             ordered.push((
                 0,
                 index * 2,
@@ -1678,7 +1723,7 @@ impl Flow<'_> {
                     content_offset: [0.0; 2],
                     paint: PaintFlags::default(),
                     clip: None,
-                    kind: FragKind::Oof(ob.clone(), Box::new(inl.clone())),
+                    kind: FragKind::Oof(ob.clone(), Box::new(inl.clone()), align),
                     children: Vec::new(),
                 },
             ));
@@ -4075,9 +4120,11 @@ impl Flow<'_> {
             let child_own_clip = if matches!(f.children[i].kind, FragKind::Oof(..)) {
                 let ph = f.children.remove(i);
                 let (x0, y0) = (ph.x, ph.y);
-                let FragKind::Oof(b, ctx) = ph.kind else {
+                let FragKind::Oof(b, ctx, flex) = ph.kind else {
                     unreachable!()
                 };
+                let content = f.content_box();
+                let flex = flex.map(|align| (align, content.width, content.height));
                 // CSS Color 4 #transparency applies opacity after layout.
                 // Even a fully transparent, pointer-events:none positioned
                 // box retains geometry and scrollable overflow. CSSOM View
@@ -4097,7 +4144,7 @@ impl Flow<'_> {
                 } else {
                     child_abs
                 };
-                let (laid, anc) = self.lay_oof(&b, cb, (x0 - cb.x, y0 - cb.y), &ctx);
+                let (laid, anc) = self.lay_oof(&b, cb, (x0 - cb.x, y0 - cb.y), flex, &ctx);
                 if top_layer {
                     top_layer_out.push(TopFrag {
                         fragment: laid,
@@ -4178,13 +4225,16 @@ impl Flow<'_> {
     /// Lay one absolutely positioned box against its containing block:
     /// §10.3.7 (widths; §10.3.8 replaced), §10.6.4 (heights; §10.6.5
     /// replaced), §10.4/§10.7 min/max re-solving, ltr. `stat` is the static
-    /// position relative to the CB's padding-box origin. Returns the laid
-    /// fragment in ABSOLUTE coordinates plus its (already offset) anchors.
+    /// position relative to the CB's padding-box origin; `flex` aligns the
+    /// box in a flex container's static-position rectangle of the given
+    /// size. Returns the laid fragment in ABSOLUTE coordinates plus its
+    /// (already offset) anchors.
     fn lay_oof(
         &self,
         b: &BoxNode,
         cb: CbRect,
         stat: (f32, f32),
+        flex: Option<(FlexStatic, f32, f32)>,
         ctx: &InlineStyle,
     ) -> (Frag, Vec<(NodeId, f32)>) {
         let s = &b.style;
@@ -4341,6 +4391,16 @@ impl Flow<'_> {
                 (lx, used_w, ml) = solve_h(Some(min_w));
             }
         }
+        // CSS Position 3 #staticpos-rect: with both insets auto, the margin
+        // box (auto margins as zero) aligns in the static-position rectangle.
+        let static_shift =
+            |justify: Justify, rect: f32, outer: f32| justify_offsets(justify, rect - outer, 1).0;
+        if let Some((align, rect_w, _)) = flex
+            && left.is_none()
+            && right.is_none()
+        {
+            lx += static_shift(align.x, rect_w, m[LEFT] + bp_h + used_w + m[RIGHT]);
+        }
         // §10.6.4 heights. A height solvable BEFORE layout — specified, or
         // both insets given (rule 5) — becomes the definite content height
         // children resolve against; otherwise the content decides (§10.6.7).
@@ -4393,7 +4453,12 @@ impl Flow<'_> {
         let top_used = match (top, bottom) {
             (Some(t), _) => t,
             (None, Some(bm)) => cb.h - bm - used_h - bp_v - mt_used - m[BOTTOM],
-            (None, None) => stat.1,
+            (None, None) => {
+                stat.1
+                    + flex.map_or(0.0, |(align, _, rect_h)| {
+                        static_shift(align.y, rect_h, m[TOP] + bp_v + used_h + m[BOTTOM])
+                    })
+            }
         };
         // The box's own transform translation (an abspos box is never also
         // relative, so this is the whole paint offset).

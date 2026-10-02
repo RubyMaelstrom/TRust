@@ -4539,6 +4539,81 @@ mod tests {
     }
 
     #[test]
+    fn flex_children_with_auto_insets_align_as_the_sole_flex_item() {
+        // CSS Flexbox 1 #abspos-items and CSS Position 3 #staticpos-rect:
+        // an absolutely positioned child of a flex container with auto
+        // insets takes the static position of a sole flex item: its margin
+        // box aligns in the container's content box by justify-content on
+        // the main axis and its align-self on the cross axis, both flipped
+        // for reversed axes. Values match Blink.
+        let cases = [
+            (
+                "a",
+                "justify-content:center;align-items:center",
+                "",
+                250.0,
+                35.0,
+            ),
+            ("b", "flex-direction:row-reverse", "", 500.0, 0.0),
+            (
+                "c",
+                "flex-direction:column;justify-content:center;align-items:flex-end",
+                "",
+                500.0,
+                35.0,
+            ),
+            ("d", "flex-direction:column-reverse", "", 0.0, 70.0),
+            ("e", "align-items:center", "align-self:flex-end", 0.0, 70.0),
+            ("f", "flex-wrap:wrap-reverse", "", 0.0, 70.0),
+            ("g", "justify-content:space-around", "", 250.0, 0.0),
+            (
+                "h",
+                "justify-content:center;padding:10px 30px",
+                "margin:5px 20px",
+                250.0,
+                15.0,
+            ),
+            (
+                "i",
+                "justify-content:center;align-items:center",
+                "left:5px;top:6px",
+                5.0,
+                6.0,
+            ),
+            (
+                "j",
+                "justify-content:center;width:100px",
+                "width:300px",
+                -100.0,
+                0.0,
+            ),
+        ];
+        let body: String = cases
+            .iter()
+            .map(|(id, flex, child, _, _)| {
+                format!(r#"<div class=f style="{flex}"><div class=c id={id} style="{child}"></div></div>"#)
+            })
+            .collect();
+        let html = format!(
+            r#"<!doctype html><style>*{{box-sizing:border-box}}body{{margin:0}}
+            .f{{display:flex;position:relative;height:100px;width:600px}}
+            .c{{position:absolute;width:100px;height:30px}}</style>{body}"#
+        );
+        let dom = Dom::parse_document(&html);
+        let layout = lay_graphical(&html, 1024.0, &HashMap::new());
+        for (id, _, _, x, y) in cases {
+            let node = dom.get_by_id(id).unwrap();
+            let parent = dom.node(node).parent.unwrap();
+            let (rect, container) = (layout.boxes[&node], layout.boxes[&parent]);
+            assert_eq!(
+                (rect.left - container.left, rect.top - container.top),
+                (x, y),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn spanning_cells_distribute_widths_by_column_measures() {
         // CSS Tables 3 #computing-column-measures: a spanning cell's
         // min-content first fills its columns' min-to-max gaps in proportion
