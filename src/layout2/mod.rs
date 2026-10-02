@@ -4075,6 +4075,37 @@ mod tests {
     }
 
     #[test]
+    fn a_serialized_frameset_keeps_its_frames() {
+        // A static page reflows from its presentation snapshot, where frames
+        // are `<div>` wrappers. The HTML parser drops a `<div>` inside a
+        // `<frameset>`, so the snapshot writes framesets as grid boxes.
+        let mut dom = Dom::parse_document(
+            r#"<frameset cols="100,*"><frame id=a><frameset rows="1*,3*"><frame id=b><frame id=c></frameset></frameset>"#,
+        );
+        for id in ["a", "b", "c"] {
+            let frame = dom.get_by_id(id).unwrap();
+            let markup = format!("<body><p id={id}p>{id}</p></body>");
+            dom.install_frame_document(frame, &markup, "https://frame.test/")
+                .unwrap();
+        }
+        let snapshots = [
+            dom.serialize(crate::dom::DOCUMENT),
+            dom.serialize_live(crate::dom::DOCUMENT, &Default::default()),
+        ];
+        for html in snapshots {
+            let snapshot = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let rect = |id: &str| {
+                let r = layout.boxes[&snapshot.get_by_id(id).unwrap()];
+                (r.left, r.top)
+            };
+            let (a, b, c) = (rect("ap"), rect("bp"), rect("cp"));
+            assert_eq!(b.0, a.0 + 100.0, "{html}");
+            assert_eq!((c.0, c.1), (b.0, b.1 + 150.0), "{html}");
+        }
+    }
+
+    #[test]
     fn textareas_are_monospace_and_rows_lines_tall() {
         // HTML Rendering #the-textarea-element-2: the effective height is
         // `rows` lines (default 2); engines' UA sheets make it monospace.

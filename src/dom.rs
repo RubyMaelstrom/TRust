@@ -7538,6 +7538,28 @@ impl Dom {
         out.push('>');
     }
 
+    /// The HTML parser drops a `<div>` in "in frameset" mode, so a frameset
+    /// holding serialized frame wrappers is itself written as a grid box: the
+    /// top-level one as the body it stands in for (HTML
+    /// #frames-and-framesets), without body's UA margin. Returns the element
+    /// name to close.
+    fn write_serialized_frameset_open(&self, frameset: NodeId, out: &mut String) -> &'static str {
+        let top = self
+            .node(frameset)
+            .parent
+            .is_some_and(|parent| self.is_document_element(parent));
+        let element = if top { "body" } else { "div" };
+        let mut style = String::from(if top { "margin:0;" } else { "" });
+        style.push_str("display:grid;");
+        append_style(&mut style, &self.baked_element_style(frameset, false));
+        out.push('<');
+        out.push_str(element);
+        out.push_str(" data-trust-frameset=\"\" style=\"");
+        out.push_str(&escape_attr(&style));
+        out.push_str("\">");
+        element
+    }
+
     fn write_serialized_frame_root_open(&self, root: NodeId, out: &mut String) {
         // HTML elements cannot be nested in serialized HTML. Preserve the
         // child Document's root as a presentation-only box with its computed
@@ -8819,6 +8841,16 @@ impl Dom {
                     out.push_str("</div>");
                     return;
                 }
+                if !js_serialization && tag == "frameset" {
+                    let element = self.write_serialized_frameset_open(id, out);
+                    for c in self.child_iter(id) {
+                        self.serialize_node_inner(c, host, js_serialization, out);
+                    }
+                    out.push_str("</");
+                    out.push_str(element);
+                    out.push('>');
+                    return;
+                }
                 // <slot> inside a shadow tree: project the host's light
                 // children (or the slot's own fallback content).
                 if !js_serialization
@@ -8935,6 +8967,16 @@ impl Dom {
                 out.push_str("</div>");
             }
             out.push_str("</div>");
+            return;
+        }
+        if tag == "frameset" {
+            let element = self.write_serialized_frameset_open(id, out);
+            for c in self.child_iter(id) {
+                self.serialize_live_node(c, host, clickable, in_anchor, out);
+            }
+            out.push_str("</");
+            out.push_str(element);
+            out.push('>');
             return;
         }
         if tag == "slot"
