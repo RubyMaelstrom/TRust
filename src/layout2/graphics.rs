@@ -3904,14 +3904,16 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
         colors,
     } = edges;
     let [top, right, bottom, left] = widths;
-    // #line-style permits UA-chosen band thickness and shading, but double
-    // must have a gap and the 3D styles must preserve their opposite relief.
-    let complex = |s: &str| matches!(s, "double" | "groove" | "ridge" | "inset" | "outset");
     let owners = corner_owners(widths, &styles);
     let splits = corner_splits(rect, radii, widths, &owners);
-    for side in 0..4 {
-        if widths[side] <= 0. || !complex(styles[side]) {
-            continue;
+    // The bands of ring that solid, double and 3D sides fill, each as the
+    // fractions of the border width it spans and its color. #line-style
+    // permits UA-chosen band thickness and shading, but double must have a
+    // gap and the 3D styles must preserve their opposite relief.
+    let fills: [Option<Vec<(f32, f32, PaintColor)>>; 4] = std::array::from_fn(|side| {
+        let color = colors[side];
+        if widths[side] <= 0. {
+            return None;
         }
         let mut kind = styles[side];
         if collapse {
@@ -3926,19 +3928,46 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
             "ridge" | "outset" => raised,
             _ => !raised,
         };
-        let color = colors[side];
-        let bands = match kind {
+        Some(match kind {
+            "solid" => vec![(0., 1., color)],
             "double" => vec![(0., 1. / 3., color), (2. / 3., 1., color)],
             "groove" | "ridge" => vec![
                 (0., 0.5, border_shade(color, light)),
                 (0.5, 1., border_shade(color, !light)),
             ],
-            _ => vec![(0., 1., border_shade(color, light))],
+            "inset" | "outset" => vec![(0., 1., border_shade(color, light))],
+            _ => return None,
+        })
+    });
+    // Adjoining sides that fill alike are filled together: clipping each
+    // to its own part of the shared corner would antialias both clips on
+    // the same line and let the background show through between them, a
+    // seam Gecko and Blink do not draw.
+    let breaks = (0..4)
+        .filter(|&side| fills[side].is_some() && fills[side] != fills[(side + 3) % 4])
+        .collect::<Vec<_>>();
+    if breaks.is_empty()
+        && let Some(bands) = &fills[0]
+    {
+        for &(start, end, color) in bands {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: border_ring(rect, radii, widths, start, end),
+                brush: PaintBrush::Solid(color),
+            });
+        }
+    }
+    for &first in &breaks {
+        let Some(bands) = &fills[first] else {
+            continue;
         };
+        let count = (1..4)
+            .take_while(|offset| fills[(first + offset) % 4] == fills[first])
+            .count()
+            + 1;
         builder
             .commands
-            .push(DisplayCommand::PushClip(side_clip(side, &splits)));
-        for (start, end, color) in bands {
+            .push(DisplayCommand::PushClip(sides_clip(first, count, &splits)));
+        for &(start, end, color) in bands {
             builder.commands.push(DisplayCommand::Fill {
                 shape: border_ring(rect, radii, widths, start, end),
                 brush: PaintBrush::Solid(color),
@@ -3951,22 +3980,11 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
         && (top - left).abs() < 0.01
         && styles.iter().all(|s| s == &styles[0])
         && colors.iter().all(|c| *c == colors[0]);
-    if uniform
-        && top > 0.0
-        && !matches!(styles[0], "none" | "hidden" | "dotted")
-        && !complex(styles[0])
-    {
+    if uniform && top > 0.0 && styles[0] == "dashed" {
         // CSS Backgrounds 3 #corner-shaping: the outer edge follows the
         // border radii and the padding edge those radii less the border
-        // width, so a solid border is exactly that ring, and a dashed one is
-        // dashed along the ring's center line.
-        if styles[0] == "solid" {
-            builder.commands.push(DisplayCommand::Fill {
-                shape: border_ring(rect, radii, widths, 0., 1.),
-                brush: PaintBrush::Solid(colors[0]),
-            });
-            return;
-        }
+        // width, so a uniform dashed border is dashed along the ring's
+        // center line.
         let inset = top / 2.0;
         let center = CssRect::new(
             rect.x + inset,
@@ -4004,10 +4022,7 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
         ),
     ];
     for (index, (width, start, end)) in sides.into_iter().enumerate() {
-        if width <= 0.0
-            || matches!(styles[index], "none" | "hidden" | "dotted")
-            || complex(styles[index])
-        {
+        if width <= 0.0 || styles[index] != "dashed" {
             continue;
         }
         // CSS Backgrounds 3 #corner-transitions: adjoining sides meet
@@ -4015,14 +4030,8 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
         // and a zero-sized padding box (the usual CSS triangle).
         builder
             .commands
-            .push(DisplayCommand::PushClip(side_clip(index, &splits)));
-        let ring = border_ring(rect, radii, widths, 0., 1.);
-        if styles[index] == "solid" {
-            builder.commands.push(DisplayCommand::Fill {
-                shape: ring,
-                brush: PaintBrush::Solid(colors[index]),
-            });
-        } else if radii.corners.iter().all(|&(x, y)| x <= 0. || y <= 0.) {
+            .push(DisplayCommand::PushClip(sides_clip(index, 1, &splits)));
+        if radii.corners.iter().all(|&(x, y)| x <= 0. || y <= 0.) {
             builder.commands.push(DisplayCommand::Stroke {
                 shape: PaintShape::Path(vec![PathElement::MoveTo(start), PathElement::LineTo(end)]),
                 brush: PaintBrush::Solid(colors[index]),
@@ -4039,7 +4048,9 @@ fn paint_border_edges(builder: &mut Builder<'_>, edges: BorderEdges<'_>, collaps
                 (rect.width - half[1] - half[3]).max(0.),
                 (rect.height - half[0] - half[2]).max(0.),
             );
-            builder.commands.push(DisplayCommand::PushClip(ring));
+            builder.commands.push(DisplayCommand::PushClip(border_ring(
+                rect, radii, widths, 0., 1.,
+            )));
             builder.commands.push(DisplayCommand::Stroke {
                 shape: PaintShape::Path(rounded_contour(
                     middle,
@@ -4286,13 +4297,22 @@ fn toward_middle(outer: CssPoint, inner: CssPoint, middle: CssPoint) -> CssPoint
     }
 }
 
-/// The part of the border area that `side` paints: its edge plus its share
-/// of both corners, as divided by `splits`.
-fn side_clip(side: usize, splits: &[Vec<CssPoint>; 4]) -> PaintShape {
-    let next = (side + 1) % 4;
-    let mut points = vec![splits[side][0]];
-    points.extend(splits[next].iter().copied());
-    points.extend(splits[side].iter().rev().take(splits[side].len() - 1));
+/// The part of the border area that `count` consecutive sides from `first`
+/// paint: their edges plus their share of the corners at either end, as
+/// divided by `splits`.
+fn sides_clip(first: usize, count: usize, splits: &[Vec<CssPoint>; 4]) -> PaintShape {
+    let corner = |offset: usize| &splits[(first + offset) % 4];
+    // Along the outer edge, through the corners between the sides…
+    let mut points = (0..count)
+        .map(|offset| corner(offset)[0])
+        .collect::<Vec<_>>();
+    // …in at the last corner and back along the inner edge…
+    points.extend(corner(count).iter().copied());
+    for offset in (1..count).rev() {
+        points.extend(corner(offset).last().copied());
+    }
+    // …and out at the first corner.
+    points.extend(corner(0).iter().rev().take(corner(0).len() - 1));
     PaintShape::Polygon {
         points,
         evenodd: false,
@@ -6460,6 +6480,44 @@ mod tests {
         // Inset: dark top and left, light bottom and right.
         assert_eq!((pixel(515, 70), pixel(624, 70)), (dark, light));
         assert_eq!((pixel(570, 35), pixel(570, 104)), (dark, light));
+    }
+
+    #[test]
+    fn alike_sides_meet_without_a_seam_at_their_corner() {
+        // Each side was clipped to its own half of a corner, so two
+        // antialiased clips met on the diagonal and let the white
+        // background show through between sides of one color.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:black">
+            <div style="position:absolute;left:20px;top:20px;width:60px;height:30px;
+                background:white;border:7px outset #86866d"></div>
+            <div style="position:absolute;left:140px;top:20px;width:60px;height:30px;
+                background:white;border:solid #86866d;border-width:7px 5px 9px 6px"></div>
+            <div style="position:absolute;left:260px;top:20px;width:60px;height:30px;
+                background:white;border:9px double #86866d"></div>"#,
+        );
+        for offset in 0..7 {
+            // The outset's light top and left, then its dark bottom and right.
+            assert_eq!(pixel(20 + offset, 20 + offset), [134, 134, 109], "{offset}");
+            assert_eq!(pixel(92 - offset, 63 - offset), [89, 89, 72], "{offset}");
+        }
+        for (x, y) in [
+            (140, 20),
+            (143, 23),
+            (145, 24),
+            (210, 21),
+            (209, 64),
+            (142, 64),
+        ] {
+            assert_eq!(pixel(x, y), [134, 134, 109], "({x}, {y})");
+        }
+        for offset in [0, 1, 7, 8] {
+            assert_eq!(
+                pixel(260 + offset, 20 + offset),
+                [134, 134, 109],
+                "{offset}"
+            );
+        }
     }
 
     #[test]
