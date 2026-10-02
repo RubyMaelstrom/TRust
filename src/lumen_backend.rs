@@ -32176,6 +32176,34 @@ mod tests {
     }
 
     #[test]
+    fn body_event_handler_attributes_are_window_handlers() {
+        // WHATWG HTML #window-reflecting-body-element-event-handler-set: a
+        // body's onload attribute is the Window's load handler, including one
+        // a misplaced second <body> tag merged onto the body (#parsing-main-inbody).
+        // window.onload returns it until script assigns a handler, so the
+        // classic addLoadEvent chain keeps it.
+        let html = r#"<!doctype html><body onload="document.body.setAttribute('data-first', 'ran')">
+            <script>
+                const old = window.onload;
+                window.onload = function () { old(); document.body.setAttribute('data-chained', 'ran'); };
+            </script>
+        </body>"#;
+        let (rendered, outcome) =
+            crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(rendered.contains("data-first=\"ran\""), "{rendered}");
+        assert!(rendered.contains("data-chained=\"ran\""), "{rendered}");
+
+        let merged = r#"<!doctype html><body><p>text</p><script>window.ready = 1;</script>
+            <body onload="document.body.setAttribute('data-merged', typeof document.body.onload)">
+        </body>"#;
+        let (rendered, outcome) =
+            crate::js::transform(merged, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(rendered.contains("data-merged=\"function\""), "{rendered}");
+    }
+
+    #[test]
     fn diagnostic_snapshot_waits_for_async_scripts_but_not_unsettled_module_promises() {
         let html = r#"<!doctype html><body>
             <script>

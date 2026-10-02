@@ -1740,8 +1740,38 @@
     // on<event> attributes compile lazily at first dispatch and re-only
     // when the attribute text changes (zero cost at page load). Old-web
     // semantics: a handler returning false prevents the default.
+    // WHATWG HTML #window-reflecting-body-element-event-handler-set and
+    // WindowEventHandlers: these on<event> content attributes of a body (or
+    // frameset) element are the event handlers of its Window, not of the
+    // element.
+    const WINDOW_REFLECTING_BODY_HANDLERS = new Set([
+        "blur", "error", "focus", "load", "resize", "scroll",
+        "afterprint", "beforeprint", "beforeunload", "hashchange", "languagechange",
+        "message", "messageerror", "offline", "online", "pagehide", "pagereveal",
+        "pageshow", "pageswap", "popstate", "rejectionhandled", "storage",
+        "unhandledrejection", "unload",
+    ]);
+    function reflectsWindowHandlers(element) {
+        return (element.localName === "body" || element.localName === "frameset") &&
+            element.namespaceURI === "http://www.w3.org/1999/xhtml";
+    }
+    // The element whose content attribute supplies `target`'s on<type>
+    // handler: the target itself, or for the Window the body element of its
+    // document, unless script assigned the Window's IDL handler since.
+    function attrHandlerOwner(cur, type) {
+        if (cur instanceof Element)
+            return WINDOW_REFLECTING_BODY_HANDLERS.has(type) && reflectsWindowHandlers(cur)
+                ? null : cur;
+        if (cur !== g || !WINDOW_REFLECTING_BODY_HANDLERS.has(type)) return null;
+        if (activeWindowState().handlers[type]) return null;
+        const frame = trust.__activeFrame || null;
+        const doc = !frame || frame === realmRootFrame ? document : frameDocument(frame);
+        const body = doc && doc.body;
+        return body && reflectsWindowHandlers(body) ? body : null;
+    }
     function attrHandler(cur, type) {
-        if (!(cur instanceof Element)) return null;
+        cur = attrHandlerOwner(cur, type);
+        if (!cur) return null;
         const src = cur.getAttribute("on" + type);
         if (src === null) return null;
         const cache = cur.__onCache || (cur.__onCache = {});
@@ -1766,7 +1796,8 @@
         if (phase !== 1) {
             const af = attrHandler(cur, ev.type);
             if (af) {
-                const afSlot = cur.__onCache && cur.__onCache[ev.type];
+                const afOwner = attrHandlerOwner(cur, ev.type);
+                const afSlot = afOwner.__onCache && afOwner.__onCache[ev.type];
                 try {
                     const result = runInFrame(afSlot && afSlot.frame,
                                               () => af.call(cur, ev));
@@ -14383,7 +14414,12 @@
             Object.defineProperty(obj, "on" + type, {
                 configurable: true,
                 enumerable: true,
-                get() { return activeWindowState().handlers[type] || null; },
+                // A body element's on<type> attribute is the handler until
+                // script assigns one (#window-reflecting-body-element-event-handler-set).
+                get() {
+                    return activeWindowState().handlers[type] ||
+                        (obj === g && attrHandler(g, type)) || null;
+                },
                 set(v) {
                     const handlers = activeWindowState().handlers;
                     const current = handlers[type] || null;
@@ -14449,8 +14485,18 @@
             Object.defineProperty(proto, "on" + type, {
                 configurable: true,
                 enumerable: false,
-                get() { return (this.__trustOn && this.__trustOn[type]) || null; },
+                get() {
+                    if (WINDOW_REFLECTING_BODY_HANDLERS.has(type) &&
+                        this instanceof Element && reflectsWindowHandlers(this))
+                        return g["on" + type];
+                    return (this.__trustOn && this.__trustOn[type]) || null;
+                },
                 set(v) {
+                    if (WINDOW_REFLECTING_BODY_HANDLERS.has(type) &&
+                        this instanceof Element && reflectsWindowHandlers(this)) {
+                        g["on" + type] = v;
+                        return;
+                    }
                     if (!this.__trustOn) this.__trustOn = {};
                     const prev = this.__trustOn[type];
                     if (prev) this.removeEventListener(type, prev);
