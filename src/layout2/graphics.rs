@@ -1624,6 +1624,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             if fragment.node != NO_NODE {
                 paint_native_control_surface(fragment, radii, builder);
             }
+            let isolated = begin_background_isolation(builder, style);
             if let Some(color) = background_color_for_style(builder.dom, style)
                 && !color.is_transparent()
             {
@@ -1645,6 +1646,9 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
             }
             paint_background_images(fragment, shape.clone(), builder, None);
+            if isolated {
+                builder.commands.push(DisplayCommand::PopLayer);
+            }
         }
         // Each iframe owns a child navigable with its own document canvas.
         // Paint that canvas below the child document, inside the iframe's
@@ -2513,7 +2517,16 @@ fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
         .as_deref()
         .map(blend_mode)
         .unwrap_or_default();
-    if opacity < 1.0 || blend != BlendMode::Normal || !fragment.paint.color_filters.is_empty() {
+    // CSS Compositing 1 #isolation: `isolate` groups descendants so their
+    // blend modes stop at this element.
+    let isolate = style
+        .value(builder.dom, "isolation")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("isolate"));
+    if opacity < 1.0
+        || blend != BlendMode::Normal
+        || isolate
+        || !fragment.paint.color_filters.is_empty()
+    {
         builder
             .commands
             .push(DisplayCommand::PushLayer(CompositingLayer {
@@ -2702,11 +2715,20 @@ fn paint_background_images_for_style(
         .value(builder.dom, "background-attachment")
         .unwrap_or_else(|| "scroll".into());
     let attachment_layers = split_top_level(&attachment_value, ',');
+    let blend_value = style
+        .value(builder.dom, "background-blend-mode")
+        .unwrap_or_else(|| "normal".into());
+    let blend_layers = split_top_level(&blend_value, ',');
     let viewport = CssRect::new(0.0, 0.0, builder.viewport_w, builder.viewport_h);
     // A fixed canvas layer's commands move to the viewport-pinned underlay
-    // once that layer is done (every path below ends its iteration).
+    // once that layer is done (every path below ends its iteration), after
+    // closing the layer's blend group.
     let mut fixed_start: Option<usize> = None;
-    let pin_fixed = |builder: &mut Builder<'_>, start: &mut Option<usize>| {
+    let mut blending = false;
+    let pin_fixed = |builder: &mut Builder<'_>, start: &mut Option<usize>, blending: &mut bool| {
+        if std::mem::take(blending) {
+            builder.commands.push(DisplayCommand::PopLayer);
+        }
         if let Some(start) = start.take() {
             let commands = builder.commands.split_off(start);
             builder.fixed_under.extend(commands);
@@ -2715,7 +2737,7 @@ fn paint_background_images_for_style(
     // CSS Backgrounds paints the first listed layer closest to the viewer, so
     // emit in reverse order after the background color.
     for (index, layer) in images.iter().enumerate().rev() {
-        pin_fixed(builder, &mut fixed_start);
+        pin_fixed(builder, &mut fixed_start, &mut blending);
         let layer = layer.trim();
         if layer.eq_ignore_ascii_case("none") || layer.is_empty() {
             continue;
@@ -2733,6 +2755,19 @@ fn paint_background_images_for_style(
         } else {
             canvas
         };
+        // CSS Compositing 1 #background-blend-mode: each layer blends with
+        // the layers and color beneath it.
+        let blend = blend_mode(layer_value(&blend_layers, index, "normal"));
+        if blend != BlendMode::Normal {
+            builder
+                .commands
+                .push(DisplayCommand::PushLayer(CompositingLayer {
+                    opacity: 1.0,
+                    blend,
+                    color_filters: std::sync::Arc::from([]),
+                }));
+            blending = true;
+        }
         let shape = if fixed && canvas.is_some() {
             PaintShape::Rect(viewport)
         } else {
@@ -2923,7 +2958,7 @@ fn paint_background_images_for_style(
             builder.commands.push(DisplayCommand::PopClip);
         }
     }
-    pin_fixed(builder, &mut fixed_start);
+    pin_fixed(builder, &mut fixed_start, &mut blending);
 }
 
 /// What one background layer paints into each of its tiles.
@@ -3648,6 +3683,7 @@ fn paint_inline_box_decorations(
             .is_some_and(|clip| builder.push_hard_clip(clip));
         let shape = rounded_shape(rect, radii);
         paint_box_shadows(builder.dom, style, &shape, builder);
+        let isolated = begin_background_isolation(builder, style);
         if let Some(color) = background_color_for_style(builder.dom, style)
             && !color.is_transparent()
         {
@@ -3669,6 +3705,9 @@ fn paint_inline_box_decorations(
             fill_background(builder, color_shape, PaintBrush::Solid(color), &shape);
         }
         paint_background_images(&decoration, shape, builder, None);
+        if isolated {
+            builder.commands.push(DisplayCommand::PopLayer);
+        }
         paint_borders(&decoration, radii, builder);
         if clipped {
             builder.pop_hard_clip();
@@ -4464,15 +4503,48 @@ fn decoration_origin(dom: &Dom, mut node: NodeId) -> Option<NodeId> {
     None
 }
 
+/// CSS Compositing 1 #isolation-blending: an element's background layers
+/// blend only with each other and its background color, never with the
+/// content behind the element, so blended backgrounds paint as an isolated
+/// group. Returns whether the group was opened.
+fn begin_background_isolation(builder: &mut Builder<'_>, style: PaintStyle) -> bool {
+    let blended = style
+        .value(builder.dom, "background-blend-mode")
+        .is_some_and(|modes| {
+            split_top_level(&modes, ',')
+                .iter()
+                .any(|mode| blend_mode(mode) != BlendMode::Normal)
+        });
+    if blended {
+        builder
+            .commands
+            .push(DisplayCommand::PushLayer(CompositingLayer {
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                color_filters: std::sync::Arc::from([]),
+            }));
+    }
+    blended
+}
+
+/// CSS Compositing 1 #ltblendmodegt.
 fn blend_mode(value: &str) -> BlendMode {
-    match value.trim() {
+    match value.trim().to_ascii_lowercase().as_str() {
         "multiply" => BlendMode::Multiply,
         "screen" => BlendMode::Screen,
         "overlay" => BlendMode::Overlay,
         "darken" => BlendMode::Darken,
         "lighten" => BlendMode::Lighten,
+        "color-dodge" => BlendMode::ColorDodge,
+        "color-burn" => BlendMode::ColorBurn,
+        "hard-light" => BlendMode::HardLight,
+        "soft-light" => BlendMode::SoftLight,
         "difference" => BlendMode::Difference,
         "exclusion" => BlendMode::Exclusion,
+        "hue" => BlendMode::Hue,
+        "saturation" => BlendMode::Saturation,
+        "color" => BlendMode::Color,
+        "luminosity" => BlendMode::Luminosity,
         _ => BlendMode::Normal,
     }
 }

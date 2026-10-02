@@ -223,6 +223,51 @@ mod tests {
     "#;
 
     #[test]
+    fn background_and_mix_blend_modes_composite_like_browsers() {
+        // CSS Compositing 1: background layers blend with the layers and
+        // color beneath them in an isolated group; a non-normal
+        // mix-blend-mode forms a stacking context that blends with its
+        // backdrop, and isolation:isolate stops that backdrop at the parent.
+        // Expected pixels were measured in LibreWolf 153.
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0;background:#fff}div{width:20px;height:10px}</style>
+            <div style="background:#00f linear-gradient(#f00,#f00);background-blend-mode:multiply"></div>
+            <div style="background:linear-gradient(#f00,#f00);background-blend-mode:multiply"></div>
+            <div style="background:#808080;mix-blend-mode:screen"></div>
+            <div style="background:#ff0;height:auto;isolation:isolate"><div style="background:#808080;mix-blend-mode:multiply"></div></div>
+            <div style="background:#ff0;height:auto"><div style="background:#808080;mix-blend-mode:difference"></div></div>"#,
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(20., 50.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let frame = render_paint_with_images(
+            &layout.paint,
+            CssSize::new(20., 50.),
+            ImageStore::default(),
+            0.,
+        )
+        .unwrap();
+        let pixel = |y: usize| frame.pixels[(y * 20 + 10) * 4..(y * 20 + 10) * 4 + 3].to_vec();
+        assert_eq!(pixel(5), [0, 0, 0]);
+        assert_eq!(pixel(15), [255, 0, 0]);
+        assert_eq!(pixel(25), [255, 255, 255]);
+        assert_eq!(pixel(35), [128, 128, 0]);
+        let difference = pixel(45);
+        assert!(
+            difference
+                .iter()
+                .all(|channel| (126..=129).contains(channel)),
+            "{difference:?}"
+        );
+    }
+
+    #[test]
     fn css_opacity_animations_fade_on_the_document_timeline() {
         // CSS Animations 1: the mixed-case keyframes name matches exactly,
         // and the fade-out overlay is opaque at first, half faded midway and

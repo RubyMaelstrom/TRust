@@ -11600,6 +11600,7 @@ const PROPS: &[PropDef] = &[
     prop("rotate", false, true),
     prop("scale", false, true),
     prop("mix-blend-mode", false, true),
+    prop("background-blend-mode", false, true),
     prop("isolation", false, true),
     prop("filter", false, true),
     prop("box-shadow", false, true),
