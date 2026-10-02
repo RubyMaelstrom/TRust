@@ -4132,8 +4132,24 @@ impl Flow<'_> {
             ),
             &vertical_inl,
         );
+        // CSS Sizing 4 #aspect-ratio-automatic: an auto width with a
+        // preferred aspect ratio and a definite height is transferred from
+        // that height through the ratio (in the box-sizing box).
+        let ratio_w = || {
+            let ratio = s.aspect_ratio.filter(|ratio| *ratio > 0.0)?;
+            if !s.width.is_auto() {
+                return None;
+            }
+            let height = self.height_px(&s.height, s, bp_t, bp_b, Some(cb.h))?;
+            Some(if s.border_box {
+                ((height + bp_v) * ratio - bp_h).max(0.0)
+            } else {
+                height * ratio
+            })
+        };
         let (mut lx, mut used_w, mut ml) = solve_h(replaced.map(|(rw, _)| rw).or_else(|| {
             spec_w(&s.width)
+                .or_else(ratio_w)
                 .or_else(|| vertical.as_ref().map(|(_, w, _)| *w))
                 .map(|w| w.clamp(min_w, max_w))
         }));

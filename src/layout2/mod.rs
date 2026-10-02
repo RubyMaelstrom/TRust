@@ -3814,6 +3814,24 @@ mod tests {
     }
 
     #[test]
+    fn absolutely_positioned_boxes_transfer_height_through_aspect_ratio() {
+        // CSS Sizing 4 #aspect-ratio-automatic: auto width, definite height
+        // and a preferred aspect ratio give a ratio-determined width, in the
+        // box-sizing box; measured against LibreWolf 153.
+        let html = r#"<body style="margin:0"><div style="position:relative;height:200px">
+            <div id=e style="position:absolute;top:10px;left:10px;height:100px;aspect-ratio:2/1"></div>
+            <div id=g style="position:absolute;top:0;left:120px;height:40px;aspect-ratio:1/1;padding:5px;box-sizing:border-box"></div>
+            <div id=c style="position:absolute;top:0;left:0;height:30px;aspect-ratio:1/1;padding:0 5px"></div></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        assert!((width("e") - 200.0).abs() < 0.01, "{}", width("e"));
+        assert!((width("g") - 40.0).abs() < 0.01, "{}", width("g"));
+        // content-box: the 30px content height gives 30px of content width.
+        assert!((width("c") - 40.0).abs() < 0.01, "{}", width("c"));
+    }
+
+    #[test]
     fn textareas_are_monospace_and_rows_lines_tall() {
         // HTML Rendering #the-textarea-element-2: the effective height is
         // `rows` lines (default 2); engines' UA sheets make it monospace.
