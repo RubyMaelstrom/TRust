@@ -629,6 +629,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn parse(text: &str) -> Vec<(String, String, bool)> {
     parse_in(text, false)
 }
