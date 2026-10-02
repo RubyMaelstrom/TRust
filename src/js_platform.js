@@ -5689,14 +5689,20 @@
                 throw new DOMException("Failed to set the 'outerHTML' property on 'Element': This element's parent is of type '#document'.", "NoModificationAllowedError");
             const prev = this.previousSibling, next = this.nextSibling;
             const before = MO.length ? new Set(__dom_children(parent.__id)) : null;
+            const index = rangeIndex(this);
             // A DocumentFragment parent parses in a body context; the native
             // insertion falls back to an equivalent flow-content context.
             __dom_insert_adjacent(this.__id, "beforebegin", v);
             baseHrefCache = null;
             const added = before ? Array.from(parent.childNodes).filter((k) => !before.has(k.__id)) : [];
-            // DOM #concept-node-replace: remove this, then report one record
-            // with the inserted nodes and this element.
-            rangesRemove(this, parent, rangeIndex(this));
+            // DOM #concept-node-replace removes this, then inserts the
+            // fragment's nodes before its next sibling, and reports one
+            // record with both. The arena inserted first, so apply the Range
+            // changes of #concept-node-remove and #concept-node-insert in
+            // that order from the pre-insertion index: the inserted nodes now
+            // precede this element.
+            rangesRemove(this, parent, index);
+            rangesInsert(parent, index, rangeIndex(this) - index);
             if (CE.defs.size) ceDisconnect(this);
             if (MO.length) moRetainTransient(parent, this);
             __dom_detach(this.__id);
