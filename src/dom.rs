@@ -201,6 +201,12 @@ pub struct Dom {
     /// HTML's parser selects the mode; omission means DOM's no-quirks default.
     /// Frame document entries use the arena's embedding-frame document root.
     document_modes: FxHashMap<NodeId, QuirksMode>,
+    /// CSS Fonts 4 #font-fetching-requirements: `@font-face` network sources
+    /// the host fetched for this arena, by absolute URL (`None` = failed).
+    downloaded_fonts: FxHashMap<String, Option<std::sync::Arc<[u8]>>>,
+    /// Network font sources a font set is waiting for, for the host to fetch,
+    /// and every source ever requested.
+    font_requests: RefCell<(Vec<url::Url>, FxHashSet<String>)>,
     input_values: FxHashMap<NodeId, input::InputValue>,
     media_fallbacks: RefCell<media::MediaFallbacks>,
     control_selections: FxHashMap<NodeId, crate::doc::ControlSelection>,
@@ -637,6 +643,8 @@ impl Dom {
             gc_allocation_leases,
             document_content_types,
             document_modes,
+            downloaded_fonts,
+            font_requests,
             input_values,
             media_fallbacks,
             control_selections,
@@ -781,6 +789,20 @@ impl Dom {
         }
         fixed_map!(document_content_types, (NodeId, String));
         fixed_map!(document_modes, (NodeId, QuirksMode));
+        fixed_map!(downloaded_fonts, (String, Option<std::sync::Arc<[u8]>>));
+        for (url, font) in downloaded_fonts {
+            bytes = bytes
+                .saturating_add(url.capacity())
+                .saturating_add(font.as_ref().map_or(0, |font| font.len()));
+        }
+        {
+            let (pending, requested) = &*font_requests.borrow();
+            fixed_map!(pending, url::Url);
+            fixed_map!(requested, String);
+            for url in requested {
+                bytes = bytes.saturating_add(url.capacity());
+            }
+        }
         fixed_map!(input_values, (NodeId, input::InputValue));
         bytes = bytes.saturating_add(media_fallbacks.borrow().retained_bytes());
         // Url exposes its length but not its allocation capacity.
@@ -1089,6 +1111,8 @@ impl Dom {
             gc_allocation_leases: false,
             document_content_types: FxHashMap::default(),
             document_modes: FxHashMap::default(),
+            downloaded_fonts: FxHashMap::default(),
+            font_requests: RefCell::default(),
             input_values: FxHashMap::default(),
             media_fallbacks: RefCell::new(media::MediaFallbacks::default()),
             control_selections: FxHashMap::default(),
@@ -6284,43 +6308,89 @@ impl Dom {
                 if sets.contains_key(&scope) {
                     continue;
                 }
+                let child_document =
+                    scope != DOCUMENT && matches!(self.nodes[scope].data, NodeData::Document);
+                let foreground = !child_document && self.registration_document(scope) == DOCUMENT;
                 let fonts = faces
                     .remove(&scope)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|face| {
-                        for source in face.sources {
-                            if !source.starts_with("data:") {
-                                break;
-                            }
-                            if let Some(font) =
-                                crate::img::decode_data_url(&source).and_then(|bytes| {
-                                    crate::font_system::PageFont::from_web_resource(
-                                        face.family.clone(),
-                                        bytes,
-                                    )
-                                })
-                            {
-                                return Some(font);
-                            }
-                        }
-                        None
-                    })
+                    .filter_map(|face| self.face_font(face, foreground))
                     .collect::<Vec<_>>();
                 let parent = self
                     .shadow_hosts
                     .get(&scope)
                     .and_then(|host| sets.get(&self.tree_scope(*host)));
-                let child_document =
-                    scope != DOCUMENT && matches!(self.nodes[scope].data, NodeData::Document);
                 if !fonts.is_empty() || child_document || parent.is_some() {
-                    let foreground =
-                        !child_document && self.registration_document(scope) == DOCUMENT;
                     let set = crate::text::FontSet::new(fonts, parent, foreground);
                     sets.insert(scope, set);
                 }
             }
         }
+    }
+
+    /// CSS Fonts 4 #src-desc: the first of a face's sources that loads. Data
+    /// URLs decode at once; a network source the host has not fetched yet is
+    /// queued for it, and the face is unavailable (falling back) meanwhile.
+    /// The foreground document's load already installed its initial sheets'
+    /// downloaded faces globally.
+    fn face_font(
+        &self,
+        face: crate::http::CssFontFace,
+        foreground: bool,
+    ) -> Option<crate::font_system::PageFont> {
+        for source in &face.sources {
+            if source.starts_with("data:") {
+                if let Some(font) = crate::img::decode_data_url(source).and_then(|bytes| {
+                    crate::font_system::PageFont::from_web_resource(face.family.clone(), bytes)
+                }) {
+                    return Some(font);
+                }
+                continue;
+            }
+            let Some(url) = url::Url::parse(source)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
+            else {
+                continue;
+            };
+            match self.downloaded_fonts.get(url.as_str()) {
+                Some(Some(bytes)) => {
+                    if let Some(font) = crate::font_system::PageFont::from_web_resource(
+                        face.family.clone(),
+                        bytes.to_vec(),
+                    ) {
+                        return Some(font);
+                    }
+                }
+                Some(None) => {}
+                None => {
+                    if foreground && crate::font_system::page_font_family_installed(&face.family) {
+                        return None;
+                    }
+                    let mut requests = self.font_requests.borrow_mut();
+                    if requests.1.insert(url.to_string()) {
+                        requests.0.push(url);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Network `@font-face` sources font sets are waiting for, each returned
+    /// once, for the host to fetch.
+    pub(crate) fn take_font_requests(&self) -> Vec<url::Url> {
+        std::mem::take(&mut self.font_requests.borrow_mut().0)
+    }
+
+    /// Record a fetched `@font-face` source (`None` when it failed), so the
+    /// rebuilt font sets use it or move on to the face's next source.
+    pub(crate) fn install_downloaded_font(&mut self, url: &str, bytes: Option<Vec<u8>>) {
+        self.downloaded_fonts
+            .insert(url.to_string(), bytes.map(Into::into));
+        self.touch_style();
     }
 
     /// CSS parent without crossing from a child document element to its
@@ -15685,7 +15755,17 @@ fn parse_sheet(
                 && let Some(brace) = after.find('{')
             {
                 let (block, tail) = take_block(&after[brace..]);
-                if let Some(face) = crate::http::font_face_descriptors(block) {
+                if let Some(mut face) = crate::http::font_face_descriptors(block) {
+                    // CSS Values 4 #relative-urls: against the sheet's URL.
+                    if let Some(base) = base {
+                        for source in &mut face.sources {
+                            if !source.starts_with("data:")
+                                && let Ok(url) = base.join(source)
+                            {
+                                *source = url.to_string();
+                            }
+                        }
+                    }
                     fonts.push(face);
                 }
                 rest = tail;
@@ -20554,6 +20634,36 @@ mod tests {
             Some("0"),
             "unitless zero remains a valid length"
         );
+    }
+
+    #[test]
+    fn network_font_faces_are_requested_once_and_used_when_fetched() {
+        // CSS Fonts 4 #font-fetching-requirements: a face whose source the
+        // page load did not fetch (a sheet a script added, a child document)
+        // is requested from the host, falls back meanwhile, and joins the
+        // tree scope's fonts once its data arrives.
+        let mut dom = Dom::parse_document(
+            "<style>@font-face{font-family:Late;src:url(fonts/late.ttf)}</style>\
+             <p id=p style='font-family:Late'>x</p>",
+        );
+        dom.set_doc_url(Some(url::Url::parse("https://example.test/page/").unwrap()));
+        let p = dom.get_by_id("p").unwrap();
+        assert!(dom.scope_font_set(p).is_none());
+        let url = "https://example.test/page/fonts/late.ttf";
+        assert_eq!(
+            dom.take_font_requests(),
+            vec![url::Url::parse(url).unwrap()]
+        );
+        dom.touch_style();
+        assert!(dom.scope_font_set(p).is_none());
+        assert!(dom.take_font_requests().is_empty(), "requested once");
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fonts/dejavu/DejaVuSerif.ttf"
+        ))
+        .unwrap();
+        dom.install_downloaded_font(url, Some(bytes));
+        assert!(dom.scope_font_set(p).is_some());
     }
 
     #[test]
