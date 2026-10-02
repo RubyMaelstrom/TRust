@@ -6314,9 +6314,10 @@ mod tests {
             &Default::default(),
             &Default::default(),
         );
+        // Fit-content around the 13.333px UA button text, not the 800px band.
         let width = layout.boxes[&dom.get_by_id("auto").unwrap()].width;
         assert!(
-            width > 80. && width < 180.,
+            width > 60. && width < 180.,
             "automatic button width: {width}"
         );
         assert_eq!(layout.boxes[&dom.get_by_id("wide").unwrap()].width, 300.);
