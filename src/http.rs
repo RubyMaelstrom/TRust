@@ -5620,6 +5620,14 @@ struct CssImport {
     condition: String,
 }
 
+/// CSS Values 4 #relative-urls: a fetched style sheet's own URL, after
+/// redirects, is the base of its `url()` tokens and `@import` rules, not the
+/// document's. Process a sheet fetched after parsing (a script-inserted
+/// `<link>`, or a sheet of a scripted frame) as the parser-time loader does.
+pub(crate) async fn fetched_stylesheet_text(css: String, sheet_url: Url, client: Url) -> String {
+    expand_stylesheet_imports(css, sheet_url, client, Vec::new()).await
+}
+
 /// CSS Cascade 5 §2.2: replace each applicable `@import` in source order by
 /// the imported rules. Imports are cycle-checked; a failed resource contributes
 /// no rules. URL tokens are then made absolute
